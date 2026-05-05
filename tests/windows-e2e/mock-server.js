@@ -146,9 +146,19 @@ async function main() {
                         '"END" | Add-Content $marker; ' +
                         '[DateTime]::UtcNow.ToString("o") | Add-Content $marker; ' +
                         'Write-Output "bash-timing-test done"',
-                    timeout: 65000, // 65s — transport budget = max(30s, 70s) = 70s
+                    // 75s timeout (was 65s — too tight): PowerShell 5.1
+                    // cold-start under detached spawn can take 5-7s before
+                    // Start-Sleep begins. With a 60s sleep, that pushes the
+                    // child past the 65s boundary intermittently and the
+                    // bash tool kills it before the END marker writes,
+                    // making the START+END assertion flaky. 75s gives
+                    // realistic headroom while still testing both the
+                    // timeout-enforcement code path and the v0.19.2 transport
+                    // budget fix (max(30s, requested+5s) = 80s, well above
+                    // the 75s bash timeout).
+                    timeout: 75000,
                     description:
-                        "issue #26 boundary: 60s Start-Sleep with 65s timeout",
+                        "issue #26 boundary: 60s Start-Sleep with 75s timeout",
                 }),
             },
         ],
