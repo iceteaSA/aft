@@ -32,7 +32,10 @@ impl RewriteRule for GrepRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = grep_request(command, "grep").ok_or("not a grep rewrite")?;
-        try_call_and_footer(crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx), "grep")
+        try_call_and_footer(
+            crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx),
+            "grep",
+        )
     }
 }
 
@@ -52,7 +55,10 @@ impl RewriteRule for RgRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = grep_request(command, "rg").ok_or("not an rg rewrite")?;
-        try_call_and_footer(crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx), "grep")
+        try_call_and_footer(
+            crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx),
+            "grep",
+        )
     }
 }
 
@@ -72,7 +78,10 @@ impl RewriteRule for FindRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = find_request(command).ok_or("not a find rewrite")?;
-        try_call_and_footer(crate::commands::glob::handle_glob(&request("glob", params, session_id), ctx), "glob")
+        try_call_and_footer(
+            crate::commands::glob::handle_glob(&request("glob", params, session_id), ctx),
+            "glob",
+        )
     }
 }
 
@@ -92,7 +101,10 @@ impl RewriteRule for CatRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = cat_read_request(command).ok_or("not a cat rewrite")?;
-        try_call_and_footer(crate::commands::read::handle_read(&request("read", params, session_id), ctx), "read")
+        try_call_and_footer(
+            crate::commands::read::handle_read(&request("read", params, session_id), ctx),
+            "read",
+        )
     }
 }
 
@@ -112,10 +124,13 @@ impl RewriteRule for CatAppendRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = append_request(command).ok_or("not an append rewrite")?;
-        try_call_and_footer(crate::commands::edit_match::handle_edit_match(
-            &request("edit_match", params, session_id),
-            ctx,
-        ), "edit")
+        try_call_and_footer(
+            crate::commands::edit_match::handle_edit_match(
+                &request("edit_match", params, session_id),
+                ctx,
+            ),
+            "edit",
+        )
     }
 }
 
@@ -135,7 +150,10 @@ impl RewriteRule for SedRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = sed_request(command).ok_or("not a sed rewrite")?;
-        try_call_and_footer(crate::commands::read::handle_read(&request("read", params, session_id), ctx), "read")
+        try_call_and_footer(
+            crate::commands::read::handle_read(&request("read", params, session_id), ctx),
+            "read",
+        )
     }
 }
 
@@ -155,7 +173,10 @@ impl RewriteRule for LsRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = ls_request(command).ok_or("not an ls rewrite")?;
-        try_call_and_footer(crate::commands::read::handle_read(&request("read", params, session_id), ctx), "read")
+        try_call_and_footer(
+            crate::commands::read::handle_read(&request("read", params, session_id), ctx),
+            "read",
+        )
     }
 }
 

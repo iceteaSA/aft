@@ -117,10 +117,7 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
     let move_outcome = match move_file_on_disk(&src_path, &dst_path) {
         MoveOutcome::Moved => MoveOutcome::Moved,
         MoveOutcome::CopiedSourceDeleteFailed(message) => {
-            log::warn!(
-                "move_file: copied but failed to remove source: {}",
-                message
-            );
+            log::warn!("move_file: copied but failed to remove source: {}", message);
             MoveOutcome::CopiedSourceDeleteFailed(message)
         }
         MoveOutcome::Failed(message) => {

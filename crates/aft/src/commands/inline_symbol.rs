@@ -384,12 +384,7 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
-    log::debug!(
-        "inline_symbol: {} at {}:{}",
-        symbol,
-        file,
-        call_site_line
-    );
+    log::debug!("inline_symbol: {} at {}:{}", symbol, file, call_site_line);
 
     // --- Build response ---
     let syntax_valid = write_result.syntax_valid.unwrap_or(true);

@@ -1009,18 +1009,12 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
     let lang = match detect_language(path) {
         Some(l) => l,
         None => {
-            log::debug!(
-                "format: {} (skipped: unsupported_language)",
-                path.display()
-            );
+            log::debug!("format: {} (skipped: unsupported_language)", path.display());
             return (false, Some("unsupported_language".to_string()));
         }
     };
     if !has_formatter_support(lang) {
-        log::debug!(
-            "format: {} (skipped: unsupported_language)",
-            path.display()
-        );
+        log::debug!("format: {} (skipped: unsupported_language)", path.display());
         return (false, Some("unsupported_language".to_string()));
     }
 
@@ -1097,10 +1091,7 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
             (false, Some("error".to_string()))
         }
         Err(FormatError::UnsupportedLanguage) => {
-            log::debug!(
-                "format: {} (skipped: unsupported_language)",
-                path.display()
-            );
+            log::debug!("format: {} (skipped: unsupported_language)", path.display());
             (false, Some("unsupported_language".to_string()))
         }
     }
