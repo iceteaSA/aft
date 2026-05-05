@@ -1597,54 +1597,22 @@ mod tests {
     /// wrapper, this test would fail because `%ERRORLEVEL%` parse-time
     /// expansion would record cmd's startup ERRORLEVEL (typically 0)
     /// regardless of what the user command returned.
-    #[cfg(windows)]
-    #[test]
-    fn windows_cmd_wrapper_records_real_exit_code() {
-        use crate::windows_shell::WindowsShell;
-        use std::process::Stdio;
-        use std::time::Instant;
-
-        let dir = tempfile::tempdir().unwrap();
-        let exit_path = dir.path().join("test.exit");
-        let stdout_path = dir.path().join("test.stdout");
-        let stderr_path = dir.path().join("test.stderr");
-
-        // Pre-create capture files so spawn can attach them as stdio.
-        create_capture_file(&stdout_path).unwrap();
-        create_capture_file(&stderr_path).unwrap();
-        let stdout = create_capture_file(&stdout_path).unwrap();
-        let stderr = create_capture_file(&stderr_path).unwrap();
-
-        let wrapper = WindowsShell::Cmd.wrapper_script("cmd /c exit 42", &exit_path);
-        let mut cmd = WindowsShell::Cmd.bg_command(&wrapper);
-        cmd.current_dir(dir.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
-
-        let mut child = cmd.spawn().expect("cmd.exe must spawn for this test");
-        child.wait().expect("child must complete");
-
-        // Wait for marker file (atomic rename).
-        let started = Instant::now();
-        loop {
-            if exit_path.exists() {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "exit marker not written within 10s"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        let content = fs::read_to_string(&exit_path).expect("read exit marker");
-        assert_eq!(
-            content.trim(),
-            "42",
-            "Cmd wrapper must capture user command's real exit code via !ERRORLEVEL!. \
-             Got {:?} (would be 0 if %ERRORLEVEL% parse-time expansion bug regressed)",
-            content
-        );
-    }
+    /// **Disabled.** This test exercises `WindowsShell::Cmd.bg_command()` —
+    /// the inline command-line wrapper helper that production code does
+    /// NOT use anymore. v0.19.4 switched bg-bash to a file-based wrapper
+    /// (`<task>.bat` / `<task>.ps1`) because the inline cmd-line quoting
+    /// produced silent failures on Windows 11 (move /Y could not parse
+    /// path arguments through cmd's /C parser). The `bg_command` helper
+    /// is kept only for parity with `WindowsShell::Cmd.command()` shape;
+    /// the production spawn path goes through `detached_shell_command_for`
+    /// which writes the wrapper to disk and invokes `cmd /V:ON /D /C
+    /// <bat-path>`.
+    ///
+    /// The `!ERRORLEVEL!` correctness this test was meant to verify is
+    /// covered live by the Windows e2e harness scenario 2d
+    /// (`bg bash records non-zero exit code (cmd /c exit 42)`), which
+    /// exercises the real file-based wrapper end-to-end via the protocol.
+    #[allow(dead_code)]
+    #[cfg(any())] // disabled on all targets
+    fn windows_cmd_wrapper_records_real_exit_code_disabled() {}
 }

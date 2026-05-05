@@ -763,10 +763,15 @@ mod tests {
     fn zoom_missing_symbol_param() {
         let ctx = make_ctx();
         let path = fixture_path("calls.ts");
-        let req_str = format!(
-            r#"{{"id":"z-6","command":"zoom","file":"{}"}}"#,
-            path.display()
-        );
+        // Build the JSON via serde_json so Windows paths (with backslashes)
+        // are escaped correctly. Hand-formatted JSON would treat `C:\path`
+        // backslashes as escape sequences and fail to parse.
+        let req_value = serde_json::json!({
+            "id": "z-6",
+            "command": "zoom",
+            "file": path.to_string_lossy(),
+        });
+        let req_str = req_value.to_string();
         let req: RawRequest = serde_json::from_str(&req_str).unwrap();
         let resp = handle_zoom(&req, &ctx);
 

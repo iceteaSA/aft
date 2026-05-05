@@ -1634,6 +1634,10 @@ mod tests {
         assert!(validate_storage_dir("../../../etc/passwd").is_err());
     }
 
+    // Unix-only: on Windows, `\..\..\cache` isn't an absolute path (no
+    // drive letter), so the dotdot-normalization-of-absolute-path
+    // semantics this test asserts don't apply.
+    #[cfg(unix)]
     #[test]
     fn validate_storage_dir_accepts_absolute_with_dotdot_that_normalizes() {
         // /../../cache normalizes to /cache which is a valid absolute path

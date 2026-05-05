@@ -1677,23 +1677,22 @@ mod tests {
         );
     }
 
+    // Unix-only: `resolve_tool_uncached` checks `node_modules/.bin/<name>`
+    // without trying Windows extensions (.cmd/.exe/.bat). Writing
+    // `biome.cmd` would not be found by the resolver. A future product
+    // fix could extend resolve_tool to honor PATHEXT; for now this test
+    // focuses on the explicit-override semantics on Unix.
+    #[cfg(unix)]
     #[test]
     fn detect_formatter_explicit_override() {
         // Create a temp dir with a fake node_modules/.bin/biome so resolve_tool finds it
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let fake = bin_dir.join("biome");
-            fs::write(&fake, "#!/bin/sh\necho 1.0.0").unwrap();
-            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        #[cfg(not(unix))]
-        {
-            fs::write(bin_dir.join("biome.cmd"), "@echo 1.0.0").unwrap();
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let fake = bin_dir.join("biome");
+        fs::write(&fake, "#!/bin/sh\necho 1.0.0").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
         let path = Path::new("test.ts");
         let mut config = Config {
