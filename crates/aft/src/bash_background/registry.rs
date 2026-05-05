@@ -13,15 +13,22 @@ use crate::protocol::{BashCompletedFrame, PushFrame};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use super::buffer::BgBuffer;
 use super::persistence::{
     create_capture_file, read_exit_marker, read_task, session_tasks_dir, task_paths, unix_millis,
     update_task, write_kill_marker_if_absent, write_task, ExitMarker, PersistedTask, TaskPaths,
 };
+use super::process::is_process_alive;
 #[cfg(unix)]
 use super::process::terminate_pgid;
+#[cfg(windows)]
+use super::process::terminate_pid;
 use super::{BgTaskInfo, BgTaskStatus};
+#[cfg(windows)]
+use crate::windows_shell::resolve_windows_shell;
 
 /// Default timeout for background bash tasks: 30 minutes.
 /// Agents can override per-call via the `timeout` parameter (in ms).
@@ -202,15 +209,82 @@ impl BgTaskRegistry {
     #[cfg(windows)]
     pub fn spawn(
         &self,
-        _command: &str,
-        _session_id: String,
-        _workdir: PathBuf,
-        _env: HashMap<String, String>,
-        _timeout: Option<Duration>,
-        _storage_dir: PathBuf,
-        _max_running: usize,
+        command: &str,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        timeout: Option<Duration>,
+        storage_dir: PathBuf,
+        max_running: usize,
     ) -> Result<String, String> {
-        Err("background bash is not yet supported on Windows".to_string())
+        self.start_watchdog();
+
+        let running = self.running_count();
+        if running >= max_running {
+            return Err(format!(
+                "background bash task limit exceeded: {running} running (max {max_running})"
+            ));
+        }
+
+        let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
+        let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
+        let task_id = self.generate_unique_task_id()?;
+        let paths = task_paths(&storage_dir, &session_id, &task_id);
+        fs::create_dir_all(&paths.dir)
+            .map_err(|e| format!("failed to create background task dir: {e}"))?;
+
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            session_id.clone(),
+            command.to_string(),
+            workdir.clone(),
+            timeout_ms,
+        );
+        write_task(&paths.json, &metadata)
+            .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
+
+        let stdout = create_capture_file(&paths.stdout)
+            .map_err(|e| format!("failed to create stdout capture file: {e}"))?;
+        let stderr = create_capture_file(&paths.stderr)
+            .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
+
+        let child = detached_shell_command(command, &paths.exit)
+            .current_dir(&workdir)
+            .envs(&env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .map_err(|e| format!("failed to spawn background bash command: {e}"))?;
+
+        let child_pid = child.id();
+        metadata.status = BgTaskStatus::Running;
+        metadata.child_pid = Some(child_pid);
+        metadata.pgid = None;
+        write_task(&paths.json, &metadata)
+            .map_err(|e| format!("failed to persist running background task metadata: {e}"))?;
+
+        let task = Arc::new(BgTask {
+            task_id: task_id.clone(),
+            session_id,
+            paths: paths.clone(),
+            started: Instant::now(),
+            terminal_at: Mutex::new(None),
+            state: Mutex::new(BgTaskState {
+                metadata,
+                child: Some(child),
+                detached: false,
+                buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
+            }),
+        });
+
+        self.inner
+            .tasks
+            .lock()
+            .map_err(|_| "background task registry lock poisoned".to_string())?
+            .insert(task_id.clone(), task);
+
+        Ok(task_id)
     }
 
     pub fn replay_session(&self, storage_dir: &Path, session_id: &str) -> Result<(), String> {
@@ -259,6 +333,14 @@ impl BgTaskRegistry {
                         self.enqueue_completion_if_needed(&metadata, false);
                     } else if let Ok(Some(marker)) = read_exit_marker(&paths.exit) {
                         metadata = terminal_metadata_from_marker(metadata, marker, None);
+                        let _ = write_task(&paths.json, &metadata);
+                        self.enqueue_completion_if_needed(&metadata, false);
+                    } else if metadata.child_pid.is_some_and(|pid| !is_process_alive(pid)) {
+                        metadata.mark_terminal(
+                            BgTaskStatus::Failed,
+                            None,
+                            Some("process exited without exit marker".to_string()),
+                        );
                         let _ = write_task(&paths.json, &metadata);
                         self.enqueue_completion_if_needed(&metadata, false);
                     } else {
@@ -505,6 +587,12 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             if let Some(pgid) = state.metadata.pgid {
                 terminate_pgid(pgid, state.child.as_mut());
+            }
+            #[cfg(windows)]
+            if let Some(child) = state.child.as_mut() {
+                super::process::terminate_process(child);
+            } else if let Some(pid) = state.metadata.child_pid {
+                terminate_pid(pid);
             }
             if let Some(child) = state.child.as_mut() {
                 let _ = child.wait();
@@ -826,6 +914,19 @@ fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
     cmd
 }
 
+#[cfg(windows)]
+fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
+    let shell = resolve_windows_shell();
+    let wrapper = shell.wrapper_script(command, exit_path);
+    let mut cmd = shell.command(&wrapper);
+    // Win32 process creation flags:
+    // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB
+    // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+    const DETACHED_BG_FLAGS: u32 = 0x0000_0200 | 0x0000_0008 | 0x0100_0000;
+    cmd.creation_flags(DETACHED_BG_FLAGS);
+    cmd
+}
+
 fn random_slug() -> String {
     let mut bytes = [0u8; 4];
     // getrandom is a transitive dependency; use it directly for OS entropy.
@@ -846,10 +947,24 @@ fn random_slug() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    #[cfg(windows)]
+    use std::fs;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    #[cfg(windows)]
+    use std::time::Instant;
 
     use super::*;
+
+    #[cfg(unix)]
+    const QUICK_SUCCESS_COMMAND: &str = "true";
+    #[cfg(windows)]
+    const QUICK_SUCCESS_COMMAND: &str = "cmd /c exit 0";
+
+    #[cfg(unix)]
+    const LONG_RUNNING_COMMAND: &str = "sleep 5";
+    #[cfg(windows)]
+    const LONG_RUNNING_COMMAND: &str = "cmd /c timeout /t 5 /nobreak > nul";
 
     #[test]
     fn cleanup_finished_removes_terminal_tasks_older_than_threshold() {
@@ -857,7 +972,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
-                "true",
+                QUICK_SUCCESS_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
@@ -881,7 +996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
-                "sleep 5",
+                LONG_RUNNING_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
@@ -895,5 +1010,101 @@ mod tests {
 
         assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
         let _ = registry.kill(&task_id, "session");
+    }
+
+    #[cfg(windows)]
+    fn wait_for_file(path: &Path) -> String {
+        let started = Instant::now();
+        loop {
+            if path.exists() {
+                return fs::read_to_string(path).expect("read file");
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[cfg(windows)]
+    fn spawn_windows_registry_command(
+        command: &str,
+    ) -> (BgTaskRegistry, tempfile::TempDir, String) {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                command,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+            )
+            .unwrap();
+        (registry, dir, task_id)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_writes_exit_marker_for_zero_exit() {
+        let (registry, _dir, task_id) = spawn_windows_registry_command("cmd /c exit 0");
+        let exit_path = registry.task_exit_path(&task_id, "session").unwrap();
+
+        let content = wait_for_file(&exit_path);
+
+        assert_eq!(content.trim(), "0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_writes_exit_marker_for_nonzero_exit() {
+        let (registry, _dir, task_id) = spawn_windows_registry_command("cmd /c exit 42");
+        let exit_path = registry.task_exit_path(&task_id, "session").unwrap();
+
+        let content = wait_for_file(&exit_path);
+
+        assert_eq!(content.trim(), "42");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_captures_stdout_to_disk() {
+        let (registry, _dir, task_id) = spawn_windows_registry_command("cmd /c echo hello");
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let stdout_path = task.paths.stdout.clone();
+        let exit_path = task.paths.exit.clone();
+
+        let _ = wait_for_file(&exit_path);
+        let stdout = fs::read_to_string(stdout_path).expect("read stdout");
+
+        assert!(stdout.contains("hello"), "stdout was {stdout:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_uses_pwsh_when_available() {
+        let shell = crate::windows_shell::resolve_windows_shell_with(|binary| {
+            matches!(binary, "pwsh.exe" | "powershell.exe")
+        });
+
+        assert_eq!(shell, crate::windows_shell::WindowsShell::Pwsh);
+        assert_eq!(shell.binary(), "pwsh.exe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_cmd_wrapper_writes_exit_marker_with_move() {
+        let exit_path = Path::new(r"C:\Temp\bgb-test.exit");
+        let script =
+            crate::windows_shell::WindowsShell::Cmd.wrapper_script("cmd /c exit 42", exit_path);
+
+        assert!(script.contains("& echo %ERRORLEVEL% >"));
+        assert!(script.contains("& move /Y"));
+        assert!(script.contains(r#""C:\Temp\bgb-test.exit.tmp""#));
+        assert!(script.contains(r#""C:\Temp\bgb-test.exit""#));
     }
 }

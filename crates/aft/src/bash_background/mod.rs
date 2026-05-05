@@ -67,15 +67,6 @@ pub fn spawn(
         );
     }
 
-    #[cfg(windows)]
-    {
-        return Response::error(
-            request_id,
-            "unsupported_platform",
-            "background bash is not yet supported on Windows",
-        );
-    }
-
     let workdir = workdir.unwrap_or_else(|| {
         ctx.config().project_root.clone().unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))

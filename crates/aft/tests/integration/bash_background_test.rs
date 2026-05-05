@@ -124,6 +124,39 @@ fn wait_for_bash_completed_frame(aft: &mut AftProcess, task_id: &str) -> Value {
     }
 }
 
+#[cfg(windows)]
+fn cross_platform_echo_command() -> &'static str {
+    "cmd /c echo hello"
+}
+
+#[cfg(not(windows))]
+fn cross_platform_echo_command() -> &'static str {
+    "echo hello"
+}
+
+#[test]
+fn background_bash_spawns_and_completes_cross_platform() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+
+    let task_id = spawn_bg(
+        &mut aft,
+        "spawn-cross-platform",
+        cross_platform_echo_command(),
+    );
+    let completed = wait_for_status(&mut aft, &task_id, "completed");
+
+    assert_eq!(completed["exit_code"], 0);
+    assert!(
+        completed["output_preview"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hello"),
+        "expected output to contain hello: {completed:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn background_spawn_status_running_and_completion() {
     let mut aft = AftProcess::spawn();

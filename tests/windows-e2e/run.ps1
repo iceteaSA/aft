@@ -373,6 +373,80 @@ function Run-OpencodeSession {
     }
 }
 
+function Invoke-AftNdjsonScenario {
+    param([string]$ProjectDir)
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $env:AFT_BINARY_PATH
+    $psi.WorkingDirectory = $ProjectDir
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { throw "failed to start aft binary" }
+
+    try {
+        $configure = @{
+            id = "bg-configure"
+            command = "configure"
+            project_root = $ProjectDir
+            experimental_bash_background = $true
+        } | ConvertTo-Json -Compress
+        $proc.StandardInput.WriteLine($configure)
+        $proc.StandardInput.Flush()
+        $cfgResponse = $proc.StandardOutput.ReadLine() | ConvertFrom-Json
+        if (-not $cfgResponse.success) { throw "configure failed: $($cfgResponse | ConvertTo-Json -Compress)" }
+
+        $spawn = @{
+            id = "bg-spawn"
+            command = "bash"
+            params = @{
+                command = "cmd /c echo hello-bg"
+                background = $true
+            }
+        } | ConvertTo-Json -Compress -Depth 5
+        $proc.StandardInput.WriteLine($spawn)
+        $proc.StandardInput.Flush()
+        $spawnResponse = $proc.StandardOutput.ReadLine() | ConvertFrom-Json
+        if (-not $spawnResponse.success) { throw "background spawn failed: $($spawnResponse | ConvertTo-Json -Compress)" }
+
+        $taskId = [string]$spawnResponse.task_id
+        if ($taskId -notmatch '^bgb-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
+
+        Start-Sleep -Seconds 2
+
+        $status = @{
+            id = "bg-status"
+            command = "bash_status"
+            params = @{ task_id = $taskId }
+        } | ConvertTo-Json -Compress -Depth 5
+        $proc.StandardInput.WriteLine($status)
+        $proc.StandardInput.Flush()
+
+        $deadline = (Get-Date).AddSeconds(10)
+        do {
+            $line = $proc.StandardOutput.ReadLine()
+            if (-not $line) { throw "aft stdout closed before status response" }
+            $statusResponse = $line | ConvertFrom-Json
+        } while ($statusResponse.id -ne "bg-status" -and (Get-Date) -lt $deadline)
+
+        if ($statusResponse.id -ne "bg-status") { throw "timed out waiting for bg-status response" }
+        if (-not $statusResponse.success) { throw "bash_status failed: $($statusResponse | ConvertTo-Json -Compress)" }
+        if ($statusResponse.status -ne "completed") { throw "expected completed status, got: $($statusResponse | ConvertTo-Json -Compress)" }
+
+        return $true
+    } finally {
+        try { $proc.StandardInput.Close() } catch { }
+        if (-not $proc.WaitForExit(3000)) {
+            try { $proc.Kill() } catch { }
+            $proc.WaitForExit(3000) | Out-Null
+        }
+    }
+}
+
 # Plugin log path on Windows -- Node's os.tmpdir() resolves to $env:TEMP.
 $PluginLog = Join-Path $env:TEMP "aft-plugin.log"
 if (Test-Path $PluginLog) { Remove-Item $PluginLog -Force }
@@ -692,6 +766,18 @@ Check "interactive bash returned promptly (<25s total)" {
 # session.
 WarnCheck "bash reported timed_out (expected for interactive hang)" {
     LogContains $Result2b "timed out|timeout"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 2c: Background bash via the real aft binary
+# ---------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "-- Scenario 2c: Background bash direct binary --"
+Write-Host ""
+
+Check "background bash direct aft binary completes" {
+    Invoke-AftNdjsonScenario -ProjectDir $ProjectDir
 }
 
 # ---------------------------------------------------------------------------
