@@ -489,6 +489,11 @@ fn outline_supports_requested_new_extensions() {
             "class CsType { void Run() {} }\n",
         ),
         write_file(dir.path(), "src/sample.zig", "fn zigFile() void {}\n"),
+        write_file(
+            dir.path(),
+            "contracts/sample.sol",
+            "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\ncontract SolType { function solFn() public {} }\n",
+        ),
     ];
 
     let mut aft = AftProcess::spawn();
@@ -513,6 +518,7 @@ fn outline_supports_requested_new_extensions() {
         "sample.hpp",
         "sample.cs",
         "sample.zig",
+        "sample.sol",
         "c_file",
         "h_file",
         "cc_file",
@@ -520,6 +526,8 @@ fn outline_supports_requested_new_extensions() {
         "HppType",
         "CsType",
         "zigFile",
+        "SolType",
+        "solFn",
     ] {
         assert!(
             text.contains(expected),

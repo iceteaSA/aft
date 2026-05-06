@@ -147,17 +147,17 @@ impl Language for AstGrepLang {
 
     fn expando_char(&self) -> char {
         match self {
-            // $ is not a valid identifier char in Python, Rust, C-family, Zig, C#, or Solidity
-            Self::Python
-            | Self::Rust
-            | Self::C
-            | Self::Cpp
-            | Self::Zig
-            | Self::CSharp
-            | Self::Solidity => {
+            // $ is not a valid identifier char in Python, Rust, C-family, Zig, or C#.
+            // Solidity intentionally allows `$` in identifiers
+            // (`identifier: /[a-zA-Z$_][a-zA-Z0-9$_]*/` in tree-sitter-solidity),
+            // so keep the meta-var sigil as `$` — replacing it with `µ`
+            // breaks pattern parsing (µ is not in the Solidity identifier
+            // character set, so `µNAME` is rejected by the grammar and
+            // meta-vars never bind).
+            Self::Python | Self::Rust | Self::C | Self::Cpp | Self::Zig | Self::CSharp => {
                 '\u{00B5}' // µ
             }
-            // $ is valid in TS, JS, Go identifiers
+            // $ is valid in TS, JS, Go, Solidity identifiers
             _ => '$',
         }
     }
@@ -293,6 +293,37 @@ mod tests {
         assert!(
             any_matched,
             "no Solidity pattern matched — grammar wiring broken"
+        );
+    }
+
+    /// Solidity grammar permits `$` in identifiers
+    /// (`/[a-zA-Z$_][a-zA-Z0-9$_]*/`), so `expando_char` must stay `$` —
+    /// not `µ` like other non-`$` languages. If `µ` were used, `$NAME` →
+    /// `µNAME`, which the Solidity grammar rejects (µ is outside the
+    /// identifier character set), and meta-vars never bind. Pin the
+    /// expected behavior so the bug we fixed in v0.19.5 cannot silently
+    /// regress.
+    #[test]
+    fn solidity_expando_char_stays_dollar() {
+        assert_eq!(AstGrepLang::Solidity.expando_char(), '$');
+    }
+
+    /// Regression for the Solidity meta-var binding bug that v0.19.5 fixed.
+    /// Before the fix, every `$NAME` in a Solidity pattern was rewritten to
+    /// `µNAME`, and the grammar rejected the result, so meta-vars never
+    /// bound and `total_matches` was always 0 for any pattern using
+    /// meta-vars.
+    #[test]
+    fn solidity_meta_var_pattern_binds_capture() {
+        let lang = AstGrepLang::Solidity;
+        let source =
+            "contract C {\n    function add(uint256 a) public pure returns (uint256) { return a; }\n}\n";
+        let grep = lang.ast_grep(source);
+        let root = grep.root();
+        let found = root.find("function $NAME($$$) public pure returns ($$$) { $$$ }");
+        assert!(
+            found.is_some(),
+            "Solidity meta-var pattern must match — bug recurrence"
         );
     }
 

@@ -836,6 +836,121 @@ fn ast_search_and_replace_support_csharp_patterns() {
     assert!(status.success());
 }
 
+#[test]
+fn ast_search_and_replace_support_solidity_patterns() {
+    // Solidity grammar quirk: tree-sitter-solidity parses `[a-zA-Z$_]` as
+    // valid identifier characters, so meta-vars stay as `$NAME` (no µ
+    // expansion). Patterns that work reliably are full function-declaration
+    // shapes; statement-only patterns (`require($COND, $MSG);`) match zero
+    // because the parser binds them at the wrong AST node level.
+    //
+    // The test uses a function-declaration pattern + a structural rewrite
+    // that's representative of real Solidity migration work (adding
+    // visibility qualifiers / modifiers like `virtual` or `nonReentrant`).
+    let project = setup_project(&[(
+        "contracts/Counter.sol",
+        "// SPDX-License-Identifier: MIT\n\
+         pragma solidity ^0.8.20;\n\
+         \n\
+         contract Counter {\n\
+             uint256 public count;\n\
+         \n\
+             function increment() public {\n\
+                 count += 1;\n\
+             }\n\
+         \n\
+             function decrement() public {\n\
+                 count -= 1;\n\
+             }\n\
+         }\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    // Search both `public` functions in one shot using a meta-var name + a
+    // variadic body. This is the canonical "find all functions of shape X"
+    // query agents reach for.
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "solidity-search",
+            "command": "ast_search",
+            "pattern": "function $NAME() public { $$$BODY }",
+            "lang": "solidity",
+        }),
+    );
+
+    assert_eq!(
+        search["success"], true,
+        "solidity ast_search should succeed: {search:?}"
+    );
+    assert_eq!(
+        search["total_matches"], 2,
+        "expected 2 public functions: {search:?}"
+    );
+
+    // Capture verification — meta-vars must propagate through the Solidity
+    // grammar like every other language. This is the regression guard for
+    // the v0.19.5 expando_char fix: before the fix, `$NAME` was rewritten
+    // to `µNAME` for Solidity, but `µ` is not in the Solidity identifier
+    // character set, so meta-vars never bound and total_matches was 0.
+    let names: Vec<&str> = search["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|m| {
+            m["meta_variables"]["$NAME"]
+                .as_str()
+                .expect("captured $NAME")
+        })
+        .collect();
+    assert!(
+        names.contains(&"increment"),
+        "captured names should include `increment`: {names:?}"
+    );
+    assert!(
+        names.contains(&"decrement"),
+        "captured names should include `decrement`: {names:?}"
+    );
+
+    // Replace path: add a modifier to a specific function. Real-world:
+    // agents bulk-add `virtual`, `nonReentrant`, `whenNotPaused`, etc.
+    // We use a literal pattern + rewrite to keep the rewrite template
+    // simple while still proving the replace pipeline produces valid
+    // Solidity output.
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "solidity-replace",
+            "command": "ast_replace",
+            "pattern": "function increment() public { count += 1; }",
+            "rewrite": "function increment() public virtual { count += 1; }",
+            "lang": "solidity",
+            "dry_run": false,
+        }),
+    );
+
+    assert_eq!(
+        replace["success"], true,
+        "solidity ast_replace should succeed: {replace:?}"
+    );
+    assert_eq!(replace["total_replacements"], 1);
+
+    let updated = read_file(project.path(), "contracts/Counter.sol");
+    assert!(
+        updated.contains("function increment() public virtual { count += 1; }"),
+        "rewrite should add virtual modifier: {updated}"
+    );
+    // Other functions must be untouched.
+    assert!(
+        updated.contains("function decrement() public {"),
+        "decrement should be unchanged: {updated}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 /// Regression guard for the v0.18 perf fix.
 ///
 /// Pre-fix, `ast_search` over ~150 files took ~23 seconds because
