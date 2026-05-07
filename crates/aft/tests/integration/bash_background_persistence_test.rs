@@ -84,8 +84,12 @@ fn wait_for_status(aft: &mut AftProcess, session: &str, task_id: &str, expected:
         if response["status"] == expected {
             return response;
         }
+        // 30s budget instead of 8s so shared CI hardware (GitHub macOS runners
+        // in particular) doesn't flake when 200 iterations of `sleep 0.01` plus
+        // I/O exceed the previous tighter window. Tasks finish in ~2-3s
+        // locally; the budget is just a backstop against a hung registry.
         assert!(
-            started.elapsed() < Duration::from_secs(8),
+            started.elapsed() < Duration::from_secs(30),
             "timed out waiting for {expected}: {response:?}"
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -169,6 +173,7 @@ fn pre_spawn_metadata_starting_replays_as_failed() {
         "true".to_string(),
         tempfile::tempdir().unwrap().path().to_path_buf(),
         None,
+        true,
     );
     let path = task_file(storage.path(), SESSION, task_id, "json");
     write_task(&path, &metadata).unwrap();
@@ -395,6 +400,7 @@ fn replay_stale_running_task_marks_killed_orphaned() {
         "sleep 99".to_string(),
         tempfile::tempdir().unwrap().path().to_path_buf(),
         None,
+        true,
     );
     metadata.status = BgTaskStatus::Running;
     metadata.started_at = metadata.started_at.saturating_sub(25 * 60 * 60 * 1000);
