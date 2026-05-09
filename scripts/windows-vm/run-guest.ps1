@@ -122,6 +122,10 @@ $RobocopyCommon = @("/E", "/NFL", "/NDL", "/NJH", "/NJS", "/MT:8")
 & robocopy (Join-Path $SrcRoot "tests\windows-e2e") (Join-Path $LocalRoot "tests\windows-e2e") @RobocopyCommon | Out-Null
 if ($LASTEXITCODE -ge 8) { Write-Host "robocopy tests failed: $LASTEXITCODE" -ForegroundColor Red; exit 1 }
 
+# .github/ — harness reads opencode-version.txt and aft-version files from here
+& robocopy (Join-Path $SrcRoot ".github") (Join-Path $LocalRoot ".github") @RobocopyCommon | Out-Null
+if ($LASTEXITCODE -ge 8) { Write-Host "robocopy .github failed: $LASTEXITCODE" -ForegroundColor Red; exit 1 }
+
 # packages/aft-bridge (just dist + package.json + node_modules placeholder
 # is sufficient since we copy a self-contained dist)
 & robocopy (Join-Path $SrcRoot "packages\aft-bridge\dist") (Join-Path $LocalRoot "packages\aft-bridge\dist") @RobocopyCommon | Out-Null

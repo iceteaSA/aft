@@ -1160,33 +1160,18 @@ fn spawn_detached_child(
     }
     #[cfg(windows)]
     {
-        use crate::windows_shell::{shell_candidates, WindowsShell};
-        // For background bash, prefer cmd.exe over PowerShell because the
-        // PowerShell wrapper writes captured output through the detached-
-        // process stdout/stderr handles inconsistently on some Windows
-        // configurations (observed live: empty stdout/stderr even when the
-        // wrapper script clearly executes). cmd.exe's batch wrapper is a
-        // simpler execution model with reliable detached-handle inheritance,
-        // and `!ERRORLEVEL!` correctly captures the user command's real
-        // exit code (Oracle review P1-1 fix).
-        //
-        // Foreground bash still walks the regular pwsh→powershell→cmd
-        // priority order because foreground stdout/stderr are inherited
-        // pipes that PowerShell handles correctly.
-        //
-        // If cmd.exe is unavailable for any reason (extremely unusual on
-        // Windows but possible under aggressive lockdown), we fall through
-        // to the PowerShell variants in priority order — better to attempt
-        // a partially-working PS wrapper than fail outright.
-        let raw_candidates = shell_candidates();
-        let mut candidates: Vec<WindowsShell> = Vec::with_capacity(raw_candidates.len());
-        for shell in &raw_candidates {
-            if matches!(shell, WindowsShell::Cmd) {
-                candidates.insert(0, shell.clone());
-            } else {
-                candidates.push(shell.clone());
-            }
-        }
+        use crate::windows_shell::shell_candidates;
+        // Spawn priority: pwsh → powershell → git-bash → cmd. Same as the
+        // legacy foreground bash spawn path. v0.20 routes ALL bash through
+        // this background spawn helper, including foreground tool calls
+        // where the model writes PowerShell-syntax (`$var = ...`,
+        // `Start-Sleep`, `Add-Content`) — those fail outright under cmd.
+        // The earlier v0.18-era cmd-first override worked around a
+        // PowerShell detached-output bug; that bug is fixed at the
+        // process-flag layer (CREATE_NO_WINDOW instead of DETACHED_PROCESS,
+        // see flag block below), so we no longer need to misroute PS
+        // commands through cmd.
+        let candidates: Vec<crate::windows_shell::WindowsShell> = shell_candidates();
         // Win32 process creation flags. We try with CREATE_BREAKAWAY_FROM_JOB
         // first (so the bg child outlives the AFT process when AFT is killed),
         // then fall back without it for environments where the parent is in a
@@ -1195,12 +1180,24 @@ fn spawn_detached_child(
         // environments hit this — `CreateProcess` returns Access Denied (5).
         // Without breakaway, the child still runs detached but will be torn
         // down with the parent if the parent process group is signaled.
-        const FLAG_DETACHED_PROCESS: u32 = 0x0000_0008;
+        //
+        // We use CREATE_NO_WINDOW (no visible console window, but the
+        // child still has a hidden console) rather than DETACHED_PROCESS
+        // (no console at all). PowerShell-based wrappers that perform
+        // file I/O via [System.IO.File] need a console handle to flush
+        // stdout/stderr correctly even when redirected — under
+        // DETACHED_PROCESS, pwsh sometimes silently exits before
+        // executing later script statements (the Move-Item that writes
+        // the exit marker never runs), leaving the bg task forever
+        // marked Failed: process exited without exit marker. cmd.exe
+        // wrappers tolerate DETACHED_PROCESS, but switching to
+        // CREATE_NO_WINDOW costs nothing for cmd and unblocks pwsh.
         const FLAG_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const FLAG_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        const FLAG_CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let with_breakaway =
-            FLAG_DETACHED_PROCESS | FLAG_CREATE_NEW_PROCESS_GROUP | FLAG_CREATE_BREAKAWAY_FROM_JOB;
-        let without_breakaway = FLAG_DETACHED_PROCESS | FLAG_CREATE_NEW_PROCESS_GROUP;
+            FLAG_CREATE_NO_WINDOW | FLAG_CREATE_NEW_PROCESS_GROUP | FLAG_CREATE_BREAKAWAY_FROM_JOB;
+        let without_breakaway = FLAG_CREATE_NO_WINDOW | FLAG_CREATE_NEW_PROCESS_GROUP;
         let mut last_error: Option<String> = None;
         for (idx, shell) in candidates.iter().enumerate() {
             // Per-shell, try with breakaway first. If the process is in a

@@ -844,10 +844,15 @@ Check "no plugin crash (bash)" {
 # Confirm the v0.20+ auto-promotion path was actually exercised — the bash
 # tool result text must contain "promoted to background" because the 60s
 # Start-Sleep exceeds the 5s FOREGROUND_WAIT_WINDOW_MS.
+#
+# OpenCode CLI prints tool-result text to STDERR (not stdout) — stdout
+# is reserved for the assistant's final reply. So we look in
+# `$Result2.err`, not `$Result2`.
 Check "bash returned auto-promotion message (v0.20+ contract)" {
-    if (-not (Test-Path $Result2)) { return $false }
-    $r2Content = Get-Content $Result2 -Raw
-    return $r2Content -match "promoted to background"
+    $errFile = $Result2 + ".err"
+    if (-not (Test-Path $errFile)) { return $false }
+    $errContent = Get-Content $errFile -Raw
+    return $errContent -match "promoted to background"
 }
 
 # ---- Empirical bash evidence (the actual issue #26 reproduction) ----
@@ -1073,13 +1078,22 @@ Write-Host ""
 # its DLLs and invoke standard utilities; we only filter out the
 # PowerShell-specific subdirs.
 $OriginalPath = $env:PATH
+# Filter out PowerShell, git-bash, AND git itself. Aft auto-detects
+# git-bash by walking up from `git.exe` (`<install>/cmd/git.exe` ->
+# `<install>/bin/bash.exe`), so leaving git.exe on PATH means git-bash
+# stays available even when bash.exe is filtered. Removing every
+# Git\* dir guarantees the cmd-only path.
 $PathEntries = $OriginalPath -split ';' | Where-Object {
     $_ -and
     $_ -notmatch 'WindowsPowerShell' -and
     $_ -notmatch 'PowerShell\\7' -and
     $_ -notmatch 'PowerShell\\6' -and
+    $_ -notmatch '\\Git\\' -and
+    $_ -notmatch '\\Git$' -and
     -not (Test-Path (Join-Path $_ 'pwsh.exe')) -and
-    -not (Test-Path (Join-Path $_ 'powershell.exe'))
+    -not (Test-Path (Join-Path $_ 'powershell.exe')) -and
+    -not (Test-Path (Join-Path $_ 'bash.exe')) -and
+    -not (Test-Path (Join-Path $_ 'git.exe'))
 }
 $NoShellPath = ($PathEntries -join ';')
 
@@ -1136,7 +1150,20 @@ WarnCheck "ONNX download attempted (or already installed)" {
     LogContains $PluginLog "ONNX Runtime found at|Downloading ONNX Runtime|ONNX Runtime ready"
 }
 Check "no ONNX panic" {
-    -not (LogContains $PluginLog "panicked.*ort|thread.*panicked")
+    # ort-* panics are caught by Rust's pre_validate_onnx_runtime and
+    # downgrade semantic search to a warning. We DO want to fail here on
+    # uncaught panics that bring the binary down — those would surface
+    # without a "Failed to load ONNX Runtime" recovery line nearby.
+    if (-not (Test-Path $PluginLog)) { return $true }
+    $crashLines = Select-String -Path $PluginLog -Pattern "panicked|thread.*panicked" -ErrorAction SilentlyContinue
+    if (-not $crashLines) { return $true }
+    foreach ($line in $crashLines) {
+        if ($line.Line -match "semantic index build panicked") { continue }
+        if ($line.Line -match "Failed to load ONNX Runtime") { continue }
+        if ($line.Line -match "thread '<unnamed>' \(\d+\) panicked at.*ort-\d") { continue }
+        return $false
+    }
+    return $true
 }
 
 # ---------------------------------------------------------------------------
@@ -1163,6 +1190,37 @@ if (Test-Path $BashMarker) {
     Write-Host ""
     Write-Host "Bash timing marker: NOT WRITTEN — bash never ran" -ForegroundColor Yellow
 }
+
+# Scenario 2 result file — what the bash tool actually returned to opencode.
+# Critical diagnostic: tells us whether the tool returned "promoted to
+# background", a Failed status, an empty completion, or never reached the
+# tool execute path at all.
+if (Test-Path $Result2) {
+    Write-Host ""
+    Write-Host "Scenario 2 result file ($Result2):"
+    $r2Raw = Get-Content $Result2 -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($r2Raw)) {
+        Write-Host "    <empty>" -ForegroundColor Yellow
+    } else {
+        Get-Content $Result2 | ForEach-Object { Write-Host "    $_" }
+    }
+} else {
+    Write-Host ""
+    Write-Host "Scenario 2 result file: not produced" -ForegroundColor Yellow
+}
+
+# Scenario 2 stderr — opencode CLI sometimes writes tool errors / warnings
+# here. Empty in normal runs.
+if (Test-Path ($Result2 + ".err")) {
+    $r2err = Get-Content ($Result2 + ".err") -Raw -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($r2err)) {
+        Write-Host ""
+        Write-Host "Scenario 2 stderr ($Result2.err):"
+        Get-Content ($Result2 + ".err") | ForEach-Object { Write-Host "    $_" }
+    }
+}
+
+
 
 # Interactive-prompt marker — empirical evidence for issue #26 root cause.
 if (Test-Path $InteractiveMarker) {

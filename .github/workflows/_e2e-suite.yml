@@ -83,16 +83,6 @@ jobs:
     name: E2E (Windows native)
     runs-on: windows-2022
     timeout-minutes: 30
-    # TEMPORARY for v0.20.0: bash through opencode tool dispatch on Windows
-    # has a regression where the detached bg child silently fails to start
-    # (marker file never written) even though Test (Windows — bash perms),
-    # Linux Docker E2E, and macOS native E2E all pass. The Rust bash
-    # subsystem on Windows is verified working (S2c/S2d direct-NDJSON
-    # scenarios pass). The failure is somewhere in opencode-tool → plugin
-    # poll → Rust spawn-detached on Windows specifically. Needs Parallels
-    # VM live debugging to pin the exact gap. Tracked for v0.20.1; do not
-    # leave continue-on-error in place after that release.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
