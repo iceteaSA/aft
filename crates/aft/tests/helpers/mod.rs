@@ -5,6 +5,7 @@
 //! Provides `AftProcess` — a handle to a running aft binary with piped I/O —
 //! and `fixture_path` for resolving test fixture files.
 
+use std::collections::VecDeque;
 #[cfg(unix)]
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
@@ -18,6 +19,7 @@ use std::process::{Child, Command, Stdio};
 pub struct AftProcess {
     child: Child,
     reader: BufReader<std::process::ChildStdout>,
+    pending_frames: VecDeque<serde_json::Value>,
 }
 
 impl AftProcess {
@@ -62,7 +64,11 @@ impl AftProcess {
         let stdout = child.stdout.take().expect("stdout handle");
         let reader = BufReader::new(stdout);
 
-        AftProcess { child, reader }
+        AftProcess {
+            child,
+            reader,
+            pending_frames: VecDeque::new(),
+        }
     }
 
     /// Send a raw line and read back the JSON response.
@@ -77,6 +83,7 @@ impl AftProcess {
         loop {
             let value = self.read_json_line();
             if value.get("type").is_some() && value.get("id").is_none() {
+                self.pending_frames.push_back(value);
                 continue;
             }
             if request_id
@@ -91,6 +98,9 @@ impl AftProcess {
 
     /// Read the next JSON line from stdout without writing a request first.
     pub fn read_next(&mut self) -> serde_json::Value {
+        if let Some(value) = self.pending_frames.pop_front() {
+            return value;
+        }
         self.read_json_line()
     }
 
@@ -99,6 +109,10 @@ impl AftProcess {
         &mut self,
         timeout: std::time::Duration,
     ) -> Option<serde_json::Value> {
+        if let Some(value) = self.pending_frames.pop_front() {
+            return Some(value);
+        }
+
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -148,6 +162,11 @@ impl AftProcess {
             "expected a response line but got EOF from aft"
         );
         serde_json::from_str(line.trim()).expect("parse response JSON")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_pending_frame_for_test(&mut self, frame: serde_json::Value) {
+        self.pending_frames.push_back(frame);
     }
 
     /// Send a configure command with project_root.
@@ -210,6 +229,13 @@ impl AftProcess {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let poll_interval = std::time::Duration::from_millis(100);
         loop {
+            while let Some(value) = self.pending_frames.pop_front() {
+                if value.get("type").and_then(|kind| kind.as_str()) == Some("configure_warnings") {
+                    return value;
+                }
+                // Other push frames (progress, bash_completed) are skipped silently.
+            }
+
             let now = std::time::Instant::now();
             if now >= deadline {
                 panic!(
@@ -268,13 +294,7 @@ impl AftProcess {
 
         let mut responses = Vec::new();
         loop {
-            let mut line = String::new();
-            self.reader.read_line(&mut line).expect("read from stdout");
-            assert!(
-                !line.is_empty(),
-                "expected a response line but got EOF from aft"
-            );
-            let value: serde_json::Value = serde_json::from_str(line.trim()).expect("parse JSON");
+            let value = self.read_next();
             let done = predicate(&value);
             responses.push(value);
             if done {

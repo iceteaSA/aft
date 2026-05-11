@@ -291,6 +291,52 @@ fn configure_warns_for_custom_lsp_regardless_of_auto_install_set() {
 }
 
 #[test]
+fn configure_warnings_wait_consumes_pending_frame_before_reading_stdout() {
+    let mut aft = AftProcess::spawn();
+
+    // Deterministic regression for the macOS CI race: when a push frame lands
+    // on stdout before the matching configure response, `send()` queues it in
+    // the helper. The later warnings wait must consume that queued frame first,
+    // not block waiting for another line that will never arrive.
+    aft.queue_pending_frame_for_test(json!({
+        "type": "progress",
+        "message": "unrelated push frame"
+    }));
+    aft.queue_pending_frame_for_test(json!({
+        "type": "configure_warnings",
+        "warnings": [{
+            "kind": "lsp_binary_missing",
+            "server": "custom-thing",
+            "binary": "nonexistent-binary"
+        }],
+        "source_file_count": 0,
+        "source_file_count_exceeds_max": false
+    }));
+
+    let configure = aft.merge_configure_warnings(json!({
+        "id": "cfg-custom-lsp-warning",
+        "success": true,
+        "warnings": [],
+        "warnings_pending": true
+    }));
+
+    let warning = warning_with_kind(
+        &configure,
+        "lsp_binary_missing",
+        "binary",
+        "nonexistent-binary",
+    )
+    .expect("missing custom LSP warning from pending frame");
+    assert_eq!(warning["server"], "custom-thing");
+    assert_eq!(configure["source_file_count"], 0);
+    assert_eq!(configure["source_file_count_exceeds_max"], false);
+    assert_eq!(configure["warnings_pending"], false);
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
 fn configure_suppresses_missing_lsp_warning_for_inflight_install() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
