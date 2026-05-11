@@ -18,7 +18,11 @@ import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
 import { callBridge } from "./_shared.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "./bash.js";
-import { runAsk } from "./permissions.js";
+import {
+  assertExternalDirectoryPermission,
+  permissionDeniedResponse,
+  runAsk,
+} from "./permissions.js";
 
 /** Extract callID from plugin context (exists on object but not in TS type). */
 function getCallID(ctx: unknown): string | undefined {
@@ -387,6 +391,14 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       // Resolve relative paths
       const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
 
+      // External-directory check first (mirrors opencode-native ordering in
+      // tool/read.ts:175). Out-of-project paths prompt the user via the
+      // separate `external_directory` permission rule.
+      {
+        const denial = await assertExternalDirectoryPermission(context, filePath);
+        if (denial) return permissionDeniedResponse(denial);
+      }
+
       // Permission check
       await runAsk(
         context.ask({
@@ -550,6 +562,12 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
 
       const relPath = path.relative(context.worktree, filePath);
+
+      // External-directory check first (mirrors opencode-native write.ts:43).
+      {
+        const denial = await assertExternalDirectoryPermission(context, filePath);
+        if (denial) return permissionDeniedResponse(denial);
+      }
 
       // Permission check
       await runAsk(
@@ -756,6 +774,18 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         const ops = args.operations as Array<Record<string, unknown>>;
         const files = ops.map((op) => op.file as string).filter(Boolean);
 
+        // External-directory check first (mirrors opencode-native edit.ts:68).
+        {
+          const asked = new Set<string>();
+          for (const file of files) {
+            const absPath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+            if (asked.has(absPath)) continue;
+            asked.add(absPath);
+            const denial = await assertExternalDirectoryPermission(context, absPath);
+            if (denial) return permissionDeniedResponse(denial);
+          }
+        }
+
         await runAsk(
           context.ask({
             permission: "edit",
@@ -784,6 +814,12 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
 
       const relPath = path.relative(context.worktree, filePath);
+
+      // External-directory check first (mirrors opencode-native edit.ts:68).
+      {
+        const denial = await assertExternalDirectoryPermission(context, filePath);
+        if (denial) return permissionDeniedResponse(denial);
+      }
 
       await runAsk(
         context.ask({
@@ -1029,6 +1065,17 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 
       const relPaths = Array.from(affectedAbs).map((abs) => path.relative(context.worktree, abs));
       const multiFileWritePaths = Array.from(affectedAbs);
+
+      // External-directory check first (mirrors opencode-native patch.ts:298).
+      {
+        const asked = new Set<string>();
+        for (const filePath of multiFileWritePaths) {
+          if (asked.has(filePath)) continue;
+          asked.add(filePath);
+          const denial = await assertExternalDirectoryPermission(context, filePath);
+          if (denial) return permissionDeniedResponse(denial);
+        }
+      }
 
       await runAsk(
         context.ask({
@@ -1452,6 +1499,17 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
         path.isAbsolute(f) ? f : path.resolve(context.directory, f),
       );
 
+      // External-directory check first (mirrors opencode-native edit.ts:68).
+      {
+        const asked = new Set<string>();
+        for (const filePath of absolutePaths) {
+          if (asked.has(filePath)) continue;
+          asked.add(filePath);
+          const denial = await assertExternalDirectoryPermission(context, filePath);
+          if (denial) return permissionDeniedResponse(denial);
+        }
+      }
+
       await runAsk(
         context.ask({
           permission: "edit",
@@ -1516,6 +1574,18 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
       const destPath = path.isAbsolute(args.destination as string)
         ? (args.destination as string)
         : path.resolve(context.directory, args.destination as string);
+
+      // External-directory check first (mirrors opencode-native edit.ts:68).
+      {
+        const sourceDenial = await assertExternalDirectoryPermission(context, filePath, {
+          kind: "file",
+        });
+        if (sourceDenial) return permissionDeniedResponse(sourceDenial);
+        if (destPath !== filePath) {
+          const destDenial = await assertExternalDirectoryPermission(context, destPath);
+          if (destDenial) return permissionDeniedResponse(destDenial);
+        }
+      }
 
       await runAsk(
         context.ask({
@@ -1637,6 +1707,13 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
           const file = normalizedArgs.filePath as string;
           const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
           const relPath = path.relative(context.worktree, filePath);
+
+          // External-directory check first (mirrors opencode-native write.ts:43).
+          {
+            const denial = await assertExternalDirectoryPermission(context, filePath);
+            if (denial) return permissionDeniedResponse(denial);
+          }
+
           await runAsk(
             context.ask({
               permission: "edit",

@@ -75,6 +75,85 @@ export async function askEditPermission(
   }
 }
 
+/**
+ * Check if `child` is inside `parent`. Mirrors `AppFileSystem.contains` in
+ * opencode core (uses `path.relative` and ensures it doesn't start with `..`).
+ */
+function containsPath(parent: string, child: string): boolean {
+  if (!parent) return false;
+  const rel = path.relative(parent, child);
+  return rel === "" || !rel.startsWith("..");
+}
+
+/**
+ * Trigger OpenCode's host-side `external_directory` permission check when the
+ * target path falls outside the current project's directory and worktree.
+ * Mirrors `opencode/src/tool/external-directory.ts::assertExternalDirectoryEffect`.
+ *
+ * Why this exists: AFT hoisted tools previously only called `permission: "edit"`,
+ * which bypassed OpenCode's separate `external_directory` rule (default `ask`).
+ * That meant `/tmp/anything` writes routed through AFT silently bypassed the
+ * prompt OpenCode native `write`/`edit`/`apply_patch`/`read` show. This helper
+ * closes that gap so AFT's hoisted surface matches native behavior.
+ *
+ * Returns `undefined` on allow (or when target is inside project), or a
+ * denial message string on deny so callers can wrap with
+ * `permissionDeniedResponse(...)`.
+ *
+ * Always call this BEFORE the regular `askEditPermission` so the user sees the
+ * external-directory prompt first (matching opencode native ordering). When the
+ * external-directory rule is `allow` (e.g. for `${os.tmpdir()}/opencode/*`), the
+ * call short-circuits and the regular permission flow continues normally.
+ */
+export async function assertExternalDirectoryPermission(
+  context: ToolContext,
+  target: string,
+  options?: { kind?: "file" | "directory" },
+): Promise<string | undefined> {
+  if (!target) return undefined;
+
+  const absoluteTarget = path.isAbsolute(target) ? target : path.resolve(context.directory, target);
+
+  const directory = context.directory;
+  const worktree = (context as { worktree?: string }).worktree;
+  if (directory && containsPath(directory, absoluteTarget)) return undefined;
+  // Non-git projects set worktree to "/" which matches ANY absolute path.
+  // Match opencode's behavior: skip the worktree check in that case so we
+  // still ask for external paths.
+  if (
+    worktree &&
+    worktree !== "/" &&
+    worktree !== directory &&
+    containsPath(worktree, absoluteTarget)
+  ) {
+    return undefined;
+  }
+
+  const kind = options?.kind ?? "file";
+  const parentDir = kind === "directory" ? absoluteTarget : path.dirname(absoluteTarget);
+  const glob = path.join(parentDir, "*").replaceAll("\\", "/");
+
+  try {
+    await runAsk(
+      context.ask({
+        permission: "external_directory",
+        patterns: [glob],
+        always: [glob],
+        metadata: {
+          filepath: absoluteTarget,
+          parentDir,
+        },
+      }),
+    );
+    return undefined;
+  } catch (error) {
+    if (error instanceof Error && error.message) {
+      return error.message;
+    }
+    return "Permission denied (external directory).";
+  }
+}
+
 export function permissionDeniedResponse(message: string): string {
   return JSON.stringify({
     success: false,

@@ -5,6 +5,7 @@ import type { PluginContext } from "../types.js";
 import { callBridge } from "./_shared.js";
 import {
   askEditPermission,
+  assertExternalDirectoryPermission,
   permissionDeniedResponse,
   resolveAbsolutePath,
   resolveRelativePattern,
@@ -96,6 +97,22 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
               ])
             : [resolveRelativePattern(context, args.filePath as string)];
         const metadata = patterns.length === 1 ? { filepath: filePath } : {};
+
+        // External-directory check first (mirrors opencode-native edit.ts:68).
+        {
+          const affectedPaths =
+            op === "move" && typeof args.destination === "string"
+              ? [filePath, resolveAbsolutePath(context, args.destination)]
+              : [filePath];
+          const asked = new Set<string>();
+          for (const affectedPath of affectedPaths) {
+            if (asked.has(affectedPath)) continue;
+            asked.add(affectedPath);
+            const denial = await assertExternalDirectoryPermission(context, affectedPath);
+            if (denial) return permissionDeniedResponse(denial);
+          }
+        }
+
         const permissionError = await askEditPermission(context, patterns, metadata);
         if (permissionError) return permissionDeniedResponse(permissionError);
 

@@ -4,6 +4,7 @@ import type { PluginContext } from "../types.js";
 import { callBridge } from "./_shared.js";
 import {
   askEditPermission,
+  assertExternalDirectoryPermission,
   permissionDeniedResponse,
   resolveAbsolutePath,
   resolveRelativePattern,
@@ -125,6 +126,13 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         }
 
         const filePath = resolveAbsolutePath(context, args.filePath as string);
+
+        // External-directory check first (mirrors opencode-native edit.ts:68).
+        {
+          const denial = await assertExternalDirectoryPermission(context, filePath);
+          if (denial) return permissionDeniedResponse(denial);
+        }
+
         const permissionError = await askEditPermission(
           context,
           [resolveRelativePattern(context, args.filePath as string)],

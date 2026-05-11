@@ -13,6 +13,8 @@ import type { PluginContext } from "../types.js";
 import { callBridge } from "./_shared.js";
 import {
   askEditPermission,
+  assertExternalDirectoryPermission,
+  permissionDeniedResponse,
   resolveAbsolutePath,
   resolveRelativePatterns,
   workspacePattern,
@@ -168,6 +170,21 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       const isDryRun = args.dryRun === true;
 
       if (!isDryRun) {
+        const paths = Array.isArray(args.paths) ? (args.paths as string[]) : ["."];
+        // External-directory check first (mirrors opencode-native grep/glob directory checks).
+        {
+          const asked = new Set<string>();
+          for (const targetPath of paths) {
+            const absPath = resolveAbsolutePath(context, targetPath);
+            if (asked.has(absPath)) continue;
+            asked.add(absPath);
+            const denial = await assertExternalDirectoryPermission(context, absPath, {
+              kind: "directory",
+            });
+            if (denial) return permissionDeniedResponse(denial);
+          }
+        }
+
         const explicitPaths = Array.isArray(args.paths)
           ? resolveRelativePatterns(context, args.paths as string[])
           : [];
