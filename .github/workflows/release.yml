@@ -98,6 +98,8 @@ jobs:
 
       - name: Rust tests
         run: cargo test --workspace
+        env:
+          AFT_TEST_DIAG: "1"
 
       - name: Install JS dependencies
         run: bun install
