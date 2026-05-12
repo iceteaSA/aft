@@ -90,14 +90,9 @@ impl WindowsShell {
 
     /// Build a `Command` that runs the background wrapper script.
     ///
-    /// For `Cmd`, this enables delayed environment-variable expansion via
-    /// `/V:ON` so the wrapper's `!ERRORLEVEL!` captures the **real** exit
-    /// code of the user command at run-time. Without this, `cmd.exe` parses
-    /// the whole compound line at spawn time, expands `%ERRORLEVEL%` to its
-    /// pre-execution value (typically 0 from cmd's startup), and the exit
-    /// marker permanently records that stale value rather than the user
-    /// command's actual exit code. PowerShell variants don't need this —
-    /// PowerShell evaluates `$LASTEXITCODE` lazily at use-site by design.
+    /// Production background bash now writes cmd wrappers to `.bat` files and
+    /// invokes them without delayed expansion, so paths containing `!` remain
+    /// literal. This helper is retained for tests around legacy inline shapes.
     ///
     /// For foreground bash, callers should use [`Self::command`] instead;
     /// `/V:ON` would change the semantics of user commands containing `!`
@@ -121,10 +116,7 @@ impl WindowsShell {
         // interaction with Rust's std-lib argument quoting is fragile,
         // so we rely on `args()` for cmd and live with the constraints.
         //
-        // `/V:ON` enables `!ERRORLEVEL!` delayed expansion for cmd;
-        // without it, `%ERRORLEVEL%` would be parse-time-expanded to
-        // cmd's startup value, recording a stale exit code. `/D` skips
-        // AutoRun macros; `/S` enables simple quote-stripping.
+        // `/D` skips AutoRun macros; `/S` enables simple quote-stripping.
         //
         // POSIX shells (git-bash etc.) take `-c <wrapper>` and execute
         // the wrapper as a normal shell script — the wrapper's `trap` and
@@ -134,7 +126,7 @@ impl WindowsShell {
                 cmd.args(self.args(wrapper));
             }
             WindowsShell::Cmd => {
-                cmd.args(["/V:ON", "/D", "/S", "/C", wrapper]);
+                cmd.args(["/D", "/S", "/C", wrapper]);
             }
             WindowsShell::Posix(_) => {
                 cmd.args(["-c", wrapper]);
@@ -185,28 +177,26 @@ impl WindowsShell {
                 )
             }
             WindowsShell::Cmd => {
-                // CRITICAL: This wrapper MUST be invoked via `bg_command()`,
-                // which prepends `/V:ON` to enable delayed expansion. Without
-                // /V:ON, `cmd.exe` would parse the entire compound line at
-                // spawn time and expand `%ERRORLEVEL%` to its pre-execution
-                // value (typically 0 from cmd's startup), permanently
-                // recording a stale exit code in the marker file regardless
-                // of what the user command actually returned. With /V:ON,
-                // `!ERRORLEVEL!` is evaluated each time it's referenced,
-                // capturing the real run-time exit code after `{command}`
-                // completes.
-                //
-                // `move /Y ... > nul` suppresses the "1 file(s) moved." line
-                // that cmd would otherwise emit to the user's stdout.
+                // This body is written to a `.bat` file and invoked as
+                // `cmd /D /C <wrapper.bat>`. Batch files expand `%ERRORLEVEL%`
+                // per line, so we do not need `/V:ON` delayed expansion; paths
+                // containing literal `!` survive unchanged.
                 let tmp_path = format!("{}.tmp", exit_path.display());
                 format!(
-                    "{command} & echo !ERRORLEVEL! > {tmp} & move /Y {tmp} {exit} > nul",
+                    concat!(
+                        "@echo off\r\n",
+                        "{command}\r\n",
+                        "set CODE=%ERRORLEVEL%\r\n",
+                        "echo %CODE% > {tmp}\r\n",
+                        "move /Y {tmp} {exit} > nul\r\n",
+                        "exit /B %CODE%\r\n"
+                    ),
                     command = command,
                     tmp = cmd_quote(&tmp_path),
                     exit = cmd_quote(&exit_path.display().to_string())
                 )
             }
-            WindowsShell::Posix(_) => {
+            WindowsShell::Posix(shell_path) => {
                 // git-bash and friends speak POSIX, so the same temp-file +
                 // mv pattern the Unix bg-bash wrapper uses applies here. The
                 // wrapper writes the user command's $? to a temp file and
@@ -218,7 +208,8 @@ impl WindowsShell {
                 let exit_str = exit_path.display().to_string();
                 let tmp_path = format!("{}.tmp", exit_str);
                 format!(
-                    "sh -c {} ; printf '%s' \"$?\" > {} && mv {} {}",
+                    "{} -c {} ; printf '%s' \"$?\" > {} && mv {} {}",
+                    posix_single_quote(&shell_path.display().to_string()),
                     posix_single_quote(command),
                     posix_single_quote(&tmp_path),
                     posix_single_quote(&tmp_path),

@@ -84,7 +84,7 @@ pub fn compress(command: &str, output: String, ctx: &AppContext) -> String {
 /// Used from background threads (notably the `BgTaskRegistry` watchdog and
 /// completion-frame emitter) where lock-free access is required.
 pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegistry) -> String {
-    let stripped = strip_ansi(output);
+    let stripped_for_generic = strip_ansi(output);
 
     // Tier 1: Rust modules — always win when matched.
     let compressors: [&dyn Compressor; 10] = [
@@ -101,17 +101,18 @@ pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegi
     ];
     for compressor in compressors {
         if compressor.matches(command) {
-            return compressor.compress(command, &stripped);
+            return compressor.compress(command, &stripped_for_generic);
         }
     }
 
-    // Tier 2: TOML filters.
+    // Tier 2: TOML filters. Pass raw output so `[ansi].strip = false` filters
+    // can intentionally match escape sequences; `apply_filter` owns ANSI policy.
     if let Some(filter) = registry.lookup(command) {
-        return apply_filter(filter, &stripped);
+        return apply_filter(filter, output);
     }
 
     // Tier 3: generic fallback.
-    GenericCompressor.compress(command, &stripped)
+    GenericCompressor.compress(command, &stripped_for_generic)
 }
 
 /// Build the registry of TOML filters from the standard sources for the

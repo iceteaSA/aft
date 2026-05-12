@@ -18,6 +18,7 @@
 #![allow(unused_imports)]
 
 use super::helpers::AftProcess;
+use serde_json::json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -163,6 +164,63 @@ fn windows_bash_blocks_path_env_case_insensitively() {
             "expected error message to mention blocked env var, got: {message}"
         );
     }
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn windows_cmd_background_wrapper_allows_bang_in_path() {
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("project!bang");
+    std::fs::create_dir_all(&project).unwrap();
+    let storage = parent.path().join("storage!bang");
+    std::fs::create_dir_all(&storage).unwrap();
+    let mut aft = AftProcess::spawn();
+
+    let cfg = aft.send(
+        &json!({
+            "id":"cfg-win-bang",
+            "command":"configure",
+            "project_root": project,
+            "storage_dir": storage,
+            "experimental_bash_background": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(cfg["success"], true, "configure failed: {cfg:?}");
+
+    let spawned = aft.send(
+        &json!({
+            "id":"spawn-win-bang",
+            "command":"bash",
+            "params":{"command":"cmd /D /C exit /B 0","background":true}
+        })
+        .to_string(),
+    );
+    assert_eq!(spawned["success"], true, "spawn failed: {spawned:?}");
+    let task_id = spawned["task_id"].as_str().unwrap();
+
+    let started = Instant::now();
+    loop {
+        let status = aft.send(
+            &json!({
+                "id":"status-win-bang",
+                "command":"bash_status",
+                "params":{"task_id":task_id}
+            })
+            .to_string(),
+        );
+        if status["status"] == "completed" {
+            assert_eq!(status["exit_code"], 0);
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(aft.shutdown().success());
 }
 
 /// Compile-time stub for non-Windows builds so this file isn't empty in

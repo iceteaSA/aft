@@ -8,7 +8,7 @@ use crate::context::AppContext;
 use super::{arity, PermissionAsk, PermissionKind};
 
 const FILE_COMMANDS: &[&str] = &[
-    "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "cat", "cd",
+    "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "cat", "cd", "source", ".",
 ];
 const CWD_COMMANDS: &[&str] = &["cd", "pushd", "popd"];
 
@@ -116,21 +116,16 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
                 let Some(path) = arg_path(arg, &scan_cwd) else {
                     continue;
                 };
-                if path.starts_with(&project_root) {
-                    continue;
-                }
-                let dir = permission_dir(&path);
-                push_ask(
-                    &mut asks,
-                    &mut seen,
-                    PermissionAsk {
-                        kind: PermissionKind::ExternalDirectory,
-                        patterns: vec![format!("{}/*", display_path(&dir))],
-                        always: vec![format!("{}/*", display_path(&dir))],
-                    },
-                );
+                push_external_path(&mut asks, &mut seen, &project_root, &path);
             }
         }
+
+        collect_redirection_targets(command, node, &scan_cwd, |target| match target {
+            RedirectTarget::Path(path) => {
+                push_external_path(&mut asks, &mut seen, &project_root, &path);
+            }
+            RedirectTarget::Dynamic => push_external_wildcard(&mut asks, &mut seen),
+        });
 
         // Mirror OpenCode's `packages/opencode/src/tool/bash.ts`: only
         // skip `cd`/`pushd`/`popd` (they have no externally visible effect
@@ -215,6 +210,64 @@ fn source(command: &str, node: Node<'_>) -> String {
 
 fn node_text<'source>(source: &'source str, node: Node<'_>) -> &'source str {
     node.utf8_text(source.as_bytes()).unwrap_or("")
+}
+
+enum RedirectTarget {
+    Path(PathBuf),
+    Dynamic,
+}
+
+fn collect_redirection_targets(
+    source: &str,
+    command: Node<'_>,
+    cwd: &Path,
+    mut on_target: impl FnMut(RedirectTarget),
+) {
+    let mut cursor = command.walk();
+    for child in command.children(&mut cursor) {
+        collect_redirection_targets_from_node(source, child, cwd, &mut on_target);
+    }
+}
+
+fn collect_redirection_targets_from_node(
+    source: &str,
+    node: Node<'_>,
+    cwd: &Path,
+    on_target: &mut impl FnMut(RedirectTarget),
+) {
+    if node.kind() == "redirection" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if is_dynamic_node(child) {
+                on_target(RedirectTarget::Dynamic);
+                continue;
+            }
+            if matches!(
+                child.kind(),
+                "word" | "file" | "raw_string" | "string" | "concatenation"
+            ) {
+                let text = node_text(source, child);
+                if dynamic(text) {
+                    on_target(RedirectTarget::Dynamic);
+                } else if let Some(path) = arg_path(text, cwd) {
+                    on_target(RedirectTarget::Path(path));
+                }
+            }
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_redirection_targets_from_node(source, child, cwd, on_target);
+    }
+}
+
+fn is_dynamic_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "expansion" | "command_substitution" | "simple_expansion"
+    )
 }
 
 fn path_args(parts: &[Part]) -> impl Iterator<Item = &str> {
@@ -361,6 +414,40 @@ fn push_xargs_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, tok
         return;
     }
     push_bash_ask(asks, seen, tokens[index..].join(" "), &tokens[index..]);
+}
+
+fn push_external_path(
+    asks: &mut Vec<PermissionAsk>,
+    seen: &mut HashSet<String>,
+    project_root: &Path,
+    path: &Path,
+) {
+    if path.starts_with(project_root) {
+        return;
+    }
+    let dir = permission_dir(path);
+    let pattern = format!("{}/*", display_path(&dir));
+    push_ask(
+        asks,
+        seen,
+        PermissionAsk {
+            kind: PermissionKind::ExternalDirectory,
+            patterns: vec![pattern.clone()],
+            always: vec![pattern],
+        },
+    );
+}
+
+fn push_external_wildcard(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>) {
+    push_ask(
+        asks,
+        seen,
+        PermissionAsk {
+            kind: PermissionKind::ExternalDirectory,
+            patterns: vec!["*".to_string()],
+            always: vec!["*".to_string()],
+        },
+    );
 }
 
 fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: PermissionAsk) {

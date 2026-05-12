@@ -1181,3 +1181,122 @@ fn replay_session_preserves_started_at_relative_offset() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn bash_kill_preserves_real_exit_code_when_marker_present() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = registry
+        .spawn(
+            "sleep 5",
+            SESSION.to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+    fs::write(task_file(storage.path(), SESSION, &task_id, "exit"), "7").unwrap();
+
+    let snapshot = registry.kill(&task_id, SESSION).unwrap();
+
+    assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
+    assert_eq!(snapshot.exit_code, Some(7));
+}
+
+#[test]
+fn failed_spawn_cleans_up_bundle() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let missing_workdir = project.path().join("does-not-exist");
+    let registry = registry();
+
+    let err = registry
+        .spawn(
+            "true",
+            SESSION.to_string(),
+            missing_workdir,
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap_err();
+
+    assert!(err.contains("failed to spawn background bash command"));
+    assert!(!session_tasks_dir(storage.path(), SESSION).exists());
+}
+
+#[test]
+fn replay_completion_carries_preview() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let paths = fake_task(
+        storage.path(),
+        project.path(),
+        SESSION,
+        "bash-preview",
+        BgTaskStatus::Completed,
+        false,
+    );
+    fs::write(&paths.stdout, "preview survives replay\n").unwrap();
+    fs::write(&paths.stderr, "").unwrap();
+
+    let registry = registry();
+    registry.replay_session(storage.path(), SESSION).unwrap();
+    let completions = registry.drain_completions_for_session(Some(SESSION));
+
+    assert_eq!(completions.len(), 1);
+    assert!(completions[0]
+        .output_preview
+        .contains("preview survives replay"));
+}
+
+#[cfg(unix)]
+#[test]
+fn background_bash_uses_bash_syntax_when_available() {
+    if which::which("bash").is_err() {
+        eprintln!("skipping: bash not available on PATH");
+        return;
+    }
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = registry
+        .spawn(
+            "[[ 1 -eq 1 ]] && echo ok",
+            SESSION.to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+    wait_for_path(&task_file(storage.path(), SESSION, &task_id, "exit"));
+
+    let snapshot = registry
+        .status(
+            &task_id,
+            SESSION,
+            Some(project.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .unwrap();
+
+    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert!(snapshot.output_preview.contains("ok"));
+}

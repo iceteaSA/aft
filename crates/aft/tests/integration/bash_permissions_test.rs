@@ -110,6 +110,67 @@ fn rm_outside_project_root_requires_external_directory() {
 }
 
 #[test]
+fn bash_permission_scan_collects_redirect_target() {
+    let root = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let response = bash(&mut aft, "redirect", "echo hi > /tmp/aft-redirect-out");
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert!(
+        response["asks"].as_array().unwrap().iter().any(|ask| {
+            ask["kind"] == "external_directory"
+                && ask["patterns"].as_array().unwrap().iter().any(|p| {
+                    p.as_str()
+                        .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
+                })
+        }),
+        "expected external_directory ask for redirect target: {response:?}"
+    );
+
+    let dynamic = bash(&mut aft, "dynamic-redirect", "echo hi > $OUTFILE");
+    assert_eq!(dynamic["success"], false, "response: {dynamic:?}");
+    assert!(dynamic["asks"].as_array().unwrap().iter().any(|ask| {
+        ask["kind"] == "external_directory"
+            && ask["patterns"].as_array().unwrap().iter().any(|p| p == "*")
+    }));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn bash_permission_scan_handles_source() {
+    let root = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let response = bash(&mut aft, "source", "source /tmp/aft-source.sh");
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert!(
+        response["asks"].as_array().unwrap().iter().any(|ask| {
+            ask["kind"] == "external_directory"
+                && ask["patterns"].as_array().unwrap().iter().any(|p| {
+                    p.as_str()
+                        .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
+                })
+        }),
+        "expected external_directory ask for source target: {response:?}"
+    );
+
+    let dot = bash(&mut aft, "dot-source", ". /tmp/aft-dot-source.sh");
+    assert_eq!(dot["success"], false, "response: {dot:?}");
+    assert!(dot["asks"].as_array().unwrap().iter().any(|ask| {
+        ask["kind"] == "external_directory"
+            && ask["patterns"].as_array().unwrap().iter().any(|p| {
+                p.as_str()
+                    .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
+            })
+    }));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn symlink_path_resolving_outside_project_requires_permission() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("project");

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use aft::compress::builtin_filters::ALL;
-use aft::compress::toml_filter::{apply_filter, parse_filter, FilterSource};
+use aft::compress::toml_filter::{apply_filter, build_registry, parse_filter, FilterSource};
 
 fn fixture_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -99,4 +99,34 @@ fn wc_filter() {
 #[test]
 fn xcodebuild_filter() {
     run_fixture("xcodebuild");
+}
+
+#[test]
+fn toml_filter_strip_ansi_false_sees_raw_ansi() {
+    let registry = build_registry(
+        &[(
+            "ansi-raw",
+            r#"
+[filter]
+matches = ["ansi-raw"]
+
+[strip]
+patterns = []
+
+[shortcircuit]
+when = "\\x1b\\[31m"
+replacement = "matched raw ansi"
+
+[ansi]
+strip = false
+"#,
+        )],
+        None,
+        None,
+    );
+
+    let actual =
+        aft::compress::compress_with_registry("ansi-raw", "\u{1b}[31mred\u{1b}[0m", &registry);
+
+    assert_eq!(actual, "matched raw ansi");
 }

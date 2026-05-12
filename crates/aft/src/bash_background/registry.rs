@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -236,7 +236,14 @@ impl BgTaskRegistry {
         create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
 
-        let child = spawn_detached_child(command, &paths, &workdir, &env)?;
+        let child = match spawn_detached_child(command, &paths, &workdir, &env) {
+            Ok(child) => child,
+            Err(error) => {
+                log::warn!("failed to spawn background bash task {task_id}; deleting partial bundle: {error}");
+                let _ = delete_task_bundle(&paths);
+                return Err(error);
+            }
+        };
 
         let child_pid = child.id();
         metadata.mark_running(child_pid, child_pid as i32);
@@ -321,7 +328,14 @@ impl BgTaskRegistry {
         create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
 
-        let child = spawn_detached_child(command, &paths, &workdir, &env)?;
+        let child = match spawn_detached_child(command, &paths, &workdir, &env) {
+            Ok(child) => child,
+            Err(error) => {
+                log::warn!("failed to spawn background bash task {task_id}; deleting partial bundle: {error}");
+                let _ = delete_task_bundle(&paths);
+                return Err(error);
+            }
+        };
 
         let child_pid = child.id();
         metadata.status = BgTaskStatus::Running;
@@ -389,7 +403,7 @@ impl BgTaskRegistry {
                         Some("spawn aborted".to_string()),
                     );
                     let _ = write_task(&paths.json, &metadata);
-                    self.enqueue_completion_if_needed(&metadata, false);
+                    self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                 }
                 BgTaskStatus::Running | BgTaskStatus::Killing => {
                     if self.running_metadata_is_stale(&metadata) {
@@ -402,7 +416,7 @@ impl BgTaskRegistry {
                             let _ = write_kill_marker_if_absent(&paths.exit);
                         }
                         let _ = write_task(&paths.json, &metadata);
-                        self.enqueue_completion_if_needed(&metadata, false);
+                        self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                     } else if let Ok(Some(marker)) = read_exit_marker(&paths.exit) {
                         let reason = (metadata.status == BgTaskStatus::Killing).then(|| {
                             "recovered from inconsistent killing state on replay".to_string()
@@ -415,7 +429,7 @@ impl BgTaskRegistry {
                         }
                         metadata = terminal_metadata_from_marker(metadata, marker, reason);
                         let _ = write_task(&paths.json, &metadata);
-                        self.enqueue_completion_if_needed(&metadata, false);
+                        self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                     } else if metadata.status == BgTaskStatus::Killing {
                         if !paths.exit.exists() {
                             let _ = write_kill_marker_if_absent(&paths.exit);
@@ -426,7 +440,7 @@ impl BgTaskRegistry {
                             Some("recovered from inconsistent killing state on replay".to_string()),
                         );
                         let _ = write_task(&paths.json, &metadata);
-                        self.enqueue_completion_if_needed(&metadata, false);
+                        self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                     } else if metadata.child_pid.is_some_and(|pid| !is_process_alive(pid)) {
                         metadata.mark_terminal(
                             BgTaskStatus::Failed,
@@ -434,14 +448,14 @@ impl BgTaskRegistry {
                             Some("process exited without exit marker".to_string()),
                         );
                         let _ = write_task(&paths.json, &metadata);
-                        self.enqueue_completion_if_needed(&metadata, false);
+                        self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                     } else {
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     }
                 }
                 _ if metadata.status.is_terminal() => {
                     self.insert_rehydrated_task(metadata.clone(), paths, true)?;
-                    self.enqueue_completion_if_needed(&metadata, false);
+                    self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                 }
                 _ => {}
             }
@@ -944,6 +958,19 @@ impl BgTaskRegistry {
                 return Ok(task.snapshot_locked(&state, 5 * 1024));
             }
 
+            if let Ok(Some(marker)) = read_exit_marker(&task.paths.exit) {
+                state.metadata =
+                    terminal_metadata_from_marker(state.metadata.clone(), marker, None);
+                task.mark_terminal_now();
+                state.child = None;
+                state.detached = true;
+                state.buffer.enforce_terminal_cap();
+                write_task(&task.paths.json, &state.metadata)
+                    .map_err(|e| format!("failed to persist terminal state: {e}"))?;
+                self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
+                return Ok(task.snapshot_locked(&state, 5 * 1024));
+            }
+
             state.metadata.status = BgTaskStatus::Killing;
             write_task(&task.paths.json, &state.metadata)
                 .map_err(|e| format!("failed to persist killing state: {e}"))?;
@@ -1015,9 +1042,14 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    fn enqueue_completion_if_needed(&self, metadata: &PersistedTask, emit_frame: bool) {
+    fn enqueue_completion_if_needed(
+        &self,
+        metadata: &PersistedTask,
+        paths: Option<&TaskPaths>,
+        emit_frame: bool,
+    ) {
         if metadata.status.is_terminal() && !metadata.completion_delivered {
-            self.enqueue_completion_locked(metadata, None, emit_frame);
+            self.enqueue_completion_from_parts(metadata, None, paths, emit_frame);
         }
     }
 
@@ -1025,6 +1057,16 @@ impl BgTaskRegistry {
         &self,
         metadata: &PersistedTask,
         buffer: Option<&BgBuffer>,
+        emit_frame: bool,
+    ) {
+        self.enqueue_completion_from_parts(metadata, buffer, None, emit_frame);
+    }
+
+    fn enqueue_completion_from_parts(
+        &self,
+        metadata: &PersistedTask,
+        buffer: Option<&BgBuffer>,
+        paths: Option<&TaskPaths>,
         emit_frame: bool,
     ) {
         if !metadata.status.is_terminal() || metadata.completion_delivered {
@@ -1036,7 +1078,9 @@ impl BgTaskRegistry {
         // same preview without racing against rotation.
         let (raw_preview, output_truncated) = match buffer {
             Some(buf) => buf.read_tail(BG_COMPLETION_PREVIEW_BYTES),
-            None => (String::new(), false),
+            None => paths
+                .map(|paths| read_tail_from_disk(paths, BG_COMPLETION_PREVIEW_BYTES))
+                .unwrap_or_else(|| (String::new(), false)),
         };
         // Compress at completion time so push-frame consumers and later
         // `bash_drain_completions` poll-callers see the same compressed text.
@@ -1380,6 +1424,19 @@ fn task_sibling_paths(json_path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn read_tail_from_disk(paths: &TaskPaths, max_bytes: usize) -> (String, bool) {
+    let stdout = fs::read(&paths.stdout).unwrap_or_default();
+    let stderr = fs::read(&paths.stderr).unwrap_or_default();
+    let mut bytes = Vec::with_capacity(stdout.len().saturating_add(stderr.len()));
+    bytes.extend_from_slice(&stdout);
+    bytes.extend_from_slice(&stderr);
+    if bytes.len() <= max_bytes {
+        return (String::from_utf8_lossy(&bytes).into_owned(), false);
+    }
+    let start = bytes.len().saturating_sub(max_bytes);
+    (String::from_utf8_lossy(&bytes[start..]).into_owned(), true)
+}
+
 impl BgTask {
     fn snapshot(&self, preview_bytes: usize) -> BgTaskSnapshot {
         let state = self
@@ -1469,10 +1526,11 @@ fn terminal_metadata_from_marker(
 
 #[cfg(unix)]
 fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
-    let mut cmd = Command::new("/bin/sh");
+    let shell = resolve_posix_shell();
+    let mut cmd = Command::new(&shell);
     cmd.arg("-c")
         .arg("\"$0\" -c \"$1\"; code=$?; printf \"%s\" \"$code\" > \"$2.tmp.$$\"; mv -f \"$2.tmp.$$\" \"$2\"")
-        .arg("/bin/sh")
+        .arg(&shell)
         .arg(command)
         .arg(exit_path);
     unsafe {
@@ -1484,6 +1542,22 @@ fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
         });
     }
     cmd
+}
+
+#[cfg(unix)]
+fn resolve_posix_shell() -> PathBuf {
+    static POSIX_SHELL: OnceLock<PathBuf> = OnceLock::new();
+    POSIX_SHELL
+        .get_or_init(|| {
+            std::env::var_os("BASH")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+                .or_else(|| which::which("bash").ok())
+                .or_else(|| which::which("zsh").ok())
+                .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+        })
+        .clone()
 }
 
 #[cfg(windows)]
@@ -1544,13 +1618,13 @@ fn detached_shell_command_for(
             cmd.arg(&wrapper_path);
         }
         WindowsShell::Cmd => {
-            // `cmd /V:ON /D /C "<bat-file-path>"` — invoking a .bat
+            // `cmd /D /C "<bat-file-path>"` — invoking a .bat
             // file via /C is well-defined; the file's contents are
             // read line-by-line by cmd's batch processor, NOT
             // re-interpreted by the /C parser. This avoids the
             // "filename syntax incorrect" errors that came from
             // having complex compound commands on the cmd line.
-            cmd.args(["/V:ON", "/D", "/C"]);
+            cmd.args(["/D", "/C"]);
             cmd.arg(&wrapper_path);
         }
         WindowsShell::Posix(_) => {
