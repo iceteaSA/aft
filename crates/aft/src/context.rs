@@ -661,10 +661,10 @@ impl AppContext {
         // observes diagnostics triggered by the current change.
         lsp.drain_events();
 
-        // Snapshot per-server epochs BEFORE sending didChange so the wait
-        // loop can detect freshness via epoch-delta for servers that don't
-        // echo `version` on publishDiagnostics.
-        let pre_snapshot = lsp.snapshot_diagnostic_epochs(file_path);
+        // Snapshot per-server epochs and document versions BEFORE sending
+        // didChange so the wait loop can prove freshness without accepting
+        // stale pre-edit publishes that arrived late.
+        let pre_snapshot = lsp.snapshot_pre_edit_state(file_path);
 
         // Send didChange/didOpen and capture per-server target version.
         let config = self.config();

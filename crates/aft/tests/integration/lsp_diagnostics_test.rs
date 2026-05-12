@@ -14,6 +14,7 @@ use aft::lsp::client::LspEvent;
 use aft::lsp::diagnostics::DiagnosticSeverity;
 use aft::lsp::manager::LspManager;
 use aft::lsp::registry::{is_config_file_path, is_config_file_path_with_custom, ServerKind};
+use aft::lsp::roots::ServerKey;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
 use lsp_types::FileChangeType;
@@ -1366,6 +1367,164 @@ fn post_edit_rejects_publish_with_stale_version() {
     // Sanity-check: without STALE_VERSION, the same flow IS complete.
     // (Use a fresh context so no state leaks.)
     let _ = root;
+}
+
+#[test]
+fn post_edit_wait_rejects_stale_pre_edit_publish() {
+    use aft::lsp::diagnostics::{DiagnosticEntry, StoredDiagnostic};
+    use aft::lsp::manager::{post_edit_entry_is_fresh, PreEditSnapshot};
+
+    let file = PathBuf::from("/tmp/aft-stale.rs");
+    let stale = DiagnosticEntry {
+        diagnostics: vec![StoredDiagnostic {
+            file,
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: "stale pre-edit".into(),
+            code: None,
+            source: Some("fake".into()),
+        }],
+        epoch: 7,
+        result_id: None,
+        version: Some(4),
+    };
+
+    let pre_edit = PreEditSnapshot {
+        epoch: 6,
+        document_version_at_capture: Some(4),
+    };
+
+    assert!(
+        !post_edit_entry_is_fresh(&stale, 5, pre_edit),
+        "publish for version N-1 must not prove freshness for post-edit version N"
+    );
+}
+
+#[test]
+fn push_only_per_file_freshness() {
+    use aft::lsp::diagnostics::DiagnosticsStore;
+
+    let mut store = DiagnosticsStore::new();
+    let server = ServerKey {
+        kind: ServerKind::TypeScript,
+        root: PathBuf::from("/tmp/aft-push-root"),
+    };
+    let a = PathBuf::from("/tmp/aft-push-root/a.ts");
+    let b = PathBuf::from("/tmp/aft-push-root/b.ts");
+    let since = Instant::now();
+
+    store.publish(server.clone(), a, Vec::new());
+
+    assert!(
+        !store.has_publish_for_file_after(&server, &b, since),
+        "publish for a.ts must not prove freshness for b.ts"
+    );
+}
+
+#[test]
+fn directory_mode_with_walk_truncation_reports_complete_false() {
+    let temp_dir = tempdir().expect("tempdir");
+    let root = temp_dir.path().join("workspace");
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("cargo toml");
+    for i in 0..250 {
+        fs::write(src.join(format!("file_{i:03}.rs")), "fn main() {}\n").expect("write rs");
+    }
+
+    let config = Config {
+        project_root: Some(root.clone()),
+        ..Config::default()
+    };
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-dir-truncated",
+        "command": "lsp_diagnostics",
+        "directory": src.display().to_string(),
+    }))
+    .expect("request parses");
+
+    let response = handle_lsp_diagnostics(&req, &ctx);
+    let json = serde_json::to_value(&response).expect("response serializes");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["complete"], false);
+    assert_eq!(json["walk_truncated"], true);
+    assert_eq!(
+        json["unchecked_files"].as_array().expect("unchecked").len(),
+        50
+    );
+}
+
+#[test]
+fn server_exit_cleanup_isolates_by_root() {
+    use aft::lsp::diagnostics::{DiagnosticsStore, StoredDiagnostic};
+
+    let mut store = DiagnosticsStore::new();
+    let root_a = PathBuf::from("/tmp/aft-root-a");
+    let root_b = PathBuf::from("/tmp/aft-root-b");
+    let key_a = ServerKey {
+        kind: ServerKind::Rust,
+        root: root_a.clone(),
+    };
+    let key_b = ServerKey {
+        kind: ServerKind::Rust,
+        root: root_b.clone(),
+    };
+    let file_a = root_a.join("src/main.rs");
+    let file_b = root_b.join("src/main.rs");
+    let diag_b = StoredDiagnostic {
+        file: file_b.clone(),
+        line: 1,
+        column: 1,
+        end_line: 1,
+        end_column: 2,
+        severity: DiagnosticSeverity::Error,
+        message: "keep me".into(),
+        code: None,
+        source: None,
+    };
+
+    store.publish(key_a.clone(), file_a.clone(), Vec::new());
+    store.publish(key_b.clone(), file_b.clone(), vec![diag_b]);
+    store.clear_for_server(&key_a);
+
+    assert!(store.entries_for_file(&file_a).is_empty());
+    assert_eq!(store.entries_for_file(&file_b).len(), 1);
+}
+
+#[test]
+fn did_change_watched_files_skipped_when_unsupported() {
+    let (_temp_dir, root, files) = typescript_workspace_with_files(&["foo.ts"]);
+    let source = &files[0];
+    let package_json = root.join("package.json");
+    let config = Config {
+        project_root: Some(root.clone()),
+        ..Config::default()
+    };
+    let mut manager = manager_with_fake_typescript_server();
+
+    manager
+        .notify_file_changed(source, "export const value = 2;\n", &config)
+        .expect("open ts source");
+    wait_for_publish(&mut manager);
+
+    manager
+        .notify_files_watched_changed(&[(package_json, FileChangeType::CHANGED)], &config)
+        .expect("notify watched files skips unsupported server");
+
+    let event = collect_event(&mut manager, |event| {
+        matches!(
+            event,
+            LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
+        )
+    });
+    assert!(
+        event.is_none(),
+        "unsupported server must not receive watched-file notification"
+    );
 }
 
 // NOTE: A test for the "no LSP server running for file" path was

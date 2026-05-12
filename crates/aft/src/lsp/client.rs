@@ -336,37 +336,33 @@ impl LspClient {
 
         let params = serde_json::from_value::<lsp_types::InitializeParams>(params_value)?;
 
-        let result = self.send_request::<lsp_types::request::Initialize>(params)?;
+        let result_value = self.send_request_value(
+            <lsp_types::request::Initialize as lsp_types::request::Request>::METHOD,
+            params,
+        )?;
+        let result: lsp_types::InitializeResult = serde_json::from_value(result_value.clone())?;
 
         // Capture diagnostic capabilities from the initialize response. We parse
         // from a re-serialized JSON Value because the lsp-types crate's
         // diagnostic_provider strict variants reject some shapes real servers
         // emit (e.g. bare `true`), and we want defensive Default fallback.
-        let caps_value = serde_json::to_value(&result.capabilities).unwrap_or(Value::Null);
+        let caps_value = result_value
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| serde_json::to_value(&result.capabilities).unwrap_or(Value::Null));
         self.diagnostic_caps = Some(parse_diagnostic_capabilities(&caps_value));
 
-        // Capture whether the server supports workspace/didChangeWatchedFiles (#32).
-        //
-        // IMPORTANT: lsp-types 0.97's WorkspaceServerCapabilities struct does NOT
-        // include a `didChangeWatchedFiles` field, so `caps_value` will never have
-        // it after re-serialization. We therefore default to `true` (permissive).
-        //
-        // Per the LSP specification, servers MUST ignore notifications for methods
-        // they don't support, so sending didChangeWatchedFiles unconditionally is
-        // spec-safe. The default-true matches the pre-#32 unconditional behavior
-        // and avoids a regression for servers that do support it (tsserver, rust-
-        // analyzer, pyright all accept it even without explicit advertising).
-        //
-        // If a future lsp-types version exposes the field, the pointer lookup
-        // below will start returning real values and the default won't matter.
+        // Capture whether the server supports workspace/didChangeWatchedFiles.
+        // Missing capability is unsupported by default; callers must not send
+        // notifications unless the server explicitly opted in.
         self.supports_watched_files = caps_value
             .pointer("/workspace/didChangeWatchedFiles/dynamicRegistration")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true) // permissive default: spec-safe to send if server doesn't say false
+            .unwrap_or(false)
             || caps_value
                 .pointer("/workspace/didChangeWatchedFiles")
                 .map(|v| v.is_object() || v.as_bool() == Some(true))
-                .unwrap_or(true);
+                .unwrap_or(false);
 
         self.send_notification::<lsp_types::notification::Initialized>(serde_json::from_value(
             json!({}),
@@ -397,6 +393,16 @@ impl LspClient {
     {
         self.ensure_can_send()?;
 
+        let value = self.send_request_value(R::METHOD, params)?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    fn send_request_value<P>(&mut self, method: &'static str, params: P) -> Result<Value, LspError>
+    where
+        P: serde::Serialize,
+    {
+        self.ensure_can_send()?;
+
         let id = RequestId::Int(self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = bounded(1);
         {
@@ -404,7 +410,7 @@ impl LspClient {
             pending.insert(id.clone(), tx);
         }
 
-        let request = Request::new(id.clone(), R::METHOD, Some(serde_json::to_value(params)?));
+        let request = Request::new(id.clone(), method, Some(serde_json::to_value(params)?));
         {
             let mut writer = self
                 .writer
@@ -422,16 +428,14 @@ impl LspClient {
                 self.remove_pending(&id);
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for '{}' response from {:?}",
-                    R::METHOD,
-                    self.kind
+                    method, self.kind
                 )));
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.remove_pending(&id);
                 return Err(LspError::ServerNotReady(format!(
                     "language server {:?} disconnected while waiting for '{}'",
-                    self.kind,
-                    R::METHOD
+                    self.kind, method
                 )));
             }
         };
@@ -443,7 +447,7 @@ impl LspClient {
             });
         }
 
-        serde_json::from_value(response.result.unwrap_or(Value::Null)).map_err(Into::into)
+        Ok(response.result.unwrap_or(Value::Null))
     }
 
     /// Send a notification (fire-and-forget).

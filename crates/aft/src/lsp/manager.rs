@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -15,7 +15,9 @@ use lsp_types::{
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::client::{LspClient, LspEvent, ServerState};
-use crate::lsp::diagnostics::{from_lsp_diagnostics, DiagnosticsStore, StoredDiagnostic};
+use crate::lsp::diagnostics::{
+    from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
+};
 use crate::lsp::document::DocumentStore;
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef, ServerKind};
 use crate::lsp::roots::{find_workspace_root, ServerKey};
@@ -94,6 +96,28 @@ pub struct PostEditWaitOutcome {
     /// Reported separately so the agent knows the gap is unrecoverable
     /// without a server restart, not "wait longer."
     pub exited_servers: Vec<ServerKey>,
+}
+
+/// Pre-edit freshness snapshot for one server/file pair.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreEditSnapshot {
+    pub epoch: u64,
+    pub document_version_at_capture: Option<i32>,
+}
+
+pub fn post_edit_entry_is_fresh(
+    entry: &DiagnosticEntry,
+    target_version: i32,
+    pre: PreEditSnapshot,
+) -> bool {
+    if entry.epoch <= pre.epoch {
+        return false;
+    }
+
+    match entry.version {
+        Some(version) => version >= target_version,
+        None => true,
+    }
 }
 
 impl PostEditWaitOutcome {
@@ -177,6 +201,9 @@ pub struct LspManager {
     /// modes we track here (binary not installed, init handshake failure)
     /// don't fix themselves at runtime.
     failed_spawns: HashMap<ServerKey, ServerAttemptResult>,
+    /// Server/root pairs for which we already logged that watched-file
+    /// notifications are skipped because the capability is absent.
+    watched_file_skip_logged: HashSet<ServerKey>,
     /// Tracks PIDs of spawned LSP child processes so the signal handler can
     /// kill them on SIGTERM/SIGINT before aft exits, preventing orphans.
     /// Defaults to empty; production wires this from `AppContext`.
@@ -195,6 +222,7 @@ impl LspManager {
             binary_overrides: HashMap::new(),
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
+            watched_file_skip_logged: HashSet::new(),
             child_registry: LspChildRegistry::new(),
         }
     }
@@ -571,10 +599,12 @@ impl LspManager {
                 // workspace.didChangeWatchedFiles causes spurious errors on some
                 // servers (e.g. older tsserver builds) and is a spec violation.
                 if !client.supports_watched_files() {
-                    log::debug!(
-                        "skipping didChangeWatchedFiles for {:?} (capability not declared)",
-                        key
-                    );
+                    if self.watched_file_skip_logged.insert(key.clone()) {
+                        log::debug!(
+                            "skipping didChangeWatchedFiles for {:?} (capability not declared)",
+                            key
+                        );
+                    }
                     continue;
                 }
                 client.send_notification::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
@@ -696,6 +726,37 @@ impl LspManager {
             .collect()
     }
 
+    /// Snapshot the current diagnostic epoch and document version for every
+    /// active server relevant to `file_path` before a post-edit notification.
+    pub fn snapshot_pre_edit_state(&self, file_path: &Path) -> HashMap<ServerKey, PreEditSnapshot> {
+        let lookup_path = normalize_lookup_path(file_path);
+        let mut snapshots: HashMap<ServerKey, PreEditSnapshot> = self
+            .diagnostics
+            .entries_for_file(&lookup_path)
+            .into_iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    PreEditSnapshot {
+                        epoch: entry.epoch,
+                        document_version_at_capture: None,
+                    },
+                )
+            })
+            .collect();
+
+        for (key, store) in &self.documents {
+            if let Some(version) = store.version(&lookup_path) {
+                snapshots
+                    .entry(key.clone())
+                    .or_default()
+                    .document_version_at_capture = Some(version);
+            }
+        }
+
+        snapshots
+    }
+
     /// Wait for FRESH per-server diagnostics that match the just-sent
     /// document version. This is the v0.17.3 post-edit path that fixes the
     /// stale-diagnostics bug: instead of returning whatever is in the cache
@@ -726,7 +787,7 @@ impl LspManager {
         // because expected_versions/pre_snapshot fully determine behavior.
         _config: &Config,
         expected_versions: &[(ServerKey, i32)],
-        pre_snapshot: &HashMap<ServerKey, u64>,
+        pre_snapshot: &HashMap<ServerKey, PreEditSnapshot>,
         timeout: std::time::Duration,
     ) -> PostEditWaitOutcome {
         let lookup_path = normalize_lookup_path(file_path);
@@ -745,8 +806,9 @@ impl LspManager {
             // Check freshness for every expected server. A server is fresh
             // if its current entry for this file satisfies either:
             //   1. version-match: entry.version == Some(target_version), OR
-            //   2. epoch-fallback: entry.version is None AND
-            //      entry.epoch > pre_snapshot.get(&key).copied().unwrap_or(0)
+            //   2. push-only freshness: entry.version is None AND entry.epoch
+            //      advanced strictly after the pre-edit snapshot. Versioned
+            //      publishes must be >= the post-edit target version.
             // Servers whose process has exited are reported separately.
             for (key, target_version) in expected_versions {
                 if fresh.contains_key(key) || exited.contains(key) {
@@ -762,13 +824,8 @@ impl LspManager {
                     .into_iter()
                     .find_map(|(k, e)| if k == key { Some(e) } else { None })
                 {
-                    let is_fresh = match entry.version {
-                        Some(v) => v == *target_version,
-                        None => {
-                            let pre = pre_snapshot.get(key).copied().unwrap_or(0);
-                            entry.epoch > pre
-                        }
-                    };
+                    let pre = pre_snapshot.get(key).copied().unwrap_or_default();
+                    let is_fresh = post_edit_entry_is_fresh(entry, *target_version, pre);
                     if is_fresh {
                         fresh.insert(key.clone(), entry.diagnostics.clone());
                     }
@@ -1202,7 +1259,7 @@ impl LspManager {
                 };
                 self.clients.remove(&key);
                 self.documents.remove(&key);
-                self.diagnostics.clear_server(server_kind.clone());
+                self.diagnostics.clear_for_server(&key);
                 None
             }
             _ => None,

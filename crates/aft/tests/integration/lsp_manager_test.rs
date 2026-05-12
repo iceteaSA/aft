@@ -190,7 +190,7 @@ fn test_custom_server_env_and_initialization_options_reach_spawned_server() {
 }
 
 #[test]
-fn watched_file_capability_defaults_permissive_when_initialize_has_no_field() {
+fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
     let (_temp_dir, main_rs, _lib_rs) = rust_fixture_files();
     let config = Config::default();
     let mut manager = LspManager::new();
@@ -201,8 +201,8 @@ fn watched_file_capability_defaults_permissive_when_initialize_has_no_field() {
 
     let client = manager.client_for_file(&main_rs, &config).expect("client");
     assert!(
-        client.supports_watched_files(),
-        "missing explicit didChangeWatchedFiles capability should default to true"
+        !client.supports_watched_files(),
+        "missing explicit didChangeWatchedFiles capability should default to false"
     );
 }
 

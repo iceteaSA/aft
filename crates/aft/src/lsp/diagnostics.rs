@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::lsp::registry::ServerKind;
 use crate::lsp::roots::ServerKey;
@@ -88,6 +89,9 @@ pub struct DiagnosticsStore {
     capacity: usize,
     /// Monotonic epoch counter. Incremented on every publish.
     next_epoch: u64,
+    /// Last time a server published/replaced diagnostics for a specific file.
+    /// Used as a per-file freshness proof for push-only servers.
+    last_publish_at_for_file: HashMap<(ServerKey, PathBuf), Instant>,
 }
 
 impl DiagnosticsStore {
@@ -101,6 +105,7 @@ impl DiagnosticsStore {
             order: Vec::new(),
             capacity,
             next_epoch: 0,
+            last_publish_at_for_file: HashMap::new(),
         }
     }
 
@@ -174,6 +179,9 @@ impl DiagnosticsStore {
             version,
         };
 
+        self.last_publish_at_for_file
+            .insert(key.clone(), Instant::now());
+
         if self.entries.contains_key(&key) {
             self.entries.insert(key.clone(), entry);
             self.touch_existing(&key);
@@ -230,6 +238,20 @@ impl DiagnosticsStore {
         self.entries.keys().any(|(_, f)| f == file)
     }
 
+    /// True if this exact server instance published/replaced diagnostics for
+    /// this exact file after `since`. This is intentionally per `(kind, root,
+    /// file)`; a publish for another file must not prove freshness here.
+    pub fn has_publish_for_file_after(
+        &self,
+        server: &ServerKey,
+        file: &Path,
+        since: Instant,
+    ) -> bool {
+        self.last_publish_at_for_file
+            .get(&(server.clone(), file.to_path_buf()))
+            .is_some_and(|published_at| *published_at >= since)
+    }
+
     /// Get all diagnostics for files under a directory.
     pub fn for_directory(&self, dir: &Path) -> Vec<&StoredDiagnostic> {
         self.entries
@@ -248,17 +270,28 @@ impl DiagnosticsStore {
     }
 
     /// Drop all entries for a server kind (e.g., on server crash/restart).
+    /// Prefer `clear_for_server` for real manager cleanup so peer roots of the
+    /// same kind are not wiped.
     pub fn clear_server(&mut self, server: ServerKind) {
         self.entries
             .retain(|(stored_key, _), _| stored_key.kind != server);
         self.order
             .retain(|(stored_key, _)| stored_key.kind != server);
+        self.last_publish_at_for_file
+            .retain(|(stored_key, _), _| stored_key.kind != server);
     }
 
     /// Drop all entries for a specific server instance.
-    pub fn clear_server_instance(&mut self, key: &ServerKey) {
+    pub fn clear_for_server(&mut self, key: &ServerKey) {
         self.entries.retain(|(k, _), _| k != key);
         self.order.retain(|(k, _)| k != key);
+        self.last_publish_at_for_file.retain(|(k, _), _| k != key);
+    }
+
+    /// Backward-compatible alias for tests/callers that already used the
+    /// instance-scoped name.
+    pub fn clear_server_instance(&mut self, key: &ServerKey) {
+        self.clear_for_server(key);
     }
 
     /// Remove the least-recently-used entry, returning its key for telemetry.
@@ -268,6 +301,7 @@ impl DiagnosticsStore {
         }
         let evicted = self.order.remove(0);
         self.entries.remove(&evicted);
+        self.last_publish_at_for_file.remove(&evicted);
         Some(evicted)
     }
 
