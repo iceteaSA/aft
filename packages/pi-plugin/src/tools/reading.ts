@@ -377,7 +377,13 @@ export function registerReadingTools(
         if (response.success === false) {
           throw new Error((response.message as string) || "zoom failed");
         }
-        return textResult(formatZoomText(targetLabel, response));
+        // The agent gets the formatted plain-text view; the Pi UI renderer
+        // needs the raw response as a structured payload so it can produce
+        // its own pretty box (name + kind + location header + indented body).
+        // Without `details` the renderer would fall back to JSON.parse on the
+        // formatted text (which isn't JSON) and print "No zoom result
+        // available" even though the agent sees the real content.
+        return textResult(formatZoomText(targetLabel, response), response);
       },
       renderCall(args, theme, context) {
         return renderZoomCall(args, theme, context);
