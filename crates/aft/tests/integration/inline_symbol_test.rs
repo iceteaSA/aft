@@ -2,7 +2,7 @@
 //!
 //! Uses temp-dir isolation (copy fixtures, mutate copies, verify results)
 //! to test the full inline pipeline: argument substitution, scope conflict
-//! detection, multiple-return rejection, dry-run mode, and error paths.
+//! detection, multiple-return rejection, and error paths.
 
 use crate::helpers::{fixture_path, AftProcess};
 
@@ -138,36 +138,6 @@ fn inline_symbol_python() {
         "call should be replaced:\n{}",
         content
     );
-
-    aft.shutdown();
-}
-
-/// Dry-run: file unchanged.
-#[test]
-fn inline_symbol_dry_run() {
-    let (_tmp, root) = setup_inline_fixture();
-    let mut aft = AftProcess::spawn();
-    configure(&mut aft, &root);
-
-    let file = format!("{}/sample.ts", root);
-
-    // Snapshot before
-    let before = std::fs::read_to_string(&file).unwrap();
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"add","call_site_line":11,"dry_run":true}}"#,
-        file
-    ));
-
-    assert_eq!(resp["success"], true, "dry_run should succeed: {:?}", resp);
-    assert_eq!(resp["dry_run"], true, "should flag dry_run");
-    assert!(resp["diff"].as_str().is_some(), "should have diff");
-    assert_eq!(resp["call_context"], "assignment");
-    assert!(resp["substitutions"].as_u64().unwrap() > 0);
-
-    // Verify file NOT modified
-    let after = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(before, after, "file should be unchanged after dry_run");
 
     aft.shutdown();
 }

@@ -1209,41 +1209,6 @@ fn edit_match_glob_replaces_across_files() {
 }
 
 #[test]
-fn edit_match_glob_dry_run() {
-    let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
-    let dir_path = dir.path();
-
-    fs::write(dir_path.join("x.ts"), "const a = \"foo\";\n").unwrap();
-    fs::write(
-        dir_path.join("y.ts"),
-        "const b = \"foo\";\nconst c = \"foo\";\n",
-    )
-    .unwrap();
-
-    let req = serde_json::json!({
-        "id": "glob-dry-1",
-        "command": "edit_match",
-        "file": format!("{}/*.ts", dir_path.display()),
-        "match": "foo",
-        "replacement": "bar",
-        "dry_run": true
-    });
-    let resp = aft.send(&serde_json::to_string(&req).unwrap());
-
-    assert_eq!(resp["success"], true);
-    assert_eq!(resp["dry_run"], true);
-    assert_eq!(resp["total_files"], 2);
-    assert_eq!(resp["total_replacements"], 3);
-
-    let x_content = fs::read_to_string(dir_path.join("x.ts")).unwrap();
-    assert!(x_content.contains("foo"), "dry_run should not modify files");
-
-    let status = aft.shutdown();
-    assert!(status.success());
-}
-
-#[test]
 fn edit_match_glob_no_matches_in_files() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();

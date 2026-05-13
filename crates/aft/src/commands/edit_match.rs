@@ -18,7 +18,6 @@ use crate::protocol::{RawRequest, Response};
 ///   - `replacement` (string, required) — replacement content
 ///   - `occurrence` (integer, optional, 0-indexed) — select a specific occurrence (single-file only)
 ///   - `replace_all` (bool, optional) — replace all occurrences (default: false)
-///   - `dry_run` (bool, optional) — preview changes without writing
 ///   - `op` (string, optional) — when `append`, appends `append_content`/`appendContent`
 ///
 /// When `file` is a glob pattern:
@@ -293,8 +292,6 @@ fn handle_glob_edit_match(
     match_str: &str,
     replacement: &str,
 ) -> Response {
-    let dry_run = edit::is_dry_run(&req.params);
-
     // Resolve glob relative to project root (or cwd)
     let config = ctx.config();
     let root = config
@@ -335,7 +332,6 @@ fn handle_glob_edit_match(
     let mut file_results: Vec<serde_json::Value> = Vec::new();
     let mut total_replacements: usize = 0;
     let mut total_files: usize = 0;
-    let mut diffs: Vec<serde_json::Value> = Vec::new();
 
     // --- Phase 1: Bulk edit — backup + write all files (fast) ---
     struct PendingEdit {
@@ -365,19 +361,6 @@ fn handle_glob_edit_match(
         let new_source = source.replace(match_str, replacement);
         let file_str = path.display().to_string();
 
-        if dry_run {
-            let dr = edit::dry_run_diff(&source, &new_source, &path);
-            diffs.push(serde_json::json!({
-                "file": file_str,
-                "replacements": count,
-                "diff": dr.diff,
-                "syntax_valid": dr.syntax_valid,
-            }));
-            total_replacements += count;
-            total_files += 1;
-            continue;
-        }
-
         // Backup before mutation
         let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
             Ok(validated) => validated,
@@ -394,7 +377,7 @@ fn handle_glob_edit_match(
         total_files += 1;
     }
 
-    if !dry_run && pending.is_empty() {
+    if pending.is_empty() {
         return Response::error(
             &req.id,
             "match_not_found",
@@ -405,9 +388,7 @@ fn handle_glob_edit_match(
         );
     }
 
-    let checkpoint_name = if dry_run {
-        None
-    } else {
+    let checkpoint_name = {
         let name = unique_glob_checkpoint_name(&req.id);
         let files = pending
             .iter()
@@ -425,40 +406,38 @@ fn handle_glob_edit_match(
         Some(name)
     };
 
-    if !dry_run {
-        let mut written_paths: Vec<PathBuf> = Vec::new();
+    let mut written_paths: Vec<PathBuf> = Vec::new();
 
-        for edit in &pending {
-            if let Err(e) = edit::auto_backup(
-                ctx,
-                req.session(),
-                &edit.path,
-                &format!("glob_edit_match: {}", match_str),
-            ) {
-                if let Some(name) = &checkpoint_name {
-                    delete_glob_checkpoint(ctx, req.session(), name);
-                }
-                return Response::error(&req.id, e.code(), e.to_string());
+    for edit in &pending {
+        if let Err(e) = edit::auto_backup(
+            ctx,
+            req.session(),
+            &edit.path,
+            &format!("glob_edit_match: {}", match_str),
+        ) {
+            if let Some(name) = &checkpoint_name {
+                delete_glob_checkpoint(ctx, req.session(), name);
             }
+            return Response::error(&req.id, e.code(), e.to_string());
         }
+    }
 
-        // Write all changed files under a checkpoint-backed transaction. If any
-        // write fails, restore files already written so callers never observe a
-        // partially-applied glob edit.
-        for edit in &pending {
-            if let Err(e) = std::fs::write(&edit.path, &edit.new_source) {
-                if let Some(name) = &checkpoint_name {
-                    let _ = restore_glob_checkpoint(ctx, req.session(), name, &written_paths);
-                    delete_glob_checkpoint(ctx, req.session(), name);
-                }
-                return Response::error(
-                    &req.id,
-                    "write_error",
-                    format!("failed to write {}: {}", edit.file_str, e),
-                );
+    // Write all changed files under a checkpoint-backed transaction. If any
+    // write fails, restore files already written so callers never observe a
+    // partially-applied glob edit.
+    for edit in &pending {
+        if let Err(e) = std::fs::write(&edit.path, &edit.new_source) {
+            if let Some(name) = &checkpoint_name {
+                let _ = restore_glob_checkpoint(ctx, req.session(), name, &written_paths);
+                delete_glob_checkpoint(ctx, req.session(), name);
             }
-            written_paths.push(edit.path.clone());
+            return Response::error(
+                &req.id,
+                "write_error",
+                format!("failed to write {}: {}", edit.file_str, e),
+            );
         }
+        written_paths.push(edit.path.clone());
     }
 
     // --- Phase 2: Format all changed files (after all writes are done) ---
@@ -477,32 +456,24 @@ fn handle_glob_edit_match(
     let mut format_skip_reasons = std::collections::BTreeSet::new();
     for edit in &pending {
         let file_str = edit.path.display().to_string();
-        let (formatted, format_skipped_reason) = if !dry_run {
-            format::auto_format(&edit.path, &config)
-        } else {
-            (false, None)
-        };
+        let (formatted, format_skipped_reason) = format::auto_format(&edit.path, &config);
         if let Some(reason) = &format_skipped_reason {
             format_skipped_count += 1;
             format_skip_reasons.insert(reason.clone());
         }
-        let syntax_valid = if !dry_run {
-            match validate_syntax(&edit.path) {
-                Ok(valid) => valid,
-                Err(e) => {
-                    if let Some(name) = &checkpoint_name {
-                        let paths = pending
-                            .iter()
-                            .map(|edit| edit.path.clone())
-                            .collect::<Vec<_>>();
-                        let _ = restore_glob_checkpoint(ctx, req.session(), name, &paths);
-                        delete_glob_checkpoint(ctx, req.session(), name);
-                    }
-                    return Response::error(&req.id, e.code(), e.to_string());
+        let syntax_valid = match validate_syntax(&edit.path) {
+            Ok(valid) => valid,
+            Err(e) => {
+                if let Some(name) = &checkpoint_name {
+                    let paths = pending
+                        .iter()
+                        .map(|edit| edit.path.clone())
+                        .collect::<Vec<_>>();
+                    let _ = restore_glob_checkpoint(ctx, req.session(), name, &paths);
+                    delete_glob_checkpoint(ctx, req.session(), name);
                 }
+                return Response::error(&req.id, e.code(), e.to_string());
             }
-        } else {
-            None
         };
 
         if syntax_valid == Some(false) {
@@ -528,7 +499,7 @@ fn handle_glob_edit_match(
     // If any file's post-edit content is syntax-invalid, roll the entire
     // batch back to the pre-edit checkpoint. Don't leave the project in a
     // partially-broken state across many files at once.
-    if !dry_run && !syntax_failures.is_empty() {
+    if !syntax_failures.is_empty() {
         let mut rollback: Option<Result<(), String>> = None;
         if let Some(name) = &checkpoint_name {
             let paths = pending
@@ -579,29 +550,6 @@ fn handle_glob_edit_match(
                 serde_json::json!({ "rollback_succeeded": true }),
             ),
         };
-    }
-
-    if dry_run {
-        if diffs.is_empty() {
-            return Response::error(
-                &req.id,
-                "match_not_found",
-                format!(
-                    "edit_match: '{}' not found in any files matching '{}'",
-                    match_str, pattern
-                ),
-            );
-        }
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "dry_run": true,
-                "files": diffs,
-                "total_replacements": total_replacements,
-                "total_files": total_files,
-            }),
-        );
     }
 
     if let Some(name) = &checkpoint_name {
@@ -862,25 +810,21 @@ fn handle_single_file_edit_match(
         );
     }
 
-    // Auto-backup before mutation (skip for dry-run)
-    let backup_id = if !edit::is_dry_run(&req.params) {
-        let label = if replace_all {
-            format!(
-                "edit_match: {} (replace_all x{})",
-                match_str,
-                positions.len()
-            )
-        } else {
-            format!("edit_match: {}", match_str)
-        };
-        match edit::auto_backup(ctx, req.session(), path.as_path(), &label) {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        }
+    // Auto-backup before mutation
+    let label = if replace_all {
+        format!(
+            "edit_match: {} (replace_all x{})",
+            match_str,
+            positions.len()
+        )
     } else {
-        None
+        format!("edit_match: {}", match_str)
+    };
+    let backup_id = match edit::auto_backup(ctx, req.session(), path.as_path(), &label) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
     };
 
     // Apply edit(s) — use fuzzy match byte lengths (may differ from match_str.len())
@@ -920,17 +864,6 @@ fn handle_single_file_edit_match(
             1,
         )
     };
-
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, path.as_path());
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
 
     // Write, format, and validate via shared pipeline
     let mut write_result = match edit::write_format_validate(

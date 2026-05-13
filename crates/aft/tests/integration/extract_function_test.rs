@@ -2,7 +2,7 @@
 //!
 //! Uses temp-dir isolation (copy fixtures, mutate copies, verify results)
 //! to test the full extract pipeline: free variable detection, return value
-//! inference, function generation, dry-run mode, and error paths.
+//! inference, function generation, and error paths.
 
 use crate::helpers::{fixture_path, AftProcess};
 
@@ -167,39 +167,6 @@ fn extract_function_python() {
         "should use Python def syntax:\n{}",
         content
     );
-
-    aft.shutdown();
-}
-
-/// Dry-run: file unchanged, diff returned.
-#[test]
-fn extract_function_dry_run() {
-    let (_tmp, root) = setup_extract_fixture();
-    let mut aft = AftProcess::spawn();
-    configure(&mut aft, &root);
-
-    let file = format!("{}/sample.ts", root);
-
-    // Snapshot before
-    let before = std::fs::read_to_string(&file).unwrap();
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"preview","start_line":6,"end_line":10,"dry_run":true}}"#,
-        file
-    ));
-
-    assert_eq!(resp["success"], true, "dry_run should succeed: {:?}", resp);
-    assert_eq!(resp["dry_run"], true, "should flag dry_run");
-    assert!(resp["diff"].as_str().is_some(), "should have diff");
-    assert!(resp["parameters"].is_array(), "should have parameters");
-    assert!(
-        resp["return_type"].as_str().is_some(),
-        "should have return_type"
-    );
-
-    // Verify file NOT modified
-    let after = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(before, after, "file should be unchanged after dry_run");
 
     aft.shutdown();
 }

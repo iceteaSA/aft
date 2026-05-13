@@ -159,17 +159,14 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         insert_text.push('\n');
     }
 
-    // --- Auto-backup (skip for dry-run) ---
-    let backup_id = if !edit::is_dry_run(&req.params) {
+    // --- Auto-backup ---
+    let backup_id =
         match edit::auto_backup(ctx, req.session(), &path, "add_import: pre-edit backup") {
             Ok(id) => id,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
             }
-        }
-    } else {
-        None
-    };
+        };
 
     // --- Insert ---
     let new_source =
@@ -177,17 +174,6 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             Ok(s) => s,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
-
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
 
     // --- Write, format, and validate ---
     let mut write_result =

@@ -23,11 +23,9 @@ use crate::symbols::SymbolKind;
 ///   - `symbol` (string, required) — name of the symbol to move
 ///   - `destination` (string, required) — target file path
 ///   - `scope` (string, optional) — scope qualifier for disambiguation
-///   - `dry_run` (bool, optional) — preview diffs without modifying disk
 ///
 /// On success: `{ ok, files_modified, consumers_updated, checkpoint_name,
 ///   results: [{ file, syntax_valid, formatted }] }`
-/// On dry-run: `{ ok, dry_run, diffs: [{ file, diff, syntax_valid }] }`
 /// On failure after partial write: `{ error with failed_file, rolled_back }`
 pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // --- Extract and validate params ---
@@ -65,7 +63,6 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let scope = req.params.get("scope").and_then(|v| v.as_str());
-    let dry_run = edit::is_dry_run(&req.params);
 
     let source_path_raw = match ctx.validate_path(&req.id, Path::new(file)) {
         Ok(path) => path,
@@ -397,46 +394,6 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         if let Some(rewritten) = new_consumer {
             consumer_rewrites.push((consumer_file.clone(), consumer_content, rewritten));
         }
-    }
-
-    // --- Dry-run mode (D071) ---
-    if dry_run {
-        let mut diffs: Vec<serde_json::Value> = Vec::new();
-
-        // Source file diff
-        let source_dr = edit::dry_run_diff(&source_content, &new_source, source_path);
-        diffs.push(serde_json::json!({
-            "file": file,
-            "diff": source_dr.diff,
-            "syntax_valid": source_dr.syntax_valid,
-        }));
-
-        // Destination file diff
-        let dest_dr = edit::dry_run_diff(&dest_content, &new_dest, dest_path);
-        diffs.push(serde_json::json!({
-            "file": destination,
-            "diff": dest_dr.diff,
-            "syntax_valid": dest_dr.syntax_valid,
-        }));
-
-        // Consumer file diffs
-        for (path, original, new_content) in &consumer_rewrites {
-            let dr = edit::dry_run_diff(original, new_content, &path);
-            diffs.push(serde_json::json!({
-                "file": path.display().to_string(),
-                "diff": dr.diff,
-                "syntax_valid": dr.syntax_valid,
-            }));
-        }
-
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "dry_run": true,
-                "diffs": diffs,
-            }),
-        );
     }
 
     // --- Create checkpoint (D105) ---

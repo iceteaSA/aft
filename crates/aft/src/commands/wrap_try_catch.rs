@@ -182,34 +182,20 @@ pub fn handle_wrap_try_catch(req: &RawRequest, ctx: &AppContext) -> Response {
         fn_indent = fn_indent,
     );
 
-    // --- Auto-backup (skip for dry-run) ---
-    let backup_id = if !edit::is_dry_run(&req.params) {
+    // --- Auto-backup ---
+    let backup_id =
         match edit::auto_backup(ctx, req.session(), &path, "wrap_try_catch: pre-edit backup") {
             Ok(id) => id,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
             }
-        }
-    } else {
-        None
-    };
+        };
 
     // --- Replace ---
     let new_source = match edit::replace_byte_range(&source, body_node.0, body_node.1, &wrapped) {
         Ok(s) => s,
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
-
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
 
     // --- Write, format, and validate ---
     let mut write_result =

@@ -13,7 +13,6 @@ use crate::ast_grep_hints::detect_pattern_hint;
 use crate::ast_grep_lang::AstGrepLang;
 use crate::commands::ast_scope::collect_ast_files;
 use crate::context::AppContext;
-use crate::edit::dry_run_diff;
 use crate::protocol::{RawRequest, Response};
 
 /// Per-file compute result from the parallel phase. Holds everything needed
@@ -23,6 +22,33 @@ struct FileChange {
     original: String,
     new_content: String,
     replacement_count: usize,
+}
+
+/// Result of an ast_replace dry-run diff computation.
+struct DryRunResult {
+    /// Unified diff between original and proposed content.
+    diff: String,
+    /// Whether the proposed content has valid syntax. `None` for unsupported languages.
+    syntax_valid: Option<bool>,
+}
+
+/// Compute a unified diff between original and proposed content, plus syntax validation.
+///
+/// This stays private to ast_replace because it is now the only command whose
+/// plugin API exposes dry-run mutation previews.
+fn dry_run_diff(original: &str, proposed: &str, path: &Path) -> DryRunResult {
+    let display_path = path.display().to_string();
+    let text_diff = similar::TextDiff::from_lines(original, proposed);
+    let diff = text_diff
+        .unified_diff()
+        .context_radius(3)
+        .header(
+            &format!("a/{}", display_path),
+            &format!("b/{}", display_path),
+        )
+        .to_string();
+    let syntax_valid = crate::edit::validate_syntax_str(proposed, path);
+    DryRunResult { diff, syntax_valid }
 }
 
 /// Handle an `ast_replace` request.
@@ -227,6 +253,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
             file_results.push(serde_json::json!({
                 "file": change.file_path.display().to_string(),
                 "diff": diff_result.diff,
+                "syntax_valid": diff_result.syntax_valid,
                 "replacements": change.replacement_count,
             }));
         } else {

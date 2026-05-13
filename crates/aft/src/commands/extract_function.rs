@@ -1,8 +1,8 @@
 //! Handler for the `extract_function` command: extract a range of code into
 //! a new function with auto-detected parameters and return value.
 //!
-//! Follows the edit_symbol.rs pattern: validate → parse → compute → dry_run
-//! check → auto_backup → write_format_validate → respond.
+//! Follows the edit_symbol.rs pattern: validate → parse → compute →
+//! auto_backup → write_format_validate → respond.
 
 use std::path::Path;
 
@@ -25,7 +25,6 @@ use crate::protocol::{RawRequest, Response};
 ///   - `name` (string, required) — name for the new function
 ///   - `start_line` (u32, required) — first line of the range to extract (1-based)
 ///   - `end_line` (u32, required) — last line (exclusive, 1-based) of the range to extract
-///   - `dry_run` (bool, optional) — if true, return diff without writing
 ///
 /// Returns on success:
 ///   `{ file, name, parameters, return_type, extracted_range, call_site_range, syntax_valid, backup_id }`
@@ -307,22 +306,6 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
         ReturnKind::Variable(_) => "variable",
         ReturnKind::Void => "void",
     };
-
-    // --- Dry-run check ---
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "dry_run": true,
-                "diff": dr.diff,
-                "syntax_valid": dr.syntax_valid,
-                "parameters": free_vars.parameters,
-                "return_type": return_type,
-            }),
-        );
-    }
 
     // --- Auto-backup before mutation ---
     let backup_id = match edit::auto_backup(
@@ -642,33 +625,5 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], false);
         assert_eq!(json["code"], "this_reference_in_range");
-    }
-
-    #[test]
-    fn extract_function_dry_run_returns_diff() {
-        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/extract_function/sample.ts");
-
-        let req = make_request(
-            "7",
-            "extract_function",
-            serde_json::json!({
-                "file": fixture.display().to_string(),
-                "name": "computeResult",
-                "start_line": 15,
-                "end_line": 17,
-                "dry_run": true,
-            }),
-        );
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config::default(),
-        );
-        let resp = handle_extract_function(&req, &ctx);
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["success"], true);
-        assert_eq!(json["dry_run"], true);
-        assert!(json["diff"].as_str().is_some(), "should have diff");
-        assert!(json["parameters"].is_array(), "should have parameters");
     }
 }

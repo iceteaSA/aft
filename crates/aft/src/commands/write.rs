@@ -51,37 +51,21 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let existed = path.exists();
 
-    // Read original content for potential dry-run diff
-    let (original, read_warning) = if existed {
+    let original = if edit::wants_diff(&req.params) && existed {
         match std::fs::read_to_string(path.as_path()) {
-            Ok(content) => (content, None),
+            Ok(content) => content,
             Err(error) => {
-                let warning = format!(
+                log::warn!(
                     "write: failed to read existing file before diff for {}: {}",
-                    file, error
+                    file,
+                    error
                 );
-                log::warn!("{}", warning);
-                (String::new(), Some(warning))
+                String::new()
             }
         }
     } else {
-        (String::new(), None)
+        String::new()
     };
-
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&original, content, path.as_path());
-        let mut result = serde_json::json!({
-            "ok": true,
-            "dry_run": true,
-            "diff": dr.diff,
-            "syntax_valid": dr.syntax_valid,
-        });
-        if let Some(ref warning) = read_warning {
-            result["read_warning"] = serde_json::json!(warning);
-        }
-        return Response::success(&req.id, result);
-    }
 
     // Auto-backup existing file before overwriting
     let backup_id = match edit::auto_backup(
@@ -155,10 +139,6 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if let Some(ref id) = backup_id {
         result["backup_id"] = serde_json::json!(id);
-    }
-
-    if let Some(ref warning) = read_warning {
-        result["read_warning"] = serde_json::json!(warning);
     }
 
     write_result.append_lsp_diagnostics_to(&mut result);

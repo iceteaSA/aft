@@ -2,8 +2,7 @@
 //!
 //! Uses temp-dir isolation (copy fixtures, mutate copies, verify results)
 //! to test the full move pipeline: symbol extraction, destination insertion,
-//! consumer import rewiring, dry-run mode, checkpoint creation/restore, and
-//! error paths.
+//! consumer import rewiring, checkpoint creation/restore, and error paths.
 
 use crate::helpers::{fixture_path, AftProcess};
 
@@ -337,74 +336,8 @@ fn move_symbol_aliased_import() {
 }
 
 // ---------------------------------------------------------------------------
-// Dry-run and checkpoint tests
+// Checkpoint tests
 // ---------------------------------------------------------------------------
-
-/// Dry-run mode: returns diffs for all affected files but modifies nothing on disk.
-#[test]
-fn move_symbol_dry_run() {
-    let (_tmp, root) = setup_move_fixture();
-    let mut aft = AftProcess::spawn();
-    configure(&mut aft, &root);
-
-    let source = format!("{}/service.ts", root);
-    let dest = format!("{}/utils.ts", root);
-
-    // Snapshot original file contents
-    let source_before = std::fs::read_to_string(&source).unwrap();
-    let dest_before = std::fs::read_to_string(&dest).unwrap();
-    let ca_before = std::fs::read_to_string(format!("{}/consumer_a.ts", root)).unwrap();
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}","dry_run":true}}"#,
-        source, dest
-    ));
-
-    assert_eq!(resp["success"], true, "dry_run should succeed: {:?}", resp);
-    assert_eq!(resp["dry_run"], true, "response should flag dry_run");
-
-    // Should have diffs for source, dest, and at least one consumer
-    let diffs = resp["diffs"].as_array().expect("diffs should be array");
-    assert!(
-        diffs.len() >= 3,
-        "should have diffs for source + dest + consumers, got {}",
-        diffs.len()
-    );
-
-    // Each diff should have file and diff fields
-    for diff in diffs {
-        assert!(
-            diff.get("file").is_some(),
-            "diff should have 'file': {:?}",
-            diff
-        );
-        assert!(
-            diff.get("diff").is_some(),
-            "diff should have 'diff': {:?}",
-            diff
-        );
-    }
-
-    // Verify NO files were modified on disk
-    let source_after = std::fs::read_to_string(&source).unwrap();
-    let dest_after = std::fs::read_to_string(&dest).unwrap();
-    let ca_after = std::fs::read_to_string(format!("{}/consumer_a.ts", root)).unwrap();
-
-    assert_eq!(
-        source_before, source_after,
-        "source should be unchanged after dry_run"
-    );
-    assert_eq!(
-        dest_before, dest_after,
-        "dest should be unchanged after dry_run"
-    );
-    assert_eq!(
-        ca_before, ca_after,
-        "consumer_a should be unchanged after dry_run"
-    );
-
-    aft.shutdown();
-}
 
 /// Checkpoint: move creates a checkpoint that can be listed and restored.
 #[test]

@@ -3,7 +3,7 @@
 //! scope conflict detection.
 //!
 //! Follows the extract_function.rs pattern: validate → parse → compute →
-//! dry_run check → auto_backup → write_format_validate → respond.
+//! auto_backup → write_format_validate → respond.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,7 +23,6 @@ use crate::protocol::{RawRequest, Response};
 ///   - `file` (string, required) — target file path
 ///   - `symbol` (string, required) — name of the function to inline
 ///   - `call_site_line` (u32, required) — line where the call expression is (1-based)
-///   - `dry_run` (bool, optional) — if true, return diff without writing
 ///
 /// Returns on success:
 ///   `{ file, symbol, call_context, substitutions, conflicts, syntax_valid, backup_id }`
@@ -339,24 +338,6 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(s) => s,
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
-
-    // --- Dry-run check ---
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "dry_run": true,
-                "diff": dr.diff,
-                "syntax_valid": dr.syntax_valid,
-                "symbol": symbol,
-                "call_context": call_context,
-                "substitutions": substitution_count,
-                "conflicts": [],
-            }),
-        );
-    }
 
     // --- Auto-backup before mutation ---
     let backup_id = match edit::auto_backup(
@@ -1033,7 +1014,6 @@ mod tests {
                 "file": fixture.display().to_string(),
                 "symbol": "compute",
                 "call_site_line": 9,
-                "dry_run": true,
             }),
         );
         let ctx = crate::context::AppContext::new(
@@ -1056,34 +1036,5 @@ mod tests {
             "should report at least one conflict: {:?}",
             conflicting
         );
-    }
-
-    // --- Dry-run inlining ---
-
-    #[test]
-    fn inline_symbol_dry_run_returns_diff() {
-        let fixture = fixture_path("sample.ts");
-
-        let req = make_request(
-            "7",
-            "inline_symbol",
-            serde_json::json!({
-                "file": fixture.display().to_string(),
-                "symbol": "add",
-                "call_site_line": 11,
-                "dry_run": true,
-            }),
-        );
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config::default(),
-        );
-        let resp = handle_inline_symbol(&req, &ctx);
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["success"], true, "should succeed: {:?}", json);
-        assert_eq!(json["dry_run"], true);
-        assert!(json["diff"].as_str().is_some(), "should have diff");
-        assert_eq!(json["call_context"], "assignment");
-        assert!(json["substitutions"].as_u64().unwrap() > 0);
     }
 }

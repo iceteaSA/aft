@@ -87,17 +87,12 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    // Phase 2: Auto-backup once before applying (skip for dry-run)
-    let dry_run = edit::is_dry_run(&req.params);
-    let backup_id = if !dry_run {
-        match edit::auto_backup(ctx, req.session(), &path, "batch: pre-batch backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
+    // Phase 2: Auto-backup once before applying
+    let backup_id = match edit::auto_backup(ctx, req.session(), &path, "batch: pre-batch backup") {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
         }
-    } else {
-        None
     };
 
     // Phase 3: Sort edits by byte_start descending (bottom-to-top) to prevent drift
@@ -131,17 +126,6 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
                 return Response::error(&req.id, e.code(), e.to_string());
             }
         };
-    }
-
-    // Dry-run: return combined diff without modifying disk
-    if dry_run {
-        let dr = edit::dry_run_diff(&source, &content, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid, "edits_applied": resolved.len(),
-            }),
-        );
     }
 
     // Phase 5: Write, format, and validate via shared pipeline
