@@ -1,16 +1,37 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::protocol::{RawRequest, Response};
-use crate::semantic_index::{is_onnx_runtime_unavailable, EmbeddingModel, SemanticResult};
+use crate::query_shape::{self, QueryKind, QueryShape};
+use crate::search_index::SearchIndex;
+use crate::semantic_index::{
+    is_onnx_runtime_unavailable, is_semantic_indexed_extension, EmbeddingModel, SemanticResult,
+};
 use crate::symbols::SymbolKind;
 
 const DEFAULT_TOP_K: usize = 10;
 const MAX_TOP_K: usize = 100;
+const HYBRID_LEXICAL_BOOST: f32 = 1.1;
+const LEXICAL_ONLY_SCORE_CEILING: f32 = 0.25;
+
+#[derive(Debug, Clone)]
+pub struct HybridResult {
+    pub file: PathBuf,
+    pub name: String,
+    pub kind: SymbolKind,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub exported: bool,
+    pub score: f32,
+    pub source: &'static str,
+    pub semantic_score: Option<f32>,
+    pub lexical_score: Option<f32>,
+    pub snippet: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct SemanticSearchParams {
@@ -87,7 +108,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
 
-    let results = {
+    let semantic_results = {
         let semantic_index = ctx.semantic_index().borrow();
         let Some(index) = semantic_index.as_ref() else {
             return Response::success(
@@ -98,8 +119,31 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 }),
             );
         };
-        index.search(&query_vector, params.top_k.min(MAX_TOP_K))
+        index.search(&query_vector, params.top_k.clamp(50, MAX_TOP_K))
     };
+
+    let shape = query_shape::classify(&params.query);
+    let lexical_files = if shape.weights.should_use_lexical {
+        let tokens = query_shape::extract_tokens(&params.query, &shape);
+        let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+        let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
+        ctx.search_index()
+            .borrow()
+            .as_ref()
+            .map(|index| {
+                index.lexical_rank(&query_trigrams, Some(&is_semantic_indexed_extension), 50)
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let results = fuse_hybrid_results(
+        semantic_results,
+        lexical_files,
+        &shape,
+        params.top_k.min(MAX_TOP_K),
+    );
 
     // No score threshold: silent filtering produced "0 results" even when the
     // model had reasonable matches the agent could have judged. Surface every
@@ -132,14 +176,9 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     let model = model_ref
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
-    let embeddings = model
-        .embed(vec![query.to_string()])
+    let query_vector = model
+        .embed_query_cached(query)
         .map_err(|error| format!("failed to embed query: {error}"))?;
-
-    let query_vector = embeddings
-        .first()
-        .cloned()
-        .ok_or_else(|| "embedding model returned no query vector".to_string())?;
 
     if let Some(index) = ctx.semantic_index().borrow().as_ref() {
         if index.dimension() != query_vector.len() {
@@ -152,6 +191,139 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     }
 
     Ok(query_vector)
+}
+
+pub fn fuse_hybrid_results(
+    semantic: Vec<SemanticResult>,
+    lexical_files: Vec<(PathBuf, f32)>,
+    shape: &QueryShape,
+    top_k: usize,
+) -> Vec<HybridResult> {
+    if top_k == 0 {
+        return Vec::new();
+    }
+
+    if lexical_files.is_empty() {
+        return semantic
+            .into_iter()
+            .map(|result| hybrid_from_semantic(result, "semantic", None))
+            .take(top_k)
+            .collect();
+    }
+
+    if semantic.is_empty() {
+        return lexical_files
+            .into_iter()
+            .take(top_k)
+            .map(|(file, score)| lexical_only_result(file, score, shape))
+            .collect();
+    }
+
+    let lexical_top_files: HashMap<PathBuf, f32> = lexical_files.iter().take(20).cloned().collect();
+    let mut results: Vec<HybridResult> = semantic
+        .into_iter()
+        .map(|result| {
+            if let Some(&lexical_score) = lexical_top_files.get(&result.file) {
+                hybrid_from_semantic(result, "hybrid", Some(lexical_score))
+            } else {
+                hybrid_from_semantic(result, "semantic", None)
+            }
+        })
+        .collect();
+
+    let semantic_files: HashSet<PathBuf> =
+        results.iter().map(|result| result.file.clone()).collect();
+    for (file, score) in lexical_files.iter().take(20) {
+        if !semantic_files.contains(file) {
+            results.push(lexical_only_result(file.clone(), *score, shape));
+        }
+    }
+
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut results = cap_per_file(results, 2);
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    results.truncate(top_k);
+    results
+}
+
+fn hybrid_from_semantic(
+    result: SemanticResult,
+    source: &'static str,
+    lexical_score: Option<f32>,
+) -> HybridResult {
+    let semantic_score = result.score;
+    let score = if source == "hybrid" {
+        semantic_score * HYBRID_LEXICAL_BOOST
+    } else {
+        semantic_score
+    };
+
+    HybridResult {
+        file: result.file,
+        name: result.name,
+        kind: result.kind,
+        start_line: result.start_line,
+        end_line: result.end_line,
+        exported: result.exported,
+        snippet: result.snippet,
+        score,
+        source,
+        semantic_score: Some(semantic_score),
+        lexical_score,
+    }
+}
+
+fn lexical_only_result(file: PathBuf, lexical_score: f32, shape: &QueryShape) -> HybridResult {
+    HybridResult {
+        file,
+        name: String::new(),
+        kind: SymbolKind::FileSummary,
+        start_line: 0,
+        end_line: 0,
+        exported: false,
+        // Lexical scores are not cosine-normalized and can exceed the semantic
+        // lane's score scale. Keep lexical-only files visible without letting
+        // broad trigram overlaps evict strong semantic matches.
+        score: (lexical_score * shape_dependent_lexical_only_weight(shape))
+            .min(LEXICAL_ONLY_SCORE_CEILING),
+        source: "lexical",
+        semantic_score: None,
+        lexical_score: Some(lexical_score),
+        snippet: "[lexical match — use aft_zoom or read for context]".to_string(),
+    }
+}
+
+fn shape_dependent_lexical_only_weight(shape: &QueryShape) -> f32 {
+    match shape.kind {
+        QueryKind::Identifier => 0.8,
+        QueryKind::Path | QueryKind::ErrorCode | QueryKind::Mixed => 0.5,
+        QueryKind::NaturalLanguage => 0.0,
+    }
+}
+
+fn cap_per_file(results: Vec<HybridResult>, cap: usize) -> Vec<HybridResult> {
+    let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+    let mut capped = Vec::new();
+    for result in results {
+        let count = counts.entry(result.file.clone()).or_insert(0);
+        if *count < cap {
+            *count += 1;
+            capped.push(result);
+        }
+    }
+    capped
 }
 
 fn semantic_error_response(request_id: &str, error: &str) -> Response {
@@ -170,12 +342,12 @@ fn semantic_error_response(request_id: &str, error: &str) -> Response {
     )
 }
 
-fn format_semantic_text(results: &[SemanticResult], project_root: &Path) -> String {
+fn format_semantic_text(results: &[HybridResult], project_root: &Path) -> String {
     if results.is_empty() {
         return "Found 0 semantic result(s). [index: ready]".to_string();
     }
 
-    let mut groups: BTreeMap<String, Vec<&SemanticResult>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Vec<&HybridResult>> = BTreeMap::new();
 
     for result in results {
         let display_path = result
@@ -193,7 +365,9 @@ fn format_semantic_text(results: &[SemanticResult], project_root: &Path) -> Stri
             let mut section = file;
 
             for result in file_results {
-                if matches!(result.kind, SymbolKind::FileSummary) {
+                if result.source == "lexical" {
+                    section.push_str(&format!(" [lexical match — score: {:.3}]", result.score));
+                } else if matches!(result.kind, SymbolKind::FileSummary) {
                     section.push_str(&format!(
                         "\n{} [{}] [file summary] score {:.3} source {}",
                         result.name,
@@ -232,8 +406,9 @@ fn format_semantic_text(results: &[SemanticResult], project_root: &Path) -> Stri
     )
 }
 
-fn result_to_json(result: &SemanticResult) -> serde_json::Value {
-    let (start_line, end_line) = if matches!(result.kind, SymbolKind::FileSummary) {
+fn result_to_json(result: &HybridResult) -> serde_json::Value {
+    let is_file_level = matches!(result.kind, SymbolKind::FileSummary);
+    let (start_line, end_line) = if is_file_level {
         (serde_json::Value::Null, serde_json::Value::Null)
     } else {
         (
@@ -248,9 +423,11 @@ fn result_to_json(result: &SemanticResult) -> serde_json::Value {
         "kind": result.kind,
         "start_line": start_line,
         "end_line": end_line,
-        "location": if matches!(result.kind, SymbolKind::FileSummary) { "[file summary]" } else { "line range" },
+        "location": if result.source == "lexical" { "[lexical match]" } else if is_file_level { "[file summary]" } else { "line range" },
         "score": result.score,
         "source": result.source,
+        "semantic_score": result.semantic_score,
+        "lexical_score": result.lexical_score,
         "snippet": result.snippet,
     })
 }
@@ -282,7 +459,7 @@ mod tests {
     #[test]
     fn file_summary_text_uses_summary_location_instead_of_line_range() {
         let project_root = Path::new("/project");
-        let results = vec![SemanticResult {
+        let results = vec![HybridResult {
             file: PathBuf::from("/project/src/index.ts"),
             name: "index".to_string(),
             kind: SymbolKind::FileSummary,
@@ -292,6 +469,8 @@ mod tests {
             snippet: String::new(),
             score: 0.75,
             source: "semantic",
+            semantic_score: Some(0.75),
+            lexical_score: None,
         }];
 
         let text = format_semantic_text(&results, project_root);
@@ -302,7 +481,7 @@ mod tests {
 
     #[test]
     fn file_summary_json_uses_summary_location_instead_of_line_numbers() {
-        let result = SemanticResult {
+        let result = HybridResult {
             file: PathBuf::from("/project/src/index.ts"),
             name: "index".to_string(),
             kind: SymbolKind::FileSummary,
@@ -312,6 +491,8 @@ mod tests {
             snippet: String::new(),
             score: 0.75,
             source: "semantic",
+            semantic_score: Some(0.75),
+            lexical_score: None,
         };
 
         let json = result_to_json(&result);
@@ -320,5 +501,8 @@ mod tests {
         assert_eq!(json["location"], "[file summary]");
         assert!(json["start_line"].is_null());
         assert!(json["end_line"].is_null());
+        assert_eq!(json["source"], "semantic");
+        assert_eq!(json["semantic_score"], 0.75);
+        assert!(json["lexical_score"].is_null());
     }
 }

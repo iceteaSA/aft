@@ -7,7 +7,7 @@ use fastembed::{EmbeddingModel as FastembedEmbeddingModel, InitOptions, TextEmbe
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt::Display;
 use std::fs;
@@ -44,6 +44,7 @@ const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 // Must stay below the bridge timeout (30s) to avoid bridge kills on slow backends.
 const DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS: u64 = 25_000;
 const DEFAULT_MAX_BATCH_SIZE: usize = 64;
+const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
 const FALLBACK_BACKEND: &str = "none";
 const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
@@ -114,6 +115,10 @@ pub struct SemanticEmbeddingModel {
     max_batch_size: usize,
     dimension: Option<usize>,
     engine: SemanticEmbeddingEngine,
+    query_embedding_cache: HashMap<String, Vec<f32>>,
+    query_embedding_cache_order: VecDeque<String>,
+    query_embedding_cache_hits: u64,
+    query_embedding_cache_misses: u64,
 }
 
 pub type EmbeddingModel = SemanticEmbeddingModel;
@@ -427,6 +432,10 @@ impl SemanticEmbeddingModel {
             max_batch_size,
             dimension: None,
             engine,
+            query_embedding_cache: HashMap::new(),
+            query_embedding_cache_order: VecDeque::new(),
+            query_embedding_cache_hits: 0,
+            query_embedding_cache_misses: 0,
         })
     }
 
@@ -497,6 +506,40 @@ impl SemanticEmbeddingModel {
 
     pub fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         self.embed_texts(texts)
+    }
+
+    pub fn embed_query_cached(&mut self, query: &str) -> Result<Vec<f32>, String> {
+        if let Some(vector) = self.query_embedding_cache.get(query) {
+            self.query_embedding_cache_hits += 1;
+            return Ok(vector.clone());
+        }
+
+        self.query_embedding_cache_misses += 1;
+        let embeddings = self.embed_texts(vec![query.to_string()])?;
+        let vector = embeddings
+            .first()
+            .cloned()
+            .ok_or_else(|| "embedding model returned no query vector".to_string())?;
+
+        if self.query_embedding_cache.len() >= QUERY_EMBEDDING_CACHE_CAP {
+            if let Some(oldest) = self.query_embedding_cache_order.pop_front() {
+                self.query_embedding_cache.remove(&oldest);
+            }
+        }
+        self.query_embedding_cache
+            .insert(query.to_string(), vector.clone());
+        self.query_embedding_cache_order
+            .push_back(query.to_string());
+
+        Ok(vector)
+    }
+
+    pub fn query_embedding_cache_stats(&self) -> (u64, u64, usize) {
+        (
+            self.query_embedding_cache_hits,
+            self.query_embedding_cache_misses,
+            self.query_embedding_cache.len(),
+        )
     }
 
     fn embed_texts(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
@@ -910,7 +953,7 @@ impl RefreshSummary {
 }
 
 /// Search result from a semantic query
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SemanticResult {
     pub file: PathBuf,
     pub name: String,
@@ -2010,6 +2053,34 @@ fn parser_for(
     }
 }
 
+pub fn is_semantic_indexed_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some(
+            "ts" | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "rs"
+                | "go"
+                | "c"
+                | "h"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "hpp"
+                | "hh"
+                | "zig"
+                | "cs"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "sol"
+                | "vue"
+        )
+    )
+}
+
 fn collect_file_metadata(file: &Path) -> Result<IndexedFileMetadata, String> {
     let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
     let mtime = metadata.modified().map_err(|error| error.to_string())?;
@@ -2024,6 +2095,9 @@ fn collect_file_chunks(
     file: &Path,
     parsers: &mut HashMap<crate::parser::LangId, Parser>,
 ) -> Result<Vec<SemanticChunk>, String> {
+    if !is_semantic_indexed_extension(file) {
+        return Err("unsupported file extension".to_string());
+    }
     let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
     let source = std::fs::read_to_string(file).map_err(|error| error.to_string())?;
     let tree = parser_for(parsers, lang)?

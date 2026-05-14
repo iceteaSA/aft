@@ -62,6 +62,17 @@ export function buildSemanticSections(
     const lines = [theme.fg("accent", shortenPath(file))];
     fileResults.forEach((result) => {
       const score = asNumber(result.score);
+      const source = asString(result.source);
+      if (source === "lexical") {
+        lines.push(
+          `  ↳ ${theme.fg("muted", `[lexical match${score !== undefined ? ` — score ${score.toFixed(3)}` : ""}]`)}`,
+        );
+        const snippet = asString(result.snippet);
+        if (snippet) {
+          lines.push(...snippet.split("\n").map((line) => `     ${line}`));
+        }
+        return;
+      }
       const startLine = asNumber(result.start_line);
       const endLine = asNumber(result.end_line);
       const range =

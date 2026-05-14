@@ -73,7 +73,7 @@ pub struct SearchIndex {
     project_root: PathBuf,
     git_head: Option<String>,
     max_file_size: u64,
-    file_trigrams: HashMap<u32, Vec<u32>>,
+    pub file_trigrams: HashMap<u32, Vec<u32>>,
     unindexed_files: HashSet<u32>,
 }
 
@@ -86,6 +86,69 @@ impl SearchIndex {
     /// Number of unique trigrams in the index.
     pub fn trigram_count(&self) -> usize {
         self.postings.len()
+    }
+
+    /// Compute distinct query trigrams from literal tokens.
+    pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
+        query_trigrams_from_tokens(tokens)
+    }
+
+    /// Score-rank file candidates by lexical relevance to query trigrams.
+    pub fn lexical_rank(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        max_files: usize,
+    ) -> Vec<(PathBuf, f32)> {
+        if query_trigrams.is_empty() || max_files == 0 {
+            return Vec::new();
+        }
+
+        let mut non_zero: Vec<(u32, usize)> = query_trigrams
+            .iter()
+            .filter_map(|trigram| {
+                let posting_count = self.postings.get(trigram).map_or(0, Vec::len);
+                (posting_count > 0).then_some((*trigram, posting_count))
+            })
+            .collect();
+        if non_zero.is_empty() {
+            return Vec::new();
+        }
+
+        non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
+        let selected_count = non_zero.len().min(3);
+        let candidate_cap = if selected_count == 3 { 200 } else { 500 };
+
+        let mut candidate_ids = BTreeSet::new();
+        for (trigram, _) in non_zero.iter().take(selected_count) {
+            if let Some(postings) = self.postings.get(trigram) {
+                for posting in postings {
+                    if self.is_active_file(posting.file_id) {
+                        candidate_ids.insert(posting.file_id);
+                    }
+                }
+            }
+        }
+
+        let mut ranked = Vec::new();
+        for file_id in candidate_ids.into_iter().take(candidate_cap) {
+            let Some(entry) = self.files.get(file_id as usize) else {
+                continue;
+            };
+            if let Some(filter) = candidate_filter {
+                if !filter(&entry.path) {
+                    continue;
+                }
+            }
+            let score = lexical_score(self, query_trigrams, file_id);
+            if score > 0.0 {
+                ranked.push((entry.path.clone(), score));
+            }
+        }
+
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(max_files);
+        ranked
     }
 }
 
@@ -1282,6 +1345,47 @@ pub fn extract_trigrams(content: &[u8]) -> Vec<(u32, u8, usize)> {
         trigrams.push((trigram, next_char, start));
     }
     trigrams
+}
+
+pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for token in tokens {
+        for (trigram, _, _) in extract_trigrams(token.as_bytes()) {
+            if seen.insert(trigram) {
+                out.push(trigram);
+            }
+        }
+    }
+    out
+}
+
+pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) -> f32 {
+    if query_trigrams.is_empty() {
+        return 0.0;
+    }
+
+    let mut hits = 0u32;
+    for &trigram in query_trigrams {
+        if let Some(postings) = index.postings.get(&trigram) {
+            if postings
+                .binary_search_by(|posting| posting.file_id.cmp(&file_id))
+                .is_ok()
+            {
+                hits += 1;
+            }
+        }
+    }
+
+    if hits == 0 {
+        return 0.0;
+    }
+
+    let file_trigram_count = index
+        .file_trigrams
+        .get(&file_id)
+        .map_or(1, |trigrams| trigrams.len().max(1)) as f32;
+    (hits as f32) / (1.0 + file_trigram_count.ln())
 }
 
 pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> PathBuf {

@@ -13,6 +13,9 @@ static HEX_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"0x[A-Fa-f0-9
 static ERROR_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bERR_\w+").unwrap());
 static NUMERIC_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bE\d{4,}").unwrap());
 static HTTP_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[1-5]\d{2}\b").unwrap());
+static IDENTIFIER_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\b").unwrap()
+});
 
 const QUESTION_WORDS: &[&str] = &[
     "how", "what", "where", "why", "when", "which", "who", "does",
@@ -81,6 +84,77 @@ pub fn classify(query: &str) -> QueryShape {
     }
 
     shape(QueryKind::NaturalLanguage)
+}
+
+pub fn extract_tokens(query: &str, shape: &QueryShape) -> Vec<String> {
+    match shape.kind {
+        QueryKind::NaturalLanguage => Vec::new(),
+        QueryKind::Path => extract_path_tokens(query),
+        QueryKind::ErrorCode => extract_error_code_tokens(query),
+        QueryKind::Identifier => extract_identifier_tokens(query, false),
+        QueryKind::Mixed => extract_identifier_tokens(query, true),
+    }
+}
+
+fn extract_path_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for segment in query
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+    {
+        if segment.contains('.') {
+            if let Some(stem) = segment.rsplit_once('.').map(|(stem, _)| stem) {
+                push_unique(&mut tokens, stem);
+            }
+        }
+        push_unique(&mut tokens, segment);
+    }
+    tokens
+}
+
+fn extract_error_code_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for regex in [
+        &*HEX_CODE_RE,
+        &*ERROR_PREFIX_RE,
+        &*NUMERIC_ERROR_RE,
+        &*HTTP_STATUS_RE,
+    ] {
+        for mat in regex.find_iter(query) {
+            push_unique(&mut tokens, mat.as_str());
+        }
+    }
+    if tokens.is_empty() && !query.trim().is_empty() {
+        push_unique(&mut tokens, query.trim());
+    }
+    tokens
+}
+
+fn extract_identifier_tokens(query: &str, require_code_shape: bool) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for mat in IDENTIFIER_TOKEN_RE.find_iter(query) {
+        let token = mat.as_str();
+        if require_code_shape && !is_code_identifier_token(token) {
+            continue;
+        }
+        push_unique(&mut tokens, token);
+    }
+    tokens
+}
+
+fn is_code_identifier_token(token: &str) -> bool {
+    CAMEL_CASE_RE.is_match(token)
+        || SNAKE_CASE_RE.is_match(token)
+        || PASCAL_CASE_RE.is_match(token)
+        || ACRONYM_PASCAL_RE.is_match(token)
+        || DOT_PATH_RE.is_match(token)
+        || ERROR_PREFIX_RE.is_match(token)
+}
+
+fn push_unique(tokens: &mut Vec<String>, token: &str) {
+    if !token.is_empty() && !tokens.iter().any(|existing| existing == token) {
+        tokens.push(token.to_string());
+    }
 }
 
 fn shape(kind: QueryKind) -> QueryShape {
