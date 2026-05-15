@@ -558,6 +558,7 @@ fn drain_search_index_events(ctx: &AppContext) {
 
     if let Some(index) = latest {
         *ctx.search_index().borrow_mut() = Some(index);
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
 }
 
@@ -580,6 +581,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     }
 
     let mut keep_receiver = true;
+    let mut status_changed = false;
     for event in events {
         match event {
             SemanticIndexEvent::Progress {
@@ -599,17 +601,22 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 *ctx.semantic_index().borrow_mut() = Some(index);
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
                 keep_receiver = false;
+                status_changed = true;
             }
             SemanticIndexEvent::Failed(error) => {
                 *ctx.semantic_index().borrow_mut() = None;
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
                 keep_receiver = false;
+                status_changed = true;
             }
         }
     }
 
     if !keep_receiver {
         *ctx.semantic_index_rx().borrow_mut() = None;
+    }
+    if status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
 }
 
@@ -652,6 +659,7 @@ fn drain_lsp_events(ctx: &AppContext) {
             }
             LspEvent::ServerExited { server_kind, root } => {
                 aft::slog_info!("exited {:?} {}", server_kind, root.display());
+                ctx.status_emitter().signal(ctx.build_status_snapshot());
             }
         }
     }

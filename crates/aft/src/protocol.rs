@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::bash_background::BgTaskStatus;
 
+/// Full payload returned by the `status` command and cached by status push frames.
+pub type StatusPayload = serde_json::Value;
+
 /// v0.18 streaming semantics for hoisted bash.
 ///
 /// Foreground `bash` execution may emit zero or more `progress` frames before
@@ -101,12 +104,22 @@ pub struct ConfigureWarningsFrame {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct StatusChangedFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub snapshot: StatusPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum PushFrame {
     Progress(ProgressFrame),
     BashCompleted(BashCompletedFrame),
     BashLongRunning(BashLongRunningFrame),
     ConfigureWarnings(ConfigureWarningsFrame),
+    StatusChanged(StatusChangedFrame),
 }
 
 impl PermissionAskFrame {
@@ -168,6 +181,16 @@ impl ConfigureWarningsFrame {
             source_file_count_exceeds_max,
             max_callgraph_files,
             warnings,
+        }
+    }
+}
+
+impl StatusChangedFrame {
+    pub fn new(session_id: Option<String>, snapshot: StatusPayload) -> Self {
+        Self {
+            frame_type: "status_changed",
+            session_id,
+            snapshot,
         }
     }
 }
@@ -235,6 +258,27 @@ mod tests {
         assert_eq!(decoded.source_file_count, 42);
         assert_eq!(decoded.max_callgraph_files, 5_000);
         assert_eq!(decoded.warnings[0]["tool"], "biome");
+    }
+
+    #[test]
+    fn status_changed_frame_serializes_correctly() {
+        let frame = StatusChangedFrame::new(
+            None,
+            json!({
+                "version": "0.24.0",
+                "project_root": "/repo",
+                "cache_role": "main",
+                "canonical_root": "/repo",
+                "search_index": { "status": "ready" },
+                "semantic_index": { "status": "disabled" },
+            }),
+        );
+
+        let json = serde_json::to_value(PushFrame::StatusChanged(frame)).unwrap();
+        assert_eq!(json["type"], "status_changed");
+        assert!(json["session_id"].is_null());
+        assert_eq!(json["snapshot"]["cache_role"], "main");
+        assert_eq!(json["snapshot"]["project_root"], "/repo");
     }
 }
 

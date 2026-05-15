@@ -1712,7 +1712,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // `configure_warnings` push frame for missing-binary warnings and the
     // accurate file count. The bounded source_file_count below is good
     // enough for an early "is this project too big for callgraph" hint.
-    Response::success(
+    let response = Response::success(
         &req.id,
         json!({
             "project_root": root_path.display().to_string(),
@@ -1724,7 +1724,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "warnings_pending": true,
             "search_index_cache_reused": search_index_cache_reused,
         }),
-    )
+    );
+    ctx.status_emitter().signal(ctx.build_status_snapshot());
+    response
 }
 
 #[cfg(test)]

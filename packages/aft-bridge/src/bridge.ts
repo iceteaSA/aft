@@ -197,6 +197,21 @@ export interface BashLongRunningPayload {
   elapsed_ms: number;
 }
 
+export interface StatusSnapshot {
+  version?: string;
+  project_root?: string | null;
+  canonical_root?: string | null;
+  cache_role?: "main" | "worktree" | "not_initialized" | string;
+  search_index?: Record<string, unknown>;
+  semantic_index?: Record<string, unknown>;
+  disk?: Record<string, unknown>;
+  lsp_servers?: number;
+  symbol_cache?: Record<string, unknown>;
+  storage_dir?: string | null;
+  features?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 export interface BridgeRequestOptions {
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
   /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */
@@ -261,6 +276,8 @@ export class BinaryBridge {
   private onBashLongRunning:
     | ((reminder: BashLongRunningPayload, bridge: BinaryBridge) => void | Promise<void>)
     | undefined;
+  private cachedStatus: StatusSnapshot | null = null;
+  private statusListeners = new Set<(snapshot: StatusSnapshot) => void>();
   /** Notification clients keyed by session_id for async configure warning pushes. */
   private configureWarningClients = new Map<string, unknown>();
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
@@ -335,6 +352,31 @@ export class BinaryBridge {
 
   hasPendingRequests(): boolean {
     return this.pending.size > 0;
+  }
+
+  /** Returns the latest pushed or primed status snapshot, or null before the cold path completes. */
+  getCachedStatus(): StatusSnapshot | null {
+    return this.cachedStatus;
+  }
+
+  /**
+   * Subscribe to status updates. If a snapshot is already cached, the listener
+   * is invoked synchronously before this method returns. Listener errors are
+   * caught and logged so one subscriber cannot break delivery to others.
+   */
+  subscribeStatus(listener: (snapshot: StatusSnapshot) => void): () => void {
+    this.statusListeners.add(listener);
+    if (this.cachedStatus !== null) {
+      this.deliverStatusSnapshot(listener, this.cachedStatus);
+    }
+    return () => {
+      this.statusListeners.delete(listener);
+    };
+  }
+
+  /** Seed the plugin-side cache from the direct `status` cold path. */
+  cacheStatusSnapshot(snapshot: StatusSnapshot): void {
+    this.cachedStatus = snapshot;
   }
 
   /**
@@ -559,6 +601,27 @@ export class BinaryBridge {
       if (sessionId) {
         this.configureWarningClients.delete(sessionId);
       }
+    }
+  }
+
+  private handleStatusChangedFrame(frame: Record<string, unknown>): void {
+    const snapshot = frame.snapshot;
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
+    this.cachedStatus = snapshot as StatusSnapshot;
+    log("Received status_changed push frame; cached AFT status snapshot");
+    for (const listener of this.statusListeners) {
+      this.deliverStatusSnapshot(listener, this.cachedStatus);
+    }
+  }
+
+  private deliverStatusSnapshot(
+    listener: (snapshot: StatusSnapshot) => void,
+    snapshot: StatusSnapshot,
+  ): void {
+    try {
+      listener(snapshot);
+    } catch (err) {
+      warn(`status listener threw: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -829,6 +892,10 @@ export class BinaryBridge {
               `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
             );
           });
+          continue;
+        }
+        if (response.type === "status_changed") {
+          this.handleStatusChangedFrame(response);
           continue;
         }
         const id = response.id as string | undefined;

@@ -63,6 +63,13 @@ export function makeMockBridge(
     options?: Record<string, unknown>;
   }> = [];
   const bridge = {
+    cachedStatus: null as Record<string, unknown> | null,
+    getCachedStatus() {
+      return this.cachedStatus;
+    },
+    cacheStatusSnapshot(snapshot: Record<string, unknown>) {
+      this.cachedStatus = snapshot;
+    },
     async send(
       command: string,
       params: Record<string, unknown>,

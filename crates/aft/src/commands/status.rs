@@ -2,147 +2,156 @@
 
 use crate::context::AppContext;
 use crate::context::SemanticIndexStatus;
-use crate::protocol::{RawRequest, Response};
+use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
 
 pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
-    let config = ctx.config();
-
-    // Search index status
-    let search_index_info = {
-        let index = ctx.search_index().borrow();
-        match index.as_ref() {
-            Some(idx) if idx.ready => {
-                let file_count = idx.file_count();
-                let trigram_count = idx.trigram_count();
-                serde_json::json!({
-                    "status": "ready",
-                    "files": file_count,
-                    "trigrams": trigram_count,
-                })
-            }
-            Some(_) => serde_json::json!({ "status": "building" }),
-            None => {
-                let status = if ctx.config().search_index {
-                    "loading"
-                } else {
-                    "disabled"
-                };
-                serde_json::json!({ "status": status })
-            }
-        }
-    };
-
-    // Semantic index status
-    let semantic_index_info = {
-        let index = ctx.semantic_index().borrow();
-        match index.as_ref() {
-            Some(idx) => {
-                serde_json::json!({
-                    "status": idx.status_label(),
-                    "entries": idx.entry_count(),
-                    "dimension": idx.dimension(),
-                    "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
-                    "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
-                })
-            }
-            None => match &*ctx.semantic_index_status().borrow() {
-                SemanticIndexStatus::Disabled => serde_json::json!({
-                    "status": "disabled",
-                    "backend": config.semantic_backend_label(),
-                    "model": config.semantic.model.as_str(),
-                }),
-                SemanticIndexStatus::Building {
-                    stage,
-                    files,
-                    entries_done,
-                    entries_total,
-                } => serde_json::json!({
-                    "status": "loading",
-                    "stage": stage,
-                    "files": files,
-                    "entries_done": entries_done,
-                    "entries_total": entries_total,
-                    "backend": config.semantic_backend_label(),
-                    "model": config.semantic.model.as_str(),
-                }),
-                SemanticIndexStatus::Ready => serde_json::json!({
-                    "status": "ready",
-                    "backend": config.semantic_backend_label(),
-                    "model": config.semantic.model.as_str(),
-                }),
-                SemanticIndexStatus::Failed(error) => serde_json::json!({
-                    "status": "failed",
-                    "error": error,
-                    "backend": config.semantic_backend_label(),
-                    "model": config.semantic.model.as_str(),
-                }),
-            },
-        }
-    };
-
-    // Disk cache sizes — scoped to the **current project** only.
-    //
-    // Both trigram (`<storage_dir>/index/<key>/`) and semantic
-    // (`<storage_dir>/semantic/<key>/`) caches are partitioned per project by
-    // `project_cache_key(project_root)`. Earlier this function reported the
-    // recursive size of the entire `index/` and `semantic/` directories,
-    // which summed disk usage across **every** project the user had ever
-    // opened. The TUI sidebar surfaced that total as if it were the current
-    // project's footprint, which was misleading (e.g. a 4.8 MB project with
-    // 9 sibling projects appeared to use 16+ GB).
-    //
-    // We now resolve the per-project key from `config.project_root` and
-    // size only that project's slice. When the project key can't be
-    // resolved (no project_root), fall back to zeros — the cross-project
-    // total is never the right answer to display per-session.
-    let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
-    let disk_info = match (&config.storage_dir, &config.project_root) {
-        (Some(dir), Some(root)) => {
-            let key = crate::search_index::project_cache_key(root);
-            let trigram_size = dir_size(&dir.join("index").join(&key));
-            let semantic_size = dir_size(&dir.join("semantic").join(&key));
-            serde_json::json!({
-                "storage_dir": dir.display().to_string(),
-                "project_cache_key": key,
-                "trigram_disk_bytes": trigram_size,
-                "semantic_disk_bytes": semantic_size,
-            })
-        }
-        (Some(dir), None) => serde_json::json!({
-            "storage_dir": dir.display().to_string(),
-            "project_cache_key": null,
-            "trigram_disk_bytes": 0,
-            "semantic_disk_bytes": 0,
-        }),
-        _ => serde_json::json!({
-            "storage_dir": null,
-            "project_cache_key": null,
-            "trigram_disk_bytes": 0,
-            "semantic_disk_bytes": 0,
-        }),
-    };
-
-    // LSP servers
-    let lsp_count = ctx.lsp_server_count();
-
-    // Symbol cache stats
-    let symbol_cache_stats = ctx.symbol_cache_stats();
-
-    // Per-session undo/checkpoint counts (issue #14 — one shared bridge serves
-    // many sessions; surface both the global footprint and the current
-    // session's own slice so `/aft-status` can split them in the UI).
-    let checkpoint_total = ctx.checkpoint().borrow().total_count();
-    let session_id = req.session();
-    let session_checkpoints = ctx.checkpoint().borrow().list(session_id).len();
-    let session_tracked_files = ctx.backup().borrow().tracked_files(session_id).len();
-
     Response::success(
         &req.id,
+        ctx.build_status_snapshot_for_session(req.session()),
+    )
+}
+
+impl AppContext {
+    pub fn build_status_snapshot(&self) -> StatusPayload {
+        self.build_status_snapshot_for_session(DEFAULT_SESSION_ID)
+    }
+
+    pub fn build_status_snapshot_for_session(&self, session_id: &str) -> StatusPayload {
+        let config = self.config();
+
+        // Search index status
+        let search_index_info = {
+            let index = self.search_index().borrow();
+            match index.as_ref() {
+                Some(idx) if idx.ready => {
+                    let file_count = idx.file_count();
+                    let trigram_count = idx.trigram_count();
+                    serde_json::json!({
+                        "status": "ready",
+                        "files": file_count,
+                        "trigrams": trigram_count,
+                    })
+                }
+                Some(_) => serde_json::json!({ "status": "building" }),
+                None => {
+                    let status = if self.config().search_index {
+                        "loading"
+                    } else {
+                        "disabled"
+                    };
+                    serde_json::json!({ "status": status })
+                }
+            }
+        };
+
+        // Semantic index status
+        let semantic_index_info = {
+            let index = self.semantic_index().borrow();
+            match index.as_ref() {
+                Some(idx) => {
+                    serde_json::json!({
+                        "status": idx.status_label(),
+                        "entries": idx.entry_count(),
+                        "dimension": idx.dimension(),
+                        "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
+                        "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
+                    })
+                }
+                None => match &*self.semantic_index_status().borrow() {
+                    SemanticIndexStatus::Disabled => serde_json::json!({
+                        "status": "disabled",
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
+                    }),
+                    SemanticIndexStatus::Building {
+                        stage,
+                        files,
+                        entries_done,
+                        entries_total,
+                    } => serde_json::json!({
+                        "status": "loading",
+                        "stage": stage,
+                        "files": files,
+                        "entries_done": entries_done,
+                        "entries_total": entries_total,
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
+                    }),
+                    SemanticIndexStatus::Ready => serde_json::json!({
+                        "status": "ready",
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
+                    }),
+                    SemanticIndexStatus::Failed(error) => serde_json::json!({
+                        "status": "failed",
+                        "error": error,
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
+                    }),
+                },
+            }
+        };
+
+        // Disk cache sizes — scoped to the **current project** only.
+        //
+        // Both trigram (`<storage_dir>/index/<key>/`) and semantic
+        // (`<storage_dir>/semantic/<key>/`) caches are partitioned per project by
+        // `project_cache_key(project_root)`. Earlier this function reported the
+        // recursive size of the entire `index/` and `semantic/` directories,
+        // which summed disk usage across **every** project the user had ever
+        // opened. The TUI sidebar surfaced that total as if it were the current
+        // project's footprint, which was misleading (e.g. a 4.8 MB project with
+        // 9 sibling projects appeared to use 16+ GB).
+        //
+        // We now resolve the per-project key from `config.project_root` and
+        // size only that project's slice. When the project key can't be
+        // resolved (no project_root), fall back to zeros — the cross-project
+        // total is never the right answer to display per-session.
+        let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
+        let disk_info = match (&config.storage_dir, &config.project_root) {
+            (Some(dir), Some(root)) => {
+                let key = crate::search_index::project_cache_key(root);
+                let trigram_size = dir_size(&dir.join("index").join(&key));
+                let semantic_size = dir_size(&dir.join("semantic").join(&key));
+                serde_json::json!({
+                    "storage_dir": dir.display().to_string(),
+                    "project_cache_key": key,
+                    "trigram_disk_bytes": trigram_size,
+                    "semantic_disk_bytes": semantic_size,
+                })
+            }
+            (Some(dir), None) => serde_json::json!({
+                "storage_dir": dir.display().to_string(),
+                "project_cache_key": null,
+                "trigram_disk_bytes": 0,
+                "semantic_disk_bytes": 0,
+            }),
+            _ => serde_json::json!({
+                "storage_dir": null,
+                "project_cache_key": null,
+                "trigram_disk_bytes": 0,
+                "semantic_disk_bytes": 0,
+            }),
+        };
+
+        // LSP servers
+        let lsp_count = self.lsp_server_count();
+
+        // Symbol cache stats
+        let symbol_cache_stats = self.symbol_cache_stats();
+
+        // Per-session undo/checkpoint counts (issue #14 — one shared bridge serves
+        // many sessions; surface both the global footprint and the current
+        // session's own slice so `/aft-status` can split them in the UI).
+        let checkpoint_total = self.checkpoint().borrow().total_count();
+        let session_checkpoints = self.checkpoint().borrow().list(session_id).len();
+        let session_tracked_files = self.backup().borrow().tracked_files(session_id).len();
+
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
-            "canonical_root": ctx.canonical_cache_root_opt().map(|p| p.display().to_string()),
-            "cache_role": ctx.cache_role(),
+            "canonical_root": self.canonical_cache_root_opt().map(|p| p.display().to_string()),
+            "cache_role": self.cache_role(),
             "features": {
                 "format_on_edit": config.format_on_edit,
                 "validate_on_edit": config.validate_on_edit.as_deref().unwrap_or("off"),
@@ -164,8 +173,8 @@ pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
                 "tracked_files": session_tracked_files,
                 "checkpoints": session_checkpoints,
             },
-        }),
-    )
+        })
+    }
 }
 
 /// Recursively compute the total size of a directory.

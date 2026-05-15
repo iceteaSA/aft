@@ -602,7 +602,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           "AFT bridge has not been initialized for this project yet. Status will populate after the first tool call.",
       };
     }
-    return await bridge.send("status", { session_id: sessionID });
+    const cached = bridge.getCachedStatus();
+    if (cached !== null) {
+      return { success: true, ...cached };
+    }
+    const response = await bridge.send("status", { session_id: sessionID });
+    if (response.success !== false) {
+      bridge.cacheStatusSnapshot(response);
+    }
+    return response;
   });
   // Feature announcement — TUI plugin calls this on startup to show a dialog.
   // Uses ANNOUNCEMENT_VERSION (not PLUGIN_VERSION) so patch releases don't re-fire.
@@ -867,7 +875,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         input.directory;
       // Prefer an existing active bridge to get warm index status
       const bridge = ctx.pool.getActiveBridgeForRoot(sessionDir) ?? ctx.pool.getBridge(sessionDir);
-      const response = await bridge.send("status", { session_id: commandInput.sessionID });
+      const cached = bridge.getCachedStatus();
+      const response = cached
+        ? { success: true, ...cached }
+        : await bridge.send("status", { session_id: commandInput.sessionID });
+      if (!cached && response.success !== false) {
+        bridge.cacheStatusSnapshot(response);
+      }
       if (response.success === false) {
         throw new Error((response.message as string) || "status failed");
       }

@@ -2,6 +2,7 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
@@ -15,11 +16,65 @@ use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
 use crate::parser::{SharedSymbolCache, SymbolCache};
-use crate::protocol::{ProgressFrame, PushFrame};
+use crate::protocol::{ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload};
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
+const STATUS_DEBOUNCE_MS: u64 = 1_000;
+
+pub struct StatusEmitter {
+    latest: Arc<Mutex<Option<StatusPayload>>>,
+    notify: mpsc::Sender<()>,
+}
+
+impl StatusEmitter {
+    fn new(progress_sender: SharedProgressSender) -> Self {
+        let (notify, rx) = mpsc::channel();
+        let latest = Arc::new(Mutex::new(None));
+        let latest_for_thread = Arc::clone(&latest);
+        std::thread::spawn(move || {
+            status_debounce_loop(rx, latest_for_thread, progress_sender);
+        });
+        Self { latest, notify }
+    }
+
+    pub fn signal(&self, snapshot: StatusPayload) {
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(snapshot);
+        }
+        let _ = self.notify.send(());
+    }
+}
+
+fn status_debounce_loop(
+    rx: mpsc::Receiver<()>,
+    latest: Arc<Mutex<Option<StatusPayload>>>,
+    progress_sender: SharedProgressSender,
+) {
+    while rx.recv().is_ok() {
+        let deadline = Instant::now() + Duration::from_millis(STATUS_DEBOUNCE_MS);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(remaining) {
+                Ok(()) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+
+        let snapshot = latest.lock().ok().and_then(|mut latest| latest.take());
+        let Some(snapshot) = snapshot else { continue };
+        let sender = progress_sender
+            .lock()
+            .ok()
+            .and_then(|sender| sender.clone());
+        if let Some(sender) = sender {
+            sender(PushFrame::StatusChanged(StatusChangedFrame::new(
+                None, snapshot,
+            )));
+        }
+    }
+}
 use crate::search_index::SearchIndex;
 use crate::semantic_index::SemanticIndex;
 
@@ -246,6 +301,7 @@ pub struct AppContext {
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
     progress_sender: SharedProgressSender,
+    status_emitter: StatusEmitter,
     bash_background: BgTaskRegistry,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
@@ -276,6 +332,7 @@ impl AppContext {
         let bash_compress_enabled = config.experimental_bash_compress;
         let progress_sender = Arc::new(Mutex::new(None));
         let stdout_writer = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+        let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
         let symbol_cache = provider
             .as_any()
             .downcast_ref::<crate::parser::TreeSitterProvider>()
@@ -306,6 +363,7 @@ impl AppContext {
             lsp_child_registry,
             stdout_writer,
             progress_sender: Arc::clone(&progress_sender),
+            status_emitter,
             bash_background: BgTaskRegistry::new(progress_sender),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
@@ -517,6 +575,10 @@ impl AppContext {
         if let Some(sender) = progress_sender.as_ref() {
             sender(PushFrame::Progress(frame));
         }
+    }
+
+    pub fn status_emitter(&self) -> &StatusEmitter {
+        &self.status_emitter
     }
 
     /// Get a clone of the current progress sender for use from background
@@ -1025,6 +1087,70 @@ impl AppContext {
             "local_entries": entries,
             "warm_entries": 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod status_emitter_tests {
+    use super::*;
+    use crate::parser::TreeSitterProvider;
+
+    fn ctx_with_frame_rx() -> (AppContext, mpsc::Receiver<PushFrame>) {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let (tx, rx) = mpsc::channel();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            let _ = tx.send(frame);
+        }))));
+        (ctx, rx)
+    }
+
+    #[test]
+    fn status_emitter_signal_triggers_push() {
+        let (ctx, rx) = ctx_with_frame_rx();
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        let frame = rx
+            .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 500))
+            .expect("status_changed push");
+        assert!(matches!(frame, PushFrame::StatusChanged(_)));
+    }
+
+    #[test]
+    fn status_emitter_debounces_burst() {
+        let (ctx, rx) = ctx_with_frame_rx();
+        for _ in 0..10 {
+            ctx.status_emitter().signal(ctx.build_status_snapshot());
+        }
+        let frame = rx
+            .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 500))
+            .expect("status_changed push");
+        assert!(matches!(frame, PushFrame::StatusChanged(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn status_emitter_separate_windows_separate_pushes() {
+        let (ctx, rx) = ctx_with_frame_rx();
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        rx.recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 500))
+            .expect("first push");
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        rx.recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 500))
+            .expect("second push");
+    }
+
+    #[test]
+    fn status_emitter_no_signal_no_push() {
+        let (_ctx, rx) = ctx_with_frame_rx();
+        assert!(rx
+            .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 100))
+            .is_err());
+    }
+
+    #[test]
+    fn status_emitter_shutdown_cleanly_exits_debounce_thread() {
+        let (ctx, rx) = ctx_with_frame_rx();
+        drop(ctx);
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 }
 

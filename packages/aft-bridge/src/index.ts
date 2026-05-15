@@ -16,6 +16,7 @@ export type {
   BridgeRequestOptions,
   ConfigureWarning,
   ConfigureWarningsContext,
+  StatusSnapshot,
 } from "./bridge.js";
 // --- transport ---
 export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";

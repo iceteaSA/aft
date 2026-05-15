@@ -50,7 +50,8 @@ export type AftPushFrame =
   | BashLongRunningFrame
   | PermissionAskFrame
   | ProgressFrame
-  | ConfigureWarningFrame;
+  | ConfigureWarningFrame
+  | StatusChangedFrame;
 
 export interface BashCompletedFrame {
   type: "bash_completed";
@@ -94,6 +95,12 @@ export interface ConfigureWarningFrame {
   code?: string;
   message: string;
   [key: string]: unknown;
+}
+
+export interface StatusChangedFrame {
+  type: "status_changed";
+  session_id?: string | null;
+  snapshot: Record<string, unknown>;
 }
 
 /**
