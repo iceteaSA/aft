@@ -158,6 +158,13 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
   };
 }
 
+/**
+ * Plain-text status renderer used by the Desktop `sendIgnoredMessage` path,
+ * which can only show a plain string. The TUI dialog uses a custom JSX
+ * component in `tui/index.tsx` (see `StatusDialog`) so it can render with
+ * themed colors, proper flex columns, and right-aligned values instead of
+ * monospace padding.
+ */
 export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   const lines = [
     `AFT version: ${status.version}`,
@@ -185,7 +192,6 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   if (status.semantic_index.model) {
     lines.push(`- model: ${status.semantic_index.model}`);
   }
-
   if (status.semantic_index.dimension != null) {
     lines.push(`- dimension: ${formatCount(status.semantic_index.dimension)}`);
   }

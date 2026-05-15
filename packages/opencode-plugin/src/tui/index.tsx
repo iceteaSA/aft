@@ -1,10 +1,11 @@
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
 
-import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui";
+import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
+import { createMemo, createSignal, onCleanup } from "solid-js";
 import packageJson from "../../package.json";
 import { AftRpcClient } from "../shared/rpc-client";
-import { coerceAftStatus, formatStatusDialogMessage } from "../shared/status";
+import { type AftStatusSnapshot, coerceAftStatus, formatBytes } from "../shared/status";
 import { createAftSidebarSlot } from "./sidebar";
 
 // The TUI talks to the server plugin via AftRpcClient. The client reads the
@@ -42,6 +43,332 @@ function getSessionId(api: TuiPluginApi): string | null {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// StatusDialog — themed, two-column JSX dialog. Modeled on the magic-context
+// /ctx-status pattern (packages/plugin/src/tui/index.tsx in that repo):
+// custom JSX rendered via `api.ui.dialog.replace(() => <StatusDialog .../>)`
+// instead of feeding a padded monospace string into DialogAlert. The
+// difference matters because OpenCode renders DialogAlert text in a
+// proportional font with no column alignment; only TUI flex primitives
+// (<box flexDirection="row" flexBasis={0}>) actually produce visible
+// columns. This component owns its own RPC polling so it can re-render
+// reactively as the status snapshot changes, with no parent re-mount.
+// ---------------------------------------------------------------------------
+
+const POLL_INTERVAL_MS = 1500;
+
+function formatCountShort(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+  return String(value);
+}
+
+function statusTone(status: string): "ok" | "warn" | "err" | "muted" {
+  switch (status) {
+    case "ready":
+      return "ok";
+    case "loading":
+    case "building":
+      return "warn";
+    case "failed":
+    case "error":
+      return "err";
+    default:
+      return "muted";
+  }
+}
+
+function pickToneColor(theme: TuiThemeCurrent, tone: "ok" | "warn" | "err" | "muted"): string {
+  switch (tone) {
+    case "ok":
+      return (theme as any).success ?? theme.accent;
+    case "warn":
+      return theme.warning;
+    case "err":
+      return theme.error;
+    case "muted":
+      return theme.textMuted;
+  }
+}
+
+/**
+ * Label/value row. Label is left-aligned and muted; value is right-aligned
+ * and themed. flexDirection="row" + justifyContent="space-between" replaces
+ * the monospace `padEnd(40)` hack from the previous string formatter.
+ */
+const R = (props: {
+  theme: TuiThemeCurrent;
+  label: string;
+  value: string;
+  tone?: "ok" | "warn" | "err" | "muted" | "accent";
+}) => {
+  const fg = createMemo(() => {
+    if (!props.tone) return props.theme.text;
+    if (props.tone === "accent") return props.theme.accent;
+    return pickToneColor(props.theme, props.tone);
+  });
+
+  return (
+    <box flexDirection="row" width="100%" justifyContent="space-between">
+      <text fg={props.theme.textMuted}>{props.label}</text>
+      <text fg={fg()}>{props.value}</text>
+    </box>
+  );
+};
+
+interface StatusDialogProps {
+  api: TuiPluginApi;
+  client: AftRpcClient;
+  sessionID: string;
+  initial: AftStatusSnapshot | null;
+  initialError: string | null;
+  onClose: () => void;
+}
+
+const StatusDialog = (props: StatusDialogProps) => {
+  const theme = createMemo(() => (props.api as any).theme.current as TuiThemeCurrent);
+  const t = () => theme();
+
+  // Reactive status signal — the dialog re-renders on every status
+  // transition without remounting. The RPC polling is local to the dialog
+  // and stops when it unmounts.
+  const [status, setStatus] = createSignal<AftStatusSnapshot | null>(props.initial);
+  const [error, setError] = createSignal<string | null>(props.initialError);
+
+  const timer = setInterval(async () => {
+    try {
+      const response = await props.client.call("status", { sessionID: props.sessionID });
+      if ((response as Record<string, unknown>).success !== false) {
+        setStatus(coerceAftStatus(response as Record<string, unknown>));
+        setError(null);
+      }
+    } catch {
+      // transient — keep showing last good snapshot
+    }
+  }, POLL_INTERVAL_MS);
+  onCleanup(() => clearInterval(timer));
+
+  // Visual cache-role badge: main is accent, worktree is warning,
+  // not_initialized is muted. Matches the sidebar convention.
+  const cacheRoleTone = (role: string): "accent" | "warn" | "muted" =>
+    role === "main" ? "accent" : role === "worktree" ? "warn" : "muted";
+
+  return (
+    <box
+      flexDirection="column"
+      width="100%"
+      paddingLeft={2}
+      paddingRight={2}
+      paddingTop={1}
+      paddingBottom={1}
+    >
+      {/* Title */}
+      <box justifyContent="center" width="100%" marginBottom={1} flexDirection="row" gap={2}>
+        <text fg={t().accent}>
+          <b>⚡ AFT Status</b>
+        </text>
+        <text fg={t().textMuted}>v{status()?.version ?? packageJson.version}</text>
+      </box>
+
+      {/* Error / not-yet-ready state */}
+      {error() ? (
+        <box width="100%" marginBottom={1}>
+          <text fg={t().warning}>{error()}</text>
+        </box>
+      ) : null}
+
+      {/* Header rows — paths span full width since they can be long */}
+      {status() ? (
+        <box flexDirection="column" width="100%" marginBottom={1}>
+          <R
+            theme={t()}
+            label="Project root"
+            value={status()!.project_root ?? "(not configured)"}
+          />
+          <R
+            theme={t()}
+            label="Canonical root"
+            value={status()!.canonical_root ?? "(not configured)"}
+          />
+          <R
+            theme={t()}
+            label="Cache role"
+            value={status()!.cache_role}
+            tone={cacheRoleTone(status()!.cache_role)}
+          />
+        </box>
+      ) : null}
+
+      {/* 2-column body */}
+      {status() ? (
+        <box flexDirection="row" width="100%" gap={4}>
+          {/* Left column */}
+          <box flexDirection="column" flexGrow={1} flexBasis={0}>
+            <text fg={t().text}>
+              <b>Search index</b>
+            </text>
+            <R
+              theme={t()}
+              label="Status"
+              value={status()!.search_index.status}
+              tone={statusTone(status()!.search_index.status)}
+            />
+            <R theme={t()} label="Files" value={formatCountShort(status()!.search_index.files)} />
+            <R
+              theme={t()}
+              label="Trigrams"
+              value={formatCountShort(status()!.search_index.trigrams)}
+            />
+            <R
+              theme={t()}
+              label="Disk"
+              value={formatBytes(status()!.disk.trigram_disk_bytes)}
+              tone="muted"
+            />
+
+            <box marginTop={1}>
+              <text fg={t().text}>
+                <b>Runtime</b>
+              </text>
+            </box>
+            <R theme={t()} label="LSP servers" value={String(status()!.lsp_servers)} />
+            <R
+              theme={t()}
+              label="Symbol cache (local)"
+              value={formatCountShort(status()!.symbol_cache.local_entries)}
+            />
+            <R
+              theme={t()}
+              label="Symbol cache (warm)"
+              value={formatCountShort(status()!.symbol_cache.warm_entries)}
+              tone="muted"
+            />
+
+            <box marginTop={1}>
+              <text fg={t().text}>
+                <b>Features</b>
+              </text>
+            </box>
+            <R
+              theme={t()}
+              label="format_on_edit"
+              value={status()!.features.format_on_edit ? "on" : "off"}
+              tone={status()!.features.format_on_edit ? "ok" : "muted"}
+            />
+            <R
+              theme={t()}
+              label="search_index"
+              value={status()!.features.search_index ? "on" : "off"}
+              tone={status()!.features.search_index ? "ok" : "muted"}
+            />
+            <R
+              theme={t()}
+              label="semantic_search"
+              value={status()!.features.semantic_search ? "on" : "off"}
+              tone={status()!.features.semantic_search ? "ok" : "muted"}
+            />
+          </box>
+
+          {/* Right column */}
+          <box flexDirection="column" flexGrow={1} flexBasis={0}>
+            <text fg={t().text}>
+              <b>Semantic index</b>
+            </text>
+            <R
+              theme={t()}
+              label="Status"
+              value={status()!.semantic_index.status}
+              tone={statusTone(status()!.semantic_index.status)}
+            />
+            <R
+              theme={t()}
+              label="Entries"
+              value={formatCountShort(status()!.semantic_index.entries)}
+            />
+            {status()!.semantic_index.backend ? (
+              <R
+                theme={t()}
+                label="Backend"
+                value={status()!.semantic_index.backend!}
+                tone="muted"
+              />
+            ) : null}
+            {status()!.semantic_index.model ? (
+              <R theme={t()} label="Model" value={status()!.semantic_index.model!} tone="muted" />
+            ) : null}
+            {status()!.semantic_index.dimension != null ? (
+              <R
+                theme={t()}
+                label="Dimension"
+                value={String(status()!.semantic_index.dimension)}
+                tone="muted"
+              />
+            ) : null}
+            <R
+              theme={t()}
+              label="Disk"
+              value={formatBytes(status()!.disk.semantic_disk_bytes)}
+              tone="muted"
+            />
+
+            <box marginTop={1}>
+              <text fg={t().text}>
+                <b>Current session</b>
+              </text>
+            </box>
+            <R theme={t()} label="Tracked files" value={String(status()!.session.tracked_files)} />
+            <R theme={t()} label="Checkpoints" value={String(status()!.session.checkpoints)} />
+            <R
+              theme={t()}
+              label="All-session checkpoints"
+              value={String(status()!.checkpoints_total)}
+              tone="muted"
+            />
+          </box>
+        </box>
+      ) : null}
+
+      {/* Optional semantic build progress — full-width below the columns */}
+      {status()?.semantic_index.stage ? (
+        <box flexDirection="column" width="100%" marginTop={1}>
+          <text fg={t().text}>
+            <b>Semantic build progress</b>
+          </text>
+          <R theme={t()} label="Stage" value={status()!.semantic_index.stage!} />
+          {status()!.semantic_index.files != null ? (
+            <R
+              theme={t()}
+              label="Files seen"
+              value={formatCountShort(status()!.semantic_index.files)}
+            />
+          ) : null}
+          {status()!.semantic_index.entries_done != null ||
+          status()!.semantic_index.entries_total != null ? (
+            <R
+              theme={t()}
+              label="Progress"
+              value={`${formatCountShort(status()!.semantic_index.entries_done ?? null)} / ${formatCountShort(status()!.semantic_index.entries_total ?? null)}`}
+            />
+          ) : null}
+        </box>
+      ) : null}
+
+      {/* Semantic error — full-width, themed error color */}
+      {status()?.semantic_index.error ? (
+        <box marginTop={1} width="100%">
+          <text fg={t().error}>⚠ {status()!.semantic_index.error}</text>
+        </box>
+      ) : null}
+
+      {/* Footer */}
+      <box marginTop={1} justifyContent="flex-end" width="100%">
+        <text fg={t().textMuted}>Enter or Esc to close</text>
+      </box>
+    </box>
+  );
+};
+
 async function showStatusDialog(api: TuiPluginApi): Promise<void> {
   const sessionID = getSessionId(api);
   if (!sessionID) {
@@ -57,82 +384,36 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
 
   const client = getRpcClient(directory);
 
-  // Fetch status immediately and show the dialog
-  let currentMessage = "Connecting to AFT...";
+  // Prime the dialog with one initial fetch so we don't show a blank
+  // skeleton — the component then takes over polling.
+  let initial: AftStatusSnapshot | null = null;
+  let initialError: string | null = null;
   try {
     const response = await client.call("status", { sessionID });
     if ((response as Record<string, unknown>).success !== false) {
-      const status = coerceAftStatus(response as Record<string, unknown>);
-      currentMessage = formatStatusDialogMessage(status);
+      initial = coerceAftStatus(response as Record<string, unknown>);
+    } else {
+      initialError = "AFT bridge returned an error response.";
     }
   } catch {
-    currentMessage = "AFT is starting up. Status will refresh automatically...";
+    initialError = "AFT is starting up. Status will refresh automatically...";
   }
 
-  // Track whether dialog is still open for polling cleanup
-  let dialogOpen = true;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-
-  // Show dialog with initial data
   api.ui.dialog.setSize("large");
   api.ui.dialog.replace(
+    () => (
+      <StatusDialog
+        api={api}
+        client={client}
+        sessionID={sessionID}
+        initial={initial}
+        initialError={initialError}
+        onClose={() => {
+          api.ui.dialog.setSize("medium");
+        }}
+      />
+    ),
     () => {
-      // Start polling after dialog renders
-      if (!pollTimer) {
-        pollTimer = setInterval(async () => {
-          if (!dialogOpen) {
-            if (pollTimer) clearInterval(pollTimer);
-            return;
-          }
-          try {
-            const response = await client.call("status", { sessionID });
-            if ((response as Record<string, unknown>).success !== false) {
-              const status = coerceAftStatus(response as Record<string, unknown>);
-              const newMessage = formatStatusDialogMessage(status);
-              if (newMessage !== currentMessage) {
-                currentMessage = newMessage;
-                // Re-render dialog with updated status
-                api.ui.dialog.replace(
-                  () => (
-                    <api.ui.DialogAlert
-                      title="AFT Status"
-                      message={currentMessage}
-                      onConfirm={() => {
-                        dialogOpen = false;
-                        if (pollTimer) clearInterval(pollTimer);
-                        api.ui.dialog.setSize("medium");
-                      }}
-                    />
-                  ),
-                  () => {
-                    dialogOpen = false;
-                    if (pollTimer) clearInterval(pollTimer);
-                    api.ui.dialog.setSize("medium");
-                  },
-                );
-              }
-            }
-          } catch {
-            // Polling failure is non-fatal — just skip this tick
-          }
-        }, 1500);
-      }
-
-      return (
-        <api.ui.DialogAlert
-          title="AFT Status"
-          message={currentMessage}
-          onConfirm={() => {
-            dialogOpen = false;
-            if (pollTimer) clearInterval(pollTimer);
-            api.ui.dialog.setSize("medium");
-          }}
-        />
-      );
-    },
-    () => {
-      dialogOpen = false;
-      if (pollTimer) clearInterval(pollTimer);
       api.ui.dialog.setSize("medium");
     },
   );
