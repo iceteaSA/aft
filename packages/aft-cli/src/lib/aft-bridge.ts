@@ -140,7 +140,14 @@ export async function sendAftRequests(
       finish(() => reject(error));
     });
 
-    child.on("exit", (code) => {
+    // Listen for "close", not "exit". "exit" fires when the child terminates
+    // but stdout/stderr streams may still be flushing buffered chunks. On
+    // slow CI runners (observed on macos-latest) the exit handler can fire
+    // before the trailing stdout chunks arrive, so noiseLines is incomplete
+    // and the resulting error message is missing the binary's actual output.
+    // "close" fires only after all stdio streams have closed, guaranteeing
+    // every line has been processed by handleLine.
+    child.on("close", (code) => {
       if (settled) return;
       finish(() => reject(buildBridgeError({ binaryPath, code, stderr, noiseLines, responses })));
     });
