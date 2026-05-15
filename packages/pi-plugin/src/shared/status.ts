@@ -38,6 +38,14 @@ export interface AftStatusSnapshot {
     warm_entries: number;
   };
   storage_dir: string | null;
+  /** Total checkpoints across all sessions sharing this bridge. */
+  checkpoints_total: number;
+  /** Current session's own slice of undo/checkpoint state. */
+  session: {
+    id: string;
+    tracked_files: number;
+    checkpoints: number;
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -97,6 +105,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
   };
   const disk = asRecord(response.disk);
   const symbolCache = asRecord(response.symbol_cache);
+  const session = asRecord(response.session);
 
   return {
     version: readString(response.version, "unknown"),
@@ -140,6 +149,12 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       warm_entries: readNumber(symbolCache.warm_entries),
     },
     storage_dir: readNullableString(response.storage_dir),
+    checkpoints_total: readNumber(response.checkpoints_total),
+    session: {
+      id: readString(session.id, "__default__"),
+      tracked_files: readNumber(session.tracked_files),
+      checkpoints: readNumber(session.checkpoints),
+    },
   };
 }
 
