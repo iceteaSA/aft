@@ -104,7 +104,7 @@ type BridgePendingState = {
 };
 
 type VersionMismatchPool = {
-  replaceBinary(path: string): Promise<void>;
+  replaceBinary(path: string): Promise<string>;
 };
 
 function createVersionMismatchHandler(
@@ -116,42 +116,39 @@ function createVersionMismatchHandler(
   // respawn with same binary → mismatch fires again → kills again → 3-attempt limit.
   let versionUpgradeAttempted: string | null = null;
 
-  return (binaryVersion: string, minVersion: string) => {
+  return async (binaryVersion: string, minVersion: string): Promise<string | null> => {
     if (versionUpgradeAttempted === binaryVersion) {
       log(`Version ${binaryVersion} < ${minVersion} but upgrade already attempted — continuing`);
-      return;
+      return null;
     }
     versionUpgradeAttempted = binaryVersion;
     warn(
       `WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
         "Some features may not work. Attempting to download a compatible binary...",
     );
-    // Fire-and-forget: try to download matching version and hot-swap future bridge spawns.
-    ensureCompatibleBinary(`v${minVersion}`).then(
-      (path) => {
-        if (!path) {
-          warn(`Could not find or download v${minVersion}. Continuing with v${binaryVersion}.`);
-          return;
-        }
-        const pool = getPool();
-        if (!pool) {
-          warn(`Found/downloaded compatible binary at ${path}, but bridge pool is not ready.`);
-          return;
-        }
-        log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
-        pool.replaceBinary(path).then(
-          () => {
-            log("Binary replaced successfully. New bridges will use the updated binary.");
-          },
-          (err) => error("Failed to replace binary:", err),
-        );
-      },
-      (err) => {
-        error(
-          `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
-        );
-      },
-    );
+    try {
+      const path = await ensureCompatibleBinary(`v${minVersion}`);
+      if (!path) {
+        warn(`Could not find or download v${minVersion}. Continuing with v${binaryVersion}.`);
+        return null;
+      }
+      const pool = getPool();
+      if (!pool) {
+        warn(`Found/downloaded compatible binary at ${path}, but bridge pool is not ready.`);
+        return null;
+      }
+      log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
+      const replaced = await pool.replaceBinary(path);
+      log("Binary replaced successfully. New bridges will use the updated binary.");
+      // Returning the new path triggers aft-bridge's coordinated retry of the
+      // in-flight request against the replacement binary.
+      return replaced;
+    } catch (err) {
+      error(
+        `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
+      );
+      return null;
+    }
   };
 }
 
