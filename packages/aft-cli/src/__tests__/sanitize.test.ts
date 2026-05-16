@@ -49,6 +49,13 @@ describe("sanitizeContent", () => {
     const twice = sanitizeContent(once);
     expect(twice).toBe(once);
   });
+
+  test("sanitizes issue-title-sized strings", () => {
+    const input = `AFT issue: failure under ${originalHome}/secret-project`;
+    const out = sanitizeContent(input);
+    expect(out).not.toContain(originalHome);
+    expect(out).toContain("~/secret-project");
+  });
 });
 
 describe("sanitizeValue", () => {

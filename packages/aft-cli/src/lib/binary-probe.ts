@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
@@ -12,45 +12,45 @@ function normalizeVersion(output: string): string | null {
 }
 
 /**
- * Probe `aft --version` from a prioritized list of candidate paths:
- *   1. Versioned cache for the given plugin version (if any)
- *   2. PATH (via `which`/`where`)
+ * Probe `aft --version` from the same prioritized candidate locations used by
+ * `findAftBinary()` (cache, npm platform package, PATH, cargo fallback).
  *
  * Returns the first successfully reported version, or null if nothing
  * resolves. Errors and missing files are swallowed — callers get a signal,
  * not an exception.
  */
 export function probeBinaryVersion(preferredVersion?: string): string | null {
-  const candidates: string[] = [];
-  if (preferredVersion) {
-    const tag = preferredVersion.startsWith("v") ? preferredVersion : `v${preferredVersion}`;
-    candidates.push(join(getAftBinaryCacheDir(), tag, getAftBinaryName()));
-  }
+  const candidate = findAftBinary(preferredVersion);
+  if (!candidate) return null;
 
   try {
-    const lookup = process.platform === "win32" ? "where aft" : "which aft";
-    const resolved = execSync(lookup, { stdio: "pipe", encoding: "utf-8" }).trim();
-    if (resolved) {
-      candidates.push(resolved.split(/\r?\n/)[0]);
-    }
+    if (!existsSync(candidate)) return null;
+    const result = spawnSync(candidate, ["--version"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    });
+    if (result.error || result.status !== 0) return null;
+    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    return normalizeVersion(output);
   } catch {
-    // ignore — PATH lookup is best-effort
+    return null;
   }
+}
 
+function pushCandidate(candidates: string[], candidate: string | null | undefined): void {
+  if (!candidate) return;
+  if (!candidates.includes(candidate)) candidates.push(candidate);
+}
+
+function firstExisting(candidates: string[]): string | null {
   for (const candidate of candidates) {
     try {
       if (!existsSync(candidate)) continue;
-      const output = execSync(`"${candidate}" --version`, {
-        stdio: "pipe",
-        encoding: "utf-8",
-      });
-      const version = normalizeVersion(output);
-      if (version) return version;
+      return candidate;
     } catch {
       // try next
     }
   }
-
   return null;
 }
 
@@ -70,14 +70,14 @@ export function findAftBinary(preferredVersion?: string): string | null {
   const candidates: string[] = [];
   if (preferredVersion) {
     const tag = preferredVersion.startsWith("v") ? preferredVersion : `v${preferredVersion}`;
-    candidates.push(join(getAftBinaryCacheDir(), tag, getAftBinaryName()));
+    pushCandidate(candidates, join(getAftBinaryCacheDir(), tag, getAftBinaryName()));
   }
 
   const key = platformKey();
   if (key) {
     try {
       const require = createRequire(import.meta.url);
-      candidates.push(require.resolve(`@cortexkit/aft-${key}/bin/${getAftBinaryName()}`));
+      pushCandidate(candidates, require.resolve(`@cortexkit/aft-${key}/bin/${getAftBinaryName()}`));
     } catch {
       // platform package is optional
     }
@@ -87,17 +87,13 @@ export function findAftBinary(preferredVersion?: string): string | null {
     const lookup = process.platform === "win32" ? "where aft" : "which aft";
     const resolved = execSync(lookup, { stdio: "pipe", encoding: "utf-8" }).trim();
     if (resolved) {
-      candidates.push(resolved.split(/\r?\n/)[0]);
+      pushCandidate(candidates, resolved.split(/\r?\n/)[0]);
     }
   } catch {
     // ignore — PATH lookup is best-effort
   }
 
-  candidates.push(join(homedir(), ".cargo", "bin", getAftBinaryName()));
+  pushCandidate(candidates, join(homedir(), ".cargo", "bin", getAftBinaryName()));
 
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
-  }
-
-  return null;
+  return firstExisting(candidates);
 }

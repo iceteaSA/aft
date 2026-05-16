@@ -3,7 +3,12 @@ import { join } from "node:path";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
-import { collectDiagnostics, renderDiagnosticsMarkdown, tailLogFile } from "../lib/diagnostics.js";
+import {
+  collectDiagnostics,
+  type DiagnosticReport,
+  renderDiagnosticsMarkdown,
+  tailLogFile,
+} from "../lib/diagnostics.js";
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
@@ -98,22 +103,22 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     );
   }
 
-  let hadProblems = false;
+  const hadProblems = hasDoctorProblems(report);
   for (const h of report.harnesses) {
     log.step(`${h.displayName}`);
     if (!h.hostInstalled) {
       log.warn(`  host not installed — install from: ${describeAdapterInstallHint(h.kind)}`);
-      hadProblems = true;
       continue;
     }
     log.info(`  host: ${h.hostVersion ?? "unknown version"}`);
     log.info(`  plugin registered: ${h.pluginRegistered ? "yes" : "no"}`);
-    if (!h.pluginRegistered) hadProblems = true;
+    if (!h.pluginRegistered) {
+      log.warn("  plugin registration can be fixed with `aft setup` or `aft doctor --fix`");
+    }
 
     log.info(`  aft config: ${h.aftConfig.exists ? h.configPaths.aftConfig : "(not set)"}`);
     if (h.aftConfig.parseError) {
       log.error(`  aft config parse error: ${h.aftConfig.parseError}`);
-      hadProblems = true;
     }
 
     log.info(
@@ -135,9 +140,13 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       }
       if (!h.onnxRuntime.cachedPath && !h.onnxRuntime.systemPath) {
         parts.push(`not installed — ${h.onnxRuntime.installHint}`);
-        hadProblems = true;
+      }
+      if (h.onnxRuntime.cachedCompatible === false || h.onnxRuntime.systemCompatible === false) {
+        parts.push("needs reinstall — run `aft doctor --fix`");
       }
       log.info(`  onnx runtime: ${parts.join(" · ")}`);
+    } else {
+      log.info("  onnx runtime: not required (semantic search disabled; ignoring ONNX status)");
     }
 
     log.info(
@@ -145,18 +154,16 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     );
   }
 
-  // Apply automatic fixes where useful.
+  // Compatibility: `doctor --force` only clears the plugin package cache.
+  // Plain `doctor` must remain strictly read-only: plugin registration is only
+  // mutated by `aft setup` or the explicit `aft doctor --fix` flow.
   if (options.force) {
     await clearDoctorCaches(adapters, DOCTOR_FORCE_CLEAR_TARGETS, { includePluginBytes: false });
   }
 
-  for (const adapter of adapters) {
-    await maybeFixPlugin(adapter);
-  }
-
   if (hadProblems) {
     note(
-      "Run `aft setup` to register AFT with any harness showing `plugin registered: no`.",
+      "Run `aft setup` or `aft doctor --fix` to register AFT with any harness showing `plugin registered: no`. Run `aft doctor --fix` for ONNX Runtime issues.",
       "Tips",
     );
     outro("Done — some issues found.");
@@ -164,6 +171,19 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   }
   outro("Everything looks good.");
   return 0;
+}
+
+export function hasDoctorProblems(report: DiagnosticReport): boolean {
+  return report.harnesses.some((h) => {
+    if (!h.hostInstalled) return true;
+    if (!h.pluginRegistered) return true;
+    if (h.aftConfig.parseError) return true;
+    if (!h.onnxRuntime.required) return false;
+    if (!h.onnxRuntime.cachedPath && !h.onnxRuntime.systemPath) return true;
+    if (h.onnxRuntime.cachedCompatible === false) return true;
+    if (h.onnxRuntime.systemCompatible === false) return true;
+    return false;
+  });
 }
 
 async function runClearFlow(argv: string[]): Promise<number> {
@@ -334,6 +354,8 @@ async function runFixFlow(argv: string[]): Promise<number> {
   log.info("Running diagnostics to identify auto-fixable issues…");
   const report = await collectDiagnostics(adapters);
 
+  await fixPluginEntries(adapters);
+
   // ONNX Runtime fix is the only supported auto-fix today.
   const onnxResult = await runOnnxFix(adapters, report);
 
@@ -344,13 +366,23 @@ async function runFixFlow(argv: string[]): Promise<number> {
         "`aft doctor` (without --fix) for a full diagnostic dump.",
       "Tip",
     );
-    outro("Done.");
-    return 0;
+    const afterReport = await collectDiagnostics(adapters);
+    const stillHasProblems = hasDoctorProblems(afterReport);
+    outro(stillHasProblems ? "Done — some issues remain." : "Done.");
+    return stillHasProblems ? 1 : 0;
   }
 
   const hadErrors = onnxResult.errors.length > 0;
-  outro(hadErrors ? "Done — some fixes failed." : "Done.");
-  return hadErrors ? 1 : 0;
+  const afterReport = await collectDiagnostics(adapters);
+  const stillHasProblems = hasDoctorProblems(afterReport);
+  outro(
+    hadErrors
+      ? "Done — some fixes failed."
+      : stillHasProblems
+        ? "Done — some issues remain."
+        : "Done.",
+  );
+  return hadErrors || stillHasProblems ? 1 : 0;
 }
 
 async function clearPluginCache(
@@ -392,6 +424,12 @@ function reportLspCacheClear(cleanup: ClearResult): void {
   }
   for (const err of cleanup.errors) {
     log.error(`LSP install cache: failed to remove ${err.path}: ${err.error}`);
+  }
+}
+
+export async function fixPluginEntries(adapters: HarnessAdapter[]): Promise<void> {
+  for (const adapter of adapters) {
+    await maybeFixPlugin(adapter);
   }
 }
 
@@ -467,7 +505,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
   ].join("\n");
   const body = sanitizeContent(rawBody);
 
-  const title = `AFT issue: ${description.slice(0, 72)}`;
+  const title = sanitizeContent(`AFT issue: ${description.slice(0, 72)}`);
   const outPath = join(process.cwd(), `aft-issue-${Date.now()}.md`);
   writeFileSync(outPath, `${body}\n`);
   log.success(`Wrote sanitized issue body to ${outPath}`);

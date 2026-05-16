@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { dirSize } from "../lib/fs-util.js";
-import { detectJsoncFile } from "../lib/jsonc.js";
+import { detectJsoncFile, readJsoncFile } from "../lib/jsonc.js";
 import { getTmpLogPath } from "../lib/paths.js";
 import type {
   HarnessAdapter,
@@ -71,10 +71,8 @@ function readPiExtensionIndex(): { installed: string[]; path: string | null } {
   for (const path of candidates) {
     if (!existsSync(path)) continue;
     try {
-      const raw = readFileSync(path, "utf-8");
-      const trimmed = raw.replace(/^\uFEFF/, "");
-      const value = JSON.parse(trimmed) as Record<string, unknown>;
-      const extensions = (value.extensions ?? value.plugins ?? []) as unknown;
+      const { value } = readJsoncFile(path);
+      const extensions = (value?.extensions ?? value?.plugins ?? []) as unknown;
       if (Array.isArray(extensions)) {
         const installed = extensions
           .map((e) =>

@@ -312,6 +312,19 @@ describe("PiAdapter configuration", () => {
     expect(adapter.hasPluginEntry()).toBe(true);
   });
 
+  test("hasPluginEntry parses legacy extensions.jsonc with comments", () => {
+    writeFileSync(
+      join(agentDir, "extensions.jsonc"),
+      `{
+  // Older Pi configs commonly allowed comments here.
+  "extensions": ["npm:@cortexkit/aft-pi"]
+}
+`,
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(true);
+  });
+
   test("settings.json `packages` takes priority over legacy extensions.json", () => {
     // settings.json has no AFT, legacy has AFT — should report false because
     // settings.json is the authoritative source on v0.74+.

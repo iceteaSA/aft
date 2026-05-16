@@ -9,13 +9,19 @@ export function isGhInstalled(): boolean {
   }
 }
 
+export function getOpenBrowserCommand(
+  url: string,
+  platform: NodeJS.Platform = process.platform,
+): [string, string[]] {
+  return platform === "darwin"
+    ? ["open", [url]]
+    : platform === "win32"
+      ? ["explorer.exe", [url]]
+      : ["xdg-open", [url]];
+}
+
 export function openBrowser(url: string): void {
-  const commands =
-    process.platform === "darwin"
-      ? ["open", [url]]
-      : process.platform === "win32"
-        ? ["cmd", ["/c", "start", "", url]]
-        : ["xdg-open", [url]];
+  const commands = getOpenBrowserCommand(url);
 
   try {
     const [cmd, args] = commands as [string, string[]];

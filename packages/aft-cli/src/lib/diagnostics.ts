@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
 import { probeBinaryVersion } from "./binary-probe.js";
@@ -105,6 +105,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       : {};
 
   const semanticEnabled =
+    (aftConfigRead.value as Record<string, unknown> | null)?.semantic_search === true ||
     (aftConfigRead.value as Record<string, unknown> | null)?.experimental_semantic_search === true;
 
   const systemOrtDir = findSystemOnnxRuntime();
@@ -221,10 +222,44 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
 /** Utility: read the tail of a log file, best-effort. */
 export function tailLogFile(path: string, lines: number): string {
   if (!existsSync(path)) return "";
+  if (lines <= 0) return "";
+  const chunkSize = 64 * 1024;
+  let fd: number | null = null;
   try {
-    const raw = readFileSync(path, "utf-8");
-    return raw.split(/\r?\n/).slice(-lines).join("\n").trim();
+    const size = statSync(path).size;
+    fd = openSync(path, "r");
+    const chunks: Buffer[] = [];
+    let position = size;
+    let newlineCount = 0;
+
+    while (position > 0 && newlineCount <= lines) {
+      const readLength = Math.min(chunkSize, position);
+      position -= readLength;
+      const buffer = Buffer.allocUnsafe(readLength);
+      const bytesRead = readSync(fd, buffer, 0, readLength, position);
+      const chunk = bytesRead === readLength ? buffer : buffer.subarray(0, bytesRead);
+      chunks.unshift(chunk);
+      for (let i = chunk.length - 1; i >= 0; i -= 1) {
+        if (chunk[i] === 10) newlineCount += 1;
+      }
+    }
+
+    return Buffer.concat(chunks)
+      .toString("utf-8")
+      .trimEnd()
+      .split(/\r?\n/)
+      .slice(-lines)
+      .join("\n")
+      .trim();
   } catch {
     return "";
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore close errors in best-effort diagnostics
+      }
+    }
   }
 }

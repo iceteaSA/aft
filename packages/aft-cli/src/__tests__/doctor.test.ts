@@ -7,7 +7,10 @@ import {
   DOCTOR_CLEAR_TARGET_OPTIONS,
   DOCTOR_FORCE_CLEAR_TARGETS,
   type DoctorClearTarget,
+  fixPluginEntries,
+  hasDoctorProblems,
 } from "../commands/doctor.js";
+import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
 
 function makeAdapter(overrides: Partial<HarnessAdapter> = {}): HarnessAdapter {
   const configPaths: HarnessConfigPaths = {
@@ -45,6 +48,60 @@ function makeAdapter(overrides: Partial<HarnessAdapter> = {}): HarnessAdapter {
       path: "/tmp/aft-test/plugin-cache",
     }),
     ...overrides,
+  };
+}
+
+function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnostic {
+  const configPaths: HarnessConfigPaths = {
+    configDir: "/tmp/aft-test",
+    harnessConfig: "/tmp/aft-test/opencode.jsonc",
+    harnessConfigFormat: "jsonc",
+    aftConfig: "/tmp/aft-test/aft.jsonc",
+    aftConfigFormat: "jsonc",
+  };
+
+  return {
+    kind: "opencode",
+    displayName: "OpenCode",
+    hostInstalled: true,
+    hostVersion: "test",
+    pluginRegistered: true,
+    configPaths,
+    aftConfig: { exists: true, flags: {} },
+    pluginCache: { path: "/tmp/aft-test/plugin-cache", exists: false },
+    storageDir: { path: "/tmp/aft-test/storage", exists: false, sizesByKey: {} },
+    onnxRuntime: {
+      required: false,
+      systemPath: null,
+      systemVersion: null,
+      systemCompatible: null,
+      cachedPath: null,
+      cachedVersion: null,
+      cachedCompatible: null,
+      platform: "test-test",
+      installHint: "install onnx",
+      requirement: ">=1.20",
+    },
+    logFile: { path: "/tmp/aft-test/aft.log", exists: false, sizeKb: 0 },
+    ...overrides,
+  };
+}
+
+function makeReport(harness: HarnessDiagnostic): DiagnosticReport {
+  return {
+    timestamp: "2026-01-01T00:00:00.000Z",
+    platform: "darwin",
+    arch: "arm64",
+    nodeVersion: "v24.0.0",
+    cliVersion: "0.0.0-test",
+    binaryVersion: "0.0.0-test",
+    harnesses: [harness],
+    binaryCache: { path: "/tmp/aft-test/bin", versions: [], totalSize: 0 },
+    lspCache: {
+      npm: { path: "/tmp/aft-test/npm", entries: [], totalSize: 0 },
+      github: { path: "/tmp/aft-test/gh", entries: [], totalSize: 0 },
+      totalSize: 0,
+    },
   };
 }
 
@@ -123,5 +180,80 @@ describe("clearDoctorCaches", () => {
     expect(summary.pluginCache).toBeUndefined();
     expect(summary.lspCache).toEqual({ cleared: 1, totalBytes: 2048, errors: 0 });
     expect(summary.hadErrors).toBe(false);
+  });
+});
+
+describe("doctor problem assessment", () => {
+  test("plain doctor treats incompatible ONNX as a problem when semantic search is enabled", () => {
+    const report = makeReport(
+      makeHarness({
+        onnxRuntime: {
+          ...makeHarness().onnxRuntime,
+          required: true,
+          cachedPath: "/tmp/aft-test/storage/onnxruntime",
+          cachedVersion: "1.9.0",
+          cachedCompatible: false,
+        },
+      }),
+    );
+
+    expect(hasDoctorProblems(report)).toBe(true);
+  });
+
+  test("plain doctor ignores ONNX incompatibility when semantic search is disabled", () => {
+    const report = makeReport(
+      makeHarness({
+        onnxRuntime: {
+          ...makeHarness().onnxRuntime,
+          required: false,
+          systemPath: "/usr/lib/libonnxruntime.so",
+          systemVersion: "1.9.0",
+          systemCompatible: false,
+        },
+      }),
+    );
+
+    expect(hasDoctorProblems(report)).toBe(false);
+  });
+
+  test("doctor --fix path registers missing plugins", async () => {
+    let ensureCalls = 0;
+    const adapter = makeAdapter({
+      hasPluginEntry: () => false,
+      ensurePluginEntry: async () => {
+        ensureCalls += 1;
+        return {
+          ok: true,
+          action: "added",
+          message: "registered",
+          configPath: "/tmp/aft-test/opencode.jsonc",
+        };
+      },
+    });
+
+    await fixPluginEntries([adapter]);
+
+    expect(ensureCalls).toBe(1);
+  });
+
+  test("plain doctor assessment is read-only and does not call ensurePluginEntry", () => {
+    let ensureCalls = 0;
+    const report = makeReport(makeHarness({ pluginRegistered: false }));
+    const adapter = makeAdapter({
+      hasPluginEntry: () => false,
+      ensurePluginEntry: async () => {
+        ensureCalls += 1;
+        return {
+          ok: true,
+          action: "added",
+          message: "registered",
+          configPath: "/tmp/aft-test/opencode.jsonc",
+        };
+      },
+    });
+
+    expect(hasDoctorProblems(report)).toBe(true);
+    expect(adapter.hasPluginEntry()).toBe(false);
+    expect(ensureCalls).toBe(0);
   });
 });
