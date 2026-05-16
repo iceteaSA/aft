@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,6 +16,7 @@ use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::jsonrpc::{
     Notification, Request, RequestId, Response as JsonRpcResponse, ServerMessage,
 };
+use crate::lsp::position::path_to_uri;
 use crate::lsp::registry::ServerKind;
 use crate::lsp::{transport, LspError};
 
@@ -24,6 +25,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
+type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
 
 /// Lifecycle state of a language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +109,11 @@ pub struct LspClient {
     /// `workspace/didChangeWatchedFiles` notifications to avoid spec violations.
     /// Intentional default: `false` (conservative — requires server opt-in).
     supports_watched_files: bool,
+    /// Dynamic `workspace/didChangeWatchedFiles` registrations requested by
+    /// the server via `client/registerCapability`. Per LSP, the client must
+    /// not send watched-file notifications merely because a server mentions
+    /// dynamic registration during initialize; a real registration is required.
+    watched_file_registrations: WatchedFileRegistrations,
     /// Shared registry that tracks live LSP child PIDs across the process
     /// so the signal handler can SIGKILL them on SIGTERM/SIGINT before
     /// aft exits. Cloned via `Arc` — multiple clients share the same set.
@@ -172,8 +179,10 @@ impl LspClient {
 
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let pending = Arc::new(Mutex::new(PendingMap::new()));
+        let watched_file_registrations = Arc::new(Mutex::new(HashSet::new()));
         let reader_pending = Arc::clone(&pending);
         let reader_writer = Arc::clone(&writer);
+        let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
         let reader_kind = kind.clone();
         let reader_root = root.clone();
 
@@ -205,6 +214,11 @@ impl LspClient {
                         });
                     }
                     Ok(Some(ServerMessage::Request { id, method, params })) => {
+                        record_watched_file_registration(
+                            &reader_watched_file_registrations,
+                            &method,
+                            params.as_ref(),
+                        );
                         // Auto-respond to server requests to prevent deadlocks.
                         // Server requests (like client/registerCapability,
                         // window/workDoneProgress/create) block the server until
@@ -267,6 +281,7 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             supports_watched_files: false,
+            watched_file_registrations,
             child_registry,
         })
     }
@@ -280,13 +295,7 @@ impl LspClient {
         self.ensure_can_send()?;
         self.state = ServerState::Initializing;
 
-        let normalized = normalize_windows_path(workspace_root);
-        let root_url = url::Url::from_file_path(&normalized).map_err(|_| {
-            LspError::NotFound(format!(
-                "failed to convert workspace root '{}' to file URI",
-                workspace_root.display()
-            ))
-        })?;
+        let root_url = path_to_uri(workspace_root)?;
         let root_uri = lsp_types::Uri::from_str(root_url.as_str()).map_err(|_| {
             LspError::NotFound(format!(
                 "failed to convert workspace root '{}' to file URI",
@@ -301,6 +310,9 @@ impl LspClient {
                 "workspace": {
                     "workspaceFolders": true,
                     "configuration": true,
+                    "didChangeWatchedFiles": {
+                        "dynamicRegistration": true
+                    },
                     // LSP 3.17 workspace diagnostic pull. We declare refreshSupport=false
                     // because we drive diagnostics on-demand via pull/push and re-query
                     // when the agent calls lsp_diagnostics again — we don't need the
@@ -400,6 +412,16 @@ impl LspClient {
         self.supports_watched_files
     }
 
+    /// Whether this server currently has an active dynamic watched-file
+    /// registration. This, not the initialize-time capability shape, controls
+    /// whether `workspace/didChangeWatchedFiles` may be sent.
+    pub fn has_watched_file_registration(&self) -> bool {
+        self.watched_file_registrations
+            .lock()
+            .map(|registrations| !registrations.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Send a request and wait for the response.
     pub fn send_request<R>(&mut self, params: R::Params) -> Result<R::Result, LspError>
     where
@@ -413,7 +435,38 @@ impl LspClient {
         serde_json::from_value(value).map_err(Into::into)
     }
 
+    /// Send a request and wait up to `timeout` for the response. If the local
+    /// deadline expires, remove the pending response handler and notify the
+    /// server with `$/cancelRequest` so it can stop work.
+    pub fn send_request_with_timeout<R>(
+        &mut self,
+        params: R::Params,
+        timeout: Duration,
+    ) -> Result<R::Result, LspError>
+    where
+        R: lsp_types::request::Request,
+        R::Params: serde::Serialize,
+        R::Result: DeserializeOwned,
+    {
+        self.ensure_can_send()?;
+
+        let value = self.send_request_value_with_timeout(R::METHOD, params, timeout)?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
     fn send_request_value<P>(&mut self, method: &'static str, params: P) -> Result<Value, LspError>
+    where
+        P: serde::Serialize,
+    {
+        self.send_request_value_with_timeout(method, params, REQUEST_TIMEOUT)
+    }
+
+    fn send_request_value_with_timeout<P>(
+        &mut self,
+        method: &'static str,
+        params: P,
+        timeout: Duration,
+    ) -> Result<Value, LspError>
     where
         P: serde::Serialize,
     {
@@ -438,10 +491,11 @@ impl LspClient {
             }
         }
 
-        let response = match rx.recv_timeout(REQUEST_TIMEOUT) {
+        let response = match rx.recv_timeout(timeout) {
             Ok(response) => response,
             Err(RecvTimeoutError::Timeout) => {
                 self.remove_pending(&id);
+                self.send_cancel_request(&id)?;
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for '{}' response from {:?}",
                     method, self.kind
@@ -568,6 +622,16 @@ impl LspClient {
             pending.remove(id);
         }
     }
+
+    fn send_cancel_request(&mut self, id: &RequestId) -> Result<(), LspError> {
+        let notification = Notification::new("$/cancelRequest", Some(json!({ "id": id })));
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
+        transport::write_notification(&mut *writer, &notification)?;
+        Ok(())
+    }
 }
 
 impl Drop for LspClient {
@@ -599,15 +663,51 @@ fn kill_lsp_child_group(child: &mut std::process::Child) {
     }
 }
 
-/// Normalize a path for file URI conversion.
-/// On Windows, strips the extended-length `\\?\` prefix that `Url::from_file_path` cannot handle.
-/// On other platforms, returns the path unchanged.
-fn normalize_windows_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        path.to_path_buf()
+fn record_watched_file_registration(
+    registrations: &WatchedFileRegistrations,
+    method: &str,
+    params: Option<&Value>,
+) {
+    match method {
+        "client/registerCapability" => {
+            let Some(items) = params
+                .and_then(|params| params.get("registrations"))
+                .and_then(|registrations| registrations.as_array())
+            else {
+                return;
+            };
+            if let Ok(mut guard) = registrations.lock() {
+                for item in items {
+                    if item.get("method").and_then(Value::as_str)
+                        == Some("workspace/didChangeWatchedFiles")
+                    {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            guard.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        "client/unregisterCapability" => {
+            let Some(items) = params
+                .and_then(|params| params.get("unregisterations"))
+                .and_then(|registrations| registrations.as_array())
+            else {
+                return;
+            };
+            if let Ok(mut guard) = registrations.lock() {
+                for item in items {
+                    if item.get("method").and_then(Value::as_str)
+                        == Some("workspace/didChangeWatchedFiles")
+                    {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            guard.remove(id);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 

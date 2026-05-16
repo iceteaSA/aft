@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use lsp_types::notification::{
@@ -19,6 +18,7 @@ use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
 use crate::lsp::document::DocumentStore;
+use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef, ServerKind};
 use crate::lsp::roots::{find_workspace_root, ServerKey};
 use crate::lsp::LspError;
@@ -594,14 +594,13 @@ impl LspManager {
             }
 
             if let Some(client) = self.clients.get_mut(&key) {
-                // Only send if the server advertised this capability (#32).
-                // Sending didChangeWatchedFiles to a server that didn't declare
-                // workspace.didChangeWatchedFiles causes spurious errors on some
-                // servers (e.g. older tsserver builds) and is a spec violation.
-                if !client.supports_watched_files() {
+                // Only send after the server dynamically registers interest.
+                // `workspace/didChangeWatchedFiles` is client-owned; a server's
+                // initialize-time dynamicRegistration shape is not a subscription.
+                if !client.has_watched_file_registration() {
                     if self.watched_file_skip_logged.insert(key.clone()) {
                         log::debug!(
-                            "skipping didChangeWatchedFiles for {:?} (capability not declared)",
+                            "skipping didChangeWatchedFiles for {:?} (not dynamically registered)",
                             key
                         );
                     }
@@ -1033,7 +1032,7 @@ impl LspManager {
         server_key: &ServerKey,
         timeout: Option<std::time::Duration>,
     ) -> Result<PullWorkspaceResult, LspError> {
-        let _timeout = timeout.unwrap_or(Self::PULL_WORKSPACE_TIMEOUT);
+        let timeout = timeout.unwrap_or(Self::PULL_WORKSPACE_TIMEOUT);
 
         let supports_workspace = self
             .clients
@@ -1064,19 +1063,13 @@ impl LspManager {
             partial_result_params: Default::default(),
         };
 
-        // Note: LspClient::send_request currently uses a fixed REQUEST_TIMEOUT
-        // (30s, see client.rs). For workspace pull this is intentionally not
-        // overridden because servers like rust-analyzer may legitimately take
-        // many seconds on first request. The plugin bridge timeout (also 30s)
-        // is what we ultimately defer to. In a future revision we should plumb
-        // a custom timeout through send_request — for v0.16 we accept that
-        // workspace pull obeys the standard request timeout.
         let result = match self
             .clients
             .get_mut(server_key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?
-            .send_request::<lsp_types::request::WorkspaceDiagnosticRequest>(params)
-        {
+            .send_request_with_timeout::<lsp_types::request::WorkspaceDiagnosticRequest>(
+                params, timeout,
+            ) {
             Ok(result) => result,
             Err(LspError::Timeout(_)) => {
                 return Ok(PullWorkspaceResult {
@@ -1409,18 +1402,6 @@ fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
     resolved
 }
 
-fn uri_for_path(path: &Path) -> Result<lsp_types::Uri, LspError> {
-    let url = url::Url::from_file_path(path).map_err(|_| {
-        LspError::NotFound(format!(
-            "failed to convert '{}' to file URI",
-            path.display()
-        ))
-    })?;
-    lsp_types::Uri::from_str(url.as_str()).map_err(|_| {
-        LspError::NotFound(format!("failed to parse file URI for '{}'", path.display()))
-    })
-}
-
 fn language_id_for_extension(ext: &str) -> &'static str {
     match ext {
         "ts" => "typescript",
@@ -1437,13 +1418,6 @@ fn language_id_for_extension(ext: &str) -> &'static str {
 
 fn normalize_lookup_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn uri_to_path(uri: &lsp_types::Uri) -> Option<PathBuf> {
-    let url = url::Url::parse(uri.as_str()).ok()?;
-    url.to_file_path()
-        .ok()
-        .map(|path| normalize_lookup_path(&path))
 }
 
 /// Classify an error returned by `spawn_server` into a structured

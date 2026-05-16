@@ -23,6 +23,18 @@ fn write_response(writer: &mut impl Write, id: RequestId, result: Value) -> io::
     )
 }
 
+fn write_request(writer: &mut impl Write, id: i64, method: &str, params: Value) -> io::Result<()> {
+    write_json_message(
+        writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    )
+}
+
 fn request_position(params: &Option<Value>) -> (u64, u64) {
     let line = params
         .as_ref()
@@ -199,6 +211,7 @@ fn main() -> io::Result<()> {
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
+    let mut should_register_watched_files = false;
 
     while let Some(message) = read_message(&mut reader)? {
         match message {
@@ -239,6 +252,7 @@ fn main() -> io::Result<()> {
                                 "dynamicRegistration": true
                             }
                         });
+                        should_register_watched_files = true;
                     }
 
                     if pull_enabled {
@@ -515,7 +529,29 @@ fn main() -> io::Result<()> {
                 }
             },
             ServerMessage::Notification { method, params } => match method.as_str() {
-                "initialized" => {}
+                "initialized" => {
+                    if should_register_watched_files {
+                        write_request(
+                            &mut writer,
+                            10_000,
+                            "client/registerCapability",
+                            json!({
+                                "registrations": [
+                                    {
+                                        "id": "fake-lsp-watched-files",
+                                        "method": "workspace/didChangeWatchedFiles",
+                                        "registerOptions": {
+                                            "watchers": [
+                                                { "globPattern": "**/*" }
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }),
+                        )?;
+                        should_register_watched_files = false;
+                    }
+                }
                 "workspace/didChangeWatchedFiles" => {
                     write_notification(
                         &mut writer,

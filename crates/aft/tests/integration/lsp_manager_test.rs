@@ -10,7 +10,8 @@ use aft::lsp::child_registry::LspChildRegistry;
 use aft::lsp::client::{LspEvent, ServerState};
 use aft::lsp::manager::{LspManager, ServerAttemptResult};
 use aft::lsp::registry::ServerKind;
-use serde_json::json;
+use lsp_types::FileChangeType;
+use serde_json::{json, Value};
 use tempfile::tempdir;
 
 fn fake_server_path() -> PathBuf {
@@ -64,6 +65,136 @@ fn collect_notification(manager: &mut LspManager, method: &str) -> serde_json::V
     }
     panic!("timed out waiting for {method}");
 }
+
+fn collect_event<F>(manager: &mut LspManager, predicate: F, timeout: Duration) -> Option<LspEvent>
+where
+    F: Fn(&LspEvent) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in manager.drain_events() {
+            if predicate(&event) {
+                return Some(event);
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    None
+}
+
+fn collect_optional_notification(
+    manager: &mut LspManager,
+    method: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    collect_event(
+        manager,
+        |event| matches!(event, LspEvent::Notification { method: event_method, .. } if event_method == method),
+        timeout,
+    )
+    .and_then(|event| match event {
+        LspEvent::Notification { params, .. } => params,
+        _ => None,
+    })
+}
+
+fn executable_protocol_server_script() -> PathBuf {
+    let temp_dir = tempdir().expect("tempdir for protocol server");
+    let script = temp_dir.keep().join("protocol_lsp_server.py");
+    fs::write(&script, PROTOCOL_SERVER).expect("write protocol server");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod protocol server");
+    }
+    script
+}
+
+const PROTOCOL_SERVER: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line == b"\r\n":
+            break
+        key, value = line.decode("ascii").split(":", 1)
+        headers[key.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+
+
+def write_message(value):
+    payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
+    sys.stdout.buffer.flush()
+
+
+def response(msg_id, result):
+    write_message({"jsonrpc": "2.0", "id": msg_id, "result": result})
+
+
+def request(msg_id, method, params):
+    write_message({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
+
+
+def notification(method, params):
+    write_message({"jsonrpc": "2.0", "method": method, "params": params})
+
+
+mode = os.environ.get("AFT_PROTOCOL_LSP_MODE", "watch")
+next_request_id = 100
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        capabilities = {"textDocumentSync": 1}
+        if mode == "workspace-timeout":
+            capabilities["diagnosticProvider"] = {
+                "interFileDependencies": True,
+                "workspaceDiagnostics": True,
+                "identifier": "protocol-test",
+            }
+        response(message["id"], {"capabilities": capabilities})
+    elif method == "initialized":
+        if mode == "watch":
+            request(next_request_id, "client/registerCapability", {
+                "registrations": [{
+                    "id": "watch-1",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {"watchers": [{"globPattern": "**/*"}]},
+                }]
+            })
+            next_request_id += 1
+    elif method == "workspace/didChangeWatchedFiles":
+        notification("custom/watchedFilesChanged", message.get("params"))
+        request(next_request_id, "client/unregisterCapability", {
+            "unregisterations": [{
+                "id": "watch-1",
+                "method": "workspace/didChangeWatchedFiles",
+            }]
+        })
+        next_request_id += 1
+    elif method == "workspace/diagnostic":
+        pass
+    elif method == "$/cancelRequest":
+        notification("custom/cancelReceived", message.get("params"))
+    elif method == "shutdown":
+        response(message["id"], None)
+    elif method == "exit":
+        break
+"#;
 
 #[test]
 fn test_manager_spawns_server_on_first_touch() {
@@ -206,6 +337,147 @@ fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
     assert!(
         !client.supports_watched_files(),
         "missing explicit didChangeWatchedFiles capability should default to false"
+    );
+}
+
+#[test]
+fn watched_file_notifications_require_dynamic_registration_and_stop_after_unregister() {
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("workspace");
+    let source = root.join("main.watchtest");
+    let changed = root.join("config.json");
+    let created = root.join("created.json");
+    let deleted = root.join("deleted.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("marker.txt"), "marker\n").unwrap();
+    fs::write(&source, "content\n").unwrap();
+    fs::write(&changed, "{}\n").unwrap();
+
+    let config = Config {
+        lsp_servers: vec![UserServerDef {
+            id: "protocol-watch".to_string(),
+            extensions: vec!["watchtest".to_string()],
+            binary: "protocol-watch".to_string(),
+            args: Vec::new(),
+            root_markers: vec!["marker.txt".to_string()],
+            env: HashMap::new(),
+            initialization_options: None,
+            disabled: false,
+        }],
+        ..Config::default()
+    };
+    let server_kind = ServerKind::Custom(Arc::from("protocol-watch"));
+    let mut manager = LspManager::new();
+    manager.override_binary(server_kind, executable_protocol_server_script());
+    manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "watch");
+
+    let keys = manager.ensure_server_for_file(&source, &config);
+    assert_eq!(keys.len(), 1);
+
+    let registered = collect_event(
+        &mut manager,
+        |event| {
+            matches!(
+                event,
+                LspEvent::ServerRequest { method, .. }
+                    if method == "client/registerCapability"
+            )
+        },
+        Duration::from_secs(2),
+    );
+    assert!(
+        registered.is_some(),
+        "server did not register watched files"
+    );
+
+    manager
+        .notify_files_watched_changed(
+            &[
+                (changed.clone(), FileChangeType::CHANGED),
+                (created, FileChangeType::CREATED),
+                (deleted, FileChangeType::DELETED),
+            ],
+            &config,
+        )
+        .expect("send watched-file change");
+    let watched = collect_optional_notification(
+        &mut manager,
+        "custom/watchedFilesChanged",
+        Duration::from_secs(2),
+    )
+    .expect("registered server should receive watched-file notification");
+    let event_types: Vec<i64> = watched["changes"]
+        .as_array()
+        .expect("changes array")
+        .iter()
+        .map(|change| change["type"].as_i64().expect("type number"))
+        .collect();
+    assert_eq!(event_types, vec![2, 1, 3]);
+
+    thread::sleep(Duration::from_millis(100));
+    let _ = manager.drain_events();
+
+    manager
+        .notify_files_watched_changed(&[(changed, FileChangeType::CHANGED)], &config)
+        .expect("skip after unregister");
+    assert!(
+        collect_optional_notification(
+            &mut manager,
+            "custom/watchedFilesChanged",
+            Duration::from_millis(250),
+        )
+        .is_none(),
+        "unregistered server must not receive watched-file notification"
+    );
+}
+
+#[test]
+fn workspace_pull_timeout_sends_cancel_request() {
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("workspace");
+    let source = root.join("main.wspull");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("marker.txt"), "marker\n").unwrap();
+    fs::write(&source, "content\n").unwrap();
+
+    let config = Config {
+        lsp_servers: vec![UserServerDef {
+            id: "protocol-workspace".to_string(),
+            extensions: vec!["wspull".to_string()],
+            binary: "protocol-workspace".to_string(),
+            args: Vec::new(),
+            root_markers: vec!["marker.txt".to_string()],
+            env: HashMap::new(),
+            initialization_options: None,
+            disabled: false,
+        }],
+        ..Config::default()
+    };
+    let server_kind = ServerKind::Custom(Arc::from("protocol-workspace"));
+    let mut manager = LspManager::new();
+    manager.override_binary(server_kind, executable_protocol_server_script());
+    manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "workspace-timeout");
+
+    let keys = manager.ensure_server_for_file(&source, &config);
+    assert_eq!(keys.len(), 1);
+
+    let started = Instant::now();
+    let result = manager
+        .pull_workspace_diagnostics(&keys[0], Some(Duration::from_millis(200)))
+        .expect("workspace pull result");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(result.cancelled);
+    assert!(!result.complete);
+
+    let cancel = collect_optional_notification(
+        &mut manager,
+        "custom/cancelReceived",
+        Duration::from_secs(2),
+    )
+    .expect("server should receive $/cancelRequest");
+    assert!(
+        cancel.get("id").is_some(),
+        "cancel params should include request id"
     );
 }
 
