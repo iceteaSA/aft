@@ -233,8 +233,8 @@ sed -E 's/  +/ /g; s/{/{\n    /; s/;}/;\n}/' "$file" > "$file.tmp" && mv "$file.
     await writeFile(h.path("ok.ts"), "export const ok = 1;\n", "utf8");
     await writeFile(h.path("fail.ts"), "export    const   fail   = 1;\n", "utf8");
 
-    const response = parseToolJson(
-      await tools.edit.execute(
+    await expect(
+      tools.edit.execute(
         {
           operations: [
             {
@@ -253,10 +253,8 @@ sed -E 's/  +/ /g; s/{/{\n    /; s/;}/;\n}/' "$file" > "$file.tmp" && mv "$file.
         },
         sdkCtx,
       ),
-    );
+    ).rejects.toThrow("missing");
 
-    expect(response.success).toBe(false);
-    expect(response.failed_operation).toBe(1);
     expect(await readTextFile(h.path("ok.ts"))).toBe("export const ok = 1;\n");
     expect(await readTextFile(h.path("fail.ts"))).toBe("export    const   fail   = 1;\n");
   });
@@ -369,8 +367,8 @@ sed -E 's/  +/ /g; s/{/{\n    /; s/;}/;\n}/' "$file" > "$file.tmp" && mv "$file.
     await writeFile(h.path("first.ts"), "export const first = 1;\n", "utf8");
     await writeFile(h.path("second.ts"), "export    const   second   = 1;\n", "utf8");
 
-    const response = parseToolJson(
-      await tools.edit.execute(
+    await expect(
+      tools.edit.execute(
         {
           operations: [
             {
@@ -389,17 +387,8 @@ sed -E 's/  +/ /g; s/{/{\n    /; s/;}/;\n}/' "$file" > "$file.tmp" && mv "$file.
         },
         sdkCtx,
       ),
-    );
+    ).rejects.toThrow("does-not-exist");
 
-    expect(response.success).toBe(false);
-    expect(response.code).toBe("transaction_failed");
-    expect(response.failed_operation).toBe(1);
-    expect(response.rolled_back).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ action: "restored", file: h.path("first.ts") }),
-        expect.objectContaining({ action: "restored", file: h.path("second.ts") }),
-      ]),
-    );
     expect(await readTextFile(h.path("first.ts"))).toBe("export const first = 1;\n");
     expect(await readTextFile(h.path("second.ts"))).toBe("export    const   second   = 1;\n");
   });

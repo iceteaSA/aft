@@ -300,22 +300,20 @@ describe("Tool round-trips", () => {
 
     // Transaction: write valid content to existing file, then write broken syntax to new file
     const brokenFile = resolve(tmpDir, "broken.ts");
-    const resultStr = await editTools.aft_edit.execute(
-      {
-        mode: "transaction",
-        operations: [
-          { file: existingFile, command: "write", content: "export const x = 999;\n" },
-          { file: brokenFile, command: "write", content: "export const {{{broken = ;\n" },
-        ],
-      },
-      sdkCtx,
-    );
-    const result = JSON.parse(resultStr);
-
-    // Transaction should fail due to syntax error
-    expect(result.success).toBe(false);
-    expect(result.code).toBe("transaction_failed");
-    expect(Array.isArray(result.rolled_back)).toBe(true);
+    // Transaction should throw due to syntax error instead of reporting a
+    // successful tool call with `{ success: false }` payload.
+    await expect(
+      editTools.aft_edit.execute(
+        {
+          mode: "transaction",
+          operations: [
+            { file: existingFile, command: "write", content: "export const x = 999;\n" },
+            { file: brokenFile, command: "write", content: "export const {{{broken = ;\n" },
+          ],
+        },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("syntax error");
 
     // Existing file should be restored to original content
     const restoredContent = await readFile(existingFile, "utf-8");

@@ -24,11 +24,11 @@ describe("session-directory", () => {
     // with "undefined is not an object (evaluating 'this._client')".
     class FakeSessionApi {
       private readonly _client = { ok: true };
-      async get(input: { sessionID: string }) {
+      async get(input: { path: { id: string } }) {
         // Throws if `this` is not the FakeSessionApi instance.
         if (!this._client?.ok)
           throw new Error("undefined is not an object (evaluating 'this._client')");
-        return { data: { id: input.sessionID, directory: "/from/session" } };
+        return { data: { id: input.path.id, directory: "/from/session" } };
       }
     }
     const client = { session: new FakeSessionApi() };
@@ -39,9 +39,10 @@ describe("session-directory", () => {
   test("returns the session-stored directory when client.session.get resolves", async () => {
     const client = {
       session: {
-        get: async (input: { sessionID: string; directory?: string }) => {
-          expect(input.sessionID).toBe("ses_foo");
-          return { data: { id: input.sessionID, directory: "/real/project" } };
+        get: async (input: { path: { id: string }; directory?: string }) => {
+          expect(input).toEqual({ path: { id: "ses_foo" } });
+          expect("directory" in input).toBe(false);
+          return { data: { id: input.path.id, directory: "/real/project" } };
         },
       },
     };

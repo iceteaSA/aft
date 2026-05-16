@@ -809,8 +809,11 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
             : path.resolve(context.directory, op.file as string),
         }));
 
-        const data = await callBridge(ctx, context, "transaction", { operations: resolvedOps });
-        return JSON.stringify(data);
+        const response = await callBridge(ctx, context, "transaction", { operations: resolvedOps });
+        if (response.success === false) {
+          throw new Error((response.message as string | undefined) ?? "transaction failed");
+        }
+        return JSON.stringify(response);
       }
 
       const file = args.filePath as string;
@@ -1538,6 +1541,10 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
         recursive,
       });
 
+      if (response.success === false) {
+        throw new Error((response.message as string | undefined) ?? "delete failed");
+      }
+
       const deletedEntries = (response.deleted as Array<{ file: string }> | undefined) ?? [];
       const skipped =
         (response.skipped_files as Array<{ file: string; reason: string }> | undefined) ?? [];
@@ -1675,7 +1682,7 @@ function formatError(error: unknown): string {
 export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const aftEditTool = createEditTool(ctx, "aft_write");
 
-  return {
+  const tools: Record<string, ToolDefinition> = {
     aft_read: createReadTool(ctx),
     aft_write: createWriteTool(ctx, "aft_edit"),
     aft_edit: {
@@ -1738,8 +1745,11 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
             create_dirs: normalizedArgs.create_dirs !== false,
             diagnostics: true,
           };
-          const data = await callBridge(ctx, context, "write", writeParams);
-          return JSON.stringify(data);
+          const response = await callBridge(ctx, context, "write", writeParams);
+          if (response.success === false) {
+            throw new Error((response.message as string | undefined) ?? "write failed");
+          }
+          return JSON.stringify(response);
         }
 
         return aftEditTool.execute(normalizedArgs, context);
@@ -1749,4 +1759,20 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
     aft_delete: createDeleteTool(ctx),
     aft_move: createMoveTool(ctx),
   };
+
+  // Keep hoist-off mode consistent with hoisted mode: bash-family tools are
+  // available only when an experimental bash path is enabled, but the primary
+  // bash tool uses the aft_ prefix to avoid overriding OpenCode's native bash.
+  const bashRewrite = ctx.config.experimental?.bash?.rewrite === true;
+  const bashCompress = ctx.config.experimental?.bash?.compress === true;
+  const bashBackground = ctx.config.experimental?.bash?.background === true;
+  const anyBashExperimental = bashRewrite || bashCompress || bashBackground;
+
+  if (anyBashExperimental) {
+    tools.aft_bash = createBashTool(ctx);
+    tools.bash_status = createBashStatusTool(ctx);
+    tools.bash_kill = createBashKillTool(ctx);
+  }
+
+  return tools;
 }

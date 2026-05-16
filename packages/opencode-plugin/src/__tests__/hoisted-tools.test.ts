@@ -7,7 +7,7 @@ import { resolve } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { consumeToolMetadata } from "../metadata-store.js";
-import { hoistedTools } from "../tools/hoisted.js";
+import { aftPrefixedTools, hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
 
@@ -33,8 +33,11 @@ function createMockClient(): any {
 }
 
 /** Helper to create a PluginContext with a pool and a mock client. */
-function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient(), config: {} as any, storageDir: "/tmp/aft-test" };
+function createPluginContext(
+  pool: BridgePool,
+  config: PluginContext["config"] = {} as PluginContext["config"],
+): PluginContext {
+  return { pool, client: createMockClient(), config, storageDir: "/tmp/aft-test" };
 }
 
 /** Mock SDK ToolContext for test execute calls. */
@@ -178,6 +181,20 @@ describe("Hoisted tool execute handlers", () => {
     ).rejects.toThrow("Cannot delete protected file");
   });
 
+  test("delete throws the Rust error response before synthesizing success", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command) => {
+      expect(command).toBe("delete_file");
+      return { success: false, message: "bridge delete refused" };
+    });
+
+    await expect(tools.aft_delete.execute({ files: ["doomed.ts"] }, sdkCtx)).rejects.toThrow(
+      "bridge delete refused",
+    );
+  });
+
   test("delete returns partial-success payload when some files fail", async () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
@@ -290,6 +307,47 @@ describe("Hoisted tool execute handlers", () => {
         session_id: "test",
       },
     });
+  });
+
+  test("transaction edit throws the Rust error response", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command) => {
+      expect(command).toBe("transaction");
+      return { success: false, message: "transaction rejected" };
+    });
+
+    await expect(
+      tools.edit.execute(
+        {
+          operations: [{ file: "a.ts", command: "write", content: "export const a = 1;\n" }],
+        },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("transaction rejected");
+  });
+
+  test('legacy aft_edit mode:"write" throws the Rust error response', async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const pool = {
+      getBridge: () => ({
+        send: async (command: string) => {
+          expect(command).toBe("write");
+          return { success: false, message: "legacy write refused" };
+        },
+      }),
+    } as unknown as BridgePool;
+    const tools = aftPrefixedTools(createPluginContext(pool));
+
+    await expect(
+      tools.aft_edit.execute(
+        { mode: "write", file: "legacy.ts", content: "export const x = 1;\n" },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("legacy write refused");
   });
 
   test("edit forwards replaceAll to Rust for multiple occurrences", async () => {
@@ -999,7 +1057,7 @@ describe("Hoisted tool execute handlers", () => {
  * `.alfonso/athena/council-aft-bash-timeout-audit-057818e1583d3883/`.)
  */
 describe("Hoisted bash gating", () => {
-  function toolsWithBashConfig(bash: Record<string, boolean> | undefined) {
+  function toolsWithBashConfig(bash: Record<string, boolean> | undefined, prefixed = false) {
     const pool = { getBridge: () => ({ send: async () => ({}) }) } as unknown as BridgePool;
     const ctx: PluginContext = {
       pool,
@@ -1007,7 +1065,7 @@ describe("Hoisted bash gating", () => {
       config: { experimental: bash ? { bash } : undefined } as PluginContext["config"],
       storageDir: "/tmp/aft-test",
     };
-    return hoistedTools(ctx);
+    return prefixed ? aftPrefixedTools(ctx) : hoistedTools(ctx);
   }
 
   test("no experimental.bash config → bash/bash_status/bash_kill NOT registered", () => {
@@ -1055,5 +1113,21 @@ describe("Hoisted bash gating", () => {
     expect(tools.bash).toBeDefined();
     expect(tools.bash_status).toBeDefined();
     expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("hoist-off experimental.bash.rewrite=true → aft_bash plus status/kill registered", () => {
+    const tools = toolsWithBashConfig({ rewrite: true }, true);
+    expect(tools.aft_bash).toBeDefined();
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("hoist-off with all bash flags false → no bash-family tools registered", () => {
+    const tools = toolsWithBashConfig({ rewrite: false, compress: false, background: false }, true);
+    expect(tools.aft_bash).toBeUndefined();
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeUndefined();
+    expect(tools.bash_kill).toBeUndefined();
   });
 });

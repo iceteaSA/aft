@@ -291,14 +291,15 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     await seedFile(okFile);
     await seedFile(failFile);
 
-    const { data } = await editTool(h).execute({
-      operations: [
-        { file: okFile, command: "edit_match", match: "alpha = 1", replacement: "alpha=  2" },
-        { file: failFile, command: "edit_match", match: "does not exist", replacement: "x" },
-      ],
-    });
+    await expect(
+      editTool(h).execute({
+        operations: [
+          { file: okFile, command: "edit_match", match: "alpha = 1", replacement: "alpha=  2" },
+          { file: failFile, command: "edit_match", match: "does not exist", replacement: "x" },
+        ],
+      }),
+    ).rejects.toThrow("does not exist");
 
-    expect(data.success).toBe(false);
     expect(await readFile(okFile, "utf8")).toContain("export const alpha = 1;");
     expect(
       (await readFile(h.path("src", "formatter-count.log"), "utf8")).trim().split("\n"),

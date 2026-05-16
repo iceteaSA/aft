@@ -28,8 +28,9 @@ interface SessionInfo {
 interface OpenCodeClientShape {
   session?: {
     get?: (input: {
-      sessionID: string;
-      directory?: string;
+      path: { id: string };
+      query?: { directory?: string };
+      throwOnError?: boolean;
     }) => Promise<{ data?: SessionInfo } | SessionInfo | undefined>;
   };
 }
@@ -45,9 +46,10 @@ const CACHE_MAX_ENTRIES = 200;
 const cache = new Map<string, CacheEntry>();
 
 /**
- * Resolve the project directory the session was created with. Returns
- * `null` when the lookup is unavailable or fails — callers should fall
- * back to the runtime's directory in that case.
+ * Resolve the project directory the session was created with from the SDK's
+ * session object. Returns the SDK-reported directory, or `null` when the
+ * lookup is unavailable/fails — callers should fall back to the runtime's
+ * directory in that case.
  *
  * This function is best-effort: any error (missing `client.session.get`,
  * network failure, malformed response) is logged and recorded as a
@@ -81,7 +83,11 @@ export async function getSessionDirectory(
     // Call as a method so the SDK's `this._client` reference resolves
     // correctly. Extracting `c.session.get` into a local would lose the
     // binding and crash the SDK with "undefined is not an object".
-    const result = await sessionApi.get({ sessionID: sessionId, directory: fallbackDirectory });
+    // SDK schema: SessionGetData uses `path: { id }`, NOT a flat
+    // `sessionID`. Do NOT pass `directory` — looking up a session by ID is an
+    // identity query, and newer SDKs don't accept a top-level directory here.
+    void fallbackDirectory;
+    const result = await sessionApi.get({ path: { id: sessionId } });
     // SDK responses come either as `{ data: Session }` or directly as `Session`
     // depending on `ThrowOnError`. Handle both shapes.
     const session: SessionInfo | undefined =
