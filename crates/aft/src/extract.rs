@@ -370,26 +370,20 @@ fn collect_param_identifiers(
 
 /// Find the innermost function node that encloses `byte_pos`.
 fn find_enclosing_function<'a>(root: &Node<'a>, byte_pos: usize, lang: LangId) -> Option<Node<'a>> {
-    let fn_kinds: &[&str] = match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
-            &[
-                "function_declaration",
-                "method_definition",
-                "arrow_function",
-                "lexical_declaration", // for const foo = () => ...
-            ]
-        }
-        LangId::Python => &["function_definition"],
-        _ => &[],
-    };
-
-    find_deepest_ancestor(root, byte_pos, fn_kinds)
+    find_deepest_function_ancestor(root, byte_pos, lang)
 }
 
-/// Find the deepest ancestor node (of the given kinds) that contains `byte_pos`.
-fn find_deepest_ancestor<'a>(node: &Node<'a>, byte_pos: usize, kinds: &[&str]) -> Option<Node<'a>> {
+/// Find the deepest function-like ancestor that contains `byte_pos`.
+fn find_deepest_function_ancestor<'a>(
+    node: &Node<'a>,
+    byte_pos: usize,
+    lang: LangId,
+) -> Option<Node<'a>> {
     let mut result: Option<Node<'a>> = None;
-    if kinds.contains(&node.kind()) && node.start_byte() <= byte_pos && byte_pos < node.end_byte() {
+    if is_function_like_boundary(node, byte_pos, lang)
+        && node.start_byte() <= byte_pos
+        && byte_pos < node.end_byte()
+    {
         result = Some(*node);
     }
 
@@ -397,7 +391,7 @@ fn find_deepest_ancestor<'a>(node: &Node<'a>, byte_pos: usize, kinds: &[&str]) -
     for i in 0..child_count {
         if let Some(child) = node.child(i as u32) {
             if child.start_byte() <= byte_pos && byte_pos < child.end_byte() {
-                if let Some(deeper) = find_deepest_ancestor(&child, byte_pos, kinds) {
+                if let Some(deeper) = find_deepest_function_ancestor(&child, byte_pos, lang) {
                     result = Some(deeper);
                 }
             }
@@ -405,6 +399,45 @@ fn find_deepest_ancestor<'a>(node: &Node<'a>, byte_pos: usize, kinds: &[&str]) -
     }
 
     result
+}
+
+fn is_function_like_boundary(node: &Node, byte_pos: usize, lang: LangId) -> bool {
+    match lang {
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => match node.kind() {
+            "function_declaration"
+            | "method_definition"
+            | "arrow_function"
+            | "function_expression" => true,
+            "lexical_declaration" => lexical_declaration_has_function_initializer(node, byte_pos),
+            _ => false,
+        },
+        LangId::Python => node.kind() == "function_definition",
+        _ => false,
+    }
+}
+
+fn lexical_declaration_has_function_initializer(node: &Node, byte_pos: usize) -> bool {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.kind() == "variable_declarator" {
+                if let Some(value) = child.child_by_field_name("value") {
+                    if matches!(value.kind(), "arrow_function" | "function_expression")
+                        && child.start_byte() <= byte_pos
+                        && byte_pos < child.end_byte()
+                    {
+                        return true;
+                    }
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    false
 }
 
 /// Check if `this` (JS/TS) or `self` (Python) appears in the byte range.
@@ -472,6 +505,62 @@ pub enum ReturnKind {
     Void,
 }
 
+const RETURN_VARIABLE_ASSIGNMENT_PREFIX: &str = "\0assignment:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsDeclarationKind {
+    Const,
+    Let,
+    Var,
+    Assignment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReturnVariableBinding {
+    name: String,
+    js_kind: JsDeclarationKind,
+}
+
+impl ReturnVariableBinding {
+    fn encoded_for_return_kind(&self) -> String {
+        match self.js_kind {
+            JsDeclarationKind::Const => self.name.clone(),
+            JsDeclarationKind::Let => format!("let {}", self.name),
+            JsDeclarationKind::Var => format!("var {}", self.name),
+            JsDeclarationKind::Assignment => {
+                format!("{}{}", RETURN_VARIABLE_ASSIGNMENT_PREFIX, self.name)
+            }
+        }
+    }
+}
+
+fn parse_return_variable(var: &str) -> ReturnVariableBinding {
+    if let Some(name) = var.strip_prefix(RETURN_VARIABLE_ASSIGNMENT_PREFIX) {
+        return ReturnVariableBinding {
+            name: name.to_string(),
+            js_kind: JsDeclarationKind::Assignment,
+        };
+    }
+
+    for (prefix, js_kind) in [
+        ("let ", JsDeclarationKind::Let),
+        ("var ", JsDeclarationKind::Var),
+        ("const ", JsDeclarationKind::Const),
+    ] {
+        if let Some(name) = var.strip_prefix(prefix) {
+            return ReturnVariableBinding {
+                name: name.to_string(),
+                js_kind,
+            };
+        }
+    }
+
+    ReturnVariableBinding {
+        name: var.to_string(),
+        js_kind: JsDeclarationKind::Const,
+    }
+}
+
 /// Detect what the extracted code range should return.
 ///
 /// 1. If there's an explicit `return` statement in the range, use its expression.
@@ -487,25 +576,20 @@ pub fn detect_return_value(
     lang: LangId,
 ) -> ReturnKind {
     let root = tree.root_node();
+    let effective_enclosing_fn_end_byte = find_enclosing_function(&root, start_byte, lang)
+        .map(|node| node.end_byte())
+        .or(enclosing_fn_end_byte);
 
     // Check for explicit return statements in the range
     if let Some(expr) = find_return_in_range(&root, source, start_byte, end_byte) {
         return ReturnKind::Expression(expr);
     }
 
-    // Collect declarations in the range
-    let mut in_range_decls: HashSet<String> = HashSet::new();
-    collect_declarations_in_range(
-        &root,
-        source,
-        start_byte,
-        end_byte,
-        lang,
-        &mut in_range_decls,
-    );
+    let in_range_bindings =
+        collect_return_bindings_in_range(&root, source, start_byte, end_byte, lang);
 
     // Check if any in-range declaration is used after the range in the enclosing fn
-    if let Some(fn_end) = enclosing_fn_end_byte {
+    if let Some(fn_end) = effective_enclosing_fn_end_byte {
         let post_range_end = fn_end.min(source.len());
         if end_byte < post_range_end {
             let mut post_refs: Vec<String> = Vec::new();
@@ -518,15 +602,127 @@ pub fn detect_return_value(
                 &mut post_refs,
             );
 
-            for decl in &in_range_decls {
-                if post_refs.contains(decl) {
-                    return ReturnKind::Variable(decl.clone());
+            for binding in &in_range_bindings {
+                if post_refs.contains(&binding.name) {
+                    return ReturnKind::Variable(binding.encoded_for_return_kind());
                 }
             }
         }
     }
 
     ReturnKind::Void
+}
+
+/// Collect in-range names that can be returned to preserve post-range uses.
+fn collect_return_bindings_in_range(
+    node: &Node,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    lang: LangId,
+) -> Vec<ReturnVariableBinding> {
+    let mut bindings = Vec::new();
+    collect_return_bindings_recursive(node, source, start_byte, end_byte, lang, &mut bindings);
+    bindings
+}
+
+fn collect_return_bindings_recursive(
+    node: &Node,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    lang: LangId,
+    out: &mut Vec<ReturnVariableBinding>,
+) {
+    if node.end_byte() <= start_byte || node.start_byte() >= end_byte {
+        return;
+    }
+
+    match lang {
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
+            if node.kind() == "variable_declarator" {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    if name_node.start_byte() >= start_byte && name_node.end_byte() <= end_byte {
+                        let name = node_text(source, &name_node).to_string();
+                        out.push(ReturnVariableBinding {
+                            name,
+                            js_kind: js_declaration_kind_for_declarator(node),
+                        });
+                    }
+                }
+            } else if is_assignment_node(node) {
+                if let Some(left) = node.child_by_field_name("left") {
+                    if left.kind() == "identifier"
+                        && left.start_byte() >= start_byte
+                        && left.end_byte() <= end_byte
+                    {
+                        out.push(ReturnVariableBinding {
+                            name: node_text(source, &left).to_string(),
+                            js_kind: JsDeclarationKind::Assignment,
+                        });
+                    }
+                }
+            }
+        }
+        LangId::Python => {
+            if node.kind() == "assignment" {
+                if let Some(left) = node.child_by_field_name("left") {
+                    if left.kind() == "identifier"
+                        && left.start_byte() >= start_byte
+                        && left.end_byte() <= end_byte
+                    {
+                        out.push(ReturnVariableBinding {
+                            name: node_text(source, &left).to_string(),
+                            js_kind: JsDeclarationKind::Assignment,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            collect_return_bindings_recursive(&child, source, start_byte, end_byte, lang, out);
+        }
+    }
+}
+
+fn js_declaration_kind_for_declarator(node: &Node) -> JsDeclarationKind {
+    let Some(parent) = node.parent() else {
+        return JsDeclarationKind::Const;
+    };
+
+    match parent.kind() {
+        "variable_declaration" => JsDeclarationKind::Var,
+        "lexical_declaration" => {
+            let mut cursor = parent.walk();
+            if cursor.goto_first_child() {
+                loop {
+                    let child = cursor.node();
+                    match child.kind() {
+                        "let" => return JsDeclarationKind::Let,
+                        "const" => return JsDeclarationKind::Const,
+                        _ => {}
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+            JsDeclarationKind::Const
+        }
+        _ => JsDeclarationKind::Const,
+    }
+}
+
+fn is_assignment_node(node: &Node) -> bool {
+    matches!(
+        node.kind(),
+        "assignment_expression" | "augmented_assignment_expression" | "assignment"
+    )
 }
 
 /// Find an explicit `return` statement in the byte range and return its expression text.
@@ -637,19 +833,25 @@ fn generate_ts_function(
         base_indent, name, params_str
     ));
 
-    // Re-indent body to be inside the function
+    // Re-indent body to be inside the function while preserving relative nesting.
+    let common_indent = common_leading_indent(body_text);
     for line in body_text.lines() {
         if line.trim().is_empty() {
             lines.push(String::new());
         } else {
-            lines.push(format!("{}{}{}", base_indent, indent_unit, line.trim()));
+            let body_line = strip_leading_indent(line, &common_indent);
+            lines.push(format!("{}{}{}", base_indent, indent_unit, body_line));
         }
     }
 
     // Add return statement if needed
     match return_kind {
         ReturnKind::Variable(var) => {
-            lines.push(format!("{}{}return {};", base_indent, indent_unit, var));
+            let binding = parse_return_variable(var);
+            lines.push(format!(
+                "{}{}return {};",
+                base_indent, indent_unit, binding.name
+            ));
         }
         ReturnKind::Expression(_) => {
             // The return is already in the body text
@@ -674,19 +876,25 @@ fn generate_py_function(
 
     lines.push(format!("{}def {}({}):", base_indent, name, params_str));
 
-    // Re-indent body
+    // Re-indent body while preserving relative nesting.
+    let common_indent = common_leading_indent(body_text);
     for line in body_text.lines() {
         if line.trim().is_empty() {
             lines.push(String::new());
         } else {
-            lines.push(format!("{}{}{}", base_indent, indent_unit, line.trim()));
+            let body_line = strip_leading_indent(line, &common_indent);
+            lines.push(format!("{}{}{}", base_indent, indent_unit, body_line));
         }
     }
 
     // Add return statement if needed
     match return_kind {
         ReturnKind::Variable(var) => {
-            lines.push(format!("{}{}return {}", base_indent, indent_unit, var));
+            let binding = parse_return_variable(var);
+            lines.push(format!(
+                "{}{}return {}",
+                base_indent, indent_unit, binding.name
+            ));
         }
         ReturnKind::Expression(_) => {
             // Already in body
@@ -695,6 +903,44 @@ fn generate_py_function(
     }
 
     lines.join("\n")
+}
+
+fn common_leading_indent(text: &str) -> String {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+
+    let mut common = leading_whitespace(first).to_string();
+    for line in lines {
+        let indent = leading_whitespace(line);
+        let common_len = common
+            .char_indices()
+            .zip(indent.char_indices())
+            .take_while(|((_, left), (_, right))| left == right)
+            .map(|((idx, ch), _)| idx + ch.len_utf8())
+            .last()
+            .unwrap_or(0);
+        common.truncate(common_len);
+        if common.is_empty() {
+            break;
+        }
+    }
+
+    common
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    let trimmed = line.trim_start_matches(|ch: char| ch == ' ' || ch == '\t');
+    &line[..line.len() - trimmed.len()]
+}
+
+fn strip_leading_indent<'a>(line: &'a str, indent: &str) -> &'a str {
+    if indent.is_empty() {
+        line
+    } else {
+        line.strip_prefix(indent).unwrap_or(line)
+    }
 }
 
 /// Generate the call site text that replaces the extracted range.
@@ -710,10 +956,25 @@ pub fn generate_call_site(
     match return_kind {
         ReturnKind::Variable(var) => match lang {
             LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
-                format!("{}const {} = {}({});", indent, var, name, args_str)
+                let binding = parse_return_variable(var);
+                match binding.js_kind {
+                    JsDeclarationKind::Const => {
+                        format!("{}const {} = {}({});", indent, binding.name, name, args_str)
+                    }
+                    JsDeclarationKind::Let => {
+                        format!("{}let {} = {}({});", indent, binding.name, name, args_str)
+                    }
+                    JsDeclarationKind::Var => {
+                        format!("{}var {} = {}({});", indent, binding.name, name, args_str)
+                    }
+                    JsDeclarationKind::Assignment => {
+                        format!("{}{} = {}({});", indent, binding.name, name, args_str)
+                    }
+                }
             }
             LangId::Python => {
-                format!("{}{} = {}({})", indent, var, name, args_str)
+                let binding = parse_return_variable(var);
+                format!("{}{} = {}({})", indent, binding.name, name, args_str)
             }
             _ => format!("{}const {} = {}({});", indent, var, name, args_str),
         },
@@ -915,13 +1176,17 @@ pub fn substitute_params(
         None => return body_text.to_string(),
     };
 
-    // Collect all identifier nodes that match parameter names
+    // Collect identifier references that are still bound to the inlined function's
+    // parameters. Nested functions and local shadowing declarations are skipped.
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let shadowed = HashSet::new();
     collect_param_replacements(
         &tree.root_node(),
         body_text,
         param_to_arg,
         lang,
+        &shadowed,
+        true,
         &mut replacements,
     );
 
@@ -942,16 +1207,27 @@ fn collect_param_replacements(
     source: &str,
     param_to_arg: &std::collections::HashMap<String, String>,
     lang: LangId,
+    shadowed: &HashSet<String>,
+    is_root: bool,
     out: &mut Vec<(usize, usize, String)>,
 ) {
+    if !is_root && is_function_scope_node(node, lang) {
+        return;
+    }
+
+    let mut current_shadowed = shadowed.clone();
+    collect_shadowing_bindings_in_scope(node, source, param_to_arg, lang, &mut current_shadowed);
+
     let kind = node.kind();
 
     if kind == "identifier" {
         // Check it's not a property access
-        if !is_property_access(node, lang) {
+        if !is_property_access(node, lang) && !is_binding_identifier(node) {
             let name = node_text(source, node);
-            if let Some(replacement) = param_to_arg.get(name) {
-                out.push((node.start_byte(), node.end_byte(), replacement.clone()));
+            if !current_shadowed.contains(name) {
+                if let Some(replacement) = param_to_arg.get(name) {
+                    out.push((node.start_byte(), node.end_byte(), replacement.clone()));
+                }
             }
         }
     }
@@ -961,9 +1237,165 @@ fn collect_param_replacements(
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i as u32) {
-            collect_param_replacements(&child, source, param_to_arg, lang, out);
+            collect_param_replacements(
+                &child,
+                source,
+                param_to_arg,
+                lang,
+                &current_shadowed,
+                false,
+                out,
+            );
         }
     }
+}
+
+fn collect_shadowing_bindings_in_scope(
+    scope: &Node,
+    source: &str,
+    param_to_arg: &std::collections::HashMap<String, String>,
+    lang: LangId,
+    out: &mut HashSet<String>,
+) {
+    collect_shadowing_bindings_in_scope_recursive(
+        scope,
+        scope.id(),
+        source,
+        param_to_arg,
+        lang,
+        out,
+    );
+}
+
+fn collect_shadowing_bindings_in_scope_recursive(
+    node: &Node,
+    scope_id: usize,
+    source: &str,
+    param_to_arg: &std::collections::HashMap<String, String>,
+    lang: LangId,
+    out: &mut HashSet<String>,
+) {
+    if node.id() != scope_id {
+        if is_function_scope_node(node, lang) || is_block_scope_node(node, lang) {
+            return;
+        }
+    }
+
+    match node.kind() {
+        "variable_declarator" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_shadowing_names_from_pattern(&name, source, param_to_arg, out);
+            }
+        }
+        "catch_clause" => {
+            if let Some(parameter) = node.child_by_field_name("parameter") {
+                collect_shadowing_names_from_pattern(&parameter, source, param_to_arg, out);
+            }
+        }
+        "for_in_statement" | "for_of_statement" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_shadowing_names_from_pattern(&left, source, param_to_arg, out);
+            }
+        }
+        "assignment" if lang == LangId::Python => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_shadowing_names_from_pattern(&left, source, param_to_arg, out);
+            }
+        }
+        _ => {}
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            collect_shadowing_bindings_in_scope_recursive(
+                &child,
+                scope_id,
+                source,
+                param_to_arg,
+                lang,
+                out,
+            );
+        }
+    }
+}
+
+fn collect_shadowing_names_from_pattern(
+    node: &Node,
+    source: &str,
+    param_to_arg: &std::collections::HashMap<String, String>,
+    out: &mut HashSet<String>,
+) {
+    if node.kind() == "identifier" {
+        let name = node_text(source, node);
+        if param_to_arg.contains_key(name) {
+            out.insert(name.to_string());
+        }
+        return;
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            collect_shadowing_names_from_pattern(&child, source, param_to_arg, out);
+        }
+    }
+}
+
+fn is_function_scope_node(node: &Node, lang: LangId) -> bool {
+    match lang {
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => matches!(
+            node.kind(),
+            "function_declaration" | "method_definition" | "arrow_function" | "function_expression"
+        ),
+        LangId::Python => node.kind() == "function_definition" || node.kind() == "lambda",
+        _ => false,
+    }
+}
+
+fn is_block_scope_node(node: &Node, lang: LangId) -> bool {
+    match lang {
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => node.kind() == "statement_block",
+        LangId::Python => node.kind() == "block",
+        _ => false,
+    }
+}
+
+fn is_binding_identifier(node: &Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    if let Some(name) = parent.child_by_field_name("name") {
+        if name.id() == node.id() || node_is_inside(&name, node) {
+            return true;
+        }
+    }
+    if let Some(pattern) = parent.child_by_field_name("pattern") {
+        if pattern.id() == node.id() || node_is_inside(&pattern, node) {
+            return true;
+        }
+    }
+    if let Some(parameter) = parent.child_by_field_name("parameter") {
+        if parameter.id() == node.id() || node_is_inside(&parameter, node) {
+            return true;
+        }
+    }
+    if let Some(left) = parent.child_by_field_name("left") {
+        if matches!(
+            parent.kind(),
+            "for_in_statement" | "for_of_statement" | "assignment"
+        ) && (left.id() == node.id() || node_is_inside(&left, node))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn node_is_inside(container: &Node, node: &Node) -> bool {
+    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1505,21 @@ mod tests {
         assert!(
             !result.parameters.contains(&"console".to_string()),
             "'console' should not be a parameter, got: {:?}",
+            result.parameters
+        );
+    }
+
+    #[test]
+    fn free_vars_plain_lexical_declaration_uses_real_enclosing_function() {
+        let source = "function f(a: number) {\n  const x = a + 1;\n  return x;\n}\n";
+        let tree = parse_source(source, LangId::TypeScript);
+        let start = crate::edit::line_col_to_byte(source, 1, 0);
+        let end = crate::edit::line_col_to_byte(source, 2, 0);
+
+        let result = detect_free_variables(source, &tree, start, end, LangId::TypeScript);
+        assert!(
+            result.parameters.contains(&"a".to_string()),
+            "plain const declaration should not stop enclosing-function lookup: {:?}",
             result.parameters
         );
     }
@@ -1187,6 +1634,24 @@ class UserService:
     }
 
     #[test]
+    fn generate_ts_function_preserves_relative_indentation() {
+        let body = "  for (const item of items) {\n    if (item.active) {\n      console.log(item.name);\n    }\n  }";
+        let result = generate_extracted_function(
+            "processItems",
+            &["items".to_string()],
+            &ReturnKind::Void,
+            body,
+            "",
+            LangId::TypeScript,
+            IndentStyle::Spaces(2),
+        );
+        assert_eq!(
+            result,
+            "function processItems(items) {\n  for (const item of items) {\n    if (item.active) {\n      console.log(item.name);\n    }\n  }\n}"
+        );
+    }
+
+    #[test]
     fn generate_py_function_with_params() {
         let body = "doubled = x * 2\nadded = doubled + 10";
         let result = generate_extracted_function(
@@ -1212,6 +1677,18 @@ class UserService:
             LangId::TypeScript,
         );
         assert_eq!(call, "  const result = compute(x);");
+    }
+
+    #[test]
+    fn generate_call_site_preserves_let_return_var() {
+        let call = generate_call_site(
+            "compute",
+            &[],
+            &ReturnKind::Variable("let result".to_string()),
+            "  ",
+            LangId::TypeScript,
+        );
+        assert_eq!(call, "  let result = compute();");
     }
 
     #[test]
@@ -1366,17 +1843,18 @@ class UserService:
         let mut map = std::collections::HashMap::new();
         map.insert("i".to_string(), "index".to_string());
         let result = substitute_params(body, &map, LangId::TypeScript);
-        // `items` should be untouched, but the arrow param `i` and its use `i` should be replaced
-        assert!(
-            !result.contains("items") || result.contains("items"),
-            "items should be preserved"
-        );
-        // The `i` in `i => i > 0` should be replaced
-        assert!(
-            result.contains("index"),
-            "should contain 'index': {}",
-            result
-        );
+        // `items` should be untouched, and the nested arrow's shadowing `i`
+        // parameter/reference pair should also be left alone.
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn substitute_params_rewrites_outer_reference_not_shadowed_arrow_param() {
+        let body = "return x + items.map(x => x + 1)[0];";
+        let mut map = std::collections::HashMap::new();
+        map.insert("x".to_string(), "5".to_string());
+        let result = substitute_params(body, &map, LangId::TypeScript);
+        assert_eq!(result, "return 5 + items.map(x => x + 1)[0];");
     }
 
     #[test]

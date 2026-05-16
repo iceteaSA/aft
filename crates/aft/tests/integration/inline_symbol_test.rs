@@ -264,3 +264,41 @@ fn inline_symbol_preserves_call_site_indent() {
 
     aft.shutdown();
 }
+
+/// Parameter substitution should rewrite only references bound to the inlined
+/// function's parameters. Nested arrow parameters that shadow the same name must
+/// stay untouched.
+#[test]
+fn inline_symbol_does_not_substitute_shadowed_arrow_parameter() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("shadowed_arrow.ts");
+    std::fs::write(
+        &file,
+        "function f(x: number): number {\n  return x + items.map(x => x + 1)[0];\n}\n\nconst items = [1, 2];\n\nfunction main() {\n  const result = f(5);\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"f","call_site_line":8}}"#,
+        file.display()
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {:?}", resp);
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    let expected = "  const result = 5 + items.map(x => x + 1)[0];";
+    assert!(
+        content.contains(expected),
+        "outer `x` should be substituted while nested arrow `x` remains:\n{}",
+        content
+    );
+    assert!(
+        !content.contains("items.map(5 => 5 + 1)"),
+        "nested arrow parameter must not be substituted:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}

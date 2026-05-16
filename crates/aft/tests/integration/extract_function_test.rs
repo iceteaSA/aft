@@ -131,6 +131,114 @@ fn extract_function_with_return_value() {
     aft.shutdown();
 }
 
+/// A plain lexical declaration inside a real function is not itself a function
+/// boundary. Free-variable detection must keep walking to `function f(a)` and
+/// pass `a` into the extracted helper.
+#[test]
+fn extract_function_plain_const_keeps_enclosing_function_scope() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("plain_const.ts");
+    std::fs::write(
+        &file,
+        "function f(a: number) {\n  const x = a + 1;\n  return x;\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"extract_function","file":"{}","name":"makeX","start_line":2,"end_line":3}}"#,
+        file.display()
+    ));
+    assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
+
+    let params = resp["parameters"].as_array().expect("parameters array");
+    assert!(
+        params.iter().any(|param| param.as_str() == Some("a")),
+        "expected `a` to be detected as a free variable, got {:?}",
+        params
+    );
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("makeX(a)"),
+        "call site should pass `a` into extracted function:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
+/// Extracted function bodies should strip only the common selected indent and
+/// preserve relative nesting inside the extracted range.
+#[test]
+fn extract_function_preserves_nested_body_indentation() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("nested_indent.ts");
+    std::fs::write(
+        &file,
+        "function f(items: Array<{ active: boolean; name: string }>) {\n  for (const item of items) {\n    if (item.active) {\n      console.log(item.name);\n    }\n  }\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"extract_function","file":"{}","name":"processItems","start_line":2,"end_line":7}}"#,
+        file.display()
+    ));
+    assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    let expected = "function processItems(items) {\n  for (const item of items) {\n    if (item.active) {\n      console.log(item.name);\n    }\n  }\n}";
+    assert!(
+        content.contains(expected),
+        "expected preserved relative indentation:\n--- expected ---\n{}\n--- actual ---\n{}",
+        expected,
+        content
+    );
+
+    aft.shutdown();
+}
+
+/// Return-variable call-site generation must preserve mutable declaration
+/// shape instead of always rewriting to `const`.
+#[test]
+fn extract_function_preserves_let_return_binding() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("let_return.ts");
+    std::fs::write(
+        &file,
+        "function f() {\n  let result = compute();\n  result += 1;\n  return result;\n}\n\nfunction compute() {\n  return 1;\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"extract_function","file":"{}","name":"computeInitial","start_line":2,"end_line":3}}"#,
+        file.display()
+    ));
+    assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("let result = computeInitial();"),
+        "call site should preserve `let` binding:\n{}",
+        content
+    );
+    assert!(
+        !content.contains("const result = computeInitial();"),
+        "call site must not introduce const for a mutable result:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
 /// Python extract: verify correct `def` syntax.
 #[test]
 fn extract_function_python() {
