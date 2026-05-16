@@ -226,7 +226,7 @@ export class BridgePool {
    * Replace the binary path and restart all bridges.
    * Used after downloading a newer binary version.
    */
-  async replaceBinary(newPath: string): Promise<void> {
+  async replaceBinary(newPath: string): Promise<string> {
     this.binaryPath = newPath;
     // Clear the pool so next getBridge() creates fresh bridges with the new binary.
     // Old bridge processes are NOT killed — they continue running from the old
@@ -238,6 +238,7 @@ export class BridgePool {
     this.log(
       `Binary path updated to ${newPath}. All bridges cleared — next calls will use the new binary.`,
     );
+    return newPath;
   }
 
   private log(message: string, meta?: LogMeta): void {

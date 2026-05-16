@@ -126,6 +126,76 @@ process.stdin.resume();
     await expect(testBridge.checkVersion()).rejects.toThrow(/did not report a version/);
   });
 
+  test("version mismatch callback can swap binaries and retry the original request once", async () => {
+    const compatible = writeExecutable(
+      "compatible.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+    } else if (req.command === "version") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, version: "2.0.0" }) + "\\n");
+    } else {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, source: "compatible", command: req.command }) + "\\n");
+    }
+  }
+});
+`,
+    );
+    const stale = writeExecutable(
+      "stale.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+    } else if (req.command === "version") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, version: "0.1.0" }) + "\\n");
+      setTimeout(() => process.exit(1), 25);
+    } else {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, source: "stale", command: req.command }) + "\\n");
+    }
+  }
+});
+`,
+    );
+    let mismatchCalls = 0;
+    const bridge = new BinaryBridge(stale, workDir, {
+      timeoutMs: 5_000,
+      maxRestarts: 0,
+      minVersion: "1.0.0",
+      onVersionMismatch: async (binaryVersion, minVersion) => {
+        mismatchCalls++;
+        expect(binaryVersion).toBe("0.1.0");
+        expect(minVersion).toBe("1.0.0");
+        return compatible;
+      },
+    });
+
+    try {
+      const response = await bridge.send("ping");
+      expect(response).toMatchObject({ success: true, source: "compatible", command: "ping" });
+      expect(mismatchCalls).toBe(1);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
   test("configureWarningClients evicts entries after delivery and clears on shutdown", async () => {
     const delivered: unknown[] = [];
     const bridge = new BinaryBridge("/fake/aft", workDir, {

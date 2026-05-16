@@ -148,6 +148,20 @@ export interface ConfigureWarningsContext {
   warnings: ConfigureWarning[];
 }
 
+export type VersionMismatchCallbackResult = string | null | undefined;
+
+export type VersionMismatchCallback = (
+  binaryVersion: string,
+  minVersion: string,
+) => VersionMismatchCallbackResult | Promise<VersionMismatchCallbackResult>;
+
+class BridgeReplacedDuringVersionCheck extends Error {
+  constructor(public readonly newBinaryPath: string) {
+    super(`Bridge binary replaced during version check: ${newBinaryPath}`);
+    this.name = "BridgeReplacedDuringVersionCheck";
+  }
+}
+
 export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
@@ -155,8 +169,12 @@ export interface BridgeOptions {
   maxRestarts?: number;
   /** Minimum binary version required (semver). If the binary is older, onVersionMismatch is called. */
   minVersion?: string;
-  /** Called when binary version is older than minVersion. Receives (binaryVersion, minVersion). */
-  onVersionMismatch?: (binaryVersion: string, minVersion: string) => void;
+  /**
+   * Called when binary version is older than minVersion. Receives (binaryVersion, minVersion).
+   * Return a replacement binary path to coordinate a one-shot retry, null to abort, or void for
+   * legacy fire-and-forget behavior.
+   */
+  onVersionMismatch?: VersionMismatchCallback;
   /** Called after the first successful configure returns user-visible warnings. */
   onConfigureWarnings?: (context: ConfigureWarningsContext) => void | Promise<void>;
   /** Called for server-pushed background bash completions. */
@@ -266,7 +284,7 @@ export class BinaryBridge {
   private _configurePromise: Promise<void> | null = null;
   private configOverrides: Record<string, unknown>;
   private minVersion: string | undefined;
-  private onVersionMismatch: ((binaryVersion: string, minVersion: string) => void) | undefined;
+  private onVersionMismatch: VersionMismatchCallback | undefined;
   private onConfigureWarnings:
     | ((context: ConfigureWarningsContext) => void | Promise<void>)
     | undefined;
@@ -388,162 +406,189 @@ export class BinaryBridge {
     params: Record<string, unknown> = {},
     options?: SendOptions,
   ): Promise<Record<string, unknown>> {
-    if (this._shuttingDown) {
-      throw new Error(`${this.errorPrefix} Bridge is shutting down, cannot send "${command}"`);
-    }
+    return this.sendWithVersionMismatchRetry(command, params, options, true);
+  }
 
-    if (Object.hasOwn(params, "id")) {
-      throw new Error("params cannot contain reserved key 'id'");
-    }
+  private async sendWithVersionMismatchRetry(
+    command: string,
+    params: Record<string, unknown>,
+    options: SendOptions | undefined,
+    canRetryAfterVersionSwap: boolean,
+  ): Promise<Record<string, unknown>> {
+    try {
+      if (this._shuttingDown) {
+        throw new Error(`${this.errorPrefix} Bridge is shutting down, cannot send "${command}"`);
+      }
 
-    // Capture session_id BEFORE ensureSpawned so the spawn-time log line gets
-    // tagged with the triggering session. Bridges are project-keyed and serve
-    // many sessions over their lifetime, but the spawn itself is attributable
-    // to whichever session's tool call triggered it.
-    const requestSessionId =
-      typeof params.session_id === "string" && params.session_id.length > 0
-        ? params.session_id
-        : undefined;
+      if (Object.hasOwn(params, "id")) {
+        throw new Error("params cannot contain reserved key 'id'");
+      }
 
-    this.ensureSpawned(requestSessionId);
+      // Capture session_id BEFORE ensureSpawned so the spawn-time log line gets
+      // tagged with the triggering session. Bridges are project-keyed and serve
+      // many sessions over their lifetime, but the spawn itself is attributable
+      // to whichever session's tool call triggered it.
+      const requestSessionId =
+        typeof params.session_id === "string" && params.session_id.length > 0
+          ? params.session_id
+          : undefined;
 
-    // Auto-configure can reuse the initiating session's notification client
-    // when the deferred configure warning frame arrives later. One project
-    // bridge can serve many sessions, so keep this per-session instead of one
-    // bridge-wide "last client".
-    if (requestSessionId && options?.configureWarningClient !== undefined) {
-      this.configureWarningClients.set(requestSessionId, options.configureWarningClient);
-    }
+      this.ensureSpawned(requestSessionId);
 
-    // Auto-configure project root + plugin config on first command, then check version.
-    // configured is set AFTER success to prevent skipping configuration on failure (#18).
-    // When multiple parallel calls arrive before configure completes, they all await
-    // the same promise instead of each independently trying to configure.
-    if (!this.configured) {
-      if (command !== "configure" && command !== "version") {
-        if (!this._configurePromise) {
-          // First caller — create the configure promise.
-          // All parallel callers await this same promise.
-          //
-          // Forward the triggering call's session_id into configure so
-          // Rust's thread-local session context propagates through to
-          // background tasks spawned by configure (search-index pre-warm,
-          // semantic-index build). Without this, background log lines
-          // emitted by configure threads appear with no session prefix.
-          const sessionIdForConfigure =
-            typeof params.session_id === "string" ? (params.session_id as string) : undefined;
-          this._configurePromise = (async () => {
-            try {
-              const configResult = await this.send("configure", {
-                project_root: this.cwd,
-                ...this.configOverrides,
-                ...(sessionIdForConfigure ? { session_id: sessionIdForConfigure } : {}),
-              });
-              if (configResult.success === false) {
-                throw new Error(
-                  `${this.errorPrefix} Configure failed: ${configResult.message ?? "unknown error"}`,
-                );
+      // Auto-configure can reuse the initiating session's notification client
+      // when the deferred configure warning frame arrives later. One project
+      // bridge can serve many sessions, so keep this per-session instead of one
+      // bridge-wide "last client".
+      if (requestSessionId && options?.configureWarningClient !== undefined) {
+        this.configureWarningClients.set(requestSessionId, options.configureWarningClient);
+      }
+
+      // Auto-configure project root + plugin config on first command, then check version.
+      // configured is set AFTER success to prevent skipping configuration on failure (#18).
+      // When multiple parallel calls arrive before configure completes, they all await
+      // the same promise instead of each independently trying to configure.
+      if (!this.configured) {
+        if (command !== "configure" && command !== "version") {
+          if (!this._configurePromise) {
+            // First caller — create the configure promise.
+            // All parallel callers await this same promise.
+            //
+            // Forward the triggering call's session_id into configure so
+            // Rust's thread-local session context propagates through to
+            // background tasks spawned by configure (search-index pre-warm,
+            // semantic-index build). Without this, background log lines
+            // emitted by configure threads appear with no session prefix.
+            const sessionIdForConfigure =
+              typeof params.session_id === "string" ? (params.session_id as string) : undefined;
+            this._configurePromise = (async () => {
+              try {
+                const configResult = await this.send("configure", {
+                  project_root: this.cwd,
+                  ...this.configOverrides,
+                  ...(sessionIdForConfigure ? { session_id: sessionIdForConfigure } : {}),
+                });
+                if (configResult.success === false) {
+                  throw new Error(
+                    `${this.errorPrefix} Configure failed: ${configResult.message ?? "unknown error"}`,
+                  );
+                }
+                // Large-repo warning is emitted by the Rust side via log::warn!
+                // and relayed through stderr → plugin log. No need to re-log here
+                // (doing so would just duplicate the same line in aft-plugin.log).
+                await this.deliverConfigureWarnings(configResult, params, options);
+                await this.checkVersion();
+                // Re-check liveness after version check — checkVersion() swallows
+                // errors as best-effort, so the bridge may have died without throwing.
+                if (!this.isAlive()) {
+                  throw new Error(
+                    `${this.errorPrefix} Bridge died during version check. Check logs: ${getLogFilePath()}`,
+                  );
+                }
+                this.configured = true;
+              } finally {
+                this._configurePromise = null;
               }
-              // Large-repo warning is emitted by the Rust side via log::warn!
-              // and relayed through stderr → plugin log. No need to re-log here
-              // (doing so would just duplicate the same line in aft-plugin.log).
-              await this.deliverConfigureWarnings(configResult, params, options);
-              await this.checkVersion();
-              // Re-check liveness after version check — checkVersion() swallows
-              // errors as best-effort, so the bridge may have died without throwing.
-              if (!this.isAlive()) {
-                throw new Error(
-                  `${this.errorPrefix} Bridge died during version check. Check logs: ${getLogFilePath()}`,
-                );
-              }
-              this.configured = true;
-            } finally {
-              this._configurePromise = null;
-            }
-          })();
-        }
+            })();
+          }
 
-        // All callers (including the first) await the shared promise
-        await this._configurePromise;
-      }
-    }
-
-    const id = String(this.nextId++);
-    // Wire format: when params contains a key that collides with the protocol
-    // envelope (`command`/`method`), nest params under a `params` key so the
-    // outer dispatch dispatches on `command: "<bridge command>"` rather than
-    // the user's payload key. Reserved envelope fields (`session_id`,
-    // `lsp_hints`) must STILL be promoted to the top level so RawRequest's
-    // dedicated fields deserialize correctly. Without this promotion, e.g.
-    // `bash` (whose params include `command: "<shell command>"`) silently
-    // loses `session_id` because it stays nested inside `params`.
-    let request: Record<string, unknown>;
-    if (Object.hasOwn(params, "command") || Object.hasOwn(params, "method")) {
-      const nested: Record<string, unknown> = { ...params };
-      const reserved: Record<string, unknown> = {};
-      for (const key of ["session_id", "lsp_hints"] as const) {
-        if (Object.hasOwn(nested, key)) {
-          reserved[key] = nested[key];
-          delete nested[key];
+          // All callers (including the first) await the shared promise
+          await this._configurePromise;
         }
       }
-      request = { id, command, ...reserved, params: nested };
-    } else {
-      request = { id, command, ...params };
-    }
-    const line = `${JSON.stringify(request)}\n`;
 
-    // Per-op timeout override: tool wrappers can pass longer budgets for
-    // commands that legitimately need them (callers, trace_to, grep on big
-    // repos). Defaults to the bridge-wide timeout otherwise.
-    const effectiveTimeoutMs = options?.transportTimeoutMs ?? options?.timeoutMs ?? this.timeoutMs;
-
-    const keepBridgeOnTimeout = options?.keepBridgeOnTimeout === true;
-
-    return new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        const restartSuffix = keepBridgeOnTimeout ? "" : " — restarting bridge";
-        const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
-        if (requestSessionId) {
-          sessionWarn(requestSessionId, timeoutMsg);
-        } else {
-          warn(timeoutMsg);
-        }
-        reject(
-          new Error(
-            `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
-          ),
-        );
-        // Kill the hung process so the next request gets a fresh bridge —
-        // unless the caller explicitly opted out (e.g. bash, which enforces
-        // its own timeout on the Rust side and shouldn't lose warm bridge
-        // state when its response is merely late).
-        if (!keepBridgeOnTimeout) {
-          this.handleTimeout(requestSessionId);
-        }
-      }, effectiveTimeoutMs);
-
-      this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress });
-
-      if (!this.process?.stdin?.writable) {
-        this.pending.delete(id);
-        clearTimeout(timer);
-        reject(new Error(`${this.errorPrefix} stdin not writable for command "${command}"`));
-        return;
-      }
-
-      this.process.stdin.write(line, (err) => {
-        if (err) {
-          const entry = this.pending.get(id);
-          if (entry) {
-            this.pending.delete(id);
-            clearTimeout(entry.timer);
-            entry.reject(new Error(`${this.errorPrefix} Failed to write to stdin: ${err.message}`));
+      const id = String(this.nextId++);
+      // Wire format: when params contains a key that collides with the protocol
+      // envelope (`command`/`method`), nest params under a `params` key so the
+      // outer dispatch dispatches on `command: "<bridge command>"` rather than
+      // the user's payload key. Reserved envelope fields (`session_id`,
+      // `lsp_hints`) must STILL be promoted to the top level so RawRequest's
+      // dedicated fields deserialize correctly. Without this promotion, e.g.
+      // `bash` (whose params include `command: "<shell command>"`) silently
+      // loses `session_id` because it stays nested inside `params`.
+      let request: Record<string, unknown>;
+      if (Object.hasOwn(params, "command") || Object.hasOwn(params, "method")) {
+        const nested: Record<string, unknown> = { ...params };
+        const reserved: Record<string, unknown> = {};
+        for (const key of ["session_id", "lsp_hints"] as const) {
+          if (Object.hasOwn(nested, key)) {
+            reserved[key] = nested[key];
+            delete nested[key];
           }
         }
+        request = { id, command, ...reserved, params: nested };
+      } else {
+        request = { id, command, ...params };
+      }
+      const line = `${JSON.stringify(request)}\n`;
+
+      // Per-op timeout override: tool wrappers can pass longer budgets for
+      // commands that legitimately need them (callers, trace_to, grep on big
+      // repos). Defaults to the bridge-wide timeout otherwise.
+      const effectiveTimeoutMs =
+        options?.transportTimeoutMs ?? options?.timeoutMs ?? this.timeoutMs;
+
+      const keepBridgeOnTimeout = options?.keepBridgeOnTimeout === true;
+
+      return new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.pending.delete(id);
+          const restartSuffix = keepBridgeOnTimeout ? "" : " — restarting bridge";
+          const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
+          if (requestSessionId) {
+            sessionWarn(requestSessionId, timeoutMsg);
+          } else {
+            warn(timeoutMsg);
+          }
+          reject(
+            new Error(
+              `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
+            ),
+          );
+          // Kill the hung process so the next request gets a fresh bridge —
+          // unless the caller explicitly opted out (e.g. bash, which enforces
+          // its own timeout on the Rust side and shouldn't lose warm bridge
+          // state when its response is merely late).
+          if (!keepBridgeOnTimeout) {
+            this.handleTimeout(requestSessionId);
+          }
+        }, effectiveTimeoutMs);
+
+        this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress });
+
+        if (!this.process?.stdin?.writable) {
+          this.pending.delete(id);
+          clearTimeout(timer);
+          reject(new Error(`${this.errorPrefix} stdin not writable for command "${command}"`));
+          return;
+        }
+
+        this.process.stdin.write(line, (err) => {
+          if (err) {
+            const entry = this.pending.get(id);
+            if (entry) {
+              this.pending.delete(id);
+              clearTimeout(entry.timer);
+              entry.reject(
+                new Error(`${this.errorPrefix} Failed to write to stdin: ${err.message}`),
+              );
+            }
+          }
+        });
       });
-    });
+    } catch (err) {
+      if (
+        err instanceof BridgeReplacedDuringVersionCheck &&
+        canRetryAfterVersionSwap &&
+        command !== "configure" &&
+        command !== "version"
+      ) {
+        log(
+          `Retrying request "${command}" once after coordinated binary replacement: ${err.newBinaryPath}`,
+        );
+        return this.sendWithVersionMismatchRetry(command, params, options, false);
+      }
+      throw err;
+    }
   }
 
   private async deliverConfigureWarnings(
@@ -674,12 +719,54 @@ export class BinaryBridge {
       log(`Binary version: ${binaryVersion}`);
       if (compareSemver(binaryVersion, this.minVersion) < 0) {
         warn(`Binary version ${binaryVersion} is older than required ${this.minVersion}`);
-        this.onVersionMismatch?.(binaryVersion, this.minVersion);
+        const replacementPath = await this.onVersionMismatch?.(binaryVersion, this.minVersion);
+        if (replacementPath === undefined) {
+          // Backwards compatibility: legacy callbacks returned void and usually kicked off a
+          // fire-and-forget download + pool swap. Preserve that behavior for existing callers.
+          return;
+        }
+        if (replacementPath === null || replacementPath.length === 0) {
+          throw new Error(
+            `Binary version ${binaryVersion} is older than required ${this.minVersion}; no compatible replacement binary was provided`,
+          );
+        }
+
+        await this.replaceCurrentBinary(replacementPath);
+        throw new BridgeReplacedDuringVersionCheck(replacementPath);
       }
     } catch (err) {
       warn(`Version check failed: ${(err as Error).message}`);
       throw err;
     }
+  }
+
+  private async replaceCurrentBinary(newBinaryPath: string): Promise<void> {
+    this.binaryPath = newBinaryPath;
+    this.configured = false;
+    this.clearRestartResetTimer();
+    this.rejectAllPending(
+      new Error(`${this.errorPrefix} Bridge restarting with updated binary: ${newBinaryPath}`),
+    );
+
+    if (!this.process) return;
+
+    const proc = this.process;
+    this.process = null;
+
+    await new Promise<void>((resolve) => {
+      const forceKillTimer = setTimeout(() => {
+        proc.kill("SIGKILL");
+        resolve();
+      }, 5_000);
+
+      proc.once("exit", () => {
+        clearTimeout(forceKillTimer);
+        log("Process exited during coordinated binary replacement");
+        resolve();
+      });
+
+      proc.kill("SIGTERM");
+    });
   }
 
   private ensureSpawned(triggeringSessionId?: string): void {

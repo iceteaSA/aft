@@ -405,6 +405,11 @@ export async function fetchUrlToTempFile(
   }
   const allowPrivate = options.allowPrivate === true;
 
+  // Enforce the caller's current SSRF policy before consulting the disk cache.
+  // Otherwise a URL previously cached with allowPrivate=true could be replayed
+  // by a later allowPrivate=false call without re-validating the host.
+  await assertPublicUrl(parsed, allowPrivate, options.lookup);
+
   const dir = cacheDir(storageDir);
   mkdirSync(dir, { recursive: true });
 
