@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::Value;
@@ -91,6 +92,12 @@ pub enum EdgeResolution {
     Resolved { file: PathBuf, symbol: String },
     /// Could not resolve — callee name preserved for diagnostics.
     Unresolved { callee_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSymbol {
+    file: PathBuf,
+    symbol: String,
 }
 
 /// A single caller site: who calls a given symbol and from where.
@@ -518,6 +525,7 @@ pub struct CallGraph {
 impl CallGraph {
     /// Create a new call graph for a project.
     pub fn new(project_root: PathBuf) -> Self {
+        clear_workspace_package_cache();
         Self {
             data: HashMap::new(),
             project_root,
@@ -572,16 +580,19 @@ impl CallGraph {
             // Direct named import: import { foo } from './utils'
             if imp.names.iter().any(|name| name == short_name) {
                 if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
-                    let target_file = resolve_reexported_symbol_path(
+                    let target = resolve_reexported_symbol(
                         &resolved_path,
                         short_name,
                         &mut file_exports_symbol,
+                        &mut file_default_export_symbol,
                     )
-                    .unwrap_or(resolved_path);
-                    // The name in the import is the original name from the source module
-                    return EdgeResolution::Resolved {
-                        file: target_file,
+                    .unwrap_or(ResolvedSymbol {
+                        file: resolved_path,
                         symbol: short_name.to_owned(),
+                    });
+                    return EdgeResolution::Resolved {
+                        file: target.file,
+                        symbol: target.symbol,
                     };
                 }
             }
@@ -589,11 +600,20 @@ impl CallGraph {
             // Default import: import foo from './utils'
             if imp.default_import.as_deref() == Some(short_name) {
                 if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
-                    let symbol = file_default_export_symbol(&resolved_path)
-                        .unwrap_or_else(|| synthetic_default_symbol(&resolved_path));
-                    return EdgeResolution::Resolved {
+                    let target = resolve_reexported_symbol(
+                        &resolved_path,
+                        "default",
+                        &mut file_exports_symbol,
+                        &mut file_default_export_symbol,
+                    )
+                    .unwrap_or_else(|| ResolvedSymbol {
+                        symbol: file_default_export_symbol(&resolved_path)
+                            .unwrap_or_else(|| synthetic_default_symbol(&resolved_path)),
                         file: resolved_path,
-                        symbol,
+                    });
+                    return EdgeResolution::Resolved {
+                        file: target.file,
+                        symbol: target.symbol,
                     };
                 }
             }
@@ -606,9 +626,19 @@ impl CallGraph {
         if let Some((original_name, resolved_path)) =
             resolve_aliased_import(short_name, import_block, caller_dir)
         {
-            return EdgeResolution::Resolved {
+            let target = resolve_reexported_symbol(
+                &resolved_path,
+                &original_name,
+                &mut file_exports_symbol,
+                &mut file_default_export_symbol,
+            )
+            .unwrap_or(ResolvedSymbol {
                 file: resolved_path,
                 symbol: original_name,
+            });
+            return EdgeResolution::Resolved {
+                file: target.file,
+                symbol: target.symbol,
             };
         }
 
@@ -798,6 +828,18 @@ impl CallGraph {
                         }
                     }
                     EdgeResolution::Unresolved { callee_name } => {
+                        if let Some(local_child) = self.resolve_local_call_tree_child(
+                            &canon,
+                            symbol,
+                            call_site,
+                            &callee_name,
+                            max_depth,
+                            current_depth,
+                            visited,
+                        )? {
+                            children.push(local_child);
+                            continue;
+                        }
                         children.push(CallTreeNode {
                             name: callee_name,
                             file: self.relative_path(&canon),
@@ -821,6 +863,40 @@ impl CallGraph {
             resolved: true,
             children,
         })
+    }
+
+    fn resolve_local_call_tree_child(
+        &mut self,
+        canon: &Path,
+        current_symbol: &str,
+        call_site: &CallSite,
+        callee_name: &str,
+        max_depth: usize,
+        current_depth: usize,
+        visited: &mut HashSet<(PathBuf, String)>,
+    ) -> Result<Option<CallTreeNode>, AftError> {
+        let has_local_symbol = self
+            .lookup_file_data(canon)
+            .map(|data| data.symbol_metadata.contains_key(callee_name))
+            .unwrap_or(false);
+        if !has_local_symbol {
+            return Ok(None);
+        }
+        if callee_name == current_symbol {
+            return Ok(None);
+        }
+
+        match self.forward_tree_inner(canon, callee_name, max_depth, current_depth + 1, visited) {
+            Ok(child) => Ok(Some(child)),
+            Err(_) => Ok(Some(CallTreeNode {
+                name: callee_name.to_string(),
+                file: self.relative_path(canon),
+                line: call_site.line,
+                signature: None,
+                resolved: false,
+                children: vec![],
+            })),
+        }
     }
 
     /// Get all project files (lazily discovered).
@@ -935,6 +1011,10 @@ impl CallGraph {
                             (canon_caller.as_ref().clone(), callee_name, false)
                         }
                     };
+
+                    if target_file == *canon_caller.as_ref() && target_symbol == *symbol_name {
+                        continue;
+                    }
 
                     reverse
                         .entry(target_file)
@@ -2056,6 +2136,7 @@ impl CallGraph {
         self.reverse_index = None;
         // Clear project_files cache for create/remove events
         self.project_files = None;
+        clear_workspace_package_cache();
     }
 
     /// Return a path relative to the project root, or the absolute path if
@@ -2148,7 +2229,6 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
 
         let sites: Vec<CallSite> = raw_calls
             .into_iter()
-            .filter(|(_, short, _)| *short != sym.name) // exclude self-references
             .map(|(full, short, line)| CallSite {
                 callee_name: short,
                 full_callee: full,
@@ -2624,6 +2704,10 @@ pub(crate) fn resolve_module_path(from_dir: &Path, module_path: &str) -> Option<
         return None;
     }
 
+    if let Some(path) = resolve_tsconfig_path(from_dir, module_path) {
+        return Some(path);
+    }
+
     resolve_workspace_module_path(from_dir, module_path)
 }
 
@@ -2663,6 +2747,63 @@ fn resolve_workspace_module_path(from_dir: &Path, module_path: &str) -> Option<P
     let (package_name, subpath) = split_package_import(module_path)?;
     let package_root = find_package_root_for_import(from_dir, &package_name)?;
     resolve_package_entry(&package_root, &subpath)
+}
+
+fn resolve_tsconfig_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    let tsconfig_dir = find_tsconfig_dir(from_dir)?;
+    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"))?;
+    let compiler_options = tsconfig.get("compilerOptions")?;
+    let paths = compiler_options.get("paths")?.as_object()?;
+    let base_url = compiler_options
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    let base_dir = tsconfig_dir.join(base_url);
+
+    for (alias, targets) in paths {
+        let Some(capture) = ts_path_capture(alias, module_path) else {
+            continue;
+        };
+        let Some(targets) = targets.as_array() else {
+            continue;
+        };
+        for target in targets.iter().filter_map(Value::as_str) {
+            let target = if target.contains('*') {
+                target.replace('*', capture)
+            } else {
+                target.to_string()
+            };
+            if let Some(path) = resolve_file_like_path(&base_dir.join(target)) {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn find_tsconfig_dir(from_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        if dir.join("tsconfig.json").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {
+    if let Some(star_index) = alias.find('*') {
+        let (prefix, suffix_with_star) = alias.split_at(star_index);
+        let suffix = &suffix_with_star[1..];
+        if module_path.starts_with(prefix) && module_path.ends_with(suffix) {
+            return Some(&module_path[prefix.len()..module_path.len() - suffix.len()]);
+        }
+        return None;
+    }
+
+    (alias == module_path).then_some("")
 }
 
 fn split_package_import(module_path: &str) -> Option<(String, Option<String>)> {
@@ -2714,13 +2855,16 @@ fn find_workspace_root(from_dir: &Path) -> Option<PathBuf> {
 }
 
 fn is_workspace_root(dir: &Path) -> bool {
-    // Workspace package resolution depends on a package.json workspaces
-    // declaration. Package-manager lockfiles can also live inside nested
-    // package members; treating those as workspace roots stops the upward
-    // search before reaching the actual monorepo root.
     package_json_value(dir)
-        .and_then(|value| value.get("workspaces").cloned())
-        .is_some()
+        .map(|value| !workspace_patterns(&value).is_empty())
+        .unwrap_or(false)
+        || !pnpm_workspace_patterns(dir).is_empty()
+}
+
+fn clear_workspace_package_cache() {
+    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        cache.clear();
+    }
 }
 
 fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Option<PathBuf> {
@@ -2749,21 +2893,19 @@ fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Optio
 }
 
 fn workspace_member_dirs(workspace_root: &Path) -> Vec<PathBuf> {
-    let Some(package_json) = package_json_value(workspace_root) else {
-        return Vec::new();
-    };
+    let mut patterns = package_json_value(workspace_root)
+        .map(|package_json| workspace_patterns(&package_json))
+        .unwrap_or_default();
+    patterns.extend(pnpm_workspace_patterns(workspace_root));
 
-    workspace_patterns(&package_json)
-        .into_iter()
-        .flat_map(|pattern| expand_workspace_pattern(workspace_root, &pattern))
-        .collect()
+    expand_workspace_patterns(workspace_root, &patterns)
 }
 
 fn workspace_patterns(package_json: &Value) -> Vec<String> {
     match package_json.get("workspaces") {
         Some(Value::Array(items)) => items
             .iter()
-            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .filter_map(non_empty_workspace_pattern)
             .collect(),
         Some(Value::Object(map)) => map
             .get("packages")
@@ -2771,7 +2913,7 @@ fn workspace_patterns(package_json: &Value) -> Vec<String> {
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .filter_map(non_empty_workspace_pattern)
                     .collect()
             })
             .unwrap_or_default(),
@@ -2779,29 +2921,134 @@ fn workspace_patterns(package_json: &Value) -> Vec<String> {
     }
 }
 
-fn expand_workspace_pattern(workspace_root: &Path, pattern: &str) -> Vec<PathBuf> {
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        let parent = workspace_root.join(prefix);
-        return std::fs::read_dir(parent)
-            .ok()
-            .into_iter()
-            .flat_map(|entries| entries.filter_map(Result::ok))
-            .map(|entry| entry.path())
-            .filter(|path| path.join("package.json").is_file())
-            .collect();
+fn non_empty_workspace_pattern(value: &Value) -> Option<String> {
+    let pattern = value.as_str()?.trim();
+    (!pattern.is_empty()).then(|| pattern.to_string())
+}
+
+fn pnpm_workspace_patterns(workspace_root: &Path) -> Vec<String> {
+    let Ok(source) = std::fs::read_to_string(workspace_root.join("pnpm-workspace.yaml")) else {
+        return Vec::new();
+    };
+
+    let mut patterns = Vec::new();
+    let mut in_packages = false;
+    for line in source.lines() {
+        let without_comment = line.split('#').next().unwrap_or("").trim_end();
+        let trimmed = without_comment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "packages:" {
+            in_packages = true;
+            continue;
+        }
+        if !trimmed.starts_with('-') && !line.starts_with(' ') && !line.starts_with('\t') {
+            in_packages = false;
+        }
+        if in_packages {
+            if let Some(pattern) = trimmed.strip_prefix('-') {
+                let pattern = pattern.trim().trim_matches('"').trim_matches('\'');
+                if !pattern.is_empty() {
+                    patterns.push(pattern.to_string());
+                }
+            }
+        }
+    }
+    patterns
+}
+
+fn expand_workspace_patterns(workspace_root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let positive_patterns: Vec<&str> = patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty() && !pattern.starts_with('!'))
+        .collect();
+    if positive_patterns.is_empty() {
+        return Vec::new();
     }
 
-    let dir = workspace_root.join(pattern);
-    if dir.join("package.json").is_file() {
-        vec![dir]
-    } else {
-        Vec::new()
+    let positives = build_glob_set(&positive_patterns);
+    let negative_patterns: Vec<&str> = patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter_map(|pattern| pattern.strip_prefix('!'))
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .collect();
+    let negatives = build_glob_set(&negative_patterns);
+
+    let mut members = Vec::new();
+    collect_workspace_member_dirs(
+        workspace_root,
+        workspace_root,
+        &positives,
+        &negatives,
+        &mut members,
+    );
+    members
+}
+
+fn build_glob_set(patterns: &[&str]) -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        if let Ok(glob) = Glob::new(pattern) {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+}
+
+fn collect_workspace_member_dirs(
+    workspace_root: &Path,
+    dir: &Path,
+    positives: &GlobSet,
+    negatives: &GlobSet,
+    members: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            "node_modules" | ".git" | "target" | "dist" | "build"
+        ) {
+            continue;
+        }
+
+        if path.join("package.json").is_file() {
+            if let Ok(rel) = path.strip_prefix(workspace_root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if positives.is_match(&rel) && !negatives.is_match(&rel) {
+                    members.push(path.clone());
+                }
+            }
+        }
+
+        collect_workspace_member_dirs(workspace_root, &path, positives, negatives, members);
     }
 }
 
 fn package_json_value(dir: &Path) -> Option<Value> {
-    let package_json = std::fs::read_to_string(dir.join("package.json")).ok()?;
-    serde_json::from_str(&package_json).ok()
+    package_json_like_value(&dir.join("package.json"))
+}
+
+fn package_json_like_value(path: &Path) -> Option<Value> {
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&json).ok()
 }
 
 fn package_json_name(dir: &Path) -> Option<String> {
@@ -2911,40 +3158,55 @@ fn resolve_package_fallback(package_root: &Path, subpath: Option<&str>) -> Optio
     }
 }
 
-fn resolve_reexported_symbol_path<F>(
+fn resolve_reexported_symbol<F, D>(
     file: &Path,
     symbol_name: &str,
     file_exports_symbol: &mut F,
-) -> Option<PathBuf>
+    file_default_export_symbol: &mut D,
+) -> Option<ResolvedSymbol>
 where
     F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
 {
     let mut visited = HashSet::new();
-    resolve_reexported_symbol_path_inner(file, symbol_name, file_exports_symbol, &mut visited)
+    resolve_reexported_symbol_inner(
+        file,
+        symbol_name,
+        file_exports_symbol,
+        file_default_export_symbol,
+        &mut visited,
+    )
 }
 
-fn resolve_reexported_symbol_path_inner<F>(
+fn resolve_reexported_symbol_inner<F, D>(
     file: &Path,
     symbol_name: &str,
     file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
     visited: &mut HashSet<(PathBuf, String)>,
-) -> Option<PathBuf>
+) -> Option<ResolvedSymbol>
 where
     F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
 {
     let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
     if !visited.insert((canon.clone(), symbol_name.to_string())) {
         return None;
     }
 
-    if file_exports_symbol(&canon, symbol_name) {
-        return Some(canon);
-    }
-
     let source = std::fs::read_to_string(&canon).ok()?;
     let lang = detect_language(&canon)?;
     if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
-        return None;
+        if symbol_name == "default" {
+            return file_default_export_symbol(&canon).map(|symbol| ResolvedSymbol {
+                file: canon,
+                symbol,
+            });
+        }
+        return file_exports_symbol(&canon, symbol_name).then(|| ResolvedSymbol {
+            file: canon,
+            symbol: symbol_name.to_string(),
+        });
     }
 
     let grammar = grammar_for(lang);
@@ -2967,6 +3229,7 @@ where
                 from_dir,
                 symbol_name,
                 file_exports_symbol,
+                file_default_export_symbol,
                 visited,
             ) {
                 return Some(target);
@@ -2978,19 +3241,45 @@ where
         }
     }
 
+    if symbol_name == "default" {
+        if let Some(symbol) = file_default_export_symbol(&canon) {
+            return Some(ResolvedSymbol {
+                file: canon,
+                symbol,
+            });
+        }
+    }
+
+    if let Some(symbol) = resolve_local_export_alias(&source, &canon, symbol_name) {
+        return Some(ResolvedSymbol {
+            file: canon,
+            symbol,
+        });
+    }
+
+    if file_exports_symbol(&canon, symbol_name) {
+        let symbol = symbol_name.to_string();
+        return Some(ResolvedSymbol {
+            file: canon,
+            symbol,
+        });
+    }
+
     None
 }
 
-fn resolve_reexport_statement<F>(
+fn resolve_reexport_statement<F, D>(
     source: &str,
     node: tree_sitter::Node,
     from_dir: &Path,
     symbol_name: &str,
     file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
     visited: &mut HashSet<(PathBuf, String)>,
-) -> Option<PathBuf>
+) -> Option<ResolvedSymbol>
 where
     F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
 {
     let source_node = node.child_by_field_name("source")?;
     let module_path = string_literal_content(source, source_node)?;
@@ -2998,22 +3287,58 @@ where
     let raw_export = node_text(node, source);
 
     if let Some(source_symbol) = reexport_clause_source_symbol(&raw_export, symbol_name) {
-        return resolve_reexported_symbol_path_inner(
+        return resolve_reexported_symbol_inner(
             &target_file,
             &source_symbol,
             file_exports_symbol,
+            file_default_export_symbol,
             visited,
         )
-        .or(Some(target_file));
+        .or(Some(ResolvedSymbol {
+            file: target_file,
+            symbol: source_symbol,
+        }));
     }
 
     if raw_export.contains('*') {
-        return resolve_reexported_symbol_path_inner(
+        return resolve_reexported_symbol_inner(
             &target_file,
             symbol_name,
             file_exports_symbol,
+            file_default_export_symbol,
             visited,
         );
+    }
+
+    None
+}
+
+fn resolve_local_export_alias(source: &str, file: &Path, requested_export: &str) -> Option<String> {
+    let lang = detect_language(file)?;
+    let grammar = grammar_for(lang);
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
+
+    let mut cursor = tree.root_node().walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let node = cursor.node();
+        if node.kind() == "export_statement" && node.child_by_field_name("source").is_none() {
+            let raw_export = node_text(node, source);
+            if let Some(source_symbol) =
+                reexport_clause_source_symbol(&raw_export, requested_export)
+            {
+                return Some(source_symbol);
+            }
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
     }
 
     None

@@ -9,9 +9,14 @@ use crate::parser::LangId;
 /// for the given language.
 pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
     match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Go => {
-            vec!["call_expression"]
-        }
+        LangId::TypeScript | LangId::JavaScript => vec!["call_expression", "new_expression"],
+        LangId::Tsx => vec![
+            "call_expression",
+            "new_expression",
+            "jsx_opening_element",
+            "jsx_self_closing_element",
+        ],
+        LangId::Go => vec!["call_expression"],
         LangId::Python => vec!["call"],
         LangId::Rust => vec!["call_expression", "macro_invocation"],
         LangId::Solidity | LangId::Scala => vec!["call_expression"],
@@ -87,10 +92,7 @@ pub fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<Str
         return Some(format!("{}!", text));
     }
 
-    // call_expression / call — get the "function" child
-    let func_node = node
-        .child_by_field_name("function")
-        .or_else(|| node.child(0))?;
+    let func_node = callee_node(node)?;
 
     let func_kind = func_node.kind();
     match func_kind {
@@ -101,6 +103,9 @@ pub fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<Str
             // Last child that's a property_identifier, field_identifier, or identifier
             extract_last_segment(&func_node, source)
         }
+        // Computed member access: obj["method"]()
+        "subscript_expression" => extract_computed_member_name(&func_node, source)
+            .or_else(|| extract_last_segment(&func_node, source)),
         _ => {
             // Fallback: use the full text
             let text = &source[func_node.byte_range()];
@@ -128,11 +133,34 @@ pub fn extract_full_callee(node: &tree_sitter::Node, source: &str) -> Option<Str
         return Some(format!("{}!", text));
     }
 
-    let func_node = node
-        .child_by_field_name("function")
-        .or_else(|| node.child(0))?;
+    let func_node = callee_node(node)?;
 
     Some(source[func_node.byte_range()].trim().to_string())
+}
+
+fn callee_node<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+    match node.kind() {
+        "new_expression" => node
+            .child_by_field_name("constructor")
+            .or_else(|| node.named_child(0)),
+        "jsx_opening_element" | "jsx_self_closing_element" => node
+            .child_by_field_name("name")
+            .or_else(|| node.named_child(0)),
+        _ => node
+            .child_by_field_name("function")
+            .or_else(|| node.child(0)),
+    }
+}
+
+fn extract_computed_member_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let index = node.child_by_field_name("index")?;
+    let text = source[index.byte_range()].trim();
+    if (text.starts_with('"') && text.ends_with('"'))
+        || (text.starts_with('\'') && text.ends_with('\''))
+    {
+        return Some(text[1..text.len().saturating_sub(1)].to_string());
+    }
+    None
 }
 
 /// Extract the last segment of a member expression (the method/property name).

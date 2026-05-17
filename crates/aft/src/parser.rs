@@ -1285,8 +1285,8 @@ fn collect_names_from_export_clause(source: &str, node: &Node, exported: &mut Ha
     loop {
         let child = cursor.node();
         if child.kind() == "export_specifier" {
-            if let Some(local_name) = first_identifier_text(source, &child) {
-                exported.insert(local_name);
+            if let Some(exported_name) = last_identifier_text(source, &child) {
+                exported.insert(exported_name);
             }
         }
         if !cursor.goto_next_sibling() {
@@ -1295,12 +1295,13 @@ fn collect_names_from_export_clause(source: &str, node: &Node, exported: &mut Ha
     }
 }
 
-fn first_identifier_text(source: &str, node: &Node) -> Option<String> {
+fn last_identifier_text(source: &str, node: &Node) -> Option<String> {
     let mut cursor = node.walk();
     if !cursor.goto_first_child() {
         return None;
     }
 
+    let mut last = None;
     loop {
         let child = cursor.node();
         if matches!(
@@ -1310,14 +1311,13 @@ fn first_identifier_text(source: &str, node: &Node) -> Option<String> {
                 | "property_identifier"
                 | "shorthand_property_identifier"
         ) {
-            return Some(node_text(source, &child).to_string());
+            last = Some(node_text(source, &child).to_string());
         }
         if !cursor.goto_next_sibling() {
             break;
         }
     }
-
-    None
+    last
 }
 
 fn mark_named_exports(symbols: &mut [Symbol], exported_names: &HashSet<String>) {
@@ -3954,6 +3954,16 @@ impl TreeSitterProvider {
             let node = cursor.node();
             if node.kind() == "export_statement" {
                 let Some(source_node) = node.child_by_field_name("source") else {
+                    if let Some(export_clause) = find_child_by_kind(node, "export_clause") {
+                        if let Some(symbol_name) =
+                            resolve_export_clause_name(&source, &export_clause, requested_name)
+                        {
+                            targets.push(ReExportTarget {
+                                file: file.to_path_buf(),
+                                symbol_name,
+                            });
+                        }
+                    }
                     if !cursor.goto_next_sibling() {
                         break;
                     }

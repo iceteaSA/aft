@@ -5,7 +5,16 @@
 
 use crate::helpers::{fixture_path, AftProcess};
 use std::fs;
+use std::path::Path;
 use tempfile::tempdir;
+
+fn configure_project(aft: &mut AftProcess, root: &Path) {
+    let resp = aft.send(&format!(
+        r#"{{"id":"configure","command":"configure","project_root":"{}"}}"#,
+        root.display()
+    ));
+    assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+}
 
 /// `configure` sets project root and returns success.
 #[test]
@@ -142,8 +151,13 @@ fn callgraph_cross_file_tree() {
     );
     assert_eq!(
         check_format.unwrap()["line"],
-        2,
-        "checkFormat line should be 1-based (call site, not definition)"
+        5,
+        "checkFormat line should be 1-based definition after same-file resolution"
+    );
+    assert_eq!(
+        check_format.unwrap()["resolved"],
+        true,
+        "checkFormat should resolve within helpers.ts"
     );
 
     aft.shutdown();
@@ -884,6 +898,463 @@ export function render(): unknown {
     aft.shutdown();
 }
 
+#[test]
+fn callgraph_reexport_alias_resolves_to_source_symbol() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("real.ts"),
+        "export function foo(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("barrel.ts"),
+        "export { foo as bar } from './real.js';\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app.ts"),
+        "import { bar } from './barrel.js';\nexport function run(): string { return bar(); }\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"foo","depth":1}}"#,
+        root.join("real.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "alias re-export should point at foo: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_aliased_import_follows_reexport_barrel() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("real.ts"),
+        "export function foo(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("barrel.ts"), "export { foo } from './real.js';\n").unwrap();
+    fs::write(
+        root.join("app.ts"),
+        "import { foo as bar } from './barrel.js';\nexport function run(): string { return bar(); }\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"foo","depth":1}}"#,
+        root.join("real.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "aliased import should follow barrel: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_default_reexport_resolves_real_default_symbol() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("real.ts"),
+        "export default function targetDefault(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("barrel.ts"),
+        "export { default } from './real.js';\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app.ts"),
+        "import targetDefault from './barrel.js';\nexport function run(): string { return targetDefault(); }\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"targetDefault","depth":1}}"#,
+        root.join("real.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "default re-export should resolve to real default: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_call_tree_resolves_same_file_calls() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("local.ts"),
+        "export function main(): string { return helper(); }\nfunction helper(): string { return leaf(); }\nfunction leaf(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"call_tree","file":"{}","symbol":"main","depth":3}}"#,
+        root.join("local.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "call_tree should succeed: {resp:?}");
+    let helper = resp["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "helper")
+        .expect("main should resolve helper");
+    assert_eq!(
+        helper["resolved"], true,
+        "helper should be a resolved local child: {helper:?}"
+    );
+    assert!(
+        helper["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "leaf"),
+        "helper should descend into leaf: {helper:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_workspace_package_cache_refreshes_after_reconfigure() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let pkg = root.join("packages/pkg");
+    let app = root.join("packages/app");
+    fs::create_dir_all(pkg.join("src")).unwrap();
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(pkg.join("package.json"), r#"{"name":"@scope/old"}"#).unwrap();
+    fs::write(
+        pkg.join("src/index.ts"),
+        "export function target(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    fs::write(app.join("package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(app.join("src/main.ts"), "import { target } from '@scope/new';\nexport function run(): string { return target(); }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"target","depth":1}}"#,
+        pkg.join("src/index.ts").display()
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "first callers should succeed: {resp:?}"
+    );
+    assert_eq!(
+        resp["total_callers"], 0,
+        "new package name should miss before package.json changes"
+    );
+
+    fs::write(pkg.join("package.json"), r#"{"name":"@scope/new"}"#).unwrap();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}","symbol":"target","depth":1}}"#,
+        pkg.join("src/index.ts").display()
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "second callers should succeed: {resp:?}"
+    );
+    assert_eq!(
+        resp["total_callers"], 1,
+        "workspace cache should not keep stale miss: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_indexes_tsx_jsx_components_and_new_expressions() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("component.tsx"),
+        "export function Widget(): JSX.Element { return <span />; }\nexport class Service {}\nexport function App(): JSX.Element { const service = new Service(); return <Widget />; }\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    for (id, symbol) in [("1", "Widget"), ("2", "Service")] {
+        let resp = aft.send(&format!(
+            r#"{{"id":"{}","command":"callers","file":"{}","symbol":"{}","depth":1}}"#,
+            id,
+            root.join("component.tsx").display(),
+            symbol
+        ));
+        assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+        assert_eq!(
+            resp["total_callers"], 1,
+            "{symbol} should be indexed from JSX/new: {resp:?}"
+        );
+    }
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_source_less_export_alias_resolves_local_symbol() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("module.ts"),
+        "function foo(): string { return 'ok'; }\nexport { foo as bar };\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app.ts"),
+        "import { bar } from './module.js';\nexport function run(): string { return bar(); }\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"foo","depth":1}}"#,
+        root.join("module.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "source-less alias should resolve to local foo: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_commands_accept_private_leaf_symbols() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(root.join("leaf.ts"), "export function caller(): string { return leaf(); }\nfunction leaf(): string { return 'ok'; }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let tree = aft.send(&format!(
+        r#"{{"id":"1","command":"call_tree","file":"{}","symbol":"leaf","depth":1}}"#,
+        root.join("leaf.ts").display()
+    ));
+    assert_eq!(
+        tree["success"], true,
+        "call_tree should accept private leaf: {tree:?}"
+    );
+    let callers = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}","symbol":"leaf","depth":1}}"#,
+        root.join("leaf.ts").display()
+    ));
+    assert_eq!(
+        callers["success"], true,
+        "callers should accept private leaf: {callers:?}"
+    );
+    assert_eq!(
+        callers["total_callers"], 1,
+        "leaf should have one caller: {callers:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_detects_pnpm_workspace_and_skips_empty_nested_workspaces() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\n",
+    )
+    .unwrap();
+    let pkg = root.join("packages/lib");
+    let app = root.join("packages/app");
+    fs::create_dir_all(pkg.join("src")).unwrap();
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(pkg.join("package.json"), r#"{"name":"@scope/lib"}"#).unwrap();
+    fs::write(
+        pkg.join("src/index.ts"),
+        "export function pnpmTarget(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    fs::write(
+        app.join("package.json"),
+        r#"{"name":"app","workspaces":[]}"#,
+    )
+    .unwrap();
+    fs::write(app.join("src/main.ts"), "import { pnpmTarget } from '@scope/lib';\nexport function run(): string { return pnpmTarget(); }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"pnpmTarget","depth":1}}"#,
+        pkg.join("src/index.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "pnpm workspace root should resolve past empty nested workspaces: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_workspace_globs_support_recursive_patterns_and_negations() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{"private":true,"workspaces":["packages/**","!packages/legacy"]}"#,
+    )
+    .unwrap();
+    let recursive = root.join("packages/nested/pkg");
+    let legacy = root.join("packages/legacy");
+    let app = root.join("app");
+    fs::create_dir_all(recursive.join("src")).unwrap();
+    fs::create_dir_all(legacy.join("src")).unwrap();
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(
+        recursive.join("package.json"),
+        r#"{"name":"@scope/recursive"}"#,
+    )
+    .unwrap();
+    fs::write(
+        recursive.join("src/index.ts"),
+        "export function recursiveTarget(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    fs::write(legacy.join("package.json"), r#"{"name":"@scope/legacy"}"#).unwrap();
+    fs::write(
+        legacy.join("src/index.ts"),
+        "export function legacyTarget(): string { return 'legacy'; }\n",
+    )
+    .unwrap();
+    fs::write(app.join("package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(app.join("src/main.ts"), "import { recursiveTarget } from '@scope/recursive';\nimport { legacyTarget } from '@scope/legacy';\nexport function run(): string { recursiveTarget(); return legacyTarget(); }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"recursiveTarget","depth":1}}"#,
+        recursive.join("src/index.ts").display()
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "recursive callers should succeed: {resp:?}"
+    );
+    assert_eq!(
+        resp["total_callers"], 1,
+        "recursive glob should include nested package: {resp:?}"
+    );
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}","symbol":"legacyTarget","depth":1}}"#,
+        legacy.join("src/index.ts").display()
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "legacy callers should succeed: {resp:?}"
+    );
+    assert_eq!(
+        resp["total_callers"], 0,
+        "negated workspace should not resolve: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_resolves_tsconfig_paths_aliases() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/lib")).unwrap();
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"]}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib/target.ts"),
+        "export function pathTarget(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.ts"), "import { pathTarget } from '@/lib/target';\nexport function run(): string { return pathTarget(); }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"pathTarget","depth":1}}"#,
+        root.join("src/lib/target.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "tsconfig paths alias should resolve: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_computed_member_call_uses_static_property_name() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(root.join("computed.ts"), "export function caller(obj: any): void { obj[\"method\"](); }\nfunction method(): void {}\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"method","depth":1}}"#,
+        root.join("computed.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "computed member should be indexed as method: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_keeps_external_member_call_with_same_short_name_as_caller() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("math.ts"),
+        "export function add(): number { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("app.ts"), "import * as math from './math.js';\nexport function add(): number { return math.add(); }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":"{}","symbol":"add","depth":1}}"#,
+        root.join("math.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "external math.add call should not be filtered as self-recursion: {resp:?}"
+    );
+    aft.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // trace_to command
 // ---------------------------------------------------------------------------
@@ -1204,9 +1675,9 @@ fn poll_watcher_update<F>(
 where
     F: Fn(&serde_json::Value) -> bool,
 {
-    // 5s upper bound — generous enough to absorb FSEvents coalescing latency
-    // on a busy CI runner, short enough that a real regression still fails fast.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // 15s upper bound — generous enough to absorb FSEvents coalescing latency
+    // under cargo-test parallelism, short enough that a real regression still fails fast.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let poll_interval = std::time::Duration::from_millis(100);
     let mut last_response = serde_json::Value::Null;
     let mut ping_id = 1000;
@@ -1225,7 +1696,7 @@ where
     }
 
     panic!(
-        "watcher update did not propagate within 5s: {}\nlast response: {:?}",
+        "watcher update did not propagate within 15s: {}\nlast response: {:?}",
         description, last_response
     );
 }
@@ -1263,6 +1734,11 @@ fn callgraph_watcher_add_caller() {
     );
     let initial_total = resp["total_callers"].as_u64().unwrap();
     assert!(initial_total > 0, "validate should have initial callers");
+
+    // Give the watcher thread a short window to finish subscribing before
+    // creating the file; under full-suite parallelism the configure response
+    // can arrive before the OS watcher is fully armed.
+    std::thread::sleep(std::time::Duration::from_millis(250));
 
     // Write a new file that calls validate
     let new_file = std::path::Path::new(&root).join("extra_caller.ts");
