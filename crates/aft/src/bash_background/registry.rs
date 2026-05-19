@@ -498,37 +498,35 @@ impl BgTaskRegistry {
                 crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
             }
         }
-        let dir = session_tasks_dir(storage_dir, session_id);
-        if !dir.exists() {
-            return Ok(());
-        }
 
         let canonical_project = project_root.map(canonicalized_path);
-        let entries = fs::read_dir(&dir)
-            .map_err(|e| format!("failed to read background task dir {}: {e}", dir.display()))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
+        let tasks = match self.replay_session_from_db(session_id) {
+            Some(Ok(tasks)) if !tasks.is_empty() => tasks,
+            Some(Ok(_)) => {
+                crate::slog_info!(
+                    "bash task replay DB miss for session {}; falling back to disk",
+                    session_id
+                );
+                self.replay_session_from_disk(storage_dir, session_id)?
             }
-            let mut metadata = match read_task(&path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    crate::slog_warn!(
-                        "quarantining invalid background task metadata {} during replay: {error}",
-                        path.display()
-                    );
-                    if let Err(quarantine_error) =
-                        quarantine_task_json(storage_dir, &dir, &path, QuarantineKind::Invalid)
-                    {
-                        crate::slog_warn!(
-                            "failed to quarantine invalid background task metadata {}: {quarantine_error}",
-                            path.display()
-                        );
-                    }
-                    continue;
-                }
-            };
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "bash task replay DB lookup failed for session {}; falling back to disk: {}",
+                    session_id,
+                    error
+                );
+                self.replay_session_from_disk(storage_dir, session_id)?
+            }
+            None => {
+                crate::slog_info!(
+                    "bash task replay DB unavailable for session {}; falling back to disk",
+                    session_id
+                );
+                self.replay_session_from_disk(storage_dir, session_id)?
+            }
+        };
+
+        for mut metadata in tasks {
             if metadata.session_id != session_id {
                 continue;
             }
@@ -617,6 +615,72 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    fn replay_session_from_db(
+        &self,
+        session_id: &str,
+    ) -> Option<Result<Vec<PersistedTask>, String>> {
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())?;
+        let harness = self
+            .inner
+            .db_harness
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())?;
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Some(Err("db mutex poisoned".to_string())),
+        };
+        Some(
+            crate::db::bash_tasks::list_bash_tasks_for_session(&conn, &harness, session_id)
+                .map(|rows| rows.into_iter().map(PersistedTask::from).collect())
+                .map_err(|error| error.to_string()),
+        )
+    }
+
+    fn replay_session_from_disk(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+    ) -> Result<Vec<PersistedTask>, String> {
+        let dir = session_tasks_dir(storage_dir, session_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| format!("failed to read background task dir {}: {e}", dir.display()))?;
+        let mut tasks = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            match read_task(&path) {
+                Ok(metadata) => tasks.push(metadata),
+                Err(error) => {
+                    crate::slog_warn!(
+                        "quarantining invalid background task metadata {} during replay: {error}",
+                        path.display()
+                    );
+                    if let Err(quarantine_error) =
+                        quarantine_task_json(storage_dir, &dir, &path, QuarantineKind::Invalid)
+                    {
+                        crate::slog_warn!(
+                            "failed to quarantine invalid background task metadata {}: {quarantine_error}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(tasks)
+    }
+
     pub fn status(
         &self,
         task_id: &str,
@@ -654,6 +718,50 @@ impl BgTaskRegistry {
         storage_dir: &Path,
     ) -> Option<Arc<BgTask>> {
         let canonical_project = canonicalized_path(project_root);
+        match self.lookup_relaxed_task_from_db(task_id, project_root) {
+            Some(Ok(Some(metadata))) => {
+                if let Some(task) = self.task(task_id) {
+                    let matches_project = task
+                        .state
+                        .lock()
+                        .map(|state| {
+                            state
+                                .metadata
+                                .project_root
+                                .as_deref()
+                                .map(canonicalized_path)
+                                .as_deref()
+                                == Some(canonical_project.as_path())
+                        })
+                        .unwrap_or(false);
+                    return matches_project.then_some(task);
+                }
+                let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
+                if self.insert_rehydrated_task(metadata, paths, true).is_err() {
+                    return None;
+                }
+                return self.task(task_id);
+            }
+            Some(Ok(None)) => {
+                crate::slog_info!(
+                    "bash task relaxed DB miss for {}; falling back to disk",
+                    task_id
+                );
+            }
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "bash task relaxed DB lookup failed for {}; falling back to disk: {}",
+                    task_id,
+                    error
+                );
+            }
+            None => {
+                crate::slog_info!(
+                    "bash task relaxed DB unavailable for {}; falling back to disk",
+                    task_id
+                );
+            }
+        }
         let root = storage_dir.join("bash-tasks");
         let entries = fs::read_dir(&root).ok()?;
         for entry in entries.flatten() {
@@ -710,6 +818,40 @@ impl BgTaskRegistry {
             return self.task(task_id);
         }
         None
+    }
+
+    fn lookup_relaxed_task_from_db(
+        &self,
+        task_id: &str,
+        project_root: &Path,
+    ) -> Option<Result<Option<PersistedTask>, String>> {
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())?;
+        let harness = self
+            .inner
+            .db_harness
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())?;
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Some(Err("db mutex poisoned".to_string())),
+        };
+        let project_key = crate::search_index::project_cache_key(project_root);
+        Some(
+            crate::db::bash_tasks::find_bash_task_for_project(
+                &conn,
+                &harness,
+                &project_key,
+                task_id,
+            )
+            .map(|row| row.map(PersistedTask::from))
+            .map_err(|error| error.to_string()),
+        )
     }
 
     pub(super) fn status_relaxed(

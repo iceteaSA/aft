@@ -284,34 +284,29 @@ fn backups_dual_write_backup_op_id_index_is_partial() {
     assert_eq!(matching, 1);
 }
 
-fn direct_row<'a>(
-    harness: &'a str,
-    session_id: &'a str,
-    path_hash: &'a str,
-    order: u128,
-) -> BackupRow<'a> {
+fn direct_row(harness: &str, session_id: &str, path_hash: &str, order: u128) -> BackupRow {
     direct_row_with_op(harness, session_id, path_hash, order, None)
 }
 
-fn direct_row_with_op<'a>(
-    harness: &'a str,
-    session_id: &'a str,
-    path_hash: &'a str,
+fn direct_row_with_op(
+    harness: &str,
+    session_id: &str,
+    path_hash: &str,
     order: u128,
-    op_id: Option<&'a str>,
-) -> BackupRow<'a> {
+    op_id: Option<&str>,
+) -> BackupRow {
     BackupRow {
-        backup_id: path_hash,
-        harness,
-        session_id,
-        project_key: PROJECT_KEY,
-        op_id,
+        backup_id: path_hash.to_string(),
+        harness: harness.to_string(),
+        session_id: session_id.to_string(),
+        project_key: PROJECT_KEY.to_string(),
+        op_id: op_id.map(str::to_string),
         order,
-        file_path: "/tmp/file.txt",
-        path_hash,
-        backup_path: Some("/tmp/backup.bak"),
-        kind: "content",
-        description: "direct row",
+        file_path: "/tmp/file.txt".to_string(),
+        path_hash: path_hash.to_string(),
+        backup_path: Some("/tmp/backup.bak".to_string()),
+        kind: "content".to_string(),
+        description: "direct row".to_string(),
         created_at: 1,
         is_tombstone: false,
     }

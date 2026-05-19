@@ -154,6 +154,48 @@ impl PersistedTask {
     }
 }
 
+impl From<BashTaskRow> for PersistedTask {
+    fn from(row: BashTaskRow) -> Self {
+        if let Ok(task) = serde_json::from_str::<PersistedTask>(&row.metadata) {
+            return task;
+        }
+
+        let status = match row.status.as_str() {
+            "starting" => BgTaskStatus::Starting,
+            "running" => BgTaskStatus::Running,
+            "killing" => BgTaskStatus::Killing,
+            "completed" => BgTaskStatus::Completed,
+            "failed" => BgTaskStatus::Failed,
+            "killed" => BgTaskStatus::Killed,
+            "timed_out" => BgTaskStatus::TimedOut,
+            _ => BgTaskStatus::Failed,
+        };
+        let started_at = u64::try_from(row.started_at).unwrap_or_default();
+        let finished_at = row.completed_at.and_then(|value| u64::try_from(value).ok());
+
+        PersistedTask {
+            schema_version: SCHEMA_VERSION,
+            task_id: row.task_id,
+            session_id: row.session_id,
+            command: row.command,
+            workdir: PathBuf::from(row.cwd),
+            project_root: None,
+            status,
+            started_at,
+            finished_at,
+            duration_ms: finished_at.map(|finished_at| finished_at.saturating_sub(started_at)),
+            timeout_ms: row.timeout_ms.and_then(|value| u64::try_from(value).ok()),
+            exit_code: row.exit_code,
+            child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
+            pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
+            completion_delivered: row.completion_delivered,
+            notify_on_completion: !row.completion_delivered,
+            compressed: row.compressed,
+            status_reason: None,
+        }
+    }
+}
+
 fn status_name(status: &BgTaskStatus) -> &'static str {
     match status {
         BgTaskStatus::Starting => "starting",

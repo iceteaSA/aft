@@ -36,33 +36,67 @@ pub enum BackupEntryKind {
 }
 
 impl BackupEntry {
-    fn to_backup_row<'a>(
-        &'a self,
-        harness: &'a str,
-        session_id: &'a str,
-        project_key: &'a str,
-        file_path: &'a str,
-        path_hash: &'a str,
-        backup_path: Option<&'a str>,
-    ) -> BackupRow<'a> {
+    fn to_backup_row(
+        &self,
+        harness: &str,
+        session_id: &str,
+        project_key: &str,
+        file_path: &str,
+        path_hash: &str,
+        backup_path: Option<&str>,
+    ) -> BackupRow {
         BackupRow {
-            backup_id: &self.backup_id,
-            harness,
-            session_id,
-            project_key,
-            op_id: self.op_id.as_deref(),
+            backup_id: self.backup_id.clone(),
+            harness: harness.to_string(),
+            session_id: session_id.to_string(),
+            project_key: project_key.to_string(),
+            op_id: self.op_id.clone(),
             order: self.order,
-            file_path,
-            path_hash,
-            backup_path,
+            file_path: file_path.to_string(),
+            path_hash: path_hash.to_string(),
+            backup_path: backup_path.map(str::to_string),
             kind: match self.kind {
-                BackupEntryKind::Content => "content",
-                BackupEntryKind::Tombstone => "tombstone",
+                BackupEntryKind::Content => "content".to_string(),
+                BackupEntryKind::Tombstone => "tombstone".to_string(),
             },
-            description: &self.description,
+            description: self.description.clone(),
             created_at: i64::try_from(self.timestamp).unwrap_or(i64::MAX),
             is_tombstone: matches!(self.kind, BackupEntryKind::Tombstone),
         }
+    }
+}
+
+impl TryFrom<BackupRow> for BackupEntry {
+    type Error = std::io::Error;
+
+    fn try_from(row: BackupRow) -> Result<Self, Self::Error> {
+        let kind = if row.is_tombstone || row.kind == "tombstone" {
+            BackupEntryKind::Tombstone
+        } else {
+            BackupEntryKind::Content
+        };
+        let content = match kind {
+            BackupEntryKind::Content => {
+                let backup_path = row.backup_path.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("backup DB row {} has no backup_path", row.backup_id),
+                    )
+                })?;
+                std::fs::read_to_string(backup_path)?
+            }
+            BackupEntryKind::Tombstone => String::new(),
+        };
+
+        Ok(BackupEntry {
+            backup_id: row.backup_id,
+            content,
+            timestamp: u64::try_from(row.created_at).unwrap_or_default(),
+            order: row.order,
+            description: row.description,
+            op_id: row.op_id,
+            kind,
+        })
     }
 }
 
@@ -267,13 +301,30 @@ impl BackupStore {
     /// Restore every top-of-stack backup entry belonging to the most recent
     /// operation in this session.
     pub fn restore_last_operation(&mut self, session: &str) -> Result<RestoredOperation, AftError> {
-        let disk_keys: Vec<PathBuf> = self
-            .disk_index
-            .get(session)
-            .map(|files| files.keys().cloned().collect())
-            .unwrap_or_default();
-        for key in disk_keys {
-            self.load_from_disk_if_needed(session, &key);
+        match self.load_latest_operation_from_db(session) {
+            Some(Ok(true)) => {}
+            Some(Ok(false)) => {
+                crate::slog_info!(
+                    "backup latest operation DB miss for session {}; falling back to disk",
+                    session
+                );
+                self.load_all_disk_backups(session);
+            }
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "backup latest operation DB lookup failed for session {}; falling back to disk: {}",
+                    session,
+                    error
+                );
+                self.load_all_disk_backups(session);
+            }
+            None => {
+                crate::slog_info!(
+                    "backup latest operation DB unavailable for session {}; falling back to disk",
+                    session
+                );
+                self.load_all_disk_backups(session);
+            }
         }
 
         let mut latest: Option<(u128, String)> = None;
@@ -465,6 +516,41 @@ impl BackupStore {
     ) -> Result<(BackupEntry, Option<String>), AftError> {
         let key = canonicalize_key(path);
 
+        match self.load_from_db_if_present(session, &key) {
+            Some(Ok(true)) => {
+                let warning = self.check_external_modification(session, &key, path);
+                let result = self
+                    .do_restore(session, &key, path)
+                    .map(|(entry, _)| (entry, warning));
+                if result.is_ok() {
+                    self.touch_session(session);
+                }
+                return result;
+            }
+            Some(Ok(false)) => {
+                crate::slog_info!(
+                    "backup DB miss for session {} path {}; falling back to disk",
+                    session,
+                    key.display()
+                );
+            }
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "backup DB lookup failed for session {} path {}; falling back to disk: {}",
+                    session,
+                    key.display(),
+                    error
+                );
+            }
+            None => {
+                crate::slog_info!(
+                    "backup DB unavailable for session {} path {}; falling back to disk",
+                    session,
+                    key.display()
+                );
+            }
+        }
+
         // Try memory first
         let in_memory = self
             .entries
@@ -499,10 +585,37 @@ impl BackupStore {
     /// Return the backup history for `(session, path)` (oldest first).
     pub fn history(&self, session: &str, path: &Path) -> Vec<BackupEntry> {
         let key = canonicalize_key(path);
+        match self.read_stack_from_db(session, &key) {
+            Some(Ok(stack)) if !stack.is_empty() => return stack,
+            Some(Ok(_)) => {
+                crate::slog_info!(
+                    "backup history DB miss for session {} path {}; falling back to disk",
+                    session,
+                    key.display()
+                );
+            }
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "backup history DB lookup failed for session {} path {}; falling back to disk: {}",
+                    session,
+                    key.display(),
+                    error
+                );
+            }
+            None => {
+                crate::slog_info!(
+                    "backup history DB unavailable for session {} path {}; falling back to disk",
+                    session,
+                    key.display()
+                );
+            }
+        }
+
         self.entries
             .get(session)
             .and_then(|s| s.get(&key))
             .cloned()
+            .or_else(|| self.read_stack_from_disk(session, &key))
             .unwrap_or_default()
     }
 
@@ -567,6 +680,137 @@ impl BackupStore {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let order = ((current_timestamp_nanos() as u128) << 32) | u128::from(n);
         (format!("backup-{}", n), order)
+    }
+
+    fn db_pool_and_harness(&self) -> Option<(Arc<Mutex<Connection>>, String)> {
+        let pool = self.db_pool.read().ok().and_then(|slot| slot.clone())?;
+        let harness = self.db_harness.read().ok().and_then(|slot| slot.clone())?;
+        Some((pool, harness))
+    }
+
+    fn read_stack_from_db(
+        &self,
+        session: &str,
+        key: &Path,
+    ) -> Option<Result<Vec<BackupEntry>, String>> {
+        let (pool, harness) = self.db_pool_and_harness()?;
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Some(Err("db mutex poisoned".to_string())),
+        };
+        let path_hash = Self::path_hash(key);
+        Some(
+            crate::db::backups::list_backups(&conn, &harness, session, &path_hash)
+                .map_err(|error| error.to_string())
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .map(BackupEntry::try_from)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| error.to_string())
+                }),
+        )
+    }
+
+    fn load_from_db_if_present(
+        &mut self,
+        session: &str,
+        key: &Path,
+    ) -> Option<Result<bool, String>> {
+        match self.read_stack_from_db(session, key) {
+            Some(Ok(stack)) if !stack.is_empty() => {
+                self.update_counter_from_entries(&stack);
+                self.entries
+                    .entry(session.to_string())
+                    .or_default()
+                    .insert(key.to_path_buf(), stack);
+                Some(Ok(true))
+            }
+            Some(Ok(_)) => Some(Ok(false)),
+            Some(Err(error)) => Some(Err(error)),
+            None => None,
+        }
+    }
+
+    fn load_latest_operation_from_db(&mut self, session: &str) -> Option<Result<bool, String>> {
+        let (pool, harness) = self.db_pool_and_harness()?;
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Some(Err("db mutex poisoned".to_string())),
+        };
+        let latest = match crate::db::backups::get_latest_operation_backup(&conn, &harness, session)
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return Some(Ok(false)),
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        let Some(op_id) = latest.op_id else {
+            return Some(Ok(false));
+        };
+        let rows = match crate::db::backups::list_backups_by_op(&conn, &harness, session, &op_id) {
+            Ok(rows) => rows,
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        if rows.is_empty() {
+            return Some(Ok(false));
+        }
+        let path_hashes: std::collections::HashSet<String> =
+            rows.into_iter().map(|row| row.path_hash).collect();
+        drop(conn);
+
+        let mut loaded_any = false;
+        for path_hash in path_hashes {
+            let conn = match pool.lock() {
+                Ok(conn) => conn,
+                Err(_) => return Some(Err("db mutex poisoned".to_string())),
+            };
+            let loaded =
+                match crate::db::backups::list_backups(&conn, &harness, session, &path_hash) {
+                    Ok(rows) => {
+                        let file_path = rows.first().map(|row| row.file_path.clone());
+                        rows.into_iter()
+                            .map(BackupEntry::try_from)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(|stack| (file_path, stack))
+                            .map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+            drop(conn);
+            let (file_path, stack) = match loaded {
+                Ok((file_path, stack)) if !stack.is_empty() => (file_path, stack),
+                Ok(_) => continue,
+                Err(error) => return Some(Err(error)),
+            };
+            let Some(file_path) = file_path else {
+                return Some(Err(format!(
+                    "backup DB rows for path hash {path_hash} have no file path"
+                )));
+            };
+            let key = PathBuf::from(file_path);
+            self.update_counter_from_entries(&stack);
+            self.entries
+                .entry(session.to_string())
+                .or_default()
+                .insert(key, stack);
+            loaded_any = true;
+        }
+
+        Some(Ok(loaded_any))
+    }
+
+    fn update_counter_from_entries(&self, entries: &[BackupEntry]) {
+        if let Some(next_counter) = entries
+            .iter()
+            .filter_map(|entry| backup_sequence(&entry.backup_id))
+            .max()
+            .and_then(|max| max.checked_add(1))
+        {
+            let _ = self
+                .counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (current < next_counter).then_some(next_counter)
+                });
+        }
     }
 
     pub fn discard_operation_entries(&mut self, session: &str, op_id: &str) {
@@ -1056,6 +1300,31 @@ impl BackupStore {
     }
 
     fn load_from_disk_if_needed(&mut self, session: &str, key: &Path) -> bool {
+        let Some(entries) = self.read_stack_from_disk(session, key) else {
+            return false;
+        };
+
+        self.update_counter_from_entries(&entries);
+
+        self.entries
+            .entry(session.to_string())
+            .or_default()
+            .insert(key.to_path_buf(), entries);
+        true
+    }
+
+    fn load_all_disk_backups(&mut self, session: &str) {
+        let disk_keys: Vec<PathBuf> = self
+            .disk_index
+            .get(session)
+            .map(|files| files.keys().cloned().collect())
+            .unwrap_or_default();
+        for key in disk_keys {
+            self.load_from_disk_if_needed(session, &key);
+        }
+    }
+
+    fn read_stack_from_disk(&self, session: &str, key: &Path) -> Option<Vec<BackupEntry>> {
         let disk_meta = match self
             .disk_index
             .get(session)
@@ -1063,7 +1332,7 @@ impl BackupStore {
             .cloned()
         {
             Some(m) if m.count > 0 => m,
-            _ => return false,
+            _ => return None,
         };
 
         let mut entries = Vec::new();
@@ -1121,27 +1390,9 @@ impl BackupStore {
         }
 
         if entries.is_empty() {
-            return false;
+            return None;
         }
-
-        if let Some(next_counter) = entries
-            .iter()
-            .filter_map(|entry| backup_sequence(&entry.backup_id))
-            .max()
-            .and_then(|max| max.checked_add(1))
-        {
-            let _ = self
-                .counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    (current < next_counter).then_some(next_counter)
-                });
-        }
-
-        self.entries
-            .entry(session.to_string())
-            .or_default()
-            .insert(key.to_path_buf(), entries);
-        true
+        Some(entries)
     }
 
     fn write_snapshot_to_disk(&mut self, session: &str, key: &Path, stack: &[BackupEntry]) {
@@ -1282,6 +1533,16 @@ impl BackupStore {
         };
         let path_hash = Self::path_hash(key);
         let file_path = key.display().to_string();
+        if let Err(error) =
+            crate::db::backups::delete_backups_for_path(&conn, &harness, session, &path_hash)
+        {
+            crate::slog_warn!(
+                "delete old backup DB rows failed for {}: {}",
+                key.display(),
+                error
+            );
+            return;
+        }
         for (index, entry) in stack.iter().enumerate() {
             let backup_path = match entry.kind {
                 BackupEntryKind::Content => {
@@ -1308,6 +1569,7 @@ impl BackupStore {
     }
 
     fn remove_disk_backups(&mut self, session: &str, key: &Path) {
+        self.remove_db_backups(session, key);
         let removed = self.disk_index.get_mut(session).and_then(|s| s.remove(key));
         if let Some(meta) = removed {
             let _ = std::fs::remove_dir_all(&meta.dir);
@@ -1328,6 +1590,32 @@ impl BackupStore {
             .unwrap_or(false);
         if empty {
             self.disk_index.remove(session);
+        }
+    }
+
+    fn remove_db_backups(&self, session: &str, key: &Path) {
+        let Some((pool, harness)) = self.db_pool_and_harness() else {
+            return;
+        };
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => {
+                crate::slog_warn!(
+                    "delete backup DB rows failed for {}: db mutex poisoned",
+                    key.display()
+                );
+                return;
+            }
+        };
+        let path_hash = Self::path_hash(key);
+        if let Err(error) =
+            crate::db::backups::delete_backups_for_path(&conn, &harness, session, &path_hash)
+        {
+            crate::slog_warn!(
+                "delete backup DB rows failed for {}: {}",
+                key.display(),
+                error
+            );
         }
     }
 }

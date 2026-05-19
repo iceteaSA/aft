@@ -21,6 +21,7 @@ mod commands_test;
 mod compress_cli_commands_test;
 mod compress_filters_test;
 mod configure_test;
+mod db_read_fallback_test;
 mod edit_append_test;
 mod edit_match_test;
 mod edit_test;
