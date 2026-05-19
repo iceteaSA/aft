@@ -110,7 +110,22 @@ function isComplete(ctx: ResolvedPromptContext): boolean {
  *
  * Mirrors `resolveSessionPromptParams` in `opencode-xtra` (the working
  * reference implementation).
+ *
+ * Bounded via `query.limit` — without it, OpenCode's legacy
+ * `/session/{id}/message` endpoint hydrates the ENTIRE session. Large
+ * sessions can carry 30k-45k messages / 100k+ parts and blow the host's
+ * memory just to find the last assistant turn. We only need the most
+ * recent prompt context, so 50 is plenty (the very last assistant
+ * usually has everything; the merge fallback rarely needs more).
+ *
+ * Future v2 migration: once `@opencode-ai/sdk` exposes `client.v2.session.messages`
+ * with projected shapes (user / assistant / agent-switched / model-switched / ...),
+ * prefer that with `{ limit: 50, order: "desc" }` and fall back to this bounded
+ * legacy call when v2 returns no items (older sessions aren't backfilled into v2).
+ * See https://github.com/cortexkit/aft notes for tracking.
  */
+const PROMPT_CONTEXT_MESSAGE_LIMIT = 50;
+
 export async function resolvePromptContext(
   client: unknown,
   sessionId: string,
@@ -118,14 +133,20 @@ export async function resolvePromptContext(
   if (!client || !sessionId) return null;
   const c = client as {
     session?: {
-      messages?: (input: { path: { id: string } }) => Promise<{ data?: unknown[] } | unknown[]>;
+      messages?: (input: {
+        path: { id: string };
+        query?: { limit?: number };
+      }) => Promise<{ data?: unknown[] } | unknown[]>;
     };
   };
   if (typeof c.session?.messages !== "function") return null;
 
   let messages: unknown[] = [];
   try {
-    const response = await c.session.messages({ path: { id: sessionId } });
+    const response = await c.session.messages({
+      path: { id: sessionId },
+      query: { limit: PROMPT_CONTEXT_MESSAGE_LIMIT },
+    });
     messages = extractMessages(response);
   } catch {
     return null;

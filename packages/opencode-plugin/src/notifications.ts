@@ -161,15 +161,47 @@ function getServerAuth(): string | undefined {
   return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
 }
 
-async function getSessionMessages(client: unknown, sessionId: string): Promise<SdkMessage[]> {
+// Both call sites of `getSessionMessages` (the status cleanup path in
+// `sendStatus` and the warning cleanup path in `cleanupWarnings`) scan from
+// the END of the array and break on the first non-AFT user message. They
+// only need a handful of recent messages, so 50 is plenty — typical AFT
+// status/warning chains are 1-5 consecutive messages at the tail.
+//
+// Bounding is required: without `query.limit`, OpenCode's legacy
+// `/session/{id}/message` endpoint hydrates the ENTIRE session. Sessions
+// with 30k+ messages and 100k+ parts blow the host's memory.
+//
+// Future v2 migration: once `@opencode-ai/sdk` exposes
+// `client.v2.session.messages` with projected shapes, prefer that with
+// `{ limit: 50, order: "desc" }` — but note v2's projected message shape
+// strips `parts[]`, which the cleanup logic below relies on for marker
+// detection. So v2 may not be drop-in for THIS caller; we'd need v2 to
+// expose part content or accept legacy as the only path here.
+export const SESSION_MESSAGES_LIMIT = 50;
+
+/**
+ * @internal — exported only so tests can pin the bounded-call contract.
+ * Production callers go through `sendStatus` / `cleanupWarnings`, both of
+ * which gate on a real `readDesktopState()` before reaching this helper.
+ */
+export async function getSessionMessages(
+  client: unknown,
+  sessionId: string,
+): Promise<SdkMessage[]> {
   try {
     const c = client as {
       session?: {
-        messages?: (input: { path: { id: string } }) => Promise<{ data?: SdkMessage[] }>;
+        messages?: (input: {
+          path: { id: string };
+          query?: { limit?: number };
+        }) => Promise<{ data?: SdkMessage[] }>;
       };
     };
     if (typeof c.session?.messages === "function") {
-      const result = await c.session.messages({ path: { id: sessionId } });
+      const result = await c.session.messages({
+        path: { id: sessionId },
+        query: { limit: SESSION_MESSAGES_LIMIT },
+      });
       return result?.data ?? [];
     }
   } catch {

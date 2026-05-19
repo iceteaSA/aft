@@ -5,7 +5,29 @@ import { getLastAssistantModel, resolvePromptContext } from "../shared/last-assi
 function makeClient(messages: unknown[]) {
   return {
     session: {
-      messages: async (_input: { path: { id: string } }) => ({ data: messages }),
+      messages: async (_input: { path: { id: string }; query?: { limit?: number } }) => ({
+        data: messages,
+      }),
+    },
+  };
+}
+
+/**
+ * Build a fake `client.session.messages` that records every input it was
+ * called with — used by the "bounded request" tests below to prove we send
+ * `query.limit` on every call.
+ */
+function makeRecordingClient(messages: unknown[]) {
+  const calls: Array<{ path: { id: string }; query?: { limit?: number } }> = [];
+  return {
+    calls,
+    client: {
+      session: {
+        messages: async (input: { path: { id: string }; query?: { limit?: number } }) => {
+          calls.push(input);
+          return { data: messages };
+        },
+      },
     },
   };
 }
@@ -223,5 +245,62 @@ describe("getLastAssistantModel (compatibility shim)", () => {
       modelID: "claude-opus-4-7",
     });
     expect("variant" in (result as object)).toBe(false);
+  });
+});
+
+// Regression coverage for the unbounded-messages-call bug surfaced by
+// OpenCode's plugin agent: legacy `client.session.messages()` without a
+// `query.limit` hydrates the entire session (30k-45k messages, 100k+ parts
+// on large legacy sessions). These tests pin the bounded contract so
+// future edits cannot accidentally drop the limit.
+describe("resolvePromptContext: bounded SDK call", () => {
+  test("sends query.limit on every request", async () => {
+    const { calls, client } = makeRecordingClient([
+      {
+        info: {
+          role: "assistant",
+          agent: "build",
+          providerID: "anthropic",
+          modelID: "claude-opus-4-7",
+          variant: "thinking",
+        },
+      },
+    ]);
+    await resolvePromptContext(client, "s1");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].path).toEqual({ id: "s1" });
+    expect(calls[0].query).toBeDefined();
+    expect(typeof calls[0].query?.limit).toBe("number");
+  });
+
+  test("limit is a small positive integer (not unbounded)", async () => {
+    const { calls, client } = makeRecordingClient([]);
+    await resolvePromptContext(client, "s1");
+    const limit = calls[0]?.query?.limit;
+    expect(limit).toBeDefined();
+    expect(limit).toBeGreaterThan(0);
+    // 200 is a defensive ceiling — the actual constant is 50; if it ever
+    // grows past 200 we want a deliberate review, not a silent regression.
+    expect(limit).toBeLessThanOrEqual(200);
+  });
+
+  test("extraction still works correctly under the bounded call", async () => {
+    const { client } = makeRecordingClient([
+      {
+        info: {
+          role: "assistant",
+          agent: "build",
+          providerID: "anthropic",
+          modelID: "claude-opus-4-7",
+          variant: "thinking",
+        },
+      },
+    ]);
+    const result = await resolvePromptContext(client, "s1");
+    expect(result).toEqual({
+      agent: "build",
+      model: { providerID: "anthropic", modelID: "claude-opus-4-7" },
+      variant: "thinking",
+    });
   });
 });

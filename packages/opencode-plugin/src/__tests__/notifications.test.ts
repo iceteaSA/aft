@@ -3,7 +3,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ConfigureWarning, deliverConfigureWarnings } from "../notifications.js";
+import {
+  type ConfigureWarning,
+  deliverConfigureWarnings,
+  getSessionMessages,
+  SESSION_MESSAGES_LIMIT,
+} from "../notifications.js";
 
 const tempRoots = new Set<string>();
 
@@ -244,5 +249,64 @@ describe("deliverConfigureWarnings", () => {
     );
     const persisted = JSON.parse(readFileSync(join(storageDir, "warned_tools.json"), "utf-8"));
     expect(Object.keys(persisted)).toHaveLength(2);
+  });
+});
+
+// Regression coverage for the unbounded-messages-call bug surfaced by
+// OpenCode's plugin agent: legacy `client.session.messages()` without a
+// `query.limit` hydrates the entire session. These tests pin the bounded
+// contract for the cleanup paths (`sendStatus` auto-delete + `cleanupWarnings`)
+// so future edits cannot accidentally drop the limit.
+describe("getSessionMessages: bounded SDK call", () => {
+  test("sends query.limit on every request", async () => {
+    const calls: Array<{ path: { id: string }; query?: { limit?: number } }> = [];
+    const client = {
+      session: {
+        messages: async (input: { path: { id: string }; query?: { limit?: number } }) => {
+          calls.push(input);
+          return { data: [] };
+        },
+      },
+    };
+
+    await getSessionMessages(client, "session-1");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].path).toEqual({ id: "session-1" });
+    expect(calls[0].query).toBeDefined();
+    expect(calls[0].query?.limit).toBe(SESSION_MESSAGES_LIMIT);
+  });
+
+  test("limit constant is a small positive integer", () => {
+    expect(SESSION_MESSAGES_LIMIT).toBeGreaterThan(0);
+    // Defensive ceiling — actual is 50; if it ever grows past 200 we want
+    // a deliberate review, not a silent regression toward unboundedness.
+    expect(SESSION_MESSAGES_LIMIT).toBeLessThanOrEqual(200);
+  });
+
+  test("returns the data array when call succeeds", async () => {
+    const fakeMsgs = [{ info: { id: "m1", role: "user" }, parts: [{ type: "text", text: "hi" }] }];
+    const client = {
+      session: {
+        messages: async () => ({ data: fakeMsgs }),
+      },
+    };
+    const result = await getSessionMessages(client, "session-1");
+    expect(result).toEqual(fakeMsgs);
+  });
+
+  test("returns empty array when client.session.messages is unavailable", async () => {
+    expect(await getSessionMessages({}, "session-1")).toEqual([]);
+  });
+
+  test("returns empty array when the messages API throws", async () => {
+    const client = {
+      session: {
+        messages: async () => {
+          throw new Error("boom");
+        },
+      },
+    };
+    expect(await getSessionMessages(client, "session-1")).toEqual([]);
   });
 });
