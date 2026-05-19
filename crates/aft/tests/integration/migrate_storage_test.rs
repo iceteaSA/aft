@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use aft::migrate_storage::{Args, ExitStatus, Harness, Options};
+use aft::harness::Harness;
+use aft::migrate_storage::{Args, ExitStatus, Options};
 
 fn args(from: PathBuf, to: PathBuf, log: PathBuf) -> Args {
     Args {
         from,
         to,
-        harness: Harness::OpenCode,
+        harness: Harness::Opencode,
         log,
     }
 }

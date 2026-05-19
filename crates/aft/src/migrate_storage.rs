@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::fs_lock;
+use crate::harness::Harness;
 
 mod log;
 
@@ -17,29 +18,6 @@ use self::log::{iso_timestamp_now, now_millis, JsonLogger};
 const SOURCE_MARKER: &str = ".migrated_to_cortexkit";
 const TARGET_MARKER: &str = ".migrated_from_legacy";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Harness {
-    OpenCode,
-    Pi,
-}
-
-impl Harness {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "opencode" => Some(Self::OpenCode),
-            "pi" => Some(Self::Pi),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenCode => "opencode",
-            Self::Pi => "pi",
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Args {
@@ -775,8 +753,9 @@ where
             "--harness" => {
                 let value = value.to_string_lossy();
                 harness = Some(
-                    Harness::parse(&value)
-                        .ok_or_else(|| format!("invalid harness: {value}\n\n{}", help_text()))?,
+                    value
+                        .parse::<Harness>()
+                        .map_err(|err| format!("invalid harness: {err}\n\n{}", help_text()))?,
                 );
             }
             "--log" => log = Some(PathBuf::from(value)),
