@@ -35,6 +35,7 @@ mod inline_symbol_test;
 mod is_semantic_indexed_extension_test;
 mod lexical_rank_test;
 mod lexical_score_test;
+mod locks_test;
 mod log_ctx_test;
 mod lsp_commands_test;
 mod lsp_diagnostics_test;

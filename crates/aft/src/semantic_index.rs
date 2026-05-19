@@ -1,5 +1,6 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::config::{SemanticBackend, SemanticBackendConfig};
+use crate::fs_lock;
 use crate::parser::{detect_language, extract_symbols_from_tree, grammar_for};
 use crate::search_index::{cache_relative_path, cached_path_under_root};
 use crate::symbols::{Symbol, SymbolKind};
@@ -14,6 +15,7 @@ use std::env;
 use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::SystemTime;
 use tree_sitter::Parser;
@@ -52,6 +54,30 @@ const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
 const FALLBACK_BACKEND: &str = "none";
 const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
+static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
+
+pub struct SemanticIndexLock {
+    _guard: fs_lock::LockGuard,
+}
+
+impl SemanticIndexLock {
+    pub fn acquire(storage_dir: &Path, project_key: &str) -> std::io::Result<Self> {
+        let dir = storage_dir.join("semantic").join(project_key);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("cache.lock");
+        let _acquire_guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
+            .lock()
+            .map_err(|_| std::io::Error::other("semantic cache lock acquisition mutex poisoned"))?;
+        fs_lock::try_acquire(&path, Duration::from_secs(2))
+            .map(|guard| Self { _guard: guard })
+            .map_err(|error| match error {
+                fs_lock::AcquireError::Timeout => {
+                    std::io::Error::other("timed out acquiring semantic cache lock")
+                }
+                fs_lock::AcquireError::Io(error) => error,
+            })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticIndexFingerprint {

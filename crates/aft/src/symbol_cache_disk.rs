@@ -2,8 +2,10 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::fs_lock;
 use crate::parser::SymbolCache;
 use crate::search_index::{cache_relative_path, validate_cached_relative_path};
 use crate::symbols::Symbol;
@@ -15,9 +17,10 @@ const MAX_ENTRIES: usize = 2_000_000;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_SYMBOL_BYTES: usize = 16 * 1024 * 1024;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SYMBOL_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct SymbolCacheLock {
-    path: PathBuf,
+    _guard: fs_lock::LockGuard,
 }
 
 impl SymbolCacheLock {
@@ -25,32 +28,17 @@ impl SymbolCacheLock {
         let dir = storage_dir.join("symbols").join(project_key);
         fs::create_dir_all(&dir)?;
         let path = dir.join("symbols.lock");
-        for _ in 0..200 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
-                    let _ = file.sync_all();
-                    return Ok(Self { path });
+        let _acquire_guard = SYMBOL_LOCK_ACQUIRE_MUTEX
+            .lock()
+            .map_err(|_| std::io::Error::other("symbol cache lock acquisition mutex poisoned"))?;
+        fs_lock::try_acquire(&path, Duration::from_secs(2))
+            .map(|guard| Self { _guard: guard })
+            .map_err(|error| match error {
+                fs_lock::AcquireError::Timeout => {
+                    std::io::Error::other("timed out acquiring symbol cache lock")
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(std::io::Error::other(
-            "timed out acquiring symbol cache lock",
-        ))
-    }
-}
-
-impl Drop for SymbolCacheLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+                fs_lock::AcquireError::Io(error) => error,
+            })
     }
 }
 

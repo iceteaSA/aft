@@ -23,7 +23,7 @@ use crate::search_index::{
     build_path_filters, current_git_head, project_cache_key, resolve_cache_dir, walk_project_files,
     CacheLock, SearchIndex,
 };
-use crate::semantic_index::SemanticIndex;
+use crate::semantic_index::{SemanticIndex, SemanticIndexLock};
 use crate::{slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -1581,9 +1581,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             .then(|| ())
                             .and_then(|_| semantic_storage.as_ref())
                             .and_then(|dir| {
-                                let semantic_cache_dir =
-                                    dir.join("semantic").join(&semantic_project_key);
-                                match CacheLock::acquire(&semantic_cache_dir) {
+                                match SemanticIndexLock::acquire(dir, &semantic_project_key) {
                                     Ok(lock) => Some(lock),
                                     Err(error) => {
                                         slog_warn!(

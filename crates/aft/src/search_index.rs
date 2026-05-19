@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,7 @@ use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::hir::{Hir, HirKind};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+use crate::fs_lock;
 
 const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
@@ -28,41 +29,27 @@ const MAX_ENTRIES: usize = 10_000_000;
 const MIN_FILE_ENTRY_BYTES: usize = 57;
 const LOOKUP_ENTRY_BYTES: usize = 16;
 const POSTING_BYTES: usize = 6;
+static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct CacheLock {
-    path: PathBuf,
+    _guard: fs_lock::LockGuard,
 }
 
 impl CacheLock {
     pub fn acquire(cache_dir: &Path) -> std::io::Result<Self> {
         fs::create_dir_all(cache_dir)?;
         let path = cache_dir.join("cache.lock");
-        for _ in 0..200 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
-                    let _ = file.sync_all();
-                    return Ok(Self { path });
+        let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
+            .lock()
+            .map_err(|_| std::io::Error::other("search cache lock acquisition mutex poisoned"))?;
+        fs_lock::try_acquire(&path, Duration::from_secs(2))
+            .map(|guard| Self { _guard: guard })
+            .map_err(|error| match error {
+                fs_lock::AcquireError::Timeout => {
+                    std::io::Error::other("timed out acquiring search cache lock")
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(std::io::Error::other(
-            "timed out acquiring search cache lock",
-        ))
-    }
-}
-
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+                fs_lock::AcquireError::Io(error) => error,
+            })
     }
 }
 
