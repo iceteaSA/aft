@@ -60,6 +60,7 @@ mod query_shape_test;
 mod safety_test;
 mod score_floor_drop_test;
 mod security_test;
+mod state_commands_test;
 mod status_disk_scope_test;
 mod structure_test;
 mod symbol_cache_persist_test;

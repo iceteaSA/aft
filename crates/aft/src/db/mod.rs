@@ -5,6 +5,7 @@ use std::path::Path;
 
 pub mod backups;
 pub mod bash_tasks;
+pub mod state;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
