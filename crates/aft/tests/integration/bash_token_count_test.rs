@@ -100,12 +100,37 @@ fn bash_completed_frame_token_count_below_cap() {
 }
 
 #[test]
-fn bash_completed_frame_skips_tokens_above_cap() {
+fn bash_completed_frame_tokenizes_tail_above_cap() {
+    // Large output (~200KB) exceeds the 128KB-per-stream tokenize cap.
+    // Previous behavior: skip tokenization entirely → no compression
+    // accounting for any large output. New behavior: tokenize the last
+    // 128KB so the compression-events table still records something
+    // meaningful for the tasks that benefit most from compression.
+    // `tokens_skipped` stays false because we DID produce a count;
+    // truncation is silent at this layer.
     let frame = run_background_command("perl -e 'print \"hello world\\n\" x 17067'");
 
-    assert!(frame.get("original_tokens").is_none());
-    assert!(frame.get("compressed_tokens").is_none());
-    assert_eq!(frame["tokens_skipped"], true);
+    let original = frame
+        .get("original_tokens")
+        .and_then(|v| v.as_u64())
+        .expect(
+            "original_tokens must be present even when output exceeds the 128KB tokenize cap — \
+         large outputs now tokenize the tail rather than skipping",
+        );
+    let compressed = frame
+        .get("compressed_tokens")
+        .and_then(|v| v.as_u64())
+        .expect("compressed_tokens must be present alongside original_tokens");
+    // The tail capture is bounded by 128KB; the full output is ~200KB and
+    // would tokenize to ~70K tokens. We expect somewhere between the
+    // ~1K tokens from a tiny output and the full 70K — anything in that
+    // window proves we read non-trivially from the spill.
+    assert!(
+        original > 1_000,
+        "expected substantial token count from 128KB tail, got {original}"
+    );
+    assert!(compressed > 0);
+    assert_eq!(frame["tokens_skipped"], false);
 }
 
 #[test]

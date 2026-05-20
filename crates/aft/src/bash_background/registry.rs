@@ -1434,7 +1434,17 @@ impl BgTaskRegistry {
         paths: Option<&TaskPaths>,
         emit_frame: bool,
     ) {
-        if !metadata.status.is_terminal() || metadata.completion_delivered {
+        // Only the terminal-state guard prevents double-recording here. The
+        // `completion_delivered` flag is NOT used to gate compression-event
+        // recording, because `mark_terminal` flips `completion_delivered=true`
+        // immediately for tasks with `notify_on_completion=false` (foreground
+        // bash polled via `bash_status`, which is the common case). Pre-emptive
+        // delivery flagging is correct for the push-frame queue (suppresses
+        // duplicate user-visible notifications) but would silently skip the
+        // database insert below. Compression event recording is idempotent at
+        // the DB layer (unique on harness+session+task_id), so re-entry is
+        // safe; the dedupe-by-queue check stays for the push frame side.
+        if !metadata.status.is_terminal() {
             return;
         }
         // Read tail once at completion time and cache on the BgCompletion so
@@ -1469,21 +1479,36 @@ impl BgTaskRegistry {
             compressed_tokens: token_counts.compressed_tokens,
             tokens_skipped: token_counts.tokens_skipped,
         };
-        if let Ok(mut completions) = self.inner.completions.lock() {
-            if completions
-                .iter()
-                .any(|completion| completion.task_id == metadata.task_id)
-            {
-                return;
-            }
-            completions.push_back(completion.clone());
-        } else {
-            return;
-        }
 
+        // Record the compression event BEFORE the push-frame dedupe. Event
+        // recording has its own idempotency at the DB layer (unique key on
+        // harness+session+task_id), so it's safe to attempt for every
+        // terminal-state finalize. Critically, this path runs even when
+        // `completion_delivered=true` was pre-set by `mark_terminal` for
+        // foreground bash (`notify_on_completion=false`) — which is the common
+        // case for OpenCode/Pi `bash` tool calls. Previously this code lived
+        // after the dedupe guard and never fired for foreground tasks, which
+        // meant compression accounting was effectively dead for >99% of
+        // real-world bash usage.
         self.record_compression_event_if_applicable(metadata, &token_counts);
 
-        if emit_frame {
+        // Push-frame queue dedupe stays per-task to prevent duplicate
+        // user-visible completion notifications.
+        let pushed = if let Ok(mut completions) = self.inner.completions.lock() {
+            if completions
+                .iter()
+                .any(|existing| existing.task_id == metadata.task_id)
+            {
+                false
+            } else {
+                completions.push_back(completion.clone());
+                true
+            }
+        } else {
+            false
+        };
+
+        if pushed && emit_frame {
             self.emit_bash_completed(completion);
         }
     }
@@ -1510,11 +1535,21 @@ impl BgTaskRegistry {
                 original_bytes,
                 compressed_bytes,
             ),
-            _ => return,
+            _ => {
+                crate::slog_warn!(
+                    "compression event skipped for {}: token counts unavailable (likely spill file missing or unreadable)",
+                    metadata.task_id
+                );
+                return;
+            }
         };
 
         let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
         let Some(pool) = pool else {
+            crate::slog_warn!(
+                "compression event skipped for {}: db_pool not initialized — was configure run?",
+                metadata.task_id
+            );
             return;
         };
         let harness = self
@@ -1565,12 +1600,24 @@ impl BgTaskRegistry {
                 return;
             }
         };
-        if let Err(error) = crate::db::compression_events::insert_compression_event(&conn, &row) {
-            crate::slog_warn!(
-                "compression event insert failed for {}: {}",
-                metadata.task_id,
-                error
-            );
+        match crate::db::compression_events::insert_compression_event(&conn, &row) {
+            Ok(_) => {
+                crate::slog_info!(
+                    "compression event recorded for {} (project={}, session={}, {} → {} tokens)",
+                    metadata.task_id,
+                    project_key,
+                    metadata.session_id,
+                    original_tokens,
+                    compressed_tokens
+                );
+            }
+            Err(error) => {
+                crate::slog_warn!(
+                    "compression event insert failed for {}: {}",
+                    metadata.task_id,
+                    error
+                );
+            }
         }
     }
 
@@ -1984,26 +2031,46 @@ fn read_for_token_count_from_disk(
     paths: &TaskPaths,
     max_bytes_per_stream: usize,
 ) -> TokenCountInput {
-    let stdout = match read_file_with_cap(&paths.stdout, max_bytes_per_stream) {
-        Ok(Some(stdout)) => stdout,
-        _ => return TokenCountInput::Skipped,
-    };
-    let stderr = match read_file_with_cap(&paths.stderr, max_bytes_per_stream) {
-        Ok(Some(stderr)) => stderr,
-        _ => return TokenCountInput::Skipped,
-    };
-    TokenCountInput::Text(combine_streams(
-        String::from_utf8_lossy(&stdout).as_ref(),
-        String::from_utf8_lossy(&stderr).as_ref(),
-    ))
+    // Read up to `max_bytes_per_stream` bytes per stream rather than
+    // refusing to tokenize anything when the file exceeds the cap.
+    // Mirror the in-memory `BgBuffer::read_for_token_count` policy
+    // (see comment there) — large outputs are exactly the tasks that
+    // benefit most from compression accounting, so silent-skipping
+    // them defeats the purpose of token tracking.
+    let stdout = read_file_tail_capped(&paths.stdout, max_bytes_per_stream);
+    let stderr = read_file_tail_capped(&paths.stderr, max_bytes_per_stream);
+    match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => TokenCountInput::Text(combine_streams(
+            String::from_utf8_lossy(&stdout).as_ref(),
+            String::from_utf8_lossy(&stderr).as_ref(),
+        )),
+        (Ok(stdout), Err(_)) => TokenCountInput::Text(combine_streams(
+            String::from_utf8_lossy(&stdout).as_ref(),
+            "",
+        )),
+        (Err(_), Ok(stderr)) => TokenCountInput::Text(combine_streams(
+            "",
+            String::from_utf8_lossy(&stderr).as_ref(),
+        )),
+        (Err(_), Err(_)) => TokenCountInput::Skipped,
+    }
 }
 
-fn read_file_with_cap(path: &Path, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > max_bytes as u64 {
-        return Ok(None);
+/// Read at most `max_bytes` bytes from the END of `path`. Used for
+/// tokenization where the most recent output is more representative than
+/// an arbitrarily-capped beginning. Returns `Err` if the file cannot be
+/// opened (genuinely missing or permissions error).
+fn read_file_tail_capped(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let read_len = len.min(max_bytes as u64);
+    if read_len > 0 && len > max_bytes as u64 {
+        file.seek(SeekFrom::End(-(read_len as i64)))?;
     }
-    fs::read(path).map(Some)
+    let mut bytes = Vec::with_capacity(read_len as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 impl BgTask {

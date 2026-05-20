@@ -445,6 +445,17 @@ fn migration_items() -> &'static [MigrationItem] {
             entry: EntryKind::File,
             merge: MergeKind::Whole,
         },
+        // ONNX runtime is host-global (shared by all harnesses). Moving it
+        // avoids forcing every user to re-download the ~200MB runtime after
+        // upgrading. ChildUnion lets a later second-harness migration coexist
+        // if a partial migration somehow ran a different runtime version.
+        MigrationItem {
+            name: "onnxruntime",
+            source_name: "onnxruntime",
+            target: TargetKind::Root,
+            entry: EntryKind::Directory,
+            merge: MergeKind::ChildUnion,
+        },
         MigrationItem {
             name: "last-update-check.json",
             source_name: "last-update-check.json",

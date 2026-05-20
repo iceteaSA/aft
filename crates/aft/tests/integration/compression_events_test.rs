@@ -157,7 +157,15 @@ fn completed_task_records_compression_event() {
 }
 
 #[test]
-fn completed_task_skipped_tokens_records_no_event() {
+fn completed_task_with_large_output_records_event_from_tail() {
+    // Previously the 128KB-per-stream tokenize cap caused
+    // `read_for_token_count` to return `Skipped`, which made
+    // `record_compression_event_if_applicable` early-return silently.
+    // That broke compression accounting for exactly the tasks that
+    // benefit most from compression (huge log/test output). The fix
+    // tokenizes the last 128KB of each stream so an event IS recorded
+    // — `tokens_skipped` stays false, and the bash_tasks/compression_events
+    // join still works for downstream analytics.
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
@@ -170,8 +178,14 @@ fn completed_task_skipped_tokens_records_no_event() {
     );
     let completion = wait_for_completion(&registry, &task_id);
 
-    assert_eq!(completion.tokens_skipped, true);
-    assert_eq!(event_count(&conn, &task_id), 0);
+    assert_eq!(completion.tokens_skipped, false);
+    wait_for_event_count(&conn, &task_id, 1);
+    let event = fetch_event(&conn, &task_id);
+    assert!(
+        event.original_tokens > 1_000,
+        "tail of ~200KB output should tokenize to substantially more than a tiny task, got {}",
+        event.original_tokens
+    );
     registry.detach();
 }
 
