@@ -1217,25 +1217,18 @@ impl BgTaskRegistry {
         };
         if let Some(child) = state.child.as_mut() {
             if matches!(child.try_wait(), Ok(Some(_))) {
-                // Child has exited. If the wrapper successfully wrote an
-                // exit marker, the next `poll_task()` cycle will pick it up
-                // and finalize via `finalize_from_marker`. But if the
-                // wrapper crashed before writing the marker (e.g. SIGKILL,
-                // power loss, wrapper bug), the task would forever appear
-                // Running until `timeout_ms` expired — and if no timeout
-                // was set, until the 24h `running_metadata_is_stale` cutoff
-                // hit at the next aft restart. Same condition as the replay
-                // path's "PID dead but no marker" branch (see line 338).
+                // First pass: the direct child has exited, but a missing exit
+                // marker is not yet proof that the wrapper crashed. Under
+                // load, the wrapper can be between writing `*.exit.tmp.$$` and
+                // renaming it to `*.exit`, or the directory entry may not be
+                // visible to this watchdog pass yet.
                 //
-                // To avoid that hidden hang, mark the task Failed
-                // immediately with the same reason string used by replay,
-                // but only if the marker is genuinely absent. If a marker
-                // appeared on disk between try_wait() returning and now
-                // (race window), prefer the marker — let the next poll
-                // cycle finalize from it.
+                // Drop the handle and mark the task detached so a later pass
+                // uses the PID-dead path below. That second observation is
+                // strong enough to fail if the marker is still absent, while a
+                // marker that lands in the meantime is finalized by poll_task.
                 state.child = None;
                 state.detached = true;
-                self.fail_without_exit_marker_if_needed(task, &mut state);
             }
         } else if state.detached
             && state
@@ -2601,11 +2594,9 @@ mod tests {
         assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
     }
 
-    /// Issue #27 Oracle review P1 + P2 test gap: verify that the live
-    /// watchdog path (reap_child) marks a task Failed when the child
-    /// has exited but no exit marker was written. Before this fix the
-    /// task would remain `Running` until timeout, even though the
-    /// process was definitely dead.
+    /// Verify that the live watchdog path (reap_child) gives an exited
+    /// child one watchdog pass for its exit marker to land, then marks the
+    /// task Failed if the next pass still sees no marker.
     ///
     /// Cross-platform: uses a quick-exiting command that does NOT go
     /// through the wrapper script (we manually clear the exit marker
@@ -2678,11 +2669,9 @@ mod tests {
         // The watchdog may have already reaped the child handle and
         // marked the task terminal before we got here. Reset both so
         // reap_child has the "Running task whose child just exited"
-        // shape it's designed to handle. We don't restore state.child
-        // (the underlying OS process is gone), but reap_child's
-        // try_wait path won't be exercised; we're testing the
-        // status-transition logic when state.child is set to a dead
-        // child OR None and the marker is missing.
+        // shape it's designed to handle. If the original child handle is
+        // gone, install a quick-exited stand-in so the first reap exercises
+        // the same try_wait path as production.
         //
         // CRITICAL on Windows: the watchdog ticks fast enough that the
         // JSON on disk may already say `Completed`. `update_task` (called
@@ -2724,16 +2713,42 @@ mod tests {
             "precondition: exit marker absent"
         );
 
-        // Invoke the watchdog's reap_child directly. The fix should mark
-        // the task Failed with the documented reason string, instead of
-        // just dropping the child handle and leaving status=Running.
+        // First watchdog observation is intentionally insufficient to
+        // declare failure. A missing marker may just mean the wrapper is
+        // still completing its tmp-file-to-marker rename, so reap_child only
+        // drops the child handle and switches to detached PID monitoring.
+        registry.reap_child(&task);
+
+        {
+            let state = task.state.lock().unwrap();
+            assert_eq!(
+                state.metadata.status,
+                BgTaskStatus::Running,
+                "first reap must leave status Running while waiting one pass for marker"
+            );
+            assert_eq!(
+                state.metadata.status_reason, None,
+                "first reap must not record a failure reason"
+            );
+            assert!(
+                state.child.is_none(),
+                "child handle must be released after first reap"
+            );
+            assert!(
+                state.detached,
+                "task must be marked detached after first reap"
+            );
+        }
+
+        // Second watchdog observation sees the detached PID is dead and the
+        // marker is still absent. That is strong enough evidence that the
+        // wrapper exited without persisting an exit code.
         registry.reap_child(&task);
 
         let state = task.state.lock().unwrap();
         assert!(
             state.metadata.status.is_terminal(),
-            "reap_child must transition to terminal when PID dead and no marker. \
-             Got status={:?}",
+            "second reap must transition to terminal when PID dead and no marker. Got status={:?}",
             state.metadata.status
         );
         assert_eq!(
@@ -2750,16 +2765,18 @@ mod tests {
         );
         assert!(
             state.child.is_none(),
-            "child handle must be released after reap"
+            "child handle must stay released after second reap"
         );
-        assert!(state.detached, "task must be marked detached after reap");
+        assert!(
+            state.detached,
+            "task must remain detached after second reap"
+        );
     }
 
     /// Companion to the above: when the exit marker DOES exist on disk
-    /// at reap_child time (race window — wrapper finished writing
-    /// between try_wait and the marker check), reap_child must NOT mark
-    /// the task Failed. Instead it leaves status=Running and lets the
-    /// next poll_task() cycle finalize via the marker.
+    /// at reap_child time, reap_child must NOT mark the task Failed.
+    /// Instead it leaves status=Running and lets the next poll_task()
+    /// cycle finalize via the marker.
     #[test]
     fn reap_child_preserves_running_when_exit_marker_exists() {
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));

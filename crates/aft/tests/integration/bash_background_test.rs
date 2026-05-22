@@ -30,12 +30,18 @@ fn wait_until_process_exits(pid: i32) -> bool {
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
+    // Keep background task storage per test. AftProcess::spawn() uses one
+    // AFT_CACHE_DIR per test binary process, so parallel integration tests
+    // would otherwise replay and mutate each other's live background tasks.
+    let storage_dir = dir.path().join("aft-storage");
+    std::fs::create_dir_all(&storage_dir).unwrap();
     let response = aft.send(
         &json!({
             "id": "cfg-bg",
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
+            "storage_dir": storage_dir,
             "experimental_bash_background": true,
         })
         .to_string(),
@@ -95,13 +101,23 @@ fn status_with_session(aft: &mut AftProcess, task_id: &str, session_id: &str) ->
     )
 }
 
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "killed" | "timed_out")
+}
+
 fn wait_for_status(aft: &mut AftProcess, task_id: &str, expected: &str) -> Value {
     let started = Instant::now();
     loop {
         let response = status(aft, task_id);
         assert_eq!(response["success"], true, "status failed: {response:?}");
-        if response["status"] == expected {
+        let observed = response["status"].as_str().unwrap_or_default();
+        if observed == expected {
             return response;
+        }
+        if is_terminal_status(observed) {
+            panic!(
+                "got terminal status '{observed}', expected '{expected}'. last metadata: {response:?}"
+            );
         }
         assert!(
             started.elapsed() < Duration::from_secs(8),
@@ -163,7 +179,10 @@ fn background_spawn_status_running_and_completion() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
-    let task_id = spawn_bg(&mut aft, "spawn-running", "sleep 0.5");
+    // Keep this longer than the 500ms watchdog interval. `sleep 0.5`
+    // ended right on the watchdog tick boundary and could complete before
+    // this status check observed the intended Running state under load.
+    let task_id = spawn_bg(&mut aft, "spawn-running", "sleep 1");
     let running = status(&mut aft, &task_id);
     assert_eq!(
         running["success"], true,
