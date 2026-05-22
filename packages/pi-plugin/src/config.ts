@@ -11,6 +11,7 @@ import { error, log, warn } from "./logger.js";
 
 export type Formatter =
   | "biome"
+  | "oxfmt"
   | "prettier"
   | "deno"
   | "ruff"
@@ -248,6 +249,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
 
 const FormatterEnum = z.enum([
   "biome",
+  "oxfmt",
   "prettier",
   "deno",
   "ruff",
