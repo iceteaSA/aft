@@ -173,3 +173,180 @@ fn dispatch_reaches_extra_compressors() {
     assert_eq!(compressed.matches("Progress: resolved").count(), 2);
     assert!(compressed.contains("dependencies:"));
 }
+
+// ---------------------------------------------------------------------------
+// `bun test` compressor tests
+//
+// Regression: until v0.28.2, `bun test` fell through to GenericCompressor,
+// which middle-truncates large outputs. Bun emits failure blocks BETWEEN the
+// header and the summary, so truncation would routinely lose the error
+// detail an agent needs to debug. The new compress_test() preserves all
+// failure blocks (capped at MAX_FAILURES) plus header + summary.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bun_test_pass_only_keeps_header_and_summary() {
+    let output = "bun test v1.3.14 (0d9b296a)\n\nsrc/__tests__/foo.test.ts:\n\n 12 pass\n 0 fail\n 24 expect() calls\nRan 12 tests across 1 file. [42.00ms]\n";
+
+    let compressed = BunCompressor.compress("bun test", output);
+    assert!(compressed.contains("bun test v1.3.14"));
+    assert!(compressed.contains("12 pass"));
+    assert!(compressed.contains("0 fail"));
+    assert!(compressed.contains("Ran 12 tests across 1 file. [42.00ms]"));
+}
+
+#[test]
+fn bun_test_preserves_single_failure_block_when_middle_truncation_would_hit() {
+    // Simulate the realistic shape: header + (many) pass-quiet sections +
+    // failure block + summary. Bun's default reporter doesn't print
+    // individual pass lines, but it does print a section header per file,
+    // so the truncation hazard is real for monorepos with many test files.
+    let mut output = String::from("bun test v1.3.14 (0d9b296a)\n");
+    for index in 0..50 {
+        output.push_str(&format!("\nsrc/pass_only_{index}.test.ts:\n"));
+    }
+    output.push_str("\nsrc/failing.test.ts:\n");
+    output.push_str("11 | test(\"failing example\", () => {\n");
+    output.push_str("12 |   expect({ a: 1 }).toEqual({ a: 2 });\n");
+    output.push_str("                          ^\n");
+    output.push_str("error: expect(received).toEqual(expected)\n");
+    output.push_str("\n@@ -1,3 +1,3 @@\n");
+    output.push_str("   {\n");
+    output.push_str("-    \"a\": 2,\n");
+    output.push_str("+    \"a\": 1,\n");
+    output.push_str("   }\n");
+    output.push_str("\n      at <anonymous> (/repo/src/failing.test.ts:12:24)\n");
+    output.push_str("(fail) failing example [3.43ms]\n");
+    output.push_str(
+        "\n 49 pass\n 1 fail\n 50 expect() calls\nRan 50 tests across 50 files. [142.00ms]\n",
+    );
+
+    let compressed = BunCompressor.compress("bun test", &output);
+
+    // Must preserve the failure block.
+    assert!(compressed.contains("error: expect(received).toEqual(expected)"));
+    assert!(compressed.contains("(fail) failing example"));
+    assert!(compressed.contains("expect({ a: 1 }).toEqual({ a: 2 });"));
+    assert!(compressed.contains("at <anonymous>"));
+    // Must preserve the file section header that owns the failure.
+    assert!(compressed.contains("src/failing.test.ts:"));
+    // Must preserve the summary tail.
+    assert!(compressed.contains("1 fail"));
+    assert!(compressed.contains("Ran 50 tests across 50 files. [142.00ms]"));
+
+    // Pass-only section headers should be dropped (no failure beneath them).
+    assert!(!compressed.contains("src/pass_only_0.test.ts:"));
+    assert!(!compressed.contains("src/pass_only_49.test.ts:"));
+
+    let ratio = compressed.len() as f32 / output.len() as f32;
+    assert!(ratio < 0.50, "ratio was {ratio}");
+}
+
+#[test]
+fn bun_test_multiple_failures_all_preserved_under_cap() {
+    let mut output = String::from("bun test v1.3.14 (0d9b296a)\n\nsrc/multi.test.ts:\n\n");
+    for index in 0..3 {
+        output.push_str(&format!(
+            "{} | expect({}).toBe(0);\n",
+            10 + index,
+            index + 1
+        ));
+        output.push_str("              ^\n");
+        output.push_str(&format!(
+            "error: expect(received).toBe(expected) [{index}]\n"
+        ));
+        output.push_str("\nExpected: 0\n");
+        output.push_str(&format!("Received: {}\n", index + 1));
+        output.push_str(&format!(
+            "      at <anonymous> (/repo/src/multi.test.ts:{}:5)\n",
+            10 + index
+        ));
+        output.push_str(&format!("(fail) case {index} [0.5ms]\n"));
+    }
+    output
+        .push_str("\n 0 pass\n 3 fail\n 3 expect() calls\nRan 3 tests across 1 file. [12.00ms]\n");
+
+    let compressed = BunCompressor.compress("bun test", &output);
+
+    for index in 0..3 {
+        assert!(
+            compressed.contains(&format!("expect(received).toBe(expected) [{index}]")),
+            "missing failure {index} body in: {compressed}"
+        );
+        assert!(
+            compressed.contains(&format!("(fail) case {index}")),
+            "missing (fail) marker {index}"
+        );
+    }
+    assert!(compressed.contains("3 fail"));
+    assert!(compressed.contains("Ran 3 tests across 1 file. [12.00ms]"));
+    assert!(!compressed.contains("+0 more failures"));
+}
+
+#[test]
+fn bun_test_catastrophic_failure_count_is_capped() {
+    let mut output = String::from("bun test v1.3.14 (0d9b296a)\n\nsrc/disaster.test.ts:\n\n");
+    let total = 100usize;
+    for index in 0..total {
+        output.push_str(&format!(
+            "{} | expect({}).toBe(0);\n",
+            10 + index,
+            index + 1
+        ));
+        output.push_str("              ^\n");
+        output.push_str(&format!("error: failure_marker_{index}\n"));
+        output.push_str(&format!("(fail) case_{index} [0.5ms]\n"));
+    }
+    output.push_str(&format!(
+        "\n 0 pass\n {total} fail\n {total} expect() calls\nRan {total} tests across 1 file. [12.00ms]\n"
+    ));
+
+    let compressed = BunCompressor.compress("bun test", &output);
+
+    // First 25 failures must be preserved (MAX_FAILURES = 25).
+    for index in 0..25 {
+        assert!(
+            compressed.contains(&format!("failure_marker_{index}")),
+            "missing kept failure {index}"
+        );
+    }
+    // Failures past 25 must be dropped from the body.
+    for index in 25..total {
+        assert!(
+            !compressed.contains(&format!("failure_marker_{index}")),
+            "did not drop failure {index}"
+        );
+    }
+    // Drop trailer must report the count of dropped failures.
+    assert!(
+        compressed.contains(&format!("+{} more failures", total - 25)),
+        "missing dropped-failures trailer in: {compressed}"
+    );
+    // Summary intact.
+    assert!(compressed.contains(&format!("{total} fail")));
+    assert!(compressed.contains(&format!("Ran {total} tests across 1 file. [12.00ms]")));
+}
+
+#[test]
+fn bun_test_dispatch_routes_through_test_compressor_not_generic() {
+    // End-to-end: confirm the registry dispatches `bun test` through the
+    // new compress_test path. Without the fix, this output would go to
+    // GenericCompressor::compress_output() which preserves all lines and
+    // does not skip individual file-section headers; with the fix we drop
+    // the pass-only sections and keep the failure block.
+    let ctx = compress_context();
+    let output = "bun test v1.3.14 (0d9b296a)\n\nsrc/a.test.ts:\n\nsrc/b.test.ts:\n\nsrc/c.test.ts:\n12 | expect(1).toBe(2);\n              ^\nerror: expect(received).toBe(expected)\n(fail) c case [0.5ms]\n\n 0 pass\n 1 fail\n 1 expect() calls\nRan 1 tests across 3 files. [3.00ms]\n".to_string();
+
+    let compressed = compress::compress("bun test", output, &ctx);
+    // Pass-only sections dropped.
+    assert!(!compressed.contains("src/a.test.ts:"));
+    assert!(!compressed.contains("src/b.test.ts:"));
+    // Failing section header preserved.
+    assert!(compressed.contains("src/c.test.ts:"));
+    // Failure body preserved.
+    assert!(compressed.contains("error: expect(received).toBe(expected)"));
+    assert!(compressed.contains("(fail) c case"));
+    // Summary tail preserved.
+    assert!(compressed.contains("1 fail"));
+    assert!(compressed.contains("Ran 1 tests across 3 files. [3.00ms]"));
+}
