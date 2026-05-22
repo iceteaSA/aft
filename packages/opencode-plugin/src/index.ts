@@ -40,6 +40,7 @@ import {
   sendFeatureAnnouncement,
   sendWarning,
 } from "./notifications.js";
+import { maybeAppendConflictsHint, maybeAppendGrepHint } from "./shared/bash-hints.js";
 import { isBunRuntime, probeServerReachable } from "./shared/live-server-client.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
 import {
@@ -983,22 +984,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         if (stored.title) output.title = stored.title;
         if (stored.metadata) output.metadata = { ...output.metadata, ...stored.metadata };
       }
-      // Hint: when a git merge/rebase produces conflicts, nudge the agent toward aft_conflicts
-      if (
-        toolInput.tool === "bash" &&
-        output.output?.includes("Automatic merge failed; fix conflicts")
-      ) {
-        output.output +=
-          "\n\n[Hint] Use aft_conflicts to see all conflict regions across files in a single call.";
-      }
-      // Hint: when agent runs grep/rg via bash, nudge toward the built-in grep tool.
-      // Detection: check the first line of output (the echoed command) for rg or grep invocations.
+      // Bash output hints — see shared/bash-hints.ts for the gating logic.
       if (toolInput.tool === "bash" && output.output) {
-        const firstLine = output.output.slice(0, 300).split("\n")[0] ?? "";
-        if (/\b(rg|grep)\s/.test(firstLine)) {
-          output.output +=
-            "\n\n[Hint] Use the grep tool instead of bash for faster indexed search.";
-        }
+        output.output = maybeAppendConflictsHint(output.output);
+        output.output = maybeAppendGrepHint(output.output);
       }
       // Use cached session directory so bg-completion drains target the
       // right project bridge after `opencode -s` from another cwd.
