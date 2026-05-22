@@ -128,11 +128,7 @@ fn is_violation_line(trimmed: &str) -> bool {
     {
         return false;
     }
-    parts[3]
-        .trim_start()
-        .split_whitespace()
-        .next()
-        .is_some_and(is_rule_code)
+    parts[3].split_whitespace().next().is_some_and(is_rule_code)
 }
 
 fn is_rule_code(token: &str) -> bool {

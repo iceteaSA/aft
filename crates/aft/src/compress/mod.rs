@@ -22,9 +22,15 @@ pub mod cargo;
 pub mod eslint;
 pub mod generic;
 pub mod git;
+pub mod go;
+pub mod mypy;
+pub mod next;
 pub mod npm;
+pub mod playwright;
 pub mod pnpm;
+pub mod prettier;
 pub mod pytest;
+pub mod ruff;
 pub mod toml_filter;
 pub mod trust;
 pub mod tsc;
@@ -37,9 +43,15 @@ use cargo::CargoCompressor;
 use eslint::EslintCompressor;
 use generic::{strip_ansi, GenericCompressor};
 use git::GitCompressor;
+use go::{GoCompressor, GolangciLintCompressor};
+use mypy::MypyCompressor;
+use next::NextCompressor;
 use npm::NpmCompressor;
+use playwright::PlaywrightCompressor;
 use pnpm::PnpmCompressor;
+use prettier::PrettierCompressor;
 use pytest::PytestCompressor;
+use ruff::RuffCompressor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use toml_filter::{apply_filter, FilterRegistry};
@@ -113,7 +125,7 @@ pub fn compress(command: &str, output: String, ctx: &AppContext) -> String {
 pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegistry) -> String {
     let stripped_for_generic = strip_ansi(output);
 
-    let compressors: [&dyn Compressor; 10] = [
+    let compressors: [&dyn Compressor; 17] = [
         &GitCompressor,
         &CargoCompressor,
         &TscCompressor,
@@ -124,6 +136,13 @@ pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegi
         &EslintCompressor,
         &VitestCompressor,
         &BiomeCompressor,
+        &PrettierCompressor,
+        &RuffCompressor,
+        &MypyCompressor,
+        &GoCompressor,
+        &GolangciLintCompressor,
+        &PlaywrightCompressor,
+        &NextCompressor,
     ];
 
     // Tier 1a: Specific compressors win first.
