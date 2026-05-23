@@ -4,8 +4,9 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 // Spy on sessionLog/sessionWarn so we can assert on the structured trace
 // events emitted by the wake path (event names, wake_client_path metadata,
-// wake_serverUrl_unavailable). The mock MUST be installed before the
-// SUT is imported, because Bun hoists `mock.module` to the top of the file.
+// bash_completion_wake_client_unavailable). The mock MUST be installed
+// before the SUT is imported, because Bun hoists `mock.module` to the
+// top of the file.
 const sessionLogSpy = mock(
   (_sessionID: string | undefined, _message: string, _data?: unknown) => {},
 );
@@ -28,16 +29,27 @@ mock.module("../logger.js", () => ({
   getLogFilePath: () => "",
 }));
 
-// Mock the live-server client factory so unit tests don't need a real
-// HTTP listener. Each test installs the client it wants via
-// `setTestLiveServerClient(...)`. This is the substitute for the legacy
-// `client: { session: { promptAsync } }` parameter on DrainContext —
-// the wake path no longer reads `drainContext.client` (workaround for
-// anomalyco/opencode#28202), so we have to intercept the SDK factory.
+// Mock the live-server client factory + wake-availability decision so
+// unit tests don't need a real HTTP listener. Each test sets up its own
+// state:
+//   • `setTestLiveServerClient(client)` — install the client returned by
+//     `getLiveServerClient()` when the wake path picks the live-server
+//     transport.
+//   • `setTestLiveServerAvailable(true|false)` — flip the per-process
+//     wake-availability decision the wake path reads at fire time.
+//
+// When availability is `false` the wake path uses `drainContext.client`
+// directly (the in-process fallback), bypassing this factory entirely.
+// That's the post-v0.29 behavior introduced when we removed the
+// `--port 0` nudge — see shared/live-server-client.ts.
 let liveServerClient: unknown = null;
 let lastLiveServerArgs: { serverUrl: string; directory: string } | null = null;
+let liveServerAvailable = true;
 function setTestLiveServerClient(client: unknown): void {
   liveServerClient = client;
+}
+function setTestLiveServerAvailable(available: boolean): void {
+  liveServerAvailable = available;
 }
 function getLastLiveServerArgs(): { serverUrl: string; directory: string } | null {
   return lastLiveServerArgs;
@@ -50,9 +62,16 @@ mock.module("../shared/live-server-client.js", () => ({
     }
     return liveServerClient;
   },
+  useLiveServerWake: () => liveServerAvailable,
+  setLiveServerWakeAvailable: (available: boolean) => {
+    liveServerAvailable = available;
+  },
   __resetLiveServerClientCacheForTests: () => {
     liveServerClient = null;
     lastLiveServerArgs = null;
+  },
+  __resetLiveServerWakeForTests: () => {
+    liveServerAvailable = true;
   },
 }));
 
@@ -78,6 +97,9 @@ beforeEach(() => {
   sessionWarnSpy.mockClear();
   liveServerClient = null;
   lastLiveServerArgs = null;
+  // Default to live-server-available so existing tests keep exercising
+  // the workaround path. Tests covering the fallback flip this to false.
+  liveServerAvailable = true;
 });
 
 afterEach(() => {
@@ -98,6 +120,23 @@ function installLiveServerClient(
       ...(messages !== undefined ? { messages: async () => ({ data: messages }) } : {}),
     },
   });
+}
+
+/**
+ * Build a stub plugin-context client shaped like OpenCode's `input.client`.
+ * Returned so individual tests can read `.session.promptAsync.mock.calls`
+ * to assert whether the in-process wake fallback fired.
+ */
+function makeClient(
+  promptAsync: ReturnType<typeof mock>,
+  messages?: unknown[],
+): { session: { promptAsync: typeof promptAsync; messages?: () => Promise<{ data: unknown[] }> } } {
+  return {
+    session: {
+      promptAsync,
+      ...(messages !== undefined ? { messages: async () => ({ data: messages }) } : {}),
+    },
+  };
 }
 
 /** Helper: extract the structured data argument from the first matching trace event. */
@@ -707,72 +746,127 @@ describe("OpenCode background notifications", () => {
     }
   });
 
-  // ─── Workaround-specific tests for anomalyco/opencode#28202 ───
+  // ─── Wake transport selection (live-server vs. in-process fallback) ───
+  //
+  // Per-process decision is made by `setLiveServerWakeAvailable()` at
+  // plugin init from the result of `probeServerReachable()`. The wake
+  // path reads the cached decision via `useLiveServerWake()` each time
+  // a reminder fires.
+  //
+  // • `true`  — POST through `createOpencodeClient(input.serverUrl)`.
+  //             Works around anomalyco/opencode#28202 (no duplicate runs).
+  // • `false` — POST through `drainContext.client.session.promptAsync`.
+  //             Accepts the upstream bug so wakes still arrive instead
+  //             of being indefinitely queued + dropped via wake_hard_stop.
 
-  test("serverUrl unavailable degrades to retry-with-backoff and never calls promptAsync", async () => {
-    // Without serverUrl, the wake path MUST NOT use input.client.promptAsync
-    // (that's the bug path). It should keep completions queued, log a
-    // dedicated trace event, and let the retry-with-backoff fire. Eventually
-    // the existing wake_hard_stop kicks in after MAX_WAKE_SEND_ATTEMPTS.
+  test("live-server wake uses createOpencodeClient and tags trace as live-server", async () => {
+    setTestLiveServerAvailable(true);
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+    const livePromptAsync = mock(async () => {});
+    installLiveServerClient(livePromptAsync);
+    const fallbackClient = makeClient(mock(async () => {}));
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await sleep(260);
+
+    // The live-server client was used; the fallback client was NOT.
+    expect(livePromptAsync).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(0);
+
+    const startMeta = findTraceEvent("bash_completion_wake_prompt_async_start");
+    expect(startMeta).toBeDefined();
+    expect(startMeta?.wake_client_path).toBe("live-server");
+    expect(typeof startMeta?.delivery_id).toBe("string");
+    expect(startMeta?.task_ids).toEqual(["task-1"]);
+    // The factory saw the serverUrl + directory we configured.
+    expect(getLastLiveServerArgs()).toEqual({
+      serverUrl: TEST_SERVER_URL,
+      directory: "/tmp/project",
+    });
+  });
+
+  test("in-process fallback wake uses drainContext.client and tags trace accordingly", async () => {
+    // When the live HTTP listener was unreachable at startup,
+    // bg-notifications must use the plugin-provided in-process client so
+    // wakes still arrive — at the cost of the upstream duplicate-runner
+    // bug. Pre-v0.29 we threw and queued for retry; post-v0.29 we
+    // intentionally accept the bug in exchange for delivery.
+    setTestLiveServerAvailable(false);
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+    const livePromptAsync = mock(async () => {});
+    installLiveServerClient(livePromptAsync);
+    const fallbackClient = makeClient(mock(async () => {}));
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await sleep(260);
+
+    // The fallback client was used; the live-server factory was NOT
+    // consulted at all (no probe of getLastLiveServerArgs).
+    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(1);
+    expect(livePromptAsync).toHaveBeenCalledTimes(0);
+    expect(getLastLiveServerArgs()).toBeNull();
+
+    const startMeta = findTraceEvent("bash_completion_wake_prompt_async_start");
+    expect(startMeta).toBeDefined();
+    expect(startMeta?.wake_client_path).toBe("in-process-fallback");
+    expect(typeof startMeta?.delivery_id).toBe("string");
+    expect(startMeta?.task_ids).toEqual(["task-1"]);
+  });
+
+  test("in-process fallback without client emits diagnostic and queues for retry", async () => {
+    // If the live-server probe said false AND the drainContext somehow
+    // arrived without a client, the wake has no transport at all. The
+    // path emits a dedicated trace event, holds completions for retry,
+    // and lets the existing retry-with-backoff fire — same behavior the
+    // pre-v0.29 missing-serverUrl path used to have.
+    setTestLiveServerAvailable(false);
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
-    const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    const livePromptAsync = mock(async () => {});
+    installLiveServerClient(livePromptAsync);
 
     await handlePushedBgCompletion(
       {
         ctx,
         directory: "/tmp/project",
         sessionID: "s1",
-        client: {},
-        // serverUrl intentionally omitted
+        // client intentionally omitted
+        serverUrl: TEST_SERVER_URL,
       },
       completion("task-1", "npm test"),
     );
-    // One debounce window — long enough for the first scheduled wake to fire.
     await sleep(260);
 
-    // The promptAsync stub must NEVER be reached — that would prove the
-    // workaround silently fell back to a broken transport.
-    expect(promptAsync).toHaveBeenCalledTimes(0);
-    // The pending completion is held for retry (not silently dropped).
+    // No client = no transport = no promptAsync call on either path.
+    expect(livePromptAsync).toHaveBeenCalledTimes(0);
+    // The pending completion is held for retry.
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
-    // The dedicated trace event was emitted with task ids + attempt number.
-    const meta = findTraceEvent("bash_completion_wake_serverUrl_unavailable");
+    // The new diagnostic event names the transport gap.
+    const meta = findTraceEvent("bash_completion_wake_client_unavailable");
     expect(meta).toBeDefined();
     expect(meta?.task_ids).toEqual(["task-1"]);
     expect(meta?.attempt).toBe(1);
-    // A retry is scheduled — debounce timer should still be live for the
-    // next attempt to run after backoff.
     expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
-  });
-
-  test("live-server wake emits wake_client_path in trace metadata", async () => {
-    trackBgTask("s1", "task-1");
-    const { ctx } = harness(() => ({
-      success: true,
-      bg_completions: [completion("task-1", "npm test")],
-    }));
-    const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
-
-    await handleIdleBgCompletions({
-      ctx,
-      directory: "/tmp/project",
-      sessionID: "s1",
-      client: {},
-      serverUrl: TEST_SERVER_URL,
-    });
-    await sleep(260);
-
-    expect(promptAsync).toHaveBeenCalledTimes(1);
-    const startMeta = findTraceEvent("bash_completion_wake_prompt_async_start");
-    expect(startMeta).toBeDefined();
-    expect(startMeta?.wake_client_path).toBe("live-server");
-    // Sanity check that the other expected wake metadata is still present —
-    // proves we didn't accidentally trim the trace surface.
-    expect(typeof startMeta?.delivery_id).toBe("string");
-    expect(startMeta?.task_ids).toEqual(["task-1"]);
   });
 });
 

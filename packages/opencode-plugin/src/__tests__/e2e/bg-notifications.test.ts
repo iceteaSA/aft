@@ -4,12 +4,17 @@ import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
-// Mock the live-server SDK factory so the wake path can route promptAsync
-// to a test stub. The real implementation builds a `createOpencodeClient`
-// pointed at `input.serverUrl`, which is not available in this real-bridge
-// e2e harness (no OpenCode HTTP server fixture). The workaround for
-// anomalyco/opencode#28202 mandates that the wake path never falls back
-// to `input.client`, so we mock the live-server factory instead.
+// Mock the live-server SDK factory + wake-availability decision so the
+// wake path can route promptAsync to a test stub. The real implementation
+// builds a `createOpencodeClient` pointed at `input.serverUrl`, which is
+// not available in this real-bridge e2e harness (no OpenCode HTTP server
+// fixture).
+//
+// Post-v0.29, when `useLiveServerWake()` returns false, the wake path
+// falls back to `drainContext.client.session.promptAsync`. We pin it to
+// `true` here so this e2e keeps exercising the workaround path; a
+// dedicated unit test covers the fallback branch in
+// `__tests__/bg-notifications.test.ts`.
 let e2eLiveServerClient: unknown = null;
 function setE2ELiveServerClient(client: unknown): void {
   e2eLiveServerClient = client;
@@ -21,9 +26,12 @@ mock.module("../../shared/live-server-client.js", () => ({
     }
     return e2eLiveServerClient;
   },
+  useLiveServerWake: () => true,
+  setLiveServerWakeAvailable: () => {},
   __resetLiveServerClientCacheForTests: () => {
     e2eLiveServerClient = null;
   },
+  __resetLiveServerWakeForTests: () => {},
 }));
 
 import {

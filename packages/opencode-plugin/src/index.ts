@@ -41,7 +41,7 @@ import {
   sendWarning,
 } from "./notifications.js";
 import { maybeAppendConflictsHint, maybeAppendGrepHint } from "./shared/bash-hints.js";
-import { isBunRuntime, probeServerReachable } from "./shared/live-server-client.js";
+import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
 import {
   getSessionDirectory,
@@ -483,10 +483,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           ctx,
           directory: sessionDir,
           sessionID: completion.session_id,
+          // `client` is the in-process fallback used when the probe at
+          // plugin init found the live HTTP listener unreachable. See
+          // shared/live-server-client.ts and bg-notifications.ts for the
+          // wake transport selection (anomalyco/opencode#28202).
           client: input.client,
-          // Workaround for anomalyco/opencode#28202 — wake path uses a
-          // separate live-server client built from this URL. See
-          // bg-notifications.ts and shared/live-server-client.ts.
           serverUrl: input.serverUrl?.toString(),
         },
         completion,
@@ -499,6 +500,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           ctx,
           directory: sessionDir,
           sessionID: reminder.session_id,
+          // See onBashCompleted above for the live-server vs. in-process
+          // wake transport selection.
           client: input.client,
           serverUrl: input.serverUrl?.toString(),
         },
@@ -516,35 +519,32 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     storageDir: configOverrides.storage_dir as string,
   };
 
-  // TUI `--port 0` nudge: under Bun runtime (OpenCode TUI), probe whether
-  // `input.serverUrl` actually accepts API requests. TUI started without
-  // `--port 0` binds an internal-only listener that 404s for /session/*,
-  // which breaks the live-server-client workaround for the promptAsync
-  // runner-split bug. If we detect that case here, set a flag and the
-  // first `chat.message` hook for each session delivers a one-time
-  // ignored message instructing the user to relaunch with `--port 0`.
-  // Reachable serverUrl (Desktop with Electron+Node, or TUI launched with
-  // `--port 0`) → no nudge. Probe runs in background so plugin init isn't
-  // blocked on the HTTP timeout.
-  let tuiPortZeroNudgeNeeded = false;
-  if (isBunRuntime()) {
-    void probeServerReachable(input.serverUrl?.toString())
-      .then((reachable) => {
-        tuiPortZeroNudgeNeeded = !reachable;
-        if (!reachable) {
-          log(
-            "Detected OpenCode TUI without --port 0; live HTTP listener unreachable. " +
-              "Will nudge once per session to restart with --port 0 (anomalyco/opencode#28202).",
-          );
-        }
-      })
-      .catch(() => {
-        // Probe failures are treated as "unreachable" so user still sees the
-        // nudge — they can't possibly be worse off.
-        tuiPortZeroNudgeNeeded = true;
-      });
-  }
-  const tuiNudgeSentSessions = new Set<string>();
+  // Wake transport probe: decide ONCE per plugin process whether
+  // bg-notifications should POST wakes through a `createOpencodeClient`
+  // aimed at `input.serverUrl` (the workaround for
+  // anomalyco/opencode#28202 — no duplicate runs) or through the
+  // in-process `input.client.session.promptAsync` (the upstream bug
+  // path, but always available). Probe runs in the background so plugin
+  // init never blocks on the HTTP timeout; the wake path reads the
+  // resolved decision through `useLiveServerWake()` at the moment a
+  // wake fires, so background probes that finish AFTER init still take
+  // effect on the next reminder. Default until the probe resolves:
+  // `false` (in-process fallback) — that's the safer direction because
+  // `input.client.session.promptAsync` is always present, while the
+  // live-server transport needs an actual listener to be reachable.
+  void probeServerReachable(input.serverUrl?.toString())
+    .then((reachable) => {
+      setLiveServerWakeAvailable(reachable);
+      log(
+        reachable
+          ? "Live OpenCode HTTP listener reachable; bg-notifications wake path = live-server (anomalyco/opencode#28202 workaround active)."
+          : "Live OpenCode HTTP listener unreachable; bg-notifications wake path = in-process-fallback. Wakes will still arrive but the upstream duplicate-runner bug (anomalyco/opencode#28202) is not worked around. Launch with `opencode --port 0` in TUI mode to activate the workaround.",
+      );
+    })
+    .catch(() => {
+      // Probe failures stay on the safe default (in-process fallback).
+      setLiveServerWakeAvailable(false);
+    });
   // Settle the ONNX runtime download promise (started above) and patch the
   // resolved path into the pool's configure overrides. Bridges spawned AFTER
   // this resolves will pass `_ort_dylib_dir` through configure and pick up
@@ -918,21 +918,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // Eagerly warm the session-directory cache so the first tool call from
       // this turn routes to the right project (covers `opencode -s`-from-cwd).
       warmSessionDirectory(input.client, sid, input.directory);
-
-      // One-time per-session `--port 0` nudge for TUI users without it.
-      // Delivered via in-process `sendIgnoredMessage` so the user sees it
-      // regardless of whether the live listener is reachable (in fact,
-      // unreachability is the very condition that triggers this path).
-      if (tuiPortZeroNudgeNeeded && typeof sid === "string" && sid.length > 0) {
-        if (!tuiNudgeSentSessions.has(sid)) {
-          tuiNudgeSentSessions.add(sid);
-          const nudge =
-            "Due to a bug in opencode (https://github.com/anomalyco/opencode/issues/28202), background bash notifications are now using a workaround which needs opencode to be run via `opencode --port 0` in TUI mode. Opencode Desktop doesn't need special treatment.";
-          void sendIgnoredMessage(input.client, sid, nudge).catch(() => {
-            // best-effort
-          });
-        }
-      }
     },
     "command.execute.before": async (
       commandInput: { command: string; sessionID: string },

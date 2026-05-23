@@ -19,6 +19,16 @@
  * UI uses, so the active session's `SessionRunState` is the one that
  * resolves `ensureRunning` and overlapping turns coalesce correctly.
  *
+ * The workaround only works when the live HTTP listener is actually
+ * reachable. OpenCode Desktop (Electron+Node) and TUI launched with
+ * `opencode --port 0` bind a real API listener; plain TUI binds an
+ * internal-only listener that 404s for `/session/*`. We probe once at
+ * plugin init and cache the result. When the listener is unreachable
+ * the wake path silently uses the in-process `input.client.session.promptAsync`,
+ * which keeps wakes flowing (at the cost of the upstream duplicate-runner
+ * bug) instead of producing no notification at all or nagging the user
+ * to relaunch with a different flag.
+ *
  * Tracked upstream as anomalyco/opencode#28202. When OpenCode fixes the
  * runtime split, this helper and its single consumer in `bg-notifications.ts`
  * can be deleted and the wake path can go back to `input.client`.
@@ -85,25 +95,17 @@ export function __resetLiveServerClientCacheForTests(): void {
 }
 
 /**
- * True when the current runtime is Bun. OpenCode's TUI ships with Bun;
- * the Electron Desktop app ships with Node. We use this to gate the
- * `--port 0` nudge: Desktop is unaffected by anomalyco/opencode#28202
- * because Node's webidl polyfill is complete, so undici v8 (and the live
- * HTTP server) work without additional flags.
- */
-export function isBunRuntime(): boolean {
-  return typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
-}
-
-/**
  * Probe whether `serverUrl` accepts a connection within `timeoutMs`.
  * Returns `true` for any HTTP response (including 4xx / 5xx) since the
  * goal is to confirm the listener exists. Returns `false` on connection
  * refused, DNS failure, timeout, or undefined URL.
  *
- * Used at plugin init under Bun to detect TUI sessions started without
- * `opencode --port 0` — those bind an internal-only listener that 404s
- * for `/session/...` endpoints and breaks AFT's wake path.
+ * Used at plugin init to decide whether bg-notifications should use the
+ * live-server wake transport (workaround for anomalyco/opencode#28202)
+ * or fall back to the in-process `input.client.session.promptAsync`
+ * path. Plain TUI (no `--port 0`) binds an internal-only listener that
+ * 404s for `/session/...`, so this returns false there; OpenCode
+ * Desktop, `opencode run`, and `opencode --port 0` TUI return true.
  */
 export async function probeServerReachable(
   serverUrl: string | undefined,
@@ -129,4 +131,44 @@ export async function probeServerReachable(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Per-plugin-process decision: should bg-notifications use the live-server
+ * wake transport (workaround for anomalyco/opencode#28202), or fall back
+ * to the in-process `input.client.session.promptAsync` path?
+ *
+ * Set once at plugin init from the result of `probeServerReachable()`.
+ * Defaults to `false` if no decision has been recorded yet — that's the
+ * safe direction because `input.client.session.promptAsync` is always
+ * available (it's part of the plugin contract), whereas the live-server
+ * path needs both a probe-confirmed listener and the workaround code
+ * itself to be live.
+ *
+ * Read at wake time (not cached on a closure) so background probes that
+ * complete after plugin init still take effect on the next wake.
+ */
+let liveServerWakeAvailable = false;
+
+/**
+ * Record the probe result. Idempotent; if you record twice, the latest
+ * value wins. The wake path reads through `useLiveServerWake()`.
+ */
+export function setLiveServerWakeAvailable(available: boolean): void {
+  liveServerWakeAvailable = available;
+}
+
+/**
+ * Read the cached probe decision. `true` means the wake path should use
+ * `getLiveServerClient(serverUrl, directory)` and POST through the live
+ * HTTP listener. `false` means fall back to the in-process client passed
+ * via plugin context (`input.client`).
+ */
+export function useLiveServerWake(): boolean {
+  return liveServerWakeAvailable;
+}
+
+/** Test helper — reset the decision cache between cases. */
+export function __resetLiveServerWakeForTests(): void {
+  liveServerWakeAvailable = false;
 }

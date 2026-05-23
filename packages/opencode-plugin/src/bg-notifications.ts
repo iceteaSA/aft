@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { sessionLog, sessionWarn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
-import { getLiveServerClient } from "./shared/live-server-client.js";
+import { getLiveServerClient, useLiveServerWake } from "./shared/live-server-client.js";
 import type { PluginContext } from "./types.js";
 
 /**
@@ -72,13 +72,28 @@ interface DrainContext {
   directory: string;
   sessionID: string;
   /**
-   * Live OpenCode HTTP listener URL (from `input.serverUrl`). Used by the
-   * wake path to build a separate `createOpencodeClient` that hits the
-   * live listener via `globalThis.fetch` — works around the OpenCode
-   * promptAsync runner-split bug (anomalyco/opencode#28202). When absent,
-   * the wake stays queued and existing retry-with-backoff fires; we do
-   * NOT fall back to `input.client.session.promptAsync` because that
-   * reopens the bug path.
+   * Plugin-provided OpenCode SDK client (`input.client`). The wake path
+   * uses this as a fallback when `useLiveServerWake()` is false — i.e.
+   * the live HTTP listener was unreachable when probed at plugin init,
+   * so `getLiveServerClient(...)` cannot be built. Falling back here
+   * accepts the upstream `promptAsync` runner-split bug
+   * (anomalyco/opencode#28202; duplicate "stop" messages) in exchange
+   * for wakes still arriving at all in plain-TUI sessions.
+   *
+   * Typed `unknown` because the real `@opencode-ai/sdk` `OpencodeClient`
+   * has a narrower, generated `promptAsync` signature than the loose
+   * structural `OpenCodeClient` shape used by the live-server factory
+   * and test stubs. The wake closure asserts to `OpenCodeClient` after
+   * deciding which transport to use.
+   */
+  client?: unknown;
+  /**
+   * Live OpenCode HTTP listener URL (from `input.serverUrl`). When the
+   * listener was reachable at startup, the wake path builds a separate
+   * `createOpencodeClient` from this URL so requests hit the same Effect
+   * memoMap as the live UI — works around the runner-split bug
+   * (anomalyco/opencode#28202). When the listener was unreachable, the
+   * wake path falls back to `client` above; this URL is unused.
    */
   serverUrl?: string;
 }
@@ -238,31 +253,52 @@ async function triggerWakeIfPending(
   scheduleWake(
     state,
     async (reminder, deliveredCompletions) => {
-      // Workaround for anomalyco/opencode#28202: bypass `input.client` and
-      // build a separate `createOpencodeClient` pointed at the live HTTP
-      // listener so SessionRunState.ensureRunning sees the active UI turn
-      // and coalesces correctly. NO fallback to `input.client` — that
-      // reopens the bug path (different Effect memoMap → split runner).
+      // Wake transport selection (per-process decision, set once at plugin
+      // init via `setLiveServerWakeAvailable()`):
       //
-      // When `serverUrl` is absent (some host versions/contexts don't
-      // populate it), we keep completions queued and emit a dedicated
-      // trace event. The existing scheduleWake retry-with-backoff fires
-      // and, after MAX_WAKE_SEND_ATTEMPTS, `wake_hard_stop` takes over.
-      if (!drainContext.serverUrl) {
-        sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake serverUrl unavailable`, {
-          event: "bash_completion_wake_serverUrl_unavailable",
-          task_ids: deliveredCompletions.map((c) => c.task_id),
-          directory: drainContext.directory,
-          attempt: state.wakeRetryAttempts + 1,
-        });
-        throw new Error("input.serverUrl is unavailable; cannot reach live OpenCode listener");
+      //   • `useLiveServerWake() === true`  — live HTTP listener was
+      //     reachable when probed at startup. Build a separate
+      //     `createOpencodeClient` pointed at `input.serverUrl` so requests
+      //     hit the same Effect memoMap as the live UI. This works around
+      //     the promptAsync runner-split bug (anomalyco/opencode#28202).
+      //
+      //   • `useLiveServerWake() === false` — listener was unreachable
+      //     (typically plain TUI started without `opencode --port 0`).
+      //     Fall back to `drainContext.client.session.promptAsync`. This
+      //     accepts the upstream duplicate-runner bug in exchange for
+      //     wakes still arriving at all instead of throwing each turn.
+      //
+      // The choice is logged via `wake_client_path` so post-mortem can
+      // tell which transport delivered each wake.
+      let client: OpenCodeClient;
+      let clientPath: "live-server" | "in-process-fallback";
+      if (useLiveServerWake() && drainContext.serverUrl) {
+        client = getLiveServerClient(
+          drainContext.serverUrl,
+          drainContext.directory,
+        ) as OpenCodeClient;
+        clientPath = "live-server";
+      } else {
+        if (!drainContext.client) {
+          sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake client unavailable`, {
+            event: "bash_completion_wake_client_unavailable",
+            task_ids: deliveredCompletions.map((c) => c.task_id),
+            directory: drainContext.directory,
+            attempt: state.wakeRetryAttempts + 1,
+          });
+          throw new Error(
+            "no wake transport available: live-server unreachable and input.client absent",
+          );
+        }
+        // Cast the unknown `input.client` (real SDK shape with a generated
+        // narrower promptAsync signature) to the loose structural shape
+        // the wake closure uses. The runtime check on
+        // `client.session?.promptAsync` below confirms shape before use.
+        client = drainContext.client as OpenCodeClient;
+        clientPath = "in-process-fallback";
       }
-      const client = getLiveServerClient(
-        drainContext.serverUrl,
-        drainContext.directory,
-      ) as OpenCodeClient;
       if (typeof client.session?.promptAsync !== "function") {
-        throw new Error("live-server client.session.promptAsync is unavailable");
+        throw new Error(`wake client.session.promptAsync is unavailable (path=${clientPath})`);
       }
       // Pass the previous turn's prompt context (agent + model + variant)
       // explicitly. OpenCode's `createUserMessage` resolves variant
@@ -302,12 +338,13 @@ async function triggerWakeIfPending(
         directory: drainContext.directory,
         reminder_sha256: hashReminder(reminder),
         reminder_chars: reminder.length,
-        // Marker so log searches for the workaround land on this site.
-        // Always "live-server" while the workaround is active — see
-        // shared/live-server-client.ts and anomalyco/opencode#28202.
-        // "in-process-fallback-disabled" is left in the type so any future
-        // code that re-enables the broken fallback path will be obvious.
-        wake_client_path: "live-server" as "live-server" | "in-process-fallback-disabled",
+        // `live-server` = wake POSTed through `createOpencodeClient` aimed
+        // at `input.serverUrl` (anomalyco/opencode#28202 workaround, no
+        // duplicate runs). `in-process-fallback` = wake POSTed through
+        // `input.client.session.promptAsync` because the live listener
+        // wasn't reachable at startup; this accepts the upstream bug so
+        // wakes still arrive at all instead of throwing each turn.
+        wake_client_path: clientPath,
         prompt_context: promptContext
           ? {
               agent: promptContext.agent,
