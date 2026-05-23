@@ -18,6 +18,8 @@ export interface BgCompletion {
   original_tokens?: number;
   compressed_tokens?: number;
   tokens_skipped?: boolean;
+  mode?: "pipes" | "pty" | string;
+  output_path?: string;
 }
 
 export interface BgLongRunningReminder {
@@ -25,6 +27,7 @@ export interface BgLongRunningReminder {
   session_id: string;
   command: string;
   elapsed_ms: number;
+  mode?: "pipes" | "pty" | string;
 }
 
 type SessionBgState = {

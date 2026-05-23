@@ -42,6 +42,7 @@ import {
 } from "./notifications.js";
 import { maybeAppendConflictsHint, maybeAppendGrepHint } from "./shared/bash-hints.js";
 import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
+import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
 import {
   getSessionDirectory,
@@ -71,6 +72,7 @@ type BashLongRunningPayload = {
   task_id: string;
   command: string;
   elapsed_ms: number;
+  mode?: "pipes" | "pty" | string;
 };
 
 type BridgePendingState = {
@@ -604,6 +606,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     } catch {
       // best-effort
     }
+    await disposeAllPtyTerminals();
     await pool.shutdown();
   });
   rpcServer.handle("status", async (params) => {
@@ -1004,6 +1007,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       unregisterShutdown();
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       rpcServer.stop();
+      await disposeAllPtyTerminals();
       await pool.shutdown();
     },
   };

@@ -75,6 +75,7 @@ import {
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
 
+import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { resolveSessionId } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
@@ -98,6 +99,7 @@ type BashLongRunningPayload = {
   task_id: string;
   command: string;
   elapsed_ms: number;
+  mode?: "pipes" | "pty" | string;
 };
 
 type BridgePendingState = {
@@ -786,6 +788,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   pi.on("session_shutdown", async () => {
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
+      await disposeAllPtyTerminals();
       await pool.shutdown();
       log("Bridge pool shut down");
     } catch (err) {
@@ -799,6 +802,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   registerShutdownCleanup(async () => {
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
+      await disposeAllPtyTerminals();
       await pool.shutdown();
     } catch (err) {
       warn(`Error during process shutdown: ${err instanceof Error ? err.message : String(err)}`);

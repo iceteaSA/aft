@@ -4,9 +4,15 @@ import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
 import { sessionLog } from "../logger.js";
 import { storeToolMetadata } from "../metadata-store.js";
+import {
+  disposePtyTerminal,
+  getOrCreatePtyTerminal,
+  readPtyBytes,
+  renderScreen,
+} from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, projectRootFor } from "./_shared.js";
 import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
@@ -31,7 +37,7 @@ const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 // background promotion, so we poll until the task is terminal or this cap fires.
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 
-const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, and optional background execution. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a task_id for bash_status/bash_kill.`;
+const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, optional background execution, and PTY mode for interactive programs. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a task_id for bash_status/bash_kill. Pass pty: true with background: true for interactive REPLs and drive them with bash_status({ outputMode: "screen" }) plus bash_write.`;
 
 interface PermissionAsk {
   kind: "external_directory" | "bash";
@@ -120,6 +126,12 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .describe(
           "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
         ),
+      pty: z
+        .boolean()
+        .optional()
+        .describe(
+          'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Requires background: true and is unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and send input with bash_write.',
+        ),
     },
     execute: async (args, context) => {
       let accumulatedOutput = "";
@@ -138,6 +150,15 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       // command still runs to completion, just inline.
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       const requestedBackground = args.background === true;
+      const requestedPty = args.pty === true;
+      if (requestedPty && !requestedBackground) {
+        throw new Error("PTY mode requires background: true");
+      }
+      if (requestedPty && isSubagent) {
+        throw new Error(
+          "PTY mode is not available in subagent sessions; subagents cannot drive interactive terminals.",
+        );
+      }
       const effectiveBackground = isSubagent ? false : requestedBackground;
       // Only log when the gate actually changes behavior (subagent path).
       // The common primary-session foreground case is the overwhelming
@@ -166,6 +187,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
           background: effectiveBackground,
           notify_on_completion: effectiveBackground,
           compressed: args.compressed,
+          pty: requestedPty,
           permissions_requested: true,
         },
         callBridge,
@@ -315,15 +337,22 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
 export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
   return {
     description:
-      "Check the status and captured output of a background bash task spawned with bash({ background: true }). Returns status (running | completed | failed | killed | timed_out), exit code, duration, and a preview of captured output.",
+      'Check the status and captured output of a background bash task spawned with bash({ background: true }). For PTY tasks, pass outputMode: "screen" (default) to render the visible terminal, "raw" for bytes since the previous read, or "both".',
     args: {
       taskId: z
         .string()
         .describe("Background task ID returned by bash({ background: true }), e.g. bash-6b454047."),
+      outputMode: z
+        .enum(["screen", "raw", "both"])
+        .optional()
+        .describe(
+          "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
+        ),
     },
     execute: async (args, context) => {
       const data = await callBridge(ctx, context, "bash_status", {
         task_id: args.taskId as string,
+        output_mode: args.outputMode as string | undefined,
       });
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_status failed");
@@ -333,18 +362,21 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
       const dur =
         typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
       let text = `Task ${args.taskId}: ${status}${exit}${dur}`;
-      const preview = data.output_preview as string | undefined;
-      if (preview && status !== "running") {
-        text += `\n${preview.slice(0, 2000)}`;
-      }
-      // For still-running tasks, append the same anti-polling reminder we add
-      // to the initial spawn line. Agents that ignore the spawn-line guidance
-      // and call bash_status anyway get the reminder again here so they don't
-      // call back-to-back. Terminal statuses (completed/failed/killed/timed_out)
-      // get NO such suffix — we want clean output once the task is actually
-      // done and the agent is ready to consume the result.
-      if (status === "running") {
-        text += `\nA completion reminder will be delivered automatically; don't poll.`;
+      if (data.mode === "pty") {
+        text += await formatPtyStatus(
+          context,
+          args.taskId as string,
+          data,
+          args.outputMode as string | undefined,
+        );
+      } else {
+        const preview = data.output_preview as string | undefined;
+        if (preview && status !== "running") {
+          text += `\n${preview.slice(0, 2000)}`;
+        }
+        if (status === "running") {
+          text += `\nA completion reminder will be delivered automatically; don't poll.`;
+        }
       }
       return text;
     },
@@ -367,9 +399,46 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
+      await disposePtyTerminal(ptyCacheKey(context, args.taskId as string));
+      if (data.kill_signaled === true) {
+        return `Task ${args.taskId}: kill_signaled`;
+      }
       return `Task ${args.taskId}: ${String(data.status ?? "killed")}`;
     },
   };
+}
+
+async function formatPtyStatus(
+  runtime: ToolContext,
+  taskId: string,
+  data: Record<string, unknown>,
+  requestedOutputMode: string | undefined,
+): Promise<string> {
+  const outputPath = data.output_path as string | undefined;
+  if (!outputPath) return "\n[PTY output path unavailable]";
+  const key = ptyCacheKey(runtime, taskId);
+  const state = await getOrCreatePtyTerminal(key, outputPath);
+  const raw = await readPtyBytes(state);
+  const outputMode = requestedOutputMode ?? "screen";
+  let suffix = "";
+  if (outputMode === "raw") {
+    suffix = raw.length > 0 ? `\n${raw.toString("utf8")}` : "";
+  } else if (outputMode === "both") {
+    suffix = `\n${JSON.stringify({ screen: renderScreen(state, 24, 80), raw: raw.toString("utf8") }, null, 2)}`;
+  } else {
+    const screen = renderScreen(state, 24, 80);
+    suffix = screen ? `\n${screen}` : "";
+  }
+  if (data.status === "running") {
+    suffix += `\nPTY task is still running. Use bash_status({ taskId: "${taskId}", outputMode: "screen" }) to inspect, bash_write({ taskId: "${taskId}", input: "..." }) to send keystrokes.`;
+  } else if (isTerminalStatus(data.status)) {
+    await disposePtyTerminal(key);
+  }
+  return suffix;
+}
+
+function ptyCacheKey(runtime: ToolContext, taskId: string): string {
+  return `${projectRootFor(runtime)}::${runtime.sessionID ?? "__default__"}::${taskId}`;
 }
 
 function preview(output: string): string {

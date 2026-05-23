@@ -38,6 +38,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const grepName = opts.hoistBuiltins ? "grep" : "aft_grep";
   const bashName = opts.hoistBuiltins ? "bash" : "aft_bash";
   const bashStatusName = "bash_status";
+  const bashWriteName = "bash_write";
 
   // aft_outline and aft_zoom are present at "minimal" + above. They're never
   // hoisted (always aft-prefixed).
@@ -89,6 +90,9 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   if (hasBash && hasBgBash) {
     sections.push(
       `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns immediately with a \`taskId\`. A completion reminder is delivered automatically — do not poll \`${bashStatusName}({ taskId })\`. Use \`${bashStatusName}\` only after the reminder arrives, or to inspect a task you already know is complete.`,
+    );
+    sections.push(
+      `**PTY / interactive commands**: PTY mode is for interactive REPLs and terminal apps (python, node, bash itself, vim). Start with \`${bashName}({ command: "python", pty: true, background: true })\`, read the screen with \`${bashStatusName}({ taskId, outputMode: "screen" })\`, and send input with \`${bashWriteName}({ taskId, input: "..." })\`.`,
     );
   }
 

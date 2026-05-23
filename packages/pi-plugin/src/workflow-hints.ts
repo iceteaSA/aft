@@ -73,6 +73,9 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     sections.push(
       `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns immediately with a \`task_id\`. A completion reminder is delivered automatically — do not poll \`bash_status({ task_id })\`. Use \`bash_status\` only after the reminder arrives, or to inspect a task you already know is complete.`,
     );
+    sections.push(
+      `**PTY / interactive commands**: PTY mode is for interactive REPLs and terminal apps (python, node, bash itself, vim). Start with \`${bashName}({ command: "python", pty: true, background: true })\`, read the screen with \`bash_status({ task_id, output_mode: "screen" })\`, and send input with \`bash_write({ task_id, input: "..." })\`.`,
+    );
   }
 
   if (sections.length === 0) {

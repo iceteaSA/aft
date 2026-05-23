@@ -19,6 +19,7 @@ import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
 import { callBridge } from "./_shared.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "./bash.js";
+import { createBashWriteTool } from "./bash_write.js";
 import {
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
@@ -1655,7 +1656,7 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
  * Returns hoisted tools keyed by opencode's built-in names.
  * Overrides: read, write, edit, apply_patch (always when hoisting is on).
  *
- * Bash hoisting is opt-in: `bash`, `bash_status`, and `bash_kill` are
+ * Bash hoisting is opt-in: `bash`, `bash_status`, `bash_write`, and `bash_kill` are
  * registered together when at least one `experimental.bash.*` flag is
  * enabled (rewrite, compress, or background). When all flags are off,
  * opencode's native bash stays in place — users without bash experimentals
@@ -1688,6 +1689,7 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
   if (resolveBashConfig(ctx.config).enabled) {
     tools.bash = createBashTool(ctx);
     tools.bash_status = createBashStatusTool(ctx);
+    tools.bash_write = createBashWriteTool(ctx);
     tools.bash_kill = createBashKillTool(ctx);
   }
 
@@ -1789,6 +1791,7 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
   if (resolveBashConfig(ctx.config).enabled) {
     tools.aft_bash = createBashTool(ctx);
     tools.bash_status = createBashStatusTool(ctx);
+    tools.bash_write = createBashWriteTool(ctx);
     tools.bash_kill = createBashKillTool(ctx);
   }
 
