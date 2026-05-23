@@ -4,6 +4,14 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { findBinary } from "./resolver.js";
 
+type SpawnSyncForMigration = typeof spawnSync;
+
+let spawnSyncForMigration: SpawnSyncForMigration = spawnSync;
+
+export function __setSpawnSyncForTests(impl: SpawnSyncForMigration | null): void {
+  spawnSyncForMigration = impl ?? spawnSync;
+}
+
 export type MigrationHarness = "opencode" | "pi";
 
 export interface MigrationOptions {
@@ -136,7 +144,7 @@ export async function ensureStorageMigrated(opts: MigrationOptions): Promise<voi
     // still gets the same information.
   }
 
-  const result = spawnSync(
+  const result = spawnSyncForMigration(
     binaryPath,
     [
       "migrate-storage",
@@ -197,7 +205,7 @@ export async function getMigrationStatus(opts: {
 }): Promise<MigrationStatus> {
   const newRoot = resolveCortexKitStorageRoot();
   const binaryPath = opts.binaryPath ?? (await findBinary());
-  const result = spawnSync(
+  const result = spawnSyncForMigration(
     binaryPath,
     ["migrate-storage", "--status", "--to", newRoot, "--harness", opts.harness],
     {

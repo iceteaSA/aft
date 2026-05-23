@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { type AutoInstallConfig, runAutoInstall } from "../lsp-auto-install";
 import { lspBinaryPath, writeInstalledMeta } from "../lsp-cache";
 
@@ -14,21 +15,17 @@ function isoDaysAgo(now: number, days: number): string {
 
 let tempCache: string;
 let tempProject: string;
-let originalCacheDir: string | undefined;
+let releaseEnv: (() => void) | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
   tempCache = mkdtempSync(join(tmpdir(), "aft-lsp-autoinstall-cache-"));
   tempProject = mkdtempSync(join(tmpdir(), "aft-lsp-autoinstall-project-"));
-  originalCacheDir = process.env.AFT_CACHE_DIR;
-  process.env.AFT_CACHE_DIR = tempCache;
+  releaseEnv = await acquireEnv({ AFT_CACHE_DIR: tempCache });
 });
 
 afterEach(() => {
-  if (originalCacheDir === undefined) {
-    delete process.env.AFT_CACHE_DIR;
-  } else {
-    process.env.AFT_CACHE_DIR = originalCacheDir;
-  }
+  releaseEnv?.();
+  releaseEnv = undefined;
   rmSync(tempCache, { recursive: true, force: true });
   rmSync(tempProject, { recursive: true, force: true });
 });

@@ -2,27 +2,30 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { runAutoInstall } from "../lsp-auto-install.js";
 import { runGithubAutoInstall } from "../lsp-github-install.js";
 
 const roots = new Set<string>();
+let releaseEnv: (() => void) | undefined;
 
-function tempCache(): string {
+async function tempCache(): Promise<string> {
   const root = mkdtempSync(join(tmpdir(), "aft-lsp-cache-validation-"));
   roots.add(root);
-  process.env.AFT_CACHE_DIR = root;
+  releaseEnv = await acquireEnv({ AFT_CACHE_DIR: root });
   return root;
 }
 
 afterEach(() => {
-  delete process.env.AFT_CACHE_DIR;
+  releaseEnv?.();
+  releaseEnv = undefined;
   for (const root of roots) rmSync(root, { recursive: true, force: true });
   roots.clear();
 });
 
 describe("cached LSP validation before lsp_paths_extra", () => {
-  test("npm cached binary with mismatched sha is excluded and quarantined", () => {
-    const root = tempCache();
+  test("npm cached binary with mismatched sha is excluded and quarantined", async () => {
+    const root = await tempCache();
     const pkgDir = join(root, "lsp-packages", "pyright");
     const binDir = join(pkgDir, "node_modules", ".bin");
     mkdirSync(binDir, { recursive: true });
@@ -48,8 +51,8 @@ describe("cached LSP validation before lsp_paths_extra", () => {
     expect(readdirSync(quarantine).length).toBeGreaterThan(0);
   });
 
-  test("GitHub cached binary with mismatched sha is excluded and quarantined", () => {
-    const root = tempCache();
+  test("GitHub cached binary with mismatched sha is excluded and quarantined", async () => {
+    const root = await tempCache();
     const pkgDir = join(root, "lsp-binaries", "clangd");
     const binDir = join(pkgDir, "bin");
     mkdirSync(binDir, { recursive: true });

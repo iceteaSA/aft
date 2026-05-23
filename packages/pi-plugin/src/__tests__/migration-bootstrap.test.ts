@@ -4,17 +4,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 
 type PiPlugin = typeof import("../index.js").default;
 
 describe.serial("Pi migration bootstrap", () => {
   let tempDir: string;
   let projectDir: string;
-  let prevPath: string | undefined;
-  let prevHome: string | undefined;
-  let prevXdgDataHome: string | undefined;
-  let prevXdgCacheHome: string | undefined;
   let prevCwd: string;
+  let releaseEnv: (() => void) | undefined;
   let argsLog: string;
   let aftPath: string;
   let cachedAft: string;
@@ -27,14 +25,10 @@ describe.serial("Pi migration bootstrap", () => {
     chmodSync(cachedAft, 0o755);
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), "aft-pi-migration-bootstrap-"));
     projectDir = join(tempDir, "project");
     mkdirSync(projectDir, { recursive: true });
-    prevPath = process.env.PATH;
-    prevHome = process.env.HOME;
-    prevXdgDataHome = process.env.XDG_DATA_HOME;
-    prevXdgCacheHome = process.env.XDG_CACHE_HOME;
     prevCwd = process.cwd();
 
     const binDir = join(tempDir, "bin");
@@ -42,19 +36,23 @@ describe.serial("Pi migration bootstrap", () => {
     argsLog = join(tempDir, "args.log");
     aftPath = join(binDir, "aft");
 
-    process.env.PATH = `${binDir}:${prevPath ?? ""}`;
-    process.env.HOME = join(tempDir, "home");
-    process.env.XDG_DATA_HOME = join(tempDir, "data");
-    process.env.XDG_CACHE_HOME = join(tempDir, "cache");
-    process.env.AFT_MIGRATION_ARGS_LOG = argsLog;
+    const home = join(tempDir, "home");
+    const xdgCacheHome = join(tempDir, "cache");
+    releaseEnv = await acquireEnv({
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      HOME: home,
+      XDG_DATA_HOME: join(tempDir, "data"),
+      XDG_CACHE_HOME: xdgCacheHome,
+      AFT_MIGRATION_ARGS_LOG: argsLog,
+    });
 
-    cachedAft = join(process.env.XDG_CACHE_HOME, "aft", "bin", "v0.26.4", "aft");
-    mkdirSync(join(process.env.XDG_CACHE_HOME, "aft", "bin", "v0.26.4"), { recursive: true });
+    cachedAft = join(xdgCacheHome, "aft", "bin", "v0.26.4", "aft");
+    mkdirSync(join(xdgCacheHome, "aft", "bin", "v0.26.4"), { recursive: true });
     writeFakeAft(0);
 
-    mkdirSync(join(process.env.HOME, ".pi", "agent"), { recursive: true });
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
     writeFileSync(
-      join(process.env.HOME, ".pi", "agent", "aft.json"),
+      join(home, ".pi", "agent", "aft.json"),
       JSON.stringify({ lsp: { auto_install: false }, semantic_search: false }),
       "utf8",
     );
@@ -63,15 +61,8 @@ describe.serial("Pi migration bootstrap", () => {
 
   afterEach(() => {
     process.chdir(prevCwd);
-    if (prevPath === undefined) delete process.env.PATH;
-    else process.env.PATH = prevPath;
-    if (prevHome === undefined) delete process.env.HOME;
-    else process.env.HOME = prevHome;
-    if (prevXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
-    else process.env.XDG_DATA_HOME = prevXdgDataHome;
-    if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
-    else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
-    delete process.env.AFT_MIGRATION_ARGS_LOG;
+    releaseEnv?.();
+    releaseEnv = undefined;
     rmSync(tempDir, { recursive: true, force: true });
   });
 

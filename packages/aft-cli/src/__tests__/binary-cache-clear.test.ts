@@ -16,24 +16,21 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { clearOldBinaries } from "../commands/doctor.js";
 import { getSelfVersion } from "../lib/self-version.js";
 
 let workDir: string;
-let originalCacheDir: string | undefined;
+let releaseEnv: (() => void) | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "aft-binary-cache-clear-"));
-  originalCacheDir = process.env.AFT_CACHE_DIR;
-  process.env.AFT_CACHE_DIR = workDir;
+  releaseEnv = await acquireEnv({ AFT_CACHE_DIR: workDir });
 });
 
 afterEach(() => {
-  if (originalCacheDir === undefined) {
-    delete process.env.AFT_CACHE_DIR;
-  } else {
-    process.env.AFT_CACHE_DIR = originalCacheDir;
-  }
+  releaseEnv?.();
+  releaseEnv = undefined;
   rmSync(workDir, { recursive: true, force: true });
 });
 

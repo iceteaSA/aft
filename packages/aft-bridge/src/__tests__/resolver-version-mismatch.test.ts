@@ -21,6 +21,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findBinarySync, readBinaryVersion } from "../resolver.js";
+import { acquireEnv } from "./test-utils/env-guard.js";
 
 // On the Ubuntu GitHub Actions runner Bun's `spawnSync` reproducibly returns
 // the literal string `"failed"` in stdout/stderr instead of executing the
@@ -100,38 +101,24 @@ describe.skipIf(skipLinuxCi)("readBinaryVersion", () => {
 
 describe.skipIf(skipLinuxCi)("findBinarySync versioned cache validation", () => {
   let tmpDir: string;
+  let releaseEnv: (() => void) | undefined;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "aft-cache-version-test-"));
+    // Bun runs test files concurrently in one process. Keep resolver env
+    // overrides guarded for the full test so other files cannot clobber them.
+    releaseEnv = await acquireEnv({
+      XDG_CACHE_HOME: tmpDir,
+      PATH: "",
+      HOME: tmpDir,
+    });
   });
 
   afterEach(() => {
+    releaseEnv?.();
+    releaseEnv = undefined;
     rmSync(tmpDir, { recursive: true, force: true });
   });
-
-  function withResolverEnvironment<T>(callback: () => T): T {
-    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
-    const prevPath = process.env.PATH;
-    const prevHome = process.env.HOME;
-
-    // Bun runs test files concurrently in one process. Keep process.env
-    // overrides scoped to the synchronous resolver call so other async test
-    // files cannot clobber XDG_CACHE_HOME between setup and lookup.
-    process.env.XDG_CACHE_HOME = tmpDir;
-    process.env.PATH = "";
-    process.env.HOME = tmpDir;
-
-    try {
-      return callback();
-    } finally {
-      if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
-      else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
-      if (prevPath === undefined) delete process.env.PATH;
-      else process.env.PATH = prevPath;
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
-    }
-  }
 
   function writeCachedVersion(dirVersion: string, reportedVersion: string): string {
     const binaryPath = join(
@@ -156,7 +143,7 @@ describe.skipIf(skipLinuxCi)("findBinarySync versioned cache validation", () => 
     // Precondition: the fake binary actually reports the expected version.
     expect(readBinaryVersion(binaryPath)).toBe("1.2.3");
 
-    expect(withResolverEnvironment(() => findBinarySync("1.2.3"))).toBe(binaryPath);
+    expect(findBinarySync("1.2.3")).toBe(binaryPath);
   });
 
   test("skips mislabeled newer cached binary instead of accepting directory name", () => {
@@ -164,6 +151,6 @@ describe.skipIf(skipLinuxCi)("findBinarySync versioned cache validation", () => 
 
     expect(existsSync(binaryPath)).toBe(true);
 
-    expect(withResolverEnvironment(() => findBinarySync("1.2.3"))).toBeNull();
+    expect(findBinarySync("1.2.3")).toBeNull();
   });
 });

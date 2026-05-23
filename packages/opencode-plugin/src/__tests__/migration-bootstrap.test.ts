@@ -4,16 +4,13 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 
 type OpenCodePlugin = typeof import("../index.js").default;
 
 describe.serial("OpenCode migration bootstrap", () => {
   let tempDir: string;
-  let prevPath: string | undefined;
-  let prevHome: string | undefined;
-  let prevXdgDataHome: string | undefined;
-  let prevXdgCacheHome: string | undefined;
-  let prevOpenCodeConfigDir: string | undefined;
+  let releaseEnv: (() => void) | undefined;
   let argsLog: string;
   let aftPath: string;
   let cachedAft: string;
@@ -26,50 +23,40 @@ describe.serial("OpenCode migration bootstrap", () => {
     chmodSync(cachedAft, 0o755);
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), "aft-opencode-migration-bootstrap-"));
-    prevPath = process.env.PATH;
-    prevHome = process.env.HOME;
-    prevXdgDataHome = process.env.XDG_DATA_HOME;
-    prevXdgCacheHome = process.env.XDG_CACHE_HOME;
-    prevOpenCodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
 
     const binDir = join(tempDir, "bin");
     mkdirSync(binDir, { recursive: true });
     argsLog = join(tempDir, "args.log");
     aftPath = join(binDir, "aft");
 
-    process.env.PATH = `${binDir}:${prevPath ?? ""}`;
-    process.env.HOME = join(tempDir, "home");
-    process.env.XDG_DATA_HOME = join(tempDir, "data");
-    process.env.XDG_CACHE_HOME = join(tempDir, "cache");
-    process.env.OPENCODE_CONFIG_DIR = join(tempDir, "opencode-config");
-    process.env.AFT_MIGRATION_ARGS_LOG = argsLog;
+    const xdgCacheHome = join(tempDir, "cache");
+    const opencodeConfigDir = join(tempDir, "opencode-config");
+    releaseEnv = await acquireEnv({
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      HOME: join(tempDir, "home"),
+      XDG_DATA_HOME: join(tempDir, "data"),
+      XDG_CACHE_HOME: xdgCacheHome,
+      OPENCODE_CONFIG_DIR: opencodeConfigDir,
+      AFT_MIGRATION_ARGS_LOG: argsLog,
+    });
 
-    cachedAft = join(process.env.XDG_CACHE_HOME, "aft", "bin", "v0.26.4", "aft");
-    mkdirSync(join(process.env.XDG_CACHE_HOME, "aft", "bin", "v0.26.4"), { recursive: true });
+    cachedAft = join(xdgCacheHome, "aft", "bin", "v0.26.4", "aft");
+    mkdirSync(join(xdgCacheHome, "aft", "bin", "v0.26.4"), { recursive: true });
     writeFakeAft(0);
 
-    mkdirSync(process.env.OPENCODE_CONFIG_DIR, { recursive: true });
+    mkdirSync(opencodeConfigDir, { recursive: true });
     writeFileSync(
-      join(process.env.OPENCODE_CONFIG_DIR, "aft.json"),
+      join(opencodeConfigDir, "aft.json"),
       JSON.stringify({ lsp: { auto_install: false }, semantic_search: false }),
       "utf8",
     );
   });
 
   afterEach(() => {
-    if (prevPath === undefined) delete process.env.PATH;
-    else process.env.PATH = prevPath;
-    if (prevHome === undefined) delete process.env.HOME;
-    else process.env.HOME = prevHome;
-    if (prevXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
-    else process.env.XDG_DATA_HOME = prevXdgDataHome;
-    if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
-    else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
-    if (prevOpenCodeConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR;
-    else process.env.OPENCODE_CONFIG_DIR = prevOpenCodeConfigDir;
-    delete process.env.AFT_MIGRATION_ARGS_LOG;
+    releaseEnv?.();
+    releaseEnv = undefined;
     rmSync(tempDir, { recursive: true, force: true });
   });
 

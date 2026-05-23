@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   acquireInstallLock,
   isInstalled,
@@ -16,35 +17,23 @@ import {
 } from "../lsp-cache";
 
 let tempCache: string;
-let originalCacheDir: string | undefined;
-let originalLocalAppData: string | undefined;
-let originalAppData: string | undefined;
-let originalXdgCacheHome: string | undefined;
+let releaseEnv: (() => void) | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
   tempCache = mkdtempSync(join(tmpdir(), "aft-lsp-cache-test-"));
-  originalCacheDir = process.env.AFT_CACHE_DIR;
-  originalLocalAppData = process.env.LOCALAPPDATA;
-  originalAppData = process.env.APPDATA;
-  originalXdgCacheHome = process.env.XDG_CACHE_HOME;
-  process.env.AFT_CACHE_DIR = tempCache;
+  releaseEnv = await acquireEnv({
+    AFT_CACHE_DIR: tempCache,
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
+    APPDATA: process.env.APPDATA,
+    XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+  });
 });
 
 afterEach(() => {
-  restoreEnv("AFT_CACHE_DIR", originalCacheDir);
-  restoreEnv("LOCALAPPDATA", originalLocalAppData);
-  restoreEnv("APPDATA", originalAppData);
-  restoreEnv("XDG_CACHE_HOME", originalXdgCacheHome);
+  releaseEnv?.();
+  releaseEnv = undefined;
   rmSync(tempCache, { recursive: true, force: true });
 });
-
-function restoreEnv(name: string, value: string | undefined): void {
-  if (value === undefined) {
-    delete process.env[name];
-  } else {
-    process.env[name] = value;
-  }
-}
 
 function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform");

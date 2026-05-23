@@ -16,17 +16,20 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { clearLspCaches, getLspCacheReport } from "../lib/lsp-cache.js";
 
 let tmpRoot = "";
+let releaseEnv: (() => void) | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpRoot = mkdtempSync(join(tmpdir(), "aft-cli-lsp-cache-"));
-  process.env.AFT_CACHE_DIR = tmpRoot;
+  releaseEnv = await acquireEnv({ AFT_CACHE_DIR: tmpRoot });
 });
 
 afterEach(() => {
-  delete process.env.AFT_CACHE_DIR;
+  releaseEnv?.();
+  releaseEnv = undefined;
   try {
     rmSync(tmpRoot, { recursive: true, force: true });
   } catch {

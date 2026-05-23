@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   discoverRelevantGithubServers,
   ghBinaryPath,
@@ -24,15 +25,17 @@ import { findGithubServerById } from "../lsp-github-table.js";
 
 let tmpRoot = "";
 let projectRoot = "";
+let releaseEnv: (() => void) | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpRoot = mkdtempSync(join(tmpdir(), "aft-gh-test-"));
   projectRoot = mkdtempSync(join(tmpdir(), "aft-gh-project-"));
-  process.env.AFT_CACHE_DIR = tmpRoot;
+  releaseEnv = await acquireEnv({ AFT_CACHE_DIR: tmpRoot });
 });
 
 afterEach(() => {
-  delete process.env.AFT_CACHE_DIR;
+  releaseEnv?.();
+  releaseEnv = undefined;
   try {
     rmSync(tmpRoot, { recursive: true, force: true });
     rmSync(projectRoot, { recursive: true, force: true });

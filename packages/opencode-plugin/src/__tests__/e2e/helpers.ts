@@ -117,19 +117,28 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), options?.tempPrefix ?? "aft-plugin-e2e-"));
+  const previousCacheDir = process.env.AFT_CACHE_DIR;
   // Redirect search index cache to temp dir so tests don't pollute user's ~/.cache/aft/index/
   process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
-  await copyFixturesToTempDir(tempDir, options?.fixtureNames);
 
-  const bridge = new BinaryBridge(
-    preparedBinary.binaryPath,
-    tempDir,
-    {
-      timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      ...(options?.bridgeOptions ?? {}),
-    },
-    { harness: "opencode" },
-  );
+  let bridge: BinaryBridge | undefined;
+  try {
+    await copyFixturesToTempDir(tempDir, options?.fixtureNames);
+
+    bridge = new BinaryBridge(
+      preparedBinary.binaryPath,
+      tempDir,
+      {
+        timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        ...(options?.bridgeOptions ?? {}),
+      },
+      { harness: "opencode" },
+    );
+  } catch (err) {
+    restoreAftCacheDir(previousCacheDir);
+    await rm(tempDir, { recursive: true, force: true });
+    throw err;
+  }
 
   return {
     binaryPath: preparedBinary.binaryPath,
@@ -143,10 +152,22 @@ export async function createHarness(
       } catch {
         // ignore cleanup errors
       } finally {
-        await rm(tempDir, { recursive: true, force: true });
+        try {
+          await rm(tempDir, { recursive: true, force: true });
+        } finally {
+          restoreAftCacheDir(previousCacheDir);
+        }
       }
     },
   };
+}
+
+function restoreAftCacheDir(previous: string | undefined): void {
+  if (previous === undefined) {
+    delete process.env.AFT_CACHE_DIR;
+  } else {
+    process.env.AFT_CACHE_DIR = previous;
+  }
 }
 
 export async function cleanupHarnesses(harnesses: E2EHarness[]): Promise<void> {

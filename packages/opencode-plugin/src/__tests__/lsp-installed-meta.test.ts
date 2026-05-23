@@ -9,6 +9,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   readInstalledMeta,
   readInstalledMetaIn,
@@ -27,47 +28,51 @@ function tempCacheRoot(): string {
 afterEach(() => {
   for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
   tempRoots.clear();
-  delete process.env.AFT_CACHE_DIR;
 });
 
 describe("writeInstalledMeta / readInstalledMeta (npm path)", () => {
-  test("round-trip: writes then reads the same version string", () => {
-    process.env.AFT_CACHE_DIR = tempCacheRoot();
-    writeInstalledMeta("typescript-language-server", "5.3.2");
-    const meta = readInstalledMeta("typescript-language-server");
-    expect(meta).not.toBeNull();
-    expect(meta?.version).toBe("5.3.2");
-    expect(meta?.installedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  test("round-trip: writes then reads the same version string", async () => {
+    await withEnv({ AFT_CACHE_DIR: tempCacheRoot() }, () => {
+      writeInstalledMeta("typescript-language-server", "5.3.2");
+      const meta = readInstalledMeta("typescript-language-server");
+      expect(meta).not.toBeNull();
+      expect(meta?.version).toBe("5.3.2");
+      expect(meta?.installedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    });
   });
 
-  test("returns null when no metadata file exists", () => {
-    process.env.AFT_CACHE_DIR = tempCacheRoot();
-    expect(readInstalledMeta("typescript-language-server")).toBeNull();
+  test("returns null when no metadata file exists", async () => {
+    await withEnv({ AFT_CACHE_DIR: tempCacheRoot() }, () => {
+      expect(readInstalledMeta("typescript-language-server")).toBeNull();
+    });
   });
 
-  test("returns null on corrupt JSON", () => {
+  test("returns null on corrupt JSON", async () => {
     const root = tempCacheRoot();
-    process.env.AFT_CACHE_DIR = root;
-    const dir = join(root, "lsp-packages", "pyright");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, ".aft-installed"), "not json {");
-    expect(readInstalledMeta("pyright")).toBeNull();
+    await withEnv({ AFT_CACHE_DIR: root }, () => {
+      const dir = join(root, "lsp-packages", "pyright");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, ".aft-installed"), "not json {");
+      expect(readInstalledMeta("pyright")).toBeNull();
+    });
   });
 
-  test("returns null when version field is missing", () => {
+  test("returns null when version field is missing", async () => {
     const root = tempCacheRoot();
-    process.env.AFT_CACHE_DIR = root;
-    const dir = join(root, "lsp-packages", "pyright");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, ".aft-installed"), JSON.stringify({ installedAt: "2024-01-01" }));
-    expect(readInstalledMeta("pyright")).toBeNull();
+    await withEnv({ AFT_CACHE_DIR: root }, () => {
+      const dir = join(root, "lsp-packages", "pyright");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, ".aft-installed"), JSON.stringify({ installedAt: "2024-01-01" }));
+      expect(readInstalledMeta("pyright")).toBeNull();
+    });
   });
 
-  test("scoped npm package works (uses URL-encoded directory)", () => {
-    process.env.AFT_CACHE_DIR = tempCacheRoot();
-    writeInstalledMeta("@vue/language-server", "2.0.0");
-    const meta = readInstalledMeta("@vue/language-server");
-    expect(meta?.version).toBe("2.0.0");
+  test("scoped npm package works (uses URL-encoded directory)", async () => {
+    await withEnv({ AFT_CACHE_DIR: tempCacheRoot() }, () => {
+      writeInstalledMeta("@vue/language-server", "2.0.0");
+      const meta = readInstalledMeta("@vue/language-server");
+      expect(meta?.version).toBe("2.0.0");
+    });
   });
 });
 

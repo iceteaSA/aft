@@ -6,22 +6,22 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "../platform.js";
+import { acquireEnv } from "./test-utils/env-guard.js";
 
 describe("downloadBinary hardened transport", () => {
   let tmpDir: string;
-  let prevXdgCacheHome: string | undefined;
+  let releaseEnv: (() => void) | undefined;
   let originalFetch: typeof fetch;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "aft-download-test-"));
-    prevXdgCacheHome = process.env.XDG_CACHE_HOME;
-    process.env.XDG_CACHE_HOME = tmpDir;
+    releaseEnv = await acquireEnv({ XDG_CACHE_HOME: tmpDir });
     originalFetch = globalThis.fetch;
   });
 
   afterEach(() => {
-    if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
-    else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+    releaseEnv?.();
+    releaseEnv = undefined;
     globalThis.fetch = originalFetch;
     rmSync(tmpDir, { recursive: true, force: true });
   });

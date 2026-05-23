@@ -7,6 +7,14 @@ import { log, warn } from "./active-logger.js";
 import { ensureBinary, getCacheDir } from "./downloader.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 
+type EnsureBinary = typeof ensureBinary;
+
+let ensureBinaryForResolver: EnsureBinary = ensureBinary;
+
+export function __setEnsureBinaryForTests(impl: EnsureBinary | null): void {
+  ensureBinaryForResolver = impl ?? ensureBinary;
+}
+
 type ResolverEnv = typeof process.env;
 
 /**
@@ -256,7 +264,7 @@ export async function findBinary(expectedVersion?: string): Promise<string> {
 
   // 5. Auto-download from GitHub releases
   log("Binary not found locally, attempting auto-download...");
-  const downloaded = await ensureBinary(expectedVersion);
+  const downloaded = await ensureBinaryForResolver(expectedVersion);
   if (downloaded) return downloaded;
 
   // All sources exhausted

@@ -140,11 +140,18 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), "aft-pi-e2e-"));
+  const previousCacheDir = process.env.AFT_CACHE_DIR;
   // Redirect AFT caches/indexes to temp so tests don't pollute user data.
   process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
 
-  if (!options.noFixtures) {
-    await copyFixturesToTempDir(tempDir, options.fixtureNames);
+  try {
+    if (!options.noFixtures) {
+      await copyFixturesToTempDir(tempDir, options.fixtureNames);
+    }
+  } catch (err) {
+    restoreAftCacheDir(previousCacheDir);
+    await rm(tempDir, { recursive: true, force: true });
+    throw err;
   }
 
   // Full permissive surface so registerAllTools exposes every tool by default.
@@ -242,8 +249,13 @@ export async function createHarness(
         await pool.shutdown();
       } catch {
         // ignore
+      } finally {
+        try {
+          await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+        } finally {
+          restoreAftCacheDir(previousCacheDir);
+        }
       }
-      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     },
   };
 }
@@ -354,6 +366,14 @@ function makeMockApi(tools: Map<string, MockToolDef>): AnyExtensionApi {
       },
     },
   );
+}
+
+function restoreAftCacheDir(previous: string | undefined): void {
+  if (previous === undefined) {
+    delete process.env.AFT_CACHE_DIR;
+  } else {
+    process.env.AFT_CACHE_DIR = previous;
+  }
 }
 
 export async function copyFixturesToTempDir(

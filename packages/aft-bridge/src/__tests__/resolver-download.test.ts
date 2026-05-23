@@ -12,67 +12,46 @@
  * `mock.module(…)` in Bun, so the partial mock could not be cleaned up.
  *
  * Today the test uses a real empty temp directory as the AFT cache, real
- * `node_modules`-free environment, and only mocks `../downloader.js` (which
- * is the actual unit-under-test boundary). All other sync resolution paths
- * miss naturally because the temp cache is empty and the npm platform package
- * isn't installed.
+ * `node_modules`-free environment, and injects only the downloader boundary.
+ * All other sync resolution paths miss naturally because the temp cache is
+ * empty and the npm platform package isn't installed.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { __setEnsureBinaryForTests, findBinary } from "../resolver.js";
+import { acquireEnv } from "./test-utils/env-guard.js";
 
 describe("findBinary async download", () => {
   let cacheDir: string;
-  let prevCacheDir: string | undefined;
-  let prevPath: string | undefined;
-  let prevHome: string | undefined;
+  let releaseEnv: (() => void) | undefined;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     cacheDir = mkdtempSync(join(tmpdir(), "aft-resolver-test-"));
-    prevCacheDir = process.env.AFT_CACHE_DIR;
-    prevPath = process.env.PATH;
-    prevHome = process.env.HOME;
     // Empty the cache + PATH + HOME so every sync resolution path misses
     // naturally, forcing the async download fallback to run.
-    process.env.AFT_CACHE_DIR = cacheDir;
-    process.env.PATH = ""; // no `which aft`
-    process.env.HOME = cacheDir; // no `~/.cargo/bin/aft`
+    releaseEnv = await acquireEnv({
+      AFT_CACHE_DIR: cacheDir,
+      PATH: "",
+      HOME: cacheDir,
+    });
   });
 
   afterEach(() => {
-    if (prevCacheDir === undefined) delete process.env.AFT_CACHE_DIR;
-    else process.env.AFT_CACHE_DIR = prevCacheDir;
-    if (prevPath === undefined) delete process.env.PATH;
-    else process.env.PATH = prevPath;
-    if (prevHome === undefined) delete process.env.HOME;
-    else process.env.HOME = prevHome;
+    __setEnsureBinaryForTests(null);
+    releaseEnv?.();
+    releaseEnv = undefined;
     rmSync(cacheDir, { recursive: true, force: true });
     mock.restore();
   });
 
   test("honors expectedVersion when falling through to ensureBinary", async () => {
     const seenVersions: Array<string | undefined> = [];
-    // Provide ALL exports from the real downloader.ts module surface. If we
-    // only stub a subset, Bun's process-global mock cache can leak into later
-    // test files that re-export through index.ts: those files end up seeing
-    // a downloader module missing exports like `getBinaryName`, which
-    // surfaces as `SyntaxError: export 'getBinaryName' not found in
-    // './downloader.js'` between tests under CI.
-    mock.module("../downloader.js", () => ({
-      ensureBinary: async (version?: string) => {
-        seenVersions.push(version);
-        return "/downloaded/aft";
-      },
-      downloadBinary: async () => "/downloaded/aft",
-      getBinaryName: () => (process.platform === "win32" ? "aft.exe" : "aft"),
-      getCacheDir: () => cacheDir,
-      getCachedBinaryPath: () => null,
-    }));
-
-    // Cache-bust the resolver import so it picks up the freshly-mocked
-    // downloader instead of an earlier-test-cached copy.
-    const { findBinary } = await import(`../resolver.js?expected-version-${Date.now()}`);
+    __setEnsureBinaryForTests(async (version?: string) => {
+      seenVersions.push(version);
+      return "/downloaded/aft";
+    });
 
     await expect(findBinary("0.99.0-test")).resolves.toBe("/downloaded/aft");
     expect(seenVersions).toEqual(["0.99.0-test"]);

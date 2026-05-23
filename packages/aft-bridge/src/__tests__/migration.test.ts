@@ -9,6 +9,7 @@ import {
   resolveCortexKitStorageRoot,
   resolveLegacyStorageRoot,
 } from "../migration.js";
+import { acquireEnv } from "./test-utils/env-guard.js";
 
 // Skip on Linux CI: Bun-on-Ubuntu reproducibly returns the literal string
 // "failed" from spawn of shebang-prefixed shell scripts under the test
@@ -20,22 +21,19 @@ const skipLinuxCi = process.platform === "linux" && process.env.CI === "true";
 
 describe.skipIf(skipLinuxCi)("storage migration bootstrap", () => {
   let tempDir: string;
-  let prevXdgDataHome: string | undefined;
-  let prevHome: string | undefined;
+  let releaseEnv: (() => void) | undefined;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), "aft-migration-test-"));
-    prevXdgDataHome = process.env.XDG_DATA_HOME;
-    prevHome = process.env.HOME;
-    process.env.XDG_DATA_HOME = tempDir;
-    process.env.HOME = tempDir;
+    releaseEnv = await acquireEnv({
+      XDG_DATA_HOME: tempDir,
+      HOME: tempDir,
+    });
   });
 
   afterEach(() => {
-    if (prevXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
-    else process.env.XDG_DATA_HOME = prevXdgDataHome;
-    if (prevHome === undefined) delete process.env.HOME;
-    else process.env.HOME = prevHome;
+    releaseEnv?.();
+    releaseEnv = undefined;
     rmSync(tempDir, { recursive: true, force: true });
   });
 

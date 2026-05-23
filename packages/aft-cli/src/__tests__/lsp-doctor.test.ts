@@ -4,6 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
 import { printLspDoctorHelp, renderLspInspection, runLspDoctor } from "../commands/lsp.js";
 import type { AftRequest, AftResponse } from "../lib/aft-bridge.js";
@@ -62,6 +63,7 @@ function captureConsole(fn: () => void): string[] {
 
 const tempRoots = new Set<string>();
 const originalCwd = process.cwd();
+let releaseEnv: (() => void) | undefined;
 
 function tempRoot(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -71,7 +73,8 @@ function tempRoot(prefix: string): string {
 
 afterEach(() => {
   process.chdir(originalCwd);
-  delete process.env.AFT_CACHE_DIR;
+  releaseEnv?.();
+  releaseEnv = undefined;
   for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
   tempRoots.clear();
 });
@@ -196,7 +199,7 @@ describe("doctor lsp", () => {
 
   test("infers cached lsp_paths_extra even when lsp.auto_install is false", async () => {
     const cacheRoot = tempRoot("aft-lsp-cache-");
-    process.env.AFT_CACHE_DIR = cacheRoot;
+    releaseEnv = await acquireEnv({ AFT_CACHE_DIR: cacheRoot });
     const cachedBinDir = join(cacheRoot, "lsp-packages", "pyright", "node_modules", ".bin");
     mkdirSync(cachedBinDir, { recursive: true });
 

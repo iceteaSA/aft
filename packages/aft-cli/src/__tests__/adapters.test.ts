@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { getAdapter, getAllAdapters } from "../adapters/index.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import { PiAdapter } from "../adapters/pi.js";
@@ -32,11 +33,18 @@ describe("OpenCodeAdapter configuration", () => {
   let tmpHome: string;
   let configDir: string;
 
-  beforeEach(() => {
+  let releaseEnv: (() => void) | undefined;
+
+  beforeEach(async () => {
     tmpHome = mkdtempSync(join(tmpdir(), "aft-cli-test-"));
     configDir = join(tmpHome, ".config", "opencode");
     mkdirSync(configDir, { recursive: true });
-    process.env.OPENCODE_CONFIG_DIR = configDir;
+    releaseEnv = await acquireEnv({ OPENCODE_CONFIG_DIR: configDir });
+  });
+
+  afterEach(() => {
+    releaseEnv?.();
+    releaseEnv = undefined;
   });
 
   test("hasPluginEntry returns false when no config", () => {
@@ -172,30 +180,21 @@ describe("OpenCodeAdapter configuration", () => {
 describe("PiAdapter configuration", () => {
   let tmpHome: string;
   let agentDir: string;
-  let originalHome: string | undefined;
-  let originalUserProfile: string | undefined;
+  let releaseEnv: (() => void) | undefined;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpHome = mkdtempSync(join(tmpdir(), "aft-cli-pi-test-"));
     agentDir = join(tmpHome, ".pi", "agent");
     mkdirSync(agentDir, { recursive: true });
-    originalHome = process.env.HOME;
-    originalUserProfile = process.env.USERPROFILE;
-    process.env.HOME = tmpHome;
-    if (process.platform === "win32") process.env.USERPROFILE = tmpHome;
+    releaseEnv = await acquireEnv({
+      HOME: tmpHome,
+      USERPROFILE: process.platform === "win32" ? tmpHome : process.env.USERPROFILE,
+    });
   });
 
   afterEach(() => {
-    if (originalHome === undefined) {
-      process.env.HOME = undefined;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    if (originalUserProfile === undefined) {
-      process.env.USERPROFILE = undefined;
-    } else {
-      process.env.USERPROFILE = originalUserProfile;
-    }
+    releaseEnv?.();
+    releaseEnv = undefined;
   });
 
   test("hasPluginEntry returns false when no settings.json", () => {
