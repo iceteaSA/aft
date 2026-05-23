@@ -23,14 +23,16 @@ use std::os::windows::process::CommandExt;
 use super::buffer::{combine_streams, BgBuffer, TokenCountInput};
 use super::persistence::{
     create_capture_file, delete_task_bundle, read_exit_marker, read_task, session_tasks_dir,
-    task_paths, unix_millis, update_task, write_kill_marker_if_absent, write_task, ExitMarker,
-    PersistedTask, TaskPaths,
+    task_paths, unix_millis, update_task, write_kill_marker_if_absent, write_task, BgMode,
+    ExitMarker, PersistedTask, TaskPaths,
 };
 use super::process::is_process_alive;
 #[cfg(unix)]
 use super::process::terminate_pgid;
 #[cfg(windows)]
 use super::process::terminate_pid;
+use super::pty_process::spawn_pty_for_command;
+use super::pty_runtime::PtyRuntime;
 use super::{BgTaskInfo, BgTaskStatus};
 // Note: `resolve_windows_shell` is no longer imported at module scope —
 // production code in `spawn_detached_child` uses `shell_candidates()`
@@ -130,6 +132,8 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor: Mutex<Option<Box<dyn Fn(&str, String) -> String + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     pub(crate) db_harness: RwLock<Option<String>>,
+    pub(crate) wake_tx: crossbeam_channel::Sender<()>,
+    pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
 }
 
 pub(crate) struct BgTask {
@@ -142,9 +146,14 @@ pub(crate) struct BgTask {
     pub(crate) state: Mutex<BgTaskState>,
 }
 
+pub(crate) enum TaskRuntime {
+    Piped(Option<Child>),
+    Pty(Option<PtyRuntime>),
+}
+
 pub(crate) struct BgTaskState {
     pub(crate) metadata: PersistedTask,
-    pub(crate) child: Option<Child>,
+    pub(crate) runtime: TaskRuntime,
     pub(crate) detached: bool,
     /// True once `reap_child` has observed the direct child handle's exit
     /// via `try_wait()`. Used by the two-pass watchdog to skip the racy
@@ -158,10 +167,13 @@ pub(crate) struct BgTaskState {
     /// continue to fall through to the `is_process_alive` probe path.
     pub(crate) child_exit_observed: bool,
     pub(crate) buffer: BgBuffer,
+    /// PTY-only: set for timeout kill intent before signaling the child.
+    pub(crate) pending_terminal_override: Option<BgTaskStatus>,
 }
 
 impl BgTaskRegistry {
     pub fn new(progress_sender: SharedProgressSender) -> Self {
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         Self {
             inner: Arc::new(RegistryInner {
                 tasks: Mutex::new(HashMap::new()),
@@ -177,6 +189,8 @@ impl BgTaskRegistry {
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_harness: RwLock::new(None),
+                wake_tx,
+                wake_rx,
             }),
         }
     }
@@ -375,10 +389,116 @@ impl BgTaskRegistry {
             terminal_at: Mutex::new(None),
             state: Mutex::new(BgTaskState {
                 metadata,
-                child: Some(child),
+                runtime: TaskRuntime::Piped(Some(child)),
                 detached: false,
                 child_exit_observed: false,
                 buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
+                pending_terminal_override: None,
+            }),
+        });
+
+        self.inner
+            .tasks
+            .lock()
+            .map_err(|_| "background task registry lock poisoned".to_string())?
+            .insert(task_id.clone(), task);
+
+        Ok(task_id)
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_pty(
+        &self,
+        command: &str,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        timeout: Option<Duration>,
+        storage_dir: PathBuf,
+        max_running: usize,
+        notify_on_completion: bool,
+        compressed: bool,
+        project_root: Option<PathBuf>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<String, String> {
+        self.start_watchdog();
+
+        let running = self.running_count();
+        if running >= max_running {
+            return Err(format!(
+                "background bash task limit exceeded: {running} running (max {max_running})"
+            ));
+        }
+
+        let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
+        let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
+        let task_id = self.generate_unique_task_id()?;
+        let paths = task_paths(&storage_dir, &session_id, &task_id);
+        fs::create_dir_all(&paths.dir)
+            .map_err(|e| format!("failed to create background task dir: {e}"))?;
+
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            session_id.clone(),
+            command.to_string(),
+            workdir.clone(),
+            project_root,
+            timeout_ms,
+            notify_on_completion,
+            compressed,
+        );
+        metadata.mode = BgMode::Pty;
+        self.persist_task(&paths, &metadata)
+            .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
+        create_capture_file(&paths.pty)
+            .map_err(|e| format!("failed to create PTY capture file: {e}"))?;
+
+        let runtime = match spawn_pty_for_command(
+            &task_id,
+            &session_id,
+            command,
+            &paths,
+            &workdir,
+            &env,
+            rows,
+            cols,
+            self.inner.wake_tx.clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                crate::slog_warn!(
+                    "failed to spawn PTY background bash task {task_id}; deleting partial bundle: {error}"
+                );
+                let _ = delete_task_bundle(&paths);
+                return Err(error);
+            }
+        };
+
+        if let Some(child_pid) = runtime.child_pid {
+            metadata.mark_running(child_pid, child_pid as i32);
+        } else {
+            metadata.status = BgTaskStatus::Running;
+            metadata.pgid = None;
+        }
+        self.persist_task(&paths, &metadata)
+            .map_err(|e| format!("failed to persist running background task metadata: {e}"))?;
+
+        let task = Arc::new(BgTask {
+            task_id: task_id.clone(),
+            session_id,
+            paths: paths.clone(),
+            started: Instant::now(),
+            last_reminder_at: Mutex::new(None),
+            terminal_at: Mutex::new(None),
+            state: Mutex::new(BgTaskState {
+                metadata,
+                runtime: TaskRuntime::Pty(Some(runtime)),
+                detached: false,
+                child_exit_observed: false,
+                buffer: BgBuffer::pty(paths.pty.clone()),
+                pending_terminal_override: None,
             }),
         });
 
@@ -470,10 +590,11 @@ impl BgTaskRegistry {
             terminal_at: Mutex::new(None),
             state: Mutex::new(BgTaskState {
                 metadata,
-                child: Some(child),
+                runtime: TaskRuntime::Piped(Some(child)),
                 detached: false,
                 child_exit_observed: false,
                 buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
+                pending_terminal_override: None,
             }),
         });
 
@@ -575,7 +696,25 @@ impl BgTaskRegistry {
                     self.insert_rehydrated_task(metadata, paths, true)?;
                 }
                 BgTaskStatus::Running | BgTaskStatus::Killing => {
-                    if self.running_metadata_is_stale(&metadata) {
+                    if metadata.mode == BgMode::Pty {
+                        if let Ok(Some(marker)) = read_exit_marker(&paths.exit) {
+                            metadata = terminal_metadata_from_marker(metadata, marker, None);
+                            let _ = self.persist_task(&paths, &metadata);
+                            self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
+                            self.insert_rehydrated_task(metadata, paths, true)?;
+                        } else if metadata.status.is_terminal() {
+                            self.insert_rehydrated_task(metadata, paths, true)?;
+                        } else {
+                            metadata.mark_terminal(
+                                BgTaskStatus::Killed,
+                                None,
+                                Some("pty_lost_on_bridge_restart".to_string()),
+                            );
+                            let _ = self.persist_task(&paths, &metadata);
+                            self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
+                            self.insert_rehydrated_task(metadata, paths, true)?;
+                        }
+                    } else if self.running_metadata_is_stale(&metadata) {
                         metadata.mark_terminal(
                             BgTaskStatus::Killed,
                             None,
@@ -1017,11 +1156,14 @@ impl BgTaskRegistry {
         if !snapshot.info.status.is_terminal() {
             return;
         }
-        let compressed_flag = task
+        let (compressed_flag, mode) = task
             .state
             .lock()
-            .map(|state| state.metadata.compressed)
-            .unwrap_or(true);
+            .map(|state| (state.metadata.compressed, state.metadata.mode.clone()))
+            .unwrap_or((true, BgMode::Pipes));
+        if mode == BgMode::Pty {
+            return;
+        }
         if !compressed_flag {
             return;
         }
@@ -1190,7 +1332,10 @@ impl BgTaskRegistry {
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             for task in tasks.values() {
                 if let Ok(mut state) = task.state.lock() {
-                    state.child = None;
+                    match &mut state.runtime {
+                        TaskRuntime::Piped(child) => *child = None,
+                        TaskRuntime::Pty(runtime) => *runtime = None,
+                    }
                     state.detached = true;
                 }
             }
@@ -1216,6 +1361,15 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        if let Ok(state) = task.state.lock() {
+            if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
+                let complete = pty.reader_done.load(Ordering::SeqCst)
+                    && pty.exit_observed.load(Ordering::SeqCst);
+                if !complete {
+                    return Ok(());
+                }
+            }
+        }
         let marker = match read_exit_marker(&task.paths.exit) {
             Ok(Some(marker)) => marker,
             Ok(None) => return Ok(()),
@@ -1228,45 +1382,34 @@ impl BgTaskRegistry {
         let Ok(mut state) = task.state.lock() else {
             return;
         };
-        if let Some(child) = state.child.as_mut() {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                // First pass: the direct child has exited, but a missing exit
-                // marker is not yet proof that the wrapper crashed. Under
-                // load, the wrapper can be between writing `*.exit.tmp.$$` and
-                // renaming it to `*.exit`, or the directory entry may not be
-                // visible to this watchdog pass yet.
-                //
-                // Drop the handle and mark the task detached so a later pass
-                // declares failure if the marker is still absent. Record
-                // `child_exit_observed=true` so that later pass can trust
-                // this `try_wait()` evidence directly — Windows PIDs get
-                // recycled fast enough that `is_process_alive(child_pid)`
-                // can return true for an unrelated process by then.
-                state.child = None;
-                state.detached = true;
-                state.child_exit_observed = true;
+        match &mut state.runtime {
+            TaskRuntime::Piped(child_slot) => {
+                if let Some(child) = child_slot.as_mut() {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        *child_slot = None;
+                        state.detached = true;
+                        state.child_exit_observed = true;
+                    }
+                } else if state.detached {
+                    let child_known_dead = state.child_exit_observed
+                        || state
+                            .metadata
+                            .child_pid
+                            .is_some_and(|pid| !is_process_alive(pid));
+                    if child_known_dead {
+                        self.fail_without_exit_marker_if_needed(task, &mut state);
+                    }
+                }
             }
-        } else if state.detached {
-            // Second pass. The child handle is gone and we're monitoring by
-            // PID. Two cases produce this shape:
-            //
-            //   1. First reap of this process observed `try_wait() == Some`
-            //      and set `child_exit_observed=true`. We already know the
-            //      child is dead — no need to re-verify via PID liveness
-            //      (unreliable on Windows due to PID recycling).
-            //
-            //   2. The task was restored from disk by replay logic — we
-            //      have `child_pid` from a previous AFT process but never
-            //      observed exit in this one. Probe `is_process_alive` to
-            //      confirm dead-ness before declaring failure.
-            let child_known_dead = state.child_exit_observed
-                || state
-                    .metadata
-                    .child_pid
-                    .is_some_and(|pid| !is_process_alive(pid));
-            if child_known_dead {
-                self.fail_without_exit_marker_if_needed(task, &mut state);
+            TaskRuntime::Pty(Some(pty)) => {
+                let complete = pty.reader_done.load(Ordering::SeqCst)
+                    && pty.exit_observed.load(Ordering::SeqCst);
+                if complete {
+                    drop(state);
+                    let _ = self.poll_task(task);
+                }
             }
+            TaskRuntime::Pty(None) => {}
         }
     }
 
@@ -1285,6 +1428,7 @@ impl BgTaskRegistry {
             );
         });
         if let Ok(metadata) = updated {
+            state.pending_terminal_override = None;
             state.metadata = metadata;
             task.mark_terminal_now();
             state.buffer.enforce_terminal_cap();
@@ -1316,6 +1460,7 @@ impl BgTaskRegistry {
         let session_id = metadata.session_id.clone();
         let started = started_instant_from_unix_millis(metadata.started_at);
         let suppress_replayed_running_reminder = metadata.status == BgTaskStatus::Running;
+        let mode = metadata.mode.clone();
         let task = Arc::new(BgTask {
             task_id: task_id.clone(),
             session_id,
@@ -1325,7 +1470,11 @@ impl BgTaskRegistry {
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
             state: Mutex::new(BgTaskState {
                 metadata,
-                child: None,
+                runtime: if mode == BgMode::Pty {
+                    TaskRuntime::Pty(None)
+                } else {
+                    TaskRuntime::Piped(None)
+                },
                 detached,
                 // Replay path: we never observed the child handle's exit
                 // in this process (the previous AFT process did, but its
@@ -1334,7 +1483,12 @@ impl BgTaskRegistry {
                 // `is_process_alive(child_pid)` probe rather than declaring
                 // failure based on stale evidence.
                 child_exit_observed: false,
-                buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
+                buffer: if mode == BgMode::Pty {
+                    BgBuffer::pty(paths.pty.clone())
+                } else {
+                    BgBuffer::new(paths.stdout.clone(), paths.stderr.clone())
+                },
+                pending_terminal_override: None,
             }),
         });
         self.inner
@@ -1361,14 +1515,19 @@ impl BgTaskRegistry {
                 .lock()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
+                state.pending_terminal_override = None;
                 return Ok(task.snapshot_locked(&state, 5 * 1024));
             }
 
             if let Ok(Some(marker)) = read_exit_marker(&task.paths.exit) {
                 state.metadata =
                     terminal_metadata_from_marker(state.metadata.clone(), marker, None);
+                state.pending_terminal_override = None;
                 task.mark_terminal_now();
-                state.child = None;
+                match &mut state.runtime {
+                    TaskRuntime::Piped(child) => *child = None,
+                    TaskRuntime::Pty(runtime) => *runtime = None,
+                }
                 state.detached = true;
                 state.buffer.enforce_terminal_cap();
                 self.persist_task(&task.paths, &state.metadata)
@@ -1377,44 +1536,76 @@ impl BgTaskRegistry {
                 return Ok(task.snapshot_locked(&state, 5 * 1024));
             }
 
-            state.metadata.status = BgTaskStatus::Killing;
-            self.persist_task(&task.paths, &state.metadata)
-                .map_err(|e| format!("failed to persist killing state: {e}"))?;
-
-            #[cfg(unix)]
-            if let Some(pgid) = state.metadata.pgid {
-                terminate_pgid(pgid, state.child.as_mut());
+            let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
+            if !was_already_killing {
+                state.metadata.status = BgTaskStatus::Killing;
+                self.persist_task(&task.paths, &state.metadata)
+                    .map_err(|e| format!("failed to persist killing state: {e}"))?;
             }
+
+            let pgid = state.metadata.pgid;
             #[cfg(windows)]
-            if let Some(child) = state.child.as_mut() {
-                super::process::terminate_process(child);
-            } else if let Some(pid) = state.metadata.child_pid {
-                terminate_pid(pid);
-            }
-            if let Some(child) = state.child.as_mut() {
-                let _ = child.wait();
-            }
-            state.child = None;
-            state.detached = true;
-
-            if !task.paths.exit.exists() {
-                write_kill_marker_if_absent(&task.paths.exit)
-                    .map_err(|e| format!("failed to write kill marker: {e}"))?;
+            let child_pid = state.metadata.child_pid;
+            if !was_already_killing
+                && state.metadata.mode == BgMode::Pty
+                && terminal_status == BgTaskStatus::TimedOut
+            {
+                state.pending_terminal_override = Some(BgTaskStatus::TimedOut);
             }
 
-            let exit_code = if terminal_status == BgTaskStatus::TimedOut {
-                Some(124)
-            } else {
-                None
-            };
-            state
-                .metadata
-                .mark_terminal(terminal_status, exit_code, None);
-            task.mark_terminal_now();
-            self.persist_task(&task.paths, &state.metadata)
-                .map_err(|e| format!("failed to persist killed state: {e}"))?;
-            state.buffer.enforce_terminal_cap();
-            self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
+            match &mut state.runtime {
+                TaskRuntime::Piped(child_slot) => {
+                    #[cfg(unix)]
+                    if let Some(pgid) = pgid {
+                        terminate_pgid(pgid, child_slot.as_mut());
+                    }
+                    #[cfg(windows)]
+                    if let Some(child) = child_slot.as_mut() {
+                        super::process::terminate_process(child);
+                    } else if let Some(pid) = child_pid {
+                        terminate_pid(pid);
+                    }
+                    if let Some(child) = child_slot.as_mut() {
+                        let _ = child.wait();
+                    }
+                    *child_slot = None;
+                    state.detached = true;
+
+                    if !task.paths.exit.exists() {
+                        write_kill_marker_if_absent(&task.paths.exit)
+                            .map_err(|e| format!("failed to write kill marker: {e}"))?;
+                    }
+
+                    let exit_code = if terminal_status == BgTaskStatus::TimedOut {
+                        Some(124)
+                    } else {
+                        None
+                    };
+                    state
+                        .metadata
+                        .mark_terminal(terminal_status, exit_code, None);
+                    state.pending_terminal_override = None;
+                    task.mark_terminal_now();
+                    self.persist_task(&task.paths, &state.metadata)
+                        .map_err(|e| format!("failed to persist killed state: {e}"))?;
+                    state.buffer.enforce_terminal_cap();
+                    self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
+                }
+                TaskRuntime::Pty(Some(pty)) => {
+                    pty.was_killed.store(true, Ordering::SeqCst);
+                    if let Err(error) = pty.killer.kill() {
+                        crate::slog_warn!("[pty-kill] {task_id} ChildKiller::kill failed: {error}");
+                    }
+                    if let Some(pid) = pty.child_pid {
+                        #[cfg(unix)]
+                        terminate_pgid(pid as i32, None);
+                        #[cfg(windows)]
+                        terminate_pid(pid);
+                    }
+                    drop(pty.master.take());
+                }
+                TaskRuntime::Pty(None) => {}
+            }
         }
 
         Ok(task.snapshot(5 * 1024))
@@ -1431,18 +1622,36 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task lock poisoned".to_string())?;
         if state.metadata.status.is_terminal() {
+            state.pending_terminal_override = None;
             return Ok(());
         }
 
+        let pending_override = state.pending_terminal_override.take();
+        let is_pty = state.metadata.mode == BgMode::Pty;
         let updated = self
             .update_task_metadata(&task.paths, |metadata| {
-                let new_metadata = terminal_metadata_from_marker(metadata.clone(), marker, reason);
+                let new_metadata = if is_pty && marker == ExitMarker::Killed {
+                    let mut metadata = metadata.clone();
+                    let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
+                    let exit_code = if target_status == BgTaskStatus::TimedOut {
+                        Some(124)
+                    } else {
+                        None
+                    };
+                    metadata.mark_terminal(target_status, exit_code, reason);
+                    metadata
+                } else {
+                    terminal_metadata_from_marker(metadata.clone(), marker, reason)
+                };
                 *metadata = new_metadata;
             })
             .map_err(|e| format!("failed to persist terminal state: {e}"))?;
         state.metadata = updated;
         task.mark_terminal_now();
-        state.child = None;
+        match &mut state.runtime {
+            TaskRuntime::Piped(child) => *child = None,
+            TaskRuntime::Pty(runtime) => *runtime = None,
+        }
         state.detached = true;
         state.buffer.enforce_terminal_cap();
         self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
@@ -1493,11 +1702,15 @@ impl BgTaskRegistry {
         // both the push-frame consumer (running session) and any later
         // `bash_drain_completions` poll (different session, restart) see the
         // same preview without racing against rotation.
-        let (raw_preview, output_truncated) = match buffer {
-            Some(buf) => buf.read_tail(BG_COMPLETION_PREVIEW_BYTES),
-            None => paths
-                .map(|paths| read_tail_from_disk(paths, BG_COMPLETION_PREVIEW_BYTES))
-                .unwrap_or_else(|| (String::new(), false)),
+        let (raw_preview, output_truncated) = if metadata.mode == BgMode::Pty {
+            (String::new(), false)
+        } else {
+            match buffer {
+                Some(buf) => buf.read_tail(BG_COMPLETION_PREVIEW_BYTES),
+                None => paths
+                    .map(|paths| read_tail_from_disk(metadata, paths, BG_COMPLETION_PREVIEW_BYTES))
+                    .unwrap_or_else(|| (String::new(), false)),
+            }
         };
         // Compress at completion time so push-frame consumers and later
         // `bash_drain_completions` poll-callers see the same compressed text.
@@ -1573,6 +1786,10 @@ impl BgTaskRegistry {
         metadata: &PersistedTask,
         token_counts: &CompletionTokenCounts,
     ) {
+        if metadata.mode == BgMode::Pty {
+            return;
+        }
+
         let (original_tokens, compressed_tokens, original_bytes, compressed_bytes) = match (
             token_counts.original_tokens,
             token_counts.compressed_tokens,
@@ -1718,10 +1935,16 @@ impl BgTaskRegistry {
         buffer: Option<&BgBuffer>,
         paths: Option<&TaskPaths>,
     ) -> CompletionTokenCounts {
+        if metadata.mode == BgMode::Pty {
+            return CompletionTokenCounts::skipped();
+        }
+
         let raw = match buffer {
             Some(buffer) => buffer.read_for_token_count(TOKENIZE_CAP_BYTES_PER_STREAM),
             None => paths
-                .map(|paths| read_for_token_count_from_disk(paths, TOKENIZE_CAP_BYTES_PER_STREAM))
+                .map(|paths| {
+                    read_for_token_count_from_disk(metadata, paths, TOKENIZE_CAP_BYTES_PER_STREAM)
+                })
                 .unwrap_or(TokenCountInput::Skipped),
         };
 
@@ -2066,13 +2289,27 @@ fn task_sibling_paths(json_path: &Path) -> Vec<PathBuf> {
     let Some(stem) = json_path.file_stem().and_then(|stem| stem.to_str()) else {
         return Vec::new();
     };
-    ["stdout", "stderr", "exit", "ps1", "bat", "sh"]
+    ["stdout", "stderr", "exit", "pty", "ps1", "bat", "sh"]
         .into_iter()
         .map(|extension| parent.join(format!("{stem}.{extension}")))
         .collect()
 }
 
-fn read_tail_from_disk(paths: &TaskPaths, max_bytes: usize) -> (String, bool) {
+fn read_tail_from_disk(
+    metadata: &PersistedTask,
+    paths: &TaskPaths,
+    max_bytes: usize,
+) -> (String, bool) {
+    if metadata.mode == BgMode::Pty {
+        return read_file_tail_capped(&paths.pty, max_bytes)
+            .map(|bytes| {
+                let truncated = fs::metadata(&paths.pty)
+                    .map(|metadata| metadata.len() > max_bytes as u64)
+                    .unwrap_or(false);
+                (String::from_utf8_lossy(&bytes).into_owned(), truncated)
+            })
+            .unwrap_or_else(|_| (String::new(), false));
+    }
     let stdout = fs::read(&paths.stdout).unwrap_or_default();
     let stderr = fs::read(&paths.stderr).unwrap_or_default();
     let mut bytes = Vec::with_capacity(stdout.len().saturating_add(stderr.len()));
@@ -2086,9 +2323,13 @@ fn read_tail_from_disk(paths: &TaskPaths, max_bytes: usize) -> (String, bool) {
 }
 
 fn read_for_token_count_from_disk(
+    metadata: &PersistedTask,
     paths: &TaskPaths,
     max_bytes_per_stream: usize,
 ) -> TokenCountInput {
+    if metadata.mode == BgMode::Pty {
+        return TokenCountInput::Skipped;
+    }
     // Read up to `max_bytes_per_stream` bytes per stream rather than
     // refusing to tokenize anything when the file exceeds the cap.
     // Mirror the in-memory `BgBuffer::read_for_token_count` policy
@@ -2154,6 +2395,7 @@ impl BgTask {
                 task_id: self.task_id.clone(),
                 status: metadata.status.clone(),
                 command: metadata.command.clone(),
+                mode: metadata.mode.clone(),
                 started_at: metadata.started_at,
                 duration_ms,
             },
@@ -2166,14 +2408,21 @@ impl BgTask {
                 .buffer
                 .output_path()
                 .map(|path| path.display().to_string()),
-            stderr_path: Some(state.buffer.stderr_path().display().to_string()),
+            stderr_path: state
+                .buffer
+                .stderr_path()
+                .map(|path| path.display().to_string()),
         }
     }
 
     pub(crate) fn is_running(&self) -> bool {
         self.state
             .lock()
-            .map(|state| state.metadata.status == BgTaskStatus::Running)
+            .map(|state| {
+                state.metadata.status == BgTaskStatus::Running
+                    || (state.metadata.mode == BgMode::Pty
+                        && state.metadata.status == BgTaskStatus::Killing)
+            })
             .unwrap_or(false)
     }
 
@@ -2667,10 +2916,9 @@ mod tests {
         loop {
             let exited = {
                 let mut state = task.state.lock().unwrap();
-                if let Some(child) = state.child.as_mut() {
-                    matches!(child.try_wait(), Ok(Some(_)))
-                } else {
-                    true
+                match &mut state.runtime {
+                    TaskRuntime::Piped(Some(child)) => matches!(child.try_wait(), Ok(Some(_))),
+                    _ => true,
                 }
             };
             if exited {
@@ -2731,8 +2979,8 @@ mod tests {
             // If the watchdog already nulled state.child, we need to
             // simulate "child exists and is dead" so reap_child's
             // try_wait path runs. Spawn a quick-exit child as a stand-in.
-            if state.child.is_none() {
-                state.child = Some(spawn_dead_child());
+            if matches!(state.runtime, TaskRuntime::Piped(None)) {
+                state.runtime = TaskRuntime::Piped(Some(spawn_dead_child()));
             }
         }
         // Clear the terminal_at marker too so mark_terminal_now() can fire
@@ -2768,7 +3016,7 @@ mod tests {
                 "first reap must not record a failure reason"
             );
             assert!(
-                state.child.is_none(),
+                matches!(state.runtime, TaskRuntime::Piped(None)),
                 "child handle must be released after first reap"
             );
             assert!(
@@ -2801,7 +3049,7 @@ mod tests {
             state.metadata.status_reason
         );
         assert!(
-            state.child.is_none(),
+            matches!(state.runtime, TaskRuntime::Piped(None)),
             "child handle must stay released after second reap"
         );
         assert!(
@@ -2841,10 +3089,9 @@ mod tests {
         loop {
             let exited = {
                 let mut state = task.state.lock().unwrap();
-                if let Some(child) = state.child.as_mut() {
-                    matches!(child.try_wait(), Ok(Some(_)))
-                } else {
-                    true
+                match &mut state.runtime {
+                    TaskRuntime::Piped(Some(child)) => matches!(child.try_wait(), Ok(Some(_))),
+                    _ => true,
                 }
             };
             if exited && task.paths.exit.exists() {
@@ -2877,8 +3124,8 @@ mod tests {
             let mut state = task.state.lock().unwrap();
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
-            if state.child.is_none() {
-                state.child = Some(spawn_dead_child());
+            if matches!(state.runtime, TaskRuntime::Piped(None)) {
+                state.runtime = TaskRuntime::Piped(Some(spawn_dead_child()));
             }
         }
         *task.terminal_at.lock().unwrap() = None;
@@ -2895,7 +3142,7 @@ mod tests {
 
         let state = task.state.lock().unwrap();
         assert!(
-            state.child.is_none(),
+            matches!(state.runtime, TaskRuntime::Piped(None)),
             "child handle still released even when marker exists"
         );
         assert!(

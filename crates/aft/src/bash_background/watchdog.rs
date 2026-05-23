@@ -13,6 +13,7 @@ pub(crate) fn start(registry: BgTaskRegistry) {
     thread::spawn(move || {
         let ticker = tick(WATCHDOG_INTERVAL);
         let cleanup_ticker = tick(CLEANUP_INTERVAL);
+        let wake_rx = registry.inner.wake_rx.clone();
         while !registry.inner.shutdown.load(Ordering::SeqCst) {
             crossbeam_channel::select! {
                 recv(ticker) -> tick => {
@@ -24,6 +25,7 @@ pub(crate) fn start(registry: BgTaskRegistry) {
                     registry.cleanup_finished(FINISHED_RETENTION);
                     continue;
                 }
+                recv(wake_rx) -> _ => {}
             }
 
             if registry.inner.shutdown.load(Ordering::SeqCst) {

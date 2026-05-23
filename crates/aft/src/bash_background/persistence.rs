@@ -10,7 +10,7 @@ use crate::db::bash_tasks::BashTaskRow;
 
 use super::BgTaskStatus;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TaskPaths {
@@ -19,6 +19,15 @@ pub struct TaskPaths {
     pub stdout: PathBuf,
     pub stderr: PathBuf,
     pub exit: PathBuf,
+    pub pty: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BgMode {
+    #[default]
+    Pipes,
+    Pty,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +36,8 @@ pub struct PersistedTask {
     pub task_id: String,
     pub session_id: String,
     pub command: String,
+    #[serde(default)]
+    pub mode: BgMode,
     pub workdir: PathBuf,
     #[serde(default)]
     pub project_root: Option<PathBuf>,
@@ -80,6 +91,7 @@ impl PersistedTask {
             task_id,
             session_id,
             command,
+            mode: BgMode::Pipes,
             workdir,
             project_root,
             status: BgTaskStatus::Starting,
@@ -129,7 +141,17 @@ impl PersistedTask {
         paths: &TaskPaths,
     ) -> Result<BashTaskRow, serde_json::Error> {
         let project_root = self.project_root.as_deref().unwrap_or(&self.workdir);
-        let output_bytes = capture_output_bytes(paths);
+        let output_bytes = capture_output_bytes(&self.mode, paths);
+        let stdout_path = match self.mode {
+            BgMode::Pipes => Some(paths.stdout.display().to_string()),
+            BgMode::Pty => Some(paths.pty.display().to_string()),
+        };
+        let stderr_path = match self.mode {
+            BgMode::Pipes => Some(paths.stderr.display().to_string()),
+            BgMode::Pty => None,
+        };
+        let mut metadata = self.clone();
+        metadata.schema_version = SCHEMA_VERSION;
         Ok(BashTaskRow {
             harness: harness.to_string(),
             session_id: self.session_id.clone(),
@@ -143,13 +165,13 @@ impl PersistedTask {
             pgid: self.pgid.map(i64::from),
             started_at: self.started_at as i64,
             completed_at: self.finished_at.map(|value| value as i64),
-            stdout_path: Some(paths.stdout.display().to_string()),
-            stderr_path: Some(paths.stderr.display().to_string()),
+            stdout_path,
+            stderr_path,
             compressed: self.compressed,
             timeout_ms: self.timeout_ms.map(|value| value as i64),
             completion_delivered: self.completion_delivered,
             output_bytes,
-            metadata: serde_json::to_string(self)?,
+            metadata: serde_json::to_string(&metadata)?,
         })
     }
 }
@@ -178,6 +200,7 @@ impl From<BashTaskRow> for PersistedTask {
             task_id: row.task_id,
             session_id: row.session_id,
             command: row.command,
+            mode: BgMode::Pipes,
             workdir: PathBuf::from(row.cwd),
             project_root: None,
             status,
@@ -208,17 +231,24 @@ fn status_name(status: &BgTaskStatus) -> &'static str {
     }
 }
 
-fn capture_output_bytes(paths: &TaskPaths) -> Option<i64> {
-    let stdout = fs::metadata(&paths.stdout)
-        .ok()
-        .map(|metadata| metadata.len());
-    let stderr = fs::metadata(&paths.stderr)
-        .ok()
-        .map(|metadata| metadata.len());
-    match (stdout, stderr) {
-        (Some(stdout), Some(stderr)) => Some(stdout.saturating_add(stderr) as i64),
-        (Some(bytes), None) | (None, Some(bytes)) => Some(bytes as i64),
-        (None, None) => None,
+fn capture_output_bytes(mode: &BgMode, paths: &TaskPaths) -> Option<i64> {
+    match mode {
+        BgMode::Pipes => {
+            let stdout = fs::metadata(&paths.stdout)
+                .ok()
+                .map(|metadata| metadata.len());
+            let stderr = fs::metadata(&paths.stderr)
+                .ok()
+                .map(|metadata| metadata.len());
+            match (stdout, stderr) {
+                (Some(stdout), Some(stderr)) => Some(stdout.saturating_add(stderr) as i64),
+                (Some(bytes), None) | (None, Some(bytes)) => Some(bytes as i64),
+                (None, None) => None,
+            }
+        }
+        BgMode::Pty => fs::metadata(&paths.pty)
+            .ok()
+            .map(|metadata| metadata.len() as i64),
     }
 }
 
@@ -235,6 +265,7 @@ pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> TaskPa
         stdout: dir.join(format!("{task_id}.stdout")),
         stderr: dir.join(format!("{task_id}.stderr")),
         exit: dir.join(format!("{task_id}.exit")),
+        pty: dir.join(format!("{task_id}.pty")),
         dir,
     }
 }
@@ -242,11 +273,11 @@ pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> TaskPa
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     let content = fs::read_to_string(path)?;
     let task: PersistedTask = serde_json::from_str(&content).map_err(io::Error::other)?;
-    if task.schema_version != SCHEMA_VERSION {
+    if !matches!(task.schema_version, 2 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported background task schema_version {} (expected {SCHEMA_VERSION})",
+                "unsupported background task schema_version {} (expected 2 or {SCHEMA_VERSION})",
                 task.schema_version
             ),
         ));
@@ -258,8 +289,10 @@ pub fn write_task(path: &Path, task: &PersistedTask) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let content = serde_json::to_vec_pretty(task).map_err(io::Error::other)?;
-    atomic_write(path, &content, &task.task_id)
+    let mut upgraded = task.clone();
+    upgraded.schema_version = SCHEMA_VERSION;
+    let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
+    atomic_write(path, &content, &upgraded.task_id)
 }
 
 pub(super) fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
@@ -284,12 +317,13 @@ pub(super) fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
     }
 }
 
-fn task_bundle_files(paths: &TaskPaths) -> Vec<PathBuf> {
+pub fn task_bundle_files(paths: &TaskPaths) -> Vec<PathBuf> {
     let mut files = vec![
         paths.json.clone(),
         paths.stdout.clone(),
         paths.stderr.clone(),
         paths.exit.clone(),
+        paths.pty.clone(),
     ];
     if let Some(stem) = paths.json.file_stem().and_then(|stem| stem.to_str()) {
         // Windows background bash writes per-task wrapper scripts next to the
@@ -318,10 +352,12 @@ where
     let original_terminal = task.is_terminal();
     let original = task.clone();
     update(&mut task);
+    task.schema_version = SCHEMA_VERSION;
     if original_terminal {
         let completion_delivered = task.completion_delivered;
         task = original;
         task.completion_delivered = completion_delivered;
+        task.schema_version = SCHEMA_VERSION;
     }
     write_task(path, &task)?;
     Ok(task)

@@ -3,11 +3,14 @@
 pub mod buffer;
 pub mod persistence;
 pub mod process;
+pub mod pty_process;
+pub mod pty_runtime;
 pub mod registry;
 pub mod watchdog;
 
 use crate::context::AppContext;
 use crate::protocol::Response;
+use persistence::BgMode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -21,6 +24,7 @@ pub struct BgTaskInfo {
     pub task_id: String,
     pub status: BgTaskStatus,
     pub command: String,
+    pub mode: BgMode,
     pub started_at: u64,
     pub duration_ms: Option<u64>,
 }
@@ -103,6 +107,7 @@ pub fn spawn(
             json!({
                 "task_id": task_id,
                 "status": BgTaskStatus::Running,
+                "mode": "pipes",
             }),
         ),
         Err(message) if message.contains("limit exceeded") => {
