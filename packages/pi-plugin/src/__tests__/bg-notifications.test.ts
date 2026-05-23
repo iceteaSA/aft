@@ -130,7 +130,7 @@ describe("Pi background notifications", () => {
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(260);
+    await waitForMockCallCount(sendUserMessage, 1);
 
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
     expect(sendUserMessage.mock.calls[0][0]).toContain("- task task-1 (exit 0)");
@@ -162,7 +162,7 @@ describe("Pi background notifications", () => {
       },
       completion("task-1", "npm test"),
     );
-    await sleep(260);
+    await waitForMockCallCount(sendUserMessage, 1);
 
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
     expect(sendUserMessage.mock.calls[0][0]).toContain("- task task-1 (exit 0)");
@@ -191,7 +191,7 @@ describe("Pi background notifications", () => {
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(260);
+    await waitForMockCallCount(sendUserMessage, 1);
 
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
     expect(sendUserMessage.mock.calls[0][0]).toContain("- task task-1 (exit 0)");
@@ -208,7 +208,7 @@ describe("Pi background notifications", () => {
       { ctx, directory: "/tmp/project", sessionID: "s1", runtime: { sendUserMessage } },
       completion("task-1", "npm test"),
     );
-    await sleep(260);
+    await waitForMockCallCount(sendUserMessage, 1);
 
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
@@ -226,7 +226,11 @@ describe("Pi background notifications", () => {
       { ctx, directory: "/tmp/project", sessionID: "s1", runtime: { sendUserMessage } },
       completion("task-1", "npm test"),
     );
-    await sleep(3_800);
+    await waitUntil(
+      () =>
+        sendUserMessage.mock.calls.length >= 5 && sessionBgStates.get("s1")?.debounceTimer === null,
+      10_000,
+    );
 
     expect(sendUserMessage).toHaveBeenCalledTimes(5);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
@@ -270,7 +274,7 @@ describe("Pi background notifications", () => {
       },
       completion("task-1", "npm test"),
     );
-    await sleep(260);
+    await waitForMockCallCount(sendUserMessage, 1);
 
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
     expect(sendUserMessage.mock.calls[0][0]).toContain("task-1");
@@ -308,7 +312,7 @@ describe("Pi background notifications", () => {
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(520);
+    await waitForMockCallCount(sendUserMessage, 1);
 
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
     expect(String(sendUserMessage.mock.calls[0][0]).match(/^- task/gm)).toHaveLength(3);
@@ -368,14 +372,14 @@ describe("Pi background notifications", () => {
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(260);
+    await waitForMockCallCount(sendUserMessage, 1);
     await handleTurnEndBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(260);
+    expect(sessionBgStates.get("s1")?.debounceTimer ?? null).toBeNull();
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
 
     responses = [{ success: true, bg_completions: [completion("task-2", "two")] }];
@@ -386,7 +390,7 @@ describe("Pi background notifications", () => {
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(260);
+    await waitForMockCallCount(sendUserMessage, 2);
     expect(sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
@@ -479,6 +483,25 @@ function ingestCompletionForCleanup(sessionID: string, taskID: string): void {
   const state = sessionBgStates.get(sessionID);
   if (!state) throw new Error(`missing state for ${sessionID}`);
   state.outstandingTaskIds.delete(taskID);
+}
+
+async function waitForMockCallCount(
+  fn: { mock: { calls: unknown[] } },
+  count: number,
+  timeoutMs = 5_000,
+): Promise<void> {
+  await waitUntil(() => fn.mock.calls.length >= count, timeoutMs);
+}
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const started = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - started > timeoutMs) throw new Error("timed out waiting for condition");
+    await sleep(50);
+  }
 }
 
 function sleep(ms: number): Promise<void> {

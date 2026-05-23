@@ -18,8 +18,28 @@ function childPid(bridge: Harness["bridge"]): number {
   return pid;
 }
 
-async function waitForExitHandler(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+async function waitForExitHandler(
+  bridge: { process?: ChildProcess | null },
+  pid: number,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const started = Date.now();
+  while (true) {
+    if (bridge.process?.pid !== pid || !isProcessAlive(pid)) return;
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`timed out waiting for bridge child ${pid} to exit`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 maybeDescribe("e2e bridge transport resilience (Pi)", () => {
@@ -87,7 +107,7 @@ maybeDescribe("e2e bridge transport resilience (Pi)", () => {
     const killedPid = childPid(h.bridge);
 
     process.kill(killedPid, "SIGKILL");
-    await waitForExitHandler();
+    await waitForExitHandler(h.bridge as unknown as { process?: ChildProcess | null }, killedPid);
 
     const after = await h.bridge.send("read", { file: h.path("sample.txt") });
     expect(after.success).toBe(true);
@@ -176,7 +196,7 @@ maybeDescribe("e2e bridge transport resilience (Pi)", () => {
     const killedPid = childPid(bridgeA);
     const otherPid = childPid(bridgeB);
     process.kill(killedPid, "SIGKILL");
-    await waitForExitHandler();
+    await waitForExitHandler(bridgeA as unknown as { process?: ChildProcess | null }, killedPid);
 
     const stillOk = await bridgeB.send("read", { file: join(sessionB, "sample.txt") });
     expect(stillOk.success).toBe(true);

@@ -21,8 +21,28 @@ function childPid(bridge: E2EHarness["bridge"]): number {
   return pid;
 }
 
-async function waitForExitHandler(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+async function waitForExitHandler(
+  bridge: { process?: ChildProcess | null },
+  pid: number,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const started = Date.now();
+  while (true) {
+    if (bridge.process?.pid !== pid || !isProcessAlive(pid)) return;
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`timed out waiting for bridge child ${pid} to exit`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 maybeDescribe("e2e bridge transport resilience (OpenCode)", () => {
@@ -53,10 +73,13 @@ maybeDescribe("e2e bridge transport resilience (OpenCode)", () => {
     await h.bridge.send("ping");
     const firstPid = childPid(h.bridge);
 
+    // transportTimeoutMs must be shorter than the bash command duration
+    // while leaving enough headroom for Rust spawn/registry/protocol work
+    // on contended CI runners. Keep this mirrored with the Pi test.
     const launched = await h.bridge.send(
       "bash",
       { command: "sleep 1 && echo slow", timeout: 5_000, compressed: false },
-      { transportTimeoutMs: 100 },
+      { transportTimeoutMs: 500 },
     );
 
     expect(launched.success).toBe(true);
@@ -78,7 +101,7 @@ maybeDescribe("e2e bridge transport resilience (OpenCode)", () => {
     const killedPid = childPid(h.bridge);
 
     process.kill(killedPid, "SIGKILL");
-    await waitForExitHandler();
+    await waitForExitHandler(h.bridge as unknown as { process?: ChildProcess | null }, killedPid);
 
     const after = await h.bridge.send("read", { file: h.path("sample.txt") });
     expect(after.success).toBe(true);

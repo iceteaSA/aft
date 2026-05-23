@@ -38,6 +38,7 @@ import {
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
   handleIdleBgCompletions,
+  sessionBgStates,
   trackBgTask,
 } from "../../bg-notifications.js";
 import { createBashTool } from "../../tools/bash.js";
@@ -147,9 +148,9 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
         client: {},
         serverUrl: "http://127.0.0.1:0/",
       });
-      await sleep(260);
-      return promptCalls.length > 0;
+      return promptCalls.length > 0 || hasScheduledBgWake();
     });
+    await waitUntil(() => promptCalls.length > 0, 5_000);
 
     expect(promptCalls).toHaveLength(1);
     const text = (promptCalls[0] as { body: { parts: Array<{ text: string }> } }).body.parts[0]
@@ -187,12 +188,21 @@ async function spawnBackground(
   return taskId;
 }
 
-async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 4_000): Promise<void> {
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 4_000,
+): Promise<void> {
   const started = Date.now();
   while (!(await predicate())) {
     if (Date.now() - started > timeoutMs) throw new Error("timed out waiting for condition");
     await sleep(100);
   }
+}
+
+function hasScheduledBgWake(): boolean {
+  return Array.from(sessionBgStates.values()).some(
+    (state) => state.pendingCompletions.length > 0 || state.debounceTimer !== null,
+  );
 }
 
 function sleep(ms: number): Promise<void> {

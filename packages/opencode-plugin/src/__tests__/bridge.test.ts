@@ -267,8 +267,9 @@ describe("BinaryBridge lifecycle", () => {
     expect(proc).not.toBeNull();
     proc.kill("SIGKILL");
 
-    // Let the exit handler run (it should NOT schedule an auto-restart).
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // Wait for the exit handler to observe the killed child. It should NOT
+    // schedule an auto-restart; the next request lazy-spawns instead.
+    await waitForBridgeProcessExit(bridge, proc.pid);
 
     // Next request lazy-spawns a fresh bridge.
     const r2 = await bridge.send("ping");
@@ -640,7 +641,7 @@ describe("BinaryBridge lifecycle", () => {
       (bridge as any).handleCrash();
 
       expect(bridge.restartCount).toBe(1);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitUntil(() => bridge?.restartCount === 0, 500, "restart counter to decay");
       expect(bridge.restartCount).toBe(0);
     } finally {
       (BinaryBridge as any).RESTART_RESET_MS = originalResetMs;
@@ -772,5 +773,35 @@ function isProcessAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function waitForBridgeProcessExit(
+  bridge: BinaryBridge,
+  pid: number | undefined,
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (pid === undefined) throw new Error("bridge child process is missing a pid");
+  await waitUntil(
+    () => {
+      const current = (bridge as unknown as { process: ChildProcess | null }).process;
+      return current?.pid !== pid || !isProcessAlive(pid);
+    },
+    timeoutMs,
+    `bridge child ${pid} to exit`,
+  );
+}
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+  description: string,
+): Promise<void> {
+  const started = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`timed out waiting for ${description}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }

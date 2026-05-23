@@ -5,6 +5,7 @@ import {
   __resetBgNotificationStateForTests,
   appendToolResultBgCompletions,
   handleTurnEndBgCompletions,
+  sessionBgStates,
   trackBgTask,
 } from "../../bg-notifications.js";
 import { registerBashTool } from "../../tools/bash.js";
@@ -100,9 +101,9 @@ maybeDescribe("e2e bg notifications (Pi adapter + bridge + Rust)", () => {
         sessionID,
         runtime: { sendUserMessage: (message: string) => messages.push(message) },
       });
-      await sleep(260);
-      return messages.length > 0;
+      return messages.length > 0 || hasScheduledBgWake();
     });
+    await waitUntil(() => messages.length > 0, 5_000);
 
     expect(messages).toHaveLength(1);
     expect(messages[0]).toContain(`- task ${taskId} (exit 0)`);
@@ -138,12 +139,21 @@ async function spawnBackground(
   return taskId;
 }
 
-async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 4_000): Promise<void> {
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 4_000,
+): Promise<void> {
   const started = Date.now();
   while (!(await predicate())) {
     if (Date.now() - started > timeoutMs) throw new Error("timed out waiting for condition");
     await sleep(100);
   }
+}
+
+function hasScheduledBgWake(): boolean {
+  return Array.from(sessionBgStates.values()).some(
+    (state) => state.pendingCompletions.length > 0 || state.debounceTimer !== null,
+  );
 }
 
 function sleep(ms: number): Promise<void> {

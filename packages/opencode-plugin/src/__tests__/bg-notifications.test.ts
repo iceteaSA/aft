@@ -310,7 +310,7 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 1);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const payload = promptAsync.mock.calls[0][0] as {
@@ -352,7 +352,7 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 1);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const payload = promptAsync.mock.calls[0][0] as {
@@ -390,7 +390,7 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 1);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const payload = promptAsync.mock.calls[0][0] as {
@@ -428,7 +428,7 @@ describe("OpenCode background notifications", () => {
       },
       completion("task-1", "npm test"),
     );
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 1);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
@@ -462,7 +462,7 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 1);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
@@ -488,7 +488,7 @@ describe("OpenCode background notifications", () => {
       },
       completion("task-1", "npm test"),
     );
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 1);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
@@ -513,7 +513,10 @@ describe("OpenCode background notifications", () => {
       },
       completion("task-1", "npm test"),
     );
-    await sleep(3_800);
+    await waitUntil(
+      () => promptAsync.mock.calls.length >= 5 && sessionBgStates.get("s1")?.debounceTimer === null,
+      10_000,
+    );
 
     expect(promptAsync).toHaveBeenCalledTimes(5);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
@@ -539,7 +542,7 @@ describe("OpenCode background notifications", () => {
       },
       completion("task-1", "npm test"),
     );
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 1);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
@@ -582,7 +585,7 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(520);
+    await waitForMockCallCount(promptAsync, 1);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
@@ -650,7 +653,7 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 1);
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
@@ -658,7 +661,7 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    expect(sessionBgStates.get("s1")?.debounceTimer ?? null).toBeNull();
     expect(promptAsync).toHaveBeenCalledTimes(1);
 
     responses = [{ success: true, bg_completions: [completion("task-2", "two")] }];
@@ -670,7 +673,7 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    await waitForMockCallCount(promptAsync, 2);
     expect(promptAsync).toHaveBeenCalledTimes(2);
   });
 
@@ -777,7 +780,7 @@ describe("OpenCode background notifications", () => {
       client: fallbackClient,
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    await waitForMockCallCount(livePromptAsync, 1);
 
     // The live-server client was used; the fallback client was NOT.
     expect(livePromptAsync).toHaveBeenCalledTimes(1);
@@ -818,7 +821,7 @@ describe("OpenCode background notifications", () => {
       client: fallbackClient,
       serverUrl: TEST_SERVER_URL,
     });
-    await sleep(260);
+    await waitForMockCallCount(fallbackClient.session.promptAsync, 1);
 
     // The fallback client was used; the live-server factory was NOT
     // consulted at all (no probe of getLastLiveServerArgs).
@@ -855,7 +858,7 @@ describe("OpenCode background notifications", () => {
       },
       completion("task-1", "npm test"),
     );
-    await sleep(260);
+    await waitUntil(() => findTraceEvent("bash_completion_wake_client_unavailable") !== undefined);
 
     // No client = no transport = no promptAsync call on either path.
     expect(livePromptAsync).toHaveBeenCalledTimes(0);
@@ -893,6 +896,25 @@ function harness(
 
 function completion(task_id: string, command: string) {
   return { task_id, status: "completed", exit_code: 0, command };
+}
+
+async function waitForMockCallCount(
+  fn: { mock: { calls: unknown[] } },
+  count: number,
+  timeoutMs = 5_000,
+): Promise<void> {
+  await waitUntil(() => fn.mock.calls.length >= count, timeoutMs);
+}
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const started = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - started > timeoutMs) throw new Error("timed out waiting for condition");
+    await sleep(50);
+  }
 }
 
 function sleep(ms: number): Promise<void> {

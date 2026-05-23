@@ -258,7 +258,7 @@ describe("Pi BinaryBridge", () => {
       (bridge as any).handleCrash();
 
       expect(bridge.restartCount).toBe(1);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitUntil(() => bridge?.restartCount === 0, 500, "restart counter to decay");
       expect(bridge.restartCount).toBe(0);
     } finally {
       (BinaryBridge as any).RESTART_RESET_MS = originalResetMs;
@@ -344,3 +344,17 @@ describe("Pi compareSemver", () => {
     expect(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.1")).toBe(0);
   });
 });
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+  description: string,
+): Promise<void> {
+  const started = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`timed out waiting for ${description}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}

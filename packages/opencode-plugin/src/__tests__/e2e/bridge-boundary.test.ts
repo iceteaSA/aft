@@ -55,9 +55,10 @@ maybeDescribe("e2e bridge boundary behavior", () => {
     const first = await h.bridge.send("ping");
     expect(first.success).toBe(true);
 
-    const proc = (h.bridge as unknown as { process?: { kill(signal: string): void } }).process;
+    const proc = (h.bridge as unknown as { process?: { kill(signal: string): void; pid?: number } })
+      .process;
     proc?.kill("SIGKILL");
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await waitForBridgeProcessExit(h.bridge, proc?.pid);
 
     const second = await h.bridge.send("ping");
     expect(second.success).toBe(true);
@@ -65,3 +66,29 @@ maybeDescribe("e2e bridge boundary behavior", () => {
     expect(h.bridge.restartCount).toBe(0);
   });
 });
+
+async function waitForBridgeProcessExit(
+  bridge: E2EHarness["bridge"],
+  pid: number | undefined,
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (pid === undefined) throw new Error("bridge child process is missing a pid");
+  const started = Date.now();
+  while (true) {
+    const current = (bridge as unknown as { process?: { pid?: number } | null }).process;
+    if (current?.pid !== pid || !isProcessAlive(pid)) return;
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`timed out waiting for bridge child ${pid} to exit`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
