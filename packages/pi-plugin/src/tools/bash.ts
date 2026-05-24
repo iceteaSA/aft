@@ -8,7 +8,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import { consumeBgCompletion, trackBgTask } from "../bg-notifications.js";
+import {
+  consumeBgCompletion,
+  markTaskWaiting,
+  trackBgTask,
+  unmarkTaskWaiting,
+} from "../bg-notifications.js";
 import {
   disposePtyTerminal,
   getOrCreatePtyTerminal,
@@ -632,39 +637,50 @@ async function waitForBashStatus(
     transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
   };
 
-  while (true) {
-    const data = await bashStatusSnapshot(bridge, extCtx, taskId, outputMode, bridgeOptions);
-    if (waitForExit && isTerminalStatus(data.status)) {
-      consumeBgCompletion(resolveSessionId(extCtx), taskId);
-      return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
-    }
-
-    if (waitFor) {
-      const scan = await readNewTaskOutput(extCtx, taskId, data, spillCursor);
-      if (scan) {
-        spillCursor = scan.nextCursor;
-        if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
-        scanText += scan.text;
-        const match = findWaitMatch(scanText, waitFor);
-        if (match) {
-          return withWaited(data, {
-            reason: "matched",
-            elapsed_ms: Date.now() - startedAt,
-            match: match.text,
-            match_offset:
-              scanBaseOffset + Buffer.byteLength(scanText.slice(0, match.index), "utf8"),
-          });
-        }
-      }
-      if (isTerminalStatus(data.status)) {
+  // Pre-mark BEFORE first poll: ingestBgCompletions will suppress any push
+  // frame that arrives while we're waiting, so no wake is ever scheduled for
+  // this task. Mirrors the OpenCode fix; see bg-notifications.markTaskWaiting.
+  const sessionId = resolveSessionId(extCtx);
+  if (waitForExit) markTaskWaiting(sessionId, taskId);
+  let sawTerminal = false;
+  try {
+    while (true) {
+      const data = await bashStatusSnapshot(bridge, extCtx, taskId, outputMode, bridgeOptions);
+      if (waitForExit && isTerminalStatus(data.status)) {
+        sawTerminal = true;
+        consumeBgCompletion(sessionId, taskId);
         return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
       }
-    }
 
-    if (Date.now() >= deadline) {
-      return withWaited(data, { reason: "timeout", elapsed_ms: Date.now() - startedAt });
+      if (waitFor) {
+        const scan = await readNewTaskOutput(extCtx, taskId, data, spillCursor);
+        if (scan) {
+          spillCursor = scan.nextCursor;
+          if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
+          scanText += scan.text;
+          const match = findWaitMatch(scanText, waitFor);
+          if (match) {
+            return withWaited(data, {
+              reason: "matched",
+              elapsed_ms: Date.now() - startedAt,
+              match: match.text,
+              match_offset:
+                scanBaseOffset + Buffer.byteLength(scanText.slice(0, match.index), "utf8"),
+            });
+          }
+        }
+        if (isTerminalStatus(data.status)) {
+          return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+        }
+      }
+
+      if (Date.now() >= deadline) {
+        return withWaited(data, { reason: "timeout", elapsed_ms: Date.now() - startedAt });
+      }
+      await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
     }
-    await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+  } finally {
+    if (waitForExit && !sawTerminal) unmarkTaskWaiting(sessionId, taskId);
   }
 }
 

@@ -2,7 +2,12 @@ import * as fs from "node:fs/promises";
 import type { BridgeRequestOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { consumeBgCompletion, trackBgTask } from "../bg-notifications.js";
+import {
+  consumeBgCompletion,
+  markTaskWaiting,
+  trackBgTask,
+  unmarkTaskWaiting,
+} from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
 import { sessionLog } from "../logger.js";
 import { storeToolMetadata } from "../metadata-store.js";

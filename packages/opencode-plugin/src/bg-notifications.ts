@@ -55,8 +55,24 @@ type SessionBgState = {
   wakeHardStopped: boolean;
   forcedDrainCompleted: boolean;
   unknownCompletions: Array<{ completion: BgCompletion; receivedAt: number }>;
+  /**
+   * Task IDs whose completions were consumed inline by an explicit
+   * `bash_status({ exit: true, ... })` wait. The bash_completed push
+   * frame for these tasks may arrive AFTER the wait poll loop returned
+   * (the Rust→plugin frame is async); without this set, the late frame
+   * would land in `pendingCompletions` and the next `appendInTurnBgCompletions`
+   * or wake would deliver a duplicate reminder. We dedupe at the ingest
+   * boundary so `pendingCompletions` stays a clean source of truth.
+   *
+   * Bounded by `CONSUMED_TASKIDS_CAP` (FIFO eviction) so a session that
+   * runs thousands of bg tasks doesn't grow this set without bound.
+   */
+  consumedTaskIds: Set<string>;
+  consumedTaskOrder: string[];
   lastSeenAt: number;
 };
+
+const CONSUMED_TASKIDS_CAP = 256;
 
 export const sessionBgStates: Map<string, SessionBgState> = new Map();
 
@@ -114,9 +130,90 @@ interface OpenCodeClient {
  * doesn't double-notify the agent.
  */
 export function consumeBgCompletion(sessionID: string | undefined, taskId: string): void {
-  const state = getSessionState(sessionID);
-  if (!state) return;
+  // Use stateFor (not getSessionState) so the suppression set is recorded
+  // even when the session has no prior bg state — the bash_completed push
+  // frame for this task may still arrive on this session, and we need the
+  // entry there to drop it.
+  const state = stateFor(sessionID);
   state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
+  if (!state.consumedTaskIds.has(taskId)) {
+    state.consumedTaskIds.add(taskId);
+    state.consumedTaskOrder.push(taskId);
+    // Bounded FIFO eviction so a session running thousands of bg tasks
+    // doesn't accumulate an unbounded suppression set.
+    while (state.consumedTaskOrder.length > CONSUMED_TASKIDS_CAP) {
+      const evicted = state.consumedTaskOrder.shift();
+      if (evicted !== undefined) state.consumedTaskIds.delete(evicted);
+    }
+  }
+  // Cancel any pending debounced wake when nothing's left to deliver.
+  // This closes the race where push frame arrived → scheduleWake →
+  // consume removes the only pending entry → wake timer would otherwise
+  // fire with empty pending (defensive skip catches that), but firing
+  // the timer at all consumes the scheduler slot.
+  if (
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0 &&
+    state.debounceTimer
+  ) {
+    clearTimeout(state.debounceTimer);
+    state.debounceTimer = null;
+    state.firstCompletionAt = null;
+    state.scheduledFireAt = null;
+    state.scheduledCompletionCount = 0;
+  }
+}
+
+/**
+ * Pre-mark a task as expected to be consumed inline before the wait loop
+ * starts polling. This is the key suppression mechanism: ingestBgCompletions
+ * will skip push frames for tasks already in consumedTaskIds, so a wake is
+ * never scheduled in the first place. The consume-after-detection path
+ * loses a race when push frame arrives faster than the wait loop's next poll.
+ *
+ * Caller MUST balance with `unmarkTaskWaiting` if the wait loop returns
+ * without seeing terminal status (timeout or pattern-match-without-exit),
+ * so future push frames deliver normally.
+ */
+export function markTaskWaiting(sessionID: string | undefined, taskId: string): void {
+  const state = stateFor(sessionID);
+  if (state.consumedTaskIds.has(taskId)) return;
+  state.consumedTaskIds.add(taskId);
+  state.consumedTaskOrder.push(taskId);
+  while (state.consumedTaskOrder.length > CONSUMED_TASKIDS_CAP) {
+    const evicted = state.consumedTaskOrder.shift();
+    if (evicted !== undefined) state.consumedTaskIds.delete(evicted);
+  }
+  // Also drop any pending completion already queued for this task — if
+  // ingestBgCompletions ran in the gap between bash() returning task_id
+  // and waitForBashStatus calling markTaskWaiting, the completion may
+  // already be in pendingCompletions. Filter it out and cancel any wake
+  // timer if that empties the queue.
+  state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
+  if (
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0 &&
+    state.debounceTimer
+  ) {
+    clearTimeout(state.debounceTimer);
+    state.debounceTimer = null;
+    state.firstCompletionAt = null;
+    state.scheduledFireAt = null;
+    state.scheduledCompletionCount = 0;
+  }
+}
+
+/**
+ * Remove a task from the consumed set when the wait loop returned without
+ * seeing terminal status (e.g. timeout or pattern-only match). Without
+ * this, future push frames for the task would be permanently suppressed.
+ */
+export function unmarkTaskWaiting(sessionID: string | undefined, taskId: string): void {
+  const state = stateFor(sessionID);
+  if (!state.consumedTaskIds.has(taskId)) return;
+  state.consumedTaskIds.delete(taskId);
+  const idx = state.consumedTaskOrder.indexOf(taskId);
+  if (idx >= 0) state.consumedTaskOrder.splice(idx, 1);
 }
 
 export function trackBgTask(sessionID: string | undefined, taskId: string): void {
@@ -146,6 +243,14 @@ export function ingestBgCompletions(
   const accepted: BgCompletion[] = [];
   for (const completion of completions) {
     if (!isBgCompletion(completion)) continue;
+    // Suppress completions for tasks already consumed inline by a
+    // bash_status wait — the late-arriving frame would otherwise queue
+    // a duplicate reminder. We still delete from outstandingTaskIds so
+    // tracking stays accurate. See `consumeBgCompletion` for context.
+    if (state.consumedTaskIds.has(completion.task_id)) {
+      state.outstandingTaskIds.delete(completion.task_id);
+      continue;
+    }
     if (!state.outstandingTaskIds.has(completion.task_id)) {
       bufferUnknownCompletion(state, completion);
       continue;
@@ -653,6 +758,8 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       wakeHardStopped: false,
       forcedDrainCompleted: false,
       unknownCompletions: [],
+      consumedTaskIds: new Set(),
+      consumedTaskOrder: [],
       lastSeenAt: now,
     };
     sessionBgStates.set(key, state);
@@ -672,6 +779,9 @@ function ingestDrainedBgCompletions(
   for (const completion of completions) {
     if (!isBgCompletion(completion)) continue;
     state.outstandingTaskIds.delete(completion.task_id);
+    // Suppress completions for tasks already consumed inline by a
+    // bash_status wait (same dedupe as ingestBgCompletions push path).
+    if (state.consumedTaskIds.has(completion.task_id)) continue;
     if (
       !state.pendingCompletions.some((pending) => pending.task_id === completion.task_id) &&
       !accepted.some((pending) => pending.task_id === completion.task_id)
