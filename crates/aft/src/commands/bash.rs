@@ -84,21 +84,15 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         log::debug!("bash description: {description}");
     }
 
-    if params.pty && !params.background {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            "PTY mode requires background: true",
-        );
-    }
-
-    if !params.pty && (params.pty_rows.is_some() || params.pty_cols.is_some()) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            "ptyRows/ptyCols require pty: true",
-        );
-    }
+    // NOTE (v0.30.1 prep, unblock-only): the previous two rejections
+    // ("PTY mode requires background: true" and "ptyRows/ptyCols require
+    // pty: true") have been removed so that:
+    //   1. pty:true silently implies background:true (handled below by
+    //      passing `params.background || params.pty` to bash_background::spawn)
+    //   2. ptyRows/ptyCols are silently ignored when pty:false instead of
+    //      rejecting agent calls that defensively include the params
+    // Bounds validation (1..60 rows, 1..140 cols) still applies via
+    // `validate_pty_dimensions` below.
 
     if let Err(message) = validate_pty_dimensions(params.pty_rows, params.pty_cols) {
         return Response::error(&req.id, "invalid_request", message);
@@ -145,6 +139,19 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let workdir = params.workdir.clone();
     let env = (!params.env.is_empty()).then_some(params.env.clone());
+    // pty:true silently implies background:true so agents don't need to know
+    // both flags. The PTY runtime requires a polling lifecycle regardless.
+    let effective_background = params.background || params.pty;
+    // Treat ptyRows/ptyCols == 0 as "use default" so empty-sentinel-style
+    // agent calls don't trip bounds validation.
+    let pty_rows = params
+        .pty_rows
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_PTY_ROWS);
+    let pty_cols = params
+        .pty_cols
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_PTY_COLS);
     crate::bash_background::spawn(
         &req.id,
         req.session(),
@@ -153,20 +160,22 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         env,
         params.timeout,
         ctx,
-        params.background,
+        effective_background,
         params.notify_on_completion,
         params.compressed,
         params.pty,
-        params.pty_rows.unwrap_or(DEFAULT_PTY_ROWS),
-        params.pty_cols.unwrap_or(DEFAULT_PTY_COLS),
+        pty_rows,
+        pty_cols,
     )
 }
 
 fn validate_pty_dimensions(rows: Option<u16>, cols: Option<u16>) -> Result<(), &'static str> {
-    if rows.is_some_and(|value| value == 0 || value > MAX_PTY_ROWS) {
+    // 0 is silently treated as "use default" (see handle()); only reject
+    // explicit out-of-bound positive values.
+    if rows.is_some_and(|value| value > MAX_PTY_ROWS) {
         return Err("ptyRows must be an integer between 1 and 60");
     }
-    if cols.is_some_and(|value| value == 0 || value > MAX_PTY_COLS) {
+    if cols.is_some_and(|value| value > MAX_PTY_COLS) {
         return Err("ptyCols must be an integer between 1 and 140");
     }
     Ok(())
