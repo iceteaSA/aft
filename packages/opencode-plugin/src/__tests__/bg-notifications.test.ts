@@ -83,6 +83,8 @@ import {
   handleIdleBgCompletions,
   handlePushedBgCompletion,
   ingestBgCompletions,
+  markBgCompletionDelivered,
+  markExplicitControl,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -446,6 +448,30 @@ describe("OpenCode background notifications", () => {
     expect(payload.body.agent).toBeUndefined();
     expect(payload.body.model).toBeUndefined();
     expect(payload.body.variant).toBeUndefined();
+  });
+
+  test("markBgCompletionDelivered persists locally consumed completions", async () => {
+    const send = mock(async () => ({ success: true, acked_task_ids: ["task-1"] }));
+    const { ctx } = harness(send);
+
+    await markBgCompletionDelivered({ ctx, directory: "/tmp/project", sessionID: "s1" }, "task-1");
+
+    expect(send).toHaveBeenCalledWith("bash_ack_completions", {
+      session_id: "s1",
+      task_ids: ["task-1"],
+    });
+  });
+
+  test("pending explicit control converts completions before task tracking", () => {
+    markExplicitControl("s1", "task-1", false);
+
+    const accepted = ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+
+    expect(accepted).toEqual([]);
+    const state = sessionBgStates.get("s1");
+    expect(state?.pendingCompletions).toHaveLength(0);
+    expect(state?.pendingPatternMatches).toHaveLength(1);
+    expect(state?.pendingPatternMatches[0]?.reason).toBe("task_exit");
   });
 
   test("push completion lands in pending and wakes when idle", async () => {

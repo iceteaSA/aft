@@ -4,8 +4,10 @@ import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import {
   consumeBgCompletion,
+  markBgCompletionDelivered,
   markExplicitControl,
   markTaskWaiting,
+  unmarkExplicitControl,
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
@@ -81,8 +83,16 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         };
         if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
         else notifyParams.pattern = waitFor.value;
-        const registered = await callBridge(ctx, context, "bash_notify", notifyParams);
+        markExplicitControl(context.sessionID, taskId, false);
+        let registered: Record<string, unknown>;
+        try {
+          registered = await callBridge(ctx, context, "bash_notify", notifyParams);
+        } catch (err) {
+          unmarkExplicitControl(context.sessionID, taskId);
+          throw err;
+        }
         if (registered.success === false) {
+          unmarkExplicitControl(context.sessionID, taskId);
           const code = String(registered.code ?? "invalid_request");
           const message = String(registered.message ?? "bash_notify failed");
           if (code === "too_many_watches") throw new Error(`invalid_request: ${message}`);
@@ -187,6 +197,10 @@ export async function waitForBashStatus(
       const data = await bashStatusSnapshot(ctx, runtime, taskId, outputMode, bridgeOptions);
       if (isTerminalStatus(data.status)) {
         consumeBgCompletion(runtime.sessionID, taskId);
+        await markBgCompletionDelivered(
+          { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
+          taskId,
+        );
         return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
       }
       if (waitFor) {

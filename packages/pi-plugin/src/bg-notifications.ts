@@ -30,6 +30,7 @@ export interface PatternMatchEntry {
   match_offset: number;
   context: string;
   once: boolean;
+  reason?: "pattern_match" | "task_exit";
 }
 
 export interface BgLongRunningReminder {
@@ -132,6 +133,15 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   }
 }
 
+export async function markBgCompletionDelivered(
+  drainContext: DrainContext,
+  taskId: string,
+): Promise<void> {
+  await ackCompletions(drainContext, [
+    { task_id: taskId, status: "unknown", exit_code: null, command: "" },
+  ]);
+}
+
 /**
  * Pre-mark a task as expected to be consumed inline before the wait loop
  * starts polling. See OpenCode `markTaskWaiting` for full design notes.
@@ -192,10 +202,18 @@ export function trackBgTask(sessionID: string | undefined, taskId: string): void
   state.outstandingTaskIds.add(taskId);
 }
 
-export function markExplicitControl(sessionID: string | undefined, taskId: string): void {
+export function markExplicitControl(
+  sessionID: string | undefined,
+  taskId: string,
+  trackOutstanding = true,
+): void {
   const state = stateFor(sessionID);
   state.explicitControlTasks.add(taskId);
-  state.outstandingTaskIds.add(taskId);
+  if (trackOutstanding) state.outstandingTaskIds.add(taskId);
+}
+
+export function unmarkExplicitControl(sessionID: string | undefined, taskId: string): void {
+  stateFor(sessionID).explicitControlTasks.delete(taskId);
 }
 
 export async function handlePushedPatternMatch(
@@ -406,6 +424,9 @@ export function formatPatternMatchReminder(matches: readonly PatternMatchEntry[]
   const bullets = matches
     .map((match) => {
       const context = (match.context || match.match_text).replace(/\n/g, "\n      > ");
+      if (match.reason === "task_exit") {
+        return `- task ${match.task_id} exited:\n      > ${context}`;
+      }
       return `- task ${match.task_id} matched ${JSON.stringify(match.match_text)} (offset ${match.match_offset}):\n      > ${context}`;
     })
     .join("\n");
@@ -656,12 +677,13 @@ function completionToExitPattern(completion: BgCompletion): PatternMatchEntry {
     task_id: completion.task_id,
     session_id: "",
     watch_id: "exit",
-    match_text: `exited (${status})`,
+    match_text: "",
     match_offset: 0,
     context: preview
       ? `task ${completion.task_id} exited (${status})\n${preview}`
       : `task ${completion.task_id} exited (${status})`,
     once: true,
+    reason: "task_exit",
   };
 }
 

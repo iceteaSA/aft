@@ -10,9 +10,11 @@ import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import {
   consumeBgCompletion,
+  markBgCompletionDelivered,
   markExplicitControl,
   markTaskWaiting,
   trackBgTask,
+  unmarkExplicitControl,
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
 import {
@@ -502,12 +504,21 @@ export function createBashWatchTool(ctx: PluginContext) {
         };
         if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
         else notifyParams.pattern = waitFor.value;
-        const registered = await callBridge(bridge, "bash_notify", notifyParams, extCtx);
+        const sessionId = resolveSessionId(extCtx);
+        markExplicitControl(sessionId, params.task_id, false);
+        let registered: Record<string, unknown>;
+        try {
+          registered = await callBridge(bridge, "bash_notify", notifyParams, extCtx);
+        } catch (err) {
+          unmarkExplicitControl(sessionId, params.task_id);
+          throw err;
+        }
         if (registered.success === false) {
+          unmarkExplicitControl(sessionId, params.task_id);
           const message = String(registered.message ?? "bash_notify failed");
           throw new Error(`${String(registered.code ?? "invalid_request")}: ${message}`);
         }
-        markExplicitControl(resolveSessionId(extCtx), params.task_id);
+        markExplicitControl(sessionId, params.task_id);
         const watchDetails = { registered: true, watchId: registered.watch_id } as BashWatchDetails;
         return textResult(
           `Watch registered: ${registered.watch_id} on task ${params.task_id}\nA notification will fire when the pattern matches or the task exits.`,
@@ -515,6 +526,7 @@ export function createBashWatchTool(ctx: PluginContext) {
         );
       }
       const data = await waitForBashStatus(
+        ctx,
         bridge,
         extCtx,
         params.task_id,
@@ -659,6 +671,7 @@ async function bashStatusSnapshot(
 }
 
 async function waitForBashStatus(
+  ctx: PluginContext,
   bridge: BinaryBridge,
   extCtx: ExtensionContext,
   taskId: string,
@@ -689,6 +702,10 @@ async function waitForBashStatus(
       if (waitForExit && isTerminalStatus(data.status)) {
         sawTerminal = true;
         consumeBgCompletion(sessionId, taskId);
+        await markBgCompletionDelivered(
+          { ctx, directory: extCtx.cwd, sessionID: sessionId },
+          taskId,
+        );
         return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
       }
 

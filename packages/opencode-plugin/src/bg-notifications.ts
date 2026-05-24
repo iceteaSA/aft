@@ -178,6 +178,15 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   }
 }
 
+export async function markBgCompletionDelivered(
+  drainContext: DrainContext,
+  taskId: string,
+): Promise<void> {
+  await ackCompletions(drainContext, [
+    { task_id: taskId, status: "unknown", exit_code: null, command: "" },
+  ]);
+}
+
 /**
  * Pre-mark a task as expected to be consumed inline before the wait loop
  * starts polling. This is the key suppression mechanism: ingestBgCompletions
@@ -249,10 +258,18 @@ export function trackBgTask(sessionID: string | undefined, taskId: string): void
   state.outstandingTaskIds.add(taskId);
 }
 
-export function markExplicitControl(sessionID: string | undefined, taskId: string): void {
+export function markExplicitControl(
+  sessionID: string | undefined,
+  taskId: string,
+  trackOutstanding = true,
+): void {
   const state = stateFor(sessionID);
   state.explicitControlTasks.add(taskId);
-  state.outstandingTaskIds.add(taskId);
+  if (trackOutstanding) state.outstandingTaskIds.add(taskId);
+}
+
+export function unmarkExplicitControl(sessionID: string | undefined, taskId: string): void {
+  stateFor(sessionID).explicitControlTasks.delete(taskId);
 }
 
 export async function handlePushedPatternMatch(

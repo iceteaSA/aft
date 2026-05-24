@@ -174,5 +174,22 @@ fn watch_controlled_exit_emits_exit_safety_net_not_completion() {
             "timed out waiting for exit safety-net frame"
         );
     }
+
+    let drained = aft.send(
+        &json!({
+            "id": "drain-watch-exit",
+            "command": "bash_drain_completions"
+        })
+        .to_string(),
+    );
+    assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+    assert!(
+        drained["bg_completions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|completion| completion["task_id"] != task_id),
+        "watch-controlled task also queued a normal completion: {drained:?}"
+    );
     assert!(aft.shutdown().success());
 }

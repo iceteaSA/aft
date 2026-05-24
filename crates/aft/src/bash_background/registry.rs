@@ -1454,30 +1454,35 @@ impl BgTaskRegistry {
         if task_ids.is_empty() {
             return Vec::new();
         }
-        let task_ids = task_ids.iter().map(String::as_str).collect::<HashSet<_>>();
-        let mut completions = match self.inner.completions.lock() {
-            Ok(completions) => completions,
-            Err(_) => return Vec::new(),
-        };
-        let mut acked = Vec::new();
-        completions.retain(|completion| {
-            let session_matches = session_id
-                .map(|session_id| completion.session_id == session_id)
-                .unwrap_or(true);
-            if session_matches && task_ids.contains(completion.task_id.as_str()) {
-                acked.push((completion.task_id.clone(), completion.session_id.clone()));
-                false
-            } else {
-                true
-            }
-        });
-        drop(completions);
+        let requested_task_ids = task_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut completion_sessions = HashMap::new();
+        if let Ok(mut completions) = self.inner.completions.lock() {
+            completions.retain(|completion| {
+                let session_matches = session_id
+                    .map(|session_id| completion.session_id == session_id)
+                    .unwrap_or(true);
+                if session_matches && requested_task_ids.contains(completion.task_id.as_str()) {
+                    completion_sessions
+                        .insert(completion.task_id.clone(), completion.session_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
 
         let mut delivered = Vec::new();
-        for (task_id, completion_session_id) in acked {
-            if let Some(task) = self.task_for_session(&task_id, &completion_session_id) {
+        for task_id in task_ids {
+            let task = if let Some(session_id) = session_id {
+                self.task_for_session(task_id, session_id)
+            } else if let Some(completion_session_id) = completion_sessions.get(task_id) {
+                self.task_for_session(task_id, completion_session_id)
+            } else {
+                self.task(task_id)
+            };
+            if let Some(task) = task {
                 if task.set_completion_delivered(true, self).is_ok() {
-                    delivered.push(task_id);
+                    delivered.push(task_id.clone());
                 }
             }
         }
@@ -3093,6 +3098,59 @@ mod tests {
             }
         }
         child
+    }
+
+    #[test]
+    fn ack_marks_delivered_even_when_completion_was_already_consumed_locally() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .kill_with_status(&task_id, "session", BgTaskStatus::Killed)
+            .unwrap();
+        assert_eq!(
+            registry
+                .drain_completions_for_session(Some("session"))
+                .len(),
+            1
+        );
+
+        // Simulate the plugin consuming a sync bash_watch({ exit:true }) result
+        // locally before the Rust completion queue is drained/acked.
+        registry.inner.completions.lock().unwrap().clear();
+
+        assert_eq!(
+            registry.ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id)),
+            vec![task_id.clone()]
+        );
+        assert!(registry
+            .drain_completions_for_session(Some("session"))
+            .is_empty());
+
+        let paths = task_paths(dir.path(), "session", &task_id);
+        let metadata = read_task(&paths.json).unwrap();
+        assert!(metadata.completion_delivered);
+
+        let replayed = BgTaskRegistry::default();
+        replayed
+            .replay_session_inner(dir.path(), "session", None)
+            .unwrap();
+        assert!(replayed
+            .drain_completions_for_session(Some("session"))
+            .is_empty());
     }
 
     #[test]
