@@ -52,7 +52,8 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    match &*ctx.semantic_index_status().borrow() {
+    let status = ctx.semantic_index_status().borrow().clone();
+    match &status {
         SemanticIndexStatus::Disabled => {
             return Response::success(
                 &req.id,
@@ -62,44 +63,11 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 }),
             );
         }
-        SemanticIndexStatus::Building {
-            stage,
-            files,
-            entries_done,
-            entries_total,
-        } => {
-            let mut detail = format!("Semantic index is still building (stage: {}).", stage);
-            if let Some(files) = files {
-                detail.push_str(&format!(" files: {}", files));
-            }
-            if let Some(entries_done) = entries_done {
-                detail.push_str(&format!(" entries done: {}", entries_done));
-            }
-            if let Some(entries_total) = entries_total {
-                detail.push_str(&format!(" / {}", entries_total));
-            }
-            return Response::success(
-                &req.id,
-                serde_json::json!({
-                    "status": "building",
-                    "text": detail,
-                    "stage": stage,
-                    "files": files,
-                    "entries_done": entries_done,
-                    "entries_total": entries_total,
-                }),
-            );
-        }
         SemanticIndexStatus::Failed(error) => {
             return semantic_error_response(&req.id, error);
         }
-        SemanticIndexStatus::Ready => {}
+        SemanticIndexStatus::Building { .. } | SemanticIndexStatus::Ready => {}
     }
-
-    let query_vector = match embed_query(&params.query, ctx) {
-        Ok(query_vector) => query_vector,
-        Err(error) => return semantic_error_response(&req.id, &error),
-    };
 
     let project_root = ctx
         .config()
@@ -107,6 +75,53 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+
+    let shape = query_shape::classify(&params.query);
+    let (lexical_files, lexical_index_ready) = collect_lexical_files(ctx, &params.query, &shape);
+
+    if let SemanticIndexStatus::Building {
+        stage,
+        files,
+        entries_done,
+        entries_total,
+    } = status
+    {
+        let mut detail = format!("Semantic index is still building (stage: {}).", stage);
+        if let Some(files) = files {
+            detail.push_str(&format!(" files: {}", files));
+        }
+        if let Some(entries_done) = entries_done {
+            detail.push_str(&format!(" entries done: {}", entries_done));
+        }
+        if let Some(entries_total) = entries_total {
+            detail.push_str(&format!(" / {}", entries_total));
+        }
+
+        let results = fuse_hybrid_results(
+            Vec::new(),
+            lexical_files,
+            &shape,
+            params.top_k.min(MAX_TOP_K),
+        );
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "status": "building",
+                "text": format_building_lexical_text(&detail, &results, &project_root, lexical_index_ready),
+                "stage": stage,
+                "files": files,
+                "entries_done": entries_done,
+                "entries_total": entries_total,
+                "note": building_lexical_note(lexical_index_ready),
+                "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    let query_vector = match embed_query(&params.query, ctx) {
+        Ok(query_vector) => query_vector,
+        Err(error) => return semantic_error_response(&req.id, &error),
+    };
 
     let semantic_results = {
         let semantic_index = ctx.semantic_index().borrow();
@@ -120,23 +135,6 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         };
         index.search(&query_vector, params.top_k.clamp(50, MAX_TOP_K))
-    };
-
-    let shape = query_shape::classify(&params.query);
-    let lexical_files = if shape.weights.should_use_lexical {
-        let tokens = query_shape::extract_tokens(&params.query, &shape);
-        let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
-        let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
-        ctx.search_index()
-            .borrow()
-            .as_ref()
-            .filter(|index| index.ready)
-            .map(|index| {
-                index.lexical_rank(&query_trigrams, Some(&is_semantic_indexed_extension), 50)
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
     };
 
     let results = fuse_hybrid_results(
@@ -166,6 +164,29 @@ fn default_top_k() -> usize {
     DEFAULT_TOP_K
 }
 
+fn collect_lexical_files(
+    ctx: &AppContext,
+    query: &str,
+    shape: &QueryShape,
+) -> (Vec<(PathBuf, f32)>, bool) {
+    let search_index = ctx.search_index().borrow();
+    let Some(index) = search_index.as_ref().filter(|index| index.ready) else {
+        return (Vec::new(), false);
+    };
+
+    if !shape.weights.should_use_lexical {
+        return (Vec::new(), true);
+    }
+
+    let tokens = query_shape::extract_tokens(query, shape);
+    let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
+    (
+        index.lexical_rank(&query_trigrams, Some(&is_semantic_indexed_extension), 50),
+        true,
+    )
+}
+
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     let mut model_ref = ctx.semantic_embedding_model().borrow_mut();
     let semantic_config = ctx.config().semantic.clone();
@@ -182,7 +203,7 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
         .map_err(|error| format!("failed to embed query: {error}"))?;
 
     if let Some(index) = ctx.semantic_index().borrow().as_ref() {
-        if index.dimension() != query_vector.len() {
+        if index.len() > 0 && index.dimension() != query_vector.len() {
             return Err(format!(
                 "semantic embedding dimension mismatch: query backend returned {}, index expects {}. Rebuild the semantic index for the active backend/model.",
                 query_vector.len(),
@@ -343,11 +364,47 @@ fn semantic_error_response(request_id: &str, error: &str) -> Response {
     )
 }
 
+fn building_lexical_note(lexical_index_ready: bool) -> &'static str {
+    if lexical_index_ready {
+        "Semantic index is rebuilding; results are lexical-only fallback results from the trigram index."
+    } else {
+        "Semantic index is rebuilding; lexical fallback is unavailable because the trigram index is not ready."
+    }
+}
+
+fn format_building_lexical_text(
+    detail: &str,
+    results: &[HybridResult],
+    project_root: &Path,
+    lexical_index_ready: bool,
+) -> String {
+    let note = building_lexical_note(lexical_index_ready);
+    if results.is_empty() {
+        return format!(
+            "{detail}\n{note}\nFound 0 lexical fallback result(s). [semantic: rebuilding]"
+        );
+    }
+
+    format!(
+        "{detail}\n{note}\n\n{}\n\nFound {} lexical fallback result(s). [semantic: rebuilding]",
+        format_result_sections(results, project_root),
+        results.len()
+    )
+}
+
 fn format_semantic_text(results: &[HybridResult], project_root: &Path) -> String {
     if results.is_empty() {
         return "Found 0 semantic result(s). [index: ready]".to_string();
     }
 
+    format!(
+        "{}\n\nFound {} semantic result(s). [index: ready]",
+        format_result_sections(results, project_root),
+        results.len()
+    )
+}
+
+fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {
     let mut groups: BTreeMap<String, Vec<&HybridResult>> = BTreeMap::new();
 
     for result in results {
@@ -360,7 +417,7 @@ fn format_semantic_text(results: &[HybridResult], project_root: &Path) -> String
         groups.entry(display_path).or_default().push(result);
     }
 
-    let sections = groups
+    groups
         .into_iter()
         .map(|(file, file_results)| {
             let mut section = file;
@@ -398,13 +455,8 @@ fn format_semantic_text(results: &[HybridResult], project_root: &Path) -> String
 
             section
         })
-        .collect::<Vec<_>>();
-
-    format!(
-        "{}\n\nFound {} semantic result(s). [index: ready]",
-        sections.join("\n\n"),
-        results.len()
-    )
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn result_to_json(result: &HybridResult) -> serde_json::Value {
@@ -455,7 +507,170 @@ fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
+    use crate::context::AppContext;
+    use crate::parser::TreeSitterProvider;
+    use crate::semantic_index::SemanticIndex;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::thread;
+
+    fn semantic_request(query: &str, top_k: usize) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": "semantic-search-test",
+            "command": "semantic_search",
+            "query": query,
+            "top_k": top_k,
+        }))
+        .expect("build semantic search request")
+    }
+
+    fn response_value(response: Response) -> serde_json::Value {
+        serde_json::to_value(response).expect("serialize response")
+    }
+
+    fn test_context(project_root: &Path) -> AppContext {
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project_root.to_path_buf()),
+                ..Config::default()
+            },
+        )
+    }
+
+    fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
+        let addr = listener.local_addr().expect("embedding server addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_length = 0usize;
+            loop {
+                let n = stream.read(&mut chunk).expect("read embedding request");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        for line in String::from_utf8_lossy(&buf[..pos + 4]).lines() {
+                            if let Some(value) = line.strip_prefix("Content-Length:") {
+                                content_length = value.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                if let Some(end) = header_end {
+                    if buf.len() >= end + content_length {
+                        break;
+                    }
+                }
+            }
+
+            let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write embedding response");
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    #[test]
+    fn building_status_returns_lexical_fallback_results() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        let source = "pub fn needle_symbol() -> bool { true }\n";
+        std::fs::write(&source_file, source).expect("write source file");
+
+        let ctx = test_context(project.path());
+        let mut index = SearchIndex::new();
+        index.index_file(&source_file, source.as_bytes());
+        index.ready = true;
+        *ctx.search_index().borrow_mut() = Some(index);
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+            stage: "embedding".to_string(),
+            files: Some(1),
+            entries_done: Some(0),
+            entries_total: Some(1),
+        };
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("needle_symbol", 5),
+            &ctx,
+        ));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["status"], "building");
+        assert!(response["note"]
+            .as_str()
+            .expect("note")
+            .contains("lexical-only fallback"));
+        assert!(response["text"]
+            .as_str()
+            .expect("text")
+            .contains("lexical fallback"));
+        let results = response["results"].as_array().expect("results array");
+        assert!(
+            results.iter().any(|result| {
+                result["source"] == "lexical"
+                    && result["file"]
+                        .as_str()
+                        .expect("file")
+                        .ends_with("src/lib.rs")
+            }),
+            "expected lexical fallback result, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn empty_semantic_index_skips_query_dimension_check() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let (base_url, handle) = start_mock_embedding_server();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                semantic: SemanticBackendConfig {
+                    backend: SemanticBackend::OpenAiCompatible,
+                    model: "test-embedding".to_string(),
+                    base_url: Some(base_url),
+                    api_key_env: None,
+                    timeout_ms: 5_000,
+                    max_batch_size: 64,
+                },
+                ..Config::default()
+            },
+        );
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
+        *ctx.semantic_index().borrow_mut() =
+            Some(SemanticIndex::new(project.path().to_path_buf(), 384));
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("anything", 5),
+            &ctx,
+        ));
+
+        assert_eq!(
+            response["success"], true,
+            "response should not fail: {response:?}"
+        );
+        assert_eq!(response["status"], "ready");
+        assert!(response["results"].as_array().expect("results").is_empty());
+        handle.join().expect("embedding server thread");
+    }
 
     #[test]
     fn file_summary_text_uses_summary_location_instead_of_line_range() {

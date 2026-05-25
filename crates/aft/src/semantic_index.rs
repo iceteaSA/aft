@@ -1328,14 +1328,7 @@ impl SemanticIndex {
         //    replaced after successful re-extraction + embedding so transient
         //    read/parse errors keep the stale-but-valid cache entry.
         if !deleted.is_empty() {
-            let deleted_set: HashSet<&Path> = deleted.iter().map(PathBuf::as_path).collect();
-            self.entries
-                .retain(|entry| !deleted_set.contains(entry.chunk.file.as_path()));
-            for path in &deleted {
-                self.file_mtimes.remove(path);
-                self.file_sizes.remove(path);
-                self.file_hashes.remove(path);
-            }
+            self.remove_indexed_files(&deleted);
         }
 
         // 3. Embed the changed + added set, if any.
@@ -1355,6 +1348,20 @@ impl SemanticIndex {
         }
 
         let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &to_embed);
+        let changed_set: HashSet<&Path> = changed.iter().map(PathBuf::as_path).collect();
+        let vanished = to_embed
+            .iter()
+            .filter(|path| {
+                changed_set.contains(path.as_path())
+                    && !fresh_metadata.contains_key(*path)
+                    && !path.exists()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !vanished.is_empty() {
+            self.remove_indexed_files(&vanished);
+            deleted.extend(vanished);
+        }
 
         if chunks.is_empty() {
             progress(0, 0);
@@ -1460,6 +1467,17 @@ impl SemanticIndex {
             deleted: deleted.len(),
             total_processed,
         })
+    }
+
+    fn remove_indexed_files(&mut self, files: &[PathBuf]) {
+        let deleted_set: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+        self.entries
+            .retain(|entry| !deleted_set.contains(entry.chunk.file.as_path()));
+        for path in files {
+            self.file_mtimes.remove(path);
+            self.file_sizes.remove(path);
+            self.file_hashes.remove(path);
+        }
     }
 
     /// Search the index with a query embedding, returning top-K results sorted by relevance
@@ -2835,7 +2853,41 @@ mod tests {
     }
 
     #[test]
-    fn refresh_transient_error_preserves_existing_entry_and_mtime() {
+    fn refresh_missing_changed_file_is_purged_after_collect() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let file = project_root.join("src/lib.rs");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        write_rust_file(&file, "vanished_symbol");
+
+        let mut index = build_test_index(project_root, std::slice::from_ref(&file));
+        let original_size = *index.file_sizes.get(&file).unwrap();
+        set_file_metadata(&mut index, &file, SystemTime::UNIX_EPOCH, original_size + 1);
+        fs::remove_file(&file).unwrap();
+
+        let mut embed = test_vector_for_texts;
+        let mut progress = |_done: usize, _total: usize| {};
+        let summary = index
+            .refresh_stale_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut embed,
+                8,
+                &mut progress,
+            )
+            .unwrap();
+
+        assert_eq!(summary.changed, 0);
+        assert_eq!(summary.added, 0);
+        assert_eq!(summary.deleted, 1);
+        assert!(index.entries.is_empty());
+        assert!(!index.file_mtimes.contains_key(&file));
+        assert!(!index.file_sizes.contains_key(&file));
+        assert!(!index.file_hashes.contains_key(&file));
+    }
+
+    #[test]
+    fn refresh_collect_error_for_existing_path_preserves_cached_entry() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path();
         let file = project_root.join("src/lib.rs");
@@ -2850,6 +2902,7 @@ mod tests {
         let stale_mtime = SystemTime::UNIX_EPOCH;
         set_file_metadata(&mut index, &file, stale_mtime, original_size + 1);
         fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
 
         let mut embed = test_vector_for_texts;
         let mut progress = |_done: usize, _total: usize| {};
