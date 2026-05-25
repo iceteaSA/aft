@@ -725,6 +725,20 @@ mod tests {
 
     #[test]
     fn restore_glob_checkpoint_reports_failures() {
+        // Isolate the checkpoint store's lock-file dir per test by giving each
+        // run its own `AFT_CACHE_DIR`. The default storage_dir lives under
+        // `$HOME/.cache/aft` (or `$AFT_CACHE_DIR`), and under parallel
+        // `cargo test` with a shared HOME (CI containers, sandboxed runners),
+        // two tests can race on the same `checkpoints/<project>/checkpoint.lock`
+        // path and fail with `No such file or directory` during the
+        // `create_dir_all` + `try_acquire` sequence.
+        let cache = tempfile::tempdir().unwrap();
+        // SAFETY: tests run single-threaded inside this function and the env
+        // var is restored on drop; we only mutate process env briefly here.
+        unsafe {
+            std::env::set_var("AFT_CACHE_DIR", cache.path());
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let a = root.join("a.ts");
@@ -748,6 +762,11 @@ mod tests {
         ctx.checkpoint()
             .borrow_mut()
             .delete("default", &checkpoint_name);
+
+        // SAFETY: only one test in this module mutates this env var.
+        unsafe {
+            std::env::remove_var("AFT_CACHE_DIR");
+        }
 
         assert!(result.unwrap_err().contains("file not found"));
     }
