@@ -331,6 +331,124 @@ fn ast_replace_dry_run_reports_counts_without_writing_files() {
 }
 
 #[test]
+fn ast_replace_real_run_rejects_invalid_rewrite_without_writing() {
+    let project = setup_project(&[
+        ("src/a.ts", "console.log(alpha);\n"),
+        ("src/b.ts", "console.log(beta);\n"),
+    ]);
+    let original_a = read_file(project.path(), "src/a.ts");
+    let original_b = read_file(project.path(), "src/b.ts");
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-invalid-syntax-real-run",
+            "command": "ast_replace",
+            "pattern": "console.log($ARG)",
+            "rewrite": "if (",
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+
+    assert_eq!(
+        replace["success"], false,
+        "invalid rewrite should fail: {replace:?}"
+    );
+    assert_eq!(replace["code"], "invalid_rewrite");
+    assert_eq!(replace["rolled_back"], true);
+    assert!(
+        replace["invalid_files"]
+            .as_array()
+            .expect("invalid files")
+            .iter()
+            .any(|file| file
+                .as_str()
+                .unwrap()
+                .replace('\\', "/")
+                .ends_with("src/a.ts")),
+        "invalid file list should include src/a.ts: {replace:?}"
+    );
+    assert_eq!(read_file(project.path(), "src/a.ts"), original_a);
+    assert_eq!(read_file(project.path(), "src/b.ts"), original_b);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_respects_explicit_node_modules_root() {
+    let project = setup_project(&[
+        ("node_modules/pkg/index.ts", "const inside = 1;\n"),
+        ("src/index.ts", "const outside = 2;\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "explicit-node-modules-search",
+            "command": "ast_search",
+            "pattern": "const $NAME = $VALUE",
+            "lang": "typescript",
+            "paths": ["node_modules"],
+        }),
+    );
+
+    assert_eq!(
+        search["success"], true,
+        "explicit root search should succeed: {search:?}"
+    );
+    assert_eq!(search["files_searched"], 1);
+    assert_eq!(search["total_matches"], 1);
+    assert!(search["matches"][0]["file"]
+        .as_str()
+        .expect("match file")
+        .replace('\\', "/")
+        .ends_with("node_modules/pkg/index.ts"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_php_full_file_uses_open_tag_grammar() {
+    let project = setup_project(&[(
+        "public/index.php",
+        "<h1>Before</h1>\n<?php\nfunction helper(): void {}\nhelper();\n?>\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "php-full-file-search",
+            "command": "ast_search",
+            "pattern": "function $NAME(): void {}",
+            "lang": "php",
+            "paths": ["public"],
+        }),
+    );
+
+    assert_eq!(
+        search["success"], true,
+        "PHP ast_search should succeed: {search:?}"
+    );
+    assert_eq!(
+        search["total_matches"], 1,
+        "PHP function should match: {search:?}"
+    );
+    assert_eq!(search["matches"][0]["meta_variables"]["$NAME"], "helper");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn ast_search_and_replace_support_meta_variables_and_preserve_captures() {
     let project = setup_project(&[(
         "transform.ts",

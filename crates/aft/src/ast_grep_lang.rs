@@ -37,6 +37,55 @@ pub enum AstGrepLang {
     Perl,
 }
 
+#[derive(Clone, Debug)]
+enum PhpPatternLang {
+    Full,
+    Snippet,
+}
+
+impl PhpPatternLang {
+    fn pattern_has_open_tag(source: &str) -> bool {
+        source.contains("<?php") || source.contains("<?=")
+    }
+}
+
+impl Language for PhpPatternLang {
+    fn kind_to_id(&self, kind: &str) -> u16 {
+        let ts_lang: TSLanguage = self.get_ts_language();
+        ts_lang.id_for_node_kind(kind, true)
+    }
+
+    fn field_to_id(&self, field: &str) -> Option<u16> {
+        self.get_ts_language()
+            .field_id_for_name(field)
+            .map(|field| field.get())
+    }
+
+    fn build_pattern(
+        &self,
+        builder: &ast_grep_core::matcher::PatternBuilder,
+    ) -> Result<Pattern, PatternError> {
+        builder.build(|src| StrDoc::try_new(src, self.clone()))
+    }
+
+    fn pre_process_pattern<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        pre_process_pattern_with_expando(query, self.expando_char())
+    }
+
+    fn expando_char(&self) -> char {
+        '\u{00B5}'
+    }
+}
+
+impl LanguageExt for PhpPatternLang {
+    fn get_ts_language(&self) -> TSLanguage {
+        match self {
+            Self::Full => tree_sitter_php::LANGUAGE_PHP.into(),
+            Self::Snippet => tree_sitter_php::LANGUAGE_PHP_ONLY.into(),
+        }
+    }
+}
+
 impl AstGrepLang {
     /// Convert from the crate's `LangId` enum.
     pub fn from_lang_id(lang_id: &LangId) -> Option<Self> {
@@ -95,6 +144,20 @@ impl AstGrepLang {
         }
     }
 
+    pub(crate) fn compile_pattern(&self, pattern: &str) -> Result<Pattern, PatternError> {
+        if !matches!(self, Self::Php) {
+            return Pattern::try_new(pattern, self.clone());
+        }
+
+        if PhpPatternLang::pattern_has_open_tag(pattern) {
+            return Pattern::try_new(pattern, PhpPatternLang::Full);
+        }
+
+        let selector = php_snippet_selector(pattern)?;
+        let context = format!("<?php\n{pattern}");
+        Pattern::contextual(&context, &selector, PhpPatternLang::Full)
+    }
+
     /// File extensions associated with this language.
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
@@ -133,6 +196,44 @@ impl AstGrepLang {
     }
 }
 
+fn php_snippet_selector(pattern: &str) -> Result<String, PatternError> {
+    Pattern::try_new(pattern, PhpPatternLang::Snippet)?;
+    let processed = PhpPatternLang::Snippet.pre_process_pattern(pattern);
+    let grep = PhpPatternLang::Snippet.ast_grep(processed.as_ref());
+    let mut node = grep.root();
+    while node.children().len() == 1 {
+        node = node.child(0).expect("single child exists");
+    }
+    Ok(node.kind().into_owned())
+}
+
+fn pre_process_pattern_with_expando<'q>(query: &'q str, expando: char) -> Cow<'q, str> {
+    if expando == '$' {
+        // TS, JS, Go: $ is valid in identifiers, no preprocessing needed
+        return Cow::Borrowed(query);
+    }
+    // Python, Rust, PHP, and other grammars that reject `$` identifiers:
+    // replace $ with µ in meta-variable positions. Logic from ast-grep's
+    // official pre_process_pattern.
+    let mut ret = Vec::with_capacity(query.len());
+    let mut dollar_count = 0;
+    for c in query.chars() {
+        if c == '$' {
+            dollar_count += 1;
+            continue;
+        }
+        let need_replace = matches!(c, 'A'..='Z' | '_') || dollar_count == 3;
+        let sigil = if need_replace { expando } else { '$' };
+        ret.extend(std::iter::repeat(sigil).take(dollar_count));
+        dollar_count = 0;
+        ret.push(c);
+    }
+    // trailing anonymous multiple ($$$)
+    let sigil = if dollar_count == 3 { expando } else { '$' };
+    ret.extend(std::iter::repeat(sigil).take(dollar_count));
+    Cow::Owned(ret.into_iter().collect())
+}
+
 impl Language for AstGrepLang {
     fn kind_to_id(&self, kind: &str) -> u16 {
         let ts_lang: TSLanguage = self.get_ts_language();
@@ -149,6 +250,10 @@ impl Language for AstGrepLang {
         &self,
         builder: &ast_grep_core::matcher::PatternBuilder,
     ) -> Result<Pattern, PatternError> {
+        if matches!(self, Self::Php) {
+            return builder.build(|src| StrDoc::try_new(src, PhpPatternLang::Snippet));
+        }
+
         builder.build(|src| StrDoc::try_new(src, self.clone()))
     }
 
@@ -156,30 +261,7 @@ impl Language for AstGrepLang {
     /// character. We replace `$` with the expando char (`µ`) in meta-variable
     /// positions so tree-sitter can parse the pattern as valid code.
     fn pre_process_pattern<'q>(&self, query: &'q str) -> Cow<'q, str> {
-        let expando = self.expando_char();
-        if expando == '$' {
-            // TS, JS, Go: $ is valid in identifiers, no preprocessing needed
-            return Cow::Borrowed(query);
-        }
-        // Python, Rust: replace $ with µ in meta-variable positions
-        // Logic from ast-grep's official pre_process_pattern
-        let mut ret = Vec::with_capacity(query.len());
-        let mut dollar_count = 0;
-        for c in query.chars() {
-            if c == '$' {
-                dollar_count += 1;
-                continue;
-            }
-            let need_replace = matches!(c, 'A'..='Z' | '_') || dollar_count == 3;
-            let sigil = if need_replace { expando } else { '$' };
-            ret.extend(std::iter::repeat(sigil).take(dollar_count));
-            dollar_count = 0;
-            ret.push(c);
-        }
-        // trailing anonymous multiple ($$$)
-        let sigil = if dollar_count == 3 { expando } else { '$' };
-        ret.extend(std::iter::repeat(sigil).take(dollar_count));
-        Cow::Owned(ret.into_iter().collect())
+        pre_process_pattern_with_expando(query, self.expando_char())
     }
 
     fn expando_char(&self) -> char {
@@ -230,7 +312,7 @@ impl LanguageExt for AstGrepLang {
             Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             Self::Kotlin => tree_sitter_kotlin_sg::LANGUAGE.into(),
             Self::Swift => tree_sitter_swift::LANGUAGE.into(),
-            Self::Php => tree_sitter_php::LANGUAGE_PHP_ONLY.into(),
+            Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::Perl => tree_sitter_perl::LANGUAGE.into(),
         }
@@ -361,11 +443,38 @@ mod tests {
         for (lang, source, pattern) in probes {
             let grep = lang.ast_grep(source);
             let root = grep.root();
+            let compiled = lang
+                .compile_pattern(pattern)
+                .unwrap_or_else(|err| panic!("{lang:?} pattern should compile: {err}"));
             assert!(
-                root.find(pattern).is_some(),
+                root.find(compiled).is_some(),
                 "{lang:?} pattern should match: {pattern}"
             );
         }
+    }
+
+    #[test]
+    fn test_php_full_file_with_open_tag_and_inline_html_matches_snippet_pattern() {
+        let lang = AstGrepLang::Php;
+        let source = "<p>before</p>
+<?php
+function helper(): void {}
+helper();
+?>
+<p>after</p>
+";
+        let grep = lang.ast_grep(source);
+        let root = grep.root();
+        let pattern = lang.compile_pattern("function $NAME(): void {}").unwrap();
+        let found = root.find(pattern);
+        assert!(
+            found.is_some(),
+            "PHP snippet pattern should match a full .php file with tags"
+        );
+        assert_eq!(
+            found.unwrap().get_env().get_match("NAME").unwrap().text(),
+            "helper"
+        );
     }
 
     #[test]

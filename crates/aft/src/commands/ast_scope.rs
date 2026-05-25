@@ -224,6 +224,10 @@ fn walk_root(
         .git_global(true)
         .git_exclude(true)
         .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
                 return !matches!(

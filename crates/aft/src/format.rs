@@ -20,12 +20,14 @@ pub struct ExternalToolResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    pub truncated: bool,
 }
 
 struct SubprocessOutcome {
     stdout: String,
     stderr: String,
     status: ExitStatus,
+    truncated: bool,
 }
 
 /// Errors from external tool execution.
@@ -102,9 +104,8 @@ fn isolate_in_process_group(cmd: &mut Command) {
 
 #[cfg(not(unix))]
 fn isolate_in_process_group(_cmd: &mut Command) {
-    // Best-effort no-op on Windows; child.kill() does not propagate
-    // to grandchildren but reader threads will still close pipes
-    // when the immediate child exits.
+    // Best-effort no-op outside Unix. Windows timeout cleanup uses taskkill /T
+    // in kill_process_tree so .cmd wrappers and grandchildren are terminated.
 }
 
 /// Kill the child and (on Unix) its entire process group, so orphaned
@@ -122,7 +123,19 @@ fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn kill_process_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    let _ = Command::new("taskkill")
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
@@ -175,37 +188,35 @@ pub fn run_external_tool(
         stdout: outcome.stdout,
         stderr: outcome.stderr,
         exit_code,
+        truncated: outcome.truncated,
     })
 }
+
+const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 fn wait_with_timeout(
     mut child: Child,
     command: &str,
     timeout_secs: u32,
 ) -> Result<SubprocessOutcome, FormatError> {
-    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-    let stdout_thread = thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_thread = thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
+    let stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_thread =
+        thread::spawn(move || read_bounded_to_string(stdout_pipe, MAX_CAPTURE_BYTES));
+    let stderr_thread =
+        thread::spawn(move || read_bounded_to_string(stderr_pipe, MAX_CAPTURE_BYTES));
     let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = stdout_thread.join().unwrap_or_default();
-                let stderr = stderr_thread.join().unwrap_or_default();
+                let (stdout, stdout_truncated) = stdout_thread.join().unwrap_or_default();
+                let (stderr, stderr_truncated) = stderr_thread.join().unwrap_or_default();
                 return Ok(SubprocessOutcome {
                     stdout,
                     stderr,
                     status,
+                    truncated: stdout_truncated || stderr_truncated,
                 });
             }
             Ok(None) => {
@@ -234,6 +245,33 @@ fn wait_with_timeout(
             }
         }
     }
+}
+
+fn read_bounded_to_string<R: Read>(mut reader: R, limit: usize) -> (String, bool) {
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut scratch = [0u8; 8192];
+    let mut truncated = false;
+
+    loop {
+        let read = match reader.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+
+        let remaining = limit.saturating_sub(bytes.len());
+        if remaining > 0 {
+            let keep = remaining.min(read);
+            bytes.extend_from_slice(&scratch[..keep]);
+            if keep < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+
+    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
 }
 
 /// TTL for tool availability and resolution cache entries.
@@ -297,11 +335,15 @@ fn resolve_tool(command: &str, project_root: Option<&Path>) -> Option<String> {
 }
 
 pub(crate) fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) -> Option<PathBuf> {
-    // 1. Check node_modules/.bin/<command> relative to project root
+    // 1. Check node_modules/.bin/<command> relative to project root. On
+    // Windows, package managers usually create .cmd/.bat/.ps1 shims rather
+    // than extensionless executables, so probe PATHEXT-style variants too.
     if let Some(root) = project_root {
-        let local_bin = root.join("node_modules").join(".bin").join(command);
-        if local_bin.exists() {
-            return Some(local_bin);
+        let local_bin_dir = root.join("node_modules").join(".bin");
+        for local_bin in local_node_bin_candidates(&local_bin_dir, command) {
+            if local_bin.exists() {
+                return Some(local_bin);
+            }
         }
     }
 
@@ -320,6 +362,53 @@ pub(crate) fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) 
     // genuinely has the tool installed. Returning the absolute path here
     // means downstream `Command::new(resolved)` works regardless.
     try_well_known_path_lookup(command)
+}
+
+fn local_node_bin_candidates(bin_dir: &Path, command: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let command_path = Path::new(command);
+        if command_path.extension().is_some() {
+            return vec![bin_dir.join(command)];
+        }
+
+        let mut candidates = vec![bin_dir.join(command)];
+        candidates.extend(
+            windows_local_node_bin_extensions(std::env::var_os("PATHEXT").as_deref())
+                .into_iter()
+                .map(|ext| bin_dir.join(format!("{command}{ext}"))),
+        );
+        candidates
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![bin_dir.join(command)]
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_local_node_bin_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
+    const DEFAULT_ORDER: [&str; 4] = [".cmd", ".exe", ".bat", ".ps1"];
+    let allowed: HashSet<&str> = DEFAULT_ORDER.into_iter().collect();
+
+    let mut ordered = Vec::new();
+    if let Some(pathext) = pathext.and_then(|value| value.to_str()) {
+        for ext in pathext.split(';') {
+            let normalized = ext.trim().to_ascii_lowercase();
+            if allowed.contains(normalized.as_str()) && !ordered.contains(&normalized) {
+                ordered.push(normalized);
+            }
+        }
+    }
+
+    for ext in DEFAULT_ORDER {
+        if !ordered.iter().any(|existing| existing == ext) {
+            ordered.push(ext.to_string());
+        }
+    }
+
+    ordered
 }
 
 /// Try spawning the tool via the inherited PATH. Returns the bare command
@@ -544,8 +633,9 @@ fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
 fn resolve_candidate_tool(
     candidate: &ToolCandidate,
     project_root: Option<&Path>,
+    require_ruff_format: bool,
 ) -> Option<String> {
-    if candidate.tool == "ruff" && !ruff_format_available(project_root) {
+    if require_ruff_format && candidate.tool == "ruff" && !ruff_format_available(project_root) {
         return None;
     }
 
@@ -751,7 +841,11 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
                 vec![ToolCandidate {
                     tool: "biome".to_string(),
                     source: "biome.json".to_string(),
-                    args: vec!["check".to_string(), file_str.to_string()],
+                    args: vec![
+                        "check".to_string(),
+                        "--reporter=json".to_string(),
+                        file_str.to_string(),
+                    ],
                     required: true,
                 }]
             } else if has_project_config(project_root, &["tsconfig.json"]) {
@@ -814,7 +908,7 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
                     ToolCandidate {
                         tool: "staticcheck".to_string(),
                         source: "go.mod".to_string(),
-                        args: vec![file_str.to_string()],
+                        args: vec!["-f".to_string(), "json".to_string(), file_str.to_string()],
                         required: false,
                     },
                     ToolCandidate {
@@ -930,7 +1024,11 @@ fn explicit_checker_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> 
         "biome" => vec![ToolCandidate {
             tool: name.to_string(),
             source: "checker config".to_string(),
-            args: vec!["check".to_string(), file_str.to_string()],
+            args: vec![
+                "check".to_string(),
+                "--reporter=json".to_string(),
+                file_str.to_string(),
+            ],
             required: true,
         }],
         "pyright" => vec![ToolCandidate {
@@ -952,7 +1050,7 @@ fn explicit_checker_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> 
         "staticcheck" => vec![ToolCandidate {
             tool: name.to_string(),
             source: "checker config".to_string(),
-            args: vec![file_str.to_string()],
+            args: vec!["-f".to_string(), "json".to_string(), file_str.to_string()],
             required: true,
         }],
         _ => Vec::new(),
@@ -962,6 +1060,7 @@ fn explicit_checker_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> 
 fn resolve_tool_candidates(
     candidates: Vec<ToolCandidate>,
     project_root: Option<&Path>,
+    require_ruff_format: bool,
 ) -> ToolDetection {
     if candidates.is_empty() {
         return ToolDetection::NotConfigured;
@@ -969,7 +1068,8 @@ fn resolve_tool_candidates(
 
     let mut missing_required = None;
     for candidate in candidates {
-        if let Some(command) = resolve_candidate_tool(&candidate, project_root) {
+        if let Some(command) = resolve_candidate_tool(&candidate, project_root, require_ruff_format)
+        {
             return ToolDetection::Found(command, candidate.args);
         }
         if candidate.required && missing_required.is_none() {
@@ -983,13 +1083,8 @@ fn resolve_tool_candidates(
     }
 }
 
-fn checker_command(candidate: &ToolCandidate, resolved: String) -> String {
-    match candidate.tool.as_str() {
-        "tsc" | "tsgo" => resolved,
-        "cargo" => "cargo".to_string(),
-        "go" => "go".to_string(),
-        _ => resolved,
-    }
+fn checker_command(_candidate: &ToolCandidate, resolved: String) -> String {
+    resolved
 }
 
 fn checker_args(candidate: &ToolCandidate) -> Vec<String> {
@@ -1009,6 +1104,7 @@ fn detect_formatter_for_path(path: &Path, lang: LangId, config: &Config) -> Tool
     resolve_tool_candidates(
         formatter_candidates(lang, config, &file_str),
         config.project_root.as_deref(),
+        true,
     )
 }
 
@@ -1022,7 +1118,7 @@ fn detect_checker_for_path(path: &Path, lang: LangId, config: &Config) -> ToolDe
     let project_root = config.project_root.as_deref();
     let mut missing_required = None;
     for candidate in candidates {
-        if let Some(command) = resolve_candidate_tool(&candidate, project_root) {
+        if let Some(command) = resolve_candidate_tool(&candidate, project_root, false) {
             return ToolDetection::Found(
                 checker_command(&candidate, command),
                 checker_args(&candidate),
@@ -1143,8 +1239,11 @@ fn missing_tool_warning(
     language: &str,
     candidate: &ToolCandidate,
     project_root: Option<&Path>,
+    require_ruff_format: bool,
 ) -> Option<MissingTool> {
-    if !candidate.required || resolve_candidate_tool(candidate, project_root).is_some() {
+    if !candidate.required
+        || resolve_candidate_tool(candidate, project_root, require_ruff_format).is_some()
+    {
         return None;
     }
 
@@ -1173,6 +1272,7 @@ pub fn detect_missing_tools(project_root: &Path, config: &Config) -> Vec<Missing
                 language,
                 &candidate,
                 config.project_root.as_deref(),
+                true,
             ) {
                 if seen.insert((
                     warning.kind.clone(),
@@ -1190,6 +1290,7 @@ pub fn detect_missing_tools(project_root: &Path, config: &Config) -> Vec<Missing
                 language,
                 &candidate,
                 config.project_root.as_deref(),
+                false,
             ) {
                 if seen.insert((
                     warning.kind.clone(),
@@ -1444,6 +1545,7 @@ pub fn run_external_tool_capture(
         stdout: outcome.stdout,
         stderr: outcome.stderr,
         exit_code: outcome.status.code().unwrap_or(-1),
+        truncated: outcome.truncated,
     })
 }
 
@@ -1491,17 +1593,102 @@ pub fn parse_checker_output(
     file: &Path,
     checker: &str,
 ) -> Vec<ValidationError> {
-    let checker_name = Path::new(checker)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(checker);
-    match checker_name {
+    let checker_name = checker_executable_name(checker);
+    match checker_name.as_str() {
         "npx" | "tsc" | "tsgo" => parse_tsc_output(stdout, stderr, file),
+        "biome" => parse_biome_output(stdout, stderr, file),
         "pyright" => parse_pyright_output(stdout, file),
+        "ruff" => parse_ruff_output(stdout, stderr, file),
         "cargo" => parse_cargo_output(stdout, stderr, file),
         "go" => parse_go_vet_output(stderr, file),
+        "staticcheck" => parse_staticcheck_output(stdout, stderr, file),
         _ => Vec::new(),
     }
+}
+
+fn checker_executable_name(checker: &str) -> String {
+    let name = checker
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(checker)
+        .to_ascii_lowercase();
+
+    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped.to_string();
+        }
+    }
+
+    name
+}
+
+fn normalize_path_for_compare(path: &str) -> String {
+    path.trim_start_matches("file://")
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn diagnostic_path_matches(file: &Path, diagnostic_file: &str) -> bool {
+    if diagnostic_file.is_empty() {
+        return true;
+    }
+
+    let file_str = normalize_path_for_compare(&file.to_string_lossy());
+    let diagnostic_str = normalize_path_for_compare(diagnostic_file);
+    file_str == diagnostic_str
+        || file_str.ends_with(&diagnostic_str)
+        || diagnostic_str.ends_with(&file_str)
+}
+
+fn line_column_for_byte_offset(source: &str, offset: usize) -> (u32, u32) {
+    let mut line = 1u32;
+    let mut column = 1u32;
+    for (idx, ch) in source.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+fn json_string_at<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str()
+}
+
+fn json_u32_at(value: &serde_json::Value, path: &[&str]) -> Option<u32> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_u64().map(|n| n as u32)
+}
+
+fn json_location_path(value: &serde_json::Value) -> Option<&str> {
+    json_string_at(value, &["location", "path", "file"])
+        .or_else(|| json_string_at(value, &["location", "path"]))
+        .or_else(|| json_string_at(value, &["filename"]))
+        .or_else(|| json_string_at(value, &["file"]))
+}
+
+fn diagnostic_message(value: &serde_json::Value) -> String {
+    json_string_at(value, &["description"])
+        .or_else(|| json_string_at(value, &["message"]))
+        .or_else(|| json_string_at(value, &["text"]))
+        .or_else(|| json_string_at(value, &["category"]))
+        .unwrap_or("unknown error")
+        .to_string()
 }
 
 /// Parse tsc output lines like: `path(line,col): error TSxxxx: message`
@@ -1549,22 +1736,149 @@ fn parse_tsc_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationEr
     errors
 }
 
+fn parse_biome_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for output in [stdout, stderr] {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            parse_biome_json_value(&json, file, &mut errors);
+        }
+    }
+    errors
+}
+
+fn parse_biome_json_value(
+    json: &serde_json::Value,
+    file: &Path,
+    errors: &mut Vec<ValidationError>,
+) {
+    let diagnostics: Vec<&serde_json::Value> = if let Some(diags) = json
+        .get("diagnostics")
+        .and_then(|diagnostics| diagnostics.as_array())
+    {
+        diags.iter().collect()
+    } else if let Some(diags) = json.as_array() {
+        diags.iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    let source = std::fs::read_to_string(file).ok();
+    for diag in diagnostics {
+        if let Some(diag_file) = json_location_path(diag) {
+            if !diagnostic_path_matches(file, diag_file) {
+                continue;
+            }
+        }
+
+        let (line, column) = biome_line_column(diag, source.as_deref());
+        errors.push(ValidationError {
+            line,
+            column,
+            message: diagnostic_message(diag),
+            severity: diag
+                .get("severity")
+                .and_then(|severity| severity.as_str())
+                .unwrap_or("error")
+                .to_lowercase(),
+        });
+    }
+}
+
+fn biome_line_column(diag: &serde_json::Value, source: Option<&str>) -> (u32, u32) {
+    if let Some(line) =
+        json_u32_at(diag, &["location", "line"]).or_else(|| json_u32_at(diag, &["line"]))
+    {
+        let column = json_u32_at(diag, &["location", "column"])
+            .or_else(|| json_u32_at(diag, &["column"]))
+            .unwrap_or(0);
+        return (line, column);
+    }
+
+    let offset = diag
+        .get("location")
+        .and_then(|location| location.get("span"))
+        .and_then(|span| span.as_array())
+        .and_then(|span| span.first())
+        .and_then(|offset| offset.as_u64())
+        .map(|offset| offset as usize);
+
+    match (source, offset) {
+        (Some(source), Some(offset)) => line_column_for_byte_offset(source, offset),
+        _ => (0, 0),
+    }
+}
+
+fn parse_ruff_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for output in [stdout, stderr] {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            parse_ruff_json_value(&json, file, &mut errors);
+        }
+    }
+    errors
+}
+
+fn parse_ruff_json_value(json: &serde_json::Value, file: &Path, errors: &mut Vec<ValidationError>) {
+    let diagnostics: Vec<&serde_json::Value> = if let Some(diags) = json.as_array() {
+        diags.iter().collect()
+    } else if let Some(diags) = json.get("diagnostics").and_then(|d| d.as_array()) {
+        diags.iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    for diag in diagnostics {
+        let diag_file = diag
+            .get("filename")
+            .and_then(|filename| filename.as_str())
+            .unwrap_or("");
+        if !diagnostic_path_matches(file, diag_file) {
+            continue;
+        }
+
+        let message = match (
+            diag.get("code").and_then(|code| code.as_str()),
+            diag.get("message").and_then(|message| message.as_str()),
+        ) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (None, Some(message)) => message.to_string(),
+            (Some(code), None) => code.to_string(),
+            (None, None) => "unknown error".to_string(),
+        };
+
+        errors.push(ValidationError {
+            line: json_u32_at(diag, &["location", "row"])
+                .or_else(|| json_u32_at(diag, &["location", "line"]))
+                .unwrap_or(0),
+            column: json_u32_at(diag, &["location", "column"]).unwrap_or(0),
+            message,
+            severity: diag
+                .get("severity")
+                .and_then(|severity| severity.as_str())
+                .unwrap_or("error")
+                .to_lowercase(),
+        });
+    }
+}
+
 /// Parse pyright JSON output.
 fn parse_pyright_output(stdout: &str, file: &Path) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let file_str = file.to_string_lossy();
-
     // pyright --outputjson emits JSON with generalDiagnostics array
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout) {
         if let Some(diags) = json.get("generalDiagnostics").and_then(|d| d.as_array()) {
             for diag in diags {
                 // Filter to our file
                 let diag_file = diag.get("file").and_then(|f| f.as_str()).unwrap_or("");
-                if !diag_file.is_empty()
-                    && !file_str.ends_with(diag_file)
-                    && !diag_file.ends_with(&*file_str)
-                    && diag_file != &*file_str
-                {
+                if !diagnostic_path_matches(file, diag_file) {
                     continue;
                 }
 
@@ -1592,8 +1906,8 @@ fn parse_pyright_output(stdout: &str, file: &Path) -> Vec<ValidationError> {
                     .to_lowercase();
 
                 errors.push(ValidationError {
-                    line: line_num + 1, // pyright uses 0-indexed lines
-                    column: col_num,
+                    line: line_num + 1,  // pyright uses 0-indexed lines
+                    column: col_num + 1, // pyright uses 0-indexed columns
                     message,
                     severity,
                 });
@@ -1678,43 +1992,163 @@ fn parse_cargo_output(stdout: &str, _stderr: &str, file: &Path) -> Vec<Validatio
 /// Parse go vet output lines like: `path:line:col: message`
 fn parse_go_vet_output(stderr: &str, file: &Path) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let file_str = file.to_string_lossy();
+    let pattern =
+        regex::Regex::new(r"^(?P<file>.+?):(?P<line>\d+)(?::(?P<col>\d+))?:\s*(?P<message>.*)$")
+            .expect("valid go vet diagnostic regex");
 
     for line in stderr.lines() {
-        // Format: path:line:col: message  OR  path:line: message
-        let parts: Vec<&str> = line.splitn(4, ':').collect();
-        if parts.len() < 3 {
+        let Some(captures) = pattern.captures(line) else {
             continue;
-        }
-
-        let err_file = parts[0].trim();
-        if !file_str.ends_with(err_file)
-            && !err_file.ends_with(&*file_str)
-            && err_file != &*file_str
-        {
-            continue;
-        }
-
-        let line_num: u32 = parts[1].trim().parse().unwrap_or(0);
-        let (col_num, message) = if parts.len() >= 4 {
-            if let Ok(col) = parts[2].trim().parse::<u32>() {
-                (col, parts[3].trim().to_string())
-            } else {
-                // parts[2] is part of the message, not a column
-                (0, format!("{}:{}", parts[2].trim(), parts[3].trim()))
-            }
-        } else {
-            (0, parts[2].trim().to_string())
         };
 
+        let err_file = captures
+            .name("file")
+            .map(|m| m.as_str())
+            .unwrap_or("")
+            .trim();
+        if !diagnostic_path_matches(file, err_file) {
+            continue;
+        }
+
         errors.push(ValidationError {
-            line: line_num,
-            column: col_num,
-            message,
+            line: captures
+                .name("line")
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0),
+            column: captures
+                .name("col")
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0),
+            message: captures
+                .name("message")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_else(|| "unknown error".to_string()),
             severity: "error".to_string(),
         });
     }
     errors
+}
+
+fn parse_staticcheck_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let combined = format!("{}\n{}", stdout, stderr);
+    let trimmed = combined.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut errors = Vec::new();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        parse_staticcheck_json_value(&json, file, &mut errors);
+        return errors;
+    }
+
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            parse_staticcheck_json_value(&json, file, &mut errors);
+        }
+    }
+
+    errors
+}
+
+fn parse_staticcheck_json_value(
+    json: &serde_json::Value,
+    file: &Path,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(diags) = json.as_array() {
+        for diag in diags {
+            parse_staticcheck_diag(diag, file, errors);
+        }
+    } else if let Some(diags) = json.get("diagnostics").and_then(|d| d.as_array()) {
+        for diag in diags {
+            parse_staticcheck_diag(diag, file, errors);
+        }
+    } else if let Some(diags) = json.get("issues").and_then(|d| d.as_array()) {
+        for diag in diags {
+            parse_staticcheck_diag(diag, file, errors);
+        }
+    } else {
+        parse_staticcheck_diag(json, file, errors);
+    }
+}
+
+fn parse_staticcheck_diag(
+    diag: &serde_json::Value,
+    file: &Path,
+    errors: &mut Vec<ValidationError>,
+) {
+    let diag_file = json_string_at(diag, &["location", "file"])
+        .or_else(|| json_string_at(diag, &["file"]))
+        .unwrap_or("");
+    if !diagnostic_path_matches(file, diag_file) {
+        return;
+    }
+
+    let message = match (
+        diag.get("code").and_then(|code| code.as_str()),
+        diag.get("message").and_then(|message| message.as_str()),
+    ) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (None, Some(message)) => message.to_string(),
+        (Some(code), None) => code.to_string(),
+        (None, None) => "unknown error".to_string(),
+    };
+
+    errors.push(ValidationError {
+        line: json_u32_at(diag, &["location", "line"])
+            .or_else(|| json_u32_at(diag, &["line"]))
+            .unwrap_or(0),
+        column: json_u32_at(diag, &["location", "column"])
+            .or_else(|| json_u32_at(diag, &["column"]))
+            .unwrap_or(0),
+        message,
+        severity: diag
+            .get("severity")
+            .and_then(|severity| severity.as_str())
+            .unwrap_or("error")
+            .to_lowercase(),
+    });
+}
+
+fn output_tail_summary(stdout: &str, stderr: &str, truncated: bool) -> String {
+    let mut parts = Vec::new();
+    if let Some(tail) = short_output_tail(stderr) {
+        parts.push(format!("stderr: {tail}"));
+    }
+    if let Some(tail) = short_output_tail(stdout) {
+        parts.push(format!("stdout: {tail}"));
+    }
+    if truncated {
+        parts.push("output truncated".to_string());
+    }
+
+    if parts.is_empty() {
+        "no output".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn short_output_tail(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut lines: Vec<&str> = trimmed.lines().rev().take(3).collect();
+    lines.reverse();
+    let mut tail = lines.join(" | ");
+    const MAX_TAIL_CHARS: usize = 500;
+    if tail.len() > MAX_TAIL_CHARS {
+        let start = tail.len().saturating_sub(MAX_TAIL_CHARS);
+        tail = format!("…{}", &tail[start..]);
+    }
+    Some(tail)
 }
 
 /// Run the project's type checker and return structured validation errors.
@@ -1776,6 +2210,16 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
     ) {
         Ok(result) => {
             let errors = parse_checker_output(&result.stdout, &result.stderr, path, &cmd);
+            if result.exit_code != 0 && errors.is_empty() {
+                let summary = output_tail_summary(&result.stdout, &result.stderr, result.truncated);
+                log::debug!(
+                    "validate: {} (skipped: error: checker exited {} with {})",
+                    path.display(),
+                    result.exit_code,
+                    summary
+                );
+                return (Vec::new(), Some("error".to_string()));
+            }
             log::debug!(
                 "validate: {} ({}, {} errors)",
                 path.display(),
@@ -2284,7 +2728,7 @@ mod tests {
         let errors = parse_pyright_output(stdout, file);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].line, 5); // 0-indexed → 1-indexed
-        assert_eq!(errors[0].column, 10);
+        assert_eq!(errors[0].column, 11);
         assert_eq!(errors[0].severity, "error");
         assert!(errors[0].message.contains("Type error here"));
     }
@@ -2563,5 +3007,206 @@ mod tests {
             "go install hint should mention PATH: got {:?}",
             hint
         );
+    }
+
+    #[test]
+    fn read_bounded_to_string_truncates_after_limit() {
+        let (text, truncated) = read_bounded_to_string(std::io::Cursor::new(b"abcdef"), 4);
+        assert_eq!(text, "abcd");
+        assert!(truncated);
+
+        let (text, truncated) = read_bounded_to_string(std::io::Cursor::new(b"abc"), 4);
+        assert_eq!(text, "abc");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn windows_local_node_bin_extensions_follow_pathext_then_defaults() {
+        let pathext = std::ffi::OsString::from(".EXE;.CMD;.BAT;.CMD");
+        let extensions = windows_local_node_bin_extensions(Some(&pathext));
+        assert_eq!(extensions, vec![".exe", ".cmd", ".bat", ".ps1"]);
+    }
+
+    #[test]
+    fn checker_executable_name_strips_paths_and_windows_extensions() {
+        assert_eq!(checker_executable_name("/usr/local/bin/ruff"), "ruff");
+        assert_eq!(checker_executable_name(r"C:\Go\bin\go.exe"), "go");
+        assert_eq!(
+            checker_executable_name(r"C:\repo\node_modules\.bin\biome.cmd"),
+            "biome"
+        );
+    }
+
+    #[test]
+    fn parse_biome_output_json_reporter() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src/app.ts");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "const value = 1;\nconsole.log(value);\n").unwrap();
+        let stdout = format!(
+            r#"{{"diagnostics":[{{"severity":"warning","description":"Avoid console.log","location":{{"path":{{"file":"{}"}},"span":[17,28]}}}}]}}"#,
+            file.display()
+        );
+
+        let errors = parse_biome_output(&stdout, "", &file);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 2);
+        assert_eq!(errors[0].column, 1);
+        assert_eq!(errors[0].severity, "warning");
+        assert!(errors[0].message.contains("Avoid console.log"));
+    }
+
+    #[test]
+    fn parse_ruff_output_json() {
+        let stdout = r#"[{"filename":"pkg/main.py","location":{"row":3,"column":5},"code":"F401","message":"`os` imported but unused"}]"#;
+        let errors = parse_ruff_output(stdout, "", Path::new("pkg/main.py"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 3);
+        assert_eq!(errors[0].column, 5);
+        assert!(errors[0].message.contains("F401"));
+    }
+
+    #[test]
+    fn parse_staticcheck_output_json_lines() {
+        let stdout = r#"{"code":"SA4006","severity":"error","location":{"file":"C:\\repo\\main.go","line":10,"column":5},"message":"value is never used"}"#;
+        let errors = parse_staticcheck_output(stdout, "", Path::new(r"C:\repo\main.go"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 10);
+        assert_eq!(errors[0].column, 5);
+        assert!(errors[0].message.contains("SA4006"));
+    }
+
+    #[test]
+    fn parse_go_vet_output_handles_windows_drive_letters() {
+        let stderr = r"C:\repo\main.go:10:5: unreachable code
+C:\repo\other.go:1:1: other file
+";
+        let errors = parse_go_vet_output(stderr, Path::new(r"C:\repo\main.go"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 10);
+        assert_eq!(errors[0].column, 5);
+        assert_eq!(errors[0].message, "unreachable code");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_biome_uses_json_reporter() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("biome.json"), "{}\n").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("biome");
+        fs::write(&fake, "#!/bin/sh\necho 1.0.0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("src/app.ts");
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        let (cmd, args) = detect_type_checker(&path, LangId::TypeScript, &config).unwrap();
+        assert!(cmd.ends_with("biome"), "expected biome, got: {cmd}");
+        assert_eq!(args[0], "check");
+        assert!(args.contains(&"--reporter=json".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_ruff_does_not_require_formatter_version() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("ruff.toml"), "\n").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("ruff");
+        fs::write(&fake, "#!/bin/sh\necho 'ruff 0.0.1'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("main.py");
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        assert!(!ruff_format_available(config.project_root.as_deref()));
+        let (cmd, args) = detect_type_checker(&path, LangId::Python, &config).unwrap();
+        assert!(cmd.ends_with("ruff"), "expected ruff checker, got: {cmd}");
+        assert_eq!(args[0], "check");
+        assert!(args.contains(&"--output-format=json".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_staticcheck_uses_json_reporter() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("go.mod"), "module test\ngo 1.21\n").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("staticcheck");
+        fs::write(&fake, "#!/bin/sh\necho staticcheck\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("main.go");
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        let (cmd, args) = detect_type_checker(&path, LangId::Go, &config).unwrap();
+        assert!(
+            cmd.ends_with("staticcheck"),
+            "expected staticcheck, got: {cmd}"
+        );
+        assert_eq!(args[0], "-f");
+        assert_eq!(args[1], "json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_uses_resolved_cargo_and_go_paths() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["cargo", "go"] {
+            let fake = bin_dir.join(name);
+            fs::write(&fake, "#!/bin/sh\necho fake\n").unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .unwrap();
+        let rust_config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let (cargo_cmd, _) =
+            detect_type_checker(&dir.path().join("src/main.rs"), LangId::Rust, &rust_config)
+                .unwrap();
+        assert_eq!(cargo_cmd, bin_dir.join("cargo").to_string_lossy());
+
+        fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
+        fs::write(dir.path().join("go.mod"), "module test\ngo 1.21\n").unwrap();
+        let go_config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let (go_cmd, _) =
+            detect_type_checker(&dir.path().join("main.go"), LangId::Go, &go_config).unwrap();
+        assert_eq!(go_cmd, bin_dir.join("go").to_string_lossy());
     }
 }

@@ -658,6 +658,46 @@ fn validate_full_no_checker_configured() {
     assert!(status.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn validate_full_nonzero_without_diagnostics_reports_error() {
+    let dir = format_test_dir("validate_checker_error_no_diagnostics");
+    fs::write(dir.join("tsconfig.json"), "{}\n").unwrap();
+    let target = dir.join("validate_checker_error_no_diagnostics.ts");
+    let _ = fs::remove_file(&target);
+
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("tsc");
+    fs::write(
+        &stub,
+        "#!/bin/sh\necho 'failed before diagnostics' >&2\nexit 2\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.configure(&dir);
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+    let resp = aft.send(&format!(
+        r#"{{"id":"val-error-no-diag","command":"write","file":"{}","content":"const x = 1;\n","validate":"full"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    assert_eq!(
+        resp["validate_skipped_reason"], "error",
+        "non-zero checker without parseable diagnostics must not look clean: {:?}",
+        resp
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn validate_full_checker_not_installed() {
     let dir = format_test_dir("validate_checker_not_installed");

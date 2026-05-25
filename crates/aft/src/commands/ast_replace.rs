@@ -5,7 +5,6 @@
 
 use std::path::{Path, PathBuf};
 
-use ast_grep_core::matcher::Pattern as AstPattern;
 use ast_grep_core::tree_sitter::LanguageExt;
 use rayon::prelude::*;
 
@@ -172,7 +171,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     // the same parsed pattern instead of re-parsing it per file. This is the
     // big perf win — ast-grep's `find_all(&str)` / `replace_all(&str, ...)`
     // re-parse the pattern via tree-sitter on every call.
-    let compiled_pattern = match AstPattern::try_new(&pattern, lang.clone()) {
+    let compiled_pattern = match lang.compile_pattern(&pattern) {
         Ok(p) => p,
         Err(e) => {
             // Attach a hint when the pattern looks like a regex or a
@@ -245,6 +244,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut total_replacements = 0usize;
     let mut total_files = 0usize;
     let mut file_results: Vec<serde_json::Value> = Vec::new();
+    let mut invalid_rewrites: Vec<String> = Vec::new();
 
     // Phase 2 — serial apply. Backup + write must touch shared state (BackupStore
     // is `RefCell`-wrapped on AppContext) so this stays on the main thread.
@@ -272,6 +272,13 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                     Err(resp) => return resp,
                 };
 
+            if crate::edit::validate_syntax_str(&change.new_content, validated_path.as_path())
+                == Some(false)
+            {
+                invalid_rewrites.push(change.file_path.display().to_string());
+                continue;
+            }
+
             let backup_id = match ctx.backup().borrow_mut().snapshot_with_op(
                 req.session(),
                 validated_path.as_path(),
@@ -284,6 +291,22 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
             changes_to_apply.push((change, validated_path, backup_id));
         }
+    }
+
+    if !invalid_rewrites.is_empty() {
+        ctx.backup()
+            .borrow_mut()
+            .discard_operation_entries(req.session(), &op_id);
+        invalid_rewrites.sort();
+        return Response::error_with_data(
+            &req.id,
+            "invalid_rewrite",
+            "ast_replace: rewritten code failed syntax validation; no files were written",
+            serde_json::json!({
+                "invalid_files": invalid_rewrites,
+                "rolled_back": true,
+            }),
+        );
     }
 
     if !dry_run {

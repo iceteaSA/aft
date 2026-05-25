@@ -90,8 +90,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     // patterns that parse to multiple AST nodes (e.g. bare `catch` or `finally`
     // clauses). Release builds use panic="unwind", so catch_unwind is effective,
     // but returning an explicit pattern error gives callers a better signal.
-    use ast_grep_core::matcher::Pattern as AstPattern;
-    if let Err(err) = AstPattern::try_new(&pattern, lang.clone()) {
+    if let Err(err) = lang.compile_pattern(&pattern) {
         // Attach a hint when the pattern looks like a common mistake. The
         // hint helps less-capable agents recover from regex-shaped patterns
         // and language-specific shape gotchas.
@@ -125,7 +124,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Pre-build the pattern ONCE so we don't re-parse it per file.
     // Validate first (try_new returns Err on patterns that don't form a single AST node).
-    let compiled_pattern = match AstPattern::try_new(&pattern, lang.clone()) {
+    let compiled_pattern = match lang.compile_pattern(&pattern) {
         Ok(p) => p,
         Err(_) => {
             // Pattern is invalid for this language — return empty result, not error
