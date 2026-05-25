@@ -50,12 +50,33 @@ pub fn collect(path: &Path) -> std::io::Result<FileFreshness> {
 }
 
 pub fn verify_file(path: &Path, cached: &FileFreshness) -> FreshnessVerdict {
+    verify_file_inner(path, cached, false)
+}
+
+pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdict {
+    verify_file_inner(path, cached, true)
+}
+
+fn verify_file_inner(
+    path: &Path,
+    cached: &FileFreshness,
+    hash_matching_metadata: bool,
+) -> FreshnessVerdict {
     let Ok(metadata) = fs::metadata(path) else {
         return FreshnessVerdict::Deleted;
     };
     let new_size = metadata.len();
     let new_mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
     if new_size == cached.size && new_mtime == cached.mtime {
+        if hash_matching_metadata
+            && new_size <= CONTENT_HASH_SIZE_CAP
+            && cached.content_hash != zero_hash()
+        {
+            return match hash_file_if_small(path, new_size) {
+                Ok(Some(hash)) if hash == cached.content_hash => FreshnessVerdict::HotFresh,
+                _ => FreshnessVerdict::Stale,
+            };
+        }
         return FreshnessVerdict::HotFresh;
     }
     if new_size != cached.size || new_size > CONTENT_HASH_SIZE_CAP {
@@ -86,6 +107,22 @@ mod tests {
         write(&path, b"same");
         let fresh = collect(&path).unwrap();
         assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
+    }
+
+    #[test]
+    fn strict_detects_same_mtime_same_size_content_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        write(&path, b"alpha");
+        filetime::set_file_mtime(&path, original_mtime).unwrap();
+        let fresh = collect(&path).unwrap();
+
+        write(&path, b"bravo");
+        filetime::set_file_mtime(&path, original_mtime).unwrap();
+
+        assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
+        assert_eq!(verify_file_strict(&path, &fresh), FreshnessVerdict::Stale);
     }
 
     #[test]

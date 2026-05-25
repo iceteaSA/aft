@@ -484,7 +484,11 @@ impl SearchIndex {
         };
         let search_root = canonicalize_or_normalize(search_root);
 
-        let query = decompose_regex(pattern);
+        let query = if !case_sensitive && !pattern.is_ascii() {
+            RegexQuery::default()
+        } else {
+            decompose_regex(pattern)
+        };
         let candidate_ids = self.candidates(&query);
 
         let candidate_files: Vec<&FileEntry> = candidate_ids
@@ -1743,7 +1747,7 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
             size: entry.size,
             content_hash: entry.content_hash,
         };
-        match cache_freshness::verify_file(&entry.path, &cached) {
+        match cache_freshness::verify_file_strict(&entry.path, &cached) {
             FreshnessVerdict::HotFresh | FreshnessVerdict::ContentFresh { .. } => {}
             FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
                 stale_paths.push(entry.path.clone())
@@ -1763,7 +1767,7 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
         if let FreshnessVerdict::ContentFresh {
             new_mtime,
             new_size,
-        } = cache_freshness::verify_file(&entry.path, &cached)
+        } = cache_freshness::verify_file_strict(&entry.path, &cached)
         {
             entry.modified = new_mtime;
             entry.size = new_size;
@@ -2621,6 +2625,57 @@ mod tests {
 
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.matches.len(), 1);
+    }
+
+    #[test]
+    fn grep_case_insensitive_unicode_literal_matches_indexed_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("unicode.txt");
+        fs::write(&file, "äbc\n").expect("write unicode file");
+
+        let index = SearchIndex::build(&project);
+        let result = index.search_grep("Äbc", false, &[], &[], &project, 10);
+
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(
+            result.matches[0].file,
+            fs::canonicalize(file).expect("canonicalize unicode file")
+        );
+    }
+
+    #[test]
+    fn refresh_reindexes_same_size_edit_with_preserved_mtime() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("tokens.txt");
+        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        fs::write(&file, "alpha").expect("write original file");
+        filetime::set_file_mtime(&file, original_mtime).expect("set original mtime");
+
+        let baseline = SearchIndex::build(&project);
+        fs::write(&file, "bravo").expect("write same-size edit");
+        filetime::set_file_mtime(&file, original_mtime).expect("restore original mtime");
+
+        let refreshed =
+            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, None, Some(baseline));
+        let result = refreshed.search_grep("bravo", true, &[], &[], &project, 10);
+        let canonical_file = fs::canonicalize(&file).expect("canonicalize edited file");
+        let refreshed_id = *refreshed
+            .path_to_id
+            .get(&canonical_file)
+            .expect("file remains indexed");
+
+        assert_eq!(result.total_matches, 1);
+        assert!(refreshed
+            .postings_for_trigram(pack_trigram(b'b', b'r', b'a'), None)
+            .contains(&refreshed_id));
+        assert!(!refreshed
+            .postings_for_trigram(pack_trigram(b'a', b'l', b'p'), None)
+            .contains(&refreshed_id));
     }
 
     #[test]
