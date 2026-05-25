@@ -904,10 +904,10 @@ export class BinaryBridge {
       // resolution silently masking the bad path. Log either way so the
       // E2E harness can assert the env var made it through.
       if (process.env.ORT_DYLIB_PATH) {
-        log(`ORT_DYLIB_PATH inherited from parent env: ${process.env.ORT_DYLIB_PATH}`);
+        this.logVia(`ORT_DYLIB_PATH inherited from parent env: ${process.env.ORT_DYLIB_PATH}`);
       } else if (ortLibraryPath) {
         env.ORT_DYLIB_PATH = ortLibraryPath;
-        log(`ORT_DYLIB_PATH set from managed ONNX Runtime: ${ortLibraryPath}`);
+        this.logVia(`ORT_DYLIB_PATH set from managed ONNX Runtime: ${ortLibraryPath}`);
       }
     }
 
