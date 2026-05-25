@@ -151,6 +151,11 @@ cleanup() {
         rm -f "$FAKE_ORT_PATH"
     fi
     if [ -n "${AIMOCK_RUN_DIR:-}" ]; then
+        if [ -n "${AFT_E2E_KEEP_LOGS:-}" ]; then
+            # Caller asked to preserve logs for post-mortem (e.g. CI artifact
+            # upload). Skip the rm; CI will clean up the runner anyway.
+            return 0
+        fi
         rm -rf "$AIMOCK_RUN_DIR"
     fi
 }
@@ -386,6 +391,20 @@ check "no crash (missing ORT)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '
 check "ORT_DYLIB_PATH passed (missing ORT)" "grep -Fq '$MISSING_ORT_PATH' '$PLUGIN_LOG' 2>/dev/null"
 check "semantic disabled gracefully (missing ORT)" "grep -qi 'failed to build semantic index.*ONNX Runtime not found\|Semantic search unavailable.*ONNX Runtime not found\|semantic_search_unavailable' '$PLUGIN_LOG' '$RESULT_FILE' 2>/dev/null"
 check "other tools still work (missing ORT)" "grep -qi 'completed\|Task complete\|src/main.py' '$RESULT_FILE' 2>/dev/null"
+
+# Dump FULL plugin log for scenario 3 (diagnostic — the ORT path check
+# and `semantic disabled gracefully` check are the most fragile pieces
+# of the suite; if they fail we want every line of context, not just
+# the tail -30).
+if [ "$FAIL" -gt 0 ]; then
+    echo ""
+    echo "  ── Full plugin log (scenario 3, for diagnostics) ──"
+    cat "$PLUGIN_LOG" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
+    echo "  ── End full plugin log ──"
+    echo ""
+    echo "  MISSING_ORT_PATH was: $MISSING_ORT_PATH"
+    echo ""
+fi
 
 stop_aimock
 
