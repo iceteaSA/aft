@@ -24,11 +24,36 @@ impl Compressor for BunCompressor {
         match bun_subcommand(command).as_deref() {
             Some("install" | "i" | "add" | "remove") => compress_package(output),
             Some("test") => compress_test(output),
-            Some("run") => GenericCompressor::compress_output(output),
             Some("build") => compress_build(output),
+            // `bun run <script>` and bare `bun` invocations: agents commonly
+            // run `bun run --cwd packages/foo test` where the package's
+            // `test` script calls `bun test` underneath. The command head
+            // says "run", but the output is bun-test shaped. Without this
+            // peek the generic compressor middle-truncates the `(fail) ...`
+            // blocks and the agent has to re-run with grep to see which
+            // tests failed — a frustration that bites every CI debug loop.
+            // We detect bun-test output by looking for its signature summary
+            // line, which is short, deterministic, and not produced by
+            // anything else bun emits.
+            Some("run") | _ if looks_like_bun_test_output(output) => compress_test(output),
             _ => GenericCompressor::compress_output(output),
         }
     }
+}
+
+/// Detect bun-test output by looking for its summary line shape:
+///   `Ran N tests across N files. [...]`
+///
+/// This is the bun-test footer regardless of pass/fail and regardless of
+/// how the test runner was invoked (`bun test`, `bun run test`, scripts
+/// that shell out, etc.). We don't match on `(pass)`/`(fail)` markers
+/// alone because well-behaved test fixtures can emit those strings in
+/// non-test contexts; the `Ran N tests across N files.` summary is
+/// effectively a private bun-test marker.
+fn looks_like_bun_test_output(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim_start().starts_with("Ran ") && line.contains(" tests across "))
 }
 
 /// Known bun subcommands we want to match on. Used by `bun_subcommand`
