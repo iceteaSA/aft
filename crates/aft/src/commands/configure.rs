@@ -1246,7 +1246,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let ttl_hours = ctx.config().checkpoint_ttl_hours;
         ctx.backup()
             .borrow_mut()
-            .set_storage_dir(storage_dir, ttl_hours);
+            .set_storage_dir_for_harness(storage_dir, harness, ttl_hours);
     }
     let db_path = ctx.storage_dir().join("aft.db");
     match crate::db::open(&db_path) {
@@ -1858,7 +1858,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let graph = CallGraph::new(root_path.clone());
     *ctx.callgraph().borrow_mut() = Some(graph);
 
-    let bg_storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    crate::bash_background::repair_legacy_root_tasks(&bg_storage_root, harness);
+    let bg_storage_dir = ctx.harness_dir();
     if let Err(error) =
         ctx.bash_background()
             .replay_session_for_project(&bg_storage_dir, req.session(), &root_path)

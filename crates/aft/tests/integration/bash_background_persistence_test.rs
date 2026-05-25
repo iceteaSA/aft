@@ -213,6 +213,53 @@ fn fake_task(
     paths
 }
 
+#[test]
+fn configure_repairs_legacy_root_bash_tasks_into_harness_namespace() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let task_id = "legacy-root-task";
+    fake_task(
+        storage.path(),
+        project.path(),
+        SESSION,
+        task_id,
+        BgTaskStatus::Completed,
+        true,
+    );
+    assert!(
+        storage.path().join("bash-tasks").exists(),
+        "test setup should create legacy root bash tasks"
+    );
+
+    let mut aft = AftProcess::spawn();
+    configure_background(&mut aft, project.path(), storage.path(), SESSION);
+
+    let harness_json = storage
+        .path()
+        .join("opencode")
+        .join("bash-tasks")
+        .join(aft::backup::hash_session(SESSION))
+        .join(format!("{task_id}.json"));
+    assert!(
+        harness_json.exists(),
+        "configure should move task JSON to harness path"
+    );
+    assert!(
+        !storage.path().join("bash-tasks").exists(),
+        "legacy root task directory should be removed after repair"
+    );
+
+    let response = status(&mut aft, SESSION, task_id);
+    assert_eq!(
+        response["success"], true,
+        "status should find repaired task: {response:?}"
+    );
+    assert_eq!(response["status"], "completed");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 fn write_legacy_task_json(storage: &Path, session: &str, task_id: &str, project: &Path) -> PathBuf {
     let path = task_file(storage, session, task_id, "json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();

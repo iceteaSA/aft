@@ -15,23 +15,30 @@ const MAX_UNDO_DEPTH: usize = 20;
 ///
 /// Bump this when the `meta.json` shape changes. Readers check the field and
 /// refuse or migrate older versions instead of misinterpreting them.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
 pub struct BackupEntry {
     pub backup_id: String,
+    /// UTF-8 view of the captured regular-file bytes, kept for API/tests that
+    /// inspect text backups. Restore uses `content_bytes` so binary files round-trip.
     pub content: String,
+    pub content_bytes: Vec<u8>,
     pub timestamp: u64,
     pub order: u128,
     pub description: String,
     pub op_id: Option<String>,
     pub kind: BackupEntryKind,
+    pub mode: Option<u32>,
+    pub link_target: Option<PathBuf>,
+    pub created_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupEntryKind {
     Content,
+    Symlink,
     Tombstone,
 }
 
@@ -57,6 +64,7 @@ impl BackupEntry {
             backup_path: backup_path.map(str::to_string),
             kind: match self.kind {
                 BackupEntryKind::Content => "content".to_string(),
+                BackupEntryKind::Symlink => "symlink".to_string(),
                 BackupEntryKind::Tombstone => "tombstone".to_string(),
             },
             description: self.description.clone(),
@@ -72,30 +80,62 @@ impl TryFrom<BackupRow> for BackupEntry {
     fn try_from(row: BackupRow) -> Result<Self, Self::Error> {
         let kind = if row.is_tombstone || row.kind == "tombstone" {
             BackupEntryKind::Tombstone
+        } else if row.kind == "symlink" {
+            BackupEntryKind::Symlink
         } else {
             BackupEntryKind::Content
         };
-        let content = match kind {
-            BackupEntryKind::Content => {
-                let backup_path = row.backup_path.ok_or_else(|| {
+        let backup_path = row.backup_path.clone();
+        let disk_metadata = backup_path
+            .as_deref()
+            .and_then(|path| read_entry_disk_metadata(Path::new(path), &row.backup_id));
+        let content_bytes = match kind {
+            BackupEntryKind::Content | BackupEntryKind::Symlink => {
+                let backup_path = backup_path.ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         format!("backup DB row {} has no backup_path", row.backup_id),
                     )
                 })?;
-                std::fs::read_to_string(backup_path)?
+                std::fs::read(backup_path)?
             }
+            BackupEntryKind::Tombstone => Vec::new(),
+        };
+        let link_target = if kind == BackupEntryKind::Symlink {
+            disk_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.link_target.clone())
+                .or_else(|| {
+                    Some(PathBuf::from(
+                        String::from_utf8_lossy(&content_bytes).into_owned(),
+                    ))
+                })
+        } else {
+            None
+        };
+        let content = match kind {
+            BackupEntryKind::Content => String::from_utf8_lossy(&content_bytes).into_owned(),
+            BackupEntryKind::Symlink => link_target
+                .as_ref()
+                .map(|target| target.display().to_string())
+                .unwrap_or_default(),
             BackupEntryKind::Tombstone => String::new(),
         };
 
         Ok(BackupEntry {
             backup_id: row.backup_id,
             content,
+            content_bytes,
             timestamp: u64::try_from(row.created_at).unwrap_or_default(),
             order: row.order,
             description: row.description,
             op_id: row.op_id,
             kind,
+            mode: disk_metadata.as_ref().and_then(|metadata| metadata.mode),
+            link_target,
+            created_dirs: disk_metadata
+                .map(|metadata| metadata.created_dirs)
+                .unwrap_or_default(),
         })
     }
 }
@@ -141,6 +181,7 @@ pub struct BackupStore {
     session_meta: HashMap<String, SessionMeta>,
     counter: AtomicU64,
     storage_dir: Option<PathBuf>,
+    storage_harness: Option<String>,
     db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     db_harness: RwLock<Option<String>>,
     db_project_key: RwLock<Option<String>>,
@@ -167,6 +208,7 @@ impl BackupStore {
             session_meta: HashMap::new(),
             counter: AtomicU64::new(0),
             storage_dir: None,
+            storage_harness: None,
             db_pool: RwLock::new(None),
             db_harness: RwLock::new(None),
             db_project_key: RwLock::new(None),
@@ -203,10 +245,25 @@ impl BackupStore {
     /// directories, and migrates any legacy pre-session (flat) layout into the
     /// default namespace.
     pub fn set_storage_dir(&mut self, dir: PathBuf, ttl_hours: u32) {
+        self.set_storage_dir_inner(dir, None, ttl_hours);
+    }
+
+    pub fn set_storage_dir_for_harness(
+        &mut self,
+        dir: PathBuf,
+        harness: crate::harness::Harness,
+        ttl_hours: u32,
+    ) {
+        self.set_storage_dir_inner(dir, Some(harness.as_str().to_string()), ttl_hours);
+    }
+
+    fn set_storage_dir_inner(&mut self, dir: PathBuf, harness: Option<String>, ttl_hours: u32) {
         self.storage_dir = Some(dir);
+        self.storage_harness = harness;
         self.entries.clear();
         self.disk_index.clear();
         self.session_meta.clear();
+        self.repair_root_backups_if_needed();
         self.gc_stale_sessions(ttl_hours);
         self.migrate_legacy_layout_if_needed();
         self.load_disk_index();
@@ -232,21 +289,9 @@ impl BackupStore {
         description: &str,
         op_id: Option<&str>,
     ) -> Result<String, AftError> {
-        let content = std::fs::read_to_string(path).map_err(|_| AftError::FileNotFound {
-            path: path.display().to_string(),
-        })?;
-
         let key = canonicalize_key(path);
         let (id, order) = self.next_id_and_order();
-        let entry = BackupEntry {
-            backup_id: id.clone(),
-            content,
-            timestamp: current_timestamp(),
-            order,
-            description: description.to_string(),
-            op_id: op_id.map(str::to_string),
-            kind: BackupEntryKind::Content,
-        };
+        let entry = backup_entry_from_path(path, id.clone(), order, description, op_id)?;
 
         let session_entries = self.entries.entry(session.to_string()).or_default();
         let stack = session_entries.entry(key.clone()).or_default();
@@ -273,15 +318,20 @@ impl BackupStore {
         description: &str,
     ) -> Result<String, AftError> {
         let key = canonicalize_key(path);
+        let created_dirs = path.parent().map(missing_parent_dirs).unwrap_or_default();
         let (id, order) = self.next_id_and_order();
         let entry = BackupEntry {
             backup_id: id.clone(),
             content: String::new(),
+            content_bytes: Vec::new(),
             timestamp: current_timestamp(),
             order,
             description: description.to_string(),
             op_id: Some(op_id.to_string()),
             kind: BackupEntryKind::Tombstone,
+            mode: None,
+            link_target: None,
+            created_dirs,
         };
 
         let session_entries = self.entries.entry(session.to_string()).or_default();
@@ -385,30 +435,14 @@ impl BackupStore {
                     path: key.display().to_string(),
                 })?;
             match entry.kind {
-                BackupEntryKind::Content => {
-                    let existing_content = match std::fs::read(key) {
-                        Ok(content) => Some(content),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => {
-                            return Err(AftError::IoError {
-                                path: key.display().to_string(),
-                                message: e.to_string(),
-                            });
-                        }
-                    };
+                BackupEntryKind::Content | BackupEntryKind::Symlink => {
+                    let existing_state = capture_path_state(key)?;
                     let warning = self.check_external_modification(session, key, key);
-                    content_targets.push((key.clone(), entry, warning, existing_content));
+                    content_targets.push((key.clone(), entry, warning, existing_state));
                 }
                 BackupEntryKind::Tombstone => {
-                    let existing_content = if key.is_file() {
-                        Some(std::fs::read(key).map_err(|e| AftError::IoError {
-                            path: key.display().to_string(),
-                            message: e.to_string(),
-                        })?)
-                    } else {
-                        None
-                    };
-                    tombstone_targets.push((key.clone(), entry, existing_content));
+                    let existing_state = capture_path_state(key)?;
+                    tombstone_targets.push((key.clone(), entry, existing_state));
                 }
             }
         }
@@ -438,10 +472,10 @@ impl BackupStore {
         }
 
         let mut written = Vec::new();
-        for (key, entry, _, existing_content) in &content_targets {
-            if let Err(e) = std::fs::write(key, &entry.content) {
+        for (key, entry, _, existing_state) in &content_targets {
+            if let Err(e) = restore_entry_to_path(key, entry) {
                 let files_rollback_ok =
-                    rollback_transactional_restore(&written, Some((key, existing_content)));
+                    rollback_transactional_restore(&written, Some((key, existing_state)));
                 let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
                 let rollback_ok = files_rollback_ok && dirs_rollback_ok;
                 return Err(AftError::IoError {
@@ -454,16 +488,13 @@ impl BackupStore {
                     ),
                 });
             }
-            written.push((key.clone(), existing_content.clone()));
+            written.push((key.clone(), existing_state.clone()));
         }
 
         let mut deleted_tombstones = Vec::new();
-        for (key, _, existing_content) in &tombstone_targets {
-            match std::fs::remove_file(key) {
-                Ok(()) => deleted_tombstones.push((key.clone(), existing_content.clone())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    deleted_tombstones.push((key.clone(), None));
-                }
+        for (key, _, existing_state) in &tombstone_targets {
+            match remove_tombstone_path(key) {
+                Ok(()) => deleted_tombstones.push((key.clone(), existing_state.clone())),
                 Err(e) => {
                     let files_rollback_ok = rollback_transactional_restore(&written, None);
                     let tombstone_rollback_ok = rollback_deleted_tombstones(&deleted_tombstones);
@@ -482,6 +513,11 @@ impl BackupStore {
                 }
             }
         }
+        let tombstone_created_dirs = tombstone_targets
+            .iter()
+            .flat_map(|(_, entry, _)| entry.created_dirs.iter().cloned())
+            .collect::<Vec<_>>();
+        remove_created_dirs_best_effort(&tombstone_created_dirs);
 
         let mut restored = Vec::new();
         let mut warnings = Vec::new();
@@ -895,33 +931,19 @@ impl BackupStore {
             })?;
 
         match entry.kind {
-            BackupEntryKind::Content => {
-                // Ensure parent directory exists. This matters when restoring an
-                // operation that deleted a directory tree — the parent directories
-                // are gone by the time we try to write the file content back.
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent).map_err(|e| AftError::IoError {
-                            path: parent.display().to_string(),
-                            message: e.to_string(),
-                        })?;
-                    }
-                }
-                std::fs::write(path, &entry.content).map_err(|e| AftError::IoError {
+            BackupEntryKind::Content | BackupEntryKind::Symlink => {
+                restore_entry_to_path(path, &entry).map_err(|e| AftError::IoError {
                     path: path.display().to_string(),
                     message: e.to_string(),
                 })?;
             }
-            BackupEntryKind::Tombstone => match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(AftError::IoError {
-                        path: path.display().to_string(),
-                        message: e.to_string(),
-                    });
-                }
-            },
+            BackupEntryKind::Tombstone => {
+                remove_tombstone_path(path).map_err(|e| AftError::IoError {
+                    path: path.display().to_string(),
+                    message: e.to_string(),
+                })?;
+                remove_created_dirs_best_effort(&entry.created_dirs);
+            }
         }
 
         stack.pop();
@@ -983,23 +1005,29 @@ impl BackupStore {
         key: &Path,
         path: &Path,
     ) -> Option<String> {
-        if let (Some(stack), Ok(current)) = (
-            self.entries.get(session).and_then(|s| s.get(key)),
-            std::fs::read_to_string(path),
-        ) {
-            if let Some(latest) = stack.last() {
-                if latest.content != current {
-                    return Some("file was modified externally since last backup".to_string());
-                }
-            }
-        }
-        None
+        let stack = self.entries.get(session).and_then(|s| s.get(key))?;
+        let latest = stack.last()?;
+        let modified = match latest.kind {
+            BackupEntryKind::Content => std::fs::read(path)
+                .map(|current| current != latest.content_bytes)
+                .unwrap_or(true),
+            BackupEntryKind::Symlink => std::fs::read_link(path)
+                .map(|target| latest.link_target.as_ref() != Some(&target))
+                .unwrap_or(true),
+            BackupEntryKind::Tombstone => false,
+        };
+        modified.then(|| "file was modified externally since last backup".to_string())
     }
 
     // ---- Disk persistence ----
 
     fn backups_dir(&self) -> Option<PathBuf> {
-        self.storage_dir.as_ref().map(|d| d.join("backups"))
+        self.storage_dir
+            .as_ref()
+            .map(|dir| match &self.storage_harness {
+                Some(harness) => dir.join(harness).join("backups"),
+                None => dir.join("backups"),
+            })
     }
 
     fn session_dir(&self, session: &str) -> Option<PathBuf> {
@@ -1037,6 +1065,61 @@ impl BackupStore {
             let tmp = session_dir.join("session.json.tmp");
             if std::fs::write(&tmp, s).is_ok() {
                 let _ = std::fs::rename(&tmp, marker);
+            }
+        }
+    }
+
+    fn repair_root_backups_if_needed(&self) {
+        let (Some(storage_dir), Some(harness)) = (&self.storage_dir, &self.storage_harness) else {
+            return;
+        };
+        let root_backups = storage_dir.join("backups");
+        if !dir_has_entries(&root_backups) {
+            return;
+        }
+        let harness_backups = storage_dir.join(harness).join("backups");
+        if dir_has_entries(&harness_backups) {
+            return;
+        }
+        if let Some(parent) = harness_backups.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                crate::slog_warn!(
+                    "failed to create harness backup dir {}: {}",
+                    parent.display(),
+                    error
+                );
+                return;
+            }
+        }
+        if harness_backups.exists() {
+            let _ = std::fs::remove_dir(&harness_backups);
+        }
+        match std::fs::rename(&root_backups, &harness_backups) {
+            Ok(()) => {
+                crate::slog_info!(
+                    "moved legacy root backups into harness namespace: {}",
+                    harness_backups.display()
+                );
+            }
+            Err(error) => {
+                crate::slog_warn!(
+                    "failed to move legacy root backups into {}: {}; trying child merge",
+                    harness_backups.display(),
+                    error
+                );
+                if std::fs::create_dir_all(&harness_backups).is_err() {
+                    return;
+                }
+                if let Ok(entries) = std::fs::read_dir(&root_backups) {
+                    for entry in entries.flatten() {
+                        let source = entry.path();
+                        let target = harness_backups.join(entry.file_name());
+                        if !target.exists() {
+                            let _ = std::fs::rename(source, target);
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir(&root_backups);
             }
         }
     }
@@ -1346,16 +1429,37 @@ impl BackupStore {
             let meta = entry_meta.get(i);
             let kind = match meta.and_then(|m| m.get("kind")).and_then(|v| v.as_str()) {
                 Some("tombstone") => BackupEntryKind::Tombstone,
+                Some("symlink") => BackupEntryKind::Symlink,
                 _ => BackupEntryKind::Content,
             };
-            let content = match kind {
-                BackupEntryKind::Content => {
+            let content_bytes = match kind {
+                BackupEntryKind::Content | BackupEntryKind::Symlink => {
                     let bak_path = disk_meta.dir.join(format!("{}.bak", i));
-                    match std::fs::read_to_string(&bak_path) {
+                    match std::fs::read(&bak_path) {
                         Ok(content) => content,
                         Err(_) => continue,
                     }
                 }
+                BackupEntryKind::Tombstone => Vec::new(),
+            };
+            let link_target = if kind == BackupEntryKind::Symlink {
+                meta.and_then(|m| m.get("link_target"))
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        Some(PathBuf::from(
+                            String::from_utf8_lossy(&content_bytes).into_owned(),
+                        ))
+                    })
+            } else {
+                None
+            };
+            let content = match kind {
+                BackupEntryKind::Content => String::from_utf8_lossy(&content_bytes).into_owned(),
+                BackupEntryKind::Symlink => link_target
+                    .as_ref()
+                    .map(|target| target.display().to_string())
+                    .unwrap_or_default(),
                 BackupEntryKind::Tombstone => String::new(),
             };
             let backup_id = meta
@@ -1374,6 +1478,7 @@ impl BackupStore {
             entries.push(BackupEntry {
                 backup_id,
                 content,
+                content_bytes,
                 timestamp,
                 order,
                 description: meta
@@ -1386,6 +1491,21 @@ impl BackupStore {
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
                 kind,
+                mode: meta
+                    .and_then(|m| m.get("mode"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|mode| u32::try_from(mode).ok()),
+                link_target,
+                created_dirs: meta
+                    .and_then(|m| m.get("created_dirs"))
+                    .and_then(|v| v.as_array())
+                    .map(|dirs| {
+                        dirs.iter()
+                            .filter_map(|dir| dir.as_str())
+                            .map(PathBuf::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
 
@@ -1430,7 +1550,17 @@ impl BackupStore {
             let tmp_path = dir.join(format!("{}.bak.tmp", i));
             match entry.kind {
                 BackupEntryKind::Content => {
-                    if std::fs::write(&tmp_path, &entry.content).is_ok() {
+                    if std::fs::write(&tmp_path, &entry.content_bytes).is_ok() {
+                        let _ = std::fs::rename(&tmp_path, &bak_path);
+                    }
+                }
+                BackupEntryKind::Symlink => {
+                    let target = entry
+                        .link_target
+                        .as_ref()
+                        .map(|target| target.as_os_str().to_string_lossy().as_bytes().to_vec())
+                        .unwrap_or_default();
+                    if std::fs::write(&tmp_path, target).is_ok() {
                         let _ = std::fs::rename(&tmp_path, &bak_path);
                     }
                 }
@@ -1460,8 +1590,16 @@ impl BackupStore {
                     "op_id": entry.op_id,
                     "kind": match entry.kind {
                         BackupEntryKind::Content => "content",
+                        BackupEntryKind::Symlink => "symlink",
                         BackupEntryKind::Tombstone => "tombstone",
                     },
+                    "mode": entry.mode,
+                    "link_target": entry.link_target.as_ref().map(|target| target.display().to_string()),
+                    "created_dirs": entry
+                        .created_dirs
+                        .iter()
+                        .map(|dir| dir.display().to_string())
+                        .collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -1545,10 +1683,10 @@ impl BackupStore {
         }
         for (index, entry) in stack.iter().enumerate() {
             let backup_path = match entry.kind {
-                BackupEntryKind::Content => {
+                BackupEntryKind::Content | BackupEntryKind::Symlink => {
                     Some(dir.join(format!("{}.bak", index)).display().to_string())
                 }
-                BackupEntryKind::Tombstone => None,
+                BackupEntryKind::Tombstone => Some(dir.join("meta.json").display().to_string()),
             };
             let row = entry.to_backup_row(
                 &harness,
@@ -1635,59 +1773,380 @@ pub fn new_op_id() -> String {
     format!("op-{}-{:08x}", current_timestamp() * 1000, rand)
 }
 
+#[derive(Debug, Clone)]
+struct BackupEntryDiskMetadata {
+    mode: Option<u32>,
+    link_target: Option<PathBuf>,
+    created_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum RestorePathState {
+    Missing,
+    Regular {
+        content_bytes: Vec<u8>,
+        mode: Option<u32>,
+    },
+    Symlink {
+        target: PathBuf,
+    },
+    Directory,
+}
+
+fn backup_entry_from_path(
+    path: &Path,
+    backup_id: String,
+    order: u128,
+    description: &str,
+    op_id: Option<&str>,
+) -> Result<BackupEntry, AftError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => AftError::FileNotFound {
+            path: path.display().to_string(),
+        },
+        _ => AftError::IoError {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        },
+    })?;
+    let mode = file_mode(&metadata);
+
+    let (kind, content, content_bytes, link_target) = if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(|error| AftError::IoError {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        (
+            BackupEntryKind::Symlink,
+            target.display().to_string(),
+            Vec::new(),
+            Some(target),
+        )
+    } else if metadata.is_file() {
+        let bytes = std::fs::read(path).map_err(|error| AftError::IoError {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        (
+            BackupEntryKind::Content,
+            String::from_utf8_lossy(&bytes).into_owned(),
+            bytes,
+            None,
+        )
+    } else {
+        return Err(AftError::InvalidRequest {
+            message: format!(
+                "backup: '{}' is not a regular file or symlink",
+                path.display()
+            ),
+        });
+    };
+
+    Ok(BackupEntry {
+        backup_id,
+        content,
+        content_bytes,
+        timestamp: current_timestamp(),
+        order,
+        description: description.to_string(),
+        op_id: op_id.map(str::to_string),
+        kind,
+        mode,
+        link_target,
+        created_dirs: Vec::new(),
+    })
+}
+
 fn canonicalize_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|err| {
-        log::debug!(
-            "backup canonicalize_key fallback for {}: {}",
-            path.display(),
-            err
-        );
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+
+    match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            canonicalize_parent_join_leaf(&absolute)
+        }
+        Ok(_) => std::fs::canonicalize(&absolute)
+            .map(|path| normalize_absolute_key(&path))
+            .unwrap_or_else(|_| canonicalize_existing_ancestor(&absolute)),
+        Err(_) => canonicalize_existing_ancestor(&absolute),
+    }
+}
+
+fn canonicalize_parent_join_leaf(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return normalize_absolute_key(path);
+    };
+    let mut key = canonicalize_existing_ancestor(parent);
+    if let Some(file_name) = path.file_name() {
+        key.push(file_name);
+    }
+    key
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    let mut suffix = Vec::new();
+    let mut current = path;
+
+    loop {
+        if let Ok(mut base) = std::fs::canonicalize(current) {
+            for component in suffix.iter().rev() {
+                base.push(Path::new(component));
+            }
+            return normalize_absolute_key(&base);
+        }
+        let Some(parent) = current.parent() else {
+            return normalize_absolute_key(path);
+        };
+        if let Some(file_name) = current.file_name() {
+            suffix.push(file_name.to_os_string());
+        }
+        current = parent;
+    }
+}
+
+fn normalize_absolute_key(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
+}
+
+fn file_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn set_file_mode(path: &Path, mode: Option<u32>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(mode) = mode {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+fn capture_path_state(path: &Path) -> Result<RestorePathState, AftError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RestorePathState::Missing);
+        }
+        Err(error) => {
+            return Err(AftError::IoError {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            });
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(|error| AftError::IoError {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        Ok(RestorePathState::Symlink { target })
+    } else if metadata.is_file() {
+        let content_bytes = std::fs::read(path).map_err(|error| AftError::IoError {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        Ok(RestorePathState::Regular {
+            content_bytes,
+            mode: file_mode(&metadata),
+        })
+    } else {
+        Ok(RestorePathState::Directory)
+    }
+}
+
+fn restore_entry_to_path(path: &Path, entry: &BackupEntry) -> std::io::Result<()> {
+    match entry.kind {
+        BackupEntryKind::Content => restore_regular_file(path, &entry.content_bytes, entry.mode),
+        BackupEntryKind::Symlink => {
+            let target = entry.link_target.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "symlink backup entry missing target",
+                )
+            })?;
+            restore_symlink(path, target)
+        }
+        BackupEntryKind::Tombstone => remove_tombstone_path(path),
+    }
+}
+
+fn restore_path_state(path: &Path, state: &RestorePathState) -> bool {
+    match state {
+        RestorePathState::Missing => remove_file_or_symlink_if_present(path).is_ok(),
+        RestorePathState::Regular {
+            content_bytes,
+            mode,
+        } => restore_regular_file(path, content_bytes, *mode).is_ok(),
+        RestorePathState::Symlink { target } => restore_symlink(path, target).is_ok(),
+        RestorePathState::Directory => true,
+    }
+}
+
+fn restore_regular_file(
+    path: &Path,
+    content_bytes: &[u8],
+    mode: Option<u32>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::write(path, content_bytes)?;
+    set_file_mode(path, mode)
+}
+
+fn restore_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    remove_file_or_symlink_if_present(path)?;
+    create_symlink(target, path)
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+fn remove_tombstone_path(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            std::fs::remove_file(path)
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "tombstone target is a directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_file_or_symlink_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            std::fs::remove_file(path)
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "path is a directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_entry_disk_metadata(
+    backup_path: &Path,
+    backup_id: &str,
+) -> Option<BackupEntryDiskMetadata> {
+    let meta_path = if backup_path.file_name().and_then(|name| name.to_str()) == Some("meta.json") {
+        backup_path.to_path_buf()
+    } else {
+        backup_path.parent()?.join("meta.json")
+    };
+    let content = std::fs::read_to_string(meta_path).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let entries = meta.get("entries")?.as_array()?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.get("backup_id").and_then(|value| value.as_str()) == Some(backup_id))?;
+    Some(BackupEntryDiskMetadata {
+        mode: entry
+            .get("mode")
+            .and_then(|value| value.as_u64())
+            .and_then(|mode| u32::try_from(mode).ok()),
+        link_target: entry
+            .get("link_target")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from),
+        created_dirs: entry
+            .get("created_dirs")
+            .and_then(|value| value.as_array())
+            .map(|dirs| {
+                dirs.iter()
+                    .filter_map(|dir| dir.as_str())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
 fn rollback_transactional_restore(
-    written: &[(PathBuf, Option<Vec<u8>>)],
-    attempted: Option<(&PathBuf, &Option<Vec<u8>>)>,
+    written: &[(PathBuf, RestorePathState)],
+    attempted: Option<(&PathBuf, &RestorePathState)>,
 ) -> bool {
     let mut ok = true;
 
-    if let Some((path, content)) = attempted {
-        ok &= rollback_one_restore_write(path, content);
+    if let Some((path, state)) = attempted {
+        ok &= restore_path_state(path, state);
     }
 
-    for (path, content) in written.iter().rev() {
-        ok &= rollback_one_restore_write(path, content);
+    for (path, state) in written.iter().rev() {
+        ok &= restore_path_state(path, state);
     }
 
     ok
 }
 
-fn rollback_one_restore_write(path: &Path, content: &Option<Vec<u8>>) -> bool {
-    match content {
-        Some(content) => std::fs::write(path, content).is_ok(),
-        None => match std::fs::remove_file(path) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        },
-    }
-}
-
-fn rollback_deleted_tombstones(deleted: &[(PathBuf, Option<Vec<u8>>)]) -> bool {
+fn rollback_deleted_tombstones(deleted: &[(PathBuf, RestorePathState)]) -> bool {
     let mut ok = true;
-    for (path, content) in deleted.iter().rev() {
-        if let Some(content) = content {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
-                    ok = false;
-                    continue;
-                }
-            }
-            if std::fs::write(path, content).is_err() {
-                ok = false;
-            }
-        }
+    for (path, state) in deleted.iter().rev() {
+        ok &= restore_path_state(path, state);
     }
     ok
 }
@@ -1722,6 +2181,26 @@ fn rollback_created_dirs(dirs: &[PathBuf]) -> bool {
     }
 
     ok
+}
+
+fn remove_created_dirs_best_effort(dirs: &[PathBuf]) {
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    dirs.dedup();
+
+    for dir in dirs {
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
+fn dir_has_entries(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 fn current_timestamp() -> u64 {

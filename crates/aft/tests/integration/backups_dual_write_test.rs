@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -213,6 +215,91 @@ fn backups_dual_write_backup_disabled_db_path_skips_dual_write() {
     assert_eq!(store.disk_history_count(SESSION, &file), 1);
     let conn = aft::db::open(&storage.path().join("aft.db")).unwrap();
     assert_eq!(backup_count(&conn), 0);
+}
+
+#[test]
+fn backup_tombstone_file_undo_uses_same_key_for_relative_created_path() {
+    let mut store = BackupStore::new();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let rel_dir = PathBuf::from("target").join(format!(
+        "aft-backup-relative-tombstone-{}-{unique}",
+        std::process::id()
+    ));
+    let rel_path = rel_dir.join("created.txt");
+    let _ = fs::remove_dir_all(&rel_dir);
+
+    store
+        .snapshot_op_tombstone(SESSION, "op-relative-created", &rel_path, "created")
+        .unwrap();
+    fs::create_dir_all(&rel_dir).unwrap();
+    fs::write(&rel_path, "created").unwrap();
+
+    let (entry, _) = store.restore_latest(SESSION, &rel_path).unwrap();
+
+    assert_eq!(entry.kind, aft::backup::BackupEntryKind::Tombstone);
+    assert!(!rel_path.exists(), "created file should be removed");
+    let _ = fs::remove_dir_all(&rel_dir);
+}
+
+#[test]
+fn backup_restore_round_trips_binary_bytes() {
+    let project = tempfile::tempdir().unwrap();
+    let mut store = BackupStore::new();
+    let file = project.path().join("binary.bin");
+    let original = vec![0, 159, 146, 150, 255, b'\n'];
+    fs::write(&file, &original).unwrap();
+
+    store.snapshot(SESSION, &file, "binary").unwrap();
+    fs::write(&file, b"changed").unwrap();
+    store.restore_latest(SESSION, &file).unwrap();
+
+    assert_eq!(fs::read(&file).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_restore_preserves_unix_permissions() {
+    let project = tempfile::tempdir().unwrap();
+    let mut store = BackupStore::new();
+    let file = temp_file(project.path(), "executable.sh", "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+
+    store.snapshot(SESSION, &file, "executable").unwrap();
+    fs::write(&file, "changed\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    store.restore_latest(SESSION, &file).unwrap();
+
+    let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+}
+
+#[test]
+fn backup_set_storage_dir_for_harness_repairs_legacy_root_backups() {
+    let storage = tempfile::tempdir().unwrap();
+    let legacy = storage.path().join("backups").join("legacy-session");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("sentinel"), "legacy").unwrap();
+
+    let mut store = BackupStore::new();
+    store.set_storage_dir_for_harness(storage.path().to_path_buf(), Harness::Opencode, 72);
+
+    assert!(
+        storage
+            .path()
+            .join("opencode")
+            .join("backups")
+            .join("legacy-session")
+            .join("sentinel")
+            .exists(),
+        "legacy root backups should be moved under the configured harness"
+    );
+    assert!(
+        !storage.path().join("backups").exists(),
+        "legacy root backups directory should be removed after repair"
+    );
 }
 
 #[test]

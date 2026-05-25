@@ -174,6 +174,68 @@ fn undo_after_move_file_restores_source_and_removes_destination() {
     assert!(status.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn undo_after_move_file_restores_symlink_source_and_removes_destination() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path();
+    let target = root.join("target.txt");
+    let source = root.join("before-link.txt");
+    let destination = root.join("nested").join("after-link.txt");
+    std::fs::write(&target, "target contents\n").expect("write target");
+    std::os::unix::fs::symlink(&target, &source).expect("create source symlink");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, root);
+
+    let move_resp = send(
+        &mut aft,
+        json!({
+            "id": "move-symlink-before-undo",
+            "command": "move_file",
+            "file": source.display().to_string(),
+            "destination": destination.display().to_string(),
+        }),
+    );
+    assert_eq!(move_resp["success"], true, "move failed: {move_resp:?}");
+    assert!(!source.exists(), "source symlink should be moved away");
+    assert!(
+        std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "destination should be the moved symlink"
+    );
+
+    let undo = send(
+        &mut aft,
+        json!({
+            "id": "undo-symlink-move-operation",
+            "command": "undo",
+        }),
+    );
+    assert_eq!(undo["success"], true, "undo failed: {undo:?}");
+    assert!(
+        std::fs::symlink_metadata(&source)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "source should be restored as a symlink"
+    );
+    assert_eq!(std::fs::read_link(&source).unwrap(), target);
+    assert!(
+        !destination.exists(),
+        "destination symlink should be removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "target contents\n"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {

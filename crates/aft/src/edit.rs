@@ -197,7 +197,7 @@ pub fn auto_backup(
     description: &str,
     op_id: Option<&str>,
 ) -> Result<Option<String>, AftError> {
-    if !path.exists() {
+    if std::fs::symlink_metadata(path).is_err() {
         return Ok(None);
     }
     let backup_id = {

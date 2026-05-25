@@ -49,30 +49,40 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(resp) => return resp,
     };
 
-    if !src_path.exists() {
-        // When the source is missing AND the destination already exists, the
-        // most likely cause is that this rename was already done earlier in
-        // the session (or by another process). Surfacing this distinction
-        // saves the agent a round-trip to discover it via `ls` or stat.
-        if dst_path.exists() {
+    let source_metadata = match std::fs::symlink_metadata(&src_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // When the source is missing AND the destination already exists, the
+            // most likely cause is that this rename was already done earlier in
+            // the session (or by another process). Surfacing this distinction
+            // saves the agent a round-trip to discover it via `ls` or stat.
+            if std::fs::symlink_metadata(&dst_path).is_ok() {
+                return Response::error(
+                    &req.id,
+                    "file_not_found",
+                    format!(
+                        "move_file: source file not found: {}. Destination '{}' already exists \
+                         — was this file already moved earlier? Verify with `read` before retrying.",
+                        file, destination
+                    ),
+                );
+            }
             return Response::error(
                 &req.id,
                 "file_not_found",
-                format!(
-                    "move_file: source file not found: {}. Destination '{}' already exists \
-                     — was this file already moved earlier? Verify with `read` before retrying.",
-                    file, destination
-                ),
+                format!("move_file: source file not found: {}", file),
             );
         }
-        return Response::error(
-            &req.id,
-            "file_not_found",
-            format!("move_file: source file not found: {}", file),
-        );
-    }
+        Err(error) => {
+            return Response::error(
+                &req.id,
+                "io_error",
+                format!("move_file: failed to stat source file: {}", error),
+            );
+        }
+    };
 
-    if src_path.is_dir() {
+    if source_metadata.is_dir() {
         return Response::error(
             &req.id,
             "invalid_request",
@@ -80,7 +90,7 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    if dst_path.exists() {
+    if std::fs::symlink_metadata(&dst_path).is_ok() {
         return Response::error(
             &req.id,
             "invalid_request",
@@ -102,6 +112,18 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if let Err(e) = ctx.backup().borrow_mut().snapshot_op_tombstone(
+        req.session(),
+        &op_id,
+        &dst_path,
+        "move_file: destination created during move",
+    ) {
+        ctx.backup()
+            .borrow_mut()
+            .discard_operation_entries(req.session(), &op_id);
+        return Response::error(&req.id, e.code(), e.to_string());
+    }
+
     // Create parent directories for destination
     if let Some(parent) = dst_path.parent() {
         if !parent.exists() {
@@ -116,15 +138,6 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         }
-    }
-
-    if let Err(e) = ctx.backup().borrow_mut().snapshot_op_tombstone(
-        req.session(),
-        &op_id,
-        &dst_path,
-        "move_file: destination created during move",
-    ) {
-        return Response::error(&req.id, e.code(), e.to_string());
     }
 
     // Move the file

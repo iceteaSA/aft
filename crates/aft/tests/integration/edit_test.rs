@@ -88,6 +88,110 @@ fn write_creates_new_file() {
 }
 
 #[test]
+fn write_created_file_undo_removes_created_parent_dirs() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("newdir").join("sub").join("created.txt");
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-created-nested","command":"write","file":"{}","content":"created"}}"#,
+        target.display()
+    ));
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert!(target.exists());
+
+    let undo = aft.send(&format!(
+        r#"{{"id":"undo-created-nested","command":"undo","file":"{}"}}"#,
+        target.display()
+    ));
+    assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
+    assert!(!target.exists(), "created file should be removed");
+    assert!(
+        !dir.path().join("newdir").exists(),
+        "empty parent directories created for the file should be removed"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_auto_rollback_discards_fake_undo_entry() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("rolled_back.ts");
+    fs::write(&target, "const value = 1;\n").unwrap();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-invalid","command":"write","file":"{}","content":"const value = {{;\n"}}"#,
+        target.display()
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "write should report validation result: {resp:?}"
+    );
+    assert_eq!(
+        resp["rolled_back"], true,
+        "invalid write should roll back: {resp:?}"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "const value = 1;\n");
+
+    let undo = aft.send(&format!(
+        r#"{{"id":"undo-after-rollback","command":"undo","file":"{}"}}"#,
+        target.display()
+    ));
+    assert_eq!(
+        undo["success"], false,
+        "rollback backup entry should be discarded: {undo:?}"
+    );
+    assert_eq!(undo["code"], "no_undo_history");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn configured_storage_writes_backups_under_harness_namespace() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let target = dir.path().join("namespaced-backup.txt");
+    fs::write(&target, "before").unwrap();
+
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "cfg-storage-backups",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "storage_dir": storage.path(),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-storage-backup","command":"write","file":"{}","content":"after"}}"#,
+        target.display()
+    ));
+    assert_eq!(resp["success"], true, "write failed: {resp:?}");
+    assert!(
+        storage.path().join("opencode").join("backups").exists(),
+        "backups should be stored under the harness namespace"
+    );
+    assert!(
+        !storage.path().join("backups").exists(),
+        "new backups should not be written to the shared root"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn write_backups_existing_file() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();

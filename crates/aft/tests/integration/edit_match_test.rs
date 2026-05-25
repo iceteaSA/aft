@@ -92,6 +92,13 @@ fn edit_match_glob_rolls_back_when_any_file_becomes_syntax_invalid() {
     assert_eq!(fs::read_to_string(&b).unwrap(), original_b);
     assert_eq!(fs::read_to_string(&c).unwrap(), original_c);
 
+    let undo = aft.send(&json!({"id": "undo-after-glob-rollback", "command": "undo"}).to_string());
+    assert_eq!(
+        undo["success"], false,
+        "glob rollback should discard operation undo entries: {undo:?}"
+    );
+    assert_eq!(undo["code"], "no_undo_history");
+
     let status = aft.shutdown();
     assert!(status.success());
 }

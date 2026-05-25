@@ -524,7 +524,11 @@ fn handle_glob_edit_match(
                         .iter()
                         .map(|edit| edit.path.clone())
                         .collect::<Vec<_>>();
-                    let _ = restore_glob_checkpoint(ctx, req.session(), name, &paths);
+                    if restore_glob_checkpoint(ctx, req.session(), name, &paths).is_ok() {
+                        ctx.backup()
+                            .borrow_mut()
+                            .discard_operation_entries(req.session(), op_id);
+                    }
                     delete_glob_checkpoint(ctx, req.session(), name);
                 }
                 return Response::error(&req.id, e.code(), e.to_string());
@@ -580,6 +584,11 @@ fn handle_glob_edit_match(
                 syntax_failures.len() - 5
             )
         };
+        if rollback.as_ref().map_or(true, |result| result.is_ok()) {
+            ctx.backup()
+                .borrow_mut()
+                .discard_operation_entries(req.session(), op_id);
+        }
         return match rollback {
             Some(Err(reason)) => Response::error_with_data(
                 &req.id,
@@ -934,6 +943,12 @@ fn handle_single_file_edit_match(
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };
+
+    if write_result.rolled_back {
+        ctx.backup()
+            .borrow_mut()
+            .discard_operation_entries(req.session(), op_id);
+    }
 
     if let Ok(final_content) = std::fs::read_to_string(path.as_path()) {
         write_result.lsp_outcome = ctx.lsp_post_write(path.as_path(), &final_content, &req.params);

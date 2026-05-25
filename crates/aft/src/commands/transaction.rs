@@ -8,7 +8,7 @@
 //! 5. Rollback all on any failure; success only if every file passes
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::context::AppContext;
 use crate::edit;
@@ -98,6 +98,7 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
     // Track which files existed (snapshotted) vs new (will be deleted on rollback).
     let mut snapshotted_files: Vec<PathBuf> = Vec::new();
     let mut new_files: Vec<PathBuf> = Vec::new();
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for op in &parsed {
@@ -117,6 +118,9 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             snapshotted_files.push(op.file.clone());
         } else {
+            if let Some(parent) = op.file.parent() {
+                created_dirs.extend(missing_parent_dirs(parent));
+            }
             let tombstone_result = {
                 let mut store = ctx.backup().borrow_mut();
                 store.snapshot_op_tombstone(
@@ -145,7 +149,13 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
         let new_content = match compute_new_content(op) {
             Ok(c) => c,
             Err(err) => {
-                let failures = rollback(ctx, req.session(), &snapshotted_files, &new_files);
+                let failures = rollback(
+                    ctx,
+                    req.session(),
+                    &snapshotted_files,
+                    &new_files,
+                    &created_dirs,
+                );
                 if failures.is_empty() {
                     ctx.backup()
                         .borrow_mut()
@@ -181,7 +191,13 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
                 });
             }
             Err(e) => {
-                let failures = rollback(ctx, req.session(), &snapshotted_files, &new_files);
+                let failures = rollback(
+                    ctx,
+                    req.session(),
+                    &snapshotted_files,
+                    &new_files,
+                    &created_dirs,
+                );
                 if failures.is_empty() {
                     ctx.backup()
                         .borrow_mut()
@@ -203,7 +219,13 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
     // --- Validate phase: check syntax_valid on all results ---
     for (i, result) in results.iter().enumerate() {
         if result.file_result.syntax_valid == Some(false) {
-            let failures = rollback(ctx, req.session(), &snapshotted_files, &new_files);
+            let failures = rollback(
+                ctx,
+                req.session(),
+                &snapshotted_files,
+                &new_files,
+                &created_dirs,
+            );
             if failures.is_empty() {
                 ctx.backup()
                     .borrow_mut()
@@ -498,6 +520,7 @@ fn rollback(
     session: &str,
     snapshotted: &[PathBuf],
     new_files: &[PathBuf],
+    created_dirs: &[PathBuf],
 ) -> Vec<RollbackFailure> {
     let mut failures = Vec::new();
 
@@ -539,7 +562,38 @@ fn rollback(
         }
     }
 
+    remove_created_dirs(created_dirs);
+
     failures
+}
+
+fn missing_parent_dirs(parent: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = Some(parent);
+
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() || dir.exists() {
+            break;
+        }
+        dirs.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+
+    dirs
+}
+
+fn remove_created_dirs(dirs: &[PathBuf]) {
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    dirs.dedup();
+
+    for dir in dirs {
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
 }
 
 /// Build the structured error response for a failed transaction.

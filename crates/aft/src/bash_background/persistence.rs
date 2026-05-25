@@ -261,9 +261,27 @@ fn capture_output_bytes(mode: &BgMode, paths: &TaskPaths) -> Option<i64> {
 }
 
 pub fn session_tasks_dir(storage_dir: &Path, session_id: &str) -> PathBuf {
-    storage_dir
-        .join("bash-tasks")
-        .join(hash_session(session_id))
+    let session_hash = hash_session(session_id);
+    let direct = storage_dir.join("bash-tasks").join(&session_hash);
+    if direct.exists() {
+        return direct;
+    }
+
+    let mut harness_matches = ["opencode", "pi"]
+        .into_iter()
+        .map(|harness| {
+            storage_dir
+                .join(harness)
+                .join("bash-tasks")
+                .join(&session_hash)
+        })
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if harness_matches.len() == 1 {
+        return harness_matches.remove(0);
+    }
+
+    direct
 }
 
 pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> TaskPaths {

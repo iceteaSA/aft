@@ -133,6 +133,12 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         };
 
+    if write_result.rolled_back {
+        ctx.backup()
+            .borrow_mut()
+            .discard_operation_entries(req.session(), &op_id);
+    }
+
     if let Ok(final_content) = std::fs::read_to_string(path.as_path()) {
         let config_change_type = if existed {
             FileChangeType::CHANGED
