@@ -24,6 +24,8 @@ use crate::lsp::roots::{find_workspace_root, ServerKey};
 use crate::lsp::LspError;
 use crate::slog_error;
 
+const STDERR_REASON_BYTES: usize = 2 * 1024;
+
 /// Outcome of attempting to ensure a server is running for a single matching
 /// `ServerDef`. Returned per matching server so the caller can report exactly
 /// what happened to the user instead of collapsing all failures into "no
@@ -177,6 +179,10 @@ pub struct PullWorkspaceResult {
 pub struct LspManager {
     /// Active server instances, keyed by (ServerKind, workspace_root).
     clients: HashMap<ServerKey, LspClient>,
+    /// Binary names for active server instances. Kept separate from
+    /// `LspClient` so crash handling can report the installable binary name
+    /// after a post-initialize process exit.
+    server_binaries: HashMap<ServerKey, String>,
     /// Tracks opened documents and versions per active server.
     documents: HashMap<ServerKey, DocumentStore>,
     /// Stored publishDiagnostics payloads across all servers.
@@ -219,6 +225,7 @@ impl LspManager {
         let (event_tx, event_rx) = unbounded();
         Self {
             clients: HashMap::new(),
+            server_binaries: HashMap::new(),
             documents: HashMap::new(),
             diagnostics: DiagnosticsStore::new(),
             event_tx,
@@ -318,6 +325,7 @@ impl LspManager {
                 match self.spawn_server(&def, &key.root, config) {
                     Ok(client) => {
                         self.clients.insert(key.clone(), client);
+                        self.server_binaries.insert(key.clone(), def.binary.clone());
                         self.documents.entry(key.clone()).or_default();
                     }
                     Err(err) => {
@@ -1047,9 +1055,7 @@ impl LspManager {
             let outcome = match self.send_pull_request(&key, params) {
                 Ok(report) => self.ingest_document_report(&key, &canonical_path, report),
                 Err(err) => {
-                    if let Some(result) =
-                        self.cache_post_initialize_exit(&key, key.kind.id_str(), &err)
-                    {
+                    if let Some(result) = self.cache_post_initialize_exit(&key, &err) {
                         PullFileOutcome::RequestFailed {
                             reason: server_attempt_result_reason(&result),
                         }
@@ -1128,9 +1134,7 @@ impl LspManager {
                 });
             }
             Err(err) => {
-                if let Some(result) =
-                    self.cache_post_initialize_exit(server_key, server_key.kind.id_str(), &err)
-                {
+                if let Some(result) = self.cache_post_initialize_exit(server_key, &err) {
                     return Err(LspError::ServerNotReady(server_attempt_result_reason(
                         &result,
                     )));
@@ -1185,9 +1189,13 @@ impl LspManager {
     fn cache_post_initialize_exit(
         &mut self,
         key: &ServerKey,
-        binary: &str,
         err: &LspError,
     ) -> Option<ServerAttemptResult> {
+        let binary = self
+            .server_binaries
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| key.kind.id_str().to_string());
         let (status, stderr_tail) = {
             let client = self.clients.get_mut(key)?;
             let mut status = client.child_exit_status();
@@ -1202,12 +1210,10 @@ impl LspManager {
             wait_for_stderr_tail(client);
             (status, client.stderr_tail())
         };
-        let reason = format_post_initialize_exit_reason(binary, status, &stderr_tail, err);
-        let result = ServerAttemptResult::SpawnFailed {
-            binary: binary.to_string(),
-            reason,
-        };
+        let reason = format_post_initialize_exit_reason(&binary, status, &stderr_tail, err);
+        let result = ServerAttemptResult::SpawnFailed { binary, reason };
         self.clients.remove(key);
+        self.server_binaries.remove(key);
         self.documents.remove(key);
         self.diagnostics.clear_for_server(key);
         self.failed_spawns.insert(key.clone(), result.clone());
@@ -1278,6 +1284,7 @@ impl LspManager {
                 slog_error!("error shutting down {:?}: {}", key, err);
             }
         }
+        self.server_binaries.clear();
         self.documents.clear();
         self.diagnostics = DiagnosticsStore::new();
     }
@@ -1338,6 +1345,7 @@ impl LspManager {
                     root: root.clone(),
                 };
                 self.clients.remove(&key);
+                self.server_binaries.remove(&key);
                 self.documents.remove(&key);
                 self.diagnostics.clear_for_server(&key);
                 None
@@ -1493,29 +1501,36 @@ fn server_attempt_result_reason(result: &ServerAttemptResult) -> String {
     }
 }
 
-fn indent_tail(stderr_tail: &str, max_lines: usize) -> String {
-    stderr_tail
+fn format_stderr_tail_for_reason(stderr_tail: &str) -> String {
+    truncate_stderr_tail_for_reason(stderr_tail)
         .lines()
-        .rev()
-        .take(max_lines)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .map(|line| format!("  {line}"))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn format_initialize_failure_reason(binary: &str, stderr_tail: &str, err: &LspError) -> String {
-    let mut reason = String::from("server crashed during initialize");
-    if !stderr_tail.is_empty() {
-        reason.push_str(". stderr tail (last 8 lines):\n");
-        reason.push_str(&indent_tail(stderr_tail, 8));
-    } else {
-        reason.push_str(&format!(": {err}"));
+fn truncate_stderr_tail_for_reason(stderr_tail: &str) -> String {
+    if stderr_tail.len() <= STDERR_REASON_BYTES {
+        return stderr_tail.to_string();
     }
-    reason.push_str("\n\n");
-    reason.push_str(&failure_hint(binary, stderr_tail));
+
+    let ellipsis = "...";
+    let target_len = STDERR_REASON_BYTES.saturating_sub(ellipsis.len());
+    let mut start = stderr_tail.len() - target_len;
+    while start < stderr_tail.len() && !stderr_tail.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{ellipsis}{}", &stderr_tail[start..])
+}
+
+fn format_initialize_failure_reason(binary: &str, stderr_tail: &str, err: &LspError) -> String {
+    let mut reason = format!("server crashed during initialize: {err}");
+    if !stderr_tail.is_empty() {
+        reason.push_str("; stderr (last 64 lines):\n");
+        reason.push_str(&format_stderr_tail_for_reason(stderr_tail));
+        reason.push_str("\n\n");
+        reason.push_str(&failure_hint(binary, stderr_tail));
+    }
     reason
 }
 
@@ -1531,8 +1546,8 @@ fn format_post_initialize_exit_reason(
         .unwrap_or_else(|| "signal/unknown".to_string());
     let mut reason = format!("server exited after initialize (code {code}): {err}");
     if !stderr_tail.is_empty() {
-        reason.push_str(". stderr tail (last 8 lines):\n");
-        reason.push_str(&indent_tail(stderr_tail, 8));
+        reason.push_str("; stderr (last 64 lines):\n");
+        reason.push_str(&format_stderr_tail_for_reason(stderr_tail));
         reason.push_str("\n\n");
         reason.push_str(&failure_hint(binary, stderr_tail));
     }
@@ -1541,14 +1556,27 @@ fn format_post_initialize_exit_reason(
 
 fn failure_hint(binary: &str, stderr_tail: &str) -> String {
     if stderr_tail.contains("MODULE_NOT_FOUND") || stderr_tail.contains("Cannot find module") {
+        let package_manager = infer_package_manager(stderr_tail);
         format!(
-            "Hint: '{binary}' shim resolves to a missing module file. Common cause: package-manager \
-             store corruption from filesystem migration, backup-restore, or store pruning. \
-             Fix: reinstall (e.g. `npm install -g <package> --force` or pnpm/yarn equivalent), \
-             or remove `lsp.servers.<id>` from your config to fall back to AFT's built-in (if available)."
+            "Your package-manager shim resolves to a missing file. Try reinstalling: {package_manager} install -g {binary} --force. Common cause: hard-link breakage from fs migration or store prune."
         )
     } else {
         format!("Hint: see stderr above for '{binary}' failure details.")
+    }
+}
+
+fn infer_package_manager(stderr_tail: &str) -> &'static str {
+    let lower = stderr_tail.to_ascii_lowercase();
+    if lower.contains(".pnpm/") || lower.contains(".pnpm\\") || lower.contains("/pnpm/") {
+        "pnpm"
+    } else if lower.contains(".yarn/")
+        || lower.contains(".yarn\\")
+        || lower.contains("/yarn/")
+        || lower.contains("yarn")
+    {
+        "yarn"
+    } else {
+        "npm"
     }
 }
 

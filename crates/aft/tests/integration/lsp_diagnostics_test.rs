@@ -205,6 +205,34 @@ fn app_context_with_fake_lsp() -> AppContext {
     ctx
 }
 
+fn app_context_with_fake_typescript_lsp() -> AppContext {
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+    ctx
+}
+
+fn executable_crashing_lsp_script(stderr: &str) -> PathBuf {
+    let temp_dir = tempdir().expect("tempdir for crashing lsp");
+    let script = temp_dir.keep().join("crashing_lsp.py");
+    let source = format!(
+        "#!/usr/bin/env python3
+import sys
+sys.stderr.write({stderr:?})
+sys.stderr.flush()
+"
+    );
+    fs::write(&script, source).expect("write crashing lsp script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod crashing lsp script");
+    }
+    script
+}
+
 #[test]
 fn test_diagnostics_stored_after_did_open() {
     let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
@@ -822,10 +850,10 @@ fn test_diagnostics_clear_on_empty_array() {
 
 #[test]
 fn test_lsp_post_initialize_exit_reports_stderr_and_caches_failure() {
-    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs", "lib.rs"]);
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts", "lib.ts"]);
     let first = &files[0];
     let second = &files[1];
-    let ctx = app_context_with_fake_lsp();
+    let ctx = app_context_with_fake_typescript_lsp();
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_PULL_EXIT_MODULE_NOT_FOUND", "1");
@@ -847,7 +875,7 @@ fn test_lsp_post_initialize_exit_reports_stderr_and_caches_failure() {
         "missing stderr in first status: {first_status}"
     );
     assert!(
-        first_status.contains("npm install -g <package> --force"),
+        first_status.contains("npm install -g typescript-language-server --force"),
         "missing reinstall hint in first status: {first_status}"
     );
     assert_eq!(ctx.lsp().active_client_count(), 0);
@@ -870,7 +898,7 @@ fn test_lsp_post_initialize_exit_reports_stderr_and_caches_failure() {
     );
     assert!(
         second_status.contains("MODULE_NOT_FOUND")
-            && second_status.contains("npm install -g <package> --force"),
+            && second_status.contains("npm install -g typescript-language-server --force"),
         "cached status lost stderr/hint: {second_status}"
     );
     assert_eq!(ctx.lsp().active_client_count(), 0);
@@ -878,9 +906,9 @@ fn test_lsp_post_initialize_exit_reports_stderr_and_caches_failure() {
 
 #[test]
 fn test_lsp_initialize_crash_reports_stderr_and_hint() {
-    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
     let file = &files[0];
-    let ctx = app_context_with_fake_lsp();
+    let ctx = app_context_with_fake_typescript_lsp();
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_INIT_CRASH_MODULE_NOT_FOUND", "1");
 
@@ -902,8 +930,43 @@ fn test_lsp_initialize_crash_reports_stderr_and_hint() {
     );
     assert!(status.contains("MODULE_NOT_FOUND"), "status: {status}");
     assert!(
-        status.contains("npm install -g <package> --force"),
+        status.contains("npm install -g typescript-language-server --force"),
         "missing reinstall hint: {status}"
+    );
+}
+
+#[test]
+fn test_lsp_module_not_found_hint_uses_package_manager_path_and_binary() {
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
+    let file = &files[0];
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let script = executable_crashing_lsp_script(
+        "Error: Cannot find module '/Users/me/.local/share/pnpm/global/5/.pnpm/typescript-language-server@4.3.4/node_modules/typescript-language-server/lib/cli.mjs'
+code: 'MODULE_NOT_FOUND'
+",
+    );
+    ctx.lsp().override_binary(ServerKind::TypeScript, script);
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-init-crash-pnpm",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 0
+    }))
+    .expect("request parses");
+    let response =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+    let status = response["lsp_servers_used"][0]["status"]
+        .as_str()
+        .expect("status string");
+
+    assert!(
+        status.contains("stderr (last 64 lines)"),
+        "status: {status}"
+    );
+    assert!(
+        status.contains("Try reinstalling: pnpm install -g typescript-language-server --force"),
+        "missing pnpm reinstall hint: {status}"
     );
 }
 
@@ -937,9 +1000,9 @@ fn test_lsp_stderr_tail_is_bounded_and_drained() {
     let tail = client.stderr_tail();
     assert!(!tail.is_empty(), "stderr tail should be captured");
     assert!(
-        tail.len() <= 16 * 1024,
-        "stderr tail exceeded byte cap: {}",
-        tail.len()
+        tail.lines().count() <= 64,
+        "stderr tail exceeded line cap: {}",
+        tail.lines().count()
     );
     assert!(tail.contains("MODULE_NOT_FOUND"), "tail: {tail}");
 }

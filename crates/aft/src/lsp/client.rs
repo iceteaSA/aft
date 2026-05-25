@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::io::{self, BufReader, BufWriter, Read};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -23,8 +23,8 @@ use crate::lsp::{transport, LspError};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const STDERR_TAIL_LINES: usize = 64;
+const STDERR_LINE_BYTES: usize = 4 * 1024;
 
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
 type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
@@ -120,7 +120,7 @@ pub struct LspClient {
     /// so the signal handler can SIGKILL them on SIGTERM/SIGINT before
     /// aft exits. Cloned via `Arc` — multiple clients share the same set.
     child_registry: LspChildRegistry,
-    stderr_tail: Arc<Mutex<String>>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl LspClient {
@@ -196,7 +196,7 @@ impl LspClient {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("language server missing stderr pipe"))?;
-        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
         spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
@@ -615,7 +615,7 @@ impl LspClient {
     pub fn stderr_tail(&self) -> String {
         self.stderr_tail
             .lock()
-            .map(|s| s.clone())
+            .map(|tail| stderr_tail_to_string(&tail))
             .unwrap_or_default()
     }
 
@@ -682,18 +682,20 @@ impl Drop for LspClient {
 }
 
 fn spawn_stderr_drain_thread(
-    mut stderr: std::process::ChildStderr,
-    stderr_tail: Arc<Mutex<String>>,
+    stderr: std::process::ChildStderr,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 ) {
     thread::spawn(move || {
-        let mut buf = [0_u8; 4096];
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+
         loop {
-            match stderr.read(&mut buf) {
+            line.clear();
+            match reader.read_line(&mut line) {
                 Ok(0) => break,
-                Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                Ok(_) => {
                     if let Ok(mut tail) = stderr_tail.lock() {
-                        append_stderr_tail(&mut tail, &chunk);
+                        append_stderr_tail(&mut tail, &line);
                     } else {
                         break;
                     }
@@ -704,33 +706,31 @@ fn spawn_stderr_drain_thread(
     });
 }
 
-fn append_stderr_tail(tail: &mut String, chunk: &str) {
-    tail.push_str(chunk);
-    trim_stderr_tail_bytes(tail);
-    trim_stderr_tail_lines(tail);
+fn append_stderr_tail(tail: &mut VecDeque<String>, line: &str) {
+    if tail.len() == STDERR_TAIL_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(trim_stderr_line(line));
 }
 
-fn trim_stderr_tail_bytes(tail: &mut String) {
-    if tail.len() <= STDERR_TAIL_BYTES {
-        return;
+fn trim_stderr_line(line: &str) -> String {
+    let line = line.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+    if line.len() <= STDERR_LINE_BYTES {
+        return line.to_string();
     }
-    let mut start = tail.len() - STDERR_TAIL_BYTES;
-    while start < tail.len() && !tail.is_char_boundary(start) {
+
+    let mut start = line.len() - STDERR_LINE_BYTES;
+    while start < line.len() && !line.is_char_boundary(start) {
         start += 1;
     }
-    tail.drain(..start);
+    format!("...{}", &line[start..])
 }
 
-fn trim_stderr_tail_lines(tail: &mut String) {
-    let line_count = tail.lines().count();
-    if line_count <= STDERR_TAIL_LINES {
-        return;
-    }
-    let excess = line_count - STDERR_TAIL_LINES;
-    let split_at = tail.match_indices('\n').nth(excess - 1).map(|(i, _)| i + 1);
-    if let Some(at) = split_at {
-        tail.drain(..at);
-    }
+fn stderr_tail_to_string(tail: &VecDeque<String>) -> String {
+    tail.iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Force-terminate an LSP child and its entire process group on Unix.
