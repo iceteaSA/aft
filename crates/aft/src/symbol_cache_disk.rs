@@ -12,7 +12,15 @@ use crate::symbols::Symbol;
 use crate::{slog_info, slog_warn};
 
 const MAGIC: &[u8; 8] = b"AFTSYM1\0";
-const VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
+
+/// Version of the symbol extraction schema stored in the disk cache.
+///
+/// Bump this whenever symbol-extraction logic changes: tree-sitter grammar
+/// upgrades, query updates, extractor behavior, or symbol shape changes. A
+/// mismatch rejects persisted symbols so they are regenerated on next access.
+pub const SCHEMA_VERSION: u32 = 3;
+
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_SYMBOL_BYTES: usize = 16 * 1024 * 1024;
@@ -146,10 +154,17 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
         return Err("invalid symbol cache magic".to_string());
     }
 
-    let version = read_u32(&mut reader)?;
-    if version != VERSION {
+    let format_version = read_u32(&mut reader)?;
+    if format_version != FORMAT_VERSION {
         return Err(format!(
-            "unsupported symbol cache version: {version} (expected {VERSION})"
+            "unsupported symbol cache format version: {format_version} (expected {FORMAT_VERSION})"
+        ));
+    }
+
+    let schema_version = read_u32(&mut reader)?;
+    if schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported symbol cache schema version: {schema_version} (expected {SCHEMA_VERSION})"
         ));
     }
 
@@ -231,7 +246,8 @@ fn write_cache_file(
         .map_err(|_| std::io::Error::other("too many symbol cache entries"))?;
 
     writer.write_all(MAGIC)?;
-    write_u32(&mut writer, VERSION)?;
+    write_u32(&mut writer, FORMAT_VERSION)?;
+    write_u32(&mut writer, SCHEMA_VERSION)?;
     write_u32(&mut writer, root_len)?;
     write_u32(&mut writer, entry_count)?;
     writer.write_all(root.as_bytes())?;
@@ -416,6 +432,23 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .contains(".tmp.")));
+    }
+
+    #[test]
+    fn symbol_cache_rejects_mismatched_schema_version() {
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let path = cache_path(storage.path(), "schema-project");
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&SCHEMA_VERSION.wrapping_add(1).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        fs::write(&path, bytes).expect("write wrong-schema cache");
+
+        assert!(read_from_disk(storage.path(), "schema-project").is_none());
     }
 
     #[test]

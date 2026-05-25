@@ -58,6 +58,7 @@ mod move_file_test;
 mod move_symbol_test;
 mod outline_languages_test;
 mod outline_zoom_test;
+mod parser_audit_fixes_test;
 mod parser_test;
 mod protocol_test;
 mod query_shape_test;

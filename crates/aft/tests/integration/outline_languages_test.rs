@@ -215,7 +215,7 @@ object Module {
 
     let text = outline_text(&mut aft, &file);
     for expected in [
-        "E cls  enum Color 3:6",
+        "E enum enum Color 3:6",
         "    .E mth  def describe: String = this match { case Red => \"r\"; case Green => \"g\"; case Blue => \"b\" } 5:5",
         "E var  given intShow: Show[Int] = Show.show(_.toString) 10:10",
         "E cls  object Module 12:14",

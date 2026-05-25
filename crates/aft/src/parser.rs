@@ -22,11 +22,27 @@ const TS_QUERY: &str = r#"
 (function_declaration
   name: (identifier) @fn.name) @fn.def
 
-;; arrow functions assigned to const/let/var
+;; function-like values assigned to const/let/var
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
     value: (arrow_function) @arrow.body)) @arrow.def
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @arrow.name
+    value: (function_expression) @arrow.body)) @arrow.def
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @arrow.name
+    value: (generator_function) @arrow.body)) @arrow.def
+
+;; anonymous default exports
+(export_statement
+  value: (function_expression) @default.body) @default.def
+(export_statement
+  value: (generator_function) @default.body) @default.def
+(export_statement
+  value: (class) @default.body) @default.def
 
 ;; class declarations
 (class_declaration
@@ -65,11 +81,27 @@ const JS_QUERY: &str = r#"
 (function_declaration
   name: (identifier) @fn.name) @fn.def
 
-;; arrow functions assigned to const/let/var
+;; function-like values assigned to const/let/var
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
     value: (arrow_function) @arrow.body)) @arrow.def
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @arrow.name
+    value: (function_expression) @arrow.body)) @arrow.def
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @arrow.name
+    value: (generator_function) @arrow.body)) @arrow.def
+
+;; anonymous default exports
+(export_statement
+  value: (function_expression) @default.body) @default.def
+(export_statement
+  value: (generator_function) @default.body) @default.def
+(export_statement
+  value: (class) @default.body) @default.def
 
 ;; class declarations
 (class_declaration
@@ -338,6 +370,8 @@ const SOL_QUERY: &str = r#"
 
 (constructor_definition) @constructor.def
 
+(fallback_receive_definition) @fallback_receive.def
+
 ;; events / errors
 (event_definition
   name: (identifier) @event.name) @event.def
@@ -497,6 +531,16 @@ const LUA_QUERY: &str = r#"
   (assignment_statement
     (variable_list
       name: (identifier) @var.name))) @var.def
+(variable_declaration
+  (assignment_statement
+    (variable_list
+      name: (variable) @var.name))) @var.def
+(variable_declaration
+  (variable_list
+    name: (identifier) @var.name)) @var.def
+(variable_declaration
+  (variable_list
+    name: (variable) @var.name)) @var.def
 "#;
 
 const PERL_QUERY: &str = r#"
@@ -548,10 +592,10 @@ pub enum LangId {
 pub fn detect_language(path: &Path) -> Option<LangId> {
     let ext = path.extension()?.to_str()?;
     match ext {
-        "ts" => Some(LangId::TypeScript),
+        "ts" | "mts" | "cts" => Some(LangId::TypeScript),
         "tsx" => Some(LangId::Tsx),
-        "js" | "jsx" => Some(LangId::JavaScript),
-        "py" => Some(LangId::Python),
+        "js" | "jsx" | "mjs" | "cjs" => Some(LangId::JavaScript),
+        "py" | "pyi" => Some(LangId::Python),
         "rs" => Some(LangId::Rust),
         "go" => Some(LangId::Go),
         "c" | "h" => Some(LangId::C),
@@ -1546,6 +1590,30 @@ fn extract_signature(source: &str, node: &Node) -> String {
     trimmed.to_string()
 }
 
+fn push_default_export_symbol(
+    symbols: &mut Vec<Symbol>,
+    source: &str,
+    lang: LangId,
+    body_node: Node,
+    def_node: Node,
+) {
+    let kind = if body_node.kind() == "class" {
+        SymbolKind::Class
+    } else {
+        SymbolKind::Function
+    };
+
+    symbols.push(Symbol {
+        name: "default".to_string(),
+        kind,
+        range: node_range_with_decorators(&def_node, source, lang),
+        signature: Some(extract_signature(source, &def_node)),
+        scope_chain: vec![],
+        exported: true,
+        parent: None,
+    });
+}
+
 /// Extract symbols from TypeScript / TSX source.
 fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::TypeScript;
@@ -1580,6 +1648,8 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut type_alias_def_node = None;
         let mut var_name_node = None;
         let mut var_def_node = None;
+        let mut default_body_node = None;
+        let mut default_def_node = None;
 
         for cap in m.captures {
             let Some(&name) = capture_names.get(cap.index as usize) else {
@@ -1603,6 +1673,8 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "type_alias.def" => type_alias_def_node = Some(cap.node),
                 "var.name" => var_name_node = Some(cap.node),
                 "var.def" => var_def_node = Some(cap.node),
+                "default.body" => default_body_node = Some(cap.node),
+                "default.def" => default_def_node = Some(cap.node),
                 // var.value/var.decl removed — not needed
                 _ => {}
             }
@@ -1632,6 +1704,11 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 exported: is_exported(&def_node, &export_ranges),
                 parent: None,
             });
+        }
+
+        // Anonymous/default function or class expression
+        if let (Some(body_node), Some(def_node)) = (default_body_node, default_def_node) {
+            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node);
         }
 
         // Class declaration
@@ -1758,6 +1835,8 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut method_class_name_node = None;
         let mut method_name_node = None;
         let mut method_def_node = None;
+        let mut default_body_node = None;
+        let mut default_def_node = None;
 
         for cap in m.captures {
             let Some(&name) = capture_names.get(cap.index as usize) else {
@@ -1773,6 +1852,8 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "method.class_name" => method_class_name_node = Some(cap.node),
                 "method.name" => method_name_node = Some(cap.node),
                 "method.def" => method_def_node = Some(cap.node),
+                "default.body" => default_body_node = Some(cap.node),
+                "default.def" => default_def_node = Some(cap.node),
                 _ => {}
             }
         }
@@ -1799,6 +1880,10 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 exported: is_exported(&def_node, &export_ranges),
                 parent: None,
             });
+        }
+
+        if let (Some(body_node), Some(def_node)) = (default_body_node, default_def_node) {
+            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node);
         }
 
         if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
@@ -3319,6 +3404,7 @@ fn extract_solidity_symbols(
         let mut modifier_name_node = None;
         let mut modifier_def_node = None;
         let mut constructor_def_node = None;
+        let mut fallback_receive_def_node = None;
         let mut event_name_node = None;
         let mut event_def_node = None;
         let mut error_name_node = None;
@@ -3346,6 +3432,7 @@ fn extract_solidity_symbols(
                 "modifier.name" => modifier_name_node = Some(cap.node),
                 "modifier.def" => modifier_def_node = Some(cap.node),
                 "constructor.def" => constructor_def_node = Some(cap.node),
+                "fallback_receive.def" => fallback_receive_def_node = Some(cap.node),
                 "event.name" => event_name_node = Some(cap.node),
                 "event.def" => event_def_node = Some(cap.node),
                 "error.name" => error_name_node = Some(cap.node),
@@ -3440,6 +3527,26 @@ fn extract_solidity_symbols(
                 kind: SymbolKind::Method,
                 range: node_range_with_decorators(&def_node, source, lang),
                 signature: Some(extract_signature(source, &def_node)),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: true,
+            });
+        }
+
+        // receive() / fallback() — synthetic names, parent is the enclosing contract
+        if let Some(def_node) = fallback_receive_def_node {
+            let scope_chain = solidity_scope_chain(&def_node, source);
+            let signature = extract_signature(source, &def_node);
+            let name = if signature.trim_start().starts_with("receive") {
+                "receive"
+            } else {
+                "fallback"
+            };
+            symbols.push(Symbol {
+                name: name.to_string(),
+                kind: SymbolKind::Method,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(signature),
                 parent: scope_chain.last().cloned(),
                 scope_chain,
                 exported: true,
@@ -3664,7 +3771,7 @@ fn extract_scala_symbols(
         if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
-                kind: SymbolKind::Class,
+                kind: SymbolKind::Enum,
                 range: node_range_with_decorators(&def_node, source, lang),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: scala_scope_chain(&def_node, source),
@@ -4217,13 +4324,13 @@ fn swift_scope_chain(node: &Node, source: &str) -> Vec<String> {
 }
 
 fn swift_type_kind(source: &str, node: &Node) -> SymbolKind {
-    let signature = extract_signature(source, node);
-    if signature.starts_with("struct ") {
-        SymbolKind::Struct
-    } else if signature.starts_with("enum ") {
-        SymbolKind::Enum
-    } else {
-        SymbolKind::Class
+    match node
+        .child_by_field_name("declaration_kind")
+        .map(|kind_node| node_text(source, &kind_node))
+    {
+        Some("struct") => SymbolKind::Struct,
+        Some("enum") => SymbolKind::Enum,
+        _ => SymbolKind::Class,
     }
 }
 
@@ -5405,6 +5512,18 @@ fn node_contains_token(source: &str, node: &Node, token: &str) -> bool {
 }
 
 fn default_export_target_name(source: &str, export_stmt: &Node) -> Option<String> {
+    if let Some(value_node) = export_stmt.child_by_field_name("value") {
+        if let Some(name) = default_export_node_name(source, &value_node) {
+            return Some(name);
+        }
+    }
+
+    if let Some(declaration_node) = export_stmt.child_by_field_name("declaration") {
+        if let Some(name) = default_export_node_name(source, &declaration_node) {
+            return Some(name);
+        }
+    }
+
     let mut cursor = export_stmt.walk();
     if !cursor.goto_first_child() {
         return None;
@@ -5412,43 +5531,54 @@ fn default_export_target_name(source: &str, export_stmt: &Node) -> Option<String
 
     loop {
         let child = cursor.node();
-        match child.kind() {
-            "function_declaration"
-            | "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "type_alias_declaration"
-            | "lexical_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    return Some(node_text(source, &name_node).to_string());
-                }
-
-                if child.kind() == "lexical_declaration" {
-                    let mut child_cursor = child.walk();
-                    if child_cursor.goto_first_child() {
-                        loop {
-                            let nested = child_cursor.node();
-                            if nested.kind() == "variable_declarator" {
-                                if let Some(name_node) = nested.child_by_field_name("name") {
-                                    return Some(node_text(source, &name_node).to_string());
-                                }
-                            }
-                            if !child_cursor.goto_next_sibling() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            "identifier" | "type_identifier" => {
-                let text = node_text(source, &child);
-                if text != "export" && text != "default" {
-                    return Some(text.to_string());
-                }
-            }
-            _ => {}
+        if let Some(name) = default_export_node_name(source, &child) {
+            return Some(name);
         }
 
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn default_export_node_name(source: &str, node: &Node) -> Option<String> {
+    match node.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function"
+        | "class_declaration"
+        | "class" => node
+            .child_by_field_name("name")
+            .map(|name_node| node_text(source, &name_node).to_string())
+            .or_else(|| Some("default".to_string())),
+        "interface_declaration" | "enum_declaration" | "type_alias_declaration" => node
+            .child_by_field_name("name")
+            .map(|name_node| node_text(source, &name_node).to_string()),
+        "lexical_declaration" => lexical_declaration_name(source, node),
+        "identifier" | "type_identifier" => {
+            let text = node_text(source, node);
+            (text != "export" && text != "default").then(|| text.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn lexical_declaration_name(source: &str, node: &Node) -> Option<String> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let child = cursor.node();
+        if child.kind() == "variable_declarator" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                return Some(node_text(source, &name_node).to_string());
+            }
+        }
         if !cursor.goto_next_sibling() {
             break;
         }
