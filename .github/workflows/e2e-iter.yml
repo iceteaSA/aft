@@ -98,3 +98,16 @@ jobs:
         env:
           AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
           AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist
+
+      - name: Dump full plugin log on failure
+        if: failure()
+        run: |
+          echo "=== Searching for plugin log files ==="
+          find "$RUNNER_TEMP" -name "aft-plugin.log" 2>/dev/null | head -5
+          echo ""
+          echo "=== Plugin log contents ==="
+          find "$RUNNER_TEMP" -name "aft-plugin.log" -exec cat {} \;
+          echo ""
+          echo "=== Bridge dist content (relevant section) ==="
+          grep -A1 "spawnProcess: useFastembedBackend" packages/aft-bridge/dist/bridge.js || echo "(not in bridge dist)"
+          grep -A1 "spawnProcess: useFastembedBackend" packages/opencode-plugin/dist/index.js || echo "(not in OC plugin dist)"
