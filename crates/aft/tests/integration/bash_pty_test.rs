@@ -344,7 +344,7 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
     let started = Instant::now();
     let task_id = registry
         .spawn_pty(
-            "printf wake",
+            "/bin/sh -c 'while [ ! -f wake-ready ]; do sleep 0.01; done; printf wake'",
             SESSION.to_string(),
             project.path().to_path_buf(),
             Default::default(),
@@ -358,12 +358,19 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
             80,
         )
         .unwrap();
-    let _snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
-    // Watchdog wake-channel completion must be far faster than the periodic
-    // watchdog poll (5s). 500ms is too tight on loaded CI runners — bumped
-    // to 2500ms which still proves the wake channel fired rather than the
-    // periodic poll, while absorbing GitHub Linux runner load variance.
-    assert!(started.elapsed() < Duration::from_millis(2500));
+    fs::write(project.path().join("wake-ready"), b"ready").unwrap();
+
+    // Do not poll status here: status() calls poll_task directly and can
+    // complete PTY tasks without the watchdog. Draining completions observes
+    // the completion frame queued by the watchdog thread.
+    let completion = wait_for_completion(&registry, &task_id);
+    assert_eq!(completion.status, BgTaskStatus::Completed);
+
+    // The command waits for this test to arm it after spawn_pty returns, so the
+    // reader/waiter cannot signal before the task is registered. A completion
+    // under 450ms is below the 500ms watchdog interval, leaving a 50ms guard at
+    // the boundary while still proving the wake channel beat the periodic poll.
+    assert!(started.elapsed() < Duration::from_millis(450));
 }
 
 #[test]
