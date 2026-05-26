@@ -6,7 +6,9 @@ on:
       - "v*"
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Include SHA so a retag at a different commit gets its own concurrency
+  # group and won't get blocked behind a stuck zombie queued run.
+  group: release-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
