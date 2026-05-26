@@ -40,6 +40,7 @@ describe("hoisted tool adapters", () => {
       hoistWrite: false,
       hoistEdit: false,
       hoistGrep: false,
+      restrictToProjectRoot: true,
     });
 
     const ranged = (await executeTool(tools.get("read")!, {
@@ -65,6 +66,7 @@ describe("hoisted tool adapters", () => {
       hoistWrite: false,
       hoistEdit: true,
       hoistGrep: false,
+      restrictToProjectRoot: true,
     });
 
     await executeTool(tools.get("edit")!, {
@@ -95,6 +97,7 @@ describe("hoisted tool adapters", () => {
       hoistWrite: false,
       hoistEdit: false,
       hoistGrep: true,
+      restrictToProjectRoot: true,
     });
 
     await executeTool(
@@ -125,6 +128,7 @@ describe("hoisted tool adapters", () => {
       hoistWrite: false,
       hoistEdit: false,
       hoistGrep: true,
+      restrictToProjectRoot: true,
     });
 
     await executeTool(tools.get("grep")!, { pattern: "oauth", path: "~/" }, { cwd: home } as never);
@@ -143,6 +147,7 @@ describe("hoisted tool adapters", () => {
       hoistWrite: true,
       hoistEdit: false,
       hoistGrep: false,
+      restrictToProjectRoot: true,
     });
 
     await executeTool(tools.get("write")!, { filePath: "src/app.ts", content: "export {};\n" });
@@ -165,6 +170,7 @@ describe("hoisted tool adapters", () => {
       hoistWrite: true,
       hoistEdit: false,
       hoistGrep: false,
+      restrictToProjectRoot: true,
     });
 
     // The ui.confirm prompt fires unconditionally for external paths, matching
@@ -203,6 +209,47 @@ describe("hoisted tool adapters", () => {
     expect(calls[0].params).toMatchObject({ file: externalPath, content: "x" });
   });
 
+  test("external path skips ui.confirm when restrictToProjectRoot is false", async () => {
+    const root = await tempRoot();
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: false,
+      hoistGrep: false,
+      // User opted in to "no restriction" — Pi has no host-level allow-list
+      // to consult, so AFT must defer to Rust without nagging with a prompt.
+      restrictToProjectRoot: false,
+    });
+
+    let confirmCallCount = 0;
+    const externalPath = join(tmpdir(), `aft-external-norestrict-${process.pid}-${Date.now()}.txt`);
+    const extCtx = {
+      cwd: root,
+      hasUI: true,
+      ui: {
+        confirm: (_title: string, _message: string) => {
+          confirmCallCount += 1;
+          return Promise.resolve(false);
+        },
+      },
+    };
+
+    await executeTool(
+      tools.get("write")!,
+      { filePath: externalPath, content: "x" },
+      extCtx as never,
+    );
+
+    // Plugin must NOT prompt; Rust accepts the path because the flag forwards
+    // to its own `restrict_to_project_root: false`.
+    expect(confirmCallCount).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe("write");
+    expect(calls[0].params).toMatchObject({ file: externalPath, content: "x" });
+  });
+
   test("external path denies immediately when hasUI is false (no confirm hang)", async () => {
     const root = await tempRoot();
     const { api, tools } = makeMockApi();
@@ -212,6 +259,7 @@ describe("hoisted tool adapters", () => {
       hoistWrite: true,
       hoistEdit: false,
       hoistGrep: false,
+      restrictToProjectRoot: true,
     });
 
     // Without a UI to surface ui.confirm, we MUST deny synchronously rather
@@ -235,6 +283,7 @@ describe("hoisted tool adapters", () => {
       hoistWrite: true,
       hoistEdit: false,
       hoistGrep: false,
+      restrictToProjectRoot: true,
     });
 
     // confirm returns a Promise that never resolves — exactly the failure mode

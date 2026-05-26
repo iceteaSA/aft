@@ -310,6 +310,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   hoistWrite: boolean;
   hoistEdit: boolean;
   hoistGrep: boolean;
+  restrictToProjectRoot: boolean;
   outline: boolean;
   zoom: boolean;
   semantic: boolean;
@@ -329,6 +330,11 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   const disabled = new Set(config.disabled_tools ?? []);
   const ok = (name: string): boolean => !disabled.has(name);
   const allOnly = (name: string): boolean => ALL_ONLY_TOOLS.has(name) && ok(name);
+  // Mirrors the Pi-side default in `configureOverrides` below: false means
+  // "no plugin-side restriction; let Rust accept any path." Threaded into
+  // ToolSurfaceFlags so hoisted tools can suppress the external_directory
+  // prompt that Pi has no host-level allow-list to back.
+  const restrictToProjectRoot = config.restrict_to_project_root ?? false;
 
   if (surface === "minimal") {
     return {
@@ -337,6 +343,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       hoistWrite: false,
       hoistEdit: false,
       hoistGrep: false,
+      restrictToProjectRoot,
       outline: ok("aft_outline"),
       zoom: ok("aft_zoom"),
       semantic: false,
@@ -361,6 +368,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     hoistWrite: ok("write"),
     hoistEdit: ok("edit"),
     hoistGrep: ok("grep") && config.search_index === true,
+    restrictToProjectRoot,
     outline: ok("aft_outline"),
     zoom: ok("aft_zoom"),
     semantic: ok("aft_search") && config.semantic_search === true,

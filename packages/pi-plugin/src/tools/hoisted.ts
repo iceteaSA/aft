@@ -86,17 +86,25 @@ async function assertExternalDirectoryPermission(
   },
   target: string,
   action = "modify",
+  options: { restrictToProjectRoot?: boolean } = {},
 ): Promise<void> {
   if (!target) return;
   const expanded = expandTilde(target);
   const absoluteTarget = isAbsolute(expanded) ? expanded : resolve(extCtx.cwd, expanded);
   if (containsPath(extCtx.cwd, absoluteTarget)) return;
 
+  // User has explicitly opted out of path restriction (the Pi default).
+  // Pi has no host-level external_directory allow-list to consult, so a
+  // ui.confirm prompt has no policy behind it — it would just nag the
+  // user on every external path. Defer to Rust, which will accept the
+  // path because `restrict_to_project_root` is false.
+  if (options.restrictToProjectRoot === false) return;
+
   // No UI available — deny immediately so the agent gets a clear refusal
-  // instead of an unanswerable prompt. Pi users who want to allow external
-  // paths from non-UI contexts can set `restrict_to_project_root: false`
-  // (the default) which lets Rust handle the bridge call without an ask
-  // here, or run Pi in a context that surfaces `ui.confirm`.
+  // instead of an unanswerable prompt. This branch is only reachable when
+  // `restrict_to_project_root: true` AND no UI is available, which is
+  // unusual; the right path is to either run Pi interactively or relax
+  // the restriction.
   const confirmFn = extCtx.ui?.confirm;
   if (extCtx.hasUI === false || !confirmFn) {
     throw new Error(
@@ -183,6 +191,19 @@ export interface ToolSurfaceFlags {
   hoistWrite: boolean;
   hoistEdit: boolean;
   hoistGrep: boolean;
+  /**
+   * Mirrors the user's `restrict_to_project_root` AFT config (Pi default
+   * `false`). When false, the user has explicitly opted into "no
+   * restriction" — Pi has no host-level external_directory allow-list, so
+   * a `ui.confirm` prompt has no policy to consult and would only annoy
+   * the user. When true, Rust hard-rejects out-of-root paths before the
+   * plugin layer sees them anyway, so the prompt is also unreachable. We
+   * pass this through so `assertExternalDirectoryPermission` can skip the
+   * prompt in the false case (the common one) and the helper stays in
+   * place as a safety net for unusual contexts that opt into restriction
+   * but still want a chance to allow a one-off external write.
+   */
+  restrictToProjectRoot: boolean;
 }
 
 /** Details surfaced to both renderer and agent message stream. */
@@ -297,7 +318,9 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
-        await assertExternalDirectoryPermission(extCtx, params.filePath, "modify");
+        await assertExternalDirectoryPermission(extCtx, params.filePath, "modify", {
+          restrictToProjectRoot: surface.restrictToProjectRoot,
+        });
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const response = await callBridge(
           bridge,
@@ -342,7 +365,9 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
-        await assertExternalDirectoryPermission(extCtx, params.filePath, "modify");
+        await assertExternalDirectoryPermission(extCtx, params.filePath, "modify", {
+          restrictToProjectRoot: surface.restrictToProjectRoot,
+        });
         const bridge = bridgeFor(ctx, extCtx.cwd);
 
         // Append mode: explicitly route through the Rust `append` op, which
@@ -408,7 +433,9 @@ export function registerHoistedTools(
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = { pattern: params.pattern };
         if (params.path) {
-          await assertExternalDirectoryPermission(extCtx, params.path, "search");
+          await assertExternalDirectoryPermission(extCtx, params.path, "search", {
+            restrictToProjectRoot: surface.restrictToProjectRoot,
+          });
           req.path = await resolvePathArg(extCtx.cwd, params.path);
         }
         if (params.include) req.include = splitIncludeGlobs(params.include);
