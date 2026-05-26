@@ -112,6 +112,29 @@ describe("hoisted tool adapters", () => {
     });
   });
 
+  test("grep expands ~ in path arg to the user's home directory", async () => {
+    // Agents commonly type `~/Work/...` paths. Without expansion, Node's
+    // path.resolve treats `~` as a literal directory, the existence check
+    // fails, and Rust receives the unresolved path. Expansion must happen
+    // before stat() so absolute tilde paths resolve like the shell would.
+    const home = (await import("node:os")).homedir();
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "" }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: true,
+    });
+
+    await executeTool(tools.get("grep")!, { pattern: "oauth", path: "~/" }, { cwd: home } as never);
+
+    expect(calls[0].command).toBe("grep");
+    // When the expanded path equals the home directory itself, stat()
+    // succeeds and resolvePathArg returns the absolute form.
+    expect(calls[0].params).toEqual({ pattern: "oauth", path: home });
+  });
+
   test("write always asks Rust for diagnostics and a diff", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
@@ -178,6 +201,77 @@ describe("hoisted tool adapters", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("write");
     expect(calls[0].params).toMatchObject({ file: externalPath, content: "x" });
+  });
+
+  test("external path denies immediately when hasUI is false (no confirm hang)", async () => {
+    const root = await tempRoot();
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: false,
+      hoistGrep: false,
+    });
+
+    // Without a UI to surface ui.confirm, we MUST deny synchronously rather
+    // than wait on a prompt that nothing will answer — that's the hang the
+    // user reported for grep against ~/Work/... in agent-driven mode.
+    const externalPath = join(tmpdir(), `aft-external-noui-${process.pid}-${Date.now()}.txt`);
+    const extCtx = { cwd: root, hasUI: false };
+
+    await expect(
+      executeTool(tools.get("write")!, { filePath: externalPath, content: "x" }, extCtx as never),
+    ).rejects.toThrow("Permission denied");
+    expect(calls).toEqual([]);
+  });
+
+  test("external path denies on confirm timeout (no bridge wedge)", async () => {
+    const root = await tempRoot();
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: false,
+      hoistGrep: false,
+    });
+
+    // confirm returns a Promise that never resolves — exactly the failure mode
+    // observed when Pi can't surface the prompt mid-agent-tool-call. The
+    // hard timeout in assertExternalDirectoryPermission must take over and
+    // throw a deterministic Permission denied so the agent unblocks. We
+    // shrink the prod 30s timeout to 50ms via env override for this test.
+    const previous = process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS;
+    process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS = "50";
+    try {
+      const externalPath = join(tmpdir(), `aft-external-stuck-${process.pid}-${Date.now()}.txt`);
+      let confirmCallCount = 0;
+      const extCtx = {
+        cwd: root,
+        hasUI: true,
+        ui: {
+          confirm: (_title: string, _message: string) => {
+            confirmCallCount += 1;
+            return new Promise<boolean>(() => {
+              /* never resolves */
+            });
+          },
+        },
+      };
+
+      await expect(
+        executeTool(tools.get("write")!, { filePath: externalPath, content: "x" }, extCtx as never),
+      ).rejects.toThrow(/Permission denied.*timed out/);
+      expect(confirmCallCount).toBe(1);
+      expect(calls).toEqual([]);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS;
+      } else {
+        process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS = previous;
+      }
+    }
   });
 
   test("formatReadFooter only hints when Rust clamped an unbounded read", () => {

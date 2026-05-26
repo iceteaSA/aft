@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { z } from "zod";
@@ -10,6 +11,22 @@ import {
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
 } from "./permissions.js";
+
+/**
+ * Expand a leading `~` to the user's home directory. Mirrors shell-style
+ * expansion so agent calls like `grep ... in ~/Work/...` resolve before
+ * any permission check or bridge call sees the literal tilde. Required
+ * because Node's `path.resolve` treats `~` as a literal directory name,
+ * so `~/foo` ends up resolved to `<cwd>/~/foo`.
+ */
+function expandTilde(input: string): string {
+  if (!input || !input.startsWith("~")) return input;
+  if (input === "~") return os.homedir();
+  if (input.startsWith("~/") || input.startsWith(`~${path.sep}`)) {
+    return path.resolve(os.homedir(), input.slice(2));
+  }
+  return input;
+}
 
 type ToolArg = ToolDefinition["args"][string];
 type SearchPathKind = "file" | "directory";
@@ -67,7 +84,8 @@ function normalizeGlob(pattern: string): string {
 }
 
 function absoluteSearchPath(context: ToolContext, target: string): string {
-  return path.isAbsolute(target) ? target : path.resolve(context.directory, target);
+  const expanded = expandTilde(target);
+  return path.isAbsolute(expanded) ? expanded : path.resolve(context.directory, expanded);
 }
 
 function searchPathExists(context: ToolContext, target: string): boolean {
@@ -175,7 +193,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
     execute: async (args, context): Promise<string> => {
       const pattern = String(args.pattern);
       const includeArg = args.include ? String(args.include) : undefined;
-      const pathArg = args.path ? String(args.path) : undefined;
+      const pathArg = args.path ? expandTilde(String(args.path)) : undefined;
 
       // Match OpenCode native ordering: grep permission first (on the raw
       // pattern + path the agent typed), then external_directory check on
@@ -230,8 +248,8 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
     execute: async (args, context): Promise<string> => {
       // Handle absolute paths embedded in the pattern (e.g. "/abs/path/src/**/*.ts")
       // Split into path (directory prefix) and pattern (glob suffix)
-      let globPattern = String(args.pattern);
-      let globPath = args.path ? String(args.path) : undefined;
+      let globPattern = expandTilde(String(args.pattern));
+      let globPath = args.path ? expandTilde(String(args.path)) : undefined;
 
       if (!globPath && globPattern.startsWith("/")) {
         // Find the last directory component before any glob metacharacters.

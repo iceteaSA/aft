@@ -19,7 +19,7 @@
 
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
   type AgentToolResult,
   type ExtensionAPI,
@@ -47,21 +47,88 @@ function containsPath(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/**
+ * Expand a leading `~` to the user's home directory. Returns the path
+ * unchanged if it does not start with `~`. Mirrors shell-style expansion so
+ * agent calls like `grep ... in ~/Work/...` resolve before any filesystem
+ * stat or permission check sees the literal tilde.
+ */
+function expandTilde(path: string): string {
+  if (!path || !path.startsWith("~")) return path;
+  if (path === "~") return homedir();
+  if (path.startsWith(`~${sep}`) || path.startsWith("~/")) {
+    return resolve(homedir(), path.slice(2));
+  }
+  return path;
+}
+
+/**
+ * Hard upper bound on how long we'll wait for `ui.confirm` before treating
+ * the prompt as denied. Without this, an agent-driven tool call from a
+ * non-UI Pi context (or any path where the host can't surface the prompt)
+ * blocks the bridge round-trip indefinitely — observed as "grep hangs
+ * forever". Denial after 30s preserves the security model while letting
+ * the agent recover. Overridable for tests via
+ * `AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS`.
+ */
+function externalDirectoryPromptTimeoutMs(): number {
+  const raw = process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS;
+  if (raw === undefined) return 30_000;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
+}
+
 async function assertExternalDirectoryPermission(
-  extCtx: { cwd: string; ui?: { confirm?: (title: string, message: string) => Promise<boolean> } },
+  extCtx: {
+    cwd: string;
+    hasUI?: boolean;
+    ui?: { confirm?: (title: string, message: string) => Promise<boolean> };
+  },
   target: string,
   action = "modify",
 ): Promise<void> {
   if (!target) return;
-  const absoluteTarget = isAbsolute(target) ? target : resolve(extCtx.cwd, target);
+  const expanded = expandTilde(target);
+  const absoluteTarget = isAbsolute(expanded) ? expanded : resolve(extCtx.cwd, expanded);
   if (containsPath(extCtx.cwd, absoluteTarget)) return;
 
-  const confirmed = await extCtx.ui?.confirm?.(
-    "Allow external directory access?",
-    `AFT wants to ${action} outside the project: ${absoluteTarget}`,
-  );
-  if (confirmed === true) return;
-  throw new Error("Permission denied: external directory access was cancelled.");
+  // No UI available — deny immediately so the agent gets a clear refusal
+  // instead of an unanswerable prompt. Pi users who want to allow external
+  // paths from non-UI contexts can set `restrict_to_project_root: false`
+  // (the default) which lets Rust handle the bridge call without an ask
+  // here, or run Pi in a context that surfaces `ui.confirm`.
+  const confirmFn = extCtx.ui?.confirm;
+  if (extCtx.hasUI === false || !confirmFn) {
+    throw new Error(
+      `Permission denied: cannot prompt for ${action} outside the project (${absoluteTarget}).`,
+    );
+  }
+
+  // Race the confirm against a hard timeout so a stuck prompt cannot wedge
+  // the bridge dispatch loop.
+  const timeoutMs = externalDirectoryPromptTimeoutMs();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  try {
+    const result = await Promise.race([
+      confirmFn(
+        "Allow external directory access?",
+        `AFT wants to ${action} outside the project: ${absoluteTarget}`,
+      ),
+      timeoutPromise,
+    ]);
+    if (result === true) return;
+    if (result === "timeout") {
+      throw new Error(
+        `Permission denied: external directory prompt timed out after ${timeoutMs}ms.`,
+      );
+    }
+    throw new Error("Permission denied: external directory access was cancelled.");
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 const ReadParams = Type.Object({
@@ -613,14 +680,15 @@ function shortenPath(path: string): string {
   return path;
 }
 
-/** Resolve a path argument to an absolute path if it exists. */
+/** Resolve a path argument to an absolute path if it exists, expanding `~`. */
 async function resolvePathArg(cwd: string, path: string): Promise<string> {
-  const abs = resolve(cwd, path);
+  const expanded = expandTilde(path);
+  const abs = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
   try {
     await stat(abs);
     return abs;
   } catch {
-    return path;
+    return expanded;
   }
 }
 
