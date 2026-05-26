@@ -464,7 +464,7 @@ export function createBashStatusTool(ctx: PluginContext) {
     name: "bash_status",
     label: "bash_status",
     description:
-      "Read-only snapshot of a background bash task. Returns immediately. Use bash_watch to block on or register for pattern matches and exit events.",
+      "Read-only snapshot of a background bash task. Returns immediately. Never waits. Use bash_watch to block on or register for pattern matches and exit events.",
     promptSnippet: "Inspect a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(

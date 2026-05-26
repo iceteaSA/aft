@@ -17,7 +17,7 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
         "- 'call_tree': See what a function calls (forward traversal). Use to understand dependencies before modifying a function.\n" +
         "- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n" +
         "- 'trace_to': Trace how execution reaches a function from entry points (routes, exports, main). Use to understand context around deeply-nested code.\n" +
-        "- 'trace_to_symbol': Find the shortest call path from one symbol to another symbol across the codebase. Requires 'toSymbol'; use 'toFile' when the target name is ambiguous.\n" +
+        "- 'trace_to_symbol': Find the shortest call path from one symbol to another symbol across the codebase. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toFile' to disambiguate.\n" +
         "- 'impact': Analyze what breaks if a symbol changes. Returns affected callers with signatures and entry point status.\n" +
         "- 'trace_data': Follow a value through variable assignments and function parameters across files. Requires 'symbol' (scope to trace from) and 'expression'.\n\n" +
         "All ops require both 'filePath' and 'symbol'. The 'expression' parameter is additionally required for trace_data; 'toSymbol' is additionally required for trace_to_symbol.\n\n",

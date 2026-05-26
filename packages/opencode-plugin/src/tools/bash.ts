@@ -38,7 +38,7 @@ const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 // background promotion, so we poll until the task is terminal or this cap fires.
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 
-const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, optional background execution, and PTY mode for interactive programs. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a task_id for bash_status/bash_kill. Pass pty: true with background: true for interactive REPLs and drive them with bash_status({ outputMode: "screen" }) plus bash_write. Use bash_watch to block on or register for pattern matches and exit events.`;
+const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, optional background execution, and PTY mode for interactive programs. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a taskId for bash_status/bash_kill. Pass pty: true for interactive REPLs and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically). Use bash_watch to block on or register for pattern matches and exit events.`;
 
 interface PermissionAsk {
   kind: "external_directory" | "bash";
@@ -114,7 +114,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .boolean()
         .optional()
         .describe(
-          "When true, spawn the command in the background and return a task_id for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+          "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
         ),
       compressed: z
         .boolean()
@@ -353,7 +353,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
 export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
   return {
     description:
-      "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Use bash_watch to block on or register for pattern matches and exit events.",
+      "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. Use bash_watch to block on or register for pattern matches and exit events.",
     args: {
       taskId: z
         .string()

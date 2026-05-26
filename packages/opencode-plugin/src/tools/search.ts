@@ -159,7 +159,7 @@ export function splitIncludeArg(raw: string): string[] {
 export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const grepTool: ToolDefinition = {
     description:
-      "Search file contents using regular expressions. Returns matching lines with file paths, line numbers, and context.",
+      "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Capped at 100 matches; if you hit the cap, narrow with `path` or `include` and re-run.",
     args: {
       pattern: arg(z.string().describe("Regular expression pattern to search for")),
       include: arg(

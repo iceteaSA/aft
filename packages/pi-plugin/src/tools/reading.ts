@@ -381,7 +381,7 @@ export function registerReadingTools(
       name: "aft_zoom",
       label: "zoom",
       description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (calls/called-by). For Markdown and HTML, returns the section content under the given heading.\n\nProvide exactly ONE of `filePath` or `url`. Pass `symbols` for one or many in the same file/URL (string or array). For symbols from DIFFERENT files in one call, use `targets` instead.",
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (calls/called-by). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them.",
       parameters: ZoomParams,
       async execute(
         _toolCallId: string,

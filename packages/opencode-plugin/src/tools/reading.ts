@@ -71,7 +71,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         target: z
           .union([z.string(), z.array(z.string())])
           .describe(
-            "What to outline: a file path, directory path, URL, or array of file paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+            "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
           ),
         files: z
           .boolean()
@@ -188,7 +188,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
 
     aft_zoom: {
       description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (what it calls and what calls it). For Markdown and HTML, returns the section content under the given heading.\n\nProvide exactly ONE of `filePath` or `url`. Pass `symbols` for one or many in the same file/URL (string or array). For symbols from DIFFERENT files in one call, use `targets` instead.",
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (what it calls and what calls it). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them.",
       args: {
         filePath: z
           .string()

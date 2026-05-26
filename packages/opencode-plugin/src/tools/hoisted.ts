@@ -754,7 +754,12 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         "0-indexed occurrence to replace when multiple matches exist",
       ),
       symbol: z.string().optional().describe("Named symbol to replace (function, class, type)"),
-      content: z.string().optional().describe("New content for symbol replace or file write"),
+      content: z
+        .string()
+        .optional()
+        .describe(
+          "Replacement content for symbol mode or operations[].command='write'. For whole-file writes, use the `write` tool.",
+        ),
       appendContent: z
         .string()
         .optional()
@@ -1034,7 +1039,7 @@ Example patch:
 \`\`\`
 
 **Behavior:**
-- All file changes are applied with checkpoint-based rollback — if any file fails, previous changes are rolled back (best-effort)
+- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. A pre-patch checkpoint is created automatically — use \`aft_safety\` undo if you need to revert.
 - Files are backed up before modification
 - Parent directories are created automatically for new files
 - Fuzzy matching for context anchors (handles whitespace and Unicode differences)
@@ -1601,7 +1606,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
 
 const MOVE_DESCRIPTION =
   "Move or rename a file with backup. Creates parent directories for destination automatically\n" +
-  "Note: This moves/renames files at the OS level.";
+  "Note: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead.";
 
 function createMoveTool(ctx: PluginContext): ToolDefinition {
   return {

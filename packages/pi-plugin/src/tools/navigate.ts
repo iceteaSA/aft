@@ -251,7 +251,7 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
     name: "aft_navigate",
     label: "navigate",
     description:
-      "Navigate code structure across files using call graph analysis. All ops require both `filePath` and `symbol`. Use `call_tree` for what a function calls, `callers` for call sites, `trace_to` for entry points, `trace_to_symbol` for a path from one symbol to another, `impact` for blast radius, `trace_data` to follow a value.",
+      "Navigate code structure across files using call graph analysis. All ops require both `filePath` and `symbol`. Use `call_tree` for what a function calls, `callers` for call sites, `trace_to` for entry points, `trace_to_symbol` for a path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `impact` for blast radius, `trace_data` to follow a value.",
     parameters: navigateParamsSchema(),
     async execute(_toolCallId: string, params: NavigateArgs, _signal, _onUpdate, extCtx) {
       if (params.op === "trace_data" && !params.expression) {

@@ -56,7 +56,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // Web/URL access — needs aft_outline + aft_zoom.
   if (hasOutline && hasZoom) {
     sections.push(
-      `**Web/URL access**: \`aft_outline({ url })\` first for structure, then \`aft_zoom({ url, symbols: "<heading>" })\` for the specific section.`,
+      `**Web/URL access**: \`aft_outline({ target: url })\` first for structure, then \`aft_zoom({ url, symbols: "<heading>" })\` for the specific section.`,
     );
   }
 
