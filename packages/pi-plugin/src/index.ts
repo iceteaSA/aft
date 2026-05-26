@@ -184,13 +184,13 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.30.0";
+const ANNOUNCEMENT_VERSION = "0.31.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  'PTY support for interactive bash. `bash({pty: true, background: true})` spawns commands inside a real terminal — runs Python/Node REPLs, vim, htop, less, and nested TUIs. Use `ptyRows`/`ptyCols` (up to 60×140) to size the terminal, `bash_status({outputMode: "screen"})` for the rendered view, and `bash_write` to send keystrokes.',
-  "New `bash_watch` tool unifies pattern notifications and sync waits. `bash_watch({taskId, pattern?, timeoutMs?})` blocks inline; `bash_watch({taskId, pattern, background: true})` registers an async watcher that fires `[BG BASH NOTIFY]` on match or task exit and suppresses the default completion reminder.",
-  "`bash_status` is now a pure snapshot tool — wait and watch semantics moved to `bash_watch`.",
-  "URL fetches in `aft_outline` and `aft_zoom` no longer hang indefinitely on slow servers — body reads abort with a clear stall error after 15 seconds without data.",
-  "Post-restart bg-bash replay is fixed: previously-delivered task completions no longer fire fresh reminders after OpenCode restarts.",
+  "`aft_navigate` has a new `trace_to_symbol` op for path-between-symbols queries. One call returns the shortest call path from one function to another with file + line for every hop. Honest errors for ambiguous, missing, or unreachable targets — including a candidate list to disambiguate.",
+  '`aft_outline target: "<dir>", files: true` returns an indexed file tree with language, symbol count, and byte size per file. Lets agents pick which files to actually open without first reading symbol bodies. Honest truncation (`complete: false` + `walk_truncated`/`unchecked_files`) when the directory exceeds the walk cap.',
+  '`aft_zoom` adds `targets` for cross-file batches — pull bodies from different files in one call. Schema breaking change: `symbol` is removed; pass `symbols: "name"` (string) or `symbols: ["a", "b"]` (array). Same shape works for `url` mode so you can grab multiple sections from one URL fetch.',
+  "Pi `grep`/`write`/`edit` no longer hang on external paths. The plugin used to nag with an `Allow external directory access?` prompt even under the Pi default (`restrict_to_project_root: false`) which explicitly opts into no restriction. The plugin now defers to Rust without prompting in that case, expands `~/...` paths correctly, and bounds the prompt with a 30s timeout when strict mode is enabled.",
+  "Tool descriptions trimmed: ~1.2K agent-facing tokens removed by dropping redundant `Returns:` blocks and compressing `lsp_diagnostics` while preserving its load-bearing honesty guidance.",
 ];
 
 /**
