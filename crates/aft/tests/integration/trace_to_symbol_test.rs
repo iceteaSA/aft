@@ -183,6 +183,96 @@ fn trace_to_symbol_from_symbol_not_found_returns_error() {
 }
 
 #[test]
+fn target_symbol_not_found_returns_specific_error() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = root.join("target_missing.ts");
+    fs::write(&file, "export function a(): string { return 'a'; }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+
+    let resp = trace_to_symbol(&mut aft, &file, "a", "doesNotExist", None, None);
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "target_symbol_not_found");
+    assert!(resp["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("doesNotExist"));
+
+    aft.shutdown();
+}
+
+#[test]
+fn to_file_not_found_returns_specific_error() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = root.join("missing_to_file.ts");
+    fs::write(
+        &file,
+        "export function a(): string { return b(); }\nfunction b(): string { return 'b'; }\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+
+    let resp = trace_to_symbol(
+        &mut aft,
+        &file,
+        "a",
+        "b",
+        Some(Path::new("/nonexistent/path.rs")),
+        None,
+    );
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "to_file_not_found");
+
+    aft.shutdown();
+}
+
+#[test]
+fn target_symbol_not_in_file_returns_candidates() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let start = root.join("start.ts");
+    let has_x = root.join("has_x.ts");
+    let without_x = root.join("fileWithoutX.ts");
+    fs::write(
+        &start,
+        "import { X } from './has_x.js';\nexport function run(): string { return X(); }\n",
+    )
+    .unwrap();
+    fs::write(&has_x, "export function X(): string { return 'x'; }\n").unwrap();
+    fs::write(&without_x, "export function Y(): string { return 'y'; }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+
+    let resp = trace_to_symbol(&mut aft, &start, "run", "X", Some(&without_x), None);
+
+    assert_eq!(
+        resp["success"], false,
+        "wrong target file should fail: {resp:?}"
+    );
+    assert_eq!(resp["code"], "target_symbol_not_in_file");
+    let candidates = resp["candidates"].as_array().expect("candidate list");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "should list the file defining X: {resp:?}"
+    );
+    assert!(candidates.iter().any(|candidate| candidate["file"]
+        .as_str()
+        .unwrap_or("")
+        .ends_with("has_x.ts")));
+
+    aft.shutdown();
+}
+
+#[test]
 fn trace_to_symbol_ambiguous_target_without_to_file_returns_candidates() {
     let temp = tempdir().unwrap();
     let root = temp.path();

@@ -59,6 +59,11 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(10)
         .min(16) as usize;
 
+    let (max_files, project_root) = {
+        let config = ctx.config();
+        (config.max_callgraph_files, config.project_root.clone())
+    };
+
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -76,7 +81,19 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(resp) => return resp,
     };
 
-    let to_file_path = match req.params.get("toFile").and_then(|v| v.as_str()) {
+    let to_file_arg = req.params.get("toFile").and_then(|v| v.as_str());
+    if let Some(to_file) = to_file_arg {
+        let requested_path = resolve_request_path(project_root.as_deref(), to_file);
+        if !requested_path.exists() {
+            return Response::error(
+                &req.id,
+                "to_file_not_found",
+                format!("trace_to_symbol: toFile not found: {}", to_file),
+            );
+        }
+    }
+
+    let to_file_path = match to_file_arg {
         Some(to_file) => match validate_callgraph_path(req, ctx, to_file) {
             Ok(path) => Some(path),
             Err(resp) => return resp,
@@ -89,12 +106,42 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
 
-    let max_files = ctx.config().max_callgraph_files;
+    let target_candidates = match graph.trace_to_symbol_candidates(to_symbol, max_files) {
+        Ok(candidates) => candidates,
+        Err(err @ AftError::ProjectTooLarge { .. }) => {
+            return Response::error(&req.id, "project_too_large", format!("{}", err));
+        }
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    };
 
-    if to_file_path.is_none() {
-        match graph.trace_to_symbol_candidates(to_symbol, max_files) {
-            Ok(candidates) if candidates.len() > 1 => {
-                let candidates_json = serde_json::to_value(&candidates).unwrap_or_default();
+    if let Some(to_file_path) = to_file_path.as_deref() {
+        if !target_candidates.iter().any(|candidate| {
+            trace_candidate_matches_file(project_root.as_deref(), &candidate.file, to_file_path)
+        }) {
+            let candidates_json = serde_json::to_value(&target_candidates).unwrap_or_default();
+            return Response::error_with_data(
+                &req.id,
+                "target_symbol_not_in_file",
+                format!(
+                    "trace_to_symbol: target symbol '{}' is not defined in toFile: {}",
+                    to_symbol,
+                    to_file_arg.unwrap_or("<unknown>")
+                ),
+                serde_json::json!({ "candidates": candidates_json }),
+            );
+        }
+    } else {
+        match target_candidates.len() {
+            0 => {
+                return Response::error(
+                    &req.id,
+                    "target_symbol_not_found",
+                    format!("trace_to_symbol: target symbol '{}' not found", to_symbol),
+                );
+            }
+            1 => {}
+            _ => {
+                let candidates_json = serde_json::to_value(&target_candidates).unwrap_or_default();
                 return Response::error_with_data(
                     &req.id,
                     "ambiguous_target",
@@ -105,11 +152,6 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                     serde_json::json!({ "candidates": candidates_json }),
                 );
             }
-            Ok(_) => {}
-            Err(err @ AftError::ProjectTooLarge { .. }) => {
-                return Response::error(&req.id, "project_too_large", format!("{}", err));
-            }
-            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         }
     }
 
@@ -130,6 +172,30 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
+}
+
+fn resolve_request_path(project_root: Option<&Path>, file: &str) -> PathBuf {
+    let path = Path::new(file);
+    if path.is_relative() {
+        project_root
+            .map(|root| root.join(path))
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn trace_candidate_matches_file(
+    project_root: Option<&Path>,
+    candidate_file: &str,
+    target_file: &Path,
+) -> bool {
+    let candidate_path = resolve_request_path(project_root, candidate_file);
+    canonicalize_for_compare(&candidate_path) == canonicalize_for_compare(target_file)
+}
+
+fn canonicalize_for_compare(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn validate_callgraph_path(
