@@ -28,6 +28,27 @@ fn bun_failure_output(summary: &str) -> String {
 }
 
 #[test]
+fn bun_output_shape_does_not_match_arbitrary_text_with_ran_line() {
+    let output = "custom runner starting\n(pass) copied status text without timing\nRan 2 tests across 1 file. [1.00ms]\ncustom runner done\n";
+
+    assert!(!BunCompressor.matches_output(output));
+    assert_eq!(compress("./scripts/custom-runner", output), output);
+}
+
+#[test]
+fn bun_output_shape_matches_real_bun_test_output() {
+    let output = bun_failure_output("Ran 2 tests across 1 file. [1.00ms]");
+
+    assert!(BunCompressor.matches_output(&output));
+
+    let compressed = compress("npm test", &output);
+
+    assert!(compressed.contains("(fail) fails [0.2ms]"));
+    assert!(compressed.contains("Ran 2 tests across 1 file. [1.00ms]"));
+    assert!(!compressed.contains("(pass) passes"));
+}
+
+#[test]
 fn bun_run_cwd_test_routes_by_bun_test_output_shape() {
     let output = bun_failure_output("Ran 2 tests across 1 file. [1.00ms]");
 
@@ -245,8 +266,11 @@ fn cargo_and_go_build_commands_do_not_get_pulled_into_test_output_sniffers() {
 
 #[test]
 fn output_signature_edge_cases_do_not_overclaim() {
-    assert!(BunCompressor.matches_output("Ran 1 tests across 1 file. [0.50ms]\n"));
-    assert!(BunCompressor.matches_output("Ran 5 tests across 3 files. [1.50ms]\n"));
+    assert!(!BunCompressor.matches_output("Ran 1 tests across 1 file. [0.50ms]\n"));
+    assert!(!BunCompressor.matches_output("Ran 5 tests across 3 files. [1.50ms]\n"));
+    assert!(!BunCompressor.matches_output(
+        "(pass) copied status text without timing\nRan 1 tests across 1 file. [0.50ms]\n"
+    ));
 
     let vitest_partial = "RERUN src/foo.test.ts x1\nTest Files  1 passed (1)\n";
     assert!(!VitestCompressor.matches_output(vitest_partial));

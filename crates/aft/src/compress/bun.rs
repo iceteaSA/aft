@@ -30,7 +30,19 @@ impl Compressor for BunCompressor {
     }
 
     fn matches_output(&self, output: &str) -> bool {
-        output.lines().any(is_ran_summary_line)
+        let mut saw_ran_summary = false;
+        let mut saw_result_marker = false;
+
+        for line in output.lines() {
+            saw_ran_summary |= is_ran_summary_line(line);
+            saw_result_marker |= is_bun_test_result_marker(line);
+
+            if saw_ran_summary && saw_result_marker {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn compress_output_match(&self, output: &str) -> String {
@@ -330,8 +342,60 @@ fn is_file_section_header(line: &str) -> bool {
         || path.contains("_spec.")
 }
 
+fn is_bun_test_result_marker(line: &str) -> bool {
+    is_bun_test_pass_marker(line) || is_bun_test_fail_marker(line)
+}
+
+fn is_bun_test_pass_marker(line: &str) -> bool {
+    is_bun_test_marker(line, "(pass)")
+}
+
 fn is_bun_test_fail_marker(line: &str) -> bool {
-    line.trim_start().starts_with("(fail)")
+    is_bun_test_marker(line, "(fail)")
+}
+
+fn is_bun_test_marker(line: &str, marker: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(rest) = trimmed.strip_prefix(marker) else {
+        return false;
+    };
+    if !rest.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+        return false;
+    }
+
+    let name_and_timing = rest.trim_start();
+    let Some((name, timing)) = name_and_timing.rsplit_once(" [") else {
+        return false;
+    };
+    if name.trim().is_empty() {
+        return false;
+    }
+
+    let Some(duration) = timing.strip_suffix(']') else {
+        return false;
+    };
+    is_bun_test_duration(duration)
+}
+
+fn is_bun_test_duration(duration: &str) -> bool {
+    ["ms", "µs", "μs", "us", "ns", "s"]
+        .iter()
+        .any(|unit| duration.strip_suffix(*unit).is_some_and(is_decimal_number))
+}
+
+fn is_decimal_number(value: &str) -> bool {
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+
+    for ch in value.chars() {
+        match ch {
+            '0'..='9' => saw_digit = true,
+            '.' if !saw_dot => saw_dot = true,
+            _ => return false,
+        }
+    }
+
+    saw_digit
 }
 
 fn is_bun_test_error_start(line: &str) -> bool {
