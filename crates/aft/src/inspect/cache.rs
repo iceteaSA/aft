@@ -1,0 +1,499 @@
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::cache_freshness::FileFreshness;
+
+use super::job::{FileContribution, InspectCategory, JobKey};
+
+#[derive(Debug)]
+pub enum InspectCacheError {
+    Io(std::io::Error),
+    Sql(rusqlite::Error),
+    Json(serde_json::Error),
+    LockPoisoned(&'static str),
+    InvalidHash(String),
+}
+
+impl fmt::Display for InspectCacheError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InspectCacheError::Io(error) => write!(formatter, "inspect cache io error: {error}"),
+            InspectCacheError::Sql(error) => {
+                write!(formatter, "inspect cache sqlite error: {error}")
+            }
+            InspectCacheError::Json(error) => {
+                write!(formatter, "inspect cache json error: {error}")
+            }
+            InspectCacheError::LockPoisoned(name) => {
+                write!(formatter, "inspect cache lock poisoned: {name}")
+            }
+            InspectCacheError::InvalidHash(hash) => {
+                write!(formatter, "inspect cache invalid blake3 hash: {hash}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InspectCacheError {}
+
+impl From<std::io::Error> for InspectCacheError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<rusqlite::Error> for InspectCacheError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sql(error)
+    }
+}
+
+impl From<serde_json::Error> for InspectCacheError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ContributionRecord {
+    pub category: InspectCategory,
+    pub file_path: PathBuf,
+    pub freshness: FileFreshness,
+    pub contribution: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryAggregate {
+    payload: serde_json::Value,
+    generated_at: i64,
+}
+
+#[derive(Debug)]
+pub struct InspectCache {
+    project_root: PathBuf,
+    project_key: String,
+    sqlite_path: PathBuf,
+    conn: Mutex<Connection>,
+    memory: RwLock<HashMap<JobKey, MemoryAggregate>>,
+}
+
+impl InspectCache {
+    pub fn open(inspect_dir: PathBuf, project_root: PathBuf) -> Result<Self, InspectCacheError> {
+        std::fs::create_dir_all(&inspect_dir)?;
+        let project_key = crate::search_index::project_cache_key(&project_root);
+        let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
+        let conn = Connection::open(&sqlite_path)?;
+        initialize_schema(&conn)?;
+        Ok(Self {
+            project_root,
+            project_key,
+            sqlite_path,
+            conn: Mutex::new(conn),
+            memory: RwLock::new(HashMap::new()),
+        })
+    }
+
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    pub fn project_key(&self) -> &str {
+        &self.project_key
+    }
+
+    pub fn sqlite_path(&self) -> &Path {
+        &self.sqlite_path
+    }
+
+    pub fn store_aggregated(
+        &self,
+        key: JobKey,
+        payload: serde_json::Value,
+    ) -> Result<(), InspectCacheError> {
+        self.memory
+            .write()
+            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+            .insert(
+                key,
+                MemoryAggregate {
+                    payload,
+                    generated_at: unix_seconds_now(),
+                },
+            );
+        Ok(())
+    }
+
+    pub fn get_aggregated(
+        &self,
+        key: &JobKey,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        if let Some(entry) = self
+            .memory
+            .read()
+            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+            .get(key)
+            .cloned()
+        {
+            return Ok(Some(entry.payload));
+        }
+
+        if !key.category.is_tier2() {
+            return Ok(None);
+        }
+
+        let payload = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            conn.query_row(
+                "SELECT aggregate FROM tier2_aggregates WHERE category = ?1 AND project_key = ?2",
+                params![key.category.as_str(), self.project_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        };
+
+        match payload {
+            Some(bytes) => {
+                let value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+                self.store_aggregated(key.clone(), value.clone())?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn store_tier2_result(
+        &self,
+        key: JobKey,
+        scanned_files: &[PathBuf],
+        contributions: &[FileContribution],
+        aggregate: serde_json::Value,
+    ) -> Result<(), InspectCacheError> {
+        if !key.category.is_tier2() {
+            self.store_aggregated(key, aggregate)?;
+            return Ok(());
+        }
+
+        let now = unix_seconds_now();
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let tx = conn.transaction()?;
+
+        let scanned_relative = scanned_files
+            .iter()
+            .map(|path| relative_string(&self.project_root, path))
+            .collect::<BTreeSet<_>>();
+        let existing = existing_contribution_paths(&tx, key.category, &self.project_key)?;
+        for file_path in existing {
+            if !scanned_relative.contains(&file_path) {
+                tx.execute(
+                    "DELETE FROM tier2_contributions WHERE category = ?1 AND project_key = ?2 AND file_path = ?3",
+                    params![key.category.as_str(), self.project_key, file_path],
+                )?;
+            }
+        }
+
+        for contribution in contributions {
+            let file_path = relative_string(&self.project_root, &contribution.file_path);
+            let blob = serde_json::to_vec(&contribution.contribution)?;
+            tx.execute(
+                "INSERT INTO tier2_contributions \
+                 (category, project_key, file_path, file_mtime_ns, file_size, file_hash, contribution, generated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(category, project_key, file_path) DO UPDATE SET \
+                 file_mtime_ns = excluded.file_mtime_ns, \
+                 file_size = excluded.file_size, \
+                 file_hash = excluded.file_hash, \
+                 contribution = excluded.contribution, \
+                 generated_at = excluded.generated_at",
+                params![
+                    contribution.category.as_str(),
+                    self.project_key,
+                    file_path,
+                    system_time_to_ns(contribution.freshness.mtime),
+                    contribution.freshness.size as i64,
+                    hash_to_hex(contribution.freshness.content_hash),
+                    blob,
+                    now,
+                ],
+            )?;
+        }
+
+        let contribution_set_hash =
+            contribution_set_hash_with_conn(&tx, key.category, &self.project_key)?;
+        let aggregate_blob = serde_json::to_vec(&aggregate)?;
+        tx.execute(
+            "INSERT INTO tier2_aggregates \
+             (category, project_key, contribution_set_hash, aggregate, generated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(category, project_key) DO UPDATE SET \
+             contribution_set_hash = excluded.contribution_set_hash, \
+             aggregate = excluded.aggregate, \
+             generated_at = excluded.generated_at",
+            params![
+                key.category.as_str(),
+                self.project_key,
+                contribution_set_hash,
+                aggregate_blob,
+                now,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO tier2_meta (category, project_key, last_full_run) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(category, project_key) DO UPDATE SET last_full_run = excluded.last_full_run",
+            params![key.category.as_str(), self.project_key, now],
+        )?;
+        tx.commit()?;
+
+        self.store_aggregated(key, aggregate)
+    }
+
+    pub fn load_tier2_contributions(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<ContributionRecord>, InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, file_mtime_ns, file_size, file_hash, contribution \
+             FROM tier2_contributions \
+             WHERE category = ?1 AND project_key = ?2 \
+             ORDER BY file_path ASC",
+        )?;
+        let rows = stmt.query_map(params![category.as_str(), self.project_key], |row| {
+            let file_path: String = row.get(0)?;
+            let mtime_ns: i64 = row.get(1)?;
+            let file_size: i64 = row.get(2)?;
+            let file_hash: String = row.get(3)?;
+            let contribution: Vec<u8> = row.get(4)?;
+            Ok((file_path, mtime_ns, file_size, file_hash, contribution))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (file_path, mtime_ns, file_size, file_hash, contribution) = row?;
+            records.push(ContributionRecord {
+                category,
+                file_path: PathBuf::from(file_path),
+                freshness: FileFreshness {
+                    mtime: ns_to_system_time(mtime_ns),
+                    size: file_size.max(0) as u64,
+                    content_hash: hash_from_hex(&file_hash)?,
+                },
+                contribution: serde_json::from_slice(&contribution)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn delete_tier2_contribution(
+        &self,
+        category: InspectCategory,
+        relative_file: &Path,
+    ) -> Result<(), InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        conn.execute(
+            "DELETE FROM tier2_contributions WHERE category = ?1 AND project_key = ?2 AND file_path = ?3",
+            params![
+                category.as_str(),
+                self.project_key,
+                relative_file.to_string_lossy().to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_content_fresh_metadata(
+        &self,
+        category: InspectCategory,
+        relative_file: &Path,
+        freshness: &FileFreshness,
+    ) -> Result<(), InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        conn.execute(
+            "UPDATE tier2_contributions \
+             SET file_mtime_ns = ?4, file_size = ?5, file_hash = ?6 \
+             WHERE category = ?1 AND project_key = ?2 AND file_path = ?3",
+            params![
+                category.as_str(),
+                self.project_key,
+                relative_file.to_string_lossy().to_string(),
+                system_time_to_ns(freshness.mtime),
+                freshness.size as i64,
+                hash_to_hex(freshness.content_hash),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn contribution_set_hash(
+        &self,
+        category: InspectCategory,
+    ) -> Result<String, InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        contribution_set_hash_with_conn(&conn, category, &self.project_key)
+    }
+
+    pub fn last_full_run(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<i64>, InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        conn.query_row(
+            "SELECT last_full_run FROM tier2_meta WHERE category = ?1 AND project_key = ?2",
+            params![category.as_str(), self.project_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(InspectCacheError::from)
+    }
+
+    pub fn memory_generated_at(&self, key: &JobKey) -> Result<Option<i64>, InspectCacheError> {
+        Ok(self
+            .memory
+            .read()
+            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+            .get(key)
+            .map(|entry| entry.generated_at))
+    }
+}
+
+fn initialize_schema(conn: &Connection) -> Result<(), InspectCacheError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tier2_contributions (
+            category        TEXT NOT NULL,
+            project_key     TEXT NOT NULL,
+            file_path       TEXT NOT NULL,
+            file_mtime_ns   INTEGER NOT NULL,
+            file_size       INTEGER NOT NULL,
+            file_hash       TEXT NOT NULL,
+            contribution    BLOB NOT NULL,
+            generated_at    INTEGER NOT NULL,
+            PRIMARY KEY (category, project_key, file_path)
+        );
+
+        CREATE TABLE IF NOT EXISTS tier2_aggregates (
+            category        TEXT NOT NULL,
+            project_key     TEXT NOT NULL,
+            contribution_set_hash TEXT NOT NULL,
+            aggregate       BLOB NOT NULL,
+            generated_at    INTEGER NOT NULL,
+            PRIMARY KEY (category, project_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS tier2_meta (
+            category        TEXT NOT NULL,
+            project_key     TEXT NOT NULL,
+            last_full_run   INTEGER NOT NULL,
+            PRIMARY KEY (category, project_key)
+        );",
+    )?;
+    Ok(())
+}
+
+fn existing_contribution_paths(
+    conn: &Connection,
+    category: InspectCategory,
+    project_key: &str,
+) -> Result<Vec<String>, InspectCacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path FROM tier2_contributions WHERE category = ?1 AND project_key = ?2",
+    )?;
+    let rows = stmt.query_map(params![category.as_str(), project_key], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(InspectCacheError::from)
+}
+
+fn contribution_set_hash_with_conn(
+    conn: &Connection,
+    category: InspectCategory,
+    project_key: &str,
+) -> Result<String, InspectCacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path, file_hash FROM tier2_contributions \
+         WHERE category = ?1 AND project_key = ?2 ORDER BY file_path ASC",
+    )?;
+    let rows = stmt.query_map(params![category.as_str(), project_key], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut hasher = blake3::Hasher::new();
+    for row in rows {
+        let (file_path, file_hash) = row?;
+        hasher.update(file_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(file_hash.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn relative_string(project_root: &Path, path: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn system_time_to_ns(time: SystemTime) -> i64 {
+    let nanos = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_nanos();
+    nanos.min(i64::MAX as u128) as i64
+}
+
+fn ns_to_system_time(value: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(value.max(0) as u64)
+}
+
+fn hash_to_hex(hash: blake3::Hash) -> String {
+    hash.to_hex().to_string()
+}
+
+fn hash_from_hex(value: &str) -> Result<blake3::Hash, InspectCacheError> {
+    if value.len() != 64 {
+        return Err(InspectCacheError::InvalidHash(value.to_string()));
+    }
+    let mut bytes = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let hex = std::str::from_utf8(chunk)
+            .map_err(|_| InspectCacheError::InvalidHash(value.to_string()))?;
+        bytes[index] = u8::from_str_radix(hex, 16)
+            .map_err(|_| InspectCacheError::InvalidHash(value.to_string()))?;
+    }
+    Ok(blake3::Hash::from_bytes(bytes))
+}
+
+fn unix_seconds_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}

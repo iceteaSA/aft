@@ -71,6 +71,7 @@ pub mod grep_executor;
 pub mod harness;
 pub mod imports;
 pub mod indent;
+pub mod inspect;
 pub mod language;
 pub mod log_ctx;
 pub mod lsp;

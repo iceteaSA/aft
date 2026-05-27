@@ -135,6 +135,7 @@ fn main() {
                 drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
                 drain_semantic_index_events(&ctx);
+                drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
                 drain_lsp_events(&ctx);
                 if shutdown_requested.load(Ordering::SeqCst) {
@@ -167,6 +168,7 @@ fn main() {
                 drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
                 drain_semantic_index_events(&ctx);
+                drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
                 drain_lsp_events(&ctx);
                 let request_id = req.id.clone();
@@ -377,6 +379,10 @@ fn drain_configure_warning_events(ctx: &AppContext) {
     }
 }
 
+fn drain_inspect_events(ctx: &AppContext) {
+    ctx.inspect_manager().drain_completions();
+}
+
 fn attach_bg_completions(
     response: &mut Response,
     ctx: &AppContext,
@@ -486,6 +492,8 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "move_symbol" => aft::commands::move_symbol::handle_move_symbol(&req, ctx),
         "extract_function" => aft::commands::extract_function::handle_extract_function(&req, ctx),
         "inline_symbol" => aft::commands::inline_symbol::handle_inline_symbol(&req, ctx),
+        "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
+        "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
         "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
         "ast_search" => aft::commands::ast_search::handle_ast_search(&req, ctx),
         "ast_replace" => aft::commands::ast_replace::handle_ast_replace(&req, ctx),

@@ -16,6 +16,7 @@ use crate::callgraph::CallGraph;
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::harness::Harness;
+use crate::inspect::InspectManager;
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
@@ -339,6 +340,7 @@ pub struct AppContext {
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     symbol_cache: SharedSymbolCache,
+    inspect_manager: Arc<InspectManager>,
     semantic_index: RefCell<Option<SemanticIndex>>,
     semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RefCell<SemanticIndexStatus>,
@@ -411,6 +413,7 @@ impl AppContext {
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
             symbol_cache,
+            inspect_manager: Arc::new(InspectManager::new()),
             semantic_index: RefCell::new(None),
             semantic_index_rx: RefCell::new(None),
             semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
@@ -755,6 +758,10 @@ impl AppContext {
         self.storage_dir().join(self.harness().as_str())
     }
 
+    pub fn inspect_dir(&self) -> PathBuf {
+        self.harness_dir().join("inspect")
+    }
+
     pub fn bash_tasks_dir(&self, session_id: &str) -> PathBuf {
         self.harness_dir()
             .join("bash-tasks")
@@ -844,6 +851,10 @@ impl AppContext {
     /// Access the search-index build receiver.
     pub fn search_index_rx(&self) -> &RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>> {
         &self.search_index_rx
+    }
+
+    pub fn inspect_manager(&self) -> Arc<InspectManager> {
+        Arc::clone(&self.inspect_manager)
     }
 
     /// Access the shared symbol cache.

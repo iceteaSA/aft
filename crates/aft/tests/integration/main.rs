@@ -42,6 +42,7 @@ mod honest_failures_test;
 mod hybrid_search_test;
 mod import_test;
 mod inline_symbol_test;
+mod inspect_engine_test;
 mod is_semantic_indexed_extension_test;
 mod lexical_rank_test;
 mod lexical_score_test;

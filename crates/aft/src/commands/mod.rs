@@ -28,6 +28,7 @@ pub mod glob;
 pub mod grep;
 pub mod impact;
 pub mod inline_symbol;
+pub mod inspect;
 pub mod list_checkpoints;
 pub mod list_filters;
 pub mod lsp_diagnostics;
