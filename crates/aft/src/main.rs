@@ -1,3 +1,4 @@
+mod cli;
 use aft::bash_background::BgTaskRegistry;
 use aft::config::Config;
 use aft::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
@@ -11,7 +12,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     // Handle --version flag before anything else
@@ -50,6 +51,17 @@ fn main() {
             writeln!(buf, "{} {}", prefix, record.args())
         })
         .init();
+
+    if std::env::args().nth(1).as_deref() == Some("warmup") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::warmup::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
 
     aft::slog_info!("started, pid {}", std::process::id());
 
@@ -450,7 +462,13 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
-        "semantic_search" => aft::commands::semantic_search::handle_semantic_search(&req, ctx),
+        "semantic_search" => {
+            if let Some(response) = wait_for_semantic_index_before_search(&req, ctx) {
+                response
+            } else {
+                aft::commands::semantic_search::handle_semantic_search(&req, ctx)
+            }
+        }
         "status" => aft::commands::status::handle_status(&req, ctx),
         "list_filters" => aft::commands::list_filters::handle_list_filters(&req, ctx),
         "trust_filter_project" => {
@@ -516,6 +534,43 @@ fn handle_echo(req: &RawRequest) -> Response {
 ///
 /// Params: `file` (string, required) — path to snapshot.
 /// Returns: `{ backup_id }`.
+fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> Option<Response> {
+    if std::env::var_os("AFT_WAIT_FOR_SEMANTIC_READY").is_none() || !ctx.config().semantic_search {
+        return None;
+    }
+
+    let timeout_ms = std::env::var("AFT_WAIT_FOR_SEMANTIC_READY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(600_000);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        drain_search_index_events(ctx);
+        drain_semantic_index_events(ctx);
+
+        match ctx.semantic_index_status().borrow().clone() {
+            SemanticIndexStatus::Ready { .. }
+            | SemanticIndexStatus::Disabled
+            | SemanticIndexStatus::Failed(_) => return None,
+            SemanticIndexStatus::Building { stage, .. } => {
+                if Instant::now() >= deadline {
+                    return Some(Response::error(
+                        &req.id,
+                        "semantic_index_timeout",
+                        format!(
+                            "semantic index did not become ready before semantic_search within {timeout_ms}ms (stage: {stage})"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn handle_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
