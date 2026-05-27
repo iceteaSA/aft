@@ -49,12 +49,18 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   }
 
   if (hasOutline && hasZoom && (hasGrep || hasSearch)) {
-    const locator = hasGrep ? `\`${grepName}\`` : "`aft_search`";
-    sections.push(
-      hasGrep && hasSearch
-        ? `**Code exploration**: For exact identifiers (\`useState\`, function names, env vars), error messages, or path-shaped queries → \`${grepName}\` first. For broad concepts ('where is X handled', 'how does Y work') → \`aft_search\`. Then use \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`
-        : `**Code exploration**: ${locator} to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`,
-    );
+    if (hasSearch) {
+      const grepFallback = hasGrep
+        ? ` Use \`${grepName}\` directly only when you need exhaustive enumeration of literal text (every TODO, every import of X) without ranking.`
+        : "";
+      sections.push(
+        `**Code exploration**: \`aft_search\` is the primary code-search tool. It auto-routes by query shape — exact identifiers, regex, error messages, natural language all use the same call. Pass \`hint: "regex"\` / \`hint: "literal"\` / \`hint: "semantic"\` to override routing if needed. Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).${grepFallback}`,
+      );
+    } else {
+      sections.push(
+        `**Code exploration**: \`${grepName}\` to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`,
+      );
+    }
   }
 
   if (hasNavigate) {

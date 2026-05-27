@@ -18,10 +18,9 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain('`aft_outline({ target: "<url>" })`');
     expect(out).not.toContain("aft_outline({ url })");
     expect(out).toContain("**Code exploration**");
-    expect(out).toContain("For exact identifiers (`useState`, function names, env vars)");
-    expect(out).toContain(
-      "For broad concepts ('where is X handled', 'how does Y work') → `aft_search`",
-    );
+    expect(out).toContain("`aft_search` is the primary code-search tool");
+    expect(out).toContain('`hint: "regex"`');
+    expect(out).toContain("auto-routes by query shape");
     expect(out).toContain("Use `aft_navigate`");
     expect(out).toContain("**Long-running commands**");
     // Anti-polling guidance must be present so agents stop calling
