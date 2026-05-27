@@ -58,6 +58,16 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
     ) -> JobOutcome {
+        self.submit_category_with_callgraph(snapshot, category, caller_scope, None)
+    }
+
+    pub fn submit_category_with_callgraph(
+        &self,
+        snapshot: InspectSnapshot,
+        category: InspectCategory,
+        caller_scope: JobScope,
+        callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
+    ) -> JobOutcome {
         if !category.is_active() {
             return JobOutcome::Failed {
                 message: format!("inspect category '{category}' is disabled in v0.33"),
@@ -77,6 +87,7 @@ impl InspectManager {
             caller_scope.clone(),
             key.clone(),
             waiter_tx,
+            callgraph_snapshot,
         ) {
             Ok(()) => self.wait_for_outcome(key, caller_scope, cache, waiter_rx),
             Err(message) => JobOutcome::Failed { message },
@@ -89,13 +100,29 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
     ) -> Result<JobKey, String> {
+        self.submit_background_with_callgraph(snapshot, category, caller_scope, None)
+    }
+
+    pub fn submit_background_with_callgraph(
+        &self,
+        snapshot: InspectSnapshot,
+        category: InspectCategory,
+        caller_scope: JobScope,
+        callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
+    ) -> Result<JobKey, String> {
         if !category.is_active() {
             return Err(format!(
                 "inspect category '{category}' is disabled in v0.33"
             ));
         }
         let key = JobKey::for_category_scope(category, &caller_scope);
-        self.enqueue_without_waiter(snapshot, category, caller_scope, key.clone())?;
+        self.enqueue_without_waiter(
+            snapshot,
+            category,
+            caller_scope,
+            key.clone(),
+            callgraph_snapshot,
+        )?;
         Ok(key)
     }
 
@@ -144,6 +171,7 @@ impl InspectManager {
         caller_scope: JobScope,
         key: JobKey,
         waiter_tx: WaiterTx,
+        callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> Result<(), String> {
         let mut in_flight = self
             .in_flight
@@ -157,7 +185,13 @@ impl InspectManager {
         in_flight.insert(key.clone(), vec![Waiter { tx: waiter_tx }]);
         drop(in_flight);
 
-        if let Err(message) = self.enqueue_new_job(snapshot, category, caller_scope, key.clone()) {
+        if let Err(message) = self.enqueue_new_job(
+            snapshot,
+            category,
+            caller_scope,
+            key.clone(),
+            callgraph_snapshot,
+        ) {
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 in_flight.remove(&key);
             }
@@ -172,6 +206,7 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
         key: JobKey,
+        callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> Result<(), String> {
         let mut in_flight = self
             .in_flight
@@ -183,7 +218,13 @@ impl InspectManager {
         in_flight.insert(key.clone(), Vec::new());
         drop(in_flight);
 
-        if let Err(message) = self.enqueue_new_job(snapshot, category, caller_scope, key.clone()) {
+        if let Err(message) = self.enqueue_new_job(
+            snapshot,
+            category,
+            caller_scope,
+            key.clone(),
+            callgraph_snapshot,
+        ) {
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 in_flight.remove(&key);
             }
@@ -198,6 +239,7 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
         key: JobKey,
+        callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> Result<(), String> {
         let scan_scope = if category.is_tier2() {
             JobScope::for_project(snapshot.project_root.clone())
@@ -214,7 +256,7 @@ impl InspectManager {
             inspect_dir: snapshot.inspect_dir,
             config: snapshot.config,
             symbol_cache: snapshot.symbol_cache,
-            callgraph_snapshot: None::<Arc<CallgraphSnapshot>>,
+            callgraph_snapshot,
         };
         self.request_tx
             .send(job)

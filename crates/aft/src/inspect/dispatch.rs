@@ -3,9 +3,8 @@ use std::thread;
 use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use rayon::prelude::*;
 
-use super::job::{InspectJob, InspectResult, InspectScanSuccess};
+use super::job::{InspectCategory, InspectJob, InspectResult};
 
 pub type InspectWorker = Arc<dyn Fn(InspectJob) -> InspectResult + Send + Sync + 'static>;
 
@@ -38,7 +37,7 @@ pub fn start_dispatch_loop(worker: InspectWorker) -> DispatchHandles {
 }
 
 pub fn default_worker() -> InspectWorker {
-    Arc::new(run_empty_scan)
+    Arc::new(dispatch_category)
 }
 
 fn dispatch_loop(
@@ -57,28 +56,32 @@ fn dispatch_loop(
     }
 }
 
-fn run_empty_scan(job: InspectJob) -> InspectResult {
-    let started = Instant::now();
-    let files_scanned = job
-        .scope_files
-        .par_iter()
-        .map(|path| {
-            let _parser = tree_sitter::Parser::new();
-            usize::from(path.is_file())
-        })
-        .sum::<usize>();
+fn dispatch_category(job: InspectJob) -> InspectResult {
+    use crate::inspect::scanners;
 
-    let aggregate = serde_json::json!({
-        "count": 0,
-        "items": [],
-        "files_scanned": files_scanned,
-    });
-    let success = InspectScanSuccess {
-        scanned_files: job.scope_files.clone(),
-        contributions: Vec::new(),
-        aggregate,
-    };
-    InspectResult::success(&job, success, started.elapsed())
+    match job.category {
+        InspectCategory::Todos => scanners::todos::run_todos_scan(&job),
+        InspectCategory::Metrics => scanners::metrics::run_metrics_scan(&job),
+        InspectCategory::DeadCode => scanners::dead_code::run_dead_code_scan(&job),
+        InspectCategory::UnusedExports => scanners::unused_exports::run_unused_exports_scan(&job),
+        InspectCategory::Duplicates => scanners::duplicates::run_duplicates_scan(&job),
+        InspectCategory::Diagnostics => {
+            let started = Instant::now();
+            InspectResult::failed(
+                &job,
+                "diagnostics: implementation pending (v0.34)",
+                started.elapsed(),
+            )
+        }
+        other => {
+            let started = Instant::now();
+            InspectResult::failed(
+                &job,
+                format!("inspect category '{other}' is not active in v0.33"),
+                started.elapsed(),
+            )
+        }
+    }
 }
 
 fn default_pool_size() -> usize {

@@ -1,12 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 
+use crate::callgraph::EdgeResolution;
 use crate::context::AppContext;
-use crate::inspect::{InspectCategory, InspectSnapshot, JobOutcome, JobScope};
+use crate::inspect::{
+    CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, InspectCategory, InspectSnapshot,
+    JobOutcome, JobScope,
+};
 use crate::protocol::{RawRequest, Response};
+use crate::symbols::SymbolKind;
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
@@ -30,10 +36,16 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
 
+    let callgraph_snapshot = build_callgraph_snapshot(ctx, &snapshot.project_root);
     let manager = ctx.inspect_manager();
     let mut outcomes = BTreeMap::new();
     for category in InspectCategory::active() {
-        let outcome = manager.submit_category(snapshot.clone(), *category, scope.clone());
+        let outcome = manager.submit_category_with_callgraph(
+            snapshot.clone(),
+            *category,
+            scope.clone(),
+            callgraph_snapshot.clone(),
+        );
         outcomes.insert(*category, outcome);
     }
 
@@ -51,12 +63,18 @@ pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response 
         Err(response) => return response.with_id(&req.id),
     };
     let scope = JobScope::for_project(snapshot.project_root.clone());
+    let callgraph_snapshot = build_callgraph_snapshot(ctx, &snapshot.project_root);
     let manager = ctx.inspect_manager();
 
     let mut queued = Vec::new();
     let mut errors = Vec::new();
     for category in categories {
-        match manager.submit_background(snapshot.clone(), category, scope.clone()) {
+        match manager.submit_background_with_callgraph(
+            snapshot.clone(),
+            category,
+            scope.clone(),
+            callgraph_snapshot.clone(),
+        ) {
             Ok(key) => queued.push(key.display_key()),
             Err(message) => errors.push(serde_json::json!({
                 "category": category.as_str(),
@@ -129,6 +147,124 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
         Arc::new(config),
         ctx.symbol_cache(),
     ))
+}
+
+fn build_callgraph_snapshot(
+    ctx: &AppContext,
+    project_root: &Path,
+) -> Option<Arc<CallgraphSnapshot>> {
+    let mut graph_ref = ctx.callgraph().borrow_mut();
+    let graph = graph_ref.as_mut()?;
+    let graph_files = graph.project_files().to_vec();
+    let files = graph_files
+        .iter()
+        .map(canonicalize_for_snapshot)
+        .collect::<Vec<_>>();
+
+    let mut exported_symbols = Vec::new();
+    let mut outbound_calls = Vec::new();
+    let mut entry_points = BTreeSet::new();
+
+    for file in &graph_files {
+        let snapshot_file = canonicalize_for_snapshot(file);
+        if is_entry_point_file(project_root, &snapshot_file) {
+            entry_points.insert(snapshot_file.clone());
+        }
+
+        let file_data = match graph.build_file(file) {
+            Ok(file_data) => file_data.clone(),
+            Err(_) => continue,
+        };
+
+        for symbol in &file_data.exported_symbols {
+            let metadata = file_data.symbol_metadata.get(symbol);
+            exported_symbols.push(CallgraphExport {
+                file: snapshot_file.clone(),
+                symbol: symbol.clone(),
+                kind: metadata
+                    .map(|metadata| symbol_kind_name(&metadata.kind))
+                    .unwrap_or("unknown")
+                    .to_string(),
+                line: metadata.map(|metadata| metadata.line).unwrap_or(1),
+            });
+        }
+
+        for calls in file_data.calls_by_symbol.values() {
+            for call in calls {
+                let target = match graph.resolve_cross_file_edge(
+                    &call.full_callee,
+                    &call.callee_name,
+                    file,
+                    &file_data.import_block,
+                ) {
+                    EdgeResolution::Resolved { file, symbol } => {
+                        let file = canonicalize_for_snapshot(&file);
+                        format!("{}::{symbol}", file.display())
+                    }
+                    EdgeResolution::Unresolved { callee_name } => callee_name,
+                };
+                outbound_calls.push(CallgraphOutboundCall {
+                    caller_file: snapshot_file.clone(),
+                    target,
+                    line: call.line,
+                });
+            }
+        }
+    }
+
+    Some(Arc::new(CallgraphSnapshot {
+        generated_at: Some(SystemTime::now()),
+        files,
+        exported_symbols,
+        outbound_calls,
+        entry_points,
+    }))
+}
+
+fn canonicalize_for_snapshot(path: &PathBuf) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.clone())
+}
+
+fn is_entry_point_file(project_root: &Path, file: &Path) -> bool {
+    let relative = file.strip_prefix(project_root).unwrap_or(file);
+    let relative_display = relative.to_string_lossy().replace('\\', "/");
+    if relative_display.starts_with("bin/") || relative_display.contains("/bin/") {
+        return true;
+    }
+
+    let Some(file_name) = relative.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        file_name,
+        "main.rs"
+            | "main.ts"
+            | "main.tsx"
+            | "main.js"
+            | "main.jsx"
+            | "main.py"
+            | "main.go"
+            | "index.ts"
+            | "index.tsx"
+            | "index.js"
+            | "index.jsx"
+    ) || (file_name == "lib.rs" && project_root.join("Cargo.toml").exists())
+}
+
+fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Class => "class",
+        SymbolKind::Method => "method",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Enum => "enum",
+        SymbolKind::TypeAlias => "type_alias",
+        SymbolKind::Variable => "variable",
+        SymbolKind::Heading => "heading",
+        SymbolKind::FileSummary => "file_summary",
+    }
 }
 
 fn parse_top_k(params: &Value) -> Result<usize, String> {
@@ -285,6 +421,7 @@ fn build_inspect_payload(
     let mut details = Map::new();
     let mut stale_categories = Vec::new();
     let mut pending_categories = Vec::new();
+    let mut failed_categories = Vec::new();
 
     for category in InspectCategory::active() {
         let outcome = outcomes.get(category);
@@ -293,6 +430,12 @@ fn build_inspect_payload(
         }
         if outcome.is_some_and(JobOutcome::is_pending) {
             pending_categories.push(category.as_str().to_string());
+        }
+        if let Some(JobOutcome::Failed { message }) = outcome {
+            failed_categories.push(serde_json::json!({
+                "category": category.as_str(),
+                "message": message,
+            }));
         }
 
         let payload = outcome.and_then(JobOutcome::payload);
@@ -321,6 +464,7 @@ fn build_inspect_payload(
             "stale_categories": stale_categories,
             "disabled_categories": disabled_categories,
             "pending_categories": pending_categories,
+            "failed_categories": failed_categories,
         }
     });
     if !details.is_empty() {
@@ -337,13 +481,13 @@ fn summary_for(category: InspectCategory, payload: Option<&Value>) -> Value {
             "pending_servers": payload.and_then(|p| p.get("pending_servers")).cloned().unwrap_or_else(|| serde_json::json!([])),
         }),
         InspectCategory::Metrics => serde_json::json!({
-            "files": payload.and_then(|p| p.get("files")).and_then(Value::as_u64).unwrap_or(0),
-            "symbols": payload.and_then(|p| p.get("symbols")).and_then(Value::as_u64).unwrap_or(0),
-            "loc": payload.and_then(|p| p.get("loc")).and_then(Value::as_u64).unwrap_or(0),
+            "files": payload.and_then(|p| p.get("files").or_else(|| p.pointer("/totals/file_count"))).and_then(Value::as_u64).unwrap_or(0),
+            "symbols": payload.and_then(|p| p.get("symbols").or_else(|| p.pointer("/totals/symbol_count"))).and_then(Value::as_u64).unwrap_or(0),
+            "loc": payload.and_then(|p| p.get("loc").or_else(|| p.pointer("/totals/loc"))).and_then(Value::as_u64).unwrap_or(0),
         }),
         InspectCategory::Todos => serde_json::json!({
             "count": count_from_payload(payload),
-            "by_kind": payload.and_then(|p| p.get("by_kind")).cloned().unwrap_or_else(|| serde_json::json!({})),
+            "by_kind": payload.and_then(|p| p.get("by_kind").or_else(|| p.get("by_marker"))).cloned().unwrap_or_else(|| serde_json::json!({})),
         }),
         InspectCategory::DeadCode => serde_json::json!({
             "count": count_from_payload(payload),
@@ -354,7 +498,7 @@ fn summary_for(category: InspectCategory, payload: Option<&Value>) -> Value {
         }),
         InspectCategory::Duplicates => serde_json::json!({
             "count": count_from_payload(payload),
-            "total_groups": payload.and_then(|p| p.get("total_groups")).and_then(Value::as_u64).unwrap_or_else(|| count_from_payload(payload)),
+            "total_groups": payload.and_then(|p| p.get("total_groups").or_else(|| p.get("groups_count"))).and_then(Value::as_u64).unwrap_or_else(|| count_from_payload(payload)),
         }),
         _ => serde_json::json!({ "count": count_from_payload(payload) }),
     }

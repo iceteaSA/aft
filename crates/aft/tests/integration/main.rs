@@ -42,6 +42,7 @@ mod honest_failures_test;
 mod hybrid_search_test;
 mod import_test;
 mod inline_symbol_test;
+mod inspect_command_test;
 mod inspect_dead_code_test;
 mod inspect_duplicates_test;
 mod inspect_engine_test;
