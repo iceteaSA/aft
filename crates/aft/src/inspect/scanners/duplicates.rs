@@ -350,6 +350,8 @@ fn build_aggregate(file_scans: &[FileScan]) -> serde_json::Value {
     let items = groups.into_iter().take(MAX_GROUP_ITEMS).collect::<Vec<_>>();
 
     json!({
+        "count": groups_count,
+        "total_groups": groups_count,
         "groups_count": groups_count,
         "items": items,
         "drill_down_capped": drill_down_capped,

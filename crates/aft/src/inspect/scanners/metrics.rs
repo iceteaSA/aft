@@ -110,6 +110,9 @@ fn aggregate_metrics(project_root: &Path, per_file: &[FileMetric]) -> serde_json
     top_files.truncate(20);
 
     serde_json::json!({
+        "files": totals.file_count,
+        "symbols": totals.symbol_count,
+        "loc": totals.loc,
         "totals": totals,
         "by_language": by_language,
         "top_files_by_loc": top_files,

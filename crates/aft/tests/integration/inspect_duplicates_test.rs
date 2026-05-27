@@ -82,7 +82,7 @@ fn has_group_with_files(aggregate: &Value, left: &str, right: &str) -> bool {
 }
 
 fn assert_no_groups(aggregate: &Value) {
-    assert_eq!(aggregate["groups_count"], 0, "aggregate: {aggregate:?}");
+    assert_eq!(aggregate["total_groups"], 0, "aggregate: {aggregate:?}");
     assert!(
         aggregate["items"]
             .as_array()
@@ -98,7 +98,7 @@ fn inspect_duplicates_empty_project_reports_no_groups() {
 
     let success = run_scan(&root);
 
-    assert_eq!(success.aggregate["groups_count"], 0);
+    assert_eq!(success.aggregate["total_groups"], 0);
     assert_eq!(success.aggregate["scanned_files"], 0);
     assert!(success.contributions.is_empty());
 }
@@ -121,7 +121,7 @@ export function calculate(input: number) {
 
     let success = run_scan(&root);
 
-    assert!(success.aggregate["groups_count"].as_u64().unwrap() > 0);
+    assert!(success.aggregate["total_groups"].as_u64().unwrap() > 0);
     assert!(
         has_group_with_files(&success.aggregate, "src/foo.ts", "src/bar.ts"),
         "aggregate: {:?}",
@@ -278,7 +278,7 @@ fn inspect_duplicates_unsupported_language_contributes_empty_fragments() {
     let success = run_scan(&root);
 
     assert!(fragments_for(&success, "scripts/run.bash").is_empty());
-    assert_eq!(success.aggregate["groups_count"], 0);
+    assert_eq!(success.aggregate["total_groups"], 0);
     assert!(success.aggregate["languages_skipped"]
         .as_array()
         .expect("languages_skipped is an array")

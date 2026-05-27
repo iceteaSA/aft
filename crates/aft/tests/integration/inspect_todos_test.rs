@@ -66,11 +66,11 @@ fn inspect_todos_counts_mixed_markers_and_items() {
     let success = run_job(&job);
 
     assert_eq!(success.aggregate["count"], 5);
-    assert_eq!(success.aggregate["by_marker"]["TODO"], 1);
-    assert_eq!(success.aggregate["by_marker"]["FIXME"], 1);
-    assert_eq!(success.aggregate["by_marker"]["HACK"], 1);
-    assert_eq!(success.aggregate["by_marker"]["XXX"], 1);
-    assert_eq!(success.aggregate["by_marker"]["BUG"], 1);
+    assert_eq!(success.aggregate["by_kind"]["TODO"], 1);
+    assert_eq!(success.aggregate["by_kind"]["FIXME"], 1);
+    assert_eq!(success.aggregate["by_kind"]["HACK"], 1);
+    assert_eq!(success.aggregate["by_kind"]["XXX"], 1);
+    assert_eq!(success.aggregate["by_kind"]["BUG"], 1);
 
     let items = success.aggregate["items"].as_array().unwrap();
     assert_eq!(items.len(), 5);
@@ -120,7 +120,7 @@ fn inspect_todos_caps_drill_down_at_one_hundred_items() {
     let success = run_job(&job);
 
     assert_eq!(success.aggregate["count"], 200);
-    assert_eq!(success.aggregate["by_marker"]["TODO"], 200);
+    assert_eq!(success.aggregate["by_kind"]["TODO"], 200);
     assert_eq!(success.aggregate["items"].as_array().unwrap().len(), 100);
     assert_eq!(success.aggregate["drill_down_capped"], true);
 }

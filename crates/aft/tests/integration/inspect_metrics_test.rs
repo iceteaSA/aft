@@ -94,9 +94,9 @@ fn inspect_metrics_empty_project_reports_zero_files() {
 
     let payload = metrics_payload(&job);
 
-    assert_eq!(payload["totals"]["file_count"], 0);
-    assert_eq!(payload["totals"]["symbol_count"], 0);
-    assert_eq!(payload["totals"]["loc"], 0);
+    assert_eq!(payload["files"], 0);
+    assert_eq!(payload["symbols"], 0);
+    assert_eq!(payload["loc"], 0);
     assert_eq!(payload["by_language"].as_object().unwrap().len(), 0);
     assert_eq!(payload["top_files_by_loc"].as_array().unwrap().len(), 0);
 }
@@ -121,8 +121,8 @@ fn inspect_metrics_mixed_rust_and_typescript_uses_cached_symbol_counts() {
 
     let payload = metrics_payload(&job);
 
-    assert_eq!(payload["totals"]["file_count"], 2);
-    assert_eq!(payload["totals"]["symbol_count"], 5);
+    assert_eq!(payload["files"], 2);
+    assert_eq!(payload["symbols"], 5);
     assert_eq!(payload["by_language"]["rust"]["file_count"], 1);
     assert_eq!(payload["by_language"]["rust"]["symbol_count"], 2);
     assert_eq!(payload["by_language"]["typescript"]["file_count"], 1);
@@ -140,8 +140,8 @@ fn inspect_metrics_loc_totals_match_known_fixture() {
 
     let payload = metrics_payload(&job);
 
-    assert_eq!(payload["totals"]["file_count"], 3);
-    assert_eq!(payload["totals"]["loc"], 7);
+    assert_eq!(payload["files"], 3);
+    assert_eq!(payload["loc"], 7);
 }
 
 #[test]

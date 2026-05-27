@@ -43,12 +43,12 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
         all_items.extend(scan.items);
     }
 
-    let mut by_marker = BTreeMap::new();
+    let mut by_kind = BTreeMap::new();
     for marker in MARKERS {
-        by_marker.insert(marker.to_string(), 0usize);
+        by_kind.insert(marker.to_string(), 0usize);
     }
     for item in &all_items {
-        if let Some(count) = by_marker.get_mut(item.marker) {
+        if let Some(count) = by_kind.get_mut(item.marker) {
             *count += 1;
         }
     }
@@ -71,7 +71,7 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
 
     let aggregate = serde_json::json!({
         "count": total_count,
-        "by_marker": by_marker,
+        "by_kind": by_kind,
         "items": items,
         "drill_down_capped": drill_down_capped,
     });
