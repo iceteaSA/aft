@@ -137,8 +137,7 @@ async function prepareArm(
       plugin: ["@cortexkit/aft-opencode@latest"],
       provider,
     });
-    writeFileSync(resolve(opencodeDir, "aft.jsonc"), '{\n  "experimental_search_index": true,\n  "experimental_semantic_search": true\n}\n');
-    writeFileSync(resolve(opencodeDir, "AGENTS.md"), aftInstructions());
+    writeFileSync(resolve(opencodeDir, "aft.jsonc"), '{\n  "search_index": true,\n  "semantic_search": true\n}\n');
     if (!dryRun) {
       const storageDir = cortexKitStorageRoot();
       const warmup = await runCommand(
@@ -168,7 +167,7 @@ async function prepareArm(
       },
     },
   });
-  writeFileSync(resolve(opencodeDir, "AGENTS.md"), codegraphInstructions());
+
   const init = await runCommand(["codegraph", "init", repoPath], HARNESS_DIR, timeoutMs, codegraphEnv());
   if (init.exitCode !== 0 && !`${init.stderr}\n${init.stdout}`.includes("Already initialized")) {
     throw new Error(`codegraph init failed: ${init.stderr || init.stdout}`);
@@ -389,14 +388,6 @@ function zenProviderConfig(): Record<string, unknown> {
       },
     },
   };
-}
-
-function aftInstructions(): string {
-  return `## AFT benchmark instructions\n\nUse AFT tools for code discovery before falling back to raw grep/read. Prefer aft_search for retrieval, aft_outline/aft_zoom for focused source, and aft_navigate for call relationships.\n`;
-}
-
-function codegraphInstructions(): string {
-  return `## CodeGraph benchmark instructions\n\nIf .codegraph exists, answer directly with CodeGraph. Prefer codegraph_context for architecture/find tasks, codegraph_search for symbols, codegraph_explore for focused source, and codegraph_callers/callees for call relationships. Do not re-discover the same facts with grep/read unless the graph lacks a needed detail.\n`;
 }
 
 function codegraphEnv(): Record<string, string> {
