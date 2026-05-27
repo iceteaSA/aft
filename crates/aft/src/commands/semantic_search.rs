@@ -81,6 +81,10 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if params.query.trim().is_empty() {
+        return Response::error(&req.id, "invalid_request", "query must be non-empty");
+    }
+
     let top_k = params.top_k.clamp(1, MAX_TOP_K);
     let project_root = grep_executor::project_root(ctx);
     let shape = query_shape::classify(&params.query);
@@ -254,7 +258,8 @@ fn handle_grep_search(
             interpreted_as,
             query_kind: query_kind_label(shape.kind),
             semantic_status,
-            status: semantic_status,
+            status: "ready",
+            complete: true,
             text,
             results: result_values,
             more_available: result.truncated || result.total_matches > result.matches.len(),
@@ -290,45 +295,33 @@ fn handle_semantic_or_hybrid_search(
 
     match status {
         SemanticIndexStatus::Disabled => {
-            return search_response(
+            return semantic_unavailable_or_fallback_response(
                 req,
-                SearchResponseParts {
-                    query: &params.query,
-                    interpreted_as: interpreted_as_label(mode),
-                    query_kind: query_kind_label(shape.kind),
-                    semantic_status: "disabled",
-                    status: "disabled",
-                    text: "Semantic search is not enabled.".to_string(),
-                    results: Vec::new(),
-                    more_available: false,
-                    engine_capped: lexical.engine_capped,
-                    fully_degraded: false,
-                    warnings,
-                    extras: serde_json::Map::new(),
-                },
+                &params,
+                mode,
+                &shape,
+                "disabled",
+                "disabled",
+                "Semantic search is not enabled.".to_string(),
+                lexical,
+                warnings,
+                project_root,
+                top_k,
             );
         }
         SemanticIndexStatus::Failed(error) => {
-            if params.hint == SearchHint::Semantic {
-                return semantic_error_response(&req.id, &error);
-            }
-            warnings.push(format!("Semantic search unavailable: {error}"));
-            return search_response(
+            return semantic_unavailable_or_fallback_response(
                 req,
-                SearchResponseParts {
-                    query: &params.query,
-                    interpreted_as: interpreted_as_label(mode),
-                    query_kind: query_kind_label(shape.kind),
-                    semantic_status: "unavailable",
-                    status: "unavailable",
-                    text: format!("Semantic search unavailable: {error}"),
-                    results: Vec::new(),
-                    more_available: false,
-                    engine_capped: lexical.engine_capped,
-                    fully_degraded: false,
-                    warnings,
-                    extras: serde_json::Map::new(),
-                },
+                &params,
+                mode,
+                &shape,
+                "unavailable",
+                "unavailable",
+                format!("Semantic search unavailable: {error}"),
+                lexical,
+                warnings,
+                project_root,
+                top_k,
             );
         }
         SemanticIndexStatus::Building {
@@ -360,6 +353,11 @@ fn handle_semantic_or_hybrid_search(
                 serde_json::json!(entries_total),
             );
             extras.insert("note".to_string(), serde_json::json!(note));
+            extras.insert("semantic_rebuilding".to_string(), serde_json::json!(true));
+            extras.insert(
+                "lexical_only_fallback".to_string(),
+                serde_json::json!(lexical.ready),
+            );
 
             return search_response(
                 req,
@@ -369,6 +367,7 @@ fn handle_semantic_or_hybrid_search(
                     query_kind: query_kind_label(shape.kind),
                     semantic_status: "building",
                     status: "building",
+                    complete: false,
                     text: format_building_lexical_text(
                         &detail,
                         &results,
@@ -394,6 +393,22 @@ fn handle_semantic_or_hybrid_search(
         }
     }
 
+    if !semantic_index_loaded(ctx) {
+        return semantic_unavailable_or_fallback_response(
+            req,
+            &params,
+            mode,
+            &shape,
+            "unavailable",
+            "not_ready",
+            "Semantic index is not ready yet.".to_string(),
+            lexical,
+            warnings,
+            project_root,
+            top_k,
+        );
+    }
+
     let query_vector = match embed_query(&params.query, ctx) {
         Ok(query_vector) => query_vector,
         Err(error) => return semantic_error_response(&req.id, &error),
@@ -402,26 +417,10 @@ fn handle_semantic_or_hybrid_search(
     let semantic_limit = top_k.clamp(50, MAX_TOP_K);
     let semantic_results = {
         let semantic_index = ctx.semantic_index().borrow();
-        let Some(index) = semantic_index.as_ref() else {
-            return search_response(
-                req,
-                SearchResponseParts {
-                    query: &params.query,
-                    interpreted_as: interpreted_as_label(mode),
-                    query_kind: query_kind_label(shape.kind),
-                    semantic_status: "unavailable",
-                    status: "not_ready",
-                    text: "Semantic index is not ready yet.".to_string(),
-                    results: Vec::new(),
-                    more_available: false,
-                    engine_capped: lexical.engine_capped,
-                    fully_degraded: false,
-                    warnings,
-                    extras: serde_json::Map::new(),
-                },
-            );
-        };
-        index.search(&query_vector, semantic_limit)
+        semantic_index
+            .as_ref()
+            .map(|index| index.search(&query_vector, semantic_limit))
+            .unwrap_or_default()
     };
 
     let pre_fuse_count = semantic_results.len().saturating_add(lexical.files.len());
@@ -439,6 +438,7 @@ fn handle_semantic_or_hybrid_search(
             query_kind: query_kind_label(shape.kind),
             semantic_status,
             status: "ready",
+            complete: true,
             text: format_semantic_text(&results, project_root),
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
             more_available: pre_fuse_count > top_k,
@@ -456,6 +456,7 @@ struct SearchResponseParts<'a> {
     query_kind: &'static str,
     semantic_status: &'static str,
     status: &'static str,
+    complete: bool,
     text: String,
     results: Vec<serde_json::Value>,
     more_available: bool,
@@ -474,6 +475,7 @@ impl<'a> SearchResponseParts<'a> {
 fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response {
     let mut object = serde_json::Map::new();
     object.insert("status".to_string(), serde_json::json!(parts.status));
+    object.insert("complete".to_string(), serde_json::json!(parts.complete));
     object.insert("text".to_string(), serde_json::json!(parts.text));
     object.insert("query".to_string(), serde_json::json!(parts.query));
     object.insert(
@@ -515,6 +517,89 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
         object.insert(key, value);
     }
     Response::success(&req.id, serde_json::Value::Object(object))
+}
+
+fn semantic_unavailable_or_fallback_response(
+    req: &RawRequest,
+    params: &SemanticSearchParams,
+    mode: SearchMode,
+    shape: &QueryShape,
+    semantic_status: &'static str,
+    unavailable_status: &'static str,
+    detail: String,
+    lexical: LexicalCollection,
+    mut warnings: Vec<String>,
+    project_root: &Path,
+    top_k: usize,
+) -> Response {
+    if params.hint == SearchHint::Semantic {
+        return semantic_unavailable_response(&req.id, detail);
+    }
+
+    let lexical_ready = mode == SearchMode::Hybrid && lexical.ready;
+    let lexical_count = lexical.files.len();
+    let results = if mode == SearchMode::Hybrid {
+        fuse_hybrid_results(Vec::new(), lexical.files, shape, top_k)
+    } else {
+        Vec::new()
+    };
+    let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
+    let status = if lexical_ready {
+        "ready"
+    } else {
+        unavailable_status
+    };
+    let text = if lexical_ready {
+        warnings.push(
+            "Semantic search unavailable; returning lexical-only fallback results.".to_string(),
+        );
+        format_lexical_unavailable_text(&detail, &results, project_root)
+    } else {
+        detail
+    };
+    let mut extras = semantic_unavailable_extras(lexical_ready);
+    if mode == SearchMode::Hybrid && !lexical_ready {
+        extras.insert("lexical_unavailable".to_string(), serde_json::json!(true));
+    }
+
+    search_response(
+        req,
+        SearchResponseParts {
+            query: &params.query,
+            interpreted_as: interpreted_as_label(mode),
+            query_kind: query_kind_label(shape.kind),
+            semantic_status,
+            status,
+            complete: false,
+            text,
+            results: result_values,
+            more_available: lexical_ready && lexical_count > top_k,
+            engine_capped: lexical.engine_capped,
+            fully_degraded: false,
+            warnings,
+            extras,
+        },
+    )
+}
+
+fn semantic_unavailable_response(request_id: &str, detail: String) -> Response {
+    Response::error(request_id, "semantic_unavailable", detail)
+}
+
+fn semantic_unavailable_extras(
+    lexical_only_fallback: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut extras = serde_json::Map::new();
+    extras.insert("semantic_unavailable".to_string(), serde_json::json!(true));
+    extras.insert(
+        "lexical_only_fallback".to_string(),
+        serde_json::json!(lexical_only_fallback),
+    );
+    extras
+}
+
+fn semantic_index_loaded(ctx: &AppContext) -> bool {
+    ctx.semantic_index().borrow().is_some()
 }
 
 fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> LexicalCollection {
@@ -731,6 +816,24 @@ fn semantic_error_response(request_id: &str, error: &str) -> Response {
         request_id,
         "semantic_search_failed",
         format!("semantic_search: {error}"),
+    )
+}
+
+fn format_lexical_unavailable_text(
+    detail: &str,
+    results: &[HybridResult],
+    project_root: &Path,
+) -> String {
+    if results.is_empty() {
+        return format!(
+            "{detail}\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]"
+        );
+    }
+
+    format!(
+        "{detail}\nSemantic search unavailable; returning lexical-only fallback results.\n\n{}\n\nFound {} lexical fallback result(s). [semantic: unavailable]",
+        format_result_sections(results, project_root),
+        results.len()
     )
 }
 

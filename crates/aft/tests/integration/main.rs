@@ -3,6 +3,7 @@ mod test_helpers;
 
 mod helpers;
 
+mod aft_search_contract_test;
 mod ast_commands_test;
 mod backups_dual_write_test;
 mod bash_background_persistence_test;
