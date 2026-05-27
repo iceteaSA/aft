@@ -54,6 +54,25 @@ export interface LspServerConfig {
   initialization_options?: unknown;
 }
 
+export interface InspectConfig {
+  enabled?: boolean;
+  tier2_idle_minutes?: number;
+  categories?: Record<string, boolean>;
+  tier2_soft_deadline_ms?: number;
+  max_drill_down_items?: number;
+  duplicates?: {
+    lower_bound?: number;
+    discard_cost?: number;
+    anonymize?: {
+      variables?: boolean;
+      fields?: boolean;
+      methods?: boolean;
+      types?: boolean;
+      literals?: boolean;
+    };
+  };
+}
+
 export interface LspConfig {
   servers?: Record<string, Omit<LspServerConfig, "id">>;
   disabled?: string[];
@@ -129,6 +148,8 @@ export interface AftConfig {
   restrict_to_project_root?: boolean;
   search_index?: boolean;
   semantic_search?: boolean;
+  /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
+  inspect?: InspectConfig;
   /**
    * Bash tool family (hoist + rewrite + compress + background execution).
    * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -362,6 +383,29 @@ const BashFeaturesSchema = z.object({
 });
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
+const InspectConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  tier2_idle_minutes: z.number().min(0).optional(),
+  categories: z.record(z.string(), z.boolean()).optional(),
+  tier2_soft_deadline_ms: z.number().int().positive().optional(),
+  max_drill_down_items: z.number().int().positive().max(100).optional(),
+  duplicates: z
+    .object({
+      lower_bound: z.number().int().positive().optional(),
+      discard_cost: z.number().int().min(0).optional(),
+      anonymize: z
+        .object({
+          variables: z.boolean().optional(),
+          fields: z.boolean().optional(),
+          methods: z.boolean().optional(),
+          types: z.boolean().optional(),
+          literals: z.boolean().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+});
+
 export const AftConfigSchema = z
   .object({
     /**
@@ -380,6 +424,7 @@ export const AftConfigSchema = z
     restrict_to_project_root: z.boolean().optional(),
     search_index: z.boolean().optional(),
     semantic_search: z.boolean().optional(),
+    inspect: InspectConfigSchema.optional(),
     /**
      * Bash tool family (hoist + rewrite + compress + background execution).
      * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -829,6 +874,40 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
  * OpenCode plugin so a project can override one sub-feature without nuking
  * the user's other sub-features. Handles boolean and object shapes.
  */
+function mergeInspectConfig(
+  baseInspect: AftConfig["inspect"],
+  overrideInspect: AftConfig["inspect"],
+): AftConfig["inspect"] {
+  const inspect = {
+    ...baseInspect,
+    ...overrideInspect,
+    duplicates:
+      baseInspect?.duplicates || overrideInspect?.duplicates
+        ? {
+            ...baseInspect?.duplicates,
+            ...overrideInspect?.duplicates,
+            anonymize:
+              baseInspect?.duplicates?.anonymize || overrideInspect?.duplicates?.anonymize
+                ? {
+                    ...baseInspect?.duplicates?.anonymize,
+                    ...overrideInspect?.duplicates?.anonymize,
+                  }
+                : undefined,
+          }
+        : undefined,
+  };
+
+  if (inspect.duplicates && inspect.duplicates.anonymize === undefined) {
+    delete inspect.duplicates.anonymize;
+  }
+  if (Object.values(inspect).every((value) => value === undefined)) {
+    return undefined;
+  }
+  return Object.fromEntries(
+    Object.entries(inspect).filter(([, value]) => value !== undefined),
+  ) as AftConfig["inspect"];
+}
+
 function mergeBashConfig(
   baseBash: AftConfig["bash"],
   overrideBash: AftConfig["bash"],
@@ -906,6 +985,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "inspect",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in a
@@ -915,6 +995,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "disabled_tools" handled separately — unioned via array merge.
   // "formatter"/"checker" handled separately — deep-merged.
   // "semantic"/"lsp" handled separately — strict field-level merge.
+  // "inspect" handled separately — deep-merged.
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "max_callgraph_files" — USER ONLY (resource budget).
@@ -947,6 +1028,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
+  const inspect = mergeInspectConfig(base.inspect, override.inspect);
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
   // See PROJECT_SAFE_TOP_LEVEL_FIELDS above for the full security rationale.
@@ -955,6 +1037,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   // would wipe out user's `bash: { rewrite: true }`.
   const safeOverride = pickProjectSafeFields(override);
   delete safeOverride.bash;
+  delete safeOverride.inspect;
 
   return {
     ...base,
@@ -963,6 +1046,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(Object.keys(checker).length > 0 ? { checker } : {}),
     ...(lsp ? { lsp } : {}),
     ...(bash !== undefined ? { bash } : {}),
+    ...(inspect !== undefined ? { inspect } : {}),
     experimental,
     semantic,
     ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),

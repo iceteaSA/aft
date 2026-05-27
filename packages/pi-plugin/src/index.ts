@@ -85,6 +85,7 @@ import { registerConflictsTool } from "./tools/conflicts.js";
 import { registerFsTools } from "./tools/fs.js";
 import { registerHoistedTools } from "./tools/hoisted.js";
 import { registerImportTools } from "./tools/imports.js";
+import { registerInspectTool } from "./tools/inspect.js";
 import { registerLspTools } from "./tools/lsp.js";
 import { registerNavigateTool } from "./tools/navigate.js";
 import { registerReadingTools } from "./tools/reading.js";
@@ -314,6 +315,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   outline: boolean;
   zoom: boolean;
   semantic: boolean;
+  inspect: boolean;
   navigate: boolean;
   conflicts: boolean;
   importTool: boolean;
@@ -347,6 +349,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       outline: ok("aft_outline"),
       zoom: ok("aft_zoom"),
       semantic: false,
+      inspect: false,
       navigate: false,
       conflicts: false,
       importTool: false,
@@ -372,6 +375,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     outline: ok("aft_outline"),
     zoom: ok("aft_zoom"),
     semantic: ok("aft_search") && config.semantic_search === true,
+    inspect: ok("aft_inspect") && config.inspect?.enabled !== false,
     navigate: false,
     conflicts: ok("aft_conflicts"),
     importTool: ok("aft_import"),
@@ -478,6 +482,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   Object.assign(configOverrides, resolveExperimentalConfigForConfigure(config));
   Object.assign(configOverrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) configOverrides.semantic = config.semantic;
+  if (config.inspect !== undefined) configOverrides.inspect = config.inspect;
   if (config.max_callgraph_files !== undefined)
     configOverrides.max_callgraph_files = config.max_callgraph_files;
   // url_fetch_allow_private: USER ONLY. Forwarded only when set (Rust default false).
@@ -748,6 +753,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   if (surface.semantic) {
     registerSemanticTool(pi, ctx);
+  }
+  if (surface.inspect) {
+    registerInspectTool(pi, ctx);
   }
   if (surface.navigate) {
     registerNavigateTool(pi, ctx);

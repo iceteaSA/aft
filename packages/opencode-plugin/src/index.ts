@@ -57,6 +57,11 @@ import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
+import {
+  createInspectTier2IdleScheduler,
+  inspectToolSurfaceEnabled,
+  inspectTools,
+} from "./tools/inspect.js";
 import { lspTools } from "./tools/lsp.js";
 import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
@@ -854,6 +859,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // AST tools: recommended+
     ...(surface !== "minimal" && astTools(ctx)),
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticTools(ctx)),
+    ...(inspectToolSurfaceEnabled(aftConfig) && inspectTools(ctx)),
     // Indexed search tools: recommended+ and opt-in
     ...(surface !== "minimal" && aftConfig.search_index === true && searchTools(ctx)),
     ...refactoringTools(ctx),
@@ -909,6 +915,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "aft_zoom",
     "aft_search",
     "aft_navigate",
+    "aft_inspect",
     "grep",
     "aft_grep",
     "bash",
@@ -925,6 +932,21 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     log(`Workflow hints injected (${hintsBlock.length} chars)`);
   }
 
+  const inspectTier2Idle = createInspectTier2IdleScheduler({
+    isEnabled: () => registeredTools.has("aft_inspect"),
+    idleMinutes: () => aftConfig.inspect?.tier2_idle_minutes,
+    warn,
+    run: async (sessionID: string): Promise<void> => {
+      const sessionDir =
+        (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
+      const bridge = ctx.pool.getActiveBridgeForRoot(sessionDir) ?? ctx.pool.getBridge(sessionDir);
+      const response = await bridge.send("inspect_tier2_run", { session_id: sessionID });
+      if (response.success === false) {
+        warn((response.message as string) || "inspect_tier2_run failed");
+      }
+    },
+  });
+
   return {
     tool: allTools,
     "experimental.chat.system.transform": async (
@@ -937,9 +959,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     },
     event: async (eventInput: { event: { type: string; properties?: unknown } }) => {
       await autoUpdateEventHook(eventInput);
-      if (eventInput.event.type !== "session.idle") return;
+      const eventType = eventInput.event.type;
       const sessionID = extractSessionID(eventInput.event.properties);
+      if ((eventType === "session.deleted" || eventType === "session.shutdown") && sessionID) {
+        inspectTier2Idle.clear(sessionID);
+        return;
+      }
+      if (eventType !== "session.idle") return;
       if (!sessionID) return;
+      inspectTier2Idle.schedule(sessionID);
       // Use the session's stored directory rather than the plugin-init cwd:
       // OpenCode passes process.cwd() in `input.directory`, which can be wrong
       // for `-s` resumes from another folder.
@@ -962,6 +990,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // Eagerly warm the session-directory cache so the first tool call from
       // this turn routes to the right project (covers `opencode -s`-from-cwd).
       warmSessionDirectory(input.client, sid, input.directory);
+    },
+    "tool.execute.before": async (toolInput: { sessionID?: string }) => {
+      if (toolInput.sessionID) inspectTier2Idle.clear(toolInput.sessionID);
     },
     "command.execute.before": async (
       commandInput: { command: string; sessionID: string },
@@ -1045,6 +1076,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     },
     dispose: async () => {
       autoUpdateAbort.abort();
+      inspectTier2Idle.clearAll();
       unregisterShutdown();
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       rpcServer.stop();

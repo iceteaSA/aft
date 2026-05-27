@@ -37,6 +37,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const hasSearch =
     opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.absentTools.has("aft_search");
   const hasNavigate = opts.toolSurface === "all" && !opts.absentTools.has("aft_navigate");
+  const hasInspect = opts.toolSurface !== "minimal" && !opts.absentTools.has("aft_inspect");
   const hasBgBash =
     opts.bashBackgroundEnabled &&
     !opts.absentTools.has(bashName) &&
@@ -61,6 +62,12 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
         `**Code exploration**: \`${grepName}\` to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`,
       );
     }
+  }
+
+  if (hasInspect) {
+    sections.push(
+      "**Codebase health**: Use `aft_inspect` when starting in unfamiliar code, before refactors/reviews, or to verify cleanup completeness. It summarizes TODOs, metrics, diagnostics, dead code, unused exports, and duplicates in one call; pass `sections` for focused drill-down, and check `stale_categories` when Tier 2 refreshes are still warming.",
+    );
   }
 
   if (hasNavigate) {
@@ -119,6 +126,7 @@ interface ToolSurfaceFlags {
   zoom: boolean;
   semantic: boolean;
   navigate: boolean;
+  inspect: boolean;
   hoistGrep: boolean;
   hoistBash: boolean;
 }
@@ -143,6 +151,7 @@ export function registerWorkflowHints(
   if (!surface.zoom) absent.add("aft_zoom");
   if (!surface.semantic) absent.add("aft_search");
   if (!surface.navigate) absent.add("aft_navigate");
+  if (!surface.inspect) absent.add("aft_inspect");
   if (!surface.hoistGrep) absent.add("grep");
   if (!surface.hoistBash) {
     absent.add("bash");

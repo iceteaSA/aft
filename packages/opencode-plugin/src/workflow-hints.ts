@@ -49,6 +49,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.disabledTools.has("aft_search");
   // aft_navigate is "all"-tier only.
   const hasNavigate = opts.toolSurface === "all" && !opts.disabledTools.has("aft_navigate");
+  const hasInspect = opts.toolSurface !== "minimal" && !opts.disabledTools.has("aft_inspect");
   const hasBash = !opts.disabledTools.has(bashName);
   const hasBgBash =
     hasBash && opts.bashBackgroundEnabled && !opts.disabledTools.has(bashStatusName);
@@ -74,6 +75,13 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
         `**Code exploration**: \`${grepName}\` to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`,
       );
     }
+  }
+
+  // Codebase health — needs aft_inspect (recommended+).
+  if (hasInspect) {
+    sections.push(
+      "**Codebase health**: Use `aft_inspect` when starting in unfamiliar code, before refactors/reviews, or to verify cleanup completeness. It summarizes TODOs, metrics, diagnostics, dead code, unused exports, and duplicates in one call; pass `sections` for focused drill-down, and check `stale_categories` when Tier 2 refreshes are still warming.",
+    );
   }
 
   // Relationship questions — needs aft_navigate ("all" surface).

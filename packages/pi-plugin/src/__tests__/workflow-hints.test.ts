@@ -22,6 +22,8 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain('`hint: "regex"`');
     expect(out).toContain("auto-routes by query shape");
     expect(out).toContain("Use `aft_navigate`");
+    expect(out).toContain("**Codebase health**");
+    expect(out).toContain("`aft_inspect`");
     expect(out).toContain("**Long-running commands**");
     // Anti-polling guidance must be present so agents stop calling
     // bash_status back-to-back. Mirrors OpenCode plugin parity.
@@ -54,6 +56,28 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).not.toContain("Use `aft_navigate`");
   });
 
+  test("inspect hint is gated by registered tool availability", () => {
+    const registered = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      absentTools: new Set(),
+    });
+    expect(registered).toContain("**Codebase health**");
+    expect(registered).toContain("aft_inspect");
+
+    const minimal = buildWorkflowHints({
+      toolSurface: "minimal",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      absentTools: new Set(),
+    });
+    expect(minimal).not.toContain("**Codebase health**");
+    expect(minimal).not.toContain("aft_inspect");
+  });
+
   test("returns null when all sections gated off by absentTools", () => {
     const out = buildWorkflowHints({
       toolSurface: "minimal",
@@ -75,5 +99,6 @@ describe("Pi buildHintsFromConfig", () => {
     const out = buildHintsFromConfig(config, new Set(), true);
     expect(out).not.toBeNull();
     expect(out).toContain("`bash({ background: true })`");
+    expect(out).toContain("**Codebase health**");
   });
 });
