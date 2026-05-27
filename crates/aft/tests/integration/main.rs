@@ -45,6 +45,7 @@ mod inline_symbol_test;
 mod inspect_dead_code_test;
 mod inspect_engine_test;
 mod inspect_metrics_test;
+mod inspect_unused_exports_test;
 mod is_semantic_indexed_extension_test;
 mod lexical_rank_test;
 mod lexical_score_test;
