@@ -28,8 +28,8 @@ fn setup_inline_fixture() -> (tempfile::TempDir, String) {
 /// Helper: configure aft with the given project root and assert success.
 fn configure(aft: &mut AftProcess, root: &str) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(
         resp["success"], true,
@@ -61,8 +61,8 @@ fn inline_symbol_exported_function() {
     configure(&mut aft, &root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"double","call_site_line":6}}"#,
-        file.display()
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"double","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(
@@ -98,8 +98,8 @@ fn inline_symbol_basic_ts() {
 
     // Inline `add` at line 10 (const result = add(x, y))
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"add","call_site_line":11}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"add","call_site_line":11}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], true, "inline should succeed: {:?}", resp);
@@ -132,8 +132,8 @@ fn inline_symbol_expression_body() {
 
     // Inline `double` at line 17 (const val = double(5)) — 0-indexed
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"double","call_site_line":18}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"double","call_site_line":18}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(
@@ -165,8 +165,8 @@ fn inline_symbol_python() {
 
     // Inline `add` at line 9 (result = add(x, y)) — 0-indexed
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"add","call_site_line":10}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"add","call_site_line":10}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(
@@ -202,8 +202,8 @@ fn inline_symbol_multiple_returns() {
 
     // multiReturn has 2 return statements
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"multiReturn","call_site_line":9}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"multiReturn","call_site_line":9}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -227,8 +227,8 @@ fn inline_symbol_scope_conflict() {
 
     // compute() body declares `temp` and `result`, both exist at call site
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"compute","call_site_line":9}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"compute","call_site_line":9}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(
@@ -288,8 +288,8 @@ fn inline_symbol_preserves_call_site_indent() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"helper","call_site_line":6}}"#,
-        file.display()
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "inline should succeed: {:?}", resp);
 
@@ -327,8 +327,8 @@ fn inline_symbol_does_not_substitute_shadowed_arrow_parameter() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"f","call_site_line":8}}"#,
-        file.display()
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"f","call_site_line":8}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "inline should succeed: {:?}", resp);
 
@@ -365,8 +365,8 @@ fn inline_symbol_matches_multiline_call_starting_on_target_line() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"multiline","command":"inline_symbol","file":"{}","symbol":"helper","call_site_line":6}}"#,
-        file.display()
+        r#"{{"id":"multiline","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -416,8 +416,8 @@ export function main() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"nested-indent","command":"inline_symbol","file":"{}","symbol":"helper","call_site_line":12}}"#,
-        file.display()
+        r#"{{"id":"nested-indent","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":12}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
 
@@ -457,8 +457,8 @@ export function main() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"standalone-return","command":"inline_symbol","file":"{}","symbol":"helper","call_site_line":10}}"#,
-        file.display()
+        r#"{{"id":"standalone-return","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":10}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
 
@@ -497,8 +497,8 @@ export function main() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"params","command":"inline_symbol","file":"{}","symbol":"describe","call_site_line":11}}"#,
-        file.display()
+        r#"{{"id":"params","command":"inline_symbol","file":{},"symbol":"describe","call_site_line":11}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
 
@@ -547,8 +547,8 @@ export function main() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"params-mismatch","command":"inline_symbol","file":"{}","symbol":"sumPoint","call_site_line":8}}"#,
-        file.display()
+        r#"{{"id":"params-mismatch","command":"inline_symbol","file":{},"symbol":"sumPoint","call_site_line":8}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], false, "inline should fail: {resp:?}");
     assert_eq!(resp["code"], "param_mismatch", "wrong error: {resp:?}");

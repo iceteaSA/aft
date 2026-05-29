@@ -1682,8 +1682,8 @@ fn add_import_merges_into_existing_same_module_named_import() {
 
     // Configure aft against the temp dir as project root.
     aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        dir.path().display()
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.path().display())
     ));
 
     let resp = send_add_import(

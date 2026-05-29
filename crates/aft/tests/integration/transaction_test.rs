@@ -87,8 +87,10 @@ fn transaction_success_three_files() {
     fs::write(&f3, "const c = 3;\n").unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"txn-1","command":"transaction","operations":[{{"file":"{}","command":"write","content":"const a = 10;\n"}},{{"file":"{}","command":"write","content":"const b = 20;\n"}},{{"file":"{}","command":"write","content":"const c = 30;\n"}}]}}"#,
-        f1.display(), f2.display(), f3.display()
+        r#"{{"id":"txn-1","command":"transaction","operations":[{{"file":{},"command":"write","content":"const a = 10;\n"}},{{"file":{},"command":"write","content":"const b = 20;\n"}},{{"file":{},"command":"write","content":"const c = 30;\n"}}]}}"#,
+        crate::helpers::json_string(&f1.display()),
+        crate::helpers::json_string(&f2.display()),
+        crate::helpers::json_string(&f3.display())
     ));
 
     assert_eq!(
@@ -243,8 +245,10 @@ fn transaction_rollback_syntax_error() {
 
     // Third file gets intentionally broken syntax
     let resp = aft.send(&format!(
-        r#"{{"id":"txn-rb","command":"transaction","operations":[{{"file":"{}","command":"write","content":"const a = 10;\n"}},{{"file":"{}","command":"write","content":"const b = 20;\n"}},{{"file":"{}","command":"write","content":"const c = {{{{;\n"}}]}}"#,
-        f1.display(), f2.display(), f3.display()
+        r#"{{"id":"txn-rb","command":"transaction","operations":[{{"file":{},"command":"write","content":"const a = 10;\n"}},{{"file":{},"command":"write","content":"const b = 20;\n"}},{{"file":{},"command":"write","content":"const c = {{{{;\n"}}]}}"#,
+        crate::helpers::json_string(&f1.display()),
+        crate::helpers::json_string(&f2.display()),
+        crate::helpers::json_string(&f3.display())
     ));
 
     assert_eq!(
@@ -313,8 +317,10 @@ fn transaction_rollback_new_file() {
 
     // Op 0: modify existing, Op 1: create new file, Op 2: broken syntax triggers rollback
     let resp = aft.send(&format!(
-        r#"{{"id":"txn-nf","command":"transaction","operations":[{{"file":"{}","command":"write","content":"const x = 10;\n"}},{{"file":"{}","command":"write","content":"const y = 1;\n"}},{{"file":"{}","command":"write","content":"const z = {{{{;\n"}}]}}"#,
-        existing.display(), new_file.display(), bad_file.display()
+        r#"{{"id":"txn-nf","command":"transaction","operations":[{{"file":{},"command":"write","content":"const x = 10;\n"}},{{"file":{},"command":"write","content":"const y = 1;\n"}},{{"file":{},"command":"write","content":"const z = {{{{;\n"}}]}}"#,
+        crate::helpers::json_string(&existing.display()),
+        crate::helpers::json_string(&new_file.display()),
+        crate::helpers::json_string(&bad_file.display())
     ));
 
     assert_eq!(
@@ -359,8 +365,9 @@ fn transaction_edit_match_operation() {
     fs::write(&f2, "const name = \"world\";\n").unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"txn-em","command":"transaction","operations":[{{"file":"{}","command":"edit_match","match":"hello","replacement":"hi"}},{{"file":"{}","command":"edit_match","match":"world","replacement":"rust"}}]}}"#,
-        f1.display(), f2.display()
+        r#"{{"id":"txn-em","command":"transaction","operations":[{{"file":{},"command":"edit_match","match":"hello","replacement":"hi"}},{{"file":{},"command":"edit_match","match":"world","replacement":"rust"}}]}}"#,
+        crate::helpers::json_string(&f1.display()),
+        crate::helpers::json_string(&f2.display())
     ));
 
     assert_eq!(
@@ -392,8 +399,8 @@ fn transaction_edit_match_requires_replacement() {
     fs::write(&f1, "const greeting = \"hello\";\n").unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"txn-em-missing","command":"transaction","operations":[{{"file":"{}","command":"edit_match","match":"hello"}}]}}"#,
-        f1.display()
+        r#"{{"id":"txn-em-missing","command":"transaction","operations":[{{"file":{},"command":"edit_match","match":"hello"}}]}}"#,
+        crate::helpers::json_string(&f1.display())
     ));
 
     assert_eq!(
@@ -503,8 +510,8 @@ fn transaction_returns_inline_lsp_diagnostics_when_requested() {
     let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg-txn-inline","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root.display()
+        r#"{{"id":"cfg-txn-inline","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(
         configure["success"], true,

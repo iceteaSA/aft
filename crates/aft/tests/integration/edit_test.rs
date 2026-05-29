@@ -61,8 +61,8 @@ fn write_creates_new_file() {
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-1","command":"write","file":"{}","content":"hello world"}}"#,
-        target.display()
+        r#"{{"id":"w-1","command":"write","file":{},"content":"hello world"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -94,15 +94,15 @@ fn write_created_file_undo_removes_created_parent_dirs() {
     let target = dir.path().join("newdir").join("sub").join("created.txt");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"write-created-nested","command":"write","file":"{}","content":"created"}}"#,
-        target.display()
+        r#"{{"id":"write-created-nested","command":"write","file":{},"content":"created"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
     assert!(target.exists());
 
     let undo = aft.send(&format!(
-        r#"{{"id":"undo-created-nested","command":"undo","file":"{}"}}"#,
-        target.display()
+        r#"{{"id":"undo-created-nested","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
     assert!(!target.exists(), "created file should be removed");
@@ -123,8 +123,8 @@ fn write_auto_rollback_discards_fake_undo_entry() {
     fs::write(&target, "const value = 1;\n").unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"write-invalid","command":"write","file":"{}","content":"const value = {{;\n"}}"#,
-        target.display()
+        r#"{{"id":"write-invalid","command":"write","file":{},"content":"const value = {{;\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(
         resp["success"], true,
@@ -137,8 +137,8 @@ fn write_auto_rollback_discards_fake_undo_entry() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "const value = 1;\n");
 
     let undo = aft.send(&format!(
-        r#"{{"id":"undo-after-rollback","command":"undo","file":"{}"}}"#,
-        target.display()
+        r#"{{"id":"undo-after-rollback","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(
         undo["success"], false,
@@ -174,8 +174,8 @@ fn configured_storage_writes_backups_under_harness_namespace() {
     );
 
     let resp = aft.send(&format!(
-        r#"{{"id":"write-storage-backup","command":"write","file":"{}","content":"after"}}"#,
-        target.display()
+        r#"{{"id":"write-storage-backup","command":"write","file":{},"content":"after"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(resp["success"], true, "write failed: {resp:?}");
     assert!(
@@ -200,8 +200,8 @@ fn write_backups_existing_file() {
 
     // Overwrite via write command
     let resp = aft.send(&format!(
-        r#"{{"id":"w-2","command":"write","file":"{}","content":"new content"}}"#,
-        target.display()
+        r#"{{"id":"w-2","command":"write","file":{},"content":"new content"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -216,8 +216,8 @@ fn write_backups_existing_file() {
 
     // Undo — should restore original
     let undo_resp = aft.send(&format!(
-        r#"{{"id":"w-2u","command":"undo","file":"{}"}}"#,
-        target.display()
+        r#"{{"id":"w-2u","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(
         undo_resp["success"], true,
@@ -240,8 +240,8 @@ fn write_syntax_valid() {
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-3","command":"write","file":"{}","content":"export function hello(): string {{ return \"hi\"; }}"}}"#,
-        target.display()
+        r#"{{"id":"w-3","command":"write","file":{},"content":"export function hello(): string {{ return \"hi\"; }}"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -263,8 +263,8 @@ fn write_syntax_invalid() {
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-4","command":"write","file":"{}","content":"export function {{ broken syntax"}}"#,
-        target.display()
+        r#"{{"id":"w-4","command":"write","file":{},"content":"export function {{ broken syntax"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -444,8 +444,8 @@ fn edit_symbol_delete() {
     assert!(before.contains("internalHelper"));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-2","command":"edit_symbol","file":"{}","symbol":"internalHelper","operation":"delete"}}"#,
-        target.display()
+        r#"{{"id":"es-2","command":"edit_symbol","file":{},"symbol":"internalHelper","operation":"delete"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -478,8 +478,8 @@ fn edit_symbol_ambiguous() {
     fs::copy(&fixture, &target).unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-3","command":"edit_symbol","file":"{}","symbol":"process","operation":"replace","content":"// replaced"}}"#,
-        target.display()
+        r#"{{"id":"es-3","command":"edit_symbol","file":{},"symbol":"process","operation":"replace","content":"// replaced"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -520,8 +520,8 @@ fn edit_symbol_not_found() {
     let file = fixture_path("sample.ts");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-4","command":"edit_symbol","file":"{}","symbol":"nonexistent_symbol","operation":"replace","content":"// nope"}}"#,
-        file.display()
+        r#"{{"id":"es-4","command":"edit_symbol","file":{},"symbol":"nonexistent_symbol","operation":"replace","content":"// nope"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(
@@ -609,8 +609,8 @@ fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
     let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root.display()
+        r#"{{"id":"cfg-inline","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(
         configure["success"], true,
@@ -674,8 +674,8 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
     let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline-fast","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root.display()
+        r#"{{"id":"cfg-inline-fast","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(
         configure["success"], true,
@@ -1035,8 +1035,8 @@ fn batch_with_undo() {
 
     // Undo
     let undo_resp = aft.send(&format!(
-        r#"{{"id":"b-4u","command":"undo","file":"{}"}}"#,
-        target.display()
+        r#"{{"id":"b-4u","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(
         undo_resp["success"], true,

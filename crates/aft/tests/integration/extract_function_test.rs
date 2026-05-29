@@ -28,8 +28,8 @@ fn setup_extract_fixture() -> (tempfile::TempDir, String) {
 /// Helper: configure aft with the given project root and assert success.
 fn configure(aft: &mut AftProcess, root: &str) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(
         resp["success"], true,
@@ -55,8 +55,8 @@ fn extract_function_basic_ts() {
     // Extract lines 5-9 of processData (the body lines with filtered, mapped, result, console.log)
     // These use `items`, `prefix` from the enclosing function → free variables
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"doProcess","start_line":6,"end_line":10}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"doProcess","start_line":6,"end_line":10}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
@@ -98,8 +98,8 @@ fn extract_function_with_return_value() {
     // Extract lines 13-14 of simpleHelper (doubled and added)
     // `added` is used after the range (return added) → return value
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"computeValues","start_line":14,"end_line":16}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"computeValues","start_line":14,"end_line":16}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
@@ -148,8 +148,8 @@ fn extract_function_plain_const_keeps_enclosing_function_scope() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"makeX","start_line":2,"end_line":3}}"#,
-        file.display()
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"makeX","start_line":2,"end_line":3}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
 
@@ -186,8 +186,8 @@ fn extract_function_preserves_nested_body_indentation() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"processItems","start_line":2,"end_line":7}}"#,
-        file.display()
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"processItems","start_line":2,"end_line":7}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
 
@@ -219,8 +219,8 @@ fn extract_function_preserves_let_return_binding() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"computeInitial","start_line":2,"end_line":3}}"#,
-        file.display()
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"computeInitial","start_line":2,"end_line":3}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
 
@@ -250,8 +250,8 @@ fn extract_function_python() {
 
     // Extract lines 5-8 of process_data body
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"do_process","start_line":6,"end_line":10}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"do_process","start_line":6,"end_line":10}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(
@@ -291,8 +291,8 @@ fn extract_function_unsupported_language() {
     std::fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"foo","start_line":2,"end_line":3}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"foo","start_line":2,"end_line":3}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -312,8 +312,8 @@ fn extract_function_this_reference() {
 
     // Lines 4-7 of UserService.getUser contain `this.users`
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"extracted","start_line":5,"end_line":8}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"extracted","start_line":5,"end_line":8}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);

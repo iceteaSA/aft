@@ -5,13 +5,13 @@ name: Unit suite
 # release.yml (tag push). Single source of truth — PR-time and release-time
 # unit jobs cannot drift.
 #
-# The `strict` input toggles whether currently-flaky Windows jobs gate the
-# caller:
-#   strict=false → PR mode. Windows cargo and Windows bash e2e are
-#     non-blocking (continue-on-error: true). Linux and macOS still block.
-#   strict=true  → release mode. ALL four jobs gate. A failure in any of
-#     them fails the called-workflow's overall status, blocking downstream
-#     `needs:` jobs in the caller (e2e, build-*, publish-*).
+# The `strict` input toggles whether the currently-scoped Windows bash e2e job
+# gates the caller:
+#   strict=false → PR mode. Linux, macOS, and Windows cargo block; Windows bash
+#     e2e remains non-blocking (continue-on-error: true).
+#   strict=true  → release mode. ALL four jobs gate. A failure in any of them
+#     fails the called-workflow's overall status, blocking downstream `needs:`
+#     jobs in the caller (e2e, build-*, publish-*).
 #
 # The release pipeline runs in strict mode so we don't ship with known
 # regressions on any platform. Currently-flaky tests in the strict-only path
@@ -22,7 +22,7 @@ on:
   workflow_call:
     inputs:
       strict:
-        description: "When true, all jobs gate the caller; when false, Windows jobs are continue-on-error"
+        description: "When true, all jobs gate the caller; when false, only Windows bash e2e is continue-on-error"
         type: boolean
         default: false
 
@@ -154,23 +154,15 @@ jobs:
   # and Windows process/path/signal differences. Same suite as Linux but on a
   # real Windows runner — does NOT spin up OpenCode, that's the e2e job.
   #
-  # PR mode (strict=false): non-blocking. Many integration tests build NDJSON
-  # requests by hand-formatting paths via `r#"...{path.display()}..."#`,
-  # which produces invalid JSON on Windows because backslashes in
-  # `C:\Users\...` get parsed as escape sequences. Migrating ~150
-  # call sites to `serde_json::json!` is a separate cleanup; the
-  # production code path is platform-clean (538 lib tests pass on
-  # Windows runners, plus the Windows native E2E job covers the
-  # integration layer). Lib-only test scope below is the workaround.
-  #
-  # Release mode (strict=true): blocking. Forces us to keep the Windows
-  # lib-test surface green before shipping.
+  # PR and release modes are blocking. Integration tests now serialize
+  # filesystem paths through serde_json before writing NDJSON requests, so
+  # Windows backslashes are escaped correctly instead of being parsed as JSON
+  # escape sequences.
   # ---------------------------------------------------------------------------
   unit-windows-cargo:
     name: Cargo test (Windows)
     runs-on: windows-2022
     timeout-minutes: 30
-    continue-on-error: ${{ inputs.strict != true }}
     steps:
       - uses: actions/checkout@v5
 
@@ -180,18 +172,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Cargo test (lib only — integration tests need JSON path-escape cleanup)
-        run: cargo test --workspace --lib
+      - name: Cargo test (workspace)
+        run: cargo test --workspace
         shell: pwsh
+        env:
+          AFT_TEST_DIAG: "1"
 
   # ---------------------------------------------------------------------------
   # Bash permission flow on Windows
   # Scoped to bash.test.ts only: covers the runAsk + Effect runtime path on
   # Windows for OS-parity peace of mind. The runAsk fix itself is platform-
   # agnostic JavaScript semantics — Linux/macOS in the unit-linux and
-  # unit-macos jobs already cover that. Running the full plugin bun suite
-  # on Windows blocks on broader integration-harness JSON-path escape issues
-  # (see unit-windows-cargo comment), so we scope this to one test file.
+  # unit-macos jobs already cover that. This Windows job is intentionally
+  # scoped to the bash permission bridge; Rust integration coverage is handled
+  # by unit-windows-cargo.
   #
   # Why a real bun runner on Windows: this exercises the BinaryBridge
   # spawning aft.exe over NDJSON via stdio on the Windows process model. It

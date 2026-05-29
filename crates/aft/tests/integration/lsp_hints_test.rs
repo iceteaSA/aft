@@ -14,8 +14,8 @@ fn edit_symbol_with_lsp_hints_disambiguates() {
     std::fs::copy(&fixture, &target).unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        dir.path().display()
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.path().display())
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);
 
@@ -24,9 +24,9 @@ fn edit_symbol_with_lsp_hints_disambiguates() {
     //   - line 7 (0-indexed): method inside DataHandler (lines 7-9)
     // Send edit_symbol with lsp_hints pointing to the standalone function (line 3 is within range).
     let resp = aft.send(&format!(
-        r#"{{"id":"lsp-1","command":"edit_symbol","file":"{}","symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toLowerCase();\n}}","lsp_hints":{{"symbols":[{{"name":"process","file":"{}","line":2}}]}}}}"#,
-        target.display(),
-        target.display()
+        r#"{{"id":"lsp-1","command":"edit_symbol","file":{},"symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toLowerCase();\n}}","lsp_hints":{{"symbols":[{{"name":"process","file":{},"line":2}}]}}}}"#,
+        crate::helpers::json_string(&target.display()),
+        crate::helpers::json_string(&target.display())
     ));
 
     // Should succeed — not ambiguous_symbol
@@ -44,14 +44,14 @@ fn edit_symbol_without_lsp_hints_returns_candidates() {
     let fixture = fixture_path("ambiguous.ts");
     let dir = fixture.parent().unwrap().parent().unwrap();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        dir.display()
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.display())
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"no-hints","command":"edit_symbol","file":"{}","symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toLowerCase();\n}}"}}"#,
-        fixture.display()
+        r#"{{"id":"no-hints","command":"edit_symbol","file":{},"symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toLowerCase();\n}}"}}"#,
+        crate::helpers::json_string(&fixture.display())
     ));
 
     // Should return ambiguous_symbol with candidates
@@ -81,15 +81,15 @@ fn edit_symbol_with_malformed_lsp_hints_falls_back() {
     let fixture = fixture_path("ambiguous.ts");
     let dir = fixture.parent().unwrap().parent().unwrap();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        dir.display()
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.display())
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);
 
     // Malformed: lsp_hints is not the expected schema
     let resp = aft.send(&format!(
-        r#"{{"id":"bad-hints","command":"edit_symbol","file":"{}","symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toLowerCase();\n}}","lsp_hints":{{"not_symbols":true}}}}"#,
-        fixture.display()
+        r#"{{"id":"bad-hints","command":"edit_symbol","file":{},"symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toLowerCase();\n}}","lsp_hints":{{"not_symbols":true}}}}"#,
+        crate::helpers::json_string(&fixture.display())
     ));
 
     // Should fall back to ambiguous_symbol — malformed hints are silently ignored
@@ -116,16 +116,16 @@ fn zoom_with_lsp_hints_disambiguates() {
     let fixture = fixture_path("ambiguous.ts");
     let dir = fixture.parent().unwrap().parent().unwrap();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        dir.display()
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.display())
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);
 
     // Zoom into the method version (line 7, inside DataHandler)
     let resp = aft.send(&format!(
-        r#"{{"id":"zoom-lsp","command":"zoom","file":"{}","symbol":"process","lsp_hints":{{"symbols":[{{"name":"process","file":"{}","line":7}}]}}}}"#,
-        fixture.display(),
-        fixture.display()
+        r#"{{"id":"zoom-lsp","command":"zoom","file":{},"symbol":"process","lsp_hints":{{"symbols":[{{"name":"process","file":{},"line":7}}]}}}}"#,
+        crate::helpers::json_string(&fixture.display()),
+        crate::helpers::json_string(&fixture.display())
     ));
 
     // Should succeed with the method, not an ambiguous error

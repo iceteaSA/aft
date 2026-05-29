@@ -109,8 +109,8 @@ fn format_integration_applied_rustfmt() {
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
     aft.configure(&dir);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-1","command":"write","file":"{}","content":"{}"}}"#,
-        target.display(),
+        r#"{{"id":"fmt-1","command":"write","file":{},"content":"{}"}}"#,
+        crate::helpers::json_string(&target.display()),
         ugly_code
     ));
 
@@ -152,8 +152,8 @@ fn format_integration_unsupported_language() {
     let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-2","command":"write","file":"{}","content":"hello world"}}"#,
-        target.display()
+        r#"{{"id":"fmt-2","command":"write","file":{},"content":"hello world"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -180,8 +180,8 @@ fn format_integration_no_formatter_configured() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-3","command":"write","file":"{}","content":"x = 1"}}"#,
-        target.display()
+        r#"{{"id":"fmt-3","command":"write","file":{},"content":"x = 1"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -215,8 +215,8 @@ fn format_integration_formatter_not_installed() {
     let cfg = aft.configure(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-3b","command":"write","file":"{}","content":"const x = 1;\n"}}"#,
-        target.display()
+        r#"{{"id":"fmt-3b","command":"write","file":{},"content":"const x = 1;\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -256,8 +256,8 @@ fn format_integration_oxfmt_config_runs_oxfmt() {
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-3c","command":"write","file":"{}","content":"const   x=1;\n"}}"#,
-        target.display()
+        r#"{{"id":"fmt-3c","command":"write","file":{},"content":"const   x=1;\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -296,8 +296,8 @@ fn format_integration_oxfmt_ignored_path_reports_formatter_excluded_path() {
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-3d","command":"write","file":"{}","content":"const   x=1;\n"}}"#,
-        target.display()
+        r#"{{"id":"fmt-3d","command":"write","file":{},"content":"const   x=1;\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -326,8 +326,8 @@ fn format_integration_add_import_with_format() {
     let mut aft = AftProcess::spawn();
     aft.configure(&dir);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-4","command":"add_import","file":"{}","module":"std::collections::HashMap"}}"#,
-        target.display()
+        r#"{{"id":"fmt-4","command":"add_import","file":{},"module":"std::collections::HashMap"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -372,8 +372,8 @@ fn format_integration_edit_symbol_with_format() {
     // Use edit_symbol to replace the function
     let new_body = r#"fn greet() {\n    println!(\"hello world\");\n}"#;
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-5","command":"edit_symbol","file":"{}","symbol":"greet","operation":"replace","content":"{}"}}"#,
-        target.display(),
+        r#"{{"id":"fmt-5","command":"edit_symbol","file":{},"symbol":"greet","operation":"replace","content":"{}"}}"#,
+        crate::helpers::json_string(&target.display()),
         new_body
     ));
 
@@ -409,8 +409,8 @@ fn format_integration_fields_always_present() {
     let mut aft = AftProcess::spawn();
     aft.configure(&dir);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-6a","command":"write","file":"{}","content":"Hello markdown"}}"#,
-        md_target.display()
+        r#"{{"id":"fmt-6a","command":"write","file":{},"content":"Hello markdown"}}"#,
+        crate::helpers::json_string(&md_target.display())
     ));
 
     assert_eq!(
@@ -432,8 +432,8 @@ fn format_integration_fields_always_present() {
     let _ = fs::remove_file(&rs_target);
 
     let resp2 = aft.send(&format!(
-        r#"{{"id":"fmt-6b","command":"write","file":"{}","content":"fn main() {{}}"}}"#,
-        rs_target.display()
+        r#"{{"id":"fmt-6b","command":"write","file":{},"content":"fn main() {{}}"}}"#,
+        crate::helpers::json_string(&rs_target.display())
     ));
 
     assert_eq!(
@@ -466,8 +466,8 @@ fn validate_full_default_no_errors() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-1","command":"write","file":"{}","content":"fn main() {{}}"}}"#,
-        target.display()
+        r#"{{"id":"val-1","command":"write","file":{},"content":"fn main() {{}}"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -509,14 +509,14 @@ fn validate_on_edit_full_from_config_runs_checker() {
 
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&format!(
-        r#"{{"id":"cfg-val-full","command":"configure","harness":"opencode","project_root":"{}","validate_on_edit":"full","checker":{{"typescript":"tsc"}}}}"#,
-        dir.display()
+        r#"{{"id":"cfg-val-full","command":"configure","harness":"opencode","project_root":{},"validate_on_edit":"full","checker":{{"typescript":"tsc"}}}}"#,
+        crate::helpers::json_string(&dir.display())
     ));
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"val-config-full","command":"write","file":"{}","content":"const x: number = \"oops\";\n"}}"#,
-        target.display()
+        r#"{{"id":"val-config-full","command":"write","file":{},"content":"const x: number = \"oops\";\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -545,14 +545,14 @@ fn validate_on_edit_off_from_config_skips_checker() {
 
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&format!(
-        r#"{{"id":"cfg-val-off","command":"configure","harness":"opencode","project_root":"{}","validate_on_edit":"off"}}"#,
-        dir.display()
+        r#"{{"id":"cfg-val-off","command":"configure","harness":"opencode","project_root":{},"validate_on_edit":"off"}}"#,
+        crate::helpers::json_string(&dir.display())
     ));
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"val-config-off","command":"write","file":"{}","content":"const x: number = \"oops\";\n"}}"#,
-        target.display()
+        r#"{{"id":"val-config-off","command":"write","file":{},"content":"const x: number = \"oops\";\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -588,8 +588,8 @@ fn validate_full_with_checker() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-2","command":"write","file":"{}","content":"fn main() {{}}","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-2","command":"write","file":{},"content":"fn main() {{}}","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -618,8 +618,8 @@ fn validate_full_unsupported_language() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-3","command":"write","file":"{}","content":"hello","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-3","command":"write","file":{},"content":"hello","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -642,8 +642,8 @@ fn validate_full_no_checker_configured() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-3b","command":"write","file":"{}","content":"const x = 1;\n","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-3b","command":"write","file":{},"content":"const x = 1;\n","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -682,8 +682,8 @@ fn validate_full_nonzero_without_diagnostics_reports_error() {
     let cfg = aft.configure(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
     let resp = aft.send(&format!(
-        r#"{{"id":"val-error-no-diag","command":"write","file":"{}","content":"const x = 1;\n","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-error-no-diag","command":"write","file":{},"content":"const x = 1;\n","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -713,8 +713,8 @@ fn validate_full_checker_not_installed() {
     let cfg = aft.configure(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
     let resp = aft.send(&format!(
-        r#"{{"id":"val-3c","command":"write","file":"{}","content":"const x = 1;\n","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-3c","command":"write","file":{},"content":"const x = 1;\n","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -740,8 +740,8 @@ fn validate_full_flows_through_add_import() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-4","command":"add_import","file":"{}","module":"std::collections::HashMap","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-4","command":"add_import","file":{},"module":"std::collections::HashMap","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(

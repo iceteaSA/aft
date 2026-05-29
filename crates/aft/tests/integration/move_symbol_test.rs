@@ -44,8 +44,8 @@ fn setup_move_fixture() -> (tempfile::TempDir, String) {
 /// Helper: configure aft with the given project root and assert success.
 fn configure(aft: &mut AftProcess, root: &str) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(
         resp["success"], true,
@@ -68,9 +68,9 @@ fn assert_move_symbol_unsupported(ext: &str, source: &str, dest: &str) {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"unsupported-{ext}","command":"move_symbol","file":"{}","symbol":"Foo","destination":"{}"}}"#,
-        src.display(),
-        dst.display()
+        r#"{{"id":"unsupported-{ext}","command":"move_symbol","file":{},"symbol":"Foo","destination":{}}}"#,
+        crate::helpers::json_string(&src.display()),
+        crate::helpers::json_string(&dst.display())
     ));
     assert_eq!(resp["success"], false, "move should fail: {resp:?}");
     assert_eq!(
@@ -110,9 +110,9 @@ fn move_symbol_rewrites_barrel_named_reexport() {
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
     let resp = aft.send(&format!(
-        r#"{{"id":"barrel","command":"move_symbol","file":"{}","symbol":"Foo","destination":"{}"}}"#,
-        foo.display(),
-        bar.display()
+        r#"{{"id":"barrel","command":"move_symbol","file":{},"symbol":"Foo","destination":{}}}"#,
+        crate::helpers::json_string(&foo.display()),
+        crate::helpers::json_string(&bar.display())
     ));
     assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
     let index_content = std::fs::read_to_string(index).expect("read index");
@@ -140,8 +140,9 @@ fn move_symbol_basic() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(
@@ -220,8 +221,9 @@ fn move_symbol_multiple_consumers() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], true, "move should succeed: {:?}", resp);
@@ -306,8 +308,9 @@ fn move_symbol_aliased_import() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], true, "move should succeed: {:?}", resp);
@@ -363,9 +366,9 @@ export function useHelper(): string {
     configure(&mut aft, &root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"source-consumer","command":"move_symbol","file":"{}","symbol":"helper","destination":"{}"}}"#,
-        source.display(),
-        dest.display()
+        r#"{{"id":"source-consumer","command":"move_symbol","file":{},"symbol":"helper","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
     ));
     assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
     assert!(
@@ -444,9 +447,9 @@ export const value = Bar();
     configure(&mut aft, &root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"default-imports","command":"move_symbol","file":"{}","symbol":"Foo","destination":"{}"}}"#,
-        old.display(),
-        dest.display()
+        r#"{{"id":"default-imports","command":"move_symbol","file":{},"symbol":"Foo","destination":{}}}"#,
+        crate::helpers::json_string(&old.display()),
+        crate::helpers::json_string(&dest.display())
     ));
     assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
 
@@ -505,8 +508,9 @@ fn move_symbol_checkpoint() {
 
     // Perform the move
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
     assert_eq!(resp["success"], true, "move should succeed: {:?}", resp);
     let checkpoint_name = resp["checkpoint_name"].as_str().unwrap().to_string();
@@ -579,8 +583,9 @@ fn move_symbol_operation_undo_restores_source_destination_and_consumers() {
     let consumer_e_original = std::fs::read_to_string(&consumer_e).unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"move-before-undo","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"move-before-undo","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
     assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
     assert!(
@@ -635,9 +640,9 @@ fn move_symbol_undo_removes_new_destination_file() {
     configure(&mut aft, &root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"move-to-new-dest","command":"move_symbol","file":"{}","symbol":"moveMe","destination":"{}"}}"#,
-        source.display(),
-        dest.display()
+        r#"{{"id":"move-to-new-dest","command":"move_symbol","file":{},"symbol":"moveMe","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
     ));
     assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
     assert!(dest.exists(), "destination should be created");
@@ -670,8 +675,9 @@ fn move_symbol_not_configured() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -691,8 +697,9 @@ fn move_symbol_symbol_not_found() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"nonExistentFn","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"nonExistentFn","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -716,9 +723,9 @@ fn move_symbol_ambiguous_symbol_is_error_response() {
     configure(&mut aft, &tmp.path().display().to_string());
 
     let resp = aft.send(&format!(
-        r#"{{"id":"ambiguous","command":"move_symbol","file":"{}","symbol":"duplicate","destination":"{}"}}"#,
-        source.display(),
-        dest.display()
+        r#"{{"id":"ambiguous","command":"move_symbol","file":{},"symbol":"duplicate","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
     ));
 
     assert_eq!(resp["success"], false, "should fail: {resp:?}");
@@ -740,8 +747,9 @@ fn move_symbol_non_top_level() {
 
     // "format" is a method inside the DateHelper class in service.ts
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"format","destination":"{}","scope":"DateHelper"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"format","destination":{},"scope":"DateHelper"}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(
@@ -780,8 +788,9 @@ fn move_symbol_file_not_found() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}/nonexistent.ts","symbol":"foo","destination":"{}"}}"#,
-        root, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"foo","destination":{}}}"#,
+        crate::helpers::json_string(&format!("{}/nonexistent.ts", root)),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -803,8 +812,8 @@ fn move_symbol_project_too_large() {
     // Configure with an artificially low cap so the 7+ file fixture trips the
     // guard. This asserts the guard fires BEFORE the move writes anything.
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
@@ -812,8 +821,9 @@ fn move_symbol_project_too_large() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], false, "move should fail: {:?}", resp);
@@ -851,15 +861,15 @@ fn move_symbol_does_not_leak_export_keyword() {
     let mut aft = AftProcess::spawn();
     let root = tmp.path().display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"greet","destination":"{}"}}"#,
-        source.display(),
-        dest.display()
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"greet","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
     ));
     assert_eq!(resp["success"], true, "move should succeed: {:?}", resp);
 
@@ -919,15 +929,15 @@ fn extract_function_preserves_enclosing_export_keyword() {
     let mut aft = AftProcess::spawn();
     let root = tmp.path().display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
     // Extract just the items.map(...) line.
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","start_line":3,"end_line":4,"name":"makeItems"}}"#,
-        file.display()
+        r#"{{"id":"1","command":"extract_function","file":{},"start_line":3,"end_line":4,"name":"makeItems"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
 

@@ -132,8 +132,8 @@ fn test_outline_typescript_nested_structure() {
     let file = fixture_path("sample.ts");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"ol-1","command":"outline","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"ol-1","command":"outline","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["id"], "ol-1");
@@ -218,8 +218,8 @@ fn test_outline_python_multi_level_nesting() {
     let file = fixture_path("sample.py");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"ol-py","command":"outline","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"ol-py","command":"outline","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], true, "outline should succeed for Python");
@@ -314,8 +314,8 @@ fn test_zoom_success_with_annotations() {
     let file = fixture_path("calls.ts");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"z-1","command":"zoom","file":"{}","symbol":"compute"}}"#,
-        file.display()
+        r#"{{"id":"z-1","command":"zoom","file":{},"symbol":"compute"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["id"], "z-1");
@@ -427,8 +427,8 @@ fn test_read_range_after_binary_sample_rewind() {
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"read-range-rewind","command":"read","file":"{}","start_line":2,"end_line":3}}"#,
-        file.display()
+        r#"{{"id":"read-range-rewind","command":"read","file":{},"start_line":2,"end_line":3}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], true, "read should succeed: {resp:?}");
@@ -452,8 +452,8 @@ fn test_read_binary_detection_after_single_open_refactor() {
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"read-binary-single-open","command":"read","file":"{}","start_line":1,"end_line":1}}"#,
-        file.display()
+        r#"{{"id":"read-binary-single-open","command":"read","file":{},"start_line":1,"end_line":1}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(
@@ -483,8 +483,8 @@ fn test_read_rejects_files_larger_than_50mb() {
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"read-large","command":"read","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"read-large","command":"read","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], false, "read should fail: {:?}", resp);
@@ -512,8 +512,8 @@ fn test_read_handles_inverted_line_range() {
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"read-inv","command":"read","file":"{}","start_line":8,"end_line":3}}"#,
-        file.display()
+        r#"{{"id":"read-inv","command":"read","file":{},"start_line":8,"end_line":3}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(
@@ -544,8 +544,8 @@ fn test_read_directory_caps_entries_at_one_thousand() {
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"read-dir-cap","command":"read","file":"{}"}}"#,
-        temp_dir.path().display()
+        r#"{{"id":"read-dir-cap","command":"read","file":{}}}"#,
+        crate::helpers::json_string(&temp_dir.path().display())
     ));
 
     assert_eq!(
@@ -572,8 +572,8 @@ fn test_zoom_symbol_not_found() {
     let file = fixture_path("calls.ts");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"z-nf","command":"zoom","file":"{}","symbol":"nonexistent_fn"}}"#,
-        file.display()
+        r#"{{"id":"z-nf","command":"zoom","file":{},"symbol":"nonexistent_fn"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], false);
@@ -603,8 +603,8 @@ pub struct Thing;
     aft.configure(dir.path());
 
     let resp = aft.send(&format!(
-        r##"{{"id":"z-rust-hash","command":"zoom","file":"{}","symbol":"#[derive(Debug)]"}}"##,
-        file.display()
+        r##"{{"id":"z-rust-hash","command":"zoom","file":{},"symbol":"#[derive(Debug)]"}}"##,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(
@@ -628,8 +628,8 @@ fn test_zoom_context_lines_param() {
 
     // Use context_lines=1
     let resp = aft.send(&format!(
-        r#"{{"id":"z-cl","command":"zoom","file":"{}","symbol":"compute","context_lines":1}}"#,
-        file.display()
+        r#"{{"id":"z-cl","command":"zoom","file":{},"symbol":"compute","context_lines":1}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], true);
@@ -658,8 +658,8 @@ fn test_zoom_empty_annotations_arrays() {
 
     // `unused` has no known callers and calls no known symbols
     let resp = aft.send(&format!(
-        r#"{{"id":"z-empty","command":"zoom","file":"{}","symbol":"unused"}}"#,
-        file.display()
+        r#"{{"id":"z-empty","command":"zoom","file":{},"symbol":"unused"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], true);
@@ -695,8 +695,8 @@ fn test_zoom_supports_c_symbols() {
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"zoom-c","command":"zoom","file":"{}","symbol":"compute"}}"#,
-        file.display()
+        r#"{{"id":"zoom-c","command":"zoom","file":{},"symbol":"compute"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], true, "zoom should succeed: {resp:?}");
@@ -722,8 +722,8 @@ fn test_zoom_supports_cpp_symbols() {
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"zoom-cpp","command":"zoom","file":"{}","symbol":"Worker"}}"#,
-        file.display()
+        r#"{{"id":"zoom-cpp","command":"zoom","file":{},"symbol":"Worker"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], true, "zoom should succeed: {resp:?}");
@@ -749,8 +749,8 @@ fn test_zoom_supports_zig_symbols() {
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"zoom-zig","command":"zoom","file":"{}","symbol":"greet"}}"#,
-        file.display()
+        r#"{{"id":"zoom-zig","command":"zoom","file":{},"symbol":"greet"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], true, "zoom should succeed: {resp:?}");
@@ -776,8 +776,8 @@ fn test_zoom_supports_csharp_symbols() {
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"zoom-csharp","command":"zoom","file":"{}","symbol":"Worker"}}"#,
-        file.display()
+        r#"{{"id":"zoom-csharp","command":"zoom","file":{},"symbol":"Worker"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["success"], true, "zoom should succeed: {resp:?}");

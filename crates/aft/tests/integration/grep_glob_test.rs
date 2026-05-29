@@ -28,8 +28,8 @@ fn configure(aft: &mut AftProcess, root: &Path) {
 
 fn configure_with_index(aft: &mut AftProcess, root: &Path) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg-index","command":"configure","harness":"opencode","project_root":"{}","search_index":true}}"#,
-        root.display()
+        r#"{{"id":"cfg-index","command":"configure","harness":"opencode","project_root":{},"search_index":true}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 }

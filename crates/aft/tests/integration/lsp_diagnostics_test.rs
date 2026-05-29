@@ -1024,20 +1024,20 @@ fn test_lsp_diagnostics_command_response_format() {
     ]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        root.display()
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(configure["success"], true);
 
     let write = aft.send(&format!(
-        r#"{{"id":"write-1","command":"write","file":"{}","content":"fn main() {{ println!(\"hello\"); }}\n"}}"#,
-        file.display()
+        r#"{{"id":"write-1","command":"write","file":{},"content":"fn main() {{ println!(\"hello\"); }}\n"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(write["success"], true, "write failed: {write:?}");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"diag-1","command":"lsp_diagnostics","file":"{}","wait_ms":400}}"#,
-        file.display()
+        r#"{{"id":"diag-1","command":"lsp_diagnostics","file":{},"wait_ms":400}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(resp["id"], "diag-1");

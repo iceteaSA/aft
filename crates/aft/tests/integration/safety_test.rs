@@ -30,14 +30,14 @@ fn test_checkpoint_create_restore_cycle() {
 
     // Snapshot both files (populates backup store + tracked files)
     let resp = aft.send(&format!(
-        r#"{{"id":"snap-a","command":"snapshot","file":"{}"}}"#,
-        file_a.display()
+        r#"{{"id":"snap-a","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file_a.display())
     ));
     assert_eq!(resp["success"], true, "snapshot a: {:?}", resp);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"snap-b","command":"snapshot","file":"{}"}}"#,
-        file_b.display()
+        r#"{{"id":"snap-b","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file_b.display())
     ));
     assert_eq!(resp["success"], true, "snapshot b: {:?}", resp);
 
@@ -87,8 +87,8 @@ fn test_undo_restores_previous_version() {
 
     // Snapshot the original
     let resp = aft.send(&format!(
-        r#"{{"id":"snap-1","command":"snapshot","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"snap-1","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true);
 
@@ -98,8 +98,8 @@ fn test_undo_restores_previous_version() {
 
     // Undo → should restore version-1
     let resp = aft.send(&format!(
-        r#"{{"id":"undo-1","command":"undo","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"undo-1","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "undo: {:?}", resp);
     assert!(resp["backup_id"].is_string());
@@ -137,15 +137,15 @@ fn test_undo_restores_file_after_edit_command() {
     assert_eq!(fs::read_to_string(&file).unwrap(), "hello rust\n");
 
     let undo = aft.send(&format!(
-        r#"{{"id":"undo-after-edit","command":"undo","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"undo-after-edit","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
     assert_eq!(fs::read_to_string(&file).unwrap(), "hello world\n");
 
     let history = aft.send(&format!(
-        r#"{{"id":"history-after-undo","command":"edit_history","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"history-after-undo","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(history["success"], true);
     assert!(history["entries"].as_array().unwrap().is_empty());
@@ -580,28 +580,28 @@ fn test_edit_history_returns_stack() {
 
     // Snapshot v1
     aft.send(&format!(
-        r#"{{"id":"s1","command":"snapshot","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"s1","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     // Modify and snapshot v2
     fs::write(&file, "v2").unwrap();
     aft.send(&format!(
-        r#"{{"id":"s2","command":"snapshot","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"s2","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     // Modify and snapshot v3
     fs::write(&file, "v3").unwrap();
     aft.send(&format!(
-        r#"{{"id":"s3","command":"snapshot","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"s3","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     // Query edit history
     let resp = aft.send(&format!(
-        r#"{{"id":"hist","command":"edit_history","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"hist","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "edit_history: {:?}", resp);
 
@@ -632,16 +632,16 @@ fn test_list_checkpoints() {
 
     // Create checkpoint with 1 file
     let resp = aft.send(&format!(
-        r#"{{"id":"cp1","command":"checkpoint","name":"first","files":["{}"]}}"#,
-        file_a.display()
+        r#"{{"id":"cp1","command":"checkpoint","name":"first","files":[{}]}}"#,
+        crate::helpers::json_string(&file_a.display())
     ));
     assert_eq!(resp["success"], true);
 
     // Create checkpoint with 2 files
     let resp = aft.send(&format!(
-        r#"{{"id":"cp2","command":"checkpoint","name":"second","files":["{}","{}"]}}"#,
-        file_a.display(),
-        file_b.display()
+        r#"{{"id":"cp2","command":"checkpoint","name":"second","files":[{},{}]}}"#,
+        crate::helpers::json_string(&file_a.display()),
+        crate::helpers::json_string(&file_b.display())
     ));
     assert_eq!(resp["success"], true);
 
@@ -679,8 +679,8 @@ fn test_undo_no_history_error() {
 
     // Undo with no prior snapshots → error
     let resp = aft.send(&format!(
-        r#"{{"id":"undo-err","command":"undo","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"undo-err","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], false, "undo should fail: {:?}", resp);
     assert_eq!(resp["code"], "no_undo_history");
@@ -736,8 +736,8 @@ fn test_checkpoint_overwrite() {
 
     // Create checkpoint "reusable" with file_a
     let resp = aft.send(&format!(
-        r#"{{"id":"ow1","command":"checkpoint","name":"reusable","files":["{}"]}}"#,
-        file_a.display()
+        r#"{{"id":"ow1","command":"checkpoint","name":"reusable","files":[{}]}}"#,
+        crate::helpers::json_string(&file_a.display())
     ));
     assert_eq!(resp["success"], true);
     assert_eq!(resp["file_count"], 1);
@@ -748,9 +748,9 @@ fn test_checkpoint_overwrite() {
 
     // Overwrite checkpoint "reusable" with both files (different content now)
     let resp = aft.send(&format!(
-        r#"{{"id":"ow2","command":"checkpoint","name":"reusable","files":["{}","{}"]}}"#,
-        file_a.display(),
-        file_b.display()
+        r#"{{"id":"ow2","command":"checkpoint","name":"reusable","files":[{},{}]}}"#,
+        crate::helpers::json_string(&file_a.display()),
+        crate::helpers::json_string(&file_b.display())
     ));
     assert_eq!(resp["success"], true);
     assert_eq!(resp["file_count"], 2);
@@ -797,8 +797,8 @@ fn test_edit_history_caps_at_twenty_entries_per_file() {
     assert_eq!(fs::read_to_string(&file).unwrap(), "v21");
 
     let history = aft.send(&format!(
-        r#"{{"id":"hist-cap","command":"edit_history","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"hist-cap","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(history["success"], true, "history failed: {:?}", history);
 
@@ -812,16 +812,16 @@ fn test_edit_history_caps_at_twenty_entries_per_file() {
 
     for expected in (1..=20).rev() {
         let undo = aft.send(&format!(
-            r#"{{"id":"undo-{expected}","command":"undo","file":"{}"}}"#,
-            file.display()
+            r#"{{"id":"undo-{expected}","command":"undo","file":{}}}"#,
+            crate::helpers::json_string(&file.display())
         ));
         assert_eq!(undo["success"], true, "undo {expected} failed: {undo:?}");
         assert_eq!(fs::read_to_string(&file).unwrap(), format!("v{expected}"));
     }
 
     let no_more_history = aft.send(&format!(
-        r#"{{"id":"undo-empty","command":"undo","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"undo-empty","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(no_more_history["success"], false);
     assert_eq!(no_more_history["code"], "no_undo_history");
