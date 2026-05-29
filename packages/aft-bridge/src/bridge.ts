@@ -8,6 +8,7 @@ import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
+const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
 const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 
@@ -240,12 +241,13 @@ export interface BridgeRequestOptions {
   /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */
   transportTimeoutMs?: number;
   /**
-   * Skip the "kill the child process on timeout" behavior for this request.
+   * Skip bridge-hang escalation for this request.
    *
-   * The default (false) treats a transport-level timeout as evidence the bridge
-   * is wedged — Rust normally responds well within the budget, so silence past
-   * the deadline almost always means a stuck child. Killing forces a clean
-   * respawn on the next call.
+   * The default (false) treats a transport-level timeout as a possible bridge
+   * hang. The bridge now escalates cautiously: a single timeout while the child
+   * is still emitting stdout, or before the hang threshold is reached, rejects
+   * only that request and keeps warm state. Repeated silent timeouts still kill
+   * the child so the next call gets a fresh bridge.
    *
    * Some commands enforce their own timeouts on the Rust side (notably `bash`,
    * which uses a watchdog thread to terminate the child shell and return a
@@ -253,7 +255,7 @@ export interface BridgeRequestOptions {
    * lost or queued behind something else — the bridge itself is still healthy
    * and should keep its warm state (LSP servers, semantic index, callers
    * cache, undo history). Pass `keepBridgeOnTimeout: true` to reject the
-   * request without tearing down the bridge.
+   * request without contributing to hang escalation.
    */
   keepBridgeOnTimeout?: boolean;
 }
@@ -309,6 +311,10 @@ export class BinaryBridge {
   /** Notification clients keyed by session_id for async configure warning pushes. */
   private configureWarningClients = new Map<string, unknown>();
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Updated after every successfully parsed stdout frame from the child. */
+  private lastChildActivityAt = 0;
+  /** Consecutive non-bash-style request timeouts without an id-matched response. */
+  private consecutiveRequestTimeouts = 0;
   private errorPrefix: string;
   private readonly logger: Logger | undefined;
 
@@ -587,29 +593,58 @@ export class BinaryBridge {
       const line = `${JSON.stringify(request)}\n`;
 
       const keepBridgeOnTimeout = options?.keepBridgeOnTimeout === true;
+      let requestSentAt = Date.now();
 
       const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
         const timer = setTimeout(() => {
+          const entry = this.pending.get(id);
+          if (!entry) return;
           this.pending.delete(id);
-          const restartSuffix = keepBridgeOnTimeout ? "" : " — restarting bridge";
+          clearTimeout(entry.timer);
+
+          if (keepBridgeOnTimeout) {
+            const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`;
+            if (requestSessionId) {
+              this.sessionWarnVia(requestSessionId, timeoutMsg);
+            } else {
+              this.warnVia(timeoutMsg);
+            }
+            entry.reject(
+              new Error(
+                `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
+              ),
+            );
+            return;
+          }
+
+          const childActiveSinceRequest = this.lastChildActivityAt > requestSentAt;
+          const consecutiveTimeouts = this.consecutiveRequestTimeouts + 1;
+          this.consecutiveRequestTimeouts = consecutiveTimeouts;
+          const keepWarm =
+            childActiveSinceRequest || consecutiveTimeouts < BRIDGE_HANG_TIMEOUT_THRESHOLD;
+          const restartSuffix = keepWarm ? " — bridge kept warm" : " — restarting bridge";
           const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
           if (requestSessionId) {
             this.sessionWarnVia(requestSessionId, timeoutMsg);
           } else {
             this.warnVia(timeoutMsg);
           }
-          reject(
+
+          if (keepWarm) {
+            entry.reject(
+              new Error(
+                `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry`,
+              ),
+            );
+            return;
+          }
+
+          entry.reject(
             new Error(
               `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
             ),
           );
-          // Kill the hung process so the next request gets a fresh bridge —
-          // unless the caller explicitly opted out (e.g. bash, which enforces
-          // its own timeout on the Rust side and shouldn't lose warm bridge
-          // state when its response is merely late).
-          if (!keepBridgeOnTimeout) {
-            this.handleTimeout(requestSessionId);
-          }
+          this.handleTimeout(requestSessionId);
         }, effectiveTimeoutMs);
 
         this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress });
@@ -621,6 +656,7 @@ export class BinaryBridge {
           return;
         }
 
+        requestSentAt = Date.now();
         this.process.stdin.write(line, (err) => {
           if (err) {
             const entry = this.pending.get(id);
@@ -983,6 +1019,8 @@ export class BinaryBridge {
     this.process = child;
     this.stdoutBuffer = "";
     this.stderrBuffer = "";
+    this.lastChildActivityAt = 0;
+    this.consecutiveRequestTimeouts = 0;
     // Fresh spawn — clear the stderr ring so crash diagnostics only reflect
     // the current child's output, not output from prior restart cycles.
     this.stderrTail = [];
@@ -1047,6 +1085,7 @@ export class BinaryBridge {
 
       try {
         const response = JSON.parse(line) as Record<string, unknown>;
+        this.lastChildActivityAt = Date.now();
         if (response.type === "progress") {
           const requestId = response.request_id as string | undefined;
           const entry = requestId ? this.pending.get(requestId) : undefined;
@@ -1100,6 +1139,7 @@ export class BinaryBridge {
           if (!entry) continue;
           this.pending.delete(id);
           clearTimeout(entry.timer);
+          this.consecutiveRequestTimeouts = 0;
           this.scheduleRestartCountReset();
           entry.resolve(response);
         } else if (typeof response.type === "string") {
@@ -1112,6 +1152,7 @@ export class BinaryBridge {
   }
 
   private handleTimeout(triggeringSessionId?: string): void {
+    this.consecutiveRequestTimeouts = 0;
     // A timed-out request means the child is about to be SIGKILLed. Reject all
     // sibling in-flight requests now instead of leaving them parked until their
     // own independent timers fire.

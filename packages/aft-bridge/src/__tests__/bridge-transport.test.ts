@@ -60,46 +60,283 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
-  test("timeout-killed bridge aborts sibling requests immediately", async () => {
+  test("single timeout with child stdout activity keeps bridge warm and sibling alive", async () => {
     const script = writeExecutable(
-      "silent.js",
+      "alive-starvation.js",
       `#!/usr/bin/env node
-process.stdin.resume();
+process.stdin.setEncoding("utf8");
+let buffer = "";
+function writeFrame(frame) {
+  process.stdout.write(JSON.stringify(frame) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      writeFrame({ id: req.id, success: true, warnings: [] });
+    } else if (req.command === "sibling") {
+      setTimeout(() => writeFrame({ type: "status_changed", snapshot: { source: "sibling" } }), 5);
+      setTimeout(() => writeFrame({ id: req.id, success: true, command: req.command }), 80);
+    }
+  }
+});
 `,
     );
     const bridge = new BinaryBridge(script, workDir, { timeoutMs: 1_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as { configured: boolean };
 
     try {
-      // Attach the handlers BEFORE the await so both rejections are captured
-      // even if Bun's `expect(p).rejects` re-throws the first error and skips
-      // the second promise.
-      const firstResult = bridge.send("version", {}, { timeoutMs: 20 }).then(
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+
+      const timedOutResult = bridge.send("slow", {}, { timeoutMs: 40 }).then(
         () => "resolved",
         (err) => String(err instanceof Error ? err.message : err),
       );
-      const siblingResult = bridge.send("version", {}, { timeoutMs: 1_000 }).then(
+      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 500 }).then(
+        (response) => String(response.command),
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+
+      const [timedOut, sibling] = await Promise.all([timedOutResult, siblingResult]);
+
+      expect(timedOut).toContain("bridge kept warm");
+      expect(sibling).toBe("sibling");
+      expect(bridge.isAlive()).toBe(true);
+      expect(testBridge.configured).toBe(true);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("single silent timeout below hang threshold keeps bridge warm and sibling alive", async () => {
+    const script = writeExecutable(
+      "single-silent-timeout.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+function writeFrame(frame) {
+  process.stdout.write(JSON.stringify(frame) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      writeFrame({ id: req.id, success: true, warnings: [] });
+    } else if (req.command === "sibling") {
+      setTimeout(() => writeFrame({ id: req.id, success: true, command: req.command }), 80);
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 1_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as { configured: boolean };
+
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+
+      const timedOutResult = bridge.send("slow", {}, { timeoutMs: 30 }).then(
+        () => "resolved",
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 500 }).then(
+        (response) => String(response.command),
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+
+      const [timedOut, sibling] = await Promise.all([timedOutResult, siblingResult]);
+
+      expect(timedOut).toContain("bridge kept warm");
+      expect(sibling).toBe("sibling");
+      expect(bridge.isAlive()).toBe(true);
+      expect(testBridge.configured).toBe(true);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("repeated silent timeouts escalate to bridge kill and abort siblings", async () => {
+    const script = writeExecutable(
+      "silent-hang.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 1_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as { configured: boolean };
+
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+
+      const first = await bridge.send("first", {}, { timeoutMs: 20 }).then(
+        () => "resolved",
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+      expect(first).toContain("bridge kept warm");
+
+      const secondResult = bridge.send("second", {}, { timeoutMs: 20 }).then(
+        () => "resolved",
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 1_000 }).then(
         () => "resolved",
         (err) => String(err instanceof Error ? err.message : err),
       );
 
-      // The first request's 20ms timer fires before the sibling's 1s timer.
-      // The Oracle F2 fix requires the sibling to reject immediately (not wait
-      // its own 1s timer) with a sibling-abort error. We assert via wall-clock
-      // by racing both against a 100ms ceiling — well below the sibling's 1s
-      // budget, so a passing test confirms the sibling did NOT wait its timer.
-      const [first, sibling] = (await Promise.race([
-        Promise.all([firstResult, siblingResult]),
+      const [second, sibling] = (await Promise.race([
+        Promise.all([secondResult, siblingResult]),
         new Promise<[string, string]>((resolve) =>
           setTimeout(() => resolve(["pending", "pending"]), 200),
         ),
       ])) as [string, string];
 
-      // F2 contract:
-      //  - first request rejects with a timeout error (its own timer fired)
-      //  - sibling request rejects with the sibling-abort error (NOT its own
-      //    1s timer — that would still be pending at the 200ms ceiling)
-      expect(first).toMatch(/timed out|aborted/);
+      expect(second).toMatch(/timed out|aborted/);
       expect(sibling).toContain("sibling timeout");
+      expect(bridge.isAlive()).toBe(false);
+      expect(testBridge.configured).toBe(false);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("successful response between timeouts resets hang escalation", async () => {
+    const script = writeExecutable(
+      "timeout-reset.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+function writeFrame(frame) {
+  process.stdout.write(JSON.stringify(frame) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      writeFrame({ id: req.id, success: true, warnings: [] });
+    } else if (req.command === "ok") {
+      writeFrame({ id: req.id, success: true, command: req.command });
+    } else if (req.command === "sibling") {
+      setTimeout(() => writeFrame({ id: req.id, success: true, command: req.command }), 80);
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 1_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as { configured: boolean };
+
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+
+      const first = await bridge.send("first-timeout", {}, { timeoutMs: 20 }).then(
+        () => "resolved",
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+      expect(first).toContain("bridge kept warm");
+
+      const ok = await bridge.send("ok", {}, { timeoutMs: 500 });
+      expect(ok).toMatchObject({ success: true, command: "ok" });
+
+      const timedOutResult = bridge.send("second-timeout", {}, { timeoutMs: 30 }).then(
+        () => "resolved",
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 500 }).then(
+        (response) => String(response.command),
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+
+      const [timedOut, sibling] = await Promise.all([timedOutResult, siblingResult]);
+
+      expect(timedOut).toContain("bridge kept warm");
+      expect(sibling).toBe("sibling");
+      expect(bridge.isAlive()).toBe(true);
+      expect(testBridge.configured).toBe(true);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("keepBridgeOnTimeout timeout does not advance hang escalation", async () => {
+    const script = writeExecutable(
+      "keep-timeout.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+function writeFrame(frame) {
+  process.stdout.write(JSON.stringify(frame) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      writeFrame({ id: req.id, success: true, warnings: [] });
+    } else if (req.command === "sibling") {
+      setTimeout(() => writeFrame({ id: req.id, success: true, command: req.command }), 80);
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 1_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as { configured: boolean };
+
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+
+      const keepResult = await bridge
+        .send("keep", {}, { timeoutMs: 20, keepBridgeOnTimeout: true })
+        .then(
+          () => "resolved",
+          (err) => String(err instanceof Error ? err.message : err),
+        );
+      expect(keepResult).toContain('Request "keep"');
+      expect(bridge.isAlive()).toBe(true);
+
+      const timedOutResult = bridge.send("ordinary", {}, { timeoutMs: 30 }).then(
+        () => "resolved",
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 500 }).then(
+        (response) => String(response.command),
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+
+      const [timedOut, sibling] = await Promise.all([timedOutResult, siblingResult]);
+
+      expect(timedOut).toContain("bridge kept warm");
+      expect(sibling).toBe("sibling");
+      expect(bridge.isAlive()).toBe(true);
+      expect(testBridge.configured).toBe(true);
     } finally {
       await bridge.shutdown();
     }
