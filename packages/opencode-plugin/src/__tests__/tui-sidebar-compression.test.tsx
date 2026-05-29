@@ -1,8 +1,15 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import { join } from "node:path";
 import type { StatusCompression } from "../shared/status";
+
+// These module mocks are applied process-globally by Bun. Restore them after
+// this file so the @opentui/solid and solid-js stubs do not leak into other
+// test files in the same `bun test` run.
+afterAll(() => {
+  mock.restore();
+});
 
 mock.module("@opentui/solid/jsx-dev-runtime", () => ({
   Fragment: (props: { children?: unknown }) => props.children,
