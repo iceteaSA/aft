@@ -100,8 +100,8 @@ impl SearchIndex {
             .files
     }
 
-    /// Score-rank file candidates and report whether candidate enumeration hit
-    /// the internal 200/500 cap before ranking.
+    /// Score-rank file candidates and report whether pre-filter candidate
+    /// enumeration hit the internal 200/500 cap before ranking.
     pub fn lexical_rank_with_stats(
         &self,
         query_trigrams: &[u32],
@@ -137,6 +137,8 @@ impl SearchIndex {
                 }
             }
         }
+        let pre_filter_candidate_count = candidate_ids.len();
+        let engine_capped = pre_filter_candidate_count > candidate_cap;
         let filtered_candidates = candidate_ids
             .into_iter()
             .filter_map(|file_id| {
@@ -152,7 +154,6 @@ impl SearchIndex {
                 }
             })
             .collect::<Vec<_>>();
-        let engine_capped = filtered_candidates.len() > candidate_cap;
 
         let mut ranked = Vec::new();
         for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {

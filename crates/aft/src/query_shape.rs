@@ -88,7 +88,8 @@ pub fn classify(query: &str) -> QueryShape {
 
     let has_question_word = QUESTION_WORDS.contains(&first_word_lower.as_str());
     let is_long_phrase = word_count > 2;
-    let has_natural_language_signals = has_question_word || is_long_phrase;
+    let is_two_word_concept = is_two_word_lowercase_concept(&words);
+    let has_natural_language_signals = has_question_word || is_long_phrase || is_two_word_concept;
     let has_error_code = contains_error_code(trimmed, word_count);
 
     if has_error_code && has_natural_language_signals {
@@ -186,6 +187,17 @@ fn has_http_status(query: &str, word_count: usize) -> bool {
         && (word_count <= 3 || query.to_ascii_lowercase().contains("http"))
 }
 
+fn is_two_word_lowercase_concept(words: &[&str]) -> bool {
+    words.len() == 2
+        && words
+            .iter()
+            .all(|word| is_dictionary_style_lowercase_word(word))
+}
+
+fn is_dictionary_style_lowercase_word(word: &str) -> bool {
+    word.len() >= 3 && word.bytes().all(|byte| byte.is_ascii_lowercase())
+}
+
 fn has_regex_meta_sequences(query: &str) -> bool {
     query.contains(".+")
         || query.contains(".*")
@@ -208,25 +220,41 @@ fn has_regex_meta_sequences(query: &str) -> bool {
 }
 
 fn has_path_regex_meta_sequences(query: &str) -> bool {
-    // Note: path-context uses doubled backslashes (Windows-style paths). Pure
-    // `\n`/`\t`/`\r` are NOT included here because they appear in Windows
-    // path segments (e.g. `C:\new\test`, `C:\temp\rs`); only the doubled
-    // forms count as deliberate escape sequences in path-shaped input.
     query.contains(".+")
         || query.contains(".*")
         || query.contains(".?")
-        || query.contains(r"\\b")
-        || query.contains(r"\\B")
-        || query.contains(r"\\w")
-        || query.contains(r"\\W")
-        || query.contains(r"\\d")
-        || query.contains(r"\\D")
-        || query.contains(r"\\s")
-        || query.contains(r"\\S")
         || query.contains(r"\p{")
         || query.contains(r"\x")
         || query.contains(r"\u{")
+        || has_path_context_regex_escape(query)
         || has_escaped_regex_metachar(query)
+}
+
+fn has_path_context_regex_escape(query: &str) -> bool {
+    let chars = query.char_indices().collect::<Vec<_>>();
+    for index in 0..chars.len().saturating_sub(1) {
+        if chars[index].1 != '\\' {
+            continue;
+        }
+        let escaped = chars[index + 1].1;
+        if matches!(escaped, 'b' | 'B' | 'w' | 'W' | 'd' | 'D' | 's' | 'S')
+            && path_escape_looks_like_regex(&chars, index + 1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn path_escape_looks_like_regex(chars: &[(usize, char)], escaped_index: usize) -> bool {
+    let Some((_, next)) = chars.get(escaped_index + 1) else {
+        return true;
+    };
+
+    matches!(
+        *next,
+        '*' | '+' | '?' | '{' | '(' | '[' | '|' | '^' | '$' | '\\' | '/'
+    )
 }
 
 fn has_escaped_regex_metachar(query: &str) -> bool {
@@ -415,7 +443,10 @@ fn has_literal_atom_quantifier(query: &str) -> bool {
         {
             continue;
         }
-        if ch == '?' && sentence_final_question_mark_in_phrase(query, byte_index) {
+        if ch == '?'
+            && (sentence_final_question_mark_in_phrase(query, byte_index)
+                || question_mark_is_code_shape(&chars, index))
+        {
             continue;
         }
         if previous_is_literal_atom(&chars, index) {
@@ -428,6 +459,98 @@ fn has_literal_atom_quantifier(query: &str) -> bool {
 fn sentence_final_question_mark_in_phrase(query: &str, byte_index: usize) -> bool {
     query[byte_index + '?'.len_utf8()..].trim().is_empty()
         && query[..byte_index].split_whitespace().count() > 1
+}
+
+fn question_mark_is_code_shape(chars: &[(usize, char)], question_index: usize) -> bool {
+    question_mark_is_optional_chain(chars, question_index)
+        || question_mark_after_empty_call(chars, question_index)
+        || question_mark_after_index_expression(chars, question_index)
+        || question_mark_is_typescript_optional(chars, question_index)
+}
+
+fn question_mark_is_optional_chain(chars: &[(usize, char)], question_index: usize) -> bool {
+    chars
+        .get(question_index + 1)
+        .is_some_and(|(_, next)| *next == '.')
+        && question_index
+            .checked_sub(1)
+            .and_then(|previous_index| chars.get(previous_index))
+            .is_some_and(|(_, previous)| is_code_expression_tail(*previous))
+}
+
+fn question_mark_after_empty_call(chars: &[(usize, char)], question_index: usize) -> bool {
+    let Some(call_open_index) = question_index.checked_sub(2) else {
+        return false;
+    };
+    chars
+        .get(question_index - 1)
+        .is_some_and(|(_, previous)| *previous == ')')
+        && chars
+            .get(call_open_index)
+            .is_some_and(|(_, open)| *open == '(')
+        && call_open_index
+            .checked_sub(1)
+            .and_then(|callee_index| chars.get(callee_index))
+            .is_some_and(|(_, callee_tail)| is_code_expression_tail(*callee_tail))
+}
+
+fn question_mark_after_index_expression(chars: &[(usize, char)], question_index: usize) -> bool {
+    if chars
+        .get(question_index.checked_sub(1).unwrap_or(usize::MAX))
+        .is_none_or(|(_, previous)| *previous != ']')
+    {
+        return false;
+    }
+
+    let mut depth = 0usize;
+    for index in (0..question_index).rev() {
+        match chars[index].1 {
+            ']' => depth += 1,
+            '[' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return index
+                        .checked_sub(1)
+                        .and_then(|target_index| chars.get(target_index))
+                        .is_some_and(|(_, target_tail)| is_code_expression_tail(*target_tail));
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn question_mark_is_typescript_optional(chars: &[(usize, char)], question_index: usize) -> bool {
+    let previous_is_identifier = question_index
+        .checked_sub(1)
+        .and_then(|previous_index| chars.get(previous_index))
+        .is_some_and(|(_, previous)| is_identifier_tail(*previous));
+    if !previous_is_identifier {
+        return false;
+    }
+    if chars
+        .get(question_index + 1)
+        .is_none_or(|(_, next)| *next != ':')
+    {
+        return false;
+    }
+
+    chars
+        .get(question_index + 2)
+        .is_none_or(|(_, after_colon)| {
+            after_colon.is_whitespace()
+                || after_colon.is_ascii_alphabetic()
+                || matches!(*after_colon, '_' | '{' | '[' | '(' | '"' | '\'')
+        })
+}
+
+fn is_code_expression_tail(ch: char) -> bool {
+    is_identifier_tail(ch) || matches!(ch, ')' | ']')
+}
+
+fn is_identifier_tail(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$')
 }
 
 fn previous_is_literal_atom(chars: &[(usize, char)], quantifier_index: usize) -> bool {
@@ -625,6 +748,7 @@ mod tests {
         for (query, expected) in [
             (r"C:\new\test", "windows_abs"),
             (r"src\bin\main.rs", "windows_rel"),
+            (r"src\tab\main.ts", "windows_rel"),
             (r"packages\opencode-plugin\src", "windows_rel"),
             ("/usr/local/bin", "posix_abs"),
             ("/Users/John Doe/Documents", "posix_abs"),
@@ -645,7 +769,13 @@ mod tests {
 
     #[test]
     fn path_exemptions_reject_regex_sequences() {
-        for query in ["src/.*", "src/.+", r"C:\bin\foo*.exe", r"C:\Users\\w+"] {
+        for query in [
+            "src/.*",
+            "src/.+",
+            r"C:\bin\foo*.exe",
+            r"C:\Users\\w+",
+            r"src\w+\main.ts",
+        ] {
             assert_eq!(kind(query), QueryKind::Regex, "{query}");
         }
     }
@@ -709,6 +839,34 @@ mod tests {
             "foo*+",
             "(?>foo)",
         ] {
+            assert_eq!(kind(query), QueryKind::Regex, "{query}");
+        }
+    }
+
+    #[test]
+    fn two_word_lowercase_concepts_route_to_natural_language() {
+        for query in ["retry logic", "auth flow", "cache invalidation"] {
+            assert_eq!(kind(query), QueryKind::NaturalLanguage, "{query}");
+        }
+    }
+
+    #[test]
+    fn identifierish_short_queries_stay_identifier() {
+        for query in ["useState hook", "parseConfig", "parse_config option"] {
+            assert_eq!(kind(query), QueryKind::Identifier, "{query}");
+        }
+    }
+
+    #[test]
+    fn question_mark_code_shapes_do_not_route_to_regex() {
+        for query in ["foo()?", "optional?.length", "user?.name", "arr[0]?"] {
+            assert_ne!(kind(query), QueryKind::Regex, "{query}");
+        }
+    }
+
+    #[test]
+    fn question_mark_regex_quantifiers_still_route_to_regex() {
+        for query in ["colou?r", "https?"] {
             assert_eq!(kind(query), QueryKind::Regex, "{query}");
         }
     }
