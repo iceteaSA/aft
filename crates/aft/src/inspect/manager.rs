@@ -876,7 +876,7 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
             });
         }
 
-        for calls in file_data.calls_by_symbol.values() {
+        for (caller_symbol, calls) in &file_data.calls_by_symbol {
             for call in calls {
                 let target = match graph.resolve_cross_file_edge(
                     &call.full_callee,
@@ -892,6 +892,7 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
                 };
                 outbound_calls.push(CallgraphOutboundCall {
                     caller_file: snapshot_file.clone(),
+                    caller_symbol: caller_symbol.clone(),
                     target,
                     line: call.line,
                 });
@@ -1154,7 +1155,7 @@ fn roll_up_unused_exports_contributions(
 
     let (public_api_entries, package_warnings) = unused_public_api_entries(&job.project_root);
     let mut imported_by: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-    let mut wildcard_imported_by: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut uncertain_by: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for scan in &parsed {
         for import in &scan.imports {
             let Some(resolved_file) = &import.resolved_file else {
@@ -1162,7 +1163,7 @@ fn roll_up_unused_exports_contributions(
             };
             for name in &import.named {
                 if name == "*" {
-                    wildcard_imported_by
+                    uncertain_by
                         .entry(resolved_file.clone())
                         .or_default()
                         .insert(scan.file.clone());
@@ -1178,6 +1179,8 @@ fn roll_up_unused_exports_contributions(
 
     let mut count = 0usize;
     let mut items = Vec::new();
+    let mut uncertain_count = 0usize;
+    let mut uncertain_items = Vec::new();
     for scan in &parsed {
         if public_api_entries.contains(&scan.file) {
             continue;
@@ -1188,12 +1191,25 @@ fn roll_up_unused_exports_contributions(
                 .get(&(scan.file.clone(), export.symbol.clone()))
                 .map(|files| !files.is_empty())
                 .unwrap_or(false);
-            let wildcard_imported = wildcard_imported_by
+            let uncertain = uncertain_by
                 .get(&scan.file)
                 .map(|files| !files.is_empty())
                 .unwrap_or(false);
 
-            if imported || wildcard_imported {
+            if imported {
+                continue;
+            }
+            if uncertain {
+                uncertain_count += 1;
+                if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
+                    uncertain_items.push(json!({
+                        "file": scan.file,
+                        "symbol": export.symbol,
+                        "kind": export.kind,
+                        "line": export.line,
+                        "reason": "wildcard_import",
+                    }));
+                }
                 continue;
             }
 
@@ -1215,6 +1231,8 @@ fn roll_up_unused_exports_contributions(
         "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
+        "uncertain_count": uncertain_count,
+        "uncertain_items": uncertain_items,
     });
     if !package_warnings.is_empty() {
         aggregate["note"] = Value::String(package_warnings.join("; "));
@@ -1251,7 +1269,6 @@ fn cap_payload_drill_down(mut payload: Value, limit: usize) -> Value {
 }
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
-const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
 #[derive(Debug, Clone, Deserialize)]
 struct ExportContribution {
@@ -1362,128 +1379,11 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
 }
 
 fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<String>) {
-    let mut entries = BTreeSet::new();
-    let mut warnings = Vec::new();
-    let mut package_jsons = Vec::new();
-
-    let root_package_json = project_root.join("package.json");
-    if root_package_json.is_file() {
-        package_jsons.push(root_package_json);
-    }
-
-    let packages_dir = project_root.join("packages");
-    if let Ok(children) = std::fs::read_dir(packages_dir) {
-        for child in children.flatten() {
-            let package_json = child.path().join("package.json");
-            if package_json.is_file() {
-                package_jsons.push(package_json);
-            }
-        }
-    }
-
-    for package_json in package_jsons {
-        match read_public_entries_from_package_json(&package_json) {
-            Ok(package_entries) => {
-                let package_dir = package_json.parent().unwrap_or(project_root);
-                entries.extend(
-                    package_entries
-                        .iter()
-                        .filter_map(|entry| resolve_package_entry(package_dir, entry))
-                        .map(|entry| relative_display_path(project_root, &entry)),
-                );
-            }
-            Err(message) => warnings.push(message),
-        }
-    }
-
-    (entries, warnings)
-}
-
-fn read_public_entries_from_package_json(package_json: &Path) -> Result<Vec<String>, String> {
-    let source = std::fs::read_to_string(package_json)
-        .map_err(|error| format!("failed to read {}: {error}", package_json.display()))?;
-    let value = serde_json::from_str::<Value>(&source)
-        .map_err(|error| format!("failed to parse {}: {error}", package_json.display()))?;
-
-    let mut entries = Vec::new();
-    if let Some(main) = value.get("main").and_then(Value::as_str) {
-        entries.push(main.to_string());
-    }
-    if let Some(exports) = value.get("exports") {
-        collect_package_export_strings(exports, &mut entries);
-    }
-    Ok(entries)
-}
-
-fn collect_package_export_strings(value: &Value, entries: &mut Vec<String>) {
-    match value {
-        Value::String(entry) => entries.push(entry.clone()),
-        Value::Array(values) => {
-            for value in values {
-                collect_package_export_strings(value, entries);
-            }
-        }
-        Value::Object(map) => {
-            for value in map.values() {
-                collect_package_export_strings(value, entries);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn resolve_package_entry(package_dir: &Path, entry: &str) -> Option<PathBuf> {
-    if entry.starts_with("node:") || entry.contains("://") {
-        return None;
-    }
-
-    let entry_path = if is_relative_module(entry) {
-        package_dir.join(entry)
-    } else {
-        package_dir.join(entry.trim_start_matches('/'))
-    };
-    candidate_paths(&entry_path)
-        .into_iter()
-        .map(|candidate| normalize_path(&candidate))
-        .find(|candidate| candidate.is_file())
-}
-
-fn candidate_paths(base: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    candidates.push(base.to_path_buf());
-
-    if base.extension().is_none() {
-        for extension in JS_MODULE_EXTENSIONS {
-            candidates.push(base.with_extension(extension));
-        }
-    }
-
-    for extension in JS_MODULE_EXTENSIONS {
-        candidates.push(base.join(format!("index.{extension}")));
-    }
-
-    candidates
-}
-
-fn is_relative_module(module_path: &str) -> bool {
-    module_path.starts_with("./")
-        || module_path.starts_with("../")
-        || module_path == "."
-        || module_path == ".."
-}
-
-fn relative_display_path(project_root: &Path, path: &Path) -> String {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
-    };
-    let normalized = normalize_path(&absolute);
-    normalized
-        .strip_prefix(&normalize_path(project_root))
-        .unwrap_or(normalized.as_path())
-        .to_string_lossy()
-        .replace('\\', "/")
+    let entry_points = super::entry_points::resolve_entry_points(project_root);
+    (
+        entry_points.public_api_files_relative(project_root),
+        entry_points.warnings().to_vec(),
+    )
 }
 
 fn filter_outcome_for_scope_with_contributions(

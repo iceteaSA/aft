@@ -133,6 +133,53 @@ fn inspect_unused_exports_package_main_entry_is_public_api() {
 }
 
 #[test]
+fn inspect_unused_exports_package_bin_is_not_public_api_but_main_is() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    write_file(
+        &root.join("package.json"),
+        r#"{"name":"fixture","main":"src/index.ts","bin":"src/cli.ts"}"#,
+    );
+    let public_entry = write_file(
+        &root.join("src/index.ts"),
+        "export function public_api() { return 1; }\n",
+    );
+    let bin_entry = write_file(
+        &root.join("src/cli.ts"),
+        "export function unused_cli_helper() { return 1; }\n",
+    );
+
+    let success = scan(root, vec![public_entry, bin_entry]);
+
+    assert_eq!(success.aggregate["count"], 1);
+    assert_eq!(success.aggregate["items"][0]["file"], "src/cli.ts");
+    assert_eq!(success.aggregate["items"][0]["symbol"], "unused_cli_helper");
+}
+
+#[test]
+fn inspect_unused_exports_namespace_import_uses_only_accessed_members() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let exported = write_file(
+        &root.join("src/a.ts"),
+        "export function used() { return 1; }\nexport function unused() { return 2; }\n",
+    );
+    let importer = write_file(
+        &root.join("src/b.ts"),
+        "import * as api from './a';\nconsole.log(api.used());\n",
+    );
+
+    let success = scan(root, vec![exported, importer]);
+
+    assert_eq!(success.aggregate["count"], 1);
+    assert_eq!(
+        symbols(&success.aggregate["items"]),
+        vec!["unused".to_string()]
+    );
+    assert_eq!(success.aggregate["uncertain_count"], 0);
+}
+
+#[test]
 fn inspect_unused_exports_non_js_ts_files_contribute_empty_and_are_skipped() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();

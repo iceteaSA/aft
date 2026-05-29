@@ -77,9 +77,16 @@ fn export(root: &Path, file: &str, symbol: &str, kind: &str, line: u32) -> Callg
     }
 }
 
-fn outbound(root: &Path, caller_file: &str, target: &str, line: u32) -> CallgraphOutboundCall {
+fn outbound(
+    root: &Path,
+    caller_file: &str,
+    caller_symbol: &str,
+    target: &str,
+    line: u32,
+) -> CallgraphOutboundCall {
     CallgraphOutboundCall {
         caller_file: root.join(caller_file),
+        caller_symbol: caller_symbol.to_string(),
         target: target.to_string(),
         line,
     }
@@ -146,6 +153,7 @@ fn inspect_dead_code_does_not_report_export_reachable_from_entry_point() {
         vec![outbound(
             &root,
             "src/main.ts",
+            "main",
             &target(&root, "src/foo.ts", "used"),
             2,
         )],
@@ -176,8 +184,14 @@ fn inspect_dead_code_keeps_multi_hop_entry_point_reachability_alive() {
             export(&root, "src/c.ts", "c", "function", 1),
         ],
         vec![
-            outbound(&root, "src/entry.ts", &target(&root, "src/b.ts", "b"), 2),
-            outbound(&root, "src/b.ts", &target(&root, "src/c.ts", "c"), 2),
+            outbound(
+                &root,
+                "src/entry.ts",
+                "entry",
+                &target(&root, "src/b.ts", "b"),
+                2,
+            ),
+            outbound(&root, "src/b.ts", "b", &target(&root, "src/c.ts", "c"), 2),
         ],
         vec![root.join("src/entry.ts")],
     );
@@ -204,6 +218,7 @@ fn inspect_dead_code_keeps_same_name_exports_distinct() {
         vec![outbound(
             &root,
             "src/entry.ts",
+            "main",
             &target(&root, "src/alive.ts", "foo"),
             2,
         )],
@@ -220,6 +235,71 @@ fn inspect_dead_code_keeps_same_name_exports_distinct() {
 }
 
 #[test]
+fn inspect_dead_code_attributes_calls_to_recorded_caller_symbol() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/a.ts",
+            "export function a() {\n  return 1;\n}\nexport function b() {}\n",
+        ),
+        ("src/target.ts", "export function target() {}\n"),
+    ]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/a.ts", "a", "function", 1),
+            export(&root, "src/a.ts", "b", "function", 4),
+            export(&root, "src/target.ts", "target", "function", 1),
+        ],
+        vec![outbound(
+            &root,
+            "src/a.ts",
+            "a",
+            &target(&root, "src/target.ts", "target"),
+            6,
+        )],
+        vec![root.join("src/a.ts")],
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 1);
+    assert_eq!(
+        success.aggregate["items"][0],
+        json!({"file": "src/a.ts", "symbol": "b", "kind": "function", "line": 4})
+    );
+}
+
+#[test]
+fn inspect_dead_code_flags_binary_export_but_suppresses_library_public_api() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"inspect-fixture\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/main.rs", "pub fn unused_internal() {}\nfn main() {}\n"),
+        ("src/lib.rs", "pub fn public_api() {}\n"),
+    ]);
+    let source_files = vec![root.join("src/main.rs"), root.join("src/lib.rs")];
+    let graph = snapshot(
+        source_files,
+        vec![
+            export(&root, "src/main.rs", "unused_internal", "function", 1),
+            export(&root, "src/lib.rs", "public_api", "function", 1),
+        ],
+        Vec::new(),
+        vec![root.join("src/main.rs")],
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 1);
+    assert_eq!(
+        success.aggregate["items"][0],
+        json!({"file": "src/main.rs", "symbol": "unused_internal", "kind": "function", "line": 1})
+    );
+}
+
+#[test]
 fn inspect_dead_code_reports_unreachable_cycle_exports() {
     let (_temp_dir, root, paths) = fixture_project(&[
         ("src/a.ts", "export function a() {\n  b();\n}\n"),
@@ -232,8 +312,8 @@ fn inspect_dead_code_reports_unreachable_cycle_exports() {
             export(&root, "src/b.ts", "b", "function", 1),
         ],
         vec![
-            outbound(&root, "src/a.ts", &target(&root, "src/b.ts", "b"), 2),
-            outbound(&root, "src/b.ts", &target(&root, "src/a.ts", "a"), 2),
+            outbound(&root, "src/a.ts", "a", &target(&root, "src/b.ts", "b"), 2),
+            outbound(&root, "src/b.ts", "b", &target(&root, "src/a.ts", "a"), 2),
         ],
         Vec::new(),
     );
@@ -364,8 +444,14 @@ fn inspect_dead_code_contribution_shape_matches_contract() {
             export(&root, "src/bar.ts", "Bar", "function", 1),
         ],
         vec![
-            outbound(&root, "src/foo.ts", &target(&root, "src/bar.ts", "Bar"), 2),
-            outbound(&root, "src/foo.ts", "external_dependency", 3),
+            outbound(
+                &root,
+                "src/foo.ts",
+                "helper",
+                &target(&root, "src/bar.ts", "Bar"),
+                2,
+            ),
+            outbound(&root, "src/foo.ts", "helper", "external_dependency", 3),
         ],
         Vec::new(),
     );
@@ -386,8 +472,9 @@ fn inspect_dead_code_contribution_shape_matches_contract() {
                 {"symbol": "helper", "kind": "function", "line": 2, "is_entry_point": false}
             ],
             "internal_calls": [
-                {"file": "src/bar.ts", "symbol": "Bar", "line": 2}
-            ]
+                {"caller_symbol": "helper", "file": "src/bar.ts", "symbol": "Bar", "line": 2}
+            ],
+            "liveness_roots": []
         })
     );
 }

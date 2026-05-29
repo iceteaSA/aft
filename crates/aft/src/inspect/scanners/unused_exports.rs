@@ -56,7 +56,7 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
         .collect::<Vec<_>>();
 
     let mut imported_by: BTreeMap<(PathBuf, String), BTreeSet<String>> = BTreeMap::new();
-    let mut wildcard_imported_by: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    let mut uncertain_by: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
     for scan in &per_file {
         for import in &scan.imports {
             let Some(resolved_file) = &import.resolved_file else {
@@ -64,7 +64,7 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
             };
             for name in &import.named {
                 if name == "*" {
-                    wildcard_imported_by
+                    uncertain_by
                         .entry(resolved_file.clone())
                         .or_default()
                         .insert(scan.relative_file.clone());
@@ -80,6 +80,8 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
 
     let mut count = 0usize;
     let mut items = Vec::new();
+    let mut uncertain_count = 0usize;
+    let mut uncertain_items = Vec::new();
     for scan in &per_file {
         if public_api_entries.is_public_api_file(&scan.file_path) {
             continue;
@@ -90,12 +92,25 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
                 .get(&(scan.file_path.clone(), export.symbol.clone()))
                 .map(|files| !files.is_empty())
                 .unwrap_or(false);
-            let wildcard_imported = wildcard_imported_by
+            let uncertain = uncertain_by
                 .get(&scan.file_path)
                 .map(|files| !files.is_empty())
                 .unwrap_or(false);
 
-            if imported || wildcard_imported {
+            if imported {
+                continue;
+            }
+            if uncertain {
+                uncertain_count += 1;
+                if uncertain_items.len() < DRILL_DOWN_LIMIT {
+                    uncertain_items.push(json!({
+                        "file": scan.relative_file,
+                        "symbol": export.symbol,
+                        "kind": export.kind,
+                        "line": export.line,
+                        "reason": "wildcard_import",
+                    }));
+                }
                 continue;
             }
 
@@ -124,6 +139,8 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
         "drill_down_capped": count > DRILL_DOWN_LIMIT,
         "scanned_files": per_file.len(),
         "languages_skipped": languages_skipped,
+        "uncertain_count": uncertain_count,
+        "uncertain_items": uncertain_items,
     });
     if !package_warnings.is_empty() {
         aggregate["note"] = Value::String(package_warnings.join("; "));
@@ -180,7 +197,9 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
     };
 
     let exports = extract_exports(&source, &tree);
-    let mut imports = import_edges_from_block(&import_block, &file_path, project_root);
+    let namespace_members = namespace_member_accesses(&source, &tree, &import_block);
+    let mut imports =
+        import_edges_from_block(&import_block, &file_path, project_root, &namespace_members);
     imports.extend(reexport_edges(&source, &tree, &file_path, project_root));
 
     let contribution = contribution_value(project_root, &relative_file, &exports, &imports);
@@ -266,11 +285,14 @@ fn import_edges_from_block(
     import_block: &ImportBlock,
     importer_file: &Path,
     project_root: &Path,
+    namespace_members: &BTreeMap<String, BTreeSet<String>>,
 ) -> Vec<ImportEdge> {
     import_block
         .imports
         .iter()
-        .map(|import| import_edge_from_statement(import, importer_file, project_root))
+        .map(|import| {
+            import_edge_from_statement(import, importer_file, project_root, namespace_members)
+        })
         .collect()
 }
 
@@ -278,13 +300,16 @@ fn import_edge_from_statement(
     import: &ImportStatement,
     importer_file: &Path,
     project_root: &Path,
+    namespace_members: &BTreeMap<String, BTreeSet<String>>,
 ) -> ImportEdge {
     let mut named = Vec::new();
     if import.default_import.is_some() {
         named.push("default".to_string());
     }
-    if import.namespace_import.is_some() {
-        named.push("*".to_string());
+    if let Some(alias) = import.namespace_import.as_deref() {
+        if let Some(members) = namespace_members.get(alias) {
+            named.extend(members.iter().cloned());
+        }
     }
     named.extend(
         import
@@ -299,6 +324,94 @@ fn import_edge_from_statement(
         from_module: import.module_path.clone(),
         resolved_file: resolve_module_path(&import.module_path, importer_file, project_root),
         named,
+    }
+}
+
+fn namespace_member_accesses(
+    source: &str,
+    tree: &Tree,
+    import_block: &ImportBlock,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let aliases = import_block
+        .imports
+        .iter()
+        .filter_map(|import| import.namespace_import.clone())
+        .collect::<BTreeSet<_>>();
+    if aliases.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut accesses = BTreeMap::new();
+    collect_namespace_member_accesses(source, tree.root_node(), &aliases, &mut accesses);
+    accesses
+}
+
+fn collect_namespace_member_accesses(
+    source: &str,
+    node: Node,
+    aliases: &BTreeSet<String>,
+    accesses: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    match node.kind() {
+        "member_expression" => {
+            if let Some(object) = node.child_by_field_name("object") {
+                let alias = node_text(source, &object).trim();
+                if aliases.contains(alias) {
+                    let member = node
+                        .child_by_field_name("property")
+                        .and_then(|property| static_member_name(source, &property))
+                        .unwrap_or_else(|| "*".to_string());
+                    accesses
+                        .entry(alias.to_string())
+                        .or_default()
+                        .insert(member);
+                }
+            }
+        }
+        "subscript_expression" => {
+            if let Some(object) = node.child_by_field_name("object") {
+                let alias = node_text(source, &object).trim();
+                if aliases.contains(alias) {
+                    let member = node
+                        .child_by_field_name("index")
+                        .and_then(|index| static_member_name(source, &index))
+                        .unwrap_or_else(|| "*".to_string());
+                    accesses
+                        .entry(alias.to_string())
+                        .or_default()
+                        .insert(member);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_namespace_member_accesses(source, cursor.node(), aliases, accesses);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn static_member_name(source: &str, node: &Node) -> Option<String> {
+    let text = node_text(source, node).trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    match node.kind() {
+        "identifier" | "property_identifier" | "shorthand_property_identifier" => {
+            Some(text.to_string())
+        }
+        "string" | "string_fragment" => {
+            let unquoted = strip_quotes(text);
+            (!unquoted.is_empty()).then(|| unquoted.to_string())
+        }
+        _ => None,
     }
 }
 

@@ -10,14 +10,18 @@ const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", 
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EntryPointSet {
-    entry_points: BTreeSet<PathBuf>,
+    liveness_root_files: BTreeSet<PathBuf>,
     public_api_files: BTreeSet<PathBuf>,
     warnings: Vec<String>,
 }
 
 impl EntryPointSet {
     pub(crate) fn is_entry_point(&self, file: &Path) -> bool {
-        contains_path(&self.entry_points, file)
+        self.is_liveness_root_file(file)
+    }
+
+    pub(crate) fn is_liveness_root_file(&self, file: &Path) -> bool {
+        contains_path(&self.liveness_root_files, file)
     }
 
     pub(crate) fn is_public_api_file(&self, file: &Path) -> bool {
@@ -35,9 +39,13 @@ impl EntryPointSet {
         &self.warnings
     }
 
-    fn insert_entry_point(&mut self, path: &Path) {
+    fn insert_liveness_root(&mut self, path: &Path) {
+        self.liveness_root_files.insert(snapshot_path(path));
+    }
+
+    fn insert_public_api_file(&mut self, path: &Path) {
         let path = snapshot_path(path);
-        self.entry_points.insert(path.clone());
+        self.liveness_root_files.insert(path.clone());
         self.public_api_files.insert(path);
     }
 
@@ -50,6 +58,12 @@ impl EntryPointSet {
 struct ManifestPaths {
     cargo_tomls: Vec<PathBuf>,
     package_jsons: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EntryPointKind {
+    LivenessRoot,
+    PublicApi,
 }
 
 pub(crate) fn resolve_entry_points(project_root: &Path) -> EntryPointSet {
@@ -152,15 +166,27 @@ fn collect_cargo_lib_target(
 ) {
     if let Some(lib) = value.get("lib") {
         if let Some(path) = lib.get("path").and_then(toml::Value::as_str) {
-            insert_existing_entry_point(entry_points, &package_dir.join(path));
+            insert_existing_entry_point(
+                entry_points,
+                &package_dir.join(path),
+                EntryPointKind::PublicApi,
+            );
         } else {
-            insert_existing_entry_point(entry_points, &package_dir.join("src/lib.rs"));
+            insert_existing_entry_point(
+                entry_points,
+                &package_dir.join("src/lib.rs"),
+                EntryPointKind::PublicApi,
+            );
         }
         return;
     }
 
     if has_package && package_autodiscovery_enabled(value, "autolib") {
-        insert_existing_entry_point(entry_points, &package_dir.join("src/lib.rs"));
+        insert_existing_entry_point(
+            entry_points,
+            &package_dir.join("src/lib.rs"),
+            EntryPointKind::PublicApi,
+        );
     }
 }
 
@@ -173,22 +199,42 @@ fn collect_cargo_bin_targets(
     if let Some(bins) = value.get("bin").and_then(toml::Value::as_array) {
         for bin in bins {
             if let Some(path) = bin.get("path").and_then(toml::Value::as_str) {
-                insert_existing_entry_point(entry_points, &package_dir.join(path));
+                insert_existing_entry_point(
+                    entry_points,
+                    &package_dir.join(path),
+                    EntryPointKind::LivenessRoot,
+                );
             } else if let Some(name) = bin.get("name").and_then(toml::Value::as_str) {
                 let named_bin = package_dir.join("src/bin").join(format!("{name}.rs"));
                 if named_bin.is_file() {
-                    insert_existing_entry_point(entry_points, &named_bin);
+                    insert_existing_entry_point(
+                        entry_points,
+                        &named_bin,
+                        EntryPointKind::LivenessRoot,
+                    );
                 } else {
-                    insert_existing_entry_point(entry_points, &package_dir.join("src/main.rs"));
+                    insert_existing_entry_point(
+                        entry_points,
+                        &package_dir.join("src/main.rs"),
+                        EntryPointKind::LivenessRoot,
+                    );
                 }
             } else {
-                insert_existing_entry_point(entry_points, &package_dir.join("src/main.rs"));
+                insert_existing_entry_point(
+                    entry_points,
+                    &package_dir.join("src/main.rs"),
+                    EntryPointKind::LivenessRoot,
+                );
             }
         }
     }
 
     if has_package && package_autodiscovery_enabled(value, "autobins") {
-        insert_existing_entry_point(entry_points, &package_dir.join("src/main.rs"));
+        insert_existing_entry_point(
+            entry_points,
+            &package_dir.join("src/main.rs"),
+            EntryPointKind::LivenessRoot,
+        );
         collect_cargo_src_bin_targets(package_dir, entry_points);
     }
 }
@@ -211,7 +257,7 @@ fn collect_cargo_src_bin_targets(package_dir: &Path, entry_points: &mut EntryPoi
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) == Some("rs") && path.is_file()
         {
-            insert_existing_entry_point(entry_points, &path);
+            insert_existing_entry_point(entry_points, &path, EntryPointKind::LivenessRoot);
         }
     }
 }
@@ -233,22 +279,32 @@ fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut Ent
         }
     };
 
-    let mut entries = BTreeSet::new();
+    let mut public_entries = BTreeSet::new();
     if let Some(main) = value.get("main").and_then(Value::as_str) {
-        entries.insert(main.to_string());
+        public_entries.insert(main.to_string());
     }
     if let Some(module) = value.get("module").and_then(Value::as_str) {
-        entries.insert(module.to_string());
+        public_entries.insert(module.to_string());
     }
     if let Some(exports) = value.get("exports") {
-        collect_json_entry_strings(exports, &mut entries);
-    }
-    if let Some(bin) = value.get("bin") {
-        collect_json_entry_strings(bin, &mut entries);
+        collect_json_entry_strings(exports, &mut public_entries);
     }
 
-    for entry in entries {
-        insert_package_entry(package_dir, &entry, entry_points);
+    let mut bin_entries = BTreeSet::new();
+    if let Some(bin) = value.get("bin") {
+        collect_json_entry_strings(bin, &mut bin_entries);
+    }
+
+    for entry in public_entries {
+        insert_package_entry(package_dir, &entry, entry_points, EntryPointKind::PublicApi);
+    }
+    for entry in bin_entries {
+        insert_package_entry(
+            package_dir,
+            &entry,
+            entry_points,
+            EntryPointKind::LivenessRoot,
+        );
     }
 }
 
@@ -271,14 +327,19 @@ fn collect_json_entry_strings(value: &Value, entries: &mut BTreeSet<String>) {
     }
 }
 
-fn insert_package_entry(package_dir: &Path, entry: &str, entry_points: &mut EntryPointSet) {
+fn insert_package_entry(
+    package_dir: &Path,
+    entry: &str,
+    entry_points: &mut EntryPointSet,
+    kind: EntryPointKind,
+) {
     let entry = entry.trim();
     if entry.is_empty() || entry.starts_with('#') || entry.contains('*') {
         return;
     }
 
     if let Some(path) = resolve_package_entry(package_dir, entry) {
-        entry_points.insert_entry_point(&path);
+        insert_resolved_entry_point(entry_points, &path, kind);
     }
 }
 
@@ -343,44 +404,52 @@ fn collect_fallback_entry_points(project_root: &Path, entry_points: &mut EntryPo
                 continue;
             }
 
-            if file_type.is_file() && is_conventional_entry_point(project_root, &path) {
-                entry_points.insert_entry_point(&path);
+            if file_type.is_file() {
+                if let Some(kind) = conventional_entry_point_kind(project_root, &path) {
+                    insert_resolved_entry_point(entry_points, &path, kind);
+                }
             }
         }
     }
 }
 
-fn is_conventional_entry_point(project_root: &Path, file: &Path) -> bool {
+fn conventional_entry_point_kind(project_root: &Path, file: &Path) -> Option<EntryPointKind> {
     let relative = file.strip_prefix(project_root).unwrap_or(file);
     let relative_display = relative.to_string_lossy().replace('\\', "/");
     if relative_display.starts_with("bin/") || relative_display.contains("/bin/") {
-        return true;
+        return Some(EntryPointKind::LivenessRoot);
     }
 
-    let Some(file_name) = relative.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    matches!(
-        file_name,
-        "main.rs"
-            | "lib.rs"
-            | "main.ts"
-            | "main.tsx"
-            | "main.js"
-            | "main.jsx"
-            | "main.py"
-            | "main.go"
-            | "index.ts"
-            | "index.tsx"
-            | "index.js"
-            | "index.jsx"
-    )
+    let file_name = relative.file_name().and_then(|name| name.to_str())?;
+    match file_name {
+        "lib.rs" | "index.ts" | "index.tsx" | "index.js" | "index.jsx" => {
+            Some(EntryPointKind::PublicApi)
+        }
+        "main.rs" | "main.ts" | "main.tsx" | "main.js" | "main.jsx" | "main.py" | "main.go" => {
+            Some(EntryPointKind::LivenessRoot)
+        }
+        _ => None,
+    }
 }
 
-fn insert_existing_entry_point(entry_points: &mut EntryPointSet, path: &Path) {
+fn insert_existing_entry_point(
+    entry_points: &mut EntryPointSet,
+    path: &Path,
+    kind: EntryPointKind,
+) {
     if path.is_file() {
-        entry_points.insert_entry_point(path);
+        insert_resolved_entry_point(entry_points, path, kind);
+    }
+}
+
+fn insert_resolved_entry_point(
+    entry_points: &mut EntryPointSet,
+    path: &Path,
+    kind: EntryPointKind,
+) {
+    match kind {
+        EntryPointKind::LivenessRoot => entry_points.insert_liveness_root(path),
+        EntryPointKind::PublicApi => entry_points.insert_public_api_file(path),
     }
 }
 

@@ -985,7 +985,7 @@ mod tests {
         // Transient: a temporary I/O hiccup or a read that raced a concurrent
         // writer. These must NOT kill the heartbeat — it retries instead.
         assert!(!heartbeat_error_is_terminal(&HeartbeatError::Io(
-            io::Error::new(io::ErrorKind::Other, "disk blip")
+            io::Error::other("disk blip")
         )));
         let malformed: serde_json::Error =
             serde_json::from_str::<LockMetadata>("not json").unwrap_err();

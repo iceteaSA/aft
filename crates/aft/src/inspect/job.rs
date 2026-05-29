@@ -344,6 +344,7 @@ pub struct CallgraphExport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallgraphOutboundCall {
     pub caller_file: PathBuf,
+    pub caller_symbol: String,
     pub target: String,
     pub line: u32,
 }

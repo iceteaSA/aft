@@ -775,7 +775,7 @@ path = "src/bin/app.rs"
     write_file(
         &root,
         "src/bin/app.rs",
-        "pub fn declared_bin_entry() -> u32 { 1 }\n",
+        "pub fn declared_bin_entry() -> u32 { 1 }\npub fn unused_bin_helper() -> u32 { 0 }\nfn main() { declared_bin_entry(); }\n",
     );
     write_file(
         &root,
@@ -806,12 +806,19 @@ path = "src/bin/app.rs"
             "src/bin/app.rs".to_string(),
             "declared_bin_entry".to_string()
         )),
-        "declared Cargo bin should remain an entry point: {response:#}"
+        "declared Cargo bin export called from main should be live: {response:#}"
+    );
+    assert!(
+        items.contains(&(
+            "src/bin/app.rs".to_string(),
+            "unused_bin_helper".to_string()
+        )),
+        "binary exports are not public API and should remain eligible: {response:#}"
     );
 }
 
 #[test]
-fn inspect_command_unused_exports_uses_package_exports_and_bin_as_public_api() {
+fn inspect_command_unused_exports_uses_package_exports_as_public_api_but_not_bin() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -862,11 +869,14 @@ fn inspect_command_unused_exports_uses_package_exports_and_bin_as_public_api() {
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
     assert_eq!(
         unused_export_items(&response),
-        vec![(
-            "src/internal.ts".to_string(),
-            "nonPublicUncalled".to_string()
-        )],
-        "package exports/bin should be public API while non-public exports are reported: {response:#}"
+        vec![
+            ("src/cli.ts".to_string(), "cliEntry".to_string()),
+            (
+                "src/internal.ts".to_string(),
+                "nonPublicUncalled".to_string()
+            ),
+        ],
+        "package exports should be public API while bin/non-public exports are reported: {response:#}"
     );
 }
 
