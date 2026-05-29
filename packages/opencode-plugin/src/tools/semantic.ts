@@ -6,6 +6,15 @@ import { askGrepPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
 
+function semanticHonestyNote(response: Record<string, unknown>): string | undefined {
+  const notes: string[] = [];
+  if (response.more_available === true) notes.push("more results available");
+  if (response.engine_capped === true) notes.push("enumeration capped");
+  if (response.fully_degraded === true) notes.push("fully degraded");
+  if (response.complete === false) notes.push("partial/incomplete");
+  return notes.length > 0 ? `Search status: ${notes.join("; ")}.` : undefined;
+}
+
 type ToolArg = ToolDefinition["args"][string];
 
 function arg(schema: unknown): ToolArg {
@@ -73,31 +82,32 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       const response = await callBridge(ctx, context, "semantic_search", bridgeParams);
 
       if (response.success === false) {
-        if (
-          response.code === "semantic_search_unavailable" &&
-          typeof response.message === "string"
-        ) {
-          return response.message;
-        }
-
-        throw new Error((response.message as string) || "semantic_search failed");
+        const message =
+          typeof response.message === "string" && response.message.length > 0
+            ? response.message
+            : "semantic_search failed";
+        const code =
+          typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
+        throw new Error(code ? `semantic_search: ${code} — ${message}` : message);
       }
 
+      const honestyNote = semanticHonestyNote(response);
       if (
         typeof response.text === "string" &&
         response.status === "disabled" &&
         Array.isArray(response.results) &&
         response.results.length === 0
       ) {
-        return response.text;
+        return honestyNote ? `${response.text}\n${honestyNote}` : response.text;
       }
 
       const structured = JSON.stringify(response, null, 2);
       if (typeof response.text === "string" && response.text.length > 0) {
-        return `${response.text}\n\nStructured response:\n${structured}`;
+        const display = honestyNote ? `${response.text}\n${honestyNote}` : response.text;
+        return `${display}\n\nStructured response:\n${structured}`;
       }
 
-      return structured;
+      return honestyNote ? `${honestyNote}\n\nStructured response:\n${structured}` : structured;
     },
   };
 

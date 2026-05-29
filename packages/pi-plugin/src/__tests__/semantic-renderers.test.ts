@@ -52,6 +52,38 @@ describe("semantic renderer", () => {
     expect(output).toContain("login [function] lines 4-8 score 0.910");
   });
 
+  test("renderSemanticResult surfaces semantic honesty flags", () => {
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "ready",
+          interpreted_as: "hybrid",
+          more_available: true,
+          engine_capped: true,
+          fully_degraded: true,
+          complete: false,
+          results: [
+            {
+              file: "/repo/src/auth.ts",
+              name: "login",
+              kind: "function",
+              start_line: 4,
+              end_line: 8,
+            },
+          ],
+        }),
+        { query: "auth", topK: 5 },
+        mockTheme,
+        makeContext({ query: "auth", topK: 5 }),
+      ),
+    );
+
+    expect(output).toContain(
+      "Search status: more results available; enumeration capped; fully degraded; partial/incomplete.",
+    );
+  });
+
   test("renderSemanticResult renders file_summary results as summaries", () => {
     const output = renderToString(
       renderSemanticResult(

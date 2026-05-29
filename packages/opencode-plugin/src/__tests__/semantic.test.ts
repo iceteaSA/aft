@@ -129,6 +129,7 @@ describe("semanticTools", () => {
       },
     ]);
     expect(output).toContain(bridgeResponse.text);
+    expect(output).toContain("Search status: more results available.");
     const structured = parseStructuredOutput(output);
     expect(structured.interpreted_as).toBe("hybrid");
     expect(structured.semantic_status).toBe("ready");
@@ -155,7 +156,28 @@ describe("semanticTools", () => {
     expect(sendImpl).not.toHaveBeenCalled();
   });
 
-  test("returns semantic runtime errors as user-friendly text", async () => {
+  test("renders all semantic honesty flags when text is present", async () => {
+    const sdkCtx = createMockSdkContext("/tmp/project");
+    const { tools } = createMockSemanticHarness({}, () => ({
+      success: true,
+      text: "partial results",
+      more_available: true,
+      engine_capped: true,
+      fully_degraded: true,
+      complete: false,
+      results: [],
+    }));
+
+    const output = await tools.aft_search.execute({ query: "auth", topK: 5 }, sdkCtx);
+
+    expect(output).toContain(
+      "Search status: more results available; enumeration capped; fully degraded; partial/incomplete.",
+    );
+    const structured = parseStructuredOutput(output);
+    expect(structured.complete).toBe(false);
+  });
+
+  test("throws semantic runtime errors with code and message", async () => {
     const sdkCtx = createMockSdkContext("/tmp/project");
     const { tools } = createMockSemanticHarness({}, () => ({
       success: false,
@@ -163,12 +185,24 @@ describe("semanticTools", () => {
       message: "Semantic search unavailable: ONNX Runtime not installed.",
     }));
 
-    const output = await tools.aft_search.execute(
-      { query: "authentication logic", topK: 5 },
-      sdkCtx,
+    await expect(
+      tools.aft_search.execute({ query: "authentication logic", topK: 5 }, sdkCtx),
+    ).rejects.toThrow(
+      "semantic_search: semantic_search_unavailable — Semantic search unavailable: ONNX Runtime not installed.",
     );
+  });
 
-    expect(output).toBe("Semantic search unavailable: ONNX Runtime not installed.");
+  test("throws bridge failure envelopes with their message", async () => {
+    const sdkCtx = createMockSdkContext("/tmp/project");
+    const { tools } = createMockSemanticHarness({}, () => ({
+      success: false,
+      code: "permission_required",
+      message: "grep permission required",
+    }));
+
+    await expect(tools.aft_search.execute({ query: "TODO", topK: 5 }, sdkCtx)).rejects.toThrow(
+      "semantic_search: permission_required — grep permission required",
+    );
   });
 
   test("asks grep permission for regex literal and auto hints but not semantic", async () => {

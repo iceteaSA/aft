@@ -50,6 +50,20 @@ describe("aft_search adapter", () => {
     expect(detailsResults[0].source).toBe("semantic");
   });
 
+  test("throws bridge failure envelopes so Pi renders them through its error path", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({
+      success: false,
+      code: "semantic_search_unavailable",
+      message: "Semantic search unavailable: ONNX Runtime not installed.",
+    }));
+    registerSemanticTool(api, makePluginContext(bridge));
+
+    await expect(executeTool(tools.get("aft_search")!, { query: "retry logic" })).rejects.toThrow(
+      "semantic_search_unavailable",
+    );
+  });
+
   test("omits top_k when topK is not provided to preserve Rust defaults", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true }));

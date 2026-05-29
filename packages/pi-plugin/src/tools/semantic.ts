@@ -22,6 +22,15 @@ import {
   shortenPath,
 } from "./render-helpers.js";
 
+function semanticHonestyNote(response: Record<string, unknown>, theme: Theme): string | undefined {
+  const notes: string[] = [];
+  if (response.more_available === true) notes.push("more results available");
+  if (response.engine_capped === true) notes.push("enumeration capped");
+  if (response.fully_degraded === true) notes.push("fully degraded");
+  if (response.complete === false) notes.push("partial/incomplete");
+  return notes.length > 0 ? theme.fg("warning", `Search status: ${notes.join("; ")}.`) : undefined;
+}
+
 const SearchParams = Type.Object({
   query: Type.String({
     description:
@@ -73,6 +82,9 @@ export function buildSemanticSections(
   if (warnings.length > 0) {
     sections.push(warnings.map((warning) => theme.fg("warning", `⚠ ${warning}`)).join("\n"));
   }
+
+  const honestyNote = semanticHonestyNote(response, theme);
+  if (honestyNote) sections.push(honestyNote);
 
   const results = asRecords(response.results);
   if (status !== "ready" && results.length === 0) {
@@ -205,6 +217,8 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       const req: Record<string, unknown> = { query: params.query };
       if (params.topK !== undefined) req.top_k = params.topK;
       if (params.hint !== undefined) req.hint = params.hint;
+      // Pi has no grep-style permission prompt; callBridge throws success:false
+      // envelopes so the host renders them via renderErrorResult below.
       const response = await callBridge(bridge, "semantic_search", req, extCtx);
       return textResult(
         (response.text as string | undefined) ?? JSON.stringify(response, null, 2),
