@@ -20,7 +20,7 @@
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk && bun build src/tui/index.tsx --outfile dist/tui.js --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opencode-ai/sdk --external @opentui/solid --external solid-js && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
-    "pretest": "cd ../.. && cargo build",
+    "pretest": "node -e \"if (process.env.CI !== 'true') { const { spawnSync } = require('node:child_process'); const result = spawnSync('cargo', ['build'], { cwd: '../..', stdio: 'inherit', shell: process.platform === 'win32' }); process.exit(result.status ?? 1); } else { console.log('Skipping cargo build in CI; workflow builds agent-file-tools before tests.'); }\"",
     "test": "bun test",
     "test:e2e": "bun test src/__tests__/e2e/",
     "lint": "biome check src",
