@@ -42,7 +42,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
     },
     aftConfig: { exists: true, flags: {} },
     pluginCache: { path: "/tmp/aft-test/plugin-cache", exists: false },
-    storageDir: { path: "/tmp/aft-test/storage", exists: true, sizesByKey: {} },
+    storageDir: { path: "/tmp/aft-test/storage", exists: true, accessible: true, sizesByKey: {} },
     onnxRuntime: {
       required: false,
       systemPath: null,

@@ -58,7 +58,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
     configPaths: configPaths(kind),
     aftConfig: { exists: true, flags: {} },
     pluginCache: { path: "/tmp/aft-test/plugin-cache", exists: false },
-    storageDir: { path: "/tmp/aft-test/storage", exists: false, sizesByKey: {} },
+    storageDir: { path: "/tmp/aft-test/storage", exists: false, accessible: false, sizesByKey: {} },
     onnxRuntime: {
       required: false,
       systemPath: null,
@@ -156,7 +156,12 @@ describe("doctor --fix planning", () => {
     const report = makeReport(
       [
         makeHarness({
-          storageDir: { path: "/tmp/aft-test/storage", exists: false, sizesByKey: {} },
+          storageDir: {
+            path: "/tmp/aft-test/storage",
+            exists: false,
+            accessible: false,
+            sizesByKey: {},
+          },
         }),
       ],
       "0.30.1",

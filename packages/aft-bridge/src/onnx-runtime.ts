@@ -486,8 +486,10 @@ function findSystemOnnxRuntime(libName?: string): string | null {
               join(nugetPackageDir, entry.name, "runtimes", "win-arm64", "native"),
             );
           }
-        } catch {
-          // best-effort scan
+        } catch (err) {
+          warn(
+            `Failed to scan NuGet ONNX Runtime cache ${nugetPackageDir}: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
         return nugetPaths;
       })(),
@@ -522,8 +524,10 @@ function findSystemOnnxRuntime(libName?: string): string | null {
     // are less common on Windows and we want PATH discovery to succeed.
     let skipVersionCheck = false;
     if (process.platform === "win32") {
-      // Only do version check for common install paths, not arbitrary PATH entries
-      const isCommonPath = dir.includes("Program Files") || dir.includes("onnxruntime");
+      // Only do version check for common install paths, not arbitrary PATH entries.
+      // Windows paths are case-insensitive, so normalize to lower case for comparison.
+      const dirLower = dir.toLowerCase();
+      const isCommonPath = dirLower.includes("program files") || dirLower.includes("onnxruntime");
       if (!isCommonPath) skipVersionCheck = true;
     }
 

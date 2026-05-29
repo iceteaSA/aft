@@ -51,6 +51,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
     storageDir: {
       path: storageDir,
       exists: true,
+      accessible: true,
       sizesByKey: {},
     },
     onnxRuntime: {
@@ -122,7 +123,7 @@ describe("findOnnxFixCandidates", () => {
     mkdirSync(join(storagePath, "onnxruntime"), { recursive: true });
     const report = makeReport([
       makeHarness({
-        storageDir: { path: storagePath, exists: true, sizesByKey: {} },
+        storageDir: { path: storagePath, exists: true, accessible: true, sizesByKey: {} },
         onnxRuntime: {
           ...makeHarness().onnxRuntime,
           cachedPath: join(storagePath, "onnxruntime/1.18.0"),
@@ -143,7 +144,7 @@ describe("findOnnxFixCandidates", () => {
     mkdirSync(storagePath, { recursive: true });
     const report = makeReport([
       makeHarness({
-        storageDir: { path: storagePath, exists: true, sizesByKey: {} },
+        storageDir: { path: storagePath, exists: true, accessible: true, sizesByKey: {} },
         onnxRuntime: {
           ...makeHarness().onnxRuntime,
           systemPath: "/usr/lib/x86_64-linux-gnu",
@@ -201,7 +202,7 @@ describe("runOnnxFix", () => {
 
     const report = makeReport([
       makeHarness({
-        storageDir: { path: storagePath, exists: true, sizesByKey: {} },
+        storageDir: { path: storagePath, exists: true, accessible: true, sizesByKey: {} },
         onnxRuntime: {
           ...makeHarness().onnxRuntime,
           cachedPath: join(onnxDir, "1.18.0"),
@@ -230,7 +231,7 @@ describe("runOnnxFix", () => {
 
     const report = makeReport([
       makeHarness({
-        storageDir: { path: storagePath, exists: true, sizesByKey: {} },
+        storageDir: { path: storagePath, exists: true, accessible: true, sizesByKey: {} },
         onnxRuntime: {
           ...makeHarness().onnxRuntime,
           cachedPath: join(onnxDir, "1.18.0"),
@@ -264,7 +265,7 @@ describe("runOnnxFix", () => {
 
     const report = makeReport([
       makeHarness({
-        storageDir: { path: storagePath, exists: true, sizesByKey: {} },
+        storageDir: { path: storagePath, exists: true, accessible: true, sizesByKey: {} },
         onnxRuntime: {
           ...makeHarness().onnxRuntime,
           systemPath: "/usr/lib/x86_64-linux-gnu",

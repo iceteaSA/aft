@@ -280,6 +280,14 @@ fn wait_for_ready_search(aft: &mut AftProcess, query: &str) -> Value {
 
 #[test]
 fn semantic_search_returns_not_ready_without_an_index() {
+    // Without configure, project_root defaults to the process cwd. In CI that
+    // is the full aft repo, which can trigger lexical grep fallback and report
+    // status "ready" even though semantic search is disabled. Use an empty
+    // project directory so the test exercises the disabled path deterministically.
+    let project = setup_project(&[]);
+    let previous_cwd = std::env::current_dir().expect("read cwd");
+    std::env::set_current_dir(project.path()).expect("set cwd to empty project");
+
     let mut aft = AftProcess::spawn();
 
     let response = send(
@@ -287,14 +295,20 @@ fn semantic_search_returns_not_ready_without_an_index() {
         json!({
             "id": "semantic-not-ready",
             "command": "semantic_search",
-            "query": "request handling",
+            // Natural-language phrasing so auto mode does not classify this as an
+            // Identifier (which triggers lexical grep fallback with status "ready"
+            // when semantic search is disabled).
+            "query": "how does request handling work",
         }),
     );
+
+    std::env::set_current_dir(&previous_cwd).expect("restore cwd");
 
     assert_eq!(
         response["success"], true,
         "search should succeed: {response:?}"
     );
+    assert_eq!(response["semantic_status"], "disabled");
     assert_eq!(response["status"], "disabled");
     assert_eq!(response["text"], "Semantic search is not enabled.");
 
@@ -319,7 +333,7 @@ fn semantic_search_returns_disabled_when_feature_is_off() {
         json!({
             "id": "semantic-disabled",
             "command": "semantic_search",
-            "query": "request handling",
+            "query": "how does request handling work",
         }),
     );
 
@@ -327,6 +341,7 @@ fn semantic_search_returns_disabled_when_feature_is_off() {
         response["success"], true,
         "search should succeed: {response:?}"
     );
+    assert_eq!(response["semantic_status"], "disabled");
     assert_eq!(response["status"], "disabled");
     assert_eq!(response["text"], "Semantic search is not enabled.");
 

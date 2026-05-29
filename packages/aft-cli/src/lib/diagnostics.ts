@@ -1,4 +1,12 @@
-import { closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants,
+  existsSync,
+  openSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
 import { probeBinaryVersion } from "./binary-probe.js";
@@ -61,7 +69,10 @@ export interface HarnessDiagnostic {
   pluginCache: ReturnType<HarnessAdapter["getPluginCacheInfo"]>;
   storageDir: {
     path: string;
+    /** True when the storage directory is present on disk. */
     exists: boolean;
+    /** True when the directory exists and is readable + writable. */
+    accessible: boolean;
     sizesByKey: Record<string, number>;
   };
   onnxRuntime: {
@@ -113,17 +124,18 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
   const logPath = adapter.getLogFile();
   const pluginCache = adapter.getPluginCacheInfo();
 
-  // Ensure the storage directory exists so diagnostics report useful info
-  // instead of "(not created)" on fresh installs. The storage directory is
-  // normally created lazily by the bridge on first tool call, but the doctor
-  // command is a read-only diagnostic that should still display it.
-  if (!existsSync(storage)) {
+  // Check if the storage directory exists and is accessible. We do NOT create
+  // it here — the doctor command is a diagnostic tool and should not mutate
+  // filesystem state. The bridge creates it lazily on first tool call.
+  const storageAccessible = (() => {
+    if (!existsSync(storage)) return false;
     try {
-      mkdirSync(storage, { recursive: true });
+      accessSync(storage, constants.R_OK | constants.W_OK);
+      return true;
     } catch {
-      // best-effort — diagnostics can still report the path as (not created)
+      return false;
     }
-  }
+  })();
 
   const describeStorage =
     "describeStorageSubtrees" in adapter &&
@@ -159,6 +171,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
     storageDir: {
       path: storage,
       exists: existsSync(storage),
+      accessible: storageAccessible,
       sizesByKey: describeStorage,
     },
     onnxRuntime: {

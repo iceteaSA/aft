@@ -869,8 +869,13 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
             // outdated DLLs (e.g. v1.9.x) before the ort crate panics.
             let mut detected_major: u32 = 0;
             let mut detected_minor: u32 = 0;
-            let mut path_buf = [0u16; 260];
-            let path_len = GetModuleFileNameW(handle, path_buf.as_mut_ptr(), 260);
+            // Use MAX_UNICODEPATH (32767) so deeply nested ORT paths (e.g.
+            // long NuGet package paths under %USERPROFILE%) never truncate.
+            // GetModuleFileNameW truncates silently when the buffer is too
+            // small, which causes version probing to fail and the version
+            // check to be bypassed — better to allocate generously.
+            let mut path_buf = [0u16; 32767];
+            let path_len = GetModuleFileNameW(handle, path_buf.as_mut_ptr(), 32767);
             if path_len > 0 {
                 let mut dummy_handle: u32 = 0;
                 let info_size = GetFileVersionInfoSizeW(path_buf.as_ptr(), &mut dummy_handle);
@@ -970,8 +975,6 @@ fn suggest_removal_command(lib_path: &str) -> String {
         return "   sudo rm /usr/local/lib/libonnxruntime* && sudo ldconfig".to_string();
         #[cfg(target_os = "macos")]
         return "   sudo rm /usr/local/lib/libonnxruntime*".to_string();
-        #[cfg(target_os = "windows")]
-        return "   Delete the ONNX Runtime DLL from your PATH".to_string();
     }
     format!("   rm '{}'", lib_path)
 }

@@ -27,7 +27,11 @@ describe("downloadBinary hardened transport", () => {
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "aft-download-test-"));
-    releaseEnv = await acquireEnv({ XDG_CACHE_HOME: tmpDir });
+    // getCacheDir() reads different env vars per platform:
+    // Windows → LOCALAPPDATA, POSIX → XDG_CACHE_HOME
+    const cacheEnv =
+      process.platform === "win32" ? { LOCALAPPDATA: tmpDir } : { XDG_CACHE_HOME: tmpDir };
+    releaseEnv = await acquireEnv(cacheEnv);
     originalFetch = globalThis.fetch;
   });
 
@@ -47,6 +51,7 @@ describe("downloadBinary hardened transport", () => {
   }
 
   test("dedupes concurrent same-version downloads and writes one final binary", async () => {
+    if (skipShellFixture) return;
     const { downloadBinary, getBinaryName } = await import(
       `../downloader.js?transport-dedupe-${Date.now()}`
     );

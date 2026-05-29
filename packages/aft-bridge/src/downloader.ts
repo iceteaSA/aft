@@ -16,6 +16,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  copyFileSync,
   createWriteStream,
   existsSync,
   mkdirSync,
@@ -264,22 +265,23 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     }
     log(`Checksum verified (SHA-256: ${actualHash.slice(0, 16)}...)`);
 
-    // Make executable
-    if (process.platform !== "win32") {
+    // Atomic rename (POSIX) or copy (Windows — renameSync fails with EEXIST
+    // when target exists). On Windows, copyFileSync overwrites the target;
+    // if it fails the original binary at binaryPath is preserved.
+    if (process.platform === "win32") {
+      copyFileSync(tmpPath, binaryPath);
+    } else {
       chmodSync(tmpPath, 0o755);
+      renameSync(tmpPath, binaryPath);
     }
 
-    // Replace binary — on Windows renameSync fails (EEXIST) when the target
-    // exists, so unlink first. This creates a brief window where no binary
-    // exists at binaryPath — callers should handle a missing binary gracefully.
-    if (process.platform === "win32" && existsSync(binaryPath)) {
-      try {
-        unlinkSync(binaryPath);
-      } catch {
-        // best-effort; renameSync will surface the error if unlink fails
-      }
+    // Binary was replaced successfully. Clean up the temp file best-effort;
+    // a cleanup failure should NOT propagate as a download failure.
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {
+      warn(`Could not clean up temporary download file ${tmpPath} — it can be removed manually.`);
     }
-    renameSync(tmpPath, binaryPath);
 
     log(`AFT binary ready at ${binaryPath}`);
     return binaryPath;
