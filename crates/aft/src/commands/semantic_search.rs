@@ -623,17 +623,6 @@ fn semantic_unavailable_or_fallback_response(
         return semantic_unavailable_response(&req.id, detail);
     }
 
-    // `semantic_search: false` is a deliberate opt-out, not an outage. The
-    // degraded grep fallback (#5) exists for semantic that was *wanted* but is
-    // temporarily unavailable (Failed/Building), not for an explicit opt-out:
-    // silently degrading an opt-out to a grep scan subverts the user's config
-    // choice and conflates the independent `semantic_search` and
-    // `search_index` flags. So a disabled status skips the grep fallback. It
-    // still honors a ready lexical lane (that's the separate `search_index`
-    // feature, not semantic) and otherwise falls through to the honest
-    // success:true "not enabled" text tail below.
-    let semantic_opted_out = semantic_status == "disabled";
-
     let lexical_ready = mode == SearchMode::Hybrid && lexical.ready;
     if lexical_ready {
         let lexical_count = lexical.files.len();
@@ -666,7 +655,7 @@ fn semantic_unavailable_or_fallback_response(
         );
     }
 
-    if !semantic_opted_out && semantic_degraded_fallback_available(params, mode, shape, &lexical) {
+    if semantic_degraded_fallback_available(params, mode, shape, &lexical) {
         return semantic_unavailable_grep_fallback_response(
             req,
             ctx,
@@ -693,10 +682,7 @@ fn semantic_unavailable_or_fallback_response(
             query_kind: query_kind_label(shape.kind),
             semantic_status,
             status: unavailable_status,
-            // A disabled opt-out is a complete answer (semantic is off — nothing
-            // more is coming). A Failed/unavailable status with no fallback is a
-            // genuinely incomplete result (semantic was wanted but unavailable).
-            complete: semantic_opted_out,
+            complete: false,
             text: detail,
             results: Vec::new(),
             more_available: false,

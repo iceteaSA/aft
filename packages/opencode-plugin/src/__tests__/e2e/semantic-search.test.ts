@@ -95,7 +95,7 @@ maybeDescribe("e2e semantic search tool", () => {
     };
   }
 
-  test("aft_search returns not_ready text when the semantic index is unavailable", async () => {
+  test("aft_search degrades to a lexical fallback when semantic is disabled", async () => {
     const { tools, sdkCtx } = await createToolHarness({ experimentalSemanticSearch: false });
 
     const output = await tools.aft_search.execute(
@@ -103,7 +103,13 @@ maybeDescribe("e2e semantic search tool", () => {
       sdkCtx,
     );
 
-    expect(output).toBe("Semantic search is not enabled.");
+    // With semantic disabled, a natural-language query degrades to a lexical
+    // (literal grep) fallback rather than stranding the agent with zero
+    // results. The response stays honest — it still names that semantic is
+    // unavailable — but returns usable lexical matches. (Matches the v0.32
+    // degraded-fallback contract; see aft_search_contract_test.)
+    expect(typeof output).toBe("string");
+    expect(output).toContain("Semantic search is not enabled.");
   });
 
   test("aft_search handles a missing query parameter gracefully", async () => {

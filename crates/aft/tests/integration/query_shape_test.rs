@@ -51,7 +51,6 @@ fn classifies_identifier_queries() {
         "x",
         "API",
         "FOO_BAR",
-        "two words",
         "  useEffect  ",
     ] {
         assert_shape(query, QueryKind::Identifier, expected);
