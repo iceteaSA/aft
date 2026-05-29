@@ -203,7 +203,7 @@ fn lexical_candidate_cap_filters_extensions_before_truncating() {
 }
 
 #[test]
-fn lexical_engine_capped_ignores_filtered_out_candidates() {
+fn lexical_engine_capped_reports_pre_filter_candidate_pressure() {
     let mut index = SearchIndex::new();
     index_matching_files(&mut index, "lock", 0, 201);
     index_matching_files(&mut index, "rs", 201, 1);
@@ -217,5 +217,5 @@ fn lexical_engine_capped_ignores_filtered_out_candidates() {
 
     assert_eq!(result.files.len(), 1);
     assert!(code_file_filter(result.files[0].0.as_path()));
-    assert!(!result.engine_capped);
+    assert!(result.engine_capped);
 }

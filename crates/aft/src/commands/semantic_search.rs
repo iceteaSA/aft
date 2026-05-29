@@ -22,6 +22,8 @@ const MAX_TOP_K: usize = 100;
 const HYBRID_LEXICAL_BOOST: f32 = 1.1;
 const LEXICAL_ONLY_SCORE_CEILING: f32 = 0.25;
 const LEXICAL_ENUMERATION_LIMIT: usize = 50;
+const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
+const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 5_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 
@@ -148,6 +150,12 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn default_top_k() -> usize {
     DEFAULT_TOP_K
+}
+
+fn semantic_candidate_limit(top_k: usize) -> usize {
+    top_k
+        .saturating_mul(SEMANTIC_OVERFETCH_MULTIPLIER)
+        .clamp(SEMANTIC_OVERFETCH_FLOOR, MAX_TOP_K)
 }
 
 fn choose_mode(
@@ -362,6 +370,20 @@ fn handle_semantic_or_hybrid_search(
                 detail.push_str(&format!(" / {}", entries_total));
             }
 
+            if natural_language_degraded_fallback_available(params.hint, mode, &shape) {
+                return semantic_unavailable_grep_fallback_response(
+                    req,
+                    ctx,
+                    &params,
+                    &shape,
+                    "building",
+                    detail,
+                    warnings,
+                    project_root,
+                    top_k,
+                );
+            }
+
             let lexical_count = lexical.files.len();
             let lexical_engine_capped = lexical.engine_capped;
             let results = fuse_hybrid_results(Vec::new(), lexical.files, &shape, top_k);
@@ -464,7 +486,7 @@ fn handle_semantic_or_hybrid_search(
         }
     };
 
-    let semantic_limit = top_k.clamp(50, MAX_TOP_K);
+    let semantic_limit = semantic_candidate_limit(top_k);
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
     let mut semantic_results = {
         let semantic_index = ctx.semantic_index().borrow();
@@ -694,10 +716,24 @@ fn semantic_degraded_fallback_available(
     shape: &QueryShape,
     lexical: &LexicalCollection,
 ) -> bool {
+    if natural_language_degraded_fallback_available(params.hint, mode, shape) {
+        return true;
+    }
+
     params.hint != SearchHint::Semantic
         && mode == SearchMode::Semantic
         && !lexical.ready
         && shape.weights.should_use_lexical
+}
+
+fn natural_language_degraded_fallback_available(
+    hint: SearchHint,
+    mode: SearchMode,
+    shape: &QueryShape,
+) -> bool {
+    hint != SearchHint::Semantic
+        && mode == SearchMode::Semantic
+        && shape.kind == QueryKind::NaturalLanguage
 }
 
 fn semantic_unavailable_grep_fallback_response(
@@ -1735,6 +1771,13 @@ mod tests {
         assert!(human[1].contains("Narrow project_root"));
         assert_eq!(human[2], "(Degraded: custom)");
         assert!(human.join("; ").contains("; "));
+    }
+
+    #[test]
+    fn semantic_candidate_limit_scales_with_small_top_k() {
+        assert_eq!(semantic_candidate_limit(1), SEMANTIC_OVERFETCH_FLOOR);
+        assert_eq!(semantic_candidate_limit(5), 15);
+        assert_eq!(semantic_candidate_limit(100), MAX_TOP_K);
     }
 
     #[test]

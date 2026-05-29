@@ -251,6 +251,91 @@ fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
 }
 
 #[test]
+fn natural_language_auto_falls_back_to_grep_when_semantic_disabled() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::write(
+        &source_file,
+        "pub fn retry() { /* how retry logic works */ }\n",
+    )
+    .expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request("how retry logic works"),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "natural-language fallback should succeed: {response:?}"
+    );
+    assert_eq!(response["query_kind"], "NaturalLanguage");
+    assert_eq!(response["interpreted_as"], "literal");
+    assert_eq!(response["semantic_status"], "disabled");
+    assert_eq!(response["lexical_only_fallback"], true);
+    assert!(
+        response["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .any(|result| result["kind"] == "GrepLine"
+                && result["line_text"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("how retry logic works"))),
+        "expected literal degraded fallback result: {response:?}"
+    );
+}
+
+#[test]
+fn natural_language_auto_falls_back_to_grep_while_semantic_builds() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::write(
+        &source_file,
+        "pub fn retry() { /* how retry logic works */ }\n",
+    )
+    .expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+        stage: "embedding".to_string(),
+        files: Some(1),
+        entries_done: Some(0),
+        entries_total: Some(1),
+    };
+
+    let response = response_value(handle_semantic_search(
+        &request("how retry logic works"),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "natural-language building fallback should succeed: {response:?}"
+    );
+    assert_eq!(response["query_kind"], "NaturalLanguage");
+    assert_eq!(response["interpreted_as"], "literal");
+    assert_eq!(response["semantic_status"], "building");
+    assert_eq!(response["lexical_only_fallback"], true);
+    assert!(
+        response["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .any(|result| result["kind"] == "GrepLine"
+                && result["line_text"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("how retry logic works"))),
+        "expected literal degraded fallback result while building: {response:?}"
+    );
+}
+
+#[test]
 fn blank_queries_are_rejected_before_routing() {
     let project = tempfile::tempdir().expect("create project dir");
     let ctx = test_context(project.path());
