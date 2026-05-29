@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::context::AppContext;
+use crate::inspect::diagnostics_category::run_diagnostics_category;
 use crate::inspect::{InspectCategory, InspectSnapshot, JobOutcome, JobScope};
 use crate::protocol::{RawRequest, Response};
 
@@ -21,6 +22,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) => return invalid_request(&req.id, message),
     };
 
+    let scope_was_provided = scope_was_provided(req.params.get("scope"));
     let snapshot = match build_snapshot(ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => return response.with_id(&req.id),
@@ -36,7 +38,12 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     let manager = ctx.inspect_manager();
     let mut outcomes = BTreeMap::new();
     for category in InspectCategory::active() {
-        let outcome = if category.is_tier2() {
+        let outcome = if *category == InspectCategory::Diagnostics {
+            // Diagnostics are backed by the AppContext LSP manager (RefCell, not
+            // Send/Sync), so they must be computed on this main dispatch thread.
+            // Do not send them through InspectManager's rayon worker path.
+            run_diagnostics_category(ctx, &snapshot, &scope, scope_was_provided)
+        } else if category.is_tier2() {
             // Tier 2 (dead_code, unused_exports, duplicates) are NEVER scanned
             // synchronously here — scans run via aft_inspect_tier2_run on
             // session.idle. handle_inspect just returns whatever aggregate the
@@ -192,6 +199,13 @@ fn parse_sections(value: Option<&Value>) -> Result<Sections, String> {
     }
 }
 
+fn scope_was_provided(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    !(value.is_null() || empty_string(value) || empty_array(value))
+}
+
 fn add_section(section: &str, categories: &mut BTreeSet<InspectCategory>) -> Result<(), String> {
     let section = section.trim();
     if section.is_empty() {
@@ -314,6 +328,14 @@ fn build_inspect_payload(
         }
 
         let payload = outcome.and_then(JobOutcome::payload);
+        if *category == InspectCategory::Diagnostics
+            && diagnostics_payload_status(payload) == Some("pending")
+            && !pending_categories
+                .iter()
+                .any(|value| value == category.as_str())
+        {
+            pending_categories.push(category.as_str().to_string());
+        }
         summary.insert(
             category.as_str().to_string(),
             summary_for(*category, outcome),
@@ -365,11 +387,7 @@ fn status_summary(status: &'static str) -> Value {
 
 fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> Value {
     match category {
-        InspectCategory::Diagnostics => serde_json::json!({
-            "errors": payload.and_then(|p| p.get("errors")).and_then(Value::as_u64).unwrap_or(0),
-            "warnings": payload.and_then(|p| p.get("warnings")).and_then(Value::as_u64).unwrap_or(0),
-            "pending_servers": payload.and_then(|p| p.get("pending_servers")).cloned().unwrap_or_else(|| serde_json::json!([])),
-        }),
+        InspectCategory::Diagnostics => diagnostics_summary_for(payload),
         InspectCategory::Metrics => serde_json::json!({
             "files": payload.and_then(|p| p.get("files").or_else(|| p.pointer("/totals/file_count"))).and_then(Value::as_u64).unwrap_or(0),
             "symbols": payload.and_then(|p| p.get("symbols").or_else(|| p.pointer("/totals/symbol_count"))).and_then(Value::as_u64).unwrap_or(0),
@@ -392,6 +410,56 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
         }),
         _ => serde_json::json!({ "count": count_from_payload(payload) }),
     }
+}
+
+fn diagnostics_payload_status(payload: Option<&Value>) -> Option<&str> {
+    payload
+        .and_then(|payload| payload.get("status"))
+        .and_then(Value::as_str)
+}
+
+fn diagnostics_summary_for(payload: Option<&Value>) -> Value {
+    let Some(payload) = payload else {
+        return status_summary("pending");
+    };
+
+    let complete = payload
+        .get("complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let server_ran = payload
+        .get("server_ran")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if complete && server_ran {
+        return serde_json::json!({
+            "errors": payload.get("errors").and_then(Value::as_u64).unwrap_or(0),
+            "warnings": payload.get("warnings").and_then(Value::as_u64).unwrap_or(0),
+            "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
+            "hints": payload.get("hints").and_then(Value::as_u64).unwrap_or(0),
+        });
+    }
+
+    // Public diagnostics summary contract for the plugin layer:
+    //   computed: { errors, warnings, info, hints }
+    //   sentinel: { status: "pending"|"incomplete", servers_pending, servers_not_installed }
+    // A zero count is only emitted in the computed shape, after at least one
+    // server has proven it ran and no server gaps remain.
+    serde_json::json!({
+        "status": payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending"),
+        "servers_pending": payload
+            .get("servers_pending")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "servers_not_installed": payload
+            .get("servers_not_installed")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    })
 }
 
 fn details_for(category: InspectCategory, payload: Option<&Value>, top_k: usize) -> Value {

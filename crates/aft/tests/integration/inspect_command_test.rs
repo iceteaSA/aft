@@ -9,6 +9,7 @@ use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run};
 use aft::config::Config;
 use aft::context::AppContext;
 use aft::inspect::{InspectCategory, InspectManager, InspectScanSuccess, InspectSnapshot};
+use aft::lsp::registry::ServerKind;
 use aft::parser::{SymbolCache, TreeSitterProvider};
 use aft::protocol::RawRequest;
 use serde_json::{json, Value};
@@ -18,6 +19,23 @@ fn fixture_project() -> (tempfile::TempDir, PathBuf) {
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project root");
     (temp_dir, root)
+}
+
+fn fake_server_path() -> PathBuf {
+    option_env!("CARGO_BIN_EXE_fake-lsp-server")
+        .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake_lsp_server").map(PathBuf::from))
+        .or_else(|| {
+            let mut path = std::env::current_exe().ok()?;
+            path.pop();
+            path.pop();
+            path.push("fake-lsp-server");
+            Some(path)
+        })
+        .filter(|path| path.exists())
+        .expect("fake-lsp-server binary path not set")
 }
 
 fn write_file(root: &Path, relative_path: &str, contents: &str) -> PathBuf {
@@ -1378,30 +1396,245 @@ fn inspect_command_tier2_last_run_updates_on_hash_match_reuse() {
     );
 }
 
+fn configure_fake_rust_lsp(ctx: &AppContext) {
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+}
+
+fn open_with_lsp(ctx: &AppContext, file: &Path, content: &str) {
+    let config = ctx.config().clone();
+    ctx.lsp()
+        .notify_file_changed(file, content, &config)
+        .expect("notify file changed");
+    let diagnostics = ctx
+        .lsp()
+        .wait_for_diagnostics(file, &config, Duration::from_secs(2));
+    assert!(
+        !diagnostics.is_empty(),
+        "fake LSP should publish diagnostics for {file:?}"
+    );
+}
+
+fn close_with_lsp(ctx: &AppContext, file: &Path) {
+    let config = ctx.config().clone();
+    ctx.lsp().notify_file_closed(file).expect("close file");
+    let diagnostics = ctx
+        .lsp()
+        .wait_for_diagnostics(file, &config, Duration::from_secs(2));
+    assert!(
+        diagnostics.is_empty(),
+        "fake LSP close should publish checked-clean diagnostics"
+    );
+    assert!(
+        ctx.lsp().has_diagnostic_report_for_file(file),
+        "empty publish should remain as checked-clean proof"
+    );
+}
+
 #[test]
-fn inspect_command_diagnostics_is_not_active_in_v0_33() {
+fn inspect_command_diagnostics_default_reports_warm_counts_and_details() {
     let (_temp_dir, root) = fixture_project();
-    write_file(&root, "src/app.ts", "export function app() { return 1; }\n");
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-warm\"\n");
+    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    open_with_lsp(&ctx, &file, "fn main() {}\n");
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-warm",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let summary = response["summary"]["diagnostics"].as_object().unwrap();
+    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(1));
+    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(1));
+    assert_eq!(summary.get("info").and_then(Value::as_u64), Some(0));
+    assert_eq!(summary.get("hints").and_then(Value::as_u64), Some(0));
+    assert!(
+        !summary.contains_key("status"),
+        "warm diagnostics should be computed, not pending: {response:#}"
+    );
+
+    let details = response["details"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics details");
+    assert_eq!(details.len(), 2, "response: {response:#}");
+    assert!(details.iter().all(|item| item["file"] == "src/main.rs"));
+    assert!(details.iter().any(|item| item["severity"] == "error"));
+    assert!(details.iter().any(|item| item["severity"] == "warning"));
+}
+
+#[test]
+fn inspect_command_diagnostics_pending_when_no_server_ran() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-pending\"\n");
+    write_file(&root, "src/main.rs", "fn main() {}\n");
     let ctx = configured_context(&root);
 
     let response = inspect(
         &ctx,
         json!({
-            "id": "inspect-diagnostics",
+            "id": "inspect-diagnostics-no-server-ran",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let summary = response["summary"]["diagnostics"].as_object().unwrap();
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("pending")
+    );
+    assert!(
+        !summary.contains_key("errors"),
+        "pending diagnostics must not be reported as zero-clean: {response:#}"
+    );
+    assert!(
+        scanner_state_contains(&response, "pending_categories", "diagnostics"),
+        "pending diagnostics should appear in scanner_state: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_command_diagnostics_clean_zero_after_empty_publish() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-clean\"\n");
+    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    open_with_lsp(&ctx, &file, "fn main() {}\n");
+    close_with_lsp(&ctx, &file);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-clean",
             "command": "inspect",
             "sections": ["diagnostics"],
         }),
     );
 
-    assert_eq!(
-        response["success"], false,
-        "diagnostics should be inactive: {response:#}"
-    );
-    assert_eq!(response["code"], "invalid_request");
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let summary = response["summary"]["diagnostics"].as_object().unwrap();
+    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
+    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(0));
     assert!(
-        response["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("registered but disabled in v0.33")),
-        "diagnostics should be rejected while deferred: {response:#}"
+        !summary.contains_key("status"),
+        "checked-clean diagnostics should be distinct from pending: {response:#}"
+    );
+    assert!(response["details"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics details")
+        .is_empty());
+}
+
+#[test]
+fn inspect_command_diagnostics_scope_actively_pulls_cold_file_and_narrows() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-scope\"\n");
+    write_file(&root, "src/main.rs", "fn main() {}\n");
+    write_file(&root, "src/lib.rs", "pub fn lib() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-scoped-pull",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src/main.rs",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 1);
+    assert_eq!(response["summary"]["diagnostics"]["warnings"], 0);
+    let details = response["details"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics details");
+    assert_eq!(details.len(), 1, "response: {response:#}");
+    assert_eq!(details[0]["file"], "src/main.rs");
+    assert_eq!(details[0]["message"], "test pull diagnostic");
+}
+
+#[test]
+fn inspect_command_diagnostics_missing_server_is_incomplete_not_zero() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-missing\"\n");
+    write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context(&root);
+    ctx.lsp().override_binary(
+        ServerKind::Rust,
+        PathBuf::from("/definitely/missing/fake-lsp-server"),
+    );
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-missing-server",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src/main.rs",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let summary = response["summary"]["diagnostics"].as_object().unwrap();
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("incomplete")
+    );
+    assert!(
+        summary["servers_not_installed"]
+            .as_array()
+            .is_some_and(|servers| servers.iter().any(|server| server == "rust")),
+        "missing server should be named: {response:#}"
+    );
+    assert!(
+        !summary.contains_key("errors"),
+        "incomplete diagnostics must not be reported as zero-clean: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_command_diagnostics_details_honor_top_k() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-top-k\"\n");
+    let main_rs = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let lib_rs = write_file(&root, "src/lib.rs", "pub fn lib() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    open_with_lsp(&ctx, &main_rs, "fn main() {}\n");
+    open_with_lsp(&ctx, &lib_rs, "pub fn lib() {}\n");
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-top-k",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "topK": 3,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 2);
+    assert_eq!(response["summary"]["diagnostics"]["warnings"], 2);
+    assert_eq!(
+        response["details"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics details")
+            .len(),
+        3,
+        "diagnostics details should honor topK: {response:#}"
     );
 }

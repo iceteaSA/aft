@@ -67,9 +67,9 @@ fn test_worker(worker_count: Arc<AtomicUsize>, sleep_for: Duration, count: u64) 
 }
 
 #[test]
-fn inspect_engine_active_categories_defer_diagnostics() {
-    assert!(!InspectCategory::active().contains(&InspectCategory::Diagnostics));
-    assert!(!InspectCategory::Diagnostics.is_active());
+fn inspect_engine_active_categories_include_diagnostics() {
+    assert!(InspectCategory::active().contains(&InspectCategory::Diagnostics));
+    assert!(InspectCategory::Diagnostics.is_active());
 }
 
 #[test]
@@ -250,7 +250,15 @@ fn inspect_engine_command_returns_lane_a_shape() {
         response["success"], true,
         "inspect should succeed: {response:?}"
     );
-    assert!(response["summary"].get("diagnostics").is_none());
+    let diagnostics = response["summary"]["diagnostics"]
+        .as_object()
+        .expect("diagnostics summary");
+    assert_eq!(
+        diagnostics.get("status").and_then(|value| value.as_str()),
+        Some("pending"),
+        "diagnostics should be active but not reported as clean until an LSP server runs: {response:?}"
+    );
+    assert!(response["details"]["diagnostics"].is_array());
     assert!(response["summary"]["metrics"].is_object());
     assert!(response["summary"]["todos"].is_object());
     assert!(response["details"]["dead_code"].is_array());

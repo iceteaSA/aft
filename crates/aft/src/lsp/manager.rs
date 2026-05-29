@@ -1346,6 +1346,29 @@ impl LspManager {
         self.diagnostics.all()
     }
 
+    /// True if any LSP server has reported diagnostics at least once, including
+    /// an empty report that proves a checked-clean file. This lets callers avoid
+    /// treating an empty flattened diagnostic list as trustworthy when no server
+    /// has actually run.
+    pub fn has_any_diagnostic_reports(&self) -> bool {
+        !self.diagnostics.is_empty()
+    }
+
+    /// True if any server has reported for this file, including an empty
+    /// checked-clean report.
+    pub fn has_diagnostic_report_for_file(&self, file: &Path) -> bool {
+        let normalized = normalize_lookup_path(file);
+        self.diagnostics.has_any_report_for_file(&normalized)
+    }
+
+    /// True if this exact server/file pair has a diagnostic report, including
+    /// an empty checked-clean report.
+    pub fn has_diagnostic_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
+        let normalized = normalize_lookup_path(file);
+        self.diagnostics
+            .has_report_for_server_file(server, &normalized)
+    }
+
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {
         let mut saw_file_diagnostics = false;
         while let Ok(event) = self.event_rx.try_recv() {
