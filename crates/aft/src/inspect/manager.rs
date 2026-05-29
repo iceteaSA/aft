@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{after, bounded, select, Receiver, Sender};
-use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -38,8 +37,7 @@ struct CachedContributionFreshness {
 #[derive(PartialEq, Eq)]
 struct ContributionFingerprint {
     count: usize,
-    mtime_sum: u128,
-    size_sum: u128,
+    set_hash: String,
 }
 
 pub struct InspectManager {
@@ -423,7 +421,7 @@ impl InspectManager {
             return Ok(None);
         };
         let cached = load_contribution_fingerprint(cache, job.category)?;
-        let current = current_file_fingerprint(&job.scope_files)?;
+        let current = current_file_fingerprint(&job.project_root, &job.scope_files)?;
         if cached != current {
             return Ok(None);
         }
@@ -927,114 +925,77 @@ fn load_contribution_fingerprint(
     cache: &InspectCache,
     category: InspectCategory,
 ) -> Result<ContributionFingerprint, String> {
-    let conn = Connection::open(cache.sqlite_path()).map_err(|error| error.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT file_mtime_ns, file_size              FROM tier2_contributions              WHERE category = ?1 AND project_key = ?2",
-        )
+    let (count, set_hash) = cache
+        .contribution_fingerprint(category)
         .map_err(|error| error.to_string())?;
-    let rows = stmt
-        .query_map(params![category.as_str(), cache.project_key()], |row| {
-            let mtime_ns: i64 = row.get(0)?;
-            let file_size: i64 = row.get(1)?;
-            Ok((mtime_ns, file_size))
-        })
-        .map_err(|error| error.to_string())?;
-
-    let mut fingerprint = ContributionFingerprint {
-        count: 0,
-        mtime_sum: 0,
-        size_sum: 0,
-    };
-    for row in rows {
-        let (mtime_ns, file_size) = row.map_err(|error| error.to_string())?;
-        fingerprint.count += 1;
-        fingerprint.mtime_sum = fingerprint.mtime_sum.wrapping_add(mtime_ns.max(0) as u128);
-        fingerprint.size_sum = fingerprint.size_sum.wrapping_add(file_size.max(0) as u128);
-    }
-    Ok(fingerprint)
+    Ok(ContributionFingerprint { count, set_hash })
 }
 
-fn current_file_fingerprint(files: &[PathBuf]) -> Result<ContributionFingerprint, String> {
-    let mut fingerprint = ContributionFingerprint {
-        count: 0,
-        mtime_sum: 0,
-        size_sum: 0,
-    };
+fn current_file_fingerprint(
+    project_root: &Path,
+    files: &[PathBuf],
+) -> Result<ContributionFingerprint, String> {
+    let mut entries = Vec::with_capacity(files.len());
     for file in files {
         let metadata = std::fs::metadata(file)
             .map_err(|error| format!("failed to stat {}: {error}", file.display()))?;
-        let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
-        fingerprint.count += 1;
-        fingerprint.mtime_sum = fingerprint
-            .mtime_sum
-            .wrapping_add(system_time_to_ns_u128(mtime));
-        fingerprint.size_sum = fingerprint.size_sum.wrapping_add(metadata.len() as u128);
+        let relative_path = relative_cache_key(project_root, file);
+        let mtime_ns = system_time_to_ns_i64(metadata.modified().unwrap_or(UNIX_EPOCH));
+        entries.push((relative_path, mtime_ns, metadata.len()));
     }
-    Ok(fingerprint)
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = blake3::Hasher::new();
+    for (relative_path, mtime_ns, file_size) in &entries {
+        update_contribution_fingerprint_hash(&mut hasher, relative_path, *mtime_ns, *file_size);
+    }
+
+    Ok(ContributionFingerprint {
+        count: entries.len(),
+        set_hash: hasher.finalize().to_hex().to_string(),
+    })
+}
+
+fn update_contribution_fingerprint_hash(
+    hasher: &mut blake3::Hasher,
+    relative_path: &str,
+    mtime_ns: i64,
+    file_size: u64,
+) {
+    hasher.update(relative_path.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&mtime_ns.to_le_bytes());
+    hasher.update(&file_size.to_le_bytes());
 }
 
 fn load_contribution_freshness(
     cache: &InspectCache,
     category: InspectCategory,
 ) -> Result<Vec<CachedContributionFreshness>, String> {
-    let conn = Connection::open(cache.sqlite_path()).map_err(|error| error.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT file_path, file_mtime_ns, file_size, file_hash              FROM tier2_contributions              WHERE category = ?1 AND project_key = ?2              ORDER BY file_path ASC",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = stmt
-        .query_map(params![category.as_str(), cache.project_key()], |row| {
-            let file_path: String = row.get(0)?;
-            let mtime_ns: i64 = row.get(1)?;
-            let file_size: i64 = row.get(2)?;
-            let file_hash: String = row.get(3)?;
-            Ok((file_path, mtime_ns, file_size, file_hash))
+    cache
+        .contribution_freshness(category)
+        .map_err(|error| error.to_string())
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|(file_path, freshness)| CachedContributionFreshness {
+                    file_path,
+                    freshness,
+                })
+                .collect()
         })
-        .map_err(|error| error.to_string())?;
-
-    let mut records = Vec::new();
-    for row in rows {
-        let (file_path, mtime_ns, file_size, file_hash) = row.map_err(|error| error.to_string())?;
-        records.push(CachedContributionFreshness {
-            file_path: PathBuf::from(file_path),
-            freshness: FileFreshness {
-                mtime: ns_to_system_time(mtime_ns),
-                size: file_size.max(0) as u64,
-                content_hash: hash_from_hex(&file_hash)?,
-            },
-        });
-    }
-    Ok(records)
 }
 
 fn freshness_record_relative_key(record: &CachedContributionFreshness) -> String {
     record.file_path.to_string_lossy().to_string()
 }
 
-fn system_time_to_ns_u128(time: SystemTime) -> u128 {
-    time.duration_since(UNIX_EPOCH)
+fn system_time_to_ns_i64(time: SystemTime) -> i64 {
+    let nanos = time
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_nanos()
-}
-
-fn ns_to_system_time(value: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_nanos(value.max(0) as u64)
-}
-
-fn hash_from_hex(value: &str) -> Result<blake3::Hash, String> {
-    if value.len() != 64 {
-        return Err(format!("inspect cache invalid blake3 hash: {value}"));
-    }
-    let mut bytes = [0u8; 32];
-    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
-        let hex = std::str::from_utf8(chunk)
-            .map_err(|_| format!("inspect cache invalid blake3 hash: {value}"))?;
-        bytes[index] = u8::from_str_radix(hex, 16)
-            .map_err(|_| format!("inspect cache invalid blake3 hash: {value}"))?;
-    }
-    Ok(blake3::Hash::from_bytes(bytes))
+        .as_nanos();
+    nanos.min(i64::MAX as u128) as i64
 }
 
 fn relative_cache_key(project_root: &Path, path: &Path) -> String {

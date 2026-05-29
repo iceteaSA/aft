@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,8 @@ use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run};
 use aft::config::Config;
 use aft::context::AppContext;
-use aft::parser::TreeSitterProvider;
+use aft::inspect::{InspectCategory, InspectManager, InspectScanSuccess, InspectSnapshot};
+use aft::parser::{SymbolCache, TreeSitterProvider};
 use aft::protocol::RawRequest;
 use serde_json::{json, Value};
 
@@ -446,6 +448,127 @@ export function calculate(input: number) {
   return fifth + second;
 }
 "#
+}
+
+fn tier2_snapshot(project_root: &Path, inspect_dir: &Path) -> InspectSnapshot {
+    let config = Config {
+        project_root: Some(project_root.to_path_buf()),
+        ..Config::default()
+    };
+    InspectSnapshot::new(
+        project_root.to_path_buf(),
+        inspect_dir.to_path_buf(),
+        Arc::new(config),
+        Arc::new(RwLock::new(SymbolCache::new())),
+    )
+}
+
+fn run_duplicates_reuse(
+    manager: &InspectManager,
+    project_root: &Path,
+    inspect_dir: &Path,
+) -> InspectScanSuccess {
+    manager
+        .tier2_run_with_reuse_result(
+            tier2_snapshot(project_root, inspect_dir),
+            InspectCategory::Duplicates,
+            None,
+        )
+        .outcome
+        .expect("duplicates tier2 reuse run succeeds")
+}
+
+fn relative_scanned_paths(project_root: &Path, files: &[PathBuf]) -> Vec<String> {
+    files
+        .iter()
+        .map(|file| {
+            file.strip_prefix(project_root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect()
+}
+
+fn duplicate_aggregate_mentions_file(success: &InspectScanSuccess, file_prefix: &str) -> bool {
+    success.aggregate["items"].as_array().is_some_and(|groups| {
+        groups.iter().any(|group| {
+            group["files"].as_array().is_some_and(|files| {
+                files
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|file| file.starts_with(file_prefix))
+            })
+        })
+    })
+}
+
+#[test]
+fn inspect_command_tier2_quick_reuse_is_path_aware_after_rename() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    let inspect_dir = root.join(".aft-cache").join("inspect");
+
+    let first_manager = InspectManager::new();
+    let first = run_duplicates_reuse(&first_manager, &root, &inspect_dir);
+    assert_eq!(first.scanned_files.len(), 2);
+    assert!(duplicate_aggregate_mentions_file(&first, "src/foo.ts:"));
+    assert!(duplicate_aggregate_mentions_file(&first, "src/bar.ts:"));
+
+    fs::rename(root.join("src/foo.ts"), root.join("src/baz.ts")).expect("rename fixture file");
+
+    let second_manager = InspectManager::new();
+    let second = run_duplicates_reuse(&second_manager, &root, &inspect_dir);
+
+    assert_eq!(
+        relative_scanned_paths(&root, &second.scanned_files),
+        vec!["src/baz.ts"],
+        "rename should invalidate quick reuse and rescan the new path"
+    );
+    assert!(duplicate_aggregate_mentions_file(&second, "src/baz.ts:"));
+    assert!(duplicate_aggregate_mentions_file(&second, "src/bar.ts:"));
+    assert!(
+        !duplicate_aggregate_mentions_file(&second, "src/foo.ts:"),
+        "renamed path must not leak from the stale aggregate"
+    );
+}
+
+#[test]
+fn inspect_command_tier2_quick_reuse_skips_rescan_for_unchanged_file_set() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    let inspect_dir = root.join(".aft-cache").join("inspect");
+    let manager = Arc::new(InspectManager::new());
+
+    let first = run_duplicates_reuse(manager.as_ref(), &root, &inspect_dir);
+    assert_eq!(first.scanned_files.len(), 2);
+
+    let second = run_duplicates_reuse(manager.as_ref(), &root, &inspect_dir);
+    assert!(
+        second.scanned_files.is_empty(),
+        "unchanged file identity set should use quick reuse without rescanning"
+    );
+    assert_eq!(second.aggregate, first.aggregate);
+
+    let handles = (0..4)
+        .map(|_| {
+            let manager = Arc::clone(&manager);
+            let root = root.clone();
+            let inspect_dir = inspect_dir.clone();
+            thread::spawn(move || run_duplicates_reuse(manager.as_ref(), &root, &inspect_dir))
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let success = handle.join().expect("concurrent quick reuse joins");
+        assert!(
+            success.scanned_files.is_empty(),
+            "concurrent freshness/fingerprint reads should reuse without rescanning"
+        );
+        assert_eq!(success.aggregate, first.aggregate);
+    }
 }
 
 #[test]

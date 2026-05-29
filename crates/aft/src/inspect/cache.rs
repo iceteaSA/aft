@@ -228,6 +228,7 @@ impl InspectCache {
         let project_key = crate::search_index::project_cache_key(&project_root);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let conn = Connection::open(&sqlite_path)?;
+        configure_connection(&conn)?;
         initialize_schema(&conn)?;
         Ok(Self {
             project_root,
@@ -659,6 +660,82 @@ impl InspectCache {
         Ok(())
     }
 
+    pub(crate) fn contribution_fingerprint(
+        &self,
+        category: InspectCategory,
+    ) -> Result<(usize, String), InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, file_mtime_ns, file_size \
+             FROM tier2_contributions \
+             WHERE category = ?1 AND project_key = ?2 \
+             ORDER BY file_path ASC",
+        )?;
+        let rows = stmt.query_map(params![category.as_str(), self.project_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut count = 0usize;
+        let mut hasher = blake3::Hasher::new();
+        for row in rows {
+            let (file_path, mtime_ns, file_size) = row?;
+            count += 1;
+            update_contribution_fingerprint_hash(
+                &mut hasher,
+                &file_path,
+                mtime_ns.max(0),
+                file_size.max(0) as u64,
+            );
+        }
+
+        Ok((count, hasher.finalize().to_hex().to_string()))
+    }
+
+    pub(crate) fn contribution_freshness(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<(PathBuf, FileFreshness)>, InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, file_mtime_ns, file_size, file_hash \
+             FROM tier2_contributions \
+             WHERE category = ?1 AND project_key = ?2 \
+             ORDER BY file_path ASC",
+        )?;
+        let rows = stmt.query_map(params![category.as_str(), self.project_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (file_path, mtime_ns, file_size, file_hash) = row?;
+            records.push((
+                PathBuf::from(file_path),
+                FileFreshness {
+                    mtime: ns_to_system_time(mtime_ns),
+                    size: file_size.max(0) as u64,
+                    content_hash: hash_from_hex(&file_hash)?,
+                },
+            ));
+        }
+        Ok(records)
+    }
+
     pub fn contribution_set_hash(
         &self,
         category: InspectCategory,
@@ -695,6 +772,12 @@ impl InspectCache {
             .get(key)
             .map(|entry| entry.generated_at))
     }
+}
+
+fn configure_connection(conn: &Connection) -> Result<(), InspectCacheError> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    Ok(())
 }
 
 fn initialize_schema(conn: &Connection) -> Result<(), InspectCacheError> {
@@ -767,6 +850,18 @@ fn contribution_set_hash_with_conn(
         hasher.update(b"\0");
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn update_contribution_fingerprint_hash(
+    hasher: &mut blake3::Hasher,
+    relative_path: &str,
+    mtime_ns: i64,
+    file_size: u64,
+) {
+    hasher.update(relative_path.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&mtime_ns.to_le_bytes());
+    hasher.update(&file_size.to_le_bytes());
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {
