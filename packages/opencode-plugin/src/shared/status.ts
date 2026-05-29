@@ -19,7 +19,7 @@ export interface AftStatusSnapshot {
    * True when at least one heavy AFT subsystem has been auto-disabled for
    * the current project root. `degraded_reasons` enumerates why (e.g.
    * `["home_root"]`, `["search_too_many_files:20000"]`). The sidebar / TUI
-   * dialog surface this so users know `aft_search`, `aft_navigate` etc.
+   * dialog surface this so users know `aft_search`, `aft_callgraph` etc.
    * won't return results from this session and can choose to open a
    * project subdirectory instead.
    */

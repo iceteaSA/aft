@@ -47,8 +47,8 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const hasGrep = opts.toolSurface !== "minimal" && !opts.disabledTools.has(grepName);
   const hasSearch =
     opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.disabledTools.has("aft_search");
-  // aft_navigate is "all"-tier only.
-  const hasNavigate = opts.toolSurface === "all" && !opts.disabledTools.has("aft_navigate");
+  // aft_callgraph is "all"-tier only.
+  const hasNavigate = opts.toolSurface === "all" && !opts.disabledTools.has("aft_callgraph");
   const hasInspect = opts.toolSurface !== "minimal" && !opts.disabledTools.has("aft_inspect");
   const hasBash = !opts.disabledTools.has(bashName);
   const hasBgBash =
@@ -88,11 +88,11 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     );
   }
 
-  // Relationship questions — needs aft_navigate ("all" surface).
+  // Relationship questions — needs aft_callgraph ("all" surface).
   if (hasNavigate) {
     sections.push(
       [
-        "Use `aft_navigate` instead of grep + read chains for relationship questions:",
+        "Use `aft_callgraph` for code-relationship questions instead of grep + read chains:",
         "- `callers` — find all call sites before changing a function signature",
         "- `impact` — blast radius (which functions/files will need updates)",
         "- `trace_to` — how execution reaches this code from entry points (routes, exports, main)",

@@ -65,7 +65,7 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 |------|-------------|------------|
 | `aft_delete` | Delete one or more files (or directories) with backup | `files`, `recursive` |
 | `aft_move` | Move or rename a file with backup | `filePath`, `destination` |
-| `aft_navigate` | Call graph and data-flow navigation | `op`, `filePath`, `symbol`, `depth` |
+| `aft_callgraph` | Call graph and data-flow navigation | `op`, `filePath`, `symbol`, `depth` |
 | `aft_transform` | Structural code transforms (members, derives, decorators) | `op`, `filePath`, `container`, `target` |
 | `aft_refactor` | Workspace-wide move, extract, inline | `op`, `filePath`, `symbol`, `destination` |
 
@@ -650,7 +650,7 @@ when using the default `fastembed` backend.
 **When NOT to use it:**
 - Error message or stack trace → use grep
 - File/module structure → use `aft_outline`
-- Following a call chain → use `aft_navigate`
+- Following a call chain → use `aft_callgraph`
 
 **How it works — hybrid retrieval:** AFT classifies each query by shape (identifier, path,
 error-code, mixed, natural-language) and routes through two lanes:
@@ -905,7 +905,7 @@ Returns `{ file, destination, moved, backup_id }` on success.
 
 ---
 
-### aft_navigate
+### aft_callgraph
 
 Call graph and data-flow analysis across the workspace.
 

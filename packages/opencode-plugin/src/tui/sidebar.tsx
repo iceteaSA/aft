@@ -420,7 +420,7 @@ const SidebarContent = (props: {
         )}
       </box>
 
-      {/* Degraded reason — explains why heavy tools (aft_search, aft_navigate)
+      {/* Degraded reason — explains why heavy tools (aft_search, aft_callgraph)
           are disabled. Surface this prominently so users know to open a real
           project subdirectory if they want full features. */}
       {s()?.degraded && degradedSummary() && (

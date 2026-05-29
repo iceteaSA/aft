@@ -146,7 +146,7 @@ function buildSchema(): Record<string, unknown> {
         enum: ["minimal", "recommended", "all"],
         default: "recommended",
         description:
-          "Tool surface level. 'minimal' = aft_outline+aft_zoom+aft_safety only. 'recommended' (default) adds hoisted read/write/edit/apply_patch + lsp_diagnostics + ast_grep + aft_import. 'all' adds aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor.",
+          "Tool surface level. 'minimal' = aft_outline+aft_zoom+aft_safety only. 'recommended' (default) adds hoisted read/write/edit/apply_patch + lsp_diagnostics + ast_grep + aft_import. 'all' adds aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor.",
       },
 
       disabled_tools: {

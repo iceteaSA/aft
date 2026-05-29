@@ -1,5 +1,5 @@
 /**
- * Unit tests for aft_navigate argument shaping.
+ * Unit tests for aft_callgraph argument shaping.
  */
 
 /// <reference path="../bun-test.d.ts" />
@@ -18,13 +18,13 @@ async function expectRejectMessage(action: () => Promise<unknown>): Promise<stri
   throw new Error("expected action to reject");
 }
 
-describe("aft_navigate adapter", () => {
+describe("aft_callgraph adapter", () => {
   test("dispatches to the selected op and maps filePath to file", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, total_affected: 0 }));
     registerNavigateTool(api, makePluginContext(bridge));
 
-    const result = (await executeTool(tools.get("aft_navigate")!, {
+    const result = (await executeTool(tools.get("aft_callgraph")!, {
       op: "impact",
       filePath: "src/app.ts",
       symbol: "run",
@@ -48,7 +48,7 @@ describe("aft_navigate adapter", () => {
     registerNavigateTool(api, makePluginContext(bridge));
 
     await expect(
-      executeTool(tools.get("aft_navigate")!, {
+      executeTool(tools.get("aft_callgraph")!, {
         op: "trace_data",
         filePath: "src/app.ts",
         symbol: "run",
@@ -62,7 +62,7 @@ describe("aft_navigate adapter", () => {
     const { bridge, calls } = makeMockBridge(() => ({ success: true }));
     registerNavigateTool(api, makePluginContext(bridge));
 
-    await executeTool(tools.get("aft_navigate")!, {
+    await executeTool(tools.get("aft_callgraph")!, {
       op: "trace_data",
       filePath: "src/app.ts",
       symbol: "run",
@@ -79,14 +79,14 @@ describe("aft_navigate adapter", () => {
     registerNavigateTool(api, makePluginContext(bridge));
 
     await expect(
-      executeTool(tools.get("aft_navigate")!, {
+      executeTool(tools.get("aft_callgraph")!, {
         op: "trace_to_symbol",
         filePath: "src/app.ts",
         symbol: "run",
       }),
     ).rejects.toThrow("toSymbol");
 
-    await executeTool(tools.get("aft_navigate")!, {
+    await executeTool(tools.get("aft_callgraph")!, {
       op: "trace_to_symbol",
       filePath: "src/app.ts",
       symbol: "run",
@@ -121,7 +121,7 @@ describe("aft_navigate adapter", () => {
     registerNavigateTool(api, makePluginContext(bridge));
 
     const message = await expectRejectMessage(() =>
-      executeTool(tools.get("aft_navigate")!, {
+      executeTool(tools.get("aft_callgraph")!, {
         op: "trace_to_symbol",
         filePath: "src/app.ts",
         symbol: "run",
@@ -147,7 +147,7 @@ describe("aft_navigate adapter", () => {
     registerNavigateTool(api, makePluginContext(bridge));
 
     const message = await expectRejectMessage(() =>
-      executeTool(tools.get("aft_navigate")!, {
+      executeTool(tools.get("aft_callgraph")!, {
         op: "trace_to_symbol",
         filePath: "src/app.ts",
         symbol: "run",
@@ -174,7 +174,7 @@ describe("aft_navigate adapter", () => {
     registerNavigateTool(api, makePluginContext(bridge));
 
     const message = await expectRejectMessage(() =>
-      executeTool(tools.get("aft_navigate")!, {
+      executeTool(tools.get("aft_callgraph")!, {
         op: "trace_to_symbol",
         filePath: "src/app.ts",
         symbol: "run",
@@ -203,7 +203,7 @@ describe("aft_navigate adapter", () => {
     registerNavigateTool(api, makePluginContext(bridge));
 
     const message = await expectRejectMessage(() =>
-      executeTool(tools.get("aft_navigate")!, {
+      executeTool(tools.get("aft_callgraph")!, {
         op: "callers",
         filePath: "src/app.ts",
         symbol: "run",

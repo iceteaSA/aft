@@ -20,7 +20,7 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("`aft_search` is the primary code-search tool");
     expect(out).toContain('`hint: "regex"`');
     expect(out).toContain("auto-routes by query shape");
-    expect(out).toContain("Use `aft_navigate`");
+    expect(out).toContain("Use `aft_callgraph`");
     expect(out).toContain("- `callers`");
     expect(out).toContain("- `impact`");
     expect(out).toContain("- `trace_to`");
@@ -64,7 +64,7 @@ describe("buildWorkflowHints", () => {
       bashBackgroundEnabled: false,
       disabledTools: new Set(),
     });
-    expect(out).not.toContain("Use `aft_navigate`");
+    expect(out).not.toContain("Use `aft_callgraph`");
     expect(out).not.toContain("- `callers`");
   });
 
@@ -133,7 +133,7 @@ describe("buildWorkflowHints", () => {
       semanticEnabled: false,
       bashBackgroundEnabled: false,
       // Disable all tools that could produce a hint section. At minimal
-      // surface, aft_navigate/grep/aft_search are already absent; disabling
+      // surface, aft_callgraph/grep/aft_search are already absent; disabling
       // outline+zoom kills URL+exploration sections, bash kills the timeout
       // hint, leaving nothing to render.
       disabledTools: new Set(["aft_outline", "aft_zoom", "bash"]),
@@ -147,10 +147,10 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: true,
       bashBackgroundEnabled: true,
-      disabledTools: new Set(["aft_navigate", "bash_status"]),
+      disabledTools: new Set(["aft_callgraph", "bash_status"]),
     });
-    // navigate section gated off (aft_navigate disabled).
-    expect(out).not.toContain("Use `aft_navigate`");
+    // navigate section gated off (aft_callgraph disabled).
+    expect(out).not.toContain("Use `aft_callgraph`");
     // bg-bash section gated off (bash_status disabled) — and there's no
     // 30s fallback anymore, foreground bash auto-promotes silently.
     expect(out).not.toContain("**Long-running commands**");

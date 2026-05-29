@@ -231,7 +231,7 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
  * - Safety: aft_safety
  * - Imports: aft_import
  * - Structure: aft_transform
- * - Navigation: aft_navigate
+ * - Navigation: aft_callgraph
  * - Refactoring: aft_refactor
  */
 // OpenCode currently calls this function more than once per process when a
@@ -833,12 +833,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // Tool surface tiers:
   //   minimal:     aft_outline, aft_zoom, aft_safety
   //   recommended: minimal + hoisted + ast_grep_* + aft_import (default)
-  //   all:         recommended + aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor
+  //   all:         recommended + aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor
   const surface = aftConfig.tool_surface ?? "recommended";
 
   // Tools only available in "all" tier
   const ALL_ONLY_TOOLS = new Set([
-    "aft_navigate",
+    "aft_callgraph",
     "aft_delete",
     "aft_move",
     "aft_transform",
@@ -913,7 +913,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "aft_outline",
     "aft_zoom",
     "aft_search",
-    "aft_navigate",
+    "aft_callgraph",
     "aft_inspect",
     "grep",
     "aft_grep",

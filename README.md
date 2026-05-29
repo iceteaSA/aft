@@ -65,7 +65,7 @@ See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`,
 - **`aft_outline`** — list every symbol in a file (or directory, or remote URL) with kind, name, line range, and visibility. One call instead of reading the whole file.
 - **`aft_zoom`** — inspect a specific function, class, or type with call-graph annotations (what it calls, what calls it). ~40 tokens instead of ~375.
 - **`aft_search`** — find code by meaning when grep keywords fall short. Hybrid semantic + lexical retrieval over an indexed codebase. Requires ONNX Runtime for the local embedding backend.
-- **`aft_navigate`** — follow callers, callees, data flow, impact analysis, and shortest call paths between two symbols across the workspace.
+- **`aft_callgraph`** — follow callers, callees, data flow, impact analysis, and shortest call paths between two symbols across the workspace.
 - **`aft_inspect`** — codebase-health snapshot: TODOs, file/symbol metrics, dead code, unused exports, and duplicate detection in one call.
 - **`grep` / `glob`** — trigram-indexed regex search and file discovery. Background index building with disk persistence.
 

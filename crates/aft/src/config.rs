@@ -225,7 +225,7 @@ impl Default for Config {
             // can raise this knob, but the default should not advertise
             // capabilities that fail in practice. Read/edit/grep/glob/outline/
             // semantic_search/AST/LSP all remain unaffected by this cap —
-            // it only gates `aft_navigate` and `aft_refactor op="move"`.
+            // it only gates `aft_callgraph` and `aft_refactor op="move"`.
             max_callgraph_files: 5_000,
             semantic: SemanticBackendConfig::default(),
             experimental_lsp_ty: false,

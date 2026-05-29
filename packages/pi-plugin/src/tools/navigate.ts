@@ -1,5 +1,5 @@
 /**
- * aft_navigate — call-graph navigation across files.
+ * aft_callgraph — call-graph relationship queries across files.
  * Ops: call_tree, callers, trace_to, trace_to_symbol, impact, trace_data.
  */
 
@@ -231,7 +231,7 @@ export function renderNavigateCall(args: NavigateArgs, theme: Theme, context: Re
   ]
     .filter(Boolean)
     .join(" ");
-  return renderToolCall("navigate", summary, theme, context);
+  return renderToolCall("callgraph", summary, theme, context);
 }
 
 /** Exported for renderer unit tests. */
@@ -250,10 +250,10 @@ export function renderNavigateResult(
 
 export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool({
-    name: "aft_navigate",
-    label: "navigate",
+    name: "aft_callgraph",
+    label: "callgraph",
     description:
-      "Navigate code structure across files using call graph analysis. All ops require both `filePath` and `symbol`. Use `call_tree` for what a function calls, `callers` for call sites, `trace_to` for entry points, `trace_to_symbol` for a path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `impact` for blast radius, `trace_data` to follow a value.",
+      "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect. All ops require both `filePath` and `symbol`. Use `callers` for call sites (before renaming/signature changes), `impact` for blast radius (what breaks if a symbol changes), `call_tree` for what a function calls, `trace_to` for how execution reaches a symbol from entry points, `trace_to_symbol` for the shortest path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `trace_data` to follow a value across assignments/params.",
     parameters: navigateParamsSchema(),
     async execute(_toolCallId: string, params: NavigateArgs, _signal, _onUpdate, extCtx) {
       if (params.op === "trace_data" && !params.expression) {

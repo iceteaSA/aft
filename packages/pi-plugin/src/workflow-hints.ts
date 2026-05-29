@@ -36,7 +36,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const hasGrep = opts.toolSurface !== "minimal" && !opts.absentTools.has(grepName);
   const hasSearch =
     opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.absentTools.has("aft_search");
-  const hasNavigate = opts.toolSurface === "all" && !opts.absentTools.has("aft_navigate");
+  const hasNavigate = opts.toolSurface === "all" && !opts.absentTools.has("aft_callgraph");
   const hasInspect = opts.toolSurface !== "minimal" && !opts.absentTools.has("aft_inspect");
   const hasBgBash =
     opts.bashBackgroundEnabled &&
@@ -73,7 +73,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   if (hasNavigate) {
     sections.push(
       [
-        "Use `aft_navigate` instead of grep + read chains for relationship questions:",
+        "Use `aft_callgraph` for code-relationship questions instead of grep + read chains:",
         "- `callers` — find all call sites before changing a function signature",
         "- `impact` — blast radius (which functions/files will need updates)",
         "- `trace_to` — how execution reaches this code from entry points (routes, exports, main)",
@@ -150,7 +150,7 @@ export function registerWorkflowHints(
   if (!surface.outline) absent.add("aft_outline");
   if (!surface.zoom) absent.add("aft_zoom");
   if (!surface.semantic) absent.add("aft_search");
-  if (!surface.navigate) absent.add("aft_navigate");
+  if (!surface.navigate) absent.add("aft_callgraph");
   if (!surface.inspect) absent.add("aft_inspect");
   if (!surface.hoistGrep) absent.add("grep");
   if (!surface.hoistBash) {

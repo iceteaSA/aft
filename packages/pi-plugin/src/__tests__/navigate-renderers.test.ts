@@ -1,5 +1,5 @@
 /**
- * Renderer coverage for aft_navigate.
+ * Renderer coverage for aft_callgraph.
  */
 
 /// <reference path="../bun-test.d.ts" />
@@ -17,7 +17,7 @@ describe("navigate renderer", () => {
         makeContext({ op: "call_tree", filePath: "src/a.ts", symbol: "run" }),
       ),
     );
-    expect(output).toContain("navigate");
+    expect(output).toContain("callgraph");
     expect(output).toContain("call_tree");
     expect(output).toContain("run");
   });

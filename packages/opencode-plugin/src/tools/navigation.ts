@@ -6,21 +6,21 @@ import { callBridge, formatBridgeErrorMessage, optionalInt } from "./_shared.js"
 const z = tool.schema;
 
 /**
- * Tool definitions for navigation commands: configure, call_tree, callers, trace_to, trace_to_symbol, impact, and trace_data.
+ * Tool definitions for call-graph navigation: call_tree, callers, trace_to, trace_to_symbol, impact, and trace_data.
  */
 export function navigationTools(ctx: PluginContext): Record<string, ToolDefinition> {
   return {
-    aft_navigate: {
+    aft_callgraph: {
       description:
-        "Navigate code structure across files using call graph analysis.\n\n" +
+        "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\n" +
         "Ops:\n" +
-        "- 'call_tree': See what a function calls (forward traversal). Use to understand dependencies before modifying a function.\n" +
         "- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n" +
-        "- 'trace_to': Trace how execution reaches a function from entry points (routes, exports, main). Use to understand context around deeply-nested code.\n" +
-        "- 'trace_to_symbol': Find the shortest call path from one symbol to another symbol across the codebase. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toFile' to disambiguate.\n" +
-        "- 'impact': Analyze what breaks if a symbol changes. Returns affected callers with signatures and entry point status.\n" +
+        "- 'impact': What breaks if a symbol changes — affected callers with signatures and entry-point status (blast radius). Use before a risky edit.\n" +
+        "- 'call_tree': What a function calls (forward traversal). Use to understand a function's dependencies before modifying it.\n" +
+        "- 'trace_to': How execution reaches a function from entry points (routes, exports, main). Use to understand context around deeply-nested code.\n" +
+        "- 'trace_to_symbol': Shortest call path from one symbol to another. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toFile' to disambiguate.\n" +
         "- 'trace_data': Follow a value through variable assignments and function parameters across files. Requires 'symbol' (scope to trace from) and 'expression'.\n\n" +
-        "All ops require both 'filePath' and 'symbol'. The 'expression' parameter is additionally required for trace_data; 'toSymbol' is additionally required for trace_to_symbol.\n\n",
+        "All ops require both 'filePath' and 'symbol'. 'expression' is additionally required for trace_data; 'toSymbol' for trace_to_symbol.\n\n",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {

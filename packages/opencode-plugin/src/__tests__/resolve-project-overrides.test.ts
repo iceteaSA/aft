@@ -136,7 +136,7 @@ describe("resolveProjectOverridesForConfigure", () => {
     // documenting the limitation. See note #157 for the v0.28+ design.
     const overrides = resolveProjectOverridesForConfigure({
       tool_surface: "minimal",
-      disabled_tools: ["aft_navigate"],
+      disabled_tools: ["aft_callgraph"],
       hoist_builtin_tools: false,
       // One real per-project field to confirm the function still works.
       format_on_edit: true,

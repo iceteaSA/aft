@@ -17,7 +17,7 @@
  *   - aft_outline    Structural outline (symbols, headings) for files/URLs
  *   - aft_zoom       Symbol-level inspection with call-graph annotations
  *   - aft_search     Semantic search (when semantic_search=true)
- *   - aft_navigate   Call-graph navigation (callers, call_tree, impact, trace_to, trace_to_symbol, trace_data)
+ *   - aft_callgraph   Call-graph navigation (callers, call_tree, impact, trace_to, trace_to_symbol, trace_data)
  *   - aft_conflicts  One-call merge conflict inspection
  *   - aft_import     Language-aware import add/remove/organize
  *   - aft_safety     Per-file undo, checkpoints, restore
@@ -202,7 +202,7 @@ const ANNOUNCEMENT_FEATURES: string[] = [
 const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
 
 const ALL_ONLY_TOOLS = new Set([
-  "aft_navigate",
+  "aft_callgraph",
   "aft_delete",
   "aft_move",
   "aft_transform",
@@ -387,7 +387,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   if (surface === "all") {
     return {
       ...base,
-      navigate: allOnly("aft_navigate"),
+      navigate: allOnly("aft_callgraph"),
       delete: allOnly("aft_delete"),
       move: allOnly("aft_move"),
       structure: allOnly("aft_transform"),

@@ -21,7 +21,7 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain("`aft_search` is the primary code-search tool");
     expect(out).toContain('`hint: "regex"`');
     expect(out).toContain("auto-routes by query shape");
-    expect(out).toContain("Use `aft_navigate`");
+    expect(out).toContain("Use `aft_callgraph`");
     expect(out).toContain("**Codebase health & diagnostics**");
     expect(out).toContain("`aft_inspect`");
     expect(out).toContain("diagnostics");
@@ -56,7 +56,7 @@ describe("Pi buildWorkflowHints", () => {
       bashBackgroundEnabled: false,
       absentTools: new Set(),
     });
-    expect(out).not.toContain("Use `aft_navigate`");
+    expect(out).not.toContain("Use `aft_callgraph`");
   });
 
   test("inspect hint is gated by registered tool availability", () => {

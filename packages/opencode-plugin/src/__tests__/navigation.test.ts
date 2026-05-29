@@ -60,7 +60,7 @@ async function expectRejectMessage(action: () => Promise<unknown>): Promise<stri
   throw new Error("expected action to reject");
 }
 
-describe("aft_navigate OpenCode adapter", () => {
+describe("aft_callgraph OpenCode adapter", () => {
   test("success path dispatches to the selected op and maps filePath to file", async () => {
     const { bridge, calls } = makeMockBridge((command, params) => ({
       success: true,
@@ -69,7 +69,7 @@ describe("aft_navigate OpenCode adapter", () => {
     }));
     const tools = navigationTools(makePluginContext(bridge));
 
-    const raw = await tools.aft_navigate.execute(
+    const raw = await tools.aft_callgraph.execute(
       {
         op: "impact",
         filePath: "src/app.ts",
@@ -107,7 +107,7 @@ describe("aft_navigate OpenCode adapter", () => {
     const tools = navigationTools(makePluginContext(bridge));
 
     const message = await expectRejectMessage(() =>
-      tools.aft_navigate.execute(
+      tools.aft_callgraph.execute(
         {
           op: "trace_to_symbol",
           filePath: "src/app.ts",
@@ -136,7 +136,7 @@ describe("aft_navigate OpenCode adapter", () => {
     const tools = navigationTools(makePluginContext(bridge));
 
     const message = await expectRejectMessage(() =>
-      tools.aft_navigate.execute(
+      tools.aft_callgraph.execute(
         {
           op: "trace_to_symbol",
           filePath: "src/app.ts",
@@ -165,7 +165,7 @@ describe("aft_navigate OpenCode adapter", () => {
     const tools = navigationTools(makePluginContext(bridge));
 
     const message = await expectRejectMessage(() =>
-      tools.aft_navigate.execute(
+      tools.aft_callgraph.execute(
         {
           op: "trace_to_symbol",
           filePath: "src/app.ts",
@@ -196,7 +196,7 @@ describe("aft_navigate OpenCode adapter", () => {
     const tools = navigationTools(makePluginContext(bridge));
 
     const message = await expectRejectMessage(() =>
-      tools.aft_navigate.execute(
+      tools.aft_callgraph.execute(
         {
           op: "callers",
           filePath: "src/app.ts",

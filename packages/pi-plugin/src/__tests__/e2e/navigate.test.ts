@@ -1,5 +1,5 @@
 /**
- * E2E coverage for aft_navigate (6 ops).
+ * E2E coverage for aft_callgraph (6 ops).
  * Each op is dispatched as its own Rust command name (call_tree, callers,
  * trace_to, trace_to_symbol, impact, trace_data).
  */
@@ -12,7 +12,7 @@ import { createHarness, type Harness, prepareBinary } from "./helpers.js";
 const initialBinary = await prepareBinary();
 const maybeDescribe = initialBinary.binaryPath ? describe : describe.skip;
 
-maybeDescribe("aft_navigate (real bridge)", () => {
+maybeDescribe("aft_callgraph (real bridge)", () => {
   let harness: Harness;
 
   beforeAll(async () => {
@@ -24,7 +24,7 @@ maybeDescribe("aft_navigate (real bridge)", () => {
   });
 
   test("call_tree returns calls from a function", async () => {
-    const result = await harness.callTool("aft_navigate", {
+    const result = await harness.callTool("aft_callgraph", {
       op: "call_tree",
       filePath: "sample.ts",
       symbol: "funcB",
@@ -35,7 +35,7 @@ maybeDescribe("aft_navigate (real bridge)", () => {
   });
 
   test("callers finds call sites of a symbol", async () => {
-    const result = await harness.callTool("aft_navigate", {
+    const result = await harness.callTool("aft_callgraph", {
       op: "callers",
       filePath: "sample.ts",
       symbol: "normalize",
@@ -46,7 +46,7 @@ maybeDescribe("aft_navigate (real bridge)", () => {
   });
 
   test("impact returns blast radius info", async () => {
-    const result = await harness.callTool("aft_navigate", {
+    const result = await harness.callTool("aft_callgraph", {
       op: "impact",
       filePath: "sample.ts",
       symbol: "funcA",
@@ -57,7 +57,7 @@ maybeDescribe("aft_navigate (real bridge)", () => {
   });
 
   test("trace_to walks upward to entry points", async () => {
-    const result = await harness.callTool("aft_navigate", {
+    const result = await harness.callTool("aft_callgraph", {
       op: "trace_to",
       filePath: "sample.ts",
       symbol: "decorate",
@@ -67,7 +67,7 @@ maybeDescribe("aft_navigate (real bridge)", () => {
   });
 
   test("trace_to_symbol returns a path between reachable symbols", async () => {
-    const result = await harness.callTool("aft_navigate", {
+    const result = await harness.callTool("aft_callgraph", {
       op: "trace_to_symbol",
       filePath: "sample.ts",
       symbol: "funcC",
@@ -90,7 +90,7 @@ maybeDescribe("aft_navigate (real bridge)", () => {
   });
 
   test("trace_to_symbol reports no_path_found for unreachable symbols", async () => {
-    const result = await harness.callTool("aft_navigate", {
+    const result = await harness.callTool("aft_callgraph", {
       op: "trace_to_symbol",
       filePath: "sample.ts",
       symbol: "funcA",
@@ -111,7 +111,7 @@ maybeDescribe("aft_navigate (real bridge)", () => {
 
   test("trace_data requires expression", async () => {
     await expect(
-      harness.callTool("aft_navigate", {
+      harness.callTool("aft_callgraph", {
         op: "trace_data",
         filePath: "sample.ts",
         symbol: "funcA",
@@ -120,7 +120,7 @@ maybeDescribe("aft_navigate (real bridge)", () => {
   });
 
   test("trace_data follows a value through scopes", async () => {
-    const result = await harness.callTool("aft_navigate", {
+    const result = await harness.callTool("aft_callgraph", {
       op: "trace_data",
       filePath: "sample.ts",
       symbol: "funcB",
