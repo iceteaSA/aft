@@ -13,6 +13,8 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::parser::{grammar_for, LangId};
 
+mod java;
+
 // ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
@@ -398,6 +400,7 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Rust => Some(&RUST_SYNTAX),
         LangId::Go => Some(&GO_SYNTAX),
         LangId::Solidity => Some(&SOLIDITY_SYNTAX),
+        LangId::Java => Some(&java::JAVA_SYNTAX),
         LangId::C
         | LangId::Cpp
         | LangId::Zig
@@ -406,7 +409,6 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::Vue
         | LangId::Json
         | LangId::Scala
-        | LangId::Java
         | LangId::Ruby
         | LangId::Kotlin
         | LangId::Swift

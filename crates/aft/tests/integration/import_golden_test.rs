@@ -432,6 +432,66 @@ fn scenarios() -> Vec<Scenario> {
                 import_kind: None,
             }],
         },
+        // ---- Java (Phase 1 structured modifiers: static + wildcard) ----
+        Scenario {
+            name: "java_add_plain",
+            ext: "java",
+            input: "package com.example;\n\nimport java.io.File;\n\nclass C {}\n",
+            ops: &[Op::Add {
+                module: "java.util.List",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "java_add_static",
+            ext: "java",
+            input: "package com.example;\n\nimport java.util.List;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "java.util.Collections.emptyList",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["static"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "java_add_wildcard",
+            ext: "java",
+            input: "package com.example;\n\nimport java.io.File;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "java.util",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["wildcard"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "java_add_static_wildcard",
+            ext: "java",
+            input: "package com.example;\n\nimport java.util.List;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "java.util.Arrays",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["static", "wildcard"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "java_remove_plain",
+            ext: "java",
+            input: "package com.example;\n\nimport java.io.File;\nimport java.util.List;\n\nclass C {}\n",
+            ops: &[Op::Remove {
+                module: "java.io.File",
+                name: None,
+            }],
+        },
     ]
 }
 
