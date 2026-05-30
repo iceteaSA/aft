@@ -246,7 +246,7 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
 
     let edges_by_source = edges_by_source(&parsed);
     let reachable = reachable_exports(&parsed, &edges_by_source);
-    let reachable_type_ref_names = collect_reachable_type_ref_names(&parsed, &reachable);
+    let referenced_type_names = collect_referenced_type_names(&parsed);
     let dispatched_method_names = collect_dispatched_method_names(&parsed);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
@@ -266,7 +266,7 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
             }
 
             if (export.is_type_like || is_type_like_kind(&export.kind))
-                && reachable_type_ref_names.contains(symbol_liveness_name(&export.symbol))
+                && referenced_type_names.contains(symbol_liveness_name(&export.symbol))
             {
                 continue;
             }
@@ -331,29 +331,21 @@ fn collect_dispatched_method_names(contributions: &[DeadCodeContribution]) -> BT
         .collect()
 }
 
-fn collect_reachable_type_ref_names(
-    contributions: &[DeadCodeContribution],
-    reachable: &BTreeSet<ExportNode>,
-) -> BTreeSet<String> {
+fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
+    // A type-like export is live if it is referenced in type position ANYWHERE
+    // in the project — not only from call-reachable files. Filtering by
+    // call-reachability (the original Phase 2 design) under-approximates
+    // liveness: the cross-file call graph is incomplete (constructor/method
+    // edges, workspace-package boundaries), so genuinely-used types referenced
+    // from files the call graph fails to mark reachable were flagged dead.
+    // This mirrors `collect_dispatched_method_names`, which is also unfiltered,
+    // and keeps dead_code biased toward under-reporting (it is a hint, not
+    // authority): a type with zero type-references anywhere is still precise
+    // dead.
     contributions
         .iter()
-        .filter(|contribution| file_is_reachable(contribution, reachable))
         .flat_map(|contribution| contribution.type_ref_names.iter().cloned())
         .collect()
-}
-
-fn file_is_reachable(
-    contribution: &DeadCodeContribution,
-    reachable: &BTreeSet<ExportNode>,
-) -> bool {
-    !contribution.liveness_roots.is_empty()
-        || contribution
-            .exports
-            .iter()
-            .any(|export| export.is_entry_point)
-        || reachable
-            .iter()
-            .any(|(file, _symbol)| file == &contribution.file)
 }
 
 fn reachable_exports(
