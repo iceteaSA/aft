@@ -357,6 +357,7 @@ pub struct FileContribution {
     pub file_path: PathBuf,
     pub freshness: FileFreshness,
     pub contribution: serde_json::Value,
+    pub type_ref_names: BTreeSet<String>,
 }
 
 impl FileContribution {
@@ -366,13 +367,62 @@ impl FileContribution {
         freshness: FileFreshness,
         contribution: serde_json::Value,
     ) -> Self {
+        let type_ref_names = type_ref_names_from_contribution(&contribution);
         Self {
             category,
             file_path: file_path.into(),
             freshness,
             contribution,
+            type_ref_names,
         }
     }
+
+    pub fn with_type_ref_names<I>(mut self, type_ref_names: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.type_ref_names = type_ref_names.into_iter().collect();
+        self.contribution =
+            contribution_with_type_ref_names(self.contribution, &self.type_ref_names);
+        self
+    }
+}
+
+pub(crate) fn type_ref_names_from_contribution(
+    contribution: &serde_json::Value,
+) -> BTreeSet<String> {
+    contribution
+        .get("type_ref_names")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub(crate) fn contribution_with_type_ref_names(
+    mut contribution: serde_json::Value,
+    type_ref_names: &BTreeSet<String>,
+) -> serde_json::Value {
+    if let serde_json::Value::Object(object) = &mut contribution {
+        if type_ref_names.is_empty() {
+            object.remove("type_ref_names");
+        } else {
+            object.insert(
+                "type_ref_names".to_string(),
+                serde_json::Value::Array(
+                    type_ref_names
+                        .iter()
+                        .map(|name| serde_json::Value::String(name.clone()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    contribution
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

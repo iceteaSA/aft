@@ -1144,6 +1144,7 @@ fn contribution_from_record(
         record.freshness,
         record.contribution,
     )
+    .with_type_ref_names(record.type_ref_names)
 }
 
 fn run_tier2_scan(job: &InspectJob) -> InspectResult {

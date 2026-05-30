@@ -3,6 +3,8 @@
 //! Extracted from `commands/zoom.rs` so both the zoom command and the
 //! call-graph engine can reuse the same AST-walking logic.
 
+use std::collections::BTreeSet;
+
 use crate::parser::LangId;
 
 /// Returns the tree-sitter node kind strings that represent call expressions
@@ -199,6 +201,180 @@ pub fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<St
     // Fallback: full text, last dot segment
     let text = &source[node.byte_range()];
     text.rsplit('.').next().map(|s| s.trim().to_string())
+}
+
+/// Extract type-reference names within a byte range of the AST.
+///
+/// This is intentionally separate from call extraction. The live call graph and
+/// `aft_callgraph` commands remain call-edge-only; dead-code analysis consumes
+/// these type-position names as a side channel.
+pub fn extract_type_references_in_range(
+    source: &str,
+    root: tree_sitter::Node,
+    byte_start: usize,
+    byte_end: usize,
+    lang: LangId,
+) -> BTreeSet<String> {
+    let mut results = BTreeSet::new();
+    collect_type_references(root, source, byte_start, byte_end, lang, &mut results);
+    results
+}
+
+/// Extract all type-reference names in a parsed file.
+pub fn extract_type_references(
+    source: &str,
+    root: tree_sitter::Node,
+    lang: LangId,
+) -> BTreeSet<String> {
+    extract_type_references_in_range(source, root, 0, source.len(), lang)
+}
+
+fn collect_type_references(
+    node: tree_sitter::Node,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    lang: LangId,
+    results: &mut BTreeSet<String>,
+) {
+    let node_start = node.start_byte();
+    let node_end = node.end_byte();
+
+    if node_end <= byte_start || node_start >= byte_end {
+        return;
+    }
+
+    if node_start >= byte_start && node_end <= byte_end {
+        collect_type_reference_fields(&node, source, lang, results);
+        if is_type_context_node(lang, node.kind()) {
+            collect_type_reference_identifiers(node, source, lang, results);
+            return;
+        }
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_type_references(cursor.node(), source, byte_start, byte_end, lang, results);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn collect_type_reference_fields(
+    node: &tree_sitter::Node,
+    source: &str,
+    lang: LangId,
+    results: &mut BTreeSet<String>,
+) {
+    for field in ["type", "return_type", "result", "trait"] {
+        if let Some(child) = node.child_by_field_name(field) {
+            collect_type_reference_identifiers(child, source, lang, results);
+        }
+    }
+
+    if matches!(lang, LangId::TypeScript | LangId::Tsx) && node.kind() == "type_alias_declaration" {
+        if let Some(value) = node.child_by_field_name("value") {
+            collect_type_reference_identifiers(value, source, lang, results);
+        }
+    }
+}
+
+fn is_type_context_node(lang: LangId, kind: &str) -> bool {
+    match lang {
+        LangId::TypeScript | LangId::Tsx => matches!(
+            kind,
+            "type_annotation"
+                | "type_arguments"
+                | "extends_clause"
+                | "implements_clause"
+                | "satisfies_expression"
+        ),
+        LangId::JavaScript => false,
+        LangId::Python => kind == "type",
+        LangId::Rust => matches!(
+            kind,
+            "parameter"
+                | "field_declaration"
+                | "generic_type"
+                | "type_arguments"
+                | "reference_type"
+                | "array_type"
+                | "tuple_type"
+                | "bounded_type"
+        ),
+        LangId::Go => matches!(
+            kind,
+            "field_declaration"
+                | "parameter_declaration"
+                | "generic_type"
+                | "type_arguments"
+                | "type_elem"
+                | "pointer_type"
+                | "array_type"
+                | "slice_type"
+                | "map_type"
+                | "qualified_type"
+                | "channel_type"
+                | "function_type"
+        ),
+        _ => false,
+    }
+}
+
+fn collect_type_reference_identifiers(
+    node: tree_sitter::Node,
+    source: &str,
+    lang: LangId,
+    results: &mut BTreeSet<String>,
+) {
+    if is_type_reference_identifier(lang, node.kind()) {
+        let name = source[node.byte_range()].trim();
+        if let Some(name) = clean_type_reference_name(name) {
+            results.insert(name);
+        }
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_type_reference_identifiers(cursor.node(), source, lang, results);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn is_type_reference_identifier(lang: LangId, kind: &str) -> bool {
+    match lang {
+        LangId::TypeScript | LangId::Tsx => matches!(kind, "type_identifier" | "identifier"),
+        LangId::Python => kind == "identifier",
+        LangId::Rust | LangId::Go => kind == "type_identifier",
+        _ => false,
+    }
+}
+
+fn clean_type_reference_name(name: &str) -> Option<String> {
+    let name = name
+        .rsplit(['.', ':'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(name)
+        .trim()
+        .trim_start_matches('?');
+
+    if name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_alphabetic())
+    {
+        return None;
+    }
+
+    Some(name.to_string())
 }
 
 /// Extract call expression names within a byte range of the AST.

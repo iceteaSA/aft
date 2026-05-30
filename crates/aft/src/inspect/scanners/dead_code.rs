@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -7,11 +8,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::cache_freshness::{self, FileFreshness};
+use crate::calls::extract_type_references;
 use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
     InspectResult, InspectScanSuccess,
 };
+use crate::parser::{detect_language, grammar_for, LangId};
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 
@@ -150,6 +153,7 @@ fn gather_file_contribution(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let type_ref_names = collect_type_ref_names(file);
 
     let liveness_roots = liveness_roots_for_file(
         &file_name,
@@ -200,6 +204,7 @@ fn gather_file_contribution(
         collect_freshness(file),
         payload,
     )
+    .with_type_ref_names(type_ref_names)
 }
 
 pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
@@ -240,15 +245,15 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         .collect::<Vec<_>>();
 
     let edges_by_source = edges_by_source(&parsed);
-    let inbound_edges = inbound_edges_by_target(&edges_by_source);
     let reachable = reachable_exports(&parsed, &edges_by_source);
+    let reachable_type_ref_names = collect_reachable_type_ref_names(&parsed, &reachable);
     let dispatched_method_names = collect_dispatched_method_names(&parsed);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
     let mut dead_items = Vec::new();
-    let mut uncertain_count = 0usize;
-    let mut uncertain_items = Vec::new();
+    let uncertain_count = 0usize;
+    let uncertain_items: Vec<serde_json::Value> = Vec::new();
     for contribution in &parsed {
         let is_public_api_file = public_api_files.contains(&contribution.file);
         for export in &contribution.exports {
@@ -260,20 +265,9 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
                 continue;
             }
 
-            let has_inbound_edge = inbound_edges
-                .get(&node)
-                .is_some_and(|sources| !sources.is_empty());
-            if (export.is_type_like || is_type_like_kind(&export.kind)) && !has_inbound_edge {
-                uncertain_count += 1;
-                if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
-                    uncertain_items.push(json!({
-                        "file": contribution.file,
-                        "symbol": export.symbol,
-                        "kind": export.kind,
-                        "line": export.line,
-                        "reason": "type-position usage not tracked until Phase 2",
-                    }));
-                }
+            if (export.is_type_like || is_type_like_kind(&export.kind))
+                && reachable_type_ref_names.contains(symbol_liveness_name(&export.symbol))
+            {
                 continue;
             }
 
@@ -330,26 +324,36 @@ fn edges_by_source(
     edges
 }
 
-fn inbound_edges_by_target(
-    edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
-) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
-    let mut inbound: BTreeMap<ExportNode, BTreeSet<ExportNode>> = BTreeMap::new();
-    for (source, targets) in edges_by_source {
-        for target in targets {
-            inbound
-                .entry(target.clone())
-                .or_default()
-                .insert(source.clone());
-        }
-    }
-    inbound
-}
-
 fn collect_dispatched_method_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
     contributions
         .iter()
         .flat_map(|contribution| contribution.dispatched_method_names.iter().cloned())
         .collect()
+}
+
+fn collect_reachable_type_ref_names(
+    contributions: &[DeadCodeContribution],
+    reachable: &BTreeSet<ExportNode>,
+) -> BTreeSet<String> {
+    contributions
+        .iter()
+        .filter(|contribution| file_is_reachable(contribution, reachable))
+        .flat_map(|contribution| contribution.type_ref_names.iter().cloned())
+        .collect()
+}
+
+fn file_is_reachable(
+    contribution: &DeadCodeContribution,
+    reachable: &BTreeSet<ExportNode>,
+) -> bool {
+    !contribution.liveness_roots.is_empty()
+        || contribution
+            .exports
+            .iter()
+            .any(|export| export.is_entry_point)
+        || reachable
+            .iter()
+            .any(|(file, _symbol)| file == &contribution.file)
 }
 
 fn reachable_exports(
@@ -615,6 +619,37 @@ fn language_for_file(file: &str) -> &'static str {
     }
 }
 
+fn collect_type_ref_names(file: &Path) -> BTreeSet<String> {
+    let Some(lang) = detect_language(file).filter(|lang| supports_type_refs(*lang)) else {
+        return BTreeSet::new();
+    };
+    let Ok(source) = fs::read_to_string(file) else {
+        return BTreeSet::new();
+    };
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return BTreeSet::new();
+    }
+    let Some(tree) = parser.parse(&source, None) else {
+        return BTreeSet::new();
+    };
+
+    extract_type_references(&source, tree.root_node(), lang)
+}
+
+fn supports_type_refs(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::TypeScript
+            | LangId::Tsx
+            | LangId::JavaScript
+            | LangId::Python
+            | LangId::Rust
+            | LangId::Go
+    )
+}
+
 fn collect_freshness(file: &Path) -> FileFreshness {
     cache_freshness::collect(file).unwrap_or_else(|_| FileFreshness {
         mtime: UNIX_EPOCH,
@@ -675,6 +710,8 @@ struct DeadCodeContribution {
     liveness_roots: Vec<String>,
     #[serde(default)]
     dispatched_method_names: Vec<String>,
+    #[serde(default)]
+    type_ref_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -764,12 +801,21 @@ mod tests {
         exported_symbols: Vec<CallgraphExport>,
         outbound_calls: Vec<CallgraphOutboundCall>,
     ) -> CallgraphSnapshot {
+        snapshot_with_entry_points(files, exported_symbols, outbound_calls, BTreeSet::new())
+    }
+
+    fn snapshot_with_entry_points(
+        files: Vec<PathBuf>,
+        exported_symbols: Vec<CallgraphExport>,
+        outbound_calls: Vec<CallgraphOutboundCall>,
+        entry_points: BTreeSet<PathBuf>,
+    ) -> CallgraphSnapshot {
         CallgraphSnapshot {
             generated_at: None,
             files,
             exported_symbols,
             outbound_calls,
-            entry_points: BTreeSet::new(),
+            entry_points,
         }
     }
 
@@ -856,7 +902,63 @@ mod tests {
     }
 
     #[test]
-    fn type_like_export_without_inbound_edge_is_uncertain() {
+    fn rust_struct_referenced_only_in_types_is_live() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            ("src/types.rs", "pub struct Widget { id: u64 }\n"),
+            (
+                "src/main.rs",
+                "use crate::types::Widget;\nstruct Holder { value: Widget }\npub fn main(input: Widget) -> Widget { input }\n",
+            ),
+        ]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(
+                paths,
+                vec![
+                    export(&root, "src/types.rs", "Widget", "struct"),
+                    export(&root, "src/main.rs", "main", "function"),
+                ],
+                Vec::new(),
+                BTreeSet::from([root.join("src/main.rs")]),
+            ),
+        ));
+
+        assert_eq!(aggregate["count"], 0);
+        assert_eq!(aggregate["uncertain_count"], 0);
+        assert!(aggregate["items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ts_interface_referenced_only_in_type_annotation_is_live() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            ("src/types.ts", "export interface Widget { id: string }\n"),
+            (
+                "src/main.ts",
+                "import type { Widget } from './types';\nexport function run(input: Widget): void {}\n",
+            ),
+        ]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(
+                paths,
+                vec![
+                    export(&root, "src/types.ts", "Widget", "interface"),
+                    export(&root, "src/main.ts", "run", "function"),
+                ],
+                Vec::new(),
+                BTreeSet::from([root.join("src/main.ts")]),
+            ),
+        ));
+
+        assert_eq!(aggregate["count"], 0);
+        assert_eq!(aggregate["uncertain_count"], 0);
+        assert!(aggregate["items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn type_like_export_without_call_or_type_ref_is_precise_dead() {
         let (_temp_dir, root, paths) =
             fixture_project(&[("src/types.ts", "export interface Widget { id: string }\n")]);
         let aggregate = scan(job(
@@ -869,18 +971,14 @@ mod tests {
             ),
         ));
 
-        assert_eq!(aggregate["count"], 0);
-        assert!(aggregate["items"].as_array().unwrap().is_empty());
-        assert_eq!(aggregate["uncertain_count"], 1);
-        assert_eq!(aggregate["uncertain_items"][0]["symbol"], "Widget");
-        assert_eq!(
-            aggregate["uncertain_items"][0]["reason"],
-            "type-position usage not tracked until Phase 2"
-        );
+        assert_eq!(aggregate["count"], 1);
+        assert_eq!(aggregate["items"][0]["symbol"], "Widget");
+        assert_eq!(aggregate["uncertain_count"], 0);
+        assert!(aggregate["uncertain_items"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn non_type_unreachable_export_is_still_dead() {
+    fn genuinely_unreachable_function_is_still_dead() {
         let (_temp_dir, root, paths) =
             fixture_project(&[("src/build.ts", "export function build() {}\n")]);
         let aggregate = scan(job(
