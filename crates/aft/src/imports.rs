@@ -59,6 +59,50 @@ impl ImportGroup {
     }
 }
 
+/// Structured, language-honest representation of a single import's shape.
+///
+/// This is the migration target that replaces the TS-shaped flat fields
+/// (`names`/`default_import`/`namespace_import`) and their per-language
+/// overloads (Rust packs `"pub"` into `default_import`; Go packs the alias
+/// there). It is introduced additively alongside the flat fields (Stream M of
+/// the imports-refactor plan): parsers populate BOTH, readers migrate onto
+/// `form` one at a time behind the golden-parity gate, and the flat fields are
+/// removed once no reader depends on them. New-language variants (Static,
+/// Include, RuntimeRequire, …) are added when their engines land — only the
+/// variants the existing engines produce exist today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportForm {
+    /// ES modules: TypeScript, TSX, JavaScript.
+    /// `named` holds verbatim specifiers (`"useState"`, `"stdin as input"`,
+    /// `"type Foo"`, `"type Foo as Bar"`) — see [`specifier_imported_name`].
+    Es {
+        default_import: Option<String>,
+        namespace_import: Option<String>,
+        named: Vec<String>,
+        /// Statement-level `import type { ... }`.
+        type_only: bool,
+        /// Side-effect-only `import "mod"` (no bindings).
+        side_effect: bool,
+    },
+    /// Python `import module` (`from_import = false`) or
+    /// `from module import a, b` (`from_import = true`).
+    Python {
+        from_import: bool,
+        named: Vec<String>,
+    },
+    /// Rust `use path;` / `pub use path;`. `visibility` replaces the
+    /// `default_import == "pub"` overload (`Some("pub")`, `Some("pub(crate)")`,
+    /// …). The brace/use-tree text remains carried by `module_path` per the
+    /// lossless-round-trip decision; `named` holds extracted use-list names.
+    RustUse {
+        visibility: Option<String>,
+        named: Vec<String>,
+    },
+    /// Go import. `alias` replaces the `default_import` overload, including the
+    /// blank (`_`) and dot (`.`) import bindings.
+    Go { alias: Option<String> },
+}
+
 /// A single parsed import statement.
 #[derive(Debug, Clone)]
 pub struct ImportStatement {
@@ -78,6 +122,10 @@ pub struct ImportStatement {
     pub byte_range: Range<usize>,
     /// Raw text of the import statement.
     pub raw_text: String,
+    /// Structured, de-overloaded representation (Stream M migration target).
+    /// Populated by every parser alongside the flat fields above; readers
+    /// migrate onto this incrementally behind the golden-parity gate.
+    pub form: ImportForm,
 }
 
 /// A block of parsed imports from a file.
@@ -617,6 +665,14 @@ fn parse_single_ts_import(source: &str, node: &Node) -> Option<ImportStatement> 
 
     let group = classify_group_ts(&module_path);
 
+    let form = ImportForm::Es {
+        default_import: default_import.clone(),
+        namespace_import: namespace_import.clone(),
+        named: names.clone(),
+        type_only: is_type_only,
+        side_effect: matches!(kind, ImportKind::SideEffect),
+    };
+
     Some(ImportStatement {
         module_path,
         names,
@@ -626,6 +682,7 @@ fn parse_single_ts_import(source: &str, node: &Node) -> Option<ImportStatement> 
         group,
         byte_range,
         raw_text,
+        form,
     })
 }
 
@@ -1143,6 +1200,10 @@ fn parse_py_import_statement(source: &str, node: &Node) -> Option<ImportStatemen
         group,
         byte_range,
         raw_text,
+        form: ImportForm::Python {
+            from_import: false,
+            named: Vec::new(),
+        },
     })
 }
 
@@ -1194,13 +1255,17 @@ fn parse_py_import_from_statement(source: &str, node: &Node) -> Option<ImportSta
 
     Some(ImportStatement {
         module_path,
-        names,
+        names: names.clone(),
         default_import: None,
         namespace_import: None,
         kind: ImportKind::Value,
         group,
         byte_range,
         raw_text,
+        form: ImportForm::Python {
+            from_import: true,
+            named: names,
+        },
     })
 }
 
@@ -1331,7 +1396,7 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
 
     Some(ImportStatement {
         module_path: use_path,
-        names,
+        names: names.clone(),
         default_import: if has_pub {
             Some("pub".to_string())
         } else {
@@ -1342,6 +1407,13 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
         group,
         byte_range,
         raw_text,
+        form: ImportForm::RustUse {
+            // Only bare `pub` is recognized by the current parser; richer
+            // visibilities (`pub(crate)`, …) collapse to the same flag today and
+            // will be parsed precisely when the Rust engine moves onto `form`.
+            visibility: has_pub.then(|| "pub".to_string()),
+            named: names,
+        },
     })
 }
 
@@ -1504,12 +1576,13 @@ fn parse_go_import_spec(source: &str, node: &Node) -> Option<ImportStatement> {
     Some(ImportStatement {
         module_path: import_path,
         names: Vec::new(),
-        default_import: alias,
+        default_import: alias.clone(),
         namespace_import: None,
         kind: ImportKind::Value,
         group,
         byte_range,
         raw_text,
+        form: ImportForm::Go { alias },
     })
 }
 
@@ -1597,6 +1670,138 @@ fn skip_newline(source: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ImportForm field-mapping contract (Stream M) ---
+    //
+    // These assert the additive `form` field faithfully mirrors the flat
+    // fields each parser populates. They are the executable field-mapping
+    // contract from the migration plan: when a reader is moved off a flat
+    // field onto `form`, these guarantee no information was lost in the
+    // de-overloading (Rust `pub`, Go alias) or restructuring.
+
+    #[test]
+    fn form_es_mirrors_flat_fields() {
+        let (_, block) = parse_ts(
+            "import Default, { a, b as c } from \"ext\";\nimport type { T } from \"./t\";\nimport \"./side\";\nimport * as ns from \"nspkg\";\n",
+        );
+        // import Default, { a, b as c } from "ext"
+        match &block.imports[0].form {
+            ImportForm::Es {
+                default_import,
+                namespace_import,
+                named,
+                type_only,
+                side_effect,
+            } => {
+                assert_eq!(default_import.as_deref(), Some("Default"));
+                assert_eq!(namespace_import, &None);
+                assert_eq!(named, &block.imports[0].names);
+                assert!(!type_only);
+                assert!(!side_effect);
+            }
+            other => panic!("expected Es, got {other:?}"),
+        }
+        // import type { T } from "./t"
+        match &block.imports[1].form {
+            ImportForm::Es {
+                type_only, named, ..
+            } => {
+                assert!(type_only);
+                assert_eq!(named, &block.imports[1].names);
+            }
+            other => panic!("expected Es type-only, got {other:?}"),
+        }
+        // import "./side"
+        match &block.imports[2].form {
+            ImportForm::Es { side_effect, .. } => assert!(side_effect),
+            other => panic!("expected Es side-effect, got {other:?}"),
+        }
+        // import * as ns from "nspkg"
+        match &block.imports[3].form {
+            ImportForm::Es {
+                namespace_import, ..
+            } => assert_eq!(namespace_import.as_deref(), Some("ns")),
+            other => panic!("expected Es namespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn form_python_mirrors_flat_fields() {
+        let (_, block) = parse_py("import os\nfrom sys import argv, path\n");
+        match &block.imports[0].form {
+            ImportForm::Python { from_import, named } => {
+                assert!(!from_import, "`import os` is not a from-import");
+                assert!(named.is_empty());
+            }
+            other => panic!("expected Python import, got {other:?}"),
+        }
+        match &block.imports[1].form {
+            ImportForm::Python { from_import, named } => {
+                assert!(from_import, "`from sys import ...` is a from-import");
+                assert_eq!(named, &block.imports[1].names);
+            }
+            other => panic!("expected Python from-import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn form_rust_de_overloads_pub_from_default_import() {
+        let (_, block) = parse_rust("pub use crate::a::Exported;\nuse std::fmt::Debug;\n");
+        // pub use -> visibility=Some("pub"); flat field still carries the "pub" hack.
+        match &block.imports[0].form {
+            ImportForm::RustUse { visibility, named } => {
+                assert_eq!(visibility.as_deref(), Some("pub"));
+                assert_eq!(named, &block.imports[0].names);
+            }
+            other => panic!("expected RustUse, got {other:?}"),
+        }
+        assert_eq!(
+            block.imports[0].default_import.as_deref(),
+            Some("pub"),
+            "flat field unchanged during additive migration"
+        );
+        // plain use -> visibility=None
+        match &block.imports[1].form {
+            ImportForm::RustUse { visibility, .. } => assert_eq!(visibility, &None),
+            other => panic!("expected RustUse, got {other:?}"),
+        }
+        assert_eq!(block.imports[1].default_import, None);
+    }
+
+    #[test]
+    fn form_go_de_overloads_alias_from_default_import() {
+        // The current Go parser only captures blank (`_`) / dot bindings as the
+        // alias (regular package aliases like `al "path"` are a pre-existing
+        // parser gap — not extracted into `default_import` today). The contract
+        // locked here is that `form.alias` mirrors `default_import` exactly,
+        // whatever the parser captures, so the de-overload is information-faithful.
+        let (_, block) =
+            parse_go("package main\n\nimport (\n\t_ \"github.com/x/y\"\n\t\"fmt\"\n)\n");
+        let blank = block
+            .imports
+            .iter()
+            .find(|i| i.module_path == "github.com/x/y")
+            .expect("blank import parsed");
+        match &blank.form {
+            ImportForm::Go { alias } => assert_eq!(alias.as_deref(), Some("_")),
+            other => panic!("expected Go blank-aliased, got {other:?}"),
+        }
+        assert_eq!(
+            blank.default_import.as_deref(),
+            Some("_"),
+            "form.alias mirrors the flat default_import field exactly"
+        );
+        let plain = block
+            .imports
+            .iter()
+            .find(|i| i.module_path == "fmt")
+            .expect("plain import parsed");
+        match &plain.form {
+            ImportForm::Go { alias } => assert_eq!(alias, &None),
+            other => panic!("expected Go plain, got {other:?}"),
+        }
+        assert_eq!(plain.default_import, None);
+    }
 
     fn parse_ts(source: &str) -> (Tree, ImportBlock) {
         let grammar = grammar_for(LangId::TypeScript);
