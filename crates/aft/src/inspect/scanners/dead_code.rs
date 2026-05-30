@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::cache_freshness::{self, FileFreshness};
+use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
+use crate::imports::{parse_imports, specifier_imported_name};
 use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
@@ -153,6 +155,8 @@ fn gather_file_contribution(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let imported_exports =
+        imported_export_liveness_roots(&job.project_root, file, exported_symbols_by_file);
     let type_ref_names = collect_type_ref_names(file);
 
     let liveness_roots = liveness_roots_for_file(
@@ -196,6 +200,15 @@ fn gather_file_contribution(
     });
     if !dispatched_method_names.is_empty() {
         payload["dispatched_method_names"] = json!(dispatched_method_names);
+    }
+    if !imported_exports.is_empty() {
+        payload["imported_exports"] = json!(imported_exports
+            .iter()
+            .map(|root| json!({
+                "file": root.file,
+                "symbol": root.symbol,
+            }))
+            .collect::<Vec<_>>());
     }
 
     FileContribution::new(
@@ -364,6 +377,9 @@ fn reachable_exports(
                 queue.push_back((contribution.file.clone(), export.symbol.clone()));
             }
         }
+        for imported_export in &contribution.imported_exports {
+            queue.push_back((imported_export.file.clone(), imported_export.symbol.clone()));
+        }
     }
 
     while let Some(node) = queue.pop_front() {
@@ -414,6 +430,159 @@ fn project_internal_call(
         symbol,
         line: call.line,
     })
+}
+
+fn imported_export_liveness_roots(
+    project_root: &Path,
+    file: &Path,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<ImportedExportContribution> {
+    let Some(lang) = detect_language(file)
+        .filter(|lang| matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript))
+    else {
+        return Vec::new();
+    };
+    let Ok(source) = fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(&source, None) else {
+        return Vec::new();
+    };
+
+    let import_block = parse_imports(&source, &tree, lang);
+    let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let mut roots: BTreeSet<ExportNode> = BTreeSet::new();
+
+    for import in &import_block.imports {
+        let Some(module_entry) = resolve_workspace_package_import(from_dir, &import.module_path)
+        else {
+            continue;
+        };
+
+        for imported_name in import
+            .names
+            .iter()
+            .map(|name| specifier_imported_name(name))
+        {
+            if let Some(root) = resolve_imported_export_liveness_root(
+                project_root,
+                &module_entry,
+                imported_name,
+                exported_symbols_by_file,
+            ) {
+                roots.insert(root);
+            }
+        }
+
+        if import.default_import.is_some() {
+            if let Some(root) = resolve_imported_export_liveness_root(
+                project_root,
+                &module_entry,
+                "default",
+                exported_symbols_by_file,
+            ) {
+                roots.insert(root);
+            }
+        }
+    }
+
+    roots
+        .into_iter()
+        .map(|(file, symbol)| ImportedExportContribution { file, symbol })
+        .collect()
+}
+
+fn resolve_workspace_package_import(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    let package_name = package_name_from_import(module_path)?;
+    let module_entry = resolve_module_path(from_dir, module_path)?;
+    let resolved_package_name = package_name_for_file(&module_entry)?;
+    (resolved_package_name == package_name).then_some(module_entry)
+}
+
+fn package_name_from_import(module_path: &str) -> Option<String> {
+    if module_path.starts_with('.') || module_path.starts_with('/') || module_path.starts_with('#')
+    {
+        return None;
+    }
+
+    let mut parts = module_path.split('/');
+    let first = parts.next()?;
+    if first.is_empty() {
+        return None;
+    }
+
+    if first.starts_with('@') {
+        let second = parts.next()?;
+        (!second.is_empty()).then(|| format!("{first}/{second}"))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+fn package_name_for_file(file: &Path) -> Option<String> {
+    let mut current = file.parent();
+    while let Some(dir) = current {
+        let manifest = dir.join("package.json");
+        if manifest.is_file() {
+            let source = fs::read_to_string(&manifest).ok()?;
+            let value = serde_json::from_str::<serde_json::Value>(&source).ok()?;
+            if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
+                return Some(name.to_string());
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn resolve_imported_export_liveness_root(
+    project_root: &Path,
+    module_entry: &Path,
+    imported_symbol: &str,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<ExportNode> {
+    let mut file_exports_symbol = |path: &Path, symbol_name: &str| {
+        exported_symbols_for_resolved_file(project_root, path, exported_symbols_by_file)
+            .is_some_and(|(_, symbols)| symbols.contains(symbol_name))
+    };
+    let mut file_default_export_symbol = |path: &Path| {
+        exported_symbols_for_resolved_file(project_root, path, exported_symbols_by_file)
+            .and_then(|(_, symbols)| symbols.contains("default").then(|| "default".to_string()))
+    };
+
+    let (target_file, symbol) = resolve_reexported_symbol_target(
+        module_entry,
+        imported_symbol,
+        &mut file_exports_symbol,
+        &mut file_default_export_symbol,
+    )?;
+
+    let (file, symbols) =
+        exported_symbols_for_resolved_file(project_root, &target_file, exported_symbols_by_file)?;
+    symbols.contains(&symbol).then_some((file, symbol))
+}
+
+fn exported_symbols_for_resolved_file<'a>(
+    project_root: &Path,
+    file: &Path,
+    exported_symbols_by_file: &'a BTreeMap<String, BTreeSet<String>>,
+) -> Option<(String, &'a BTreeSet<String>)> {
+    let relative = relative_path(project_root, file);
+    if let Some(symbols) = exported_symbols_by_file.get(&relative) {
+        return Some((relative, symbols));
+    }
+
+    let canonical_root = fs::canonicalize(project_root).ok()?;
+    let canonical_file = fs::canonicalize(file).ok()?;
+    let relative = relative_path(&canonical_root, &canonical_file);
+    exported_symbols_by_file
+        .get(&relative)
+        .map(|symbols| (relative, symbols))
 }
 
 fn resolve_unqualified_target(
@@ -701,9 +870,17 @@ struct DeadCodeContribution {
     #[serde(default)]
     liveness_roots: Vec<String>,
     #[serde(default)]
+    imported_exports: Vec<ImportedExportContribution>,
+    #[serde(default)]
     dispatched_method_names: Vec<String>,
     #[serde(default)]
     type_ref_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ImportedExportContribution {
+    file: String,
+    symbol: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

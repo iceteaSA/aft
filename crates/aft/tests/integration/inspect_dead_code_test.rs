@@ -398,6 +398,82 @@ fn inspect_dead_code_resolves_extensionless_package_json_main_export() {
 }
 
 #[test]
+fn inspect_dead_code_keeps_cross_package_barrel_reexport_import_live() {
+    let (_temp_dir, root, _paths) = fixture_project(&[
+        (
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        ),
+        (
+            "packages/bridge/package.json",
+            r#"{"name":"@scope/bridge","exports":"./src/index.ts"}"#,
+        ),
+        (
+            "packages/bridge/src/index.ts",
+            "export type { LiveEnvelope } from \"./protocol.js\";\n",
+        ),
+        (
+            "packages/bridge/src/protocol.ts",
+            "export interface LiveEnvelope { id: string; }\nexport interface DeadEnvelope { id: string; }\n",
+        ),
+        ("packages/app/package.json", r#"{"name":"app"}"#),
+        (
+            "packages/app/src/consumer.ts",
+            "import type { LiveEnvelope as DownstreamEnvelope } from \"@scope/bridge\";\ntype ConsumerEnvelope = DownstreamEnvelope;\n",
+        ),
+    ]);
+    let source_files = vec![
+        root.join("packages/bridge/src/index.ts"),
+        root.join("packages/bridge/src/protocol.ts"),
+        root.join("packages/app/src/consumer.ts"),
+    ];
+    let graph = snapshot(
+        source_files.clone(),
+        vec![
+            export(
+                &root,
+                "packages/bridge/src/index.ts",
+                "LiveEnvelope",
+                "interface",
+                1,
+            ),
+            export(
+                &root,
+                "packages/bridge/src/protocol.ts",
+                "LiveEnvelope",
+                "interface",
+                1,
+            ),
+            export(
+                &root,
+                "packages/bridge/src/protocol.ts",
+                "DeadEnvelope",
+                "interface",
+                2,
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let success = scan(job(&root, source_files, Some(graph)));
+    let dead_symbols = success.aggregate["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["symbol"].as_str().expect("symbol").to_string())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(success.aggregate["count"], 1, "{:#}", success.aggregate);
+    assert!(
+        !dead_symbols.contains("LiveEnvelope"),
+        "barrel-imported cross-package type should be live: {:#}",
+        success.aggregate
+    );
+    assert!(dead_symbols.contains("DeadEnvelope"));
+}
+
+#[test]
 fn inspect_dead_code_caps_drill_down_after_one_hundred_items() {
     let source = (0..101)
         .map(|index| format!("export function unused_{index}() {{}}\n"))

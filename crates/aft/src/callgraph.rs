@@ -3997,12 +3997,10 @@ fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Optio
         std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     let cache_key = (workspace_root.clone(), package_name.to_string());
 
-    if let Some(cached) = WORKSPACE_PACKAGE_CACHE
-        .read()
-        .ok()
-        .and_then(|cache| cache.get(&cache_key).cloned())
-    {
-        return cached;
+    if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
+        if let Some(cached) = cache.get(&cache_key) {
+            return cached.clone();
+        }
     }
 
     let resolved = workspace_member_dirs(&workspace_root)
@@ -4283,6 +4281,25 @@ fn resolve_package_fallback(package_root: &Path, subpath: Option<&str>) -> Optio
     }
 }
 
+pub(crate) fn resolve_reexported_symbol_target<F, D>(
+    file: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
+) -> Option<(PathBuf, String)>
+where
+    F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
+{
+    resolve_reexported_symbol(
+        file,
+        symbol_name,
+        file_exports_symbol,
+        file_default_export_symbol,
+    )
+    .map(|target| (target.file, target.symbol))
+}
+
 fn resolve_reexported_symbol<F, D>(
     file: &Path,
     symbol_name: &str,
@@ -4406,7 +4423,9 @@ where
     F: FnMut(&Path, &str) -> bool,
     D: FnMut(&Path) -> Option<String>,
 {
-    let source_node = node.child_by_field_name("source")?;
+    let source_node = node
+        .child_by_field_name("source")
+        .or_else(|| find_child_by_kind(node, "string"))?;
     let module_path = string_literal_content(source, source_node)?;
     let target_file = resolve_module_path(from_dir, &module_path)?;
     let raw_export = node_text(node, source);
