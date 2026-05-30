@@ -14,7 +14,7 @@ use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
     normalize_path, CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, FileContribution,
     InspectCategory, InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey,
-    JobOutcome, JobScope,
+    JobOutcome, JobScope, DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::cache_freshness::FileFreshness;
 use crate::callgraph::{is_bare_callee, resolve_symbol_query_in_data, CallGraph, EdgeResolution};
@@ -975,6 +975,11 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
                         }
                     }
                 };
+                let target = if is_method_dispatch_callee(&call.full_callee, &call.callee_name) {
+                    format!("{target}{DISPATCHED_CALLEE_SEPARATOR}{}", call.full_callee)
+                } else {
+                    target
+                };
                 outbound_calls.push(CallgraphOutboundCall {
                     caller_file: snapshot_file.clone(),
                     caller_symbol: caller_symbol.clone(),
@@ -1000,6 +1005,19 @@ fn canonicalize_for_snapshot(path: &PathBuf) -> PathBuf {
 
 fn is_entry_point_file(entry_points: &super::entry_points::EntryPointSet, file: &Path) -> bool {
     entry_points.is_entry_point(file)
+}
+
+fn is_method_dispatch_callee(full_callee: &str, callee_name: &str) -> bool {
+    let full_callee = full_callee.trim();
+    if !full_callee.contains('.') || full_callee == callee_name.trim() {
+        return false;
+    }
+
+    full_callee
+        .rsplit('.')
+        .next()
+        .map(|segment| segment.trim().trim_start_matches('?') == callee_name.trim())
+        .unwrap_or(false)
 }
 
 fn symbol_kind_name(kind: &SymbolKind) -> &'static str {

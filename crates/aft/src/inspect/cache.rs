@@ -67,6 +67,12 @@ impl From<serde_json::Error> for InspectCacheError {
     }
 }
 
+/// Persisted Tier-2 contribution/aggregate format version.
+///
+/// Bump this when `FileContribution.contribution` JSON changes in a way that
+/// requires existing per-file contributions to be rebuilt before roll-up.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 2;
+
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
     pub category: InspectCategory,
@@ -978,6 +984,8 @@ fn contribution_set_hash_with_conn(
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"tier2-contributions\0");
+    hasher.update(&TIER2_CONTRIBUTION_CACHE_VERSION.to_le_bytes());
+    hasher.update(b"\0");
     for row in rows {
         let (file_path, file_hash) = row?;
         hasher.update(file_path.as_bytes());
@@ -1073,7 +1081,7 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn collect_freshness(path: &Path) -> FileFreshness {
         crate::cache_freshness::collect(path).unwrap()
@@ -1191,5 +1199,78 @@ mod tests {
         });
         assert_eq!(fresh_after_rescan, "second scan");
         assert_eq!(scans.get(), 2);
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct RoundTripContributionRecord {
+        category: String,
+        file_path: PathBuf,
+        contribution: serde_json::Value,
+    }
+
+    impl From<&ContributionRecord> for RoundTripContributionRecord {
+        fn from(record: &ContributionRecord) -> Self {
+            Self {
+                category: record.category.as_str().to_string(),
+                file_path: record.file_path.clone(),
+                contribution: record.contribution.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn contribution_record_round_trip_preserves_dead_code_liveness_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let inspect_dir = temp.path().join("inspect");
+        let source = project_root.join("src/lib.ts");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "export interface Widget { id: string }\n").unwrap();
+
+        let cache = InspectCache::open(inspect_dir.clone(), project_root.clone()).unwrap();
+        let contribution = FileContribution::new(
+            InspectCategory::DeadCode,
+            source.clone(),
+            collect_freshness(&source),
+            serde_json::json!({
+                "file": "src/lib.ts",
+                "exports": [{
+                    "symbol": "Widget",
+                    "kind": "interface",
+                    "line": 1,
+                    "is_type_like": true,
+                    "is_entry_point": false,
+                }],
+                "internal_calls": [],
+                "liveness_roots": [],
+                "dispatched_method_names": ["render"],
+            }),
+        );
+        cache
+            .store_tier2_result(
+                JobKey::for_project_category(InspectCategory::DeadCode),
+                std::slice::from_ref(&source),
+                &[contribution],
+                serde_json::json!({ "count": 0, "items": [] }),
+            )
+            .unwrap();
+        drop(cache);
+
+        let cache = InspectCache::open(inspect_dir, project_root).unwrap();
+        let records = cache
+            .load_tier2_contributions(InspectCategory::DeadCode)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+
+        let serialized =
+            serde_json::to_vec(&RoundTripContributionRecord::from(&records[0])).unwrap();
+        let decoded: RoundTripContributionRecord = serde_json::from_slice(&serialized).unwrap();
+        assert_eq!(decoded.category, InspectCategory::DeadCode.as_str());
+        assert_eq!(decoded.contribution["dispatched_method_names"][0], "render");
+        assert_eq!(
+            decoded.contribution["exports"][0]["is_type_like"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 2);
     }
 }

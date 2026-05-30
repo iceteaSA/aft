@@ -341,6 +341,8 @@ pub struct CallgraphExport {
     pub line: u32,
 }
 
+pub(crate) const DISPATCHED_CALLEE_SEPARATOR: char = '\u{1f}';
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallgraphOutboundCall {
     pub caller_file: PathBuf,

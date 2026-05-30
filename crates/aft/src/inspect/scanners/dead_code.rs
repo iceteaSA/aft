@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::cache_freshness::{self, FileFreshness};
+use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
     InspectResult, InspectScanSuccess,
@@ -108,6 +109,7 @@ fn gather_file_contribution(
             symbol: export.symbol.clone(),
             kind: export.kind.clone(),
             line: export.line,
+            is_type_like: is_type_like_kind(&export.kind),
             is_entry_point: false,
         })
         .collect::<Vec<_>>();
@@ -140,6 +142,15 @@ fn gather_file_contribution(
             && left.line == right.line
     });
 
+    let dispatched_method_names = snapshot
+        .outbound_calls
+        .iter()
+        .filter(|call| same_file(&job.project_root, &call.caller_file, file))
+        .filter_map(dispatched_method_name_from_call)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
     let liveness_roots = liveness_roots_for_file(
         &file_name,
         &exports,
@@ -151,32 +162,43 @@ fn gather_file_contribution(
         export.is_entry_point = liveness_roots.contains(&export.symbol);
     }
 
-    FileContribution::new(
-        InspectCategory::DeadCode,
-        file.to_path_buf(),
-        collect_freshness(file),
-        json!({
-            "file": file_name,
-            "exports": exports
-                .iter()
-                .map(|export| json!({
+    let mut payload = json!({
+        "file": file_name,
+        "exports": exports
+            .iter()
+            .map(|export| {
+                let mut value = json!({
                     "symbol": export.symbol,
                     "kind": export.kind,
                     "line": export.line,
                     "is_entry_point": export.is_entry_point,
-                }))
-                .collect::<Vec<_>>(),
-            "internal_calls": internal_calls
-                .into_iter()
-                .map(|call| json!({
-                    "caller_symbol": call.caller_symbol,
-                    "file": call.file,
-                    "symbol": call.symbol,
-                    "line": call.line,
-                }))
-                .collect::<Vec<_>>(),
-            "liveness_roots": liveness_roots,
-        }),
+                });
+                if export.is_type_like {
+                    value["is_type_like"] = json!(true);
+                }
+                value
+            })
+            .collect::<Vec<_>>(),
+        "internal_calls": internal_calls
+            .into_iter()
+            .map(|call| json!({
+                "caller_symbol": call.caller_symbol,
+                "file": call.file,
+                "symbol": call.symbol,
+                "line": call.line,
+            }))
+            .collect::<Vec<_>>(),
+        "liveness_roots": liveness_roots,
+    });
+    if !dispatched_method_names.is_empty() {
+        payload["dispatched_method_names"] = json!(dispatched_method_names);
+    }
+
+    FileContribution::new(
+        InspectCategory::DeadCode,
+        file.to_path_buf(),
+        collect_freshness(file),
+        payload,
     )
 }
 
@@ -186,6 +208,8 @@ pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_jso
         "items": [],
         "by_language": {},
         "drill_down_capped": false,
+        "uncertain_count": 0,
+        "uncertain_items": [],
         "callgraph_available": false,
         "scanned_files": scanned_files,
         "notes": ["callgraph_unavailable"],
@@ -216,41 +240,65 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         .collect::<Vec<_>>();
 
     let edges_by_source = edges_by_source(&parsed);
+    let inbound_edges = inbound_edges_by_target(&edges_by_source);
     let reachable = reachable_exports(&parsed, &edges_by_source);
+    let dispatched_method_names = collect_dispatched_method_names(&parsed);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
+    let mut count = 0usize;
     let mut dead_items = Vec::new();
+    let mut uncertain_count = 0usize;
+    let mut uncertain_items = Vec::new();
     for contribution in &parsed {
         let is_public_api_file = public_api_files.contains(&contribution.file);
         for export in &contribution.exports {
             let node = (contribution.file.clone(), export.symbol.clone());
-            if reachable.contains(&node) || is_public_api_file {
+            if reachable.contains(&node)
+                || is_public_api_file
+                || dispatched_method_names.contains(symbol_liveness_name(&export.symbol))
+            {
                 continue;
             }
 
+            let has_inbound_edge = inbound_edges
+                .get(&node)
+                .is_some_and(|sources| !sources.is_empty());
+            if (export.is_type_like || is_type_like_kind(&export.kind)) && !has_inbound_edge {
+                uncertain_count += 1;
+                if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
+                    uncertain_items.push(json!({
+                        "file": contribution.file,
+                        "symbol": export.symbol,
+                        "kind": export.kind,
+                        "line": export.line,
+                        "reason": "type-position usage not tracked until Phase 2",
+                    }));
+                }
+                continue;
+            }
+
+            count += 1;
             *by_language
                 .entry(language_for_file(&contribution.file).to_string())
                 .or_default() += 1;
-            dead_items.push(json!({
-                "file": contribution.file,
-                "symbol": export.symbol,
-                "kind": export.kind,
-                "line": export.line,
-            }));
+            if drill_down_limit.is_none_or(|limit| dead_items.len() < limit) {
+                dead_items.push(json!({
+                    "file": contribution.file,
+                    "symbol": export.symbol,
+                    "kind": export.kind,
+                    "line": export.line,
+                }));
+            }
         }
-    }
-
-    let count = dead_items.len();
-    let drill_down_capped = drill_down_limit.is_some_and(|limit| count > limit);
-    if let Some(limit) = drill_down_limit {
-        dead_items.truncate(limit);
     }
 
     json!({
         "count": count,
         "items": dead_items,
         "by_language": by_language,
-        "drill_down_capped": drill_down_capped,
+        "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "uncertain_count": uncertain_count,
+        "uncertain_items": uncertain_items,
         "callgraph_available": true,
         "scanned_files": contributions.len(),
     })
@@ -280,6 +328,28 @@ fn edges_by_source(
     }
 
     edges
+}
+
+fn inbound_edges_by_target(
+    edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
+) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
+    let mut inbound: BTreeMap<ExportNode, BTreeSet<ExportNode>> = BTreeMap::new();
+    for (source, targets) in edges_by_source {
+        for target in targets {
+            inbound
+                .entry(target.clone())
+                .or_default()
+                .insert(source.clone());
+        }
+    }
+    inbound
+}
+
+fn collect_dispatched_method_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
+    contributions
+        .iter()
+        .flat_map(|contribution| contribution.dispatched_method_names.iter().cloned())
+        .collect()
 }
 
 fn reachable_exports(
@@ -371,7 +441,50 @@ fn resolve_unqualified_target(
     }
 }
 
+fn dispatched_method_name_from_call(call: &CallgraphOutboundCall) -> Option<String> {
+    let (target, full_callee) = split_call_target_metadata(&call.target);
+    if let Some(full_callee) = full_callee {
+        return dispatched_method_name_from_callee(full_callee);
+    }
+    if target.contains("::") || target.contains('#') {
+        return None;
+    }
+    dispatched_method_name_from_callee(target)
+}
+
+fn dispatched_method_name_from_callee(callee: &str) -> Option<String> {
+    let callee = callee.trim();
+    if !callee.contains('.') {
+        return None;
+    }
+
+    clean_symbol(callee.rsplit('.').next()?.trim().trim_start_matches('?'))
+}
+
+fn split_call_target_metadata(target: &str) -> (&str, Option<&str>) {
+    target
+        .split_once(DISPATCHED_CALLEE_SEPARATOR)
+        .map_or((target, None), |(target, full_callee)| {
+            (target, Some(full_callee))
+        })
+}
+
+fn symbol_liveness_name(symbol: &str) -> &str {
+    symbol
+        .rsplit(['.', ':', '#'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(symbol)
+}
+
+fn is_type_like_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "struct" | "enum" | "trait" | "type" | "type_alias" | "interface"
+    )
+}
+
 fn parse_target(project_root: &Path, target: &str) -> ParsedTarget {
+    let (target, _) = split_call_target_metadata(target);
     let trimmed = target.trim();
     if trimmed.is_empty() {
         return ParsedTarget {
@@ -560,6 +673,8 @@ struct DeadCodeContribution {
     internal_calls: Vec<InternalCallContribution>,
     #[serde(default)]
     liveness_roots: Vec<String>,
+    #[serde(default)]
+    dispatched_method_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -567,6 +682,8 @@ struct ExportContribution {
     symbol: String,
     kind: String,
     line: u32,
+    #[serde(default)]
+    is_type_like: bool,
     #[serde(default)]
     is_entry_point: bool,
 }
@@ -591,4 +708,193 @@ struct InternalCall {
 struct ParsedTarget {
     file: Option<String>,
     symbol: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, RwLock};
+
+    use crate::config::Config;
+    use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
+    use crate::inspect::{CallgraphExport, JobKey};
+    use crate::parser::SymbolCache;
+
+    fn fixture_project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+
+        let paths = files
+            .iter()
+            .map(|(relative, contents)| {
+                let path = root.join(relative);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).expect("create parent");
+                }
+                fs::write(&path, contents).expect("write fixture file");
+                path
+            })
+            .collect::<Vec<_>>();
+
+        (temp_dir, root, paths)
+    }
+
+    fn job(root: &Path, scope_files: Vec<PathBuf>, snapshot: CallgraphSnapshot) -> InspectJob {
+        InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::DeadCode),
+            category: InspectCategory::DeadCode,
+            scope_files,
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join(".aft-cache").join("inspect"),
+            config: Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            callgraph_snapshot: Some(Arc::new(snapshot)),
+        }
+    }
+
+    fn snapshot(
+        files: Vec<PathBuf>,
+        exported_symbols: Vec<CallgraphExport>,
+        outbound_calls: Vec<CallgraphOutboundCall>,
+    ) -> CallgraphSnapshot {
+        CallgraphSnapshot {
+            generated_at: None,
+            files,
+            exported_symbols,
+            outbound_calls,
+            entry_points: BTreeSet::new(),
+        }
+    }
+
+    fn export(root: &Path, file: &str, symbol: &str, kind: &str) -> CallgraphExport {
+        CallgraphExport {
+            file: root.join(file),
+            symbol: symbol.to_string(),
+            kind: kind.to_string(),
+            line: 1,
+        }
+    }
+
+    fn outbound(
+        root: &Path,
+        caller_file: &str,
+        caller_symbol: &str,
+        target: &str,
+    ) -> CallgraphOutboundCall {
+        CallgraphOutboundCall {
+            caller_file: root.join(caller_file),
+            caller_symbol: caller_symbol.to_string(),
+            target: target.to_string(),
+            line: 1,
+        }
+    }
+
+    fn dispatched_target(target: &str, full_callee: &str) -> String {
+        format!("{target}{DISPATCHED_CALLEE_SEPARATOR}{full_callee}")
+    }
+
+    fn scan(job: InspectJob) -> serde_json::Value {
+        run_dead_code_scan(&job)
+            .outcome
+            .expect("scan succeeds")
+            .aggregate
+    }
+
+    #[test]
+    fn method_dispatched_by_receiver_call_is_live() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            ("src/service.ts", "export class Service { render() {} }\n"),
+            (
+                "src/consumer.ts",
+                "function run(service: Service) { service.render(); }\n",
+            ),
+        ]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(
+                paths,
+                vec![export(&root, "src/service.ts", "render", "method")],
+                vec![outbound(
+                    &root,
+                    "src/consumer.ts",
+                    "run",
+                    &dispatched_target("render", "service.render"),
+                )],
+            ),
+        ));
+
+        assert_eq!(aggregate["count"], 0);
+        assert_eq!(aggregate["uncertain_count"], 0);
+        assert!(aggregate["items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn method_without_any_dispatch_is_still_dead() {
+        let (_temp_dir, root, paths) =
+            fixture_project(&[("src/service.ts", "export class Service { render() {} }\n")]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(
+                paths,
+                vec![export(&root, "src/service.ts", "render", "method")],
+                Vec::new(),
+            ),
+        ));
+
+        assert_eq!(aggregate["count"], 1);
+        assert_eq!(aggregate["items"][0]["symbol"], "render");
+        assert_eq!(aggregate["uncertain_count"], 0);
+    }
+
+    #[test]
+    fn type_like_export_without_inbound_edge_is_uncertain() {
+        let (_temp_dir, root, paths) =
+            fixture_project(&[("src/types.ts", "export interface Widget { id: string }\n")]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(
+                paths,
+                vec![export(&root, "src/types.ts", "Widget", "interface")],
+                Vec::new(),
+            ),
+        ));
+
+        assert_eq!(aggregate["count"], 0);
+        assert!(aggregate["items"].as_array().unwrap().is_empty());
+        assert_eq!(aggregate["uncertain_count"], 1);
+        assert_eq!(aggregate["uncertain_items"][0]["symbol"], "Widget");
+        assert_eq!(
+            aggregate["uncertain_items"][0]["reason"],
+            "type-position usage not tracked until Phase 2"
+        );
+    }
+
+    #[test]
+    fn non_type_unreachable_export_is_still_dead() {
+        let (_temp_dir, root, paths) =
+            fixture_project(&[("src/build.ts", "export function build() {}\n")]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(
+                paths,
+                vec![export(&root, "src/build.ts", "build", "function")],
+                Vec::new(),
+            ),
+        ));
+
+        assert_eq!(aggregate["count"], 1);
+        assert_eq!(aggregate["items"][0]["symbol"], "build");
+        assert_eq!(aggregate["uncertain_count"], 0);
+    }
 }
