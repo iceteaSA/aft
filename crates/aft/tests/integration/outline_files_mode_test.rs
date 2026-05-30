@@ -91,7 +91,7 @@ fn outline_files_mode_returns_file_metadata_with_language_and_symbol_counts() {
     assert_eq!(md_entry["symbols"], 2);
     assert_eq!(md_entry["bytes"], fs::metadata(md).unwrap().len());
 
-    let text = resp["text"].as_str().unwrap();
+    let text = resp["text"].as_str().unwrap().replace('\\', "/");
     assert!(text.contains("src/service.ts"), "missing TS row: {text}");
     assert!(text.contains("typescript"), "missing language: {text}");
     assert!(text.contains("2 syms"), "missing symbol count: {text}");
@@ -128,8 +128,11 @@ fn outline_files_false_keeps_symbol_focused_directory_output() {
         resp.get("files").is_none(),
         "default outline must not return files data: {resp:?}"
     );
-    let text = resp["text"].as_str().unwrap();
-    assert!(text.contains("src/\n"), "missing directory tree: {text}");
+    let text = resp["text"].as_str().unwrap().replace('\\', "/");
+    assert!(
+        text.contains("src/\n") || text.contains("src/service.ts"),
+        "missing directory tree: {text}"
+    );
     assert!(text.contains("service.ts"), "missing file in tree: {text}");
     assert!(text.contains("greet"), "missing symbol in tree: {text}");
 

@@ -76,9 +76,29 @@ fn run_background_command(command: &str) -> Value {
     frame
 }
 
+#[cfg(windows)]
+fn print_no_newline_command(text: &str) -> String {
+    format!("Write-Host -NoNewline {text:?}")
+}
+
+#[cfg(not(windows))]
+fn print_no_newline_command(text: &str) -> String {
+    format!("printf '%s' {text:?}")
+}
+
+#[cfg(windows)]
+fn repeat_hello_world_command(count: usize) -> String {
+    format!("for ($i = 0; $i -lt {count}; $i++) {{ Write-Output 'hello world' }}")
+}
+
+#[cfg(not(windows))]
+fn repeat_hello_world_command(count: usize) -> String {
+    format!("perl -e 'print \"hello world\\n\" x {count}'")
+}
+
 #[test]
 fn bash_completed_frame_includes_token_counts() {
-    let frame = run_background_command("printf 'hello world'");
+    let frame = run_background_command(&print_no_newline_command("hello world"));
     let expected = aft_tokenizer::count_tokens("hello world") as u64;
 
     assert_eq!(frame["original_tokens"], expected);
@@ -88,8 +108,8 @@ fn bash_completed_frame_includes_token_counts() {
 
 #[test]
 fn bash_completed_frame_token_count_below_cap() {
-    let output = "hello world\n".repeat(5_461);
-    let frame = run_background_command("perl -e 'print \"hello world\\n\" x 5461'");
+    let output = format!("hello world{}", if cfg!(windows) { "\r\n" } else { "\n" }).repeat(5_461);
+    let frame = run_background_command(&repeat_hello_world_command(5_461));
 
     assert_eq!(
         frame["original_tokens"],
@@ -108,7 +128,7 @@ fn bash_completed_frame_tokenizes_tail_above_cap() {
     // meaningful for the tasks that benefit most from compression.
     // `tokens_skipped` stays false because we DID produce a count;
     // truncation is silent at this layer.
-    let frame = run_background_command("perl -e 'print \"hello world\\n\" x 17067'");
+    let frame = run_background_command(&repeat_hello_world_command(17_067));
 
     let original = frame
         .get("original_tokens")
@@ -174,7 +194,7 @@ fn bash_completed_frame_compressed_tokens_reflect_compression() {
 
 #[test]
 fn bash_completed_frame_empty_output_zero_tokens() {
-    let frame = run_background_command("true");
+    let frame = run_background_command(if cfg!(windows) { "$null" } else { "true" });
 
     assert_eq!(frame["original_tokens"], 0);
     assert_eq!(frame["compressed_tokens"], 0);

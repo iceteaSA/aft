@@ -211,9 +211,9 @@ fn transaction_rollback_restores_first_config_and_sends_no_lsp_notification() {
     let json = serde_json::to_value(&response).expect("response serializes");
     assert_eq!(json["success"], false, "transaction should fail: {json}");
     assert_eq!(json["code"], "transaction_failed");
-    assert!(json["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("No such file")));
+    assert!(json["message"].as_str().is_some_and(
+        |message| message.contains("No such file") || message.contains("cannot find the path")
+    ));
     assert_eq!(fs::read_to_string(&package_json).unwrap(), original_package);
     assert!(
         collect_watched_file_events_from_ctx_before_deadline(&ctx, Duration::from_millis(250))

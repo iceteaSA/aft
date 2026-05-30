@@ -1681,9 +1681,14 @@ impl BgTaskRegistry {
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
         if let Ok(state) = task.state.lock() {
             if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
-                let complete = pty.reader_done.load(Ordering::SeqCst)
-                    && pty.exit_observed.load(Ordering::SeqCst);
-                if !complete {
+                // On Windows ConPTY, the reader may not observe EOF while the
+                // master handle is still held in `PtyRuntime`. The waiter writes
+                // the authoritative exit marker before setting `exit_observed`,
+                // so once exit is observed we can finalize from that marker and
+                // drop the runtime, which lets the reader finish. Waiting for
+                // `reader_done && exit_observed` wedges completed PTY tasks on
+                // Windows.
+                if !pty.exit_observed.load(Ordering::SeqCst) {
                     return Ok(());
                 }
             }
@@ -1720,9 +1725,7 @@ impl BgTaskRegistry {
                 }
             }
             TaskRuntime::Pty(Some(pty)) => {
-                let complete = pty.reader_done.load(Ordering::SeqCst)
-                    && pty.exit_observed.load(Ordering::SeqCst);
-                if complete {
+                if pty.exit_observed.load(Ordering::SeqCst) {
                     drop(state);
                     let _ = self.poll_task(task);
                 }
@@ -1868,6 +1871,7 @@ impl BgTaskRegistry {
                     .map_err(|e| format!("failed to persist killing state: {e}"))?;
             }
 
+            #[cfg(unix)]
             let pgid = state.metadata.pgid;
             #[cfg(windows)]
             let child_pid = state.metadata.child_pid;
@@ -1992,6 +1996,7 @@ impl BgTaskRegistry {
         reason: Option<String>,
     ) -> Result<(), String> {
         let watch_controlled = self.task_has_watch_control(&task.task_id);
+        let mut pty_reader_done = None;
         {
             let mut state = task
                 .state
@@ -2029,9 +2034,21 @@ impl BgTaskRegistry {
             task.mark_terminal_now();
             match &mut state.runtime {
                 TaskRuntime::Piped(child) => *child = None,
-                TaskRuntime::Pty(runtime) => *runtime = None,
+                TaskRuntime::Pty(runtime) => {
+                    pty_reader_done = runtime
+                        .as_ref()
+                        .map(|runtime| Arc::clone(&runtime.reader_done));
+                    *runtime = None;
+                }
             }
             state.detached = true;
+        }
+
+        if let Some(reader_done) = pty_reader_done {
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while !reader_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
 
         // One final scan runs before terminal notification routing so bytes
@@ -3005,7 +3022,7 @@ fn detached_shell_command_for(
     // body's internal quotes never reach the shell command line — the
     // shell reads them from disk by file syntax rules, not command-line
     // parser rules.
-    let wrapper_body = shell.wrapper_script(command, exit_path);
+    let wrapper_body = shell.wrapper_script_bytes(command, exit_path);
     let wrapper_ext = match shell {
         WindowsShell::Pwsh | WindowsShell::Powershell => "ps1",
         WindowsShell::Cmd => "bat",

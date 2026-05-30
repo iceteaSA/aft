@@ -337,11 +337,13 @@ fn handle_glob_edit_match(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     drop(config);
-    let full_pattern = if pattern.starts_with('/') {
+    let full_pattern = if is_absolute_glob_pattern(pattern) {
         pattern.to_string()
     } else {
-        format!("{}/{}", root.display(), pattern)
+        root.join(pattern).display().to_string()
     };
+    #[cfg(windows)]
+    let full_pattern = full_pattern.replace('\\', "/");
 
     let mut paths: Vec<std::path::PathBuf> = match glob::glob(&full_pattern) {
         Ok(entries) => entries
@@ -356,6 +358,10 @@ fn handle_glob_edit_match(
             );
         }
     };
+    #[cfg(windows)]
+    if paths.is_empty() {
+        paths = expand_windows_glob(&full_pattern);
+    }
     paths.sort();
 
     if paths.is_empty() {
@@ -642,6 +648,59 @@ fn handle_glob_edit_match(
             "format_skip_reasons": format_skip_reasons,
         }),
     )
+}
+
+#[cfg(windows)]
+fn is_absolute_glob_pattern(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    Path::new(path).is_absolute()
+        || (bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || path.starts_with("\\\\")
+        || path.starts_with("//")
+}
+
+#[cfg(not(windows))]
+fn is_absolute_glob_pattern(path: &str) -> bool {
+    Path::new(path).is_absolute()
+}
+
+#[cfg(windows)]
+fn expand_windows_glob(full_pattern: &str) -> Vec<PathBuf> {
+    let normalized = full_pattern.replace('\\', "/");
+    let Some(first_glob) = normalized.find(['*', '?', '[', '{']) else {
+        return Vec::new();
+    };
+    let Some(base_end) = normalized[..first_glob].rfind('/') else {
+        return Vec::new();
+    };
+    let base = PathBuf::from(&normalized[..base_end]);
+    let rel_pattern = &normalized[base_end + 1..];
+    let Ok(pattern) = glob::Pattern::new(rel_pattern) else {
+        return Vec::new();
+    };
+    let options = glob::MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+
+    ignore::WalkBuilder::new(&base)
+        .hidden(false)
+        .parents(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .build()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.strip_prefix(&base)
+                .ok()
+                .map(|relative| relative.display().to_string().replace('\\', "/"))
+                .is_some_and(|relative| pattern.matches_with(&relative, options))
+        })
+        .collect()
 }
 
 fn unique_glob_checkpoint_name(request_id: &str) -> String {

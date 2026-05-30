@@ -54,23 +54,34 @@ fn configure_restricted(aft: &mut AftProcess, root: &Path) {
 }
 
 #[cfg(unix)]
-fn create_dir_symlink(src: &Path, dst: &Path) {
-    std::os::unix::fs::symlink(src, dst).expect("create symlink");
+fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
 }
 
 #[cfg(windows)]
-fn create_dir_symlink(src: &Path, dst: &Path) {
-    std::os::windows::fs::symlink_dir(src, dst).expect("create symlink");
+fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(src, dst)
 }
 
 #[cfg(unix)]
-fn create_file_symlink(src: &Path, dst: &Path) {
-    std::os::unix::fs::symlink(src, dst).expect("create symlink");
+fn create_file_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
 }
 
 #[cfg(windows)]
-fn create_file_symlink(src: &Path, dst: &Path) {
-    std::os::windows::fs::symlink_file(src, dst).expect("create symlink");
+fn create_file_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(src, dst)
+}
+
+fn ensure_symlink(result: std::io::Result<()>, test_name: &str) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) if cfg!(windows) => {
+            eprintln!("skipping {test_name}: Windows symlink privilege unavailable: {error}");
+            false
+        }
+        Err(error) => panic!("create symlink for {test_name}: {error}"),
+    }
 }
 
 #[test]
@@ -135,7 +146,12 @@ fn write_blocks_symlink_traversal_outside_project_root() {
     let outside = dir.path().join("outside");
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&outside).unwrap();
-    create_dir_symlink(&outside, &root.join("link"));
+    if !ensure_symlink(
+        create_dir_symlink(&outside, &root.join("link")),
+        "write_blocks_symlink_traversal_outside_project_root",
+    ) {
+        return;
+    }
     configure_restricted(&mut aft, &root);
 
     let attempted = root.join("link/newdir/escape.txt");
@@ -164,7 +180,12 @@ fn write_blocks_broken_symlink_escape_from_project_root() {
     let root = dir.path().join("project");
     let outside = dir.path().join("escape-target");
     fs::create_dir_all(&root).unwrap();
-    create_file_symlink(&outside, &root.join("broken-link"));
+    if !ensure_symlink(
+        create_file_symlink(&outside, &root.join("broken-link")),
+        "write_blocks_broken_symlink_escape_from_project_root",
+    ) {
+        return;
+    }
     configure_restricted(&mut aft, &root);
 
     let attempted = root.join("broken-link");
@@ -192,7 +213,12 @@ fn validate_path_rejects_broken_absolute_symlink_escape() {
     let root = dir.path().join("project");
     let outside = dir.path().join("outside").join("foo");
     fs::create_dir_all(&root).unwrap();
-    create_file_symlink(&outside, &root.join("escape"));
+    if !ensure_symlink(
+        create_file_symlink(&outside, &root.join("escape")),
+        "validate_path_rejects_broken_absolute_symlink_escape",
+    ) {
+        return;
+    }
 
     let ctx = restricted_context(&root);
     assert_validate_path_outside_root(&ctx, &root.join("escape"));
@@ -205,7 +231,12 @@ fn validate_path_rejects_broken_relative_symlink_escape() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
     fs::create_dir_all(&root).unwrap();
-    create_file_symlink(Path::new("../../etc/passwd"), &root.join("escape"));
+    if !ensure_symlink(
+        create_file_symlink(Path::new("../../etc/passwd"), &root.join("escape")),
+        "validate_path_rejects_broken_relative_symlink_escape",
+    ) {
+        return;
+    }
 
     let ctx = restricted_context(&root);
     assert_validate_path_outside_root(&ctx, &root.join("escape"));
@@ -218,8 +249,18 @@ fn validate_path_rejects_broken_symlink_chain_escape() {
     let root = dir.path().join("project");
     let outside = dir.path().join("outside");
     fs::create_dir_all(&root).unwrap();
-    create_file_symlink(Path::new("b"), &root.join("a"));
-    create_file_symlink(&outside, &root.join("b"));
+    if !ensure_symlink(
+        create_file_symlink(Path::new("b"), &root.join("a")),
+        "validate_path_rejects_broken_symlink_chain_escape",
+    ) {
+        return;
+    }
+    if !ensure_symlink(
+        create_file_symlink(&outside, &root.join("b")),
+        "validate_path_rejects_broken_symlink_chain_escape",
+    ) {
+        return;
+    }
 
     let ctx = restricted_context(&root);
     assert_validate_path_outside_root(&ctx, &root.join("a"));

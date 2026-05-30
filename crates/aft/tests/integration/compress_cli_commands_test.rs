@@ -66,12 +66,13 @@ description = "Internal test filter"
         .iter()
         .any(|f| f["source"] == "user" && f["name"] == "user-build"));
     assert_eq!(
-        response["user_dir"],
+        response["user_dir"].as_str().unwrap().replace('\\', "/"),
         storage
             .path()
             .join("opencode/filters")
             .display()
             .to_string()
+            .replace('\\', "/")
     );
     assert!(storage
         .path()

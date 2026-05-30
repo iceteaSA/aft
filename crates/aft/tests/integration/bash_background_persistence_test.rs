@@ -1197,7 +1197,7 @@ fn disk_read_tail_does_not_truncate_live_file() {
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);
-    let command = "for i in $(seq 1 200); do printf '%01024d' 0; sleep 0.01; done";
+    let command = "for i in $(seq 1 80); do printf '%0512d\\n' 0; sleep 0.01; done";
     let task_id = spawn_bg(&mut aft, SESSION, command, None);
     let stdout_path = task_file(storage.path(), SESSION, &task_id, "stdout");
 

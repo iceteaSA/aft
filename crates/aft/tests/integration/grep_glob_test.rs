@@ -130,6 +130,7 @@ fn grep_fallback_returns_relative_paths_and_counts() {
     assert!(matches[0]["column"].as_u64().unwrap_or(0) >= 1);
     // Files are returned as absolute paths
     let file_path = matches[0]["file"].as_str().expect("file path");
+    let file_path = file_path.replace('\\', "/");
     assert!(file_path.contains("src/one.rs") || file_path.contains("src/two.rs"));
 
     let status = aft.shutdown();
@@ -281,7 +282,10 @@ fn grep_text_uses_relative_paths_and_compact_format() {
         response["success"], true,
         "grep should succeed: {response:?}"
     );
-    let text = response["text"].as_str().expect("grep text");
+    let text = response["text"]
+        .as_str()
+        .expect("grep text")
+        .replace('\\', "/");
     // New format: relative paths, no decorators, line:text format
     assert!(text.contains("src/one.rs\n"));
     assert!(text.contains("src/two.rs\n"));
@@ -318,7 +322,10 @@ fn glob_text_uses_relative_paths() {
         response["success"], true,
         "glob should succeed: {response:?}"
     );
-    let text = response["text"].as_str().expect("glob text");
+    let text = response["text"]
+        .as_str()
+        .expect("glob text")
+        .replace('\\', "/");
     // Relative paths in text
     assert!(text.contains("src/keep.rs") || text.contains("src/other.rs"));
     // No absolute paths

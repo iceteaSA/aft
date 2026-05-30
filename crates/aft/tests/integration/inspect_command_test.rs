@@ -787,7 +787,7 @@ fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results(
     cache
         .update_content_fresh_metadata(
             InspectCategory::DeadCode,
-            Path::new("src/lib.ts"),
+            Path::new("src").join("lib.ts").as_path(),
             &changed_freshness,
         )
         .expect("update contribution metadata to force aggregate hash miss");

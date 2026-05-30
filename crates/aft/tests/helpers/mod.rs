@@ -6,12 +6,25 @@
 //! and `fixture_path` for resolving test fixture files.
 
 use std::collections::VecDeque;
-#[cfg(unix)]
-use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    mpsc::{self, Receiver, RecvTimeoutError},
+    Arc, Mutex,
+};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+enum StdoutEvent {
+    Json(serde_json::Value),
+    Eof,
+    IoError(String),
+    ParseError { line: String, error: String },
+}
 
 /// A handle to a running aft process with piped I/O.
 ///
@@ -19,14 +32,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// don't lose buffered data between calls.
 pub struct AftProcess {
     child: Child,
-    reader: BufReader<std::process::ChildStdout>,
+    stdout_rx: Receiver<StdoutEvent>,
+    stdout_eof: bool,
     pending_frames: VecDeque<serde_json::Value>,
     diag_enabled: bool,
     spawned_at: Instant,
     stdout_trace_log_path: Option<PathBuf>,
-    stdout_trace_log: Option<std::fs::File>,
+    stdout_trace_log: Option<Arc<Mutex<std::fs::File>>>,
+    stdout_capture_thread: Option<JoinHandle<()>>,
     stderr_log_path: Option<PathBuf>,
-    stderr_capture_thread: Option<std::thread::JoinHandle<String>>,
+    stderr_capture_thread: Option<JoinHandle<String>>,
     _cache_dir: tempfile::TempDir,
 }
 
@@ -50,7 +65,9 @@ impl AftProcess {
     }
 
     fn spawn_inner(envs: &[(&str, &std::ffi::OsStr)], pipe_stderr: bool) -> Self {
-        let binary = env!("CARGO_BIN_EXE_aft");
+        let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")));
         let diag_enabled =
             std::env::var_os("AFT_TEST_DIAG").as_deref() == Some(std::ffi::OsStr::new("1"));
         let cache_dir = tempfile::tempdir().expect("create aft test cache dir");
@@ -72,9 +89,7 @@ impl AftProcess {
         let mut child = command.spawn().expect("failed to spawn aft binary");
         let child_pid = child.id();
 
-        let stdout = child.stdout.take().expect("stdout handle");
-        let reader = BufReader::new(stdout);
-
+        let spawned_at = Instant::now();
         let (stdout_trace_log_path, stdout_trace_log, stderr_log_path, stderr_capture_thread) =
             if diag_enabled {
                 let target_tmpdir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
@@ -88,6 +103,7 @@ impl AftProcess {
                     .truncate(true)
                     .open(&stdout_trace_log_path)
                     .expect("open aft stdout trace log");
+                let stdout_trace_log = Arc::new(Mutex::new(stdout_trace_log));
 
                 let stderr_log_path =
                     target_tmpdir.join(format!("aft-test-stderr-{child_pid}.log"));
@@ -105,14 +121,20 @@ impl AftProcess {
                 (None, None, None, None)
             };
 
+        let stdout = child.stdout.take().expect("stdout handle");
+        let (stdout_rx, stdout_capture_thread) =
+            spawn_stdout_capture_thread(stdout, stdout_trace_log.clone(), spawned_at);
+
         AftProcess {
             child,
-            reader,
+            stdout_rx,
+            stdout_eof: false,
             pending_frames: VecDeque::new(),
             diag_enabled,
-            spawned_at: Instant::now(),
+            spawned_at,
             stdout_trace_log_path,
             stdout_trace_log,
+            stdout_capture_thread: Some(stdout_capture_thread),
             stderr_log_path,
             stderr_capture_thread,
             _cache_dir: cache_dir,
@@ -161,81 +183,69 @@ impl AftProcess {
             return Some(value);
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let fd = self.reader.get_ref().as_raw_fd();
-            let previous_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if previous_flags == -1 {
-                return None;
-            }
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFL, previous_flags | libc::O_NONBLOCK);
-            }
-
-            let started = Instant::now();
-            let mut line = String::new();
-            let result = loop {
-                match self.reader.read_line(&mut line) {
-                    Ok(0) => {
-                        self.trace_event("STDOUT_EOF");
-                        break None;
-                    }
-                    Ok(_) => {
-                        self.trace_stdout_line(&line);
-                        break Some(serde_json::from_str(line.trim()).expect("parse JSON"));
-                    }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        if started.elapsed() >= timeout {
-                            self.trace_event(&format!(
-                                "STDOUT_POLL_TIMEOUT (no data within {}ms)",
-                                timeout.as_millis()
-                            ));
-                            break None;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => {
-                        self.trace_read_error(&error);
-                        unsafe {
-                            libc::fcntl(fd, libc::F_SETFL, previous_flags);
-                        }
-                        panic!("read from stdout: {error}");
-                    }
-                }
-            };
-
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFL, previous_flags);
-            }
-            result
+        if self.stdout_eof {
+            return None;
         }
 
-        #[cfg(not(unix))]
-        {
-            let _ = timeout;
-            None
+        match self.stdout_rx.recv_timeout(timeout) {
+            Ok(StdoutEvent::Json(value)) => Some(value),
+            Ok(StdoutEvent::Eof) => {
+                self.stdout_eof = true;
+                None
+            }
+            Ok(StdoutEvent::IoError(error)) => panic!("read from stdout: {error}"),
+            Ok(StdoutEvent::ParseError { line, error }) => {
+                panic!("parse response JSON: {error}; line: {line}")
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.trace_event(&format!(
+                    "STDOUT_POLL_TIMEOUT (no data within {}ms)",
+                    timeout.as_millis()
+                ));
+                None
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.stdout_eof = true;
+                None
+            }
         }
     }
 
     fn read_json_line(&mut self) -> serde_json::Value {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => {
-                self.trace_event("STDOUT_EOF");
-                panic!("expected a response line but got EOF from aft");
+        self.read_json_line_timeout(DEFAULT_RESPONSE_TIMEOUT, "response line")
+    }
+
+    fn read_json_line_timeout(&mut self, timeout: Duration, context: &str) -> serde_json::Value {
+        assert!(
+            !self.stdout_eof,
+            "expected {context} but stdout was already at EOF from aft"
+        );
+        match self.stdout_rx.recv_timeout(timeout) {
+            Ok(StdoutEvent::Json(value)) => value,
+            Ok(StdoutEvent::Eof) => {
+                self.stdout_eof = true;
+                panic!("expected {context} but got EOF from aft");
             }
-            Ok(_) => self.trace_stdout_line(&line),
-            Err(error) => {
-                self.trace_read_error(&error);
-                panic!("read from stdout: {error}");
+            Ok(StdoutEvent::IoError(error)) => panic!("read from stdout: {error}"),
+            Ok(StdoutEvent::ParseError { line, error }) => {
+                panic!("parse response JSON: {error}; line: {line}")
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let child_status = match self.child.try_wait() {
+                    Ok(Some(status)) => format!("exited with status {status}"),
+                    Ok(None) => "still running".to_string(),
+                    Err(error) => format!("try_wait error: {error}"),
+                };
+                panic!(
+                    "timed out after {}s waiting for {context} from aft stdout (child {child_status})",
+                    timeout.as_secs()
+                );
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.stdout_eof = true;
+                panic!("expected {context} but stdout reader disconnected");
             }
         }
-        assert!(
-            !line.is_empty(),
-            "expected a response line but got EOF from aft"
-        );
-        serde_json::from_str(line.trim()).expect("parse response JSON")
     }
 
     #[cfg(test)]
@@ -294,12 +304,6 @@ impl AftProcess {
     /// Read frames until a `configure_warnings` push frame arrives, then
     /// return it. Panics if a non-frame response (one with an `id`) arrives
     /// before the frame, or if EOF is hit, or if no frame arrives within 60s.
-    ///
-    /// Uses non-blocking reads with a short poll interval on Unix so the
-    /// deadline actually fires when the frame never arrives. On Windows the
-    /// helper falls back to a blocking read with one final timeout check;
-    /// if the frame is missing on Windows we have no choice but to block
-    /// (no portable non-blocking pipe read available).
     fn wait_for_configure_warnings_frame(&mut self) -> serde_json::Value {
         let deadline = Instant::now() + Duration::from_secs(60);
         let poll_interval = Duration::from_millis(100);
@@ -325,32 +329,14 @@ impl AftProcess {
             }
             let remaining = deadline - now;
             let timeout = std::cmp::min(remaining, poll_interval);
-            #[cfg(unix)]
-            {
-                if let Some(value) = self.try_read_next_timeout(timeout) {
-                    if value.get("type").and_then(|kind| kind.as_str())
-                        == Some("configure_warnings")
-                    {
-                        return value;
-                    }
-                    // Other push frames (progress, bash_completed) are skipped silently.
-                    continue;
-                }
-                // No data within poll_interval — loop and re-check deadline.
-            }
-            #[cfg(not(unix))]
-            {
-                // No portable non-blocking pipe read on Windows; fall back to
-                // a single blocking read. If the frame never arrives the test
-                // will hang until the cargo test harness or job-level timeout
-                // kills it. This was the pre-fix behavior on all platforms.
-                let _ = timeout;
-                let value = self.read_json_line();
+            if let Some(value) = self.try_read_next_timeout(timeout) {
                 if value.get("type").and_then(|kind| kind.as_str()) == Some("configure_warnings") {
                     return value;
                 }
                 // Other push frames (progress, bash_completed) are skipped silently.
+                continue;
             }
+            // No data within poll_interval — loop and re-check deadline.
         }
     }
 
@@ -385,7 +371,10 @@ impl AftProcess {
     /// Close stdin and wait for the process to exit. Returns the exit status.
     pub fn shutdown(mut self) -> std::process::ExitStatus {
         drop(self.child.stdin.take());
-        let status = self.child.wait().expect("wait for process exit");
+        let status = self.wait_for_child_exit(SHUTDOWN_TIMEOUT, "shutdown after stdin close");
+        if let Some(handle) = self.stdout_capture_thread.take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.stderr_capture_thread.take() {
             // Join the AFT_TEST_DIAG=1 capture thread before returning so
             // parallel test processes cannot leave detached stderr writers
@@ -413,7 +402,10 @@ impl AftProcess {
     /// Read stderr contents after process exits.
     pub fn stderr_output(mut self) -> (std::process::ExitStatus, String) {
         drop(self.child.stdin.take());
-        let status = self.child.wait().expect("wait for process exit");
+        let status = self.wait_for_child_exit(SHUTDOWN_TIMEOUT, "stderr_output after stdin close");
+        if let Some(handle) = self.stdout_capture_thread.take() {
+            let _ = handle.join();
+        }
         let mut stderr_content = String::new();
         if let Some(mut stderr) = self.child.stderr.take() {
             use std::io::Read;
@@ -424,24 +416,36 @@ impl AftProcess {
         (status, stderr_content)
     }
 
-    fn trace_stdout_line(&mut self, line: &str) {
-        self.trace_event(&format!("STDOUT_LINE: {}", truncate_for_trace(line)));
-    }
-
-    fn trace_read_error(&mut self, error: &std::io::Error) {
-        self.trace_event(&format!("STDOUT_READ_ERR: {:?}: {}", error.kind(), error));
+    fn wait_for_child_exit(
+        &mut self,
+        timeout: Duration,
+        context: &str,
+    ) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!(
+                        "timed out after {}s waiting for aft process exit during {context}; child was killed",
+                        timeout.as_secs()
+                    );
+                }
+                Err(error) => panic!("wait for process exit during {context}: {error}"),
+            }
+        }
     }
 
     fn trace_event(&mut self, event: &str) {
         if !self.diag_enabled {
             return;
         }
-        let elapsed_ms = self.spawned_at.elapsed().as_millis();
-        if let Some(log) = self.stdout_trace_log.as_mut() {
-            writeln!(log, "[{}][{}] {}", iso_timestamp_now(), elapsed_ms, event)
-                .expect("write aft stdout trace log");
-            log.flush().expect("flush aft stdout trace log");
-        }
+        write_trace_event(&self.stdout_trace_log, self.spawned_at, event);
     }
 
     fn panic_configure_warnings_timeout(&mut self) -> ! {
@@ -496,10 +500,84 @@ impl AftProcess {
     }
 }
 
+fn spawn_stdout_capture_thread(
+    stdout: std::process::ChildStdout,
+    trace_log: Option<Arc<Mutex<std::fs::File>>>,
+    spawned_at: Instant,
+) -> (Receiver<StdoutEvent>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    write_trace_event(&trace_log, spawned_at, "STDOUT_EOF");
+                    let _ = tx.send(StdoutEvent::Eof);
+                    break;
+                }
+                Ok(_) => {
+                    write_trace_event(
+                        &trace_log,
+                        spawned_at,
+                        &format!("STDOUT_LINE: {}", truncate_for_trace(&line)),
+                    );
+                    match serde_json::from_str(line.trim()) {
+                        Ok(value) => {
+                            if tx.send(StdoutEvent::Json(value)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let rendered_line = truncate_for_trace(&line);
+                            let _ = tx.send(StdoutEvent::ParseError {
+                                line: rendered_line,
+                                error: error.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    write_trace_event(
+                        &trace_log,
+                        spawned_at,
+                        &format!("STDOUT_READ_ERR: {:?}: {}", error.kind(), error),
+                    );
+                    let _ = tx.send(StdoutEvent::IoError(format!(
+                        "{:?}: {}",
+                        error.kind(),
+                        error
+                    )));
+                    break;
+                }
+            }
+        }
+    });
+
+    (rx, handle)
+}
+
+fn write_trace_event(
+    trace_log: &Option<Arc<Mutex<std::fs::File>>>,
+    spawned_at: Instant,
+    event: &str,
+) {
+    let Some(log) = trace_log else {
+        return;
+    };
+    let elapsed_ms = spawned_at.elapsed().as_millis();
+    let mut log = log.lock().expect("lock aft stdout trace log");
+    writeln!(log, "[{}][{}] {}", iso_timestamp_now(), elapsed_ms, event)
+        .expect("write aft stdout trace log");
+    log.flush().expect("flush aft stdout trace log");
+}
+
 fn spawn_stderr_capture_thread(
     stderr: std::process::ChildStderr,
     stderr_log_path: PathBuf,
-) -> std::thread::JoinHandle<String> {
+) -> JoinHandle<String> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut log = std::fs::OpenOptions::new()
@@ -648,9 +726,54 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// Resolve the crate manifest directory.
+pub fn cargo_manifest_dir() -> PathBuf {
+    normalize_embedded_manifest_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+#[cfg(not(windows))]
+fn normalize_embedded_manifest_dir(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(windows)]
+fn normalize_embedded_manifest_dir(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+
+    // The Windows VM verification path cross-compiles the test binary on macOS.
+    // Cargo embeds a Unix-shaped manifest dir such as `/Users/.../crates/aft`;
+    // on Windows that is drive-relative, not absolute, so AFT correctly rejects
+    // it as a project root. Map that shape onto the current drive for the VM.
+    let raw = path.to_string_lossy();
+    let Some(stripped) = raw.strip_prefix('/').or_else(|| raw.strip_prefix('\\')) else {
+        return path;
+    };
+    let Some(drive) = current_windows_drive() else {
+        return path;
+    };
+    PathBuf::from(format!("{drive}:/{stripped}"))
+}
+
+#[cfg(windows)]
+fn current_windows_drive() -> Option<char> {
+    use std::path::{Component, Prefix};
+
+    match std::env::current_dir().ok()?.components().next()? {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                Some((drive as char).to_ascii_uppercase())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Resolve a fixture file path relative to the project root.
 pub fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    cargo_manifest_dir()
         .join("tests")
         .join("fixtures")
         .join(name)

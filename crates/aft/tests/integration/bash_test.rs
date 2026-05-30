@@ -50,7 +50,13 @@ fn bash_streams_progress_and_returns_final_response() {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    assert_eq!(status["output_preview"], "hello\n");
+    assert_eq!(
+        status["output_preview"]
+            .as_str()
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "hello\n"
+    );
     assert_eq!(status["exit_code"], 0);
     assert!(status["duration_ms"].is_u64());
 

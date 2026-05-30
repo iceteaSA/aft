@@ -228,7 +228,7 @@ fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
         results.iter().any(|result| result["kind"] == "GrepLine"
             && result["file"]
                 .as_str()
-                .is_some_and(|file| file.ends_with("src/lib.rs"))
+                .is_some_and(|file| file.replace('\\', "/").ends_with("src/lib.rs"))
             && result["line_text"]
                 .as_str()
                 .is_some_and(|line| line.contains("needle_symbol"))),

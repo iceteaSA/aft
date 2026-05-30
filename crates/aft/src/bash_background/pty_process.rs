@@ -3,7 +3,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,7 +47,7 @@ pub(crate) fn spawn_pty_for_command(
         let mut last_err = String::from("no Windows shell candidates available");
 
         for shell in candidates {
-            let wrapper_body = shell.wrapper_script(user_command, &paths.exit);
+            let wrapper_body = shell.wrapper_script_bytes(user_command, &paths.exit);
             let wrapper_path = windows_wrapper_path(paths, &shell);
             if let Err(error) = fs::write(&wrapper_path, wrapper_body) {
                 last_err = format!("write wrapper {wrapper_path:?}: {error}");
@@ -185,11 +187,13 @@ fn try_spawn_pty(
         wake_tx,
     ));
 
+    let writer = Arc::new(Mutex::new(writer));
     spawn_reader(
         reader,
         paths.pty.clone(),
         Arc::clone(&reader_done),
         Arc::clone(&coordinator),
+        Some(Arc::clone(&writer)),
     );
     spawn_waiter(
         child,
@@ -201,7 +205,7 @@ fn try_spawn_pty(
 
     Ok(PtyRuntime {
         master: Some(pair.master),
-        writer: Arc::new(Mutex::new(writer)),
+        writer,
         killer,
         child_pid,
         reader_done,
@@ -216,6 +220,7 @@ pub(crate) fn spawn_reader(
     spill_path: std::path::PathBuf,
     reader_done: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
+    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
 ) {
     thread::spawn(move || {
         let result = (|| -> io::Result<()> {
@@ -233,6 +238,21 @@ pub(crate) fn spawn_reader(
                     Ok(n) => {
                         file.write_all(&buf[..n])?;
                         file.flush()?;
+                        if buf[..n].windows(4).any(|window| window == b"\x1b[6n") {
+                            // Some Windows console hosts/apps query the
+                            // terminal cursor position with DSR (ESC[6n)
+                            // before accepting input. A real terminal answers
+                            // with ESC[row;colR; without that response the
+                            // process can sit forever after emitting only the
+                            // query. We own both ends of the PTY, so provide a
+                            // conservative 1;1 response.
+                            if let Some(writer) = writer.as_ref() {
+                                if let Ok(mut writer) = writer.lock() {
+                                    let _ = writer.write_all(b"\x1b[1;1R");
+                                    let _ = writer.flush();
+                                }
+                            }
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),

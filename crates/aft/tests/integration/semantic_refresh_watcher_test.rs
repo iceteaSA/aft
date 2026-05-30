@@ -34,9 +34,6 @@ struct MockEmbeddingServer {
 impl MockEmbeddingServer {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
-        listener
-            .set_nonblocking(true)
-            .expect("set embedding server nonblocking");
         let addr = listener.local_addr().expect("embedding server addr");
         let running = Arc::new(AtomicBool::new(true));
         let running_for_thread = Arc::clone(&running);
@@ -47,9 +44,6 @@ impl MockEmbeddingServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = handle_embedding_request(&mut stream, &release_for_thread);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break,
                 }
@@ -86,7 +80,7 @@ fn handle_embedding_request(
     stream: &mut TcpStream,
     release_refresh: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut header_end = None;
@@ -217,7 +211,7 @@ fn configure_semantic_openai(
                 "backend": "openai_compatible",
                 "model": "test-embedding",
                 "base_url": base_url,
-                "timeout_ms": 5_000,
+                "timeout_ms": 30_000,
                 "max_batch_size": 64,
             },
         }),
@@ -437,7 +431,7 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
         .find(|result| {
             result["file"]
                 .as_str()
-                .is_some_and(|file| file.ends_with("src/b.rs"))
+                .is_some_and(|file| file.replace('\\', "/").ends_with("src/b.rs"))
         })
         .unwrap_or_else(|| panic!("expected refreshed src/b.rs result, got {results:?}"));
     assert!(

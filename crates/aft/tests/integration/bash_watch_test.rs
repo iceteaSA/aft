@@ -46,6 +46,16 @@ fn spawn(aft: &mut AftProcess, command: &str) -> String {
     spawn["task_id"].as_str().unwrap().to_string()
 }
 
+#[cfg(windows)]
+fn print_ready_after_complete_command() -> &'static str {
+    "Write-Host -NoNewline READY-AFTER-COMPLETE"
+}
+
+#[cfg(not(windows))]
+fn print_ready_after_complete_command() -> &'static str {
+    "printf READY-AFTER-COMPLETE"
+}
+
 fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
     let started = Instant::now();
     loop {
@@ -198,7 +208,7 @@ fn watch_controlled_exit_emits_exit_safety_net_not_completion() {
 fn registering_watch_after_completion_removes_completion_and_emits_one_watch_frame() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
-    let task_id = spawn(&mut aft, "printf READY-AFTER-COMPLETE");
+    let task_id = spawn(&mut aft, print_ready_after_complete_command());
 
     let started = Instant::now();
     loop {

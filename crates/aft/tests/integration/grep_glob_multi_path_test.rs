@@ -49,6 +49,11 @@ fn canonical_path_string(path: &Path) -> String {
         .expect("canonicalize path")
         .display()
         .to_string()
+        .replace('\\', "/")
+}
+
+fn normalize_path_text(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 fn match_files(response: &Value) -> HashSet<String> {
@@ -56,7 +61,12 @@ fn match_files(response: &Value) -> HashSet<String> {
         .as_array()
         .expect("matches array")
         .iter()
-        .map(|entry| entry["file"].as_str().expect("file path").to_string())
+        .map(|entry| {
+            entry["file"]
+                .as_str()
+                .expect("file path")
+                .replace('\\', "/")
+        })
         .collect()
 }
 
@@ -92,8 +102,9 @@ fn grep_multi_path_happy_path() {
             files.contains(&expected),
             "missing {relative}: {response:?}"
         );
+        let text = response["text"].as_str().expect("text").replace('\\', "/");
         assert!(
-            response["text"].as_str().expect("text").contains(relative),
+            text.contains(relative),
             "text should mention {relative}: {response:?}"
         );
     }
@@ -131,7 +142,11 @@ fn grep_multi_path_with_overlap_deduplicates_files() {
     assert_eq!(
         matches
             .iter()
-            .filter(|entry| entry["file"] == feature_path)
+            .filter(|entry| {
+                entry["file"]
+                    .as_str()
+                    .is_some_and(|path| normalize_path_text(path) == feature_path)
+            })
             .count(),
         1,
         "feature file should not be duplicated: {response:?}"
@@ -189,7 +204,7 @@ fn grep_legitimate_single_path_with_space_is_not_split() {
     );
     assert_eq!(response["total_matches"], 1);
     assert_eq!(
-        response["matches"][0]["file"],
+        normalize_path_text(response["matches"][0]["file"].as_str().expect("file path")),
         canonical_path_string(&project.path().join("with space/file.ts"))
     );
 
@@ -255,7 +270,7 @@ fn glob_multi_path_happy_path() {
         .as_array()
         .expect("files array")
         .iter()
-        .map(|entry| entry.as_str().expect("file path").to_string())
+        .map(|entry| normalize_path_text(entry.as_str().expect("file path")))
         .collect();
     for relative in ["a/one.ts", "b/two.ts", "c/three.ts"] {
         assert!(

@@ -32,13 +32,13 @@ fn configure_path(aft: &mut AftProcess, root: &std::path::Path) {
 }
 
 #[cfg(unix)]
-fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) {
-    std::os::unix::fs::symlink(src, dst).expect("create symlink");
+fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
 }
 
 #[cfg(windows)]
-fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) {
-    std::os::windows::fs::symlink_dir(src, dst).expect("create symlink");
+fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(src, dst)
 }
 
 fn bash(aft: &mut AftProcess, id: &str, command: &str) -> serde_json::Value {
@@ -240,7 +240,15 @@ fn symlink_path_resolving_outside_project_requires_permission() {
     let outside = dir.path().join("outside");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    create_dir_symlink(&outside, &root.join("link"));
+    if let Err(error) = create_dir_symlink(&outside, &root.join("link")) {
+        if cfg!(windows) {
+            eprintln!(
+                "skipping symlink_path_resolving_outside_project_requires_permission: Windows symlink privilege unavailable: {error}"
+            );
+            return;
+        }
+        panic!("create symlink: {error}");
+    }
     std::fs::write(outside.join("secret.txt"), "secret").unwrap();
 
     let mut aft = AftProcess::spawn();

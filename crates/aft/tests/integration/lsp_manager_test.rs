@@ -100,16 +100,54 @@ fn collect_optional_notification(
 
 fn executable_protocol_server_script() -> PathBuf {
     let temp_dir = tempdir().expect("tempdir for protocol server");
-    let script = temp_dir.keep().join("protocol_lsp_server.py");
+    let dir = temp_dir.keep();
+    let script = dir.join("protocol_lsp_server.py");
     fs::write(&script, PROTOCOL_SERVER).expect("write protocol server");
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).expect("chmod protocol server");
+        let wrapper = dir.join("protocol_lsp_server.cmd");
+        fs::write(
+            &wrapper,
+            "@echo off\r\nwhere python >nul 2>nul\r\nif %ERRORLEVEL% EQU 0 (python \"%~dp0protocol_lsp_server.py\" & exit /b %ERRORLEVEL%)\r\npy -3 \"%~dp0protocol_lsp_server.py\"\r\n",
+        )
+        .expect("write protocol server cmd wrapper");
+        wrapper
     }
-    script
+    #[cfg(not(windows))]
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).expect("chmod protocol server");
+        }
+        script
+    }
+}
+
+fn protocol_server_prerequisites_available() -> bool {
+    if cfg!(windows) {
+        std::process::Command::new("python")
+            .arg("--version")
+            .output()
+            .is_ok()
+            || std::process::Command::new("py")
+                .args(["-3", "--version"])
+                .output()
+                .is_ok()
+    } else {
+        true
+    }
+}
+
+fn skip_if_protocol_server_prerequisites_missing() -> bool {
+    if protocol_server_prerequisites_available() {
+        false
+    } else {
+        eprintln!("skipping protocol LSP integration test: python/py launcher not available");
+        true
+    }
 }
 
 const PROTOCOL_SERVER: &str = r#"#!/usr/bin/env python3
@@ -351,6 +389,9 @@ fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
 
 #[test]
 fn static_watched_file_capability_allows_notification_without_dynamic_registration() {
+    if skip_if_protocol_server_prerequisites_missing() {
+        return;
+    }
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("workspace");
     let source = root.join("main.staticwatch");
@@ -403,6 +444,9 @@ fn static_watched_file_capability_allows_notification_without_dynamic_registrati
 
 #[test]
 fn watched_file_notifications_require_dynamic_registration_and_stop_after_unregister() {
+    if skip_if_protocol_server_prerequisites_missing() {
+        return;
+    }
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("workspace");
     let source = root.join("main.watchtest");
@@ -494,6 +538,9 @@ fn watched_file_notifications_require_dynamic_registration_and_stop_after_unregi
 
 #[test]
 fn workspace_pull_timeout_sends_cancel_request() {
+    if skip_if_protocol_server_prerequisites_missing() {
+        return;
+    }
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("workspace");
     let source = root.join("main.wspull");

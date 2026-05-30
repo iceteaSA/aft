@@ -11,6 +11,34 @@ fn assert_error_code(resp: &serde_json::Value, code: &str) {
     assert_eq!(resp["code"], code, "unexpected error response: {resp:?}");
 }
 
+fn normalize_path_text(text: &str) -> String {
+    let normalized = text.replace(r"\\?\", "").replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn assert_message_mentions_path(message: &str, path: &Path) {
+    let normalized_message = normalize_path_text(message);
+    let mut candidates = vec![path.to_path_buf()];
+    if let Ok(canonical) = fs::canonicalize(path) {
+        candidates.push(canonical);
+    } else if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) {
+        if let Ok(canonical_parent) = fs::canonicalize(parent) {
+            candidates.push(canonical_parent.join(file_name));
+        }
+    }
+
+    assert!(
+        candidates.iter().any(|candidate| normalized_message
+            .contains(&normalize_path_text(&candidate.display().to_string()))),
+        "message should mention {} (or its canonical form): {message}",
+        path.display()
+    );
+}
+
 fn set_read_only(path: &Path, read_only: bool) {
     let mut perms = fs::metadata(path).expect("metadata").permissions();
 
@@ -99,8 +127,8 @@ fn write_rejects_paths_outside_the_configured_project_root() {
 
     assert_error_code(&resp, "path_outside_root");
     let message = resp["message"].as_str().unwrap();
-    assert!(message.contains(&target.display().to_string()));
-    assert!(message.contains(&root.display().to_string()));
+    assert_message_mentions_path(message, &target);
+    assert_message_mentions_path(message, &root);
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -270,8 +298,8 @@ fn delete_file_rejects_paths_outside_the_configured_project_root() {
 
     assert_error_code(&resp, "path_outside_root");
     let message = resp["message"].as_str().unwrap();
-    assert!(message.contains(&target.display().to_string()));
-    assert!(message.contains(&root.display().to_string()));
+    assert_message_mentions_path(message, &target);
+    assert_message_mentions_path(message, &root);
     assert!(
         target.exists(),
         "delete_file should not remove files outside the project root"

@@ -29,6 +29,13 @@ const STDERR_LINE_BYTES: usize = 4 * 1024;
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
 type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
 
+#[cfg(windows)]
+fn is_windows_batch_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
 /// Lifecycle state of a language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
@@ -138,6 +145,15 @@ impl LspClient {
         event_tx: Sender<LspEvent>,
         child_registry: LspChildRegistry,
     ) -> io::Result<Self> {
+        #[cfg(windows)]
+        let mut command = if is_windows_batch_file(binary) {
+            let mut command = Command::new("cmd.exe");
+            command.arg("/C").arg(binary.as_os_str());
+            command
+        } else {
+            Command::new(binary)
+        };
+        #[cfg(not(windows))]
         let mut command = Command::new(binary);
         command
             .args(args)

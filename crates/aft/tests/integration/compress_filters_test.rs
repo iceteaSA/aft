@@ -5,7 +5,7 @@ use aft::compress::builtin_filters::ALL;
 use aft::compress::toml_filter::{apply_filter, build_registry, parse_filter, FilterSource};
 
 fn fixture_dir(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    crate::helpers::cargo_manifest_dir()
         .join("tests/integration/fixtures/compress_filters")
         .join(name)
 }

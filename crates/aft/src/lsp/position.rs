@@ -117,12 +117,14 @@ pub fn url_to_path(url: &Url) -> Result<PathBuf, LspError> {
             path.push('\\');
             path.push_str(segment);
         }
-        return Ok(PathBuf::from(path));
+        return Ok(normalize_lookup_path(&PathBuf::from(path)));
     }
 
     let path = url.path();
     if path.len() >= 4 && path.as_bytes()[0] == b'/' && is_ascii_drive_prefix(&path[1..]) {
-        return Ok(PathBuf::from(path[1..].replace('/', "\\")));
+        return Ok(normalize_lookup_path(&PathBuf::from(
+            path[1..].replace('/', "\\"),
+        )));
     }
 
     url.to_file_path()

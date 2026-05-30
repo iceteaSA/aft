@@ -530,7 +530,8 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
 
     // Case 1: nanos >= 1e9 → reject with a specific message.
     let bad_nanos = build_v3_with_mtime(0, 2_000_000_000);
-    let err = SemanticIndex::from_bytes(&bad_nanos, Path::new("/"))
+    let root = tempfile::tempdir().expect("semantic cache root");
+    let err = SemanticIndex::from_bytes(&bad_nanos, root.path())
         .expect_err("V3 with nanos >= 1e9 must be rejected");
     assert!(
         err.contains("nanos") && err.contains("1_000_000_000"),
@@ -541,7 +542,7 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
     // panicking. We pick secs = u64::MAX so adding any Duration carries past
     // the platform's representable range on every target.
     let overflow = build_v3_with_mtime(u64::MAX, 0);
-    let err = SemanticIndex::from_bytes(&overflow, Path::new("/"))
+    let err = SemanticIndex::from_bytes(&overflow, root.path())
         .expect_err("V3 with secs=u64::MAX must be rejected");
     assert!(
         err.contains("overflows SystemTime"),
@@ -551,6 +552,6 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
     // Case 3: valid V3 payload with nanos = 999_999_999 (max valid) loads
     // cleanly — proves the boundary is strictly < 1e9, not <=.
     let boundary = build_v3_with_mtime(1_700_000_000, 999_999_999);
-    let _ = SemanticIndex::from_bytes(&boundary, Path::new("/"))
+    let _ = SemanticIndex::from_bytes(&boundary, root.path())
         .expect("V3 with nanos=999_999_999 must load cleanly");
 }

@@ -172,15 +172,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Windows runs the lib-test surface (proven green). The full integration
-      # suite has ~77 Windows-harness incompatibilities (path separators, CRLF,
-      # POSIX-command fixtures, LSP servers absent on CI) that are tracked for a
-      # dedicated Windows-integration-enablement effort, not a feature release.
-      # Real Windows coverage also comes from Windows bash-perm e2e + Windows
-      # native E2E (real OpenCode + bridge). 5a5d9ba over-promoted this to
-      # --workspace; reverted to --lib until the integration suite is clean.
-      - name: Cargo test (lib only — Windows integration suite enablement tracked separately)
-        run: cargo test --workspace --lib
+      - name: Cargo test
+        run: cargo test --workspace
         shell: pwsh
         env:
           AFT_TEST_DIAG: "1"

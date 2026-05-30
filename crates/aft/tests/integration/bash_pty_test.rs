@@ -15,6 +15,14 @@ fn registry() -> BgTaskRegistry {
     BgTaskRegistry::new(Arc::new(Mutex::new(None)))
 }
 
+fn pty_completed_print_command(text: &str) -> String {
+    if cfg!(windows) {
+        format!("cmd /c echo {text}")
+    } else {
+        format!("printf {text}")
+    }
+}
+
 fn base_task(
     storage: &std::path::Path,
     project: &std::path::Path,
@@ -590,7 +598,7 @@ fn pty_write_exited_task() {
         &registry,
         storage.path(),
         project.path(),
-        "printf done",
+        &pty_completed_print_command("done"),
         Duration::from_secs(30),
     );
     wait_for_status(&registry, &task_id, BgTaskStatus::Completed);

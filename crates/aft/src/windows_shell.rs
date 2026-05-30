@@ -83,6 +83,7 @@ impl WindowsShell {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn command(&self, command: &str) -> Command {
         let mut cmd = Command::new(self.binary().as_ref());
         cmd.args(self.args(command));
@@ -175,6 +176,8 @@ impl WindowsShell {
                 // interpolation needs.
                 format!(
                     concat!(
+                        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
+                        "$OutputEncoding = [Console]::OutputEncoding; ",
                         "$exitPath = {exit_path}; ",
                         "$tmpPath = $exitPath + '.tmp.' + $PID; ",
                         "$global:LASTEXITCODE = $null; ",
@@ -232,6 +235,18 @@ impl WindowsShell {
                     posix_single_quote(&exit_str),
                 )
             }
+        }
+    }
+
+    pub(crate) fn wrapper_script_bytes(&self, command: &str, exit_path: &Path) -> Vec<u8> {
+        let script = self.wrapper_script(command, exit_path);
+        match self {
+            WindowsShell::Pwsh | WindowsShell::Powershell => {
+                let mut bytes = vec![0xEF, 0xBB, 0xBF];
+                bytes.extend_from_slice(script.as_bytes());
+                bytes
+            }
+            WindowsShell::Cmd | WindowsShell::Posix(_) => script.into_bytes(),
         }
     }
 }

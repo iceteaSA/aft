@@ -46,18 +46,22 @@ fn probe_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let direct = dir.join(binary);
-    if direct.is_file() {
-        return Some(direct);
-    }
-
     if cfg!(windows) {
+        // npm creates both an extensionless POSIX shell shim and a `.cmd`
+        // wrapper under node_modules/.bin. The extensionless shim exists on
+        // Windows too but is not a Win32 executable, so prefer Windows-native
+        // wrappers before falling back to the direct path.
         for ext in ["cmd", "exe", "bat"] {
             let candidate = dir.join(format!("{binary}.{ext}"));
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
+    }
+
+    let direct = dir.join(binary);
+    if direct.is_file() {
+        return Some(direct);
     }
 
     None

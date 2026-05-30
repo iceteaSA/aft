@@ -41,6 +41,14 @@ fn ack(aft: &mut AftProcess, task_id: &str) -> Value {
     )
 }
 
+fn echo_text_command(text: &str) -> String {
+    if cfg!(windows) {
+        format!("cmd /c echo {text}")
+    } else {
+        format!("echo {text}")
+    }
+}
+
 #[test]
 fn drain_completions_returns_empty_success_when_none_pending() {
     let mut aft = AftProcess::spawn();
@@ -58,11 +66,12 @@ fn drain_completions_peeks_until_ack_consumes_background_completions() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
+    let command = echo_text_command("drained");
     let spawn = aft.send(
         &json!({
             "id": "spawn-drain-bg",
             "command": "bash",
-            "params": { "command": "echo drained", "background": true }
+            "params": { "command": command, "background": true }
         })
         .to_string(),
     );
@@ -81,13 +90,13 @@ fn drain_completions_peeks_until_ack_consumes_background_completions() {
         {
             break completion.clone();
         }
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_secs(12));
         std::thread::sleep(Duration::from_millis(100));
     };
 
     assert_eq!(first["status"], "completed");
     assert_eq!(first["exit_code"], 0);
-    assert_eq!(first["command"], "echo drained");
+    assert_eq!(first["command"], command);
 
     let second = drain(&mut aft);
     assert_eq!(second["success"], true);

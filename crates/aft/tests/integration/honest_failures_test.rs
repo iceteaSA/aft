@@ -171,7 +171,10 @@ fn outline_directory_reports_parse_error_skips() {
         .as_array()
         .expect("skipped_files array");
     assert_eq!(skipped.len(), 1, "one file should be skipped: {resp:?}");
-    assert_eq!(skipped[0]["file"], "src/invalid.ts");
+    assert_eq!(
+        skipped[0]["file"].as_str().unwrap().replace('\\', "/"),
+        "src/invalid.ts"
+    );
     assert_eq!(skipped[0]["reason"], "parse_error");
 
     assert!(aft.shutdown().success());

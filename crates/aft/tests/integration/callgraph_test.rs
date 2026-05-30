@@ -16,6 +16,10 @@ fn configure_project(aft: &mut AftProcess, root: &Path) {
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 }
 
+fn path_text_ends_with(path: &str, suffix: &str) -> bool {
+    path.replace('\\', "/").ends_with(suffix)
+}
+
 /// `configure` sets project root and returns success.
 #[test]
 fn callgraph_configure_sets_project_root() {
@@ -509,8 +513,7 @@ export function runWorkspaceImport(): string {
     let pkg_b_group = callers.iter().find(|group| {
         group["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("packages/pkg-b/src/main.ts")
+            .is_some_and(|path| path_text_ends_with(path, "packages/pkg-b/src/main.ts"))
     });
     assert!(
         pkg_b_group.is_some(),
@@ -536,8 +539,7 @@ export function runWorkspaceImport(): string {
     assert!(
         target_child["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("packages/pkg-a/src/target.ts"),
+            .is_some_and(|path| path_text_ends_with(path, "packages/pkg-a/src/target.ts")),
         "workspaceTarget should resolve through package export to source file: {:?}",
         target_child
     );
@@ -662,8 +664,7 @@ export function registerPiReadingTools(): string {
             assert!(
                 callers.iter().any(|group| group["file"]
                     .as_str()
-                    .unwrap_or("")
-                    .ends_with(expected_file)),
+                    .is_some_and(|path| path_text_ends_with(path, expected_file))),
                 "{symbol} caller should include {expected_file}: {:?}",
                 callers
             );
@@ -751,8 +752,7 @@ export function runWorkspaceImport(): string {
     let pkg_b_group = callers.iter().find(|group| {
         group["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("packages/pkg-b/src/main.ts")
+            .is_some_and(|path| path_text_ends_with(path, "packages/pkg-b/src/main.ts"))
     });
     assert!(
         pkg_b_group.is_some(),
@@ -778,16 +778,14 @@ export function runWorkspaceImport(): string {
     assert!(
         target_child["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("packages/pkg-a/src/target.ts"),
+            .is_some_and(|path| path_text_ends_with(path, "packages/pkg-a/src/target.ts")),
         "workspaceTarget should resolve to source target instead of dist bundle: {:?}",
         target_child
     );
     assert!(
         !target_child["file"]
             .as_str()
-            .unwrap_or("")
-            .contains("/dist/"),
+            .is_some_and(|path| path.replace('\\', "/").contains("/dist/")),
         "workspaceTarget should not resolve to dist bundle: {:?}",
         target_child
     );
@@ -846,8 +844,7 @@ test("calls target", () => {
     let test_group = callers.iter().find(|group| {
         group["file"]
             .as_str()
-            .unwrap_or("")
-            .ends_with("src/__tests__/model.test.ts")
+            .is_some_and(|path| path_text_ends_with(path, "src/__tests__/model.test.ts"))
     });
     assert!(
         test_group.is_some(),
@@ -1404,8 +1401,7 @@ fn assert_single_caller(
         .find(|group| {
             group["file"]
                 .as_str()
-                .unwrap_or("")
-                .ends_with(expected_file_suffix)
+                .is_some_and(|path| path_text_ends_with(path, expected_file_suffix))
         })
         .unwrap_or_else(|| panic!("caller should include {expected_file_suffix}: {callers:?}"));
     let entries = group["callers"].as_array().expect("caller entries");

@@ -214,7 +214,25 @@ fn app_context_with_fake_typescript_lsp() -> AppContext {
 
 fn executable_crashing_lsp_script(stderr: &str) -> PathBuf {
     let temp_dir = tempdir().expect("tempdir for crashing lsp");
+    #[cfg(windows)]
+    {
+        let script = temp_dir.keep().join("crashing_lsp.cmd");
+        let mut source = String::from("@echo off\r\n");
+        for line in stderr.lines() {
+            if line.is_empty() {
+                source.push_str("echo. 1>&2\r\n");
+            } else {
+                source.push_str(&format!("echo {line} 1>&2\r\n"));
+            }
+        }
+        source.push_str("exit /b 1\r\n");
+        fs::write(&script, source).expect("write crashing lsp cmd script");
+        return script;
+    }
+
+    #[cfg(not(windows))]
     let script = temp_dir.keep().join("crashing_lsp.py");
+    #[cfg(not(windows))]
     let source = format!(
         "#!/usr/bin/env python3
 import sys
@@ -222,6 +240,7 @@ sys.stderr.write({stderr:?})
 sys.stderr.flush()
 "
     );
+    #[cfg(not(windows))]
     fs::write(&script, source).expect("write crashing lsp script");
     #[cfg(unix)]
     {
@@ -230,6 +249,7 @@ sys.stderr.flush()
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).expect("chmod crashing lsp script");
     }
+    #[cfg(not(windows))]
     script
 }
 
