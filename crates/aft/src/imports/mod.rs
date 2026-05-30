@@ -13,8 +13,8 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::parser::{grammar_for, LangId};
 
-mod java;
 mod csharp;
+mod java;
 mod php;
 
 // ---------------------------------------------------------------------------
@@ -408,7 +408,6 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::C
         | LangId::Cpp
         | LangId::Zig
-        | LangId::CSharp
         | LangId::Bash
         | LangId::Vue
         | LangId::Json
@@ -416,7 +415,6 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::Ruby
         | LangId::Kotlin
         | LangId::Swift
-        | LangId::Php
         | LangId::Lua
         | LangId::Perl
         | LangId::Html
