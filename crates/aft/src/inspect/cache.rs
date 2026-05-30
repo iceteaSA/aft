@@ -9,7 +9,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
 
-use super::job::{FileContribution, InspectCategory, JobKey};
+use super::job::{
+    contribution_with_type_ref_names, type_ref_names_from_contribution, FileContribution,
+    InspectCategory, JobKey,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct Tier2ContributionUpdates {
@@ -71,7 +74,7 @@ impl From<serde_json::Error> for InspectCacheError {
 ///
 /// Bump this when `FileContribution.contribution` JSON changes in a way that
 /// requires existing per-file contributions to be rebuilt before roll-up.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 2;
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -79,6 +82,7 @@ pub struct ContributionRecord {
     pub file_path: PathBuf,
     pub freshness: FileFreshness,
     pub contribution: serde_json::Value,
+    pub type_ref_names: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -450,7 +454,10 @@ impl InspectCache {
 
         for contribution in contributions {
             let file_path = relative_string(&self.project_root, &contribution.file_path);
-            let blob = serde_json::to_vec(&contribution.contribution)?;
+            let blob = serde_json::to_vec(&contribution_with_type_ref_names(
+                contribution.contribution.clone(),
+                &contribution.type_ref_names,
+            ))?;
             tx.execute(
                 "INSERT INTO tier2_contributions \
                  (category, project_key, file_path, file_mtime_ns, file_size, file_hash, contribution, generated_at) \
@@ -548,7 +555,10 @@ impl InspectCache {
 
         for contribution in updates.upserts {
             let file_path = relative_string(&self.project_root, &contribution.file_path);
-            let blob = serde_json::to_vec(&contribution.contribution)?;
+            let blob = serde_json::to_vec(&contribution_with_type_ref_names(
+                contribution.contribution.clone(),
+                &contribution.type_ref_names,
+            ))?;
             tx.execute(
                 "INSERT INTO tier2_contributions \
                  (category, project_key, file_path, file_mtime_ns, file_size, file_hash, contribution, generated_at) \
@@ -740,6 +750,8 @@ impl InspectCache {
         let mut records = Vec::new();
         for row in rows {
             let (file_path, mtime_ns, file_size, file_hash, contribution) = row?;
+            let contribution: serde_json::Value = serde_json::from_slice(&contribution)?;
+            let type_ref_names = type_ref_names_from_contribution(&contribution);
             records.push(ContributionRecord {
                 category,
                 file_path: PathBuf::from(file_path),
@@ -748,7 +760,8 @@ impl InspectCache {
                     size: file_size.max(0) as u64,
                     content_hash: hash_from_hex(&file_hash)?,
                 },
-                contribution: serde_json::from_slice(&contribution)?,
+                contribution,
+                type_ref_names,
             });
         }
         Ok(records)
@@ -1206,6 +1219,7 @@ mod tests {
         category: String,
         file_path: PathBuf,
         contribution: serde_json::Value,
+        type_ref_names: BTreeSet<String>,
     }
 
     impl From<&ContributionRecord> for RoundTripContributionRecord {
@@ -1214,6 +1228,7 @@ mod tests {
                 category: record.category.as_str().to_string(),
                 file_path: record.file_path.clone(),
                 contribution: record.contribution.clone(),
+                type_ref_names: record.type_ref_names.clone(),
             }
         }
     }
@@ -1244,8 +1259,10 @@ mod tests {
                 "internal_calls": [],
                 "liveness_roots": [],
                 "dispatched_method_names": ["render"],
+                "type_ref_names": ["Widget"],
             }),
-        );
+        )
+        .with_type_ref_names(["Widget".to_string()]);
         cache
             .store_tier2_result(
                 JobKey::for_project_category(InspectCategory::DeadCode),
@@ -1267,10 +1284,12 @@ mod tests {
         let decoded: RoundTripContributionRecord = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(decoded.category, InspectCategory::DeadCode.as_str());
         assert_eq!(decoded.contribution["dispatched_method_names"][0], "render");
+        assert_eq!(decoded.contribution["type_ref_names"][0], "Widget");
+        assert!(decoded.type_ref_names.contains("Widget"));
         assert_eq!(
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 2);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 3);
     }
 }
