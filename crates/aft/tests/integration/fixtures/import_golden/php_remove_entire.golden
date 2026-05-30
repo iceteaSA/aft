@@ -1,0 +1,7 @@
+<?php
+
+namespace Demo;
+
+use App\Keep;
+
+class C {}

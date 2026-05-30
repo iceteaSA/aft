@@ -432,6 +432,66 @@ fn scenarios() -> Vec<Scenario> {
                 import_kind: None,
             }],
         },
+        // ---- PHP (Phase 1 imports expansion — structured alias/import_kind) ----
+        Scenario {
+            name: "php_add_plain_use",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nuse App\\Existing;\n\nclass C {}\n",
+            ops: &[Op::Add {
+                module: "App\\Foo",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "php_add_alias",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nuse App\\Existing;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "App\\Foo",
+                names: &[],
+                namespace: None,
+                alias: Some("Bar"),
+                modifiers: &[],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "php_add_function",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nuse App\\Existing;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "App\\helper",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("function"),
+            }],
+        },
+        Scenario {
+            name: "php_add_const",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nuse App\\Existing;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "App\\VERSION",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("const"),
+            }],
+        },
+        Scenario {
+            name: "php_remove_entire",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nuse App\\Unused;\nuse App\\Keep;\n\nclass C {}\n",
+            ops: &[Op::Remove {
+                module: "App\\Unused",
+                name: None,
+            }],
+        },
     ]
 }
 

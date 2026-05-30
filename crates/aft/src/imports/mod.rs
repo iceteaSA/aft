@@ -13,6 +13,8 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::parser::{grammar_for, LangId};
 
+mod php;
+
 // ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
@@ -398,6 +400,7 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Rust => Some(&RUST_SYNTAX),
         LangId::Go => Some(&GO_SYNTAX),
         LangId::Solidity => Some(&SOLIDITY_SYNTAX),
+        LangId::Php => Some(&php::PHP_SYNTAX),
         LangId::C
         | LangId::Cpp
         | LangId::Zig
@@ -410,7 +413,6 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::Ruby
         | LangId::Kotlin
         | LangId::Swift
-        | LangId::Php
         | LangId::Lua
         | LangId::Perl
         | LangId::Html

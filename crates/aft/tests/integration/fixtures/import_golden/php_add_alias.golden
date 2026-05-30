@@ -1,0 +1,8 @@
+<?php
+
+namespace Demo;
+
+use App\Existing;
+use App\Foo as Bar;
+
+class C {}
