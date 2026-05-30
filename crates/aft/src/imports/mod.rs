@@ -17,6 +17,7 @@ mod csharp;
 mod java;
 mod kotlin;
 mod php;
+mod scala;
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -407,13 +408,13 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Kotlin => Some(&kotlin::KOTLIN_SYNTAX),
         LangId::CSharp => Some(&csharp::CSHARP_SYNTAX),
         LangId::Php => Some(&php::PHP_SYNTAX),
+        LangId::Scala => Some(&scala::SCALA_SYNTAX),
         LangId::C
         | LangId::Cpp
         | LangId::Zig
         | LangId::Bash
         | LangId::Vue
         | LangId::Json
-        | LangId::Scala
         | LangId::Ruby
         | LangId::Swift
         | LangId::Lua

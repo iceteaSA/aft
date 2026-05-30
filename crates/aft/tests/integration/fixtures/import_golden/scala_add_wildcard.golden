@@ -1,0 +1,3 @@
+import cats.syntax.all.*
+
+object Main { val x = 1 }

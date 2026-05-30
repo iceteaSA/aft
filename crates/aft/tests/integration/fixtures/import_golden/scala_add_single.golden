@@ -1,0 +1,3 @@
+import scala.collection.mutable.ListBuffer
+
+object Main { val x = 1 }

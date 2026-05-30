@@ -1,0 +1,7 @@
+import scala.util.Try
+
+import cats.effect.{IO, Resource}
+import cats.effect.kernel.given
+import cats.syntax.all.*
+
+object Main { val x = 1 }

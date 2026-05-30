@@ -1,0 +1,3 @@
+import cats.effect.kernel.given
+
+object Main { val x = 1 }

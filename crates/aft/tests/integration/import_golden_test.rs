@@ -676,6 +676,81 @@ fn scenarios() -> Vec<Scenario> {
                 name: None,
             }],
         },
+        // ---- Scala (Scala 2/3 import forms: wildcard, selectors, rename, given) ----
+        Scenario {
+            name: "scala_add_single",
+            ext: "scala",
+            input: "object Main { val x = 1 }\n",
+            ops: &[Op::Add {
+                module: "scala.collection.mutable.ListBuffer",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "scala_add_wildcard",
+            ext: "scala",
+            input: "object Main { val x = 1 }\n",
+            ops: &[Op::AddForm {
+                module: "cats.syntax.all",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["wildcard"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "scala_add_selector",
+            ext: "scala",
+            input: "object Main { val x = 1 }\n",
+            ops: &[Op::Add {
+                module: "cats.effect",
+                names: &["IO", "Resource"],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "scala_add_rename",
+            ext: "scala",
+            input: "object Main { val x = 1 }\n",
+            ops: &[Op::Add {
+                module: "scala.concurrent",
+                names: &["ExecutionContext as EC"],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "scala_add_given",
+            ext: "scala",
+            input: "object Main { val x = 1 }\n",
+            ops: &[Op::AddForm {
+                module: "cats.effect.kernel",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("given"),
+            }],
+        },
+        Scenario {
+            name: "scala_remove_selector_name",
+            ext: "scala",
+            input: "import cats.effect.{IO, Resource}\n\nobject Main { val x = 1 }\n",
+            ops: &[Op::Remove {
+                module: "cats.effect",
+                name: Some("Resource"),
+            }],
+        },
+        Scenario {
+            name: "scala_organize_mixed",
+            ext: "scala",
+            input: "import cats.syntax.all._\nimport scala.util.Try\nimport cats.effect.{Resource, IO}\nimport cats.syntax.all.*\nimport cats.effect.kernel.given\n\nobject Main { val x = 1 }\n",
+            ops: &[Op::Organize],
+        },
     ]
 }
 

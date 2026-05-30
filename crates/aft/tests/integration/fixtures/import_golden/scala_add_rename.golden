@@ -1,0 +1,3 @@
+import scala.concurrent.ExecutionContext as EC
+
+object Main { val x = 1 }
