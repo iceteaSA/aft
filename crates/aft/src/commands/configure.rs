@@ -350,6 +350,13 @@ fn parse_semantic_config(
         semantic.max_batch_size = usize::try_from(max_batch_size)
             .map_err(|_| "configure: semantic.max_batch_size is too large".to_string())?;
     }
+    if let Some(raw) = obj.get("max_files") {
+        let max_files = raw.as_u64().ok_or_else(|| {
+            "configure: semantic.max_files must be an unsigned integer".to_string()
+        })?;
+        semantic.max_files = usize::try_from(max_files)
+            .map_err(|_| "configure: semantic.max_files is too large".to_string())?;
+    }
 
     Ok(semantic)
 }
@@ -1831,10 +1838,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let session_id_for_bg2 = log_ctx::current_session();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg2, || {
-                // Cap file count to prevent OOM on huge project roots (e.g., /home/user).
-                // fastembed model (~200MB) + embeddings + batch buffers can exceed memory
-                // on constrained systems when indexing tens of thousands of files.
-                const MAX_SEMANTIC_FILES: usize = 10_000;
+                // Cap file count to bound memory on huge project roots (e.g.,
+                // /home/user). The local fastembed model (~200MB) + embeddings +
+                // batch buffers can exceed memory on constrained systems when
+                // indexing tens of thousands of files. Configurable via
+                // `semantic.max_files` (default 20k); remote backends that embed
+                // server-side can raise it freely.
+                let max_semantic_files = semantic_config.max_files;
 
                 let build_result = catch_unwind(AssertUnwindSafe(
                     || -> Result<(SemanticIndex, crate::semantic_index::EmbeddingModel), String> {
@@ -1881,17 +1891,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 let current_files = walk_project_files(&root_clone, &filters);
 
                                 // Cap before incremental too — same reason as full rebuild.
-                                if current_files.len() > MAX_SEMANTIC_FILES {
+                                if current_files.len() > max_semantic_files {
                                     slog_warn!(
                                         "skipping semantic index: {} files exceeds limit of {}. \
-                                         Open a specific project directory instead of a large root.",
+                                         Raise semantic.max_files or open a specific project directory.",
                                         current_files.len(),
-                                        MAX_SEMANTIC_FILES
+                                        max_semantic_files
                                     );
                                     return Err(format!(
                                         "too many files ({}) for semantic indexing (max {})",
                                         current_files.len(),
-                                        MAX_SEMANTIC_FILES
+                                        max_semantic_files
                                     ));
                                 }
 
@@ -1971,17 +1981,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             entries_total: None,
                         });
 
-                        if files.len() > MAX_SEMANTIC_FILES {
+                        if files.len() > max_semantic_files {
                             slog_warn!(
                                 "skipping semantic index: {} files exceeds limit of {}. \
-                             Open a specific project directory instead of a large root.",
+                             Raise semantic.max_files or open a specific project directory.",
                                 files.len(),
-                                MAX_SEMANTIC_FILES
+                                max_semantic_files
                             );
                             return Err(format!(
                                 "too many files ({}) for semantic indexing (max {})",
                                 files.len(),
-                                MAX_SEMANTIC_FILES
+                                max_semantic_files
                             ));
                         }
 

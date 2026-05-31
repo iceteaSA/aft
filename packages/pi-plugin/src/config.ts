@@ -41,6 +41,7 @@ export interface SemanticConfig {
   api_key_env?: string;
   timeout_ms?: number;
   max_batch_size?: number;
+  max_files?: number;
 }
 
 export interface LspServerConfig {
@@ -327,6 +328,7 @@ const SemanticConfigSchema = z.object({
   api_key_env: z.string().trim().min(1).optional(),
   timeout_ms: z.number().int().positive().optional(),
   max_batch_size: z.number().int().positive().optional(),
+  max_files: z.number().int().positive().optional(),
 });
 
 const LspExtensionSchema = z
@@ -866,6 +868,7 @@ function mergeSemanticConfig(
   if (override?.model !== undefined) projectSafe.model = override.model;
   if (override?.timeout_ms !== undefined) projectSafe.timeout_ms = override.timeout_ms;
   if (override?.max_batch_size !== undefined) projectSafe.max_batch_size = override.max_batch_size;
+  if (override?.max_files !== undefined) projectSafe.max_files = override.max_files;
 
   const semantic: SemanticConfig = { ...base, ...projectSafe };
   if (Object.values(semantic).every((v) => v === undefined)) return undefined;

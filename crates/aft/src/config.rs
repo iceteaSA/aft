@@ -45,6 +45,10 @@ pub struct SemanticBackendConfig {
     pub api_key_env: Option<String>,
     pub timeout_ms: u64,
     pub max_batch_size: usize,
+    /// Maximum number of project files to semantically index. Guards local
+    /// fastembed memory (model + embeddings + batch buffers) on huge project
+    /// roots; remote backends that embed server-side can raise it freely.
+    pub max_files: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +74,7 @@ impl Default for SemanticBackendConfig {
             // semantic_search requests when callers do not set an explicit timeout.
             timeout_ms: 25_000,
             max_batch_size: 64,
+            max_files: 20_000,
         }
     }
 }

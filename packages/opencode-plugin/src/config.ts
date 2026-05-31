@@ -49,6 +49,8 @@ const SemanticConfigSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
   /** Maximum batch size used by the semantic pipeline. */
   max_batch_size: z.number().int().positive().optional(),
+  /** Maximum number of project files to semantically index (default 20000). */
+  max_files: z.number().int().positive().optional(),
 });
 
 const LspExtensionSchema = z
@@ -955,6 +957,8 @@ function mergeSemanticConfig(
       projectSemantic.timeout_ms = overrideSemantic.timeout_ms;
     if (overrideSemantic.max_batch_size !== undefined)
       projectSemantic.max_batch_size = overrideSemantic.max_batch_size;
+    if (overrideSemantic.max_files !== undefined)
+      projectSemantic.max_files = overrideSemantic.max_files;
   }
 
   const semantic = {
