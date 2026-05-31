@@ -891,6 +891,42 @@ fn scenarios() -> Vec<Scenario> {
             input: "local zeta = require(\"zeta\")\nrequire(\"boot\")\nlocal alpha = require(\"alpha\")\n\nreturn alpha, zeta\n",
             ops: &[Op::Organize],
         },
+        // ---- Header-prologue insertion (add to a header-only file with no
+        // existing imports must land AFTER the package/namespace header, not at
+        // offset 0 which would be invalid code). ----
+        Scenario {
+            name: "java_add_into_header_only",
+            ext: "java",
+            input: "package com.example;\n\nclass C {}\n",
+            ops: &[Op::Add {
+                module: "java.io.File",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "kotlin_add_into_header_only",
+            ext: "kt",
+            input: "package com.example\n\nfun main() {}\n",
+            ops: &[Op::Add {
+                module: "kotlin.collections.List",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "php_add_into_header_only",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nclass C {}\n",
+            ops: &[Op::Add {
+                module: "App\\Service",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
     ]
 }
 

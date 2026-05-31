@@ -232,8 +232,36 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         // Fall through to the original "find insertion point and insert a new
         // statement" behavior.
-        let (insert_offset, needs_blank_before, needs_blank_after) =
-            imports::find_insertion_point(&source, &block, group, module, type_only);
+        //
+        // Special case: a file with a language-level header (package/namespace/
+        // pragma) but NO existing imports. `find_insertion_point` returns offset
+        // 0 for an empty block, which would place the import BEFORE the header —
+        // invalid code (e.g. `import` before `package`, or before `<?php`). When
+        // we can locate the header prologue, insert just after it instead.
+        let (insert_offset, needs_blank_before, needs_blank_after) = match block
+            .imports
+            .is_empty()
+            .then(|| header_prologue_anchor(lang, &source, &tree))
+            .flatten()
+        {
+            Some(anchor) => {
+                let bytes = source.as_bytes();
+                let mut at = anchor;
+                if at < bytes.len() && bytes[at] == b'\r' {
+                    at += 1;
+                }
+                if at < bytes.len() && bytes[at] == b'\n' {
+                    at += 1;
+                }
+                // Blank line before separates the import from the header. Blank
+                // line after only when the next byte isn't already a newline, so
+                // a header already followed by a blank line doesn't double up.
+                let next_is_newline =
+                    at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
+                (at, true, !next_is_newline && at < source.len())
+            }
+            None => imports::find_insertion_point(&source, &block, group, module, type_only),
+        };
 
         // For Go, check if we're inserting into a grouped import block
         let import_line = if matches!(lang, LangId::Go) {
@@ -336,4 +364,45 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
     Response::success(&req.id, result)
+}
+
+/// For a file with a language-level header prologue (package/namespace/pragma
+/// declarations, optionally preceded by comments) but no existing imports,
+/// return the byte offset at the END of that prologue. A freshly added import
+/// is then placed after the header instead of at offset 0, which would produce
+/// invalid code (e.g. an import before a Go `package`, or before PHP's `<?php`).
+///
+/// Returns `None` for languages without a header-before-imports convention, or
+/// when the file does not begin with a recognized prologue node. C# is
+/// deliberately excluded: `using` directives before `namespace` are idiomatic.
+///
+/// `strong` kinds are header declarations whose end advances the anchor;
+/// `skippable` kinds (comments, PHP open tag) are stepped over without
+/// anchoring so a leading license comment alone never displaces the import.
+fn header_prologue_anchor(lang: LangId, _source: &str, tree: &tree_sitter::Tree) -> Option<usize> {
+    let (strong, skippable): (&[&str], &[&str]) = match lang {
+        LangId::Go => (&["package_clause"], &["comment"]),
+        LangId::Java => (&["package_declaration"], &["comment"]),
+        LangId::Kotlin => (&["package_header"], &["comment"]),
+        LangId::Scala => (&["package_clause"], &["comment"]),
+        LangId::Solidity => (&["pragma_directive"], &["comment"]),
+        LangId::Php => (&["php_tag", "namespace_definition"], &["comment"]),
+        LangId::Perl => (&["package_statement"], &["comment"]),
+        _ => return None,
+    };
+
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut anchor: Option<usize> = None;
+    for child in root.named_children(&mut cursor) {
+        let kind = child.kind();
+        if strong.contains(&kind) {
+            anchor = Some(child.end_byte());
+        } else if skippable.contains(&kind) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    anchor
 }
