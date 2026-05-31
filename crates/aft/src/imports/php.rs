@@ -39,11 +39,26 @@ fn collect_php_imports(source: &str, node: Node, imports: &mut Vec<ImportStateme
 }
 
 fn parse_php_namespace_use_declaration(source: &str, node: &Node) -> Option<ImportStatement> {
+    if let Some(clause) = find_direct_child(node, "namespace_use_clause") {
+        return parse_php_single_namespace_use_declaration(source, node, &clause);
+    }
+
+    if find_direct_child(node, "namespace_use_group").is_some() {
+        return parse_php_grouped_namespace_use_declaration(source, node);
+    }
+
+    parse_php_payload_namespace_use_declaration(source, node)
+}
+
+fn parse_php_single_namespace_use_declaration(
+    source: &str,
+    node: &Node,
+    clause: &Node,
+) -> Option<ImportStatement> {
     let raw_text = source[node.byte_range()].to_string();
     let byte_range = node.byte_range();
 
-    let clause = find_direct_child(node, "namespace_use_clause")?;
-    let (module_path, alias, import_kind) = parse_php_namespace_use_clause(source, &clause)?;
+    let (module_path, alias, import_kind) = parse_php_namespace_use_clause(source, clause)?;
     let names = Vec::new();
     let group = classify_group_php(&module_path);
 
@@ -64,6 +79,137 @@ fn parse_php_namespace_use_declaration(source: &str, node: &Node) -> Option<Impo
             import_kind,
         },
     })
+}
+
+fn parse_php_payload_namespace_use_declaration(
+    source: &str,
+    node: &Node,
+) -> Option<ImportStatement> {
+    let raw_text = source[node.byte_range()].to_string();
+    let byte_range = node.byte_range();
+    let mut payload = php_use_payload(source, node)?;
+    let mut import_kind = None;
+
+    for kind in ["function", "const"] {
+        if let Some(rest) = payload
+            .strip_prefix(kind)
+            .and_then(|rest| rest.strip_prefix(' '))
+        {
+            import_kind = Some(kind.to_string());
+            payload = rest.trim().to_string();
+            break;
+        }
+    }
+
+    let (module_path, alias) = if let Some((path, alias)) = payload.split_once(" as ") {
+        (path.trim().to_string(), Some(alias.trim().to_string()))
+    } else {
+        (payload.trim().to_string(), None)
+    };
+    if module_path.is_empty() {
+        return None;
+    }
+
+    let group = classify_group_php(&module_path);
+
+    Some(ImportStatement {
+        module_path,
+        names: Vec::new(),
+        default_import: None,
+        namespace_import: None,
+        kind: ImportKind::Value,
+        group,
+        byte_range,
+        raw_text,
+        form: ImportForm::Structured {
+            named: Vec::new(),
+            namespace: None,
+            alias,
+            modifiers: vec![],
+            import_kind,
+        },
+    })
+}
+
+fn parse_php_grouped_namespace_use_declaration(
+    source: &str,
+    node: &Node,
+) -> Option<ImportStatement> {
+    let raw_text = source[node.byte_range()].to_string();
+    let byte_range = node.byte_range();
+    let (module_path, import_kind) = parse_php_grouped_use_header(source, node)
+        .or_else(|| php_use_payload(source, node).map(|payload| (payload, None)))?;
+    if module_path.is_empty() {
+        return None;
+    }
+
+    let group = classify_group_php(&module_path);
+
+    Some(ImportStatement {
+        module_path,
+        names: Vec::new(),
+        default_import: None,
+        namespace_import: None,
+        kind: ImportKind::Value,
+        group,
+        byte_range,
+        raw_text,
+        form: ImportForm::Structured {
+            named: Vec::new(),
+            namespace: None,
+            alias: None,
+            modifiers: vec!["group".to_string()],
+            import_kind,
+        },
+    })
+}
+
+fn parse_php_grouped_use_header(source: &str, node: &Node) -> Option<(String, Option<String>)> {
+    let mut module_path: Option<String> = None;
+    let mut import_kind: Option<String> = None;
+    let mut leading_absolute = false;
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.kind() == "namespace_use_group" {
+                break;
+            }
+
+            let text = source[child.byte_range()].trim();
+            match child.kind() {
+                "function" | "const" => import_kind = Some(text.to_string()),
+                "\\" if module_path.is_none() => leading_absolute = true,
+                "qualified_name" | "namespace_name" | "name" => {
+                    if module_path.is_none() {
+                        module_path = Some(text.to_string());
+                    }
+                }
+                _ => {}
+            }
+
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    let mut module_path = module_path?;
+    if leading_absolute && !module_path.starts_with('\\') {
+        module_path.insert(0, '\\');
+    }
+
+    Some((module_path, import_kind))
+}
+
+fn php_use_payload(source: &str, node: &Node) -> Option<String> {
+    let raw = source[node.byte_range()].trim();
+    raw.strip_prefix("use")
+        .map(str::trim)
+        .map(|payload| payload.strip_suffix(';').map(str::trim).unwrap_or(payload))
+        .map(str::to_string)
+        .filter(|payload| !payload.is_empty())
 }
 
 fn parse_php_namespace_use_clause(
@@ -227,14 +373,19 @@ mod tests {
     #[test]
     fn parse_php_all_supported_forms() {
         let (_, block) = parse_php(
-            "<?php\nuse App\\Foo;\nuse App\\Foo as Bar;\nuse function App\\helper;\nuse const App\\VERSION;\n",
+            r"<?php
+use App\Foo;
+use App\Foo as Bar;
+use function App\helper;
+use const App\VERSION;
+",
         );
         assert_eq!(block.imports.len(), 4);
 
-        assert_php_import(&block.imports[0], "App\\Foo", None, None);
-        assert_php_import(&block.imports[1], "App\\Foo", Some("Bar"), None);
-        assert_php_import(&block.imports[2], "App\\helper", None, Some("function"));
-        assert_php_import(&block.imports[3], "App\\VERSION", None, Some("const"));
+        assert_php_import(&block.imports[0], r"App\Foo", None, None);
+        assert_php_import(&block.imports[1], r"App\Foo", Some("Bar"), None);
+        assert_php_import(&block.imports[2], r"App\helper", None, Some("function"));
+        assert_php_import(&block.imports[3], r"App\VERSION", None, Some("const"));
     }
 
     fn assert_php_import(
@@ -258,6 +409,26 @@ mod tests {
                 alias: expected_alias.map(str::to_string),
                 modifiers: vec![],
                 import_kind: expected_import_kind.map(str::to_string),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_php_grouped_use_is_captured_for_raw_preserving_organize() {
+        let (_, block) = parse_php(
+            "<?php\nuse App\\Alpha;\nuse App\\{Beta, Gamma as G};\nuse function App\\helper;\n",
+        );
+        assert_eq!(block.imports.len(), 3);
+        assert_eq!(block.imports[1].module_path, "App");
+        assert_eq!(block.imports[1].raw_text, "use App\\{Beta, Gamma as G};");
+        assert_eq!(
+            block.imports[1].form,
+            ImportForm::Structured {
+                named: vec![],
+                namespace: None,
+                alias: None,
+                modifiers: vec!["group".to_string()],
+                import_kind: None,
             }
         );
     }

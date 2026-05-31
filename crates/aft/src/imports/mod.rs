@@ -396,33 +396,81 @@ impl ImportSyntax for SoliditySyntax {
     }
 }
 
-/// Locate the byte range of the first `<script>` block's inner content in a Vue
-/// Single-File Component. tree-sitter-vue exposes the script body as a single
-/// `raw_text` node; this returns `(start, end)` of that node, or — for an empty
-/// `<script></script>` with no `raw_text` child — a zero-width range right after
-/// the start tag. Returns `None` when the file has no `<script>` element.
-pub(crate) fn vue_script_content_range(tree: &Tree) -> Option<(usize, usize)> {
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.kind() != "script_element" {
-            continue;
-        }
-        let mut inner = child.walk();
-        for sub in child.named_children(&mut inner) {
-            if sub.kind() == "raw_text" {
-                return Some((sub.start_byte(), sub.end_byte()));
-            }
-        }
-        // Empty `<script></script>`: insert right after the start tag.
-        let mut inner2 = child.walk();
-        for sub in child.named_children(&mut inner2) {
-            if sub.kind() == "start_tag" {
-                return Some((sub.end_byte(), sub.end_byte()));
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VueScriptRangeError {
+    MissingScript,
+    MultipleScripts,
+}
+
+impl VueScriptRangeError {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            VueScriptRangeError::MissingScript => "missing_vue_script",
+            VueScriptRangeError::MultipleScripts => "ambiguous_vue_script",
         }
     }
-    None
+
+    pub(crate) fn message(self, command: &str) -> String {
+        match self {
+            VueScriptRangeError::MissingScript => format!(
+                "{command}: Vue import management requires exactly one <script> block; found none"
+            ),
+            VueScriptRangeError::MultipleScripts => format!(
+                "{command}: Vue import management requires exactly one <script> block; found multiple"
+            ),
+        }
+    }
+}
+
+/// Locate the byte range of the single `<script>` block's inner content in a
+/// Vue Single-File Component. tree-sitter-vue exposes the script body as a
+/// single `raw_text` node; this returns `(start, end)` of that node, or — for an
+/// empty `<script></script>` with no `raw_text` child — a zero-width range right
+/// after the start tag. Multiple scripts are ambiguous for byte-level edits and
+/// no-script SFCs have no safe insertion region, so callers should surface the
+/// returned error instead of silently editing byte 0 or the first script.
+pub(crate) fn vue_single_script_content_range(
+    tree: &Tree,
+) -> Result<(usize, usize), VueScriptRangeError> {
+    let root = tree.root_node();
+    let mut ranges = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "script_element" {
+            ranges.push(vue_script_element_content_range(&child));
+        }
+    }
+
+    match ranges.len() {
+        0 => Err(VueScriptRangeError::MissingScript),
+        1 => Ok(ranges[0]),
+        _ => Err(VueScriptRangeError::MultipleScripts),
+    }
+}
+
+/// Back-compat convenience wrapper for callers that only need the safe single
+/// script range and intentionally treat missing/ambiguous scripts as absent.
+pub(crate) fn vue_script_content_range(tree: &Tree) -> Option<(usize, usize)> {
+    vue_single_script_content_range(tree).ok()
+}
+
+fn vue_script_element_content_range(child: &Node) -> (usize, usize) {
+    let mut inner = child.walk();
+    for sub in child.named_children(&mut inner) {
+        if sub.kind() == "raw_text" {
+            return (sub.start_byte(), sub.end_byte());
+        }
+    }
+
+    // Empty `<script></script>`: insert right after the start tag.
+    let mut inner2 = child.walk();
+    for sub in child.named_children(&mut inner2) {
+        if sub.kind() == "start_tag" {
+            return (sub.end_byte(), sub.end_byte());
+        }
+    }
+
+    (child.end_byte(), child.end_byte())
 }
 
 /// Parse imports from a Vue SFC `<script>` block. The script body is re-parsed
@@ -430,7 +478,7 @@ pub(crate) fn vue_script_content_range(tree: &Tree) -> Option<(usize, usize)> {
 /// import syntax), then every byte offset is remapped from script-relative to
 /// whole-file positions so insertion, removal, and organize operate correctly.
 fn parse_vue_imports(source: &str, tree: &Tree) -> ImportBlock {
-    let Some((start, end)) = vue_script_content_range(tree) else {
+    let Ok((start, end)) = vue_single_script_content_range(tree) else {
         return ImportBlock {
             imports: Vec::new(),
             byte_range: None,
@@ -624,6 +672,347 @@ pub fn is_duplicate_with_namespace(
     }
 
     false
+}
+
+/// Check whether a fully structured add-import request is already present.
+///
+/// Legacy ES/Python/Rust/Go callers intentionally keep the historical
+/// subset/dominance semantics (`import { a, b }` satisfies adding `{ a }`). The
+/// newer engines carry language-specific shape in `ImportForm::Structured` (or
+/// Solidity's dedicated form), where module path alone is not enough: include
+/// delimiters, statement kinds, modifiers, aliases, and runtime import flavors
+/// all affect the generated source. Those languages deduplicate on a canonical
+/// full-form key so `#include <x>` does not block `#include "x"`, `load` does
+/// not block `require`, and side-effect Solidity imports do not block aliases.
+pub(crate) fn is_duplicate_import_request(
+    lang: LangId,
+    block: &ImportBlock,
+    req: &ImportRequest<'_>,
+) -> bool {
+    if !uses_form_aware_dedup(lang) {
+        return is_duplicate_with_namespace(
+            block,
+            req.module_path,
+            req.names,
+            req.default_import,
+            req.namespace,
+            req.type_only,
+        );
+    }
+
+    let target = request_dedup_key(lang, req);
+    block
+        .imports
+        .iter()
+        .map(|imp| statement_dedup_key(lang, imp))
+        .any(|key| key == target)
+}
+
+fn uses_form_aware_dedup(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::Solidity
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Java
+            | LangId::CSharp
+            | LangId::Php
+            | LangId::Kotlin
+            | LangId::Scala
+            | LangId::Swift
+            | LangId::Ruby
+            | LangId::Lua
+            | LangId::Perl
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportDedupKey {
+    module_path: String,
+    kind: ImportKind,
+    form: ImportForm,
+}
+
+fn statement_dedup_key(lang: LangId, imp: &ImportStatement) -> ImportDedupKey {
+    canonical_dedup_key(
+        lang,
+        ImportDedupKey {
+            module_path: imp.module_path.clone(),
+            kind: imp.kind,
+            form: imp.form.clone(),
+        },
+    )
+}
+
+fn request_dedup_key(lang: LangId, req: &ImportRequest<'_>) -> ImportDedupKey {
+    let key = match lang {
+        LangId::Solidity => {
+            let kind = if req.names.is_empty() && req.namespace.is_none() && req.alias.is_none() {
+                ImportKind::SideEffect
+            } else {
+                ImportKind::Value
+            };
+            ImportDedupKey {
+                module_path: req.module_path.to_string(),
+                kind,
+                form: ImportForm::Solidity {
+                    named: req.names.to_vec(),
+                    namespace: req.namespace.map(str::to_string),
+                    alias: req.alias.map(str::to_string),
+                },
+            }
+        }
+        LangId::C | LangId::Cpp => structured_dedup_key(
+            req.module_path,
+            ImportKind::SideEffect,
+            &[],
+            None,
+            None,
+            &[],
+            Some(req.import_kind.or(req.default_import).unwrap_or("system")),
+        ),
+        LangId::Java => {
+            let (module_path, modifiers) = wildcard_suffix_request(
+                req.module_path,
+                req.modifiers,
+                req.default_import == Some("*"),
+            );
+            structured_dedup_key(
+                &module_path,
+                ImportKind::Value,
+                &[],
+                None,
+                None,
+                &modifiers,
+                None,
+            )
+        }
+        LangId::CSharp => structured_dedup_key(
+            req.module_path,
+            ImportKind::Value,
+            &[],
+            None,
+            req.alias,
+            req.modifiers,
+            None,
+        ),
+        LangId::Php => structured_dedup_key(
+            req.module_path,
+            ImportKind::Value,
+            &[],
+            None,
+            req.alias,
+            req.modifiers,
+            req.import_kind,
+        ),
+        LangId::Kotlin => {
+            let wildcard = req.default_import == Some("*") || req.module_path.ends_with(".*");
+            let (module_path, modifiers) =
+                wildcard_suffix_request(req.module_path, req.modifiers, wildcard);
+            let alias = req
+                .alias
+                .or(req.default_import.filter(|value| *value != "*"));
+            structured_dedup_key(
+                &module_path,
+                ImportKind::Value,
+                &[],
+                None,
+                alias,
+                &modifiers,
+                None,
+            )
+        }
+        LangId::Scala => scala_request_dedup_key(req),
+        LangId::Swift => structured_dedup_key(
+            req.module_path,
+            ImportKind::Value,
+            &[],
+            None,
+            None,
+            req.modifiers,
+            req.import_kind,
+        ),
+        LangId::Ruby => {
+            let mut modifiers = req.modifiers.to_vec();
+            if !modifiers
+                .iter()
+                .any(|modifier| modifier == "quote:single" || modifier == "quote:double")
+            {
+                modifiers.push("quote:single".to_string());
+            }
+            structured_dedup_key(
+                req.module_path,
+                ImportKind::SideEffect,
+                &[],
+                None,
+                None,
+                &modifiers,
+                Some(req.import_kind.unwrap_or("require")),
+            )
+        }
+        LangId::Lua => {
+            let alias = req.default_import.or(req.alias);
+            let kind = if alias.is_some() {
+                ImportKind::Value
+            } else {
+                ImportKind::SideEffect
+            };
+            structured_dedup_key(req.module_path, kind, &[], None, alias, req.modifiers, None)
+        }
+        LangId::Perl => structured_dedup_key(
+            req.module_path,
+            ImportKind::SideEffect,
+            &[],
+            None,
+            None,
+            req.modifiers,
+            Some(req.import_kind.unwrap_or("use")),
+        ),
+        _ => structured_dedup_key(
+            req.module_path,
+            if req.type_only {
+                ImportKind::Type
+            } else {
+                ImportKind::Value
+            },
+            req.names,
+            req.namespace,
+            req.alias,
+            req.modifiers,
+            req.import_kind,
+        ),
+    };
+
+    canonical_dedup_key(lang, key)
+}
+
+fn structured_dedup_key(
+    module_path: &str,
+    kind: ImportKind,
+    named: &[String],
+    namespace: Option<&str>,
+    alias: Option<&str>,
+    modifiers: &[String],
+    import_kind: Option<&str>,
+) -> ImportDedupKey {
+    ImportDedupKey {
+        module_path: module_path.to_string(),
+        kind,
+        form: ImportForm::Structured {
+            named: named.to_vec(),
+            namespace: namespace.map(str::to_string),
+            alias: alias.map(str::to_string),
+            modifiers: modifiers.to_vec(),
+            import_kind: import_kind.map(str::to_string),
+        },
+    }
+}
+
+fn wildcard_suffix_request(
+    module_path: &str,
+    modifiers: &[String],
+    wildcard: bool,
+) -> (String, Vec<String>) {
+    let stripped = module_path.strip_suffix(".*").unwrap_or(module_path);
+    let mut modifiers = modifiers.to_vec();
+    if (wildcard || stripped.len() != module_path.len())
+        && !modifiers.iter().any(|modifier| modifier == "wildcard")
+    {
+        modifiers.push("wildcard".to_string());
+    }
+    (stripped.to_string(), modifiers)
+}
+
+fn scala_request_dedup_key(req: &ImportRequest<'_>) -> ImportDedupKey {
+    let mut module_path = req.module_path.to_string();
+    let mut names: Vec<String> = req
+        .names
+        .iter()
+        .map(|name| normalize_scala_selector_for_dedup(name))
+        .collect();
+    let mut modifiers = req.modifiers.to_vec();
+    let mut import_kind = req.import_kind.map(str::to_string);
+
+    if req.default_import == Some("given") || module_path.ends_with(".given") {
+        import_kind.get_or_insert_with(|| "given".to_string());
+        if let Some(stripped) = module_path.strip_suffix(".given") {
+            module_path = stripped.to_string();
+        }
+    }
+
+    if matches!(req.default_import, Some("*") | Some("_"))
+        || matches!(req.namespace, Some("*") | Some("_"))
+        || module_path.ends_with(".*")
+        || module_path.ends_with("._")
+    {
+        if !modifiers.iter().any(|modifier| modifier == "wildcard") {
+            modifiers.push("wildcard".to_string());
+        }
+        module_path = module_path
+            .strip_suffix(".*")
+            .or_else(|| module_path.strip_suffix("._"))
+            .unwrap_or(&module_path)
+            .to_string();
+    }
+
+    if names.is_empty() {
+        if let Some(alias) = req.alias.filter(|alias| !alias.is_empty()) {
+            if let Some((prefix, leaf)) = module_path.rsplit_once('.') {
+                names.push(format!("{leaf} as {alias}"));
+                module_path = prefix.to_string();
+            }
+        }
+    }
+
+    structured_dedup_key(
+        &module_path,
+        ImportKind::Value,
+        &names,
+        None,
+        None,
+        &modifiers,
+        import_kind.as_deref(),
+    )
+}
+
+fn normalize_scala_selector_for_dedup(name: &str) -> String {
+    let trimmed = name.trim();
+    if let Some((from, to)) = trimmed.split_once("=>") {
+        format!("{} as {}", from.trim(), to.trim())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn canonical_dedup_key(lang: LangId, mut key: ImportDedupKey) -> ImportDedupKey {
+    match &mut key.form {
+        ImportForm::Structured { named, .. } | ImportForm::Solidity { named, .. } => {
+            sort_named_specifiers(named);
+        }
+        ImportForm::Es { named, .. } | ImportForm::Python { named, .. } => {
+            sort_named_specifiers(named);
+        }
+        ImportForm::RustUse { named, .. } => {
+            sort_named_specifiers(named);
+        }
+        ImportForm::Go { .. } => {}
+    }
+
+    if matches!(lang, LangId::Java | LangId::Kotlin) {
+        if let Some(stripped) = key.module_path.strip_suffix(".*") {
+            key.module_path = stripped.to_string();
+        }
+    } else if matches!(lang, LangId::Scala) {
+        key.module_path = key
+            .module_path
+            .strip_suffix(".given")
+            .or_else(|| key.module_path.strip_suffix(".*"))
+            .or_else(|| key.module_path.strip_suffix("._"))
+            .unwrap_or(&key.module_path)
+            .to_string();
+    }
+
+    key
 }
 
 fn sort_named_specifiers(names: &mut [String]) {

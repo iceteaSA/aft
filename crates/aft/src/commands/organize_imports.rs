@@ -86,6 +86,12 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if lang == LangId::Vue {
+        if let Err(err) = imports::vue_single_script_content_range(&_tree) {
+            return Response::error(&req.id, err.code(), err.message("organize_imports"));
+        }
+    }
+
     if block.imports.is_empty() {
         log::debug!("organize_imports: {} (no imports)", file);
         return Response::success(
@@ -238,7 +244,7 @@ fn organize(
     for (group, imps) in &groups {
         let (organized, removed) = if matches!(lang, LangId::Rust) {
             organize_rust_group(imps)
-        } else if matches!(lang, LangId::Scala) {
+        } else if should_preserve_raw_on_organize(lang) {
             organize_raw_preserving_group(imps)
         } else {
             organize_generic_group(imps, lang)
@@ -250,6 +256,25 @@ fn organize(
     }
 
     (result, total_removed)
+}
+
+fn should_preserve_raw_on_organize(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::Scala
+            | LangId::Java
+            | LangId::CSharp
+            | LangId::Php
+            | LangId::Kotlin
+            | LangId::Solidity
+            | LangId::Swift
+            | LangId::Ruby
+            | LangId::Lua
+            | LangId::Perl
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Vue
+    )
 }
 
 /// An organized import ready for code generation.

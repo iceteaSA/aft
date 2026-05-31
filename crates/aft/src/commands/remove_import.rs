@@ -93,13 +93,27 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    let module_owned;
+    let module = if matches!(lang, LangId::C | LangId::Cpp) {
+        module_owned = imports::normalize_include_module(module).0;
+        module_owned.as_str()
+    } else {
+        module
+    };
+
     // --- Parse file and imports ---
-    let (source, _tree, block) = match imports::parse_file_imports(&path, lang) {
+    let (source, tree, block) = match imports::parse_file_imports(&path, lang) {
         Ok(result) => result,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };
+
+    if lang == LangId::Vue {
+        if let Err(err) = imports::vue_single_script_content_range(&tree) {
+            return Response::error(&req.id, err.code(), err.message("remove_import"));
+        }
+    }
 
     // --- Find matching import ---
     let matching: Vec<(usize, &imports::ImportStatement)> = block
@@ -239,6 +253,19 @@ fn remove_name_from_imports(
     let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
     for (_, imp) in matching {
+        if lang == LangId::Scala {
+            if let Some(replacement) = remove_name_from_scala_import(imp, target_name) {
+                match replacement {
+                    Some(new_line) => edits.push((imp.byte_range.clone(), new_line)),
+                    None => {
+                        let range = line_range(source, &imp.byte_range);
+                        edits.push((range, String::new()));
+                    }
+                }
+            }
+            continue;
+        }
+
         // Match against either the imported name or the local binding so the
         // caller can ask to remove `input` even when the specifier is stored
         // verbatim as `stdin as input` (TS/JS).
@@ -303,6 +330,106 @@ fn remove_name_from_imports(
     }
 
     result
+}
+
+fn remove_name_from_scala_import(
+    imp: &imports::ImportStatement,
+    target_name: &str,
+) -> Option<Option<String>> {
+    let any_match = imp
+        .names
+        .iter()
+        .any(|name| imports::specifier_matches(name, target_name));
+    if !any_match {
+        return None;
+    }
+
+    let remaining_names: Vec<String> = imp
+        .names
+        .iter()
+        .filter(|name| !imports::specifier_matches(name, target_name))
+        .cloned()
+        .collect();
+    if remaining_names.is_empty() {
+        return Some(None);
+    }
+
+    let replacement =
+        rewrite_scala_selector_list(&imp.raw_text, target_name).unwrap_or_else(|| {
+            imports::generate_import_line(
+                LangId::Scala,
+                &imp.module_path,
+                &remaining_names,
+                imp.default_import.as_deref(),
+                false,
+            )
+        });
+    Some(Some(replacement))
+}
+
+fn rewrite_scala_selector_list(raw_text: &str, target_name: &str) -> Option<String> {
+    let open = raw_text.find('{')?;
+    let close = raw_text.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+
+    let body = &raw_text[open + 1..close];
+    let selectors = split_scala_selectors(body);
+    if selectors.is_empty() {
+        return None;
+    }
+
+    let kept: Vec<String> = selectors
+        .iter()
+        .filter(|selector| !scala_selector_matches(selector, target_name))
+        .map(|selector| selector.trim().to_string())
+        .filter(|selector| !selector.is_empty())
+        .collect();
+
+    if kept.len() == selectors.len() || kept.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "{}{}{}",
+        &raw_text[..open + 1],
+        kept.join(", "),
+        &raw_text[close..]
+    ))
+}
+
+fn split_scala_selectors(body: &str) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in body.char_indices() {
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                selectors.push(body[start..idx].to_string());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    selectors.push(body[start..].to_string());
+    selectors
+}
+
+fn scala_selector_matches(selector: &str, target_name: &str) -> bool {
+    let normalized = normalize_scala_selector(selector);
+    imports::specifier_matches(&normalized, target_name)
+}
+
+fn normalize_scala_selector(selector: &str) -> String {
+    let trimmed = selector.trim();
+    if let Some((from, to)) = trimmed.split_once("=>") {
+        format!("{} as {}", from.trim(), to.trim())
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Remove entire import statements for all matching imports.

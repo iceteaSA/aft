@@ -1,0 +1,11 @@
+<?php
+
+namespace Demo;
+
+use App\Alpha;
+use App\{Grouped, Other as Alias};
+use Zed\Last;
+use const App\VERSION;
+use function App\helper;
+
+class C {}

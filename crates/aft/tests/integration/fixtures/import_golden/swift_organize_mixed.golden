@@ -1,8 +1,8 @@
 import Foundation
 import UIKit.UIView
 
-import struct Foo.Bar
-import Foo.Zed
 @testable import MyApp
+import Foo.Zed
+import struct Foo.Bar
 
 struct App {}

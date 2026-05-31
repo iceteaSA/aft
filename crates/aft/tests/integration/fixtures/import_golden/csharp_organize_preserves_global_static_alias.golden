@@ -1,0 +1,10 @@
+global using System;
+global using static System.Linq.Enumerable;
+using Con = System.Console;
+using static System.Math;
+
+using Newtonsoft.Json;
+
+namespace App;
+
+class C {}

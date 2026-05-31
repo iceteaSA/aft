@@ -383,6 +383,19 @@ fn scenarios() -> Vec<Scenario> {
             }],
         },
         Scenario {
+            name: "sol_add_spdx_only_keeps_license_first",
+            ext: "sol",
+            input: r#"// SPDX-License-Identifier: MIT
+contract C {}
+"#,
+            ops: &[Op::Add {
+                module: "./Dep.sol",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
             name: "sol_remove_named",
             ext: "sol",
             input: "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport { A, B } from \"./Lib.sol\";\n\ncontract C {}\n",
@@ -428,6 +441,25 @@ fn scenarios() -> Vec<Scenario> {
                 names: &[],
                 namespace: None,
                 alias: Some("Utils"),
+                modifiers: &[],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "sol_add_alias_not_deduped_by_side_effect",
+            ext: "sol",
+            input: r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "./X.sol";
+
+contract C {}
+"#,
+            ops: &[Op::AddForm {
+                module: "./X.sol",
+                names: &[],
+                namespace: None,
+                alias: Some("X"),
                 modifiers: &[],
                 import_kind: None,
             }],
@@ -491,6 +523,21 @@ fn scenarios() -> Vec<Scenario> {
                 module: "java.io.File",
                 name: None,
             }],
+        },
+        Scenario {
+            name: "java_organize_preserves_static_and_wildcard",
+            ext: "java",
+            input: r#"package com.example;
+
+import org.example.Zed;
+import static java.util.Collections.emptyList;
+import java.util.*;
+import static java.util.Arrays.*;
+import java.io.File;
+
+class C {}
+"#,
+            ops: &[Op::Organize],
         },
         // ---- Kotlin (structured alias + wildcard imports) ----
         Scenario {
@@ -618,6 +665,21 @@ fn scenarios() -> Vec<Scenario> {
             }],
         },
         Scenario {
+            name: "csharp_organize_preserves_global_static_alias",
+            ext: "cs",
+            input: r#"using Newtonsoft.Json;
+global using System;
+using static System.Math;
+using Con = System.Console;
+global using static System.Linq.Enumerable;
+
+namespace App;
+
+class C {}
+"#,
+            ops: &[Op::Organize],
+        },
+        Scenario {
             name: "php_add_plain_use",
             ext: "php",
             input: "<?php\n\nnamespace Demo;\n\nuse App\\Existing;\n\nclass C {}\n",
@@ -675,6 +737,23 @@ fn scenarios() -> Vec<Scenario> {
                 module: "App\\Unused",
                 name: None,
             }],
+        },
+        Scenario {
+            name: "php_organize_preserves_grouped_and_kind_uses",
+            ext: "php",
+            input: r#"<?php
+
+namespace Demo;
+
+use Zed\Last;
+use App\{Grouped, Other as Alias};
+use function App\helper;
+use App\Alpha;
+use const App\VERSION;
+
+class C {}
+"#,
+            ops: &[Op::Organize],
         },
         // ---- Scala (Scala 2/3 import forms: wildcard, selectors, rename, given) ----
         Scenario {
@@ -760,6 +839,34 @@ fn scenarios() -> Vec<Scenario> {
             input: "import scala.collection.mutable._\nimport java.util.{List => JList, Map => JMap}\n\nobject Main { val x = 1 }\n",
             ops: &[Op::Organize],
         },
+        Scenario {
+            name: "scala_add_preserves_existing_scala2_imports",
+            ext: "scala",
+            input: r#"import a.{b => c}
+import a._
+
+object Main { val x = 1 }
+"#,
+            ops: &[Op::Add {
+                module: "z.Y",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "scala_remove_selector_preserves_scala2_arrow",
+            ext: "scala",
+            input: r#"import a.{b => c, d}
+import a._
+
+object Main { val x = 1 }
+"#,
+            ops: &[Op::Remove {
+                module: "a",
+                name: Some("d"),
+            }],
+        },
         // ---- Swift (structured modifiers + kind imports) ----
         Scenario {
             name: "swift_add_plain",
@@ -776,6 +883,21 @@ fn scenarios() -> Vec<Scenario> {
             name: "swift_add_testable",
             ext: "swift",
             input: "import Foundation\nstruct App {}\n",
+            ops: &[Op::AddForm {
+                module: "MyApp",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["@testable"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "swift_add_duplicate_testable_is_noop",
+            ext: "swift",
+            input: r#"@testable import MyApp
+struct App {}
+"#,
             ops: &[Op::AddForm {
                 module: "MyApp",
                 names: &[],
@@ -818,6 +940,33 @@ fn scenarios() -> Vec<Scenario> {
             name: "ruby_add_require",
             ext: "rb",
             input: "puts 'hi'\n",
+            ops: &[Op::Add {
+                module: "json",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "ruby_add_require_not_deduped_by_load",
+            ext: "rb",
+            input: r#"load 'boot.rb'
+
+puts 'hi'
+"#,
+            ops: &[Op::Add {
+                module: "boot.rb",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "ruby_add_after_shebang",
+            ext: "rb",
+            input: r#"#!/usr/bin/env ruby
+puts 'hi'
+"#,
             ops: &[Op::Add {
                 module: "json",
                 names: &[],
@@ -994,6 +1143,22 @@ fn scenarios() -> Vec<Scenario> {
                 import_kind: Some("local"),
             }],
         },
+        Scenario {
+            name: "c_add_local_same_header_as_system_not_duplicate",
+            ext: "c",
+            input: r#"#include <config.h>
+
+int main(void) { return 0; }
+"#,
+            ops: &[Op::AddForm {
+                module: "\"config.h\"",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: None,
+            }],
+        },
         // Agents naturally pass includes WITH the delimiter. The engine must
         // strip it and infer the kind rather than double-wrapping (which would
         // generate `#include <<string>>` and silently roll back).
@@ -1051,6 +1216,20 @@ fn scenarios() -> Vec<Scenario> {
             }],
         },
         Scenario {
+            name: "c_remove_preserves_remaining_include_delimiters",
+            ext: "c",
+            input: r#"#include <stdio.h>
+#include "keep.h"
+#include <stdlib.h>
+
+int main(void) { return 0; }
+"#,
+            ops: &[Op::Remove {
+                module: "stdio.h",
+                name: None,
+            }],
+        },
+        Scenario {
             name: "c_organize_mixed_includes",
             ext: "h",
             input: "#include \"z_local.h\"\n#include <stdio.h>\n#include \"a_local.h\"\n#include <stdlib.h>\n\nvoid f(void);\n",
@@ -1089,6 +1268,19 @@ fn scenarios() -> Vec<Scenario> {
             input: "#include <vector>\n#include \"unused.hpp\"\n#include \"keep.hpp\"\n\nint main() { return 0; }\n",
             ops: &[Op::Remove {
                 module: "unused.hpp",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "cpp_remove_delimited_system_include",
+            ext: "cpp",
+            input: r#"#include <vector>
+#include "keep.hpp"
+
+int main() { return 0; }
+"#,
+            ops: &[Op::Remove {
+                module: "<vector>",
                 name: None,
             }],
         },

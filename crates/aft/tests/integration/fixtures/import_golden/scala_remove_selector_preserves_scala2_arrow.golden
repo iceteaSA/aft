@@ -1,0 +1,4 @@
+import a.{b => c}
+import a._
+
+object Main { val x = 1 }

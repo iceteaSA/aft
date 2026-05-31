@@ -165,8 +165,25 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if lang == LangId::Vue {
+        if let Err(err) = imports::vue_single_script_content_range(&tree) {
+            return Response::error(&req.id, err.code(), err.message("add_import"));
+        }
+    }
+
+    let import_request = imports::ImportRequest {
+        module_path: module,
+        names: &names,
+        default_import: default_import.as_deref(),
+        namespace: namespace.as_deref(),
+        alias: alias.as_deref(),
+        type_only,
+        modifiers: &modifiers,
+        import_kind: import_kind.as_deref(),
+    };
+
     // --- Check for duplicates ---
-    if imports::is_duplicate(&block, module, &names, default_import.as_deref(), type_only) {
+    if imports::is_duplicate_import_request(lang, &block, &import_request) {
         log::debug!("add_import: {} (already present)", file);
         return Response::success(
             &req.id,
@@ -207,18 +224,22 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         imports::ImportKind::Value
     };
-    let merge_target =
-        if !names.is_empty() && default_import.is_none() && !matches!(lang, LangId::Go) {
-            block.imports.iter().find(|imp| {
-                imp.module_path == module
-                    && imp.kind == target_kind
-                    && imp.namespace_import.is_none()
-                    && imp.default_import.is_none()
-                    && !imp.names.is_empty()
-            })
-        } else {
-            None
-        };
+    let merge_target = if !names.is_empty()
+        && default_import.is_none()
+        && matches!(
+            lang,
+            LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Python | LangId::Rust
+        ) {
+        block.imports.iter().find(|imp| {
+            imp.module_path == module
+                && imp.kind == target_kind
+                && imp.namespace_import.is_none()
+                && imp.default_import.is_none()
+                && !imp.names.is_empty()
+        })
+    } else {
+        None
+    };
 
     let (insert_offset, replace_end, insert_text, merged_into_existing) = if let Some(existing) =
         merge_target
@@ -287,6 +308,10 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
                 Some((start, _end)) => (skip_one_newline(start), false, false),
                 None => imports::find_insertion_point(&source, &block, group, module, type_only),
             }
+        } else if let Some(anchor) = shebang_anchor(lang, &source) {
+            let at = skip_one_newline(anchor);
+            let next_is_newline = at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
+            (at, false, !next_is_newline && at < source.len())
         } else if let Some(anchor) = header_prologue_anchor(lang, &source, &tree) {
             let at = skip_one_newline(anchor);
             // Blank line before separates the import from the header. Blank line
@@ -294,6 +319,10 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             // already followed by a blank line doesn't double up.
             let next_is_newline = at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
             (at, true, !next_is_newline && at < source.len())
+        } else if let Some(anchor) = spdx_license_anchor(lang, &source) {
+            let at = skip_one_newline(anchor);
+            let next_is_newline = at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
+            (at, false, !next_is_newline && at < source.len())
         } else {
             imports::find_insertion_point(&source, &block, group, module, type_only)
         };
@@ -303,19 +332,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             let in_group = imports::go_has_grouped_import(&source, &tree).is_some();
             imports::generate_go_import_line_pub(module, default_import.as_deref(), in_group)
         } else {
-            imports::generate_import(
-                lang,
-                &imports::ImportRequest {
-                    module_path: module,
-                    names: &names,
-                    default_import: default_import.as_deref(),
-                    namespace: namespace.as_deref(),
-                    alias: alias.as_deref(),
-                    type_only,
-                    modifiers: &modifiers,
-                    import_kind: import_kind.as_deref(),
-                },
-            )
+            imports::generate_import(lang, &import_request)
         };
 
         // Build the text to insert
@@ -412,6 +429,36 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
     Response::success(&req.id, result)
+}
+
+fn shebang_anchor(lang: LangId, source: &str) -> Option<usize> {
+    if !matches!(
+        lang,
+        LangId::TypeScript
+            | LangId::JavaScript
+            | LangId::Python
+            | LangId::Ruby
+            | LangId::Perl
+            | LangId::Lua
+    ) || !source.starts_with("#!")
+    {
+        return None;
+    }
+
+    Some(source.find('\n').unwrap_or(source.len()))
+}
+
+fn spdx_license_anchor(lang: LangId, source: &str) -> Option<usize> {
+    if lang != LangId::Solidity {
+        return None;
+    }
+
+    let first_line_end = source.find('\n').unwrap_or(source.len());
+    let first_line = &source[..first_line_end];
+    first_line
+        .trim_start()
+        .starts_with("// SPDX-License-Identifier:")
+        .then_some(first_line_end)
 }
 
 /// For a file with a language-level header prologue (package/namespace/pragma
