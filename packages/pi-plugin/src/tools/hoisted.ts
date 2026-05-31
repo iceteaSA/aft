@@ -85,7 +85,7 @@ function externalDirectoryPromptTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
 }
 
-async function assertExternalDirectoryPermission(
+export async function assertExternalDirectoryPermission(
   extCtx: {
     cwd: string;
     hasUI?: boolean;

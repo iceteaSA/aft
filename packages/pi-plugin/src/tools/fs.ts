@@ -7,6 +7,7 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission } from "./hoisted.js";
 import {
   accentPath,
   type RenderContextLike,
@@ -131,6 +132,15 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         _onUpdate,
         extCtx,
       ) {
+        const checked = new Set<string>();
+        for (const file of params.files) {
+          if (checked.has(file)) continue;
+          checked.add(file);
+          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+          });
+        }
+
         const bridge = bridgeFor(ctx, extCtx.cwd);
         // Single batched call so every file shares one op_id; one
         // `aft_safety undo` then restores the whole delete atomically.
@@ -189,6 +199,13 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         _onUpdate,
         extCtx,
       ) {
+        const checked = new Set([params.filePath, params.destination]);
+        for (const file of checked) {
+          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+          });
+        }
+
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const response = await callBridge(
           bridge,

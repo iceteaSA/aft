@@ -8,6 +8,7 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission } from "./hoisted.js";
 import {
   accentPath,
   asRecord,
@@ -125,6 +126,10 @@ export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): voi
       extCtx,
     ) {
       validateTransformParams(params);
+
+      await assertExternalDirectoryPermission(extCtx, params.filePath, "modify", {
+        restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+      });
 
       const bridge = bridgeFor(ctx, extCtx.cwd);
       // Rust dispatch accepts the op name directly (add_member, add_derive, etc.)

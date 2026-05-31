@@ -15,6 +15,7 @@ import {
   optionalInt,
   textResult,
 } from "./_shared.js";
+import { assertExternalDirectoryPermission } from "./hoisted.js";
 import {
   accentPath,
   asNumber,
@@ -127,7 +128,6 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       _onUpdate,
       extCtx,
     ) {
-      const bridge = bridgeFor(ctx, extCtx.cwd);
       const commandMap: Record<string, string> = {
         move: "move_symbol",
         extract: "extract_function",
@@ -146,6 +146,20 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
         throw new Error("'name' is required for 'extract' op");
       }
 
+      const permissionTargets =
+        params.op === "move" && !isEmptyParam(params.destination)
+          ? [params.filePath, params.destination as string]
+          : [params.filePath];
+      const checked = new Set<string>();
+      for (const target of permissionTargets) {
+        if (checked.has(target)) continue;
+        checked.add(target);
+        await assertExternalDirectoryPermission(extCtx, target, "modify", {
+          restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+        });
+      }
+
+      const bridge = bridgeFor(ctx, extCtx.cwd);
       const req: Record<string, unknown> = { file: params.filePath };
       // Use isEmptyParam everywhere so "" / [] / null don't slip through as
       // valid string params that Rust then has to deal with.

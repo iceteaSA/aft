@@ -7,6 +7,7 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission } from "./hoisted.js";
 import {
   accentPath,
   asNumber,
@@ -172,6 +173,26 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       if ((params.op === "checkpoint" || params.op === "restore") && !params.name) {
         throw new Error(`op='${params.op}' requires 'name'`);
       }
+
+      if (params.op === "undo" && params.filePath) {
+        await assertExternalDirectoryPermission(extCtx, params.filePath, "modify", {
+          restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+        });
+      }
+      if (params.op === "checkpoint") {
+        const files = params.files ?? (params.filePath ? [params.filePath] : undefined);
+        if (Array.isArray(files)) {
+          const checked = new Set<string>();
+          for (const file of files) {
+            if (checked.has(file)) continue;
+            checked.add(file);
+            await assertExternalDirectoryPermission(extCtx, file, "modify", {
+              restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+            });
+          }
+        }
+      }
+
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const commandMap: Record<string, string> = {
         undo: "undo",

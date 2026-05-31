@@ -4,10 +4,16 @@
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission } from "./hoisted.js";
 import {
   asNumber,
   asRecord,
@@ -89,6 +95,20 @@ function appendScopeSections(response: Record<string, unknown>, sections: string
     sections.push(
       `${theme.fg("muted", "Scope warnings:")}\n${warningStrings.map((w) => `  ${w}`).join("\n")}`,
     );
+  }
+}
+async function assertAstPathsPermission(
+  extCtx: ExtensionContext,
+  paths: unknown,
+  action: "modify" | "search",
+  restrictToProjectRoot: boolean,
+): Promise<void> {
+  if (isEmptyParam(paths) || !Array.isArray(paths)) return;
+  const checked = new Set<string>();
+  for (const path of paths) {
+    if (typeof path !== "string" || checked.has(path)) continue;
+    checked.add(path);
+    await assertExternalDirectoryPermission(extCtx, path, action, { restrictToProjectRoot });
   }
 }
 
@@ -261,6 +281,13 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         _onUpdate,
         extCtx,
       ) {
+        await assertAstPathsPermission(
+          extCtx,
+          params.paths,
+          "search",
+          ctx.config.restrict_to_project_root ?? false,
+        );
+
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = {
           pattern: params.pattern,
@@ -298,6 +325,13 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         _onUpdate,
         extCtx,
       ) {
+        await assertAstPathsPermission(
+          extCtx,
+          params.paths,
+          params.dryRun === true ? "search" : "modify",
+          ctx.config.restrict_to_project_root ?? false,
+        );
+
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = {
           pattern: params.pattern,

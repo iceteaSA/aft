@@ -8,6 +8,7 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission } from "./hoisted.js";
 import {
   accentPath,
   asNumber,
@@ -164,6 +165,9 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       if ((params.op === "add" || params.op === "remove") && !params.module) {
         throw new Error(`op='${params.op}' requires 'module'`);
       }
+      await assertExternalDirectoryPermission(extCtx, params.filePath, "modify", {
+        restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+      });
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const commandMap: Record<string, string> = {
         add: "add_import",
