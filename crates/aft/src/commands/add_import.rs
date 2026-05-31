@@ -157,6 +157,14 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     let module = module_owned.as_str();
     let import_kind = import_kind.or_else(|| inferred_import_kind.map(String::from));
 
+    if let Err(reason) = validate_module_path_for_add(lang, module) {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            format!("add_import: invalid module path '{module}': {reason}"),
+        );
+    }
+
     // --- Parse file and imports ---
     let (source, tree, block) = match imports::parse_file_imports(&path, lang) {
         Ok(result) => result,
@@ -474,7 +482,7 @@ fn spdx_license_anchor(lang: LangId, source: &str) -> Option<usize> {
 /// `strong` kinds are header declarations whose end advances the anchor;
 /// `skippable` kinds (comments, PHP open tag) are stepped over without
 /// anchoring so a leading license comment alone never displaces the import.
-fn header_prologue_anchor(lang: LangId, _source: &str, tree: &tree_sitter::Tree) -> Option<usize> {
+fn header_prologue_anchor(lang: LangId, source: &str, tree: &tree_sitter::Tree) -> Option<usize> {
     let (strong, skippable): (&[&str], &[&str]) = match lang {
         LangId::Go => (&["package_clause"], &["comment"]),
         LangId::Java => (&["package_declaration"], &["comment"]),
@@ -492,7 +500,11 @@ fn header_prologue_anchor(lang: LangId, _source: &str, tree: &tree_sitter::Tree)
     for child in root.named_children(&mut cursor) {
         let kind = child.kind();
         if strong.contains(&kind) {
-            anchor = Some(child.end_byte());
+            anchor = if lang == LangId::Php && kind == "namespace_definition" {
+                php_braced_namespace_anchor(source, child).or(Some(child.end_byte()))
+            } else {
+                Some(child.end_byte())
+            };
         } else if skippable.contains(&kind) {
             continue;
         } else {
@@ -500,4 +512,59 @@ fn header_prologue_anchor(lang: LangId, _source: &str, tree: &tree_sitter::Tree)
         }
     }
     anchor
+}
+
+fn validate_module_path_for_add(lang: LangId, module: &str) -> Result<(), &'static str> {
+    if !uses_strict_module_path_validation(lang) {
+        return Ok(());
+    }
+
+    let module = module.trim();
+    if module.starts_with('/') {
+        return Err("absolute paths are not allowed for this language");
+    }
+    if contains_parent_path_segment(module) {
+        return Err("parent path traversal segments are not allowed for this language");
+    }
+
+    Ok(())
+}
+
+fn uses_strict_module_path_validation(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::C
+            | LangId::Cpp
+            | LangId::Solidity
+            | LangId::Php
+            | LangId::Java
+            | LangId::Kotlin
+            | LangId::Scala
+            | LangId::CSharp
+    )
+}
+
+fn contains_parent_path_segment(module: &str) -> bool {
+    module
+        .split(|ch| ch == '/' || ch == '\\')
+        .any(|segment| segment == "..")
+}
+
+fn php_braced_namespace_anchor(source: &str, node: tree_sitter::Node<'_>) -> Option<usize> {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.kind() == "{" {
+                return Some(child.end_byte());
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    source[node.start_byte()..node.end_byte()]
+        .find('{')
+        .map(|offset| node.start_byte() + offset + 1)
 }

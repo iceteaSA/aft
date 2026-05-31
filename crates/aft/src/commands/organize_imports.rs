@@ -100,6 +100,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
                 "file": file,
                 "groups": [],
                 "removed_duplicates": 0,
+                "no_op": true,
             }),
         );
     }

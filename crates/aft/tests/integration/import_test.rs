@@ -155,6 +155,68 @@ fn add_import_ts_relative_group() {
 }
 
 #[test]
+fn add_import_ts_allows_parent_relative_module() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("parent_relative.ts");
+    fs::write(&file, "export const x = 1;\n").unwrap();
+
+    let resp = send_add_import(
+        &mut aft,
+        "imp-parent-relative",
+        &file.display().to_string(),
+        "../config",
+        Some(&["Config"]),
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "relative add should succeed: {resp:?}"
+    );
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("import { Config } from '../config';"),
+        "single-parent ES relative imports must remain allowed:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_rejects_c_path_traversal_and_absolute_modules() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("unsafe_include.c");
+    let original = "int main(void) { return 0; }\n";
+    fs::write(&file, original).unwrap();
+    let file_str = file.display().to_string();
+
+    for (id, module) in [
+        ("imp-c-traversal", "../../etc/passwd"),
+        ("imp-c-absolute", "/etc/passwd"),
+        ("imp-c-quoted-traversal", "\"../../secret.h\""),
+    ] {
+        let resp = send_add_import(&mut aft, id, &file_str, module, None, None, false);
+        assert_eq!(
+            resp["success"], false,
+            "dangerous module {module:?} should be rejected: {resp:?}"
+        );
+        assert_eq!(resp["code"], "invalid_request");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            original,
+            "rejected module {module:?} must not mutate the file"
+        );
+    }
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
 fn add_import_ts_dedup() {
     let mut aft = AftProcess::spawn();
     let (_dir, file) = temp_copy("imports_ts.ts");
@@ -832,6 +894,31 @@ fn remove_import_missing_module_reports_not_removed() {
     assert_eq!(resp["success"], true, "request should complete: {resp:?}");
     assert_eq!(resp["removed"], false, "nothing should be removed");
     assert_eq!(resp["reason"], "module_not_found");
+    assert_eq!(resp["no_op"], true, "no-match removes must report no_op");
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn remove_import_missing_name_reports_no_op() {
+    let mut aft = AftProcess::spawn();
+    let (_dir, file) = temp_copy("imports_ts.ts");
+    let file_str = file.display().to_string();
+
+    let resp = send_remove_import(
+        &mut aft,
+        "rm-missing-name",
+        &file_str,
+        "react",
+        Some("useMemo"),
+    );
+
+    assert_eq!(resp["success"], true, "request should complete: {resp:?}");
+    assert_eq!(resp["removed"], false, "nothing should be removed");
+    assert_eq!(resp["reason"], "name_not_found");
+    assert_eq!(resp["name"], "useMemo");
+    assert_eq!(resp["no_op"], true, "name misses must report no_op");
 
     fs::remove_file(&file).ok();
     aft.shutdown();
@@ -879,6 +966,26 @@ fn remove_import_preserves_default_when_named_removed() {
 // ===========================================================================
 // organize_imports tests
 // ===========================================================================
+
+#[test]
+fn organize_imports_without_imports_reports_no_op() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("no_imports.ts");
+    let original = "export const x = 1;\n";
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-no-imports", &file.display().to_string());
+
+    assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
+    assert_eq!(resp["groups"].as_array().unwrap().len(), 0);
+    assert_eq!(resp["removed_duplicates"], 0);
+    assert_eq!(resp["no_op"], true, "no-import organize must report no_op");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
 
 #[test]
 fn organize_imports_ts_regroups_and_sorts() {

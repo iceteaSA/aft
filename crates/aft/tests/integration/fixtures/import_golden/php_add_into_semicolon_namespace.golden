@@ -1,0 +1,7 @@
+<?php
+
+namespace Demo;
+
+use App\Repository;
+
+class C {}

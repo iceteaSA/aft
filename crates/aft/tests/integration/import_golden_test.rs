@@ -1076,6 +1076,28 @@ puts 'hi'
                 type_only: false,
             }],
         },
+        Scenario {
+            name: "php_add_into_semicolon_namespace",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nclass C {}\n",
+            ops: &[Op::Add {
+                module: "App\\Repository",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "php_add_into_braced_namespace",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo {\nclass C {}\n}\n",
+            ops: &[Op::Add {
+                module: "App\\Service",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
         // ---- Perl (use/require/no statements with preserved raw args) ----
         Scenario {
             name: "perl_add_use",

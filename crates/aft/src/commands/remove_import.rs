@@ -129,6 +129,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
             "removed": false,
             "module": module,
             "reason": "module_not_found",
+            "no_op": true,
         });
         if let Some(ref n) = name {
             result["name"] = serde_json::json!(n);
@@ -155,6 +156,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
             "removed": false,
             "module": module,
             "reason": reason,
+            "no_op": true,
         });
         if let Some(ref n) = name {
             result["name"] = serde_json::json!(n);

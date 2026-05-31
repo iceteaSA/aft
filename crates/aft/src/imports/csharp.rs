@@ -76,6 +76,9 @@ fn parse_csharp_using_directive(source: &str, node: &Node) -> Option<ImportState
     if children.iter().any(|(kind, _)| kind == "static") {
         modifiers.push("static".to_string());
     }
+    if children.iter().any(|(kind, _)| kind == "unsafe") {
+        modifiers.push("unsafe".to_string());
+    }
 
     let equals_pos = children.iter().position(|(kind, _)| kind == "=");
     let alias = equals_pos.and_then(|idx| csharp_alias_before_equals(&children, idx));
@@ -133,13 +136,14 @@ fn csharp_payload_text(children: &[(String, String)]) -> Option<String> {
 }
 
 fn is_csharp_using_syntax_token(kind: &str) -> bool {
-    matches!(kind, "global" | "using" | "static" | "=" | ";")
+    matches!(kind, "global" | "using" | "static" | "unsafe" | "=" | ";")
 }
 
 /// Generate a C# using directive from the generic structured import request.
 pub(crate) fn generate_csharp_import_line(req: &ImportRequest) -> String {
     let has_global = req.modifiers.iter().any(|m| m == "global");
     let has_static = req.alias.is_none() && req.modifiers.iter().any(|m| m == "static");
+    let has_unsafe = req.modifiers.iter().any(|m| m == "unsafe");
 
     let mut line = String::new();
     if has_global {
@@ -148,6 +152,9 @@ pub(crate) fn generate_csharp_import_line(req: &ImportRequest) -> String {
     line.push_str("using ");
     if has_static {
         line.push_str("static ");
+    }
+    if has_unsafe {
+        line.push_str("unsafe ");
     }
     if let Some(alias) = req.alias {
         line.push_str(alias);
@@ -193,14 +200,14 @@ mod tests {
 
     /// Grammar fixture: lock the tree-sitter-c-sharp node kinds the parser
     /// depends on. The current grammar emits `using_directive` with direct
-    /// keyword/token children (`global`, `using`, `static`, `=`, `;`) and path
-    /// nodes (`identifier` / `qualified_name`).
+    /// keyword/token children (`global`, `using`, `static`, `unsafe`, `=`, `;`)
+    /// and path nodes (`identifier` / `qualified_name`).
     #[test]
     fn csharp_grammar_node_kinds_are_stable() {
         let grammar = grammar_for(LangId::CSharp);
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
-        let src = "using System;\nusing static System.Math;\nusing Con = System.Console;\nglobal using System;\nglobal using static System.Math;\nnamespace App;\nclass C {}\n";
+        let src = "using System;\nusing static System.Math;\nusing unsafe System.Buffer;\nusing Con = System.Console;\nusing unsafe Ptr = System.IntPtr;\nglobal using System;\nglobal using static unsafe System.Math;\nnamespace App;\nclass C {}\n";
         let tree = parser.parse(src, None).unwrap();
         let mut kinds = BTreeSet::new();
 
@@ -225,6 +232,7 @@ mod tests {
             "qualified_name",
             "static",
             "global",
+            "unsafe",
             "=",
             ";",
         ] {
@@ -252,6 +260,23 @@ mod tests {
             &["global", "static"],
             None,
         );
+    }
+
+    #[test]
+    fn parse_csharp_unsafe_using_forms() {
+        let block = parse_csharp(
+            "using unsafe System.Buffer;\nusing static unsafe System.Math;\nusing unsafe Ptr = System.IntPtr;\nclass C {}\n",
+        );
+        assert_eq!(block.imports.len(), 3);
+
+        assert_csharp_import(&block.imports[0], "System.Buffer", &["unsafe"], None);
+        assert_csharp_import(
+            &block.imports[1],
+            "System.Math",
+            &["static", "unsafe"],
+            None,
+        );
+        assert_csharp_import(&block.imports[2], "System.IntPtr", &["unsafe"], Some("Ptr"));
     }
 
     fn assert_csharp_import(
@@ -371,6 +396,40 @@ mod tests {
             ),
             "global using static System.Math;"
         );
+
+        let unsafe_modifiers = vec!["unsafe".to_string()];
+        assert_eq!(
+            generate_import(
+                LangId::CSharp,
+                &ImportRequest {
+                    module_path: "System.Buffer",
+                    names: &[],
+                    default_import: None,
+                    namespace: None,
+                    alias: None,
+                    type_only: false,
+                    modifiers: &unsafe_modifiers,
+                    import_kind: None,
+                }
+            ),
+            "using unsafe System.Buffer;"
+        );
+        assert_eq!(
+            generate_import(
+                LangId::CSharp,
+                &ImportRequest {
+                    module_path: "System.IntPtr",
+                    names: &[],
+                    default_import: None,
+                    namespace: None,
+                    alias: Some("Ptr"),
+                    type_only: false,
+                    modifiers: &unsafe_modifiers,
+                    import_kind: None,
+                }
+            ),
+            "using unsafe Ptr = System.IntPtr;"
+        );
     }
 
     #[test]
@@ -399,6 +458,9 @@ mod tests {
             "using Con = System.Console;",
             "global using System;",
             "global using static System.Math;",
+            "using unsafe System.Buffer;",
+            "using static unsafe System.Math;",
+            "using unsafe Ptr = System.IntPtr;",
         ] {
             let block = parse_csharp(src);
             assert_eq!(block.imports.len(), 1, "parse {src:?}");
