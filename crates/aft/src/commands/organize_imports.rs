@@ -162,6 +162,19 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
+    // A rollback means post-write syntax validation failed and the file was
+    // restored — imports were NOT reorganized. Report that honestly with an
+    // error instead of claiming `organized: true`.
+    if write_result.rolled_back {
+        return Response::error(
+            &req.id,
+            "generated_invalid_syntax",
+            format!(
+                "organize_imports: reorganizing imports in {file} would produce invalid syntax; file left unchanged"
+            ),
+        );
+    }
+
     log::debug!("organize_imports: {}", file);
 
     // --- Build response ---

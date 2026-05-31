@@ -175,6 +175,19 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
+    // A rollback means post-write syntax validation failed and the file was
+    // restored — the import was NOT removed. Report that honestly with an error
+    // instead of claiming `removed: true`.
+    if write_result.rolled_back {
+        return Response::error(
+            &req.id,
+            "generated_invalid_syntax",
+            format!(
+                "remove_import: removing '{module}' from {file} would produce invalid syntax; file left unchanged"
+            ),
+        );
+    }
+
     log::debug!("remove_import: {}", file);
 
     // --- Build response ---
