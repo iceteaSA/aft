@@ -690,6 +690,7 @@ fn expand_windows_glob(full_pattern: &str) -> Vec<PathBuf> {
         .git_ignore(false)
         .git_global(false)
         .git_exclude(false)
+        .add_custom_ignore_filename(".aftignore")
         .build()
         .filter_map(Result::ok)
         .map(|entry| entry.into_path())

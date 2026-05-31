@@ -482,6 +482,7 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
 
     let walker = ignore::WalkBuilder::new(dir)
         .standard_filters(true) // honors .gitignore + hidden-file rules
+        .add_custom_ignore_filename(".aftignore")
         .filter_entry(|e| {
             // Skip noisy directories that explode walk time on real repos.
             let name = e.file_name().to_string_lossy();

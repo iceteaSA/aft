@@ -62,16 +62,20 @@ pub(crate) fn dedupe_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut keyed = Vec::new();
     for path in paths {
         let key = canonical_key(&path);
-        if keyed.iter().any(|(_, existing_key)| existing_key == &key) {
+        if keyed
+            .iter()
+            .any(|(_, existing_key, _)| existing_key == &key)
+        {
             continue;
         }
-        keyed.push((path, key));
+        let is_dir = path.is_dir();
+        keyed.push((path, key, is_dir));
     }
 
     let mut deduped = Vec::new();
-    'outer: for (index, (path, key)) in keyed.iter().enumerate() {
-        for (other_index, (_, other_key)) in keyed.iter().enumerate() {
-            if index != other_index && key.starts_with(other_key) {
+    'outer: for (index, (path, key, is_dir)) in keyed.iter().enumerate() {
+        for (other_index, (_, other_key, other_is_dir)) in keyed.iter().enumerate() {
+            if index != other_index && *is_dir && *other_is_dir && key.starts_with(other_key) {
                 continue 'outer;
             }
         }

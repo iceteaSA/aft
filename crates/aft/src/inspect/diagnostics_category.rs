@@ -348,6 +348,7 @@ fn scoped_lsp_files(
 
         let walker = ignore::WalkBuilder::new(&root)
             .standard_filters(true)
+            .add_custom_ignore_filename(".aftignore")
             .filter_entry(|entry| {
                 let name = entry.file_name().to_string_lossy();
                 !matches!(

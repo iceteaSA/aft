@@ -236,7 +236,7 @@ fn execute_root(
     // .aftignored, or not yet indexed. Binary + UTF-8 guards still apply.
     if root.search_root.is_file() {
         let index_status = if root.use_index {
-            IndexStatus::Ready
+            current_index_status(ctx)
         } else {
             IndexStatus::Fallback
         };

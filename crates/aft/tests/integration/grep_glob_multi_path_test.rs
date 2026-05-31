@@ -157,6 +157,45 @@ fn grep_multi_path_with_overlap_deduplicates_files() {
 }
 
 #[test]
+fn grep_multi_path_keeps_explicit_file_under_aftignored_parent() {
+    let project = setup_project(&[
+        (
+            "vendored/sub.rs",
+            "pub fn vendored() { let _ = \"needle\"; }\n",
+        ),
+        (".aftignore", "vendored/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-explicit-under-aftignored-parent",
+            "command": "grep",
+            "pattern": "needle",
+            "path": [".", "vendored/sub.rs"],
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(
+        response["total_matches"], 1,
+        "explicit file nested under an .aftignored directory must still be searched: {response:?}"
+    );
+    assert_eq!(
+        normalize_path_text(response["matches"][0]["file"].as_str().expect("file path")),
+        canonical_path_string(&project.path().join("vendored/sub.rs"))
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn grep_multi_path_falls_through_to_path_not_found_when_fragment_missing() {
     let project = setup_project(&[
         ("a/one.ts", "const value = 'needle';\n"),

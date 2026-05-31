@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,23 @@ fn configure_with_index(aft: &mut AftProcess, root: &Path) {
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {
     aft.send(&serde_json::to_string(&request).expect("serialize request"))
+}
+
+fn fake_server_path() -> PathBuf {
+    option_env!("CARGO_BIN_EXE_fake-lsp-server")
+        .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake_lsp_server").map(PathBuf::from))
+        .or_else(|| {
+            let mut path = std::env::current_exe().ok()?;
+            path.pop();
+            path.pop();
+            path.push("fake-lsp-server");
+            Some(path)
+        })
+        .filter(|path| path.exists())
+        .expect("fake-lsp-server binary path not set")
 }
 
 fn wait_for_index_ready<F>(aft: &mut AftProcess, mut request: F) -> Value
@@ -559,6 +576,176 @@ fn grep_explicit_aftignored_file_is_searched() {
         response["total_matches"], 1,
         "explicitly-named .aftignored file must be searched: {response:?}"
     );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_explicit_file_reports_runtime_fallback_index_status_when_index_disabled() {
+    let project = setup_project(&[("src/main.rs", "fn main() { println!(\"needle\"); }\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-explicit-index-status",
+            "command": "grep",
+            "pattern": "needle",
+            "path": "src/main.rs",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(response["total_matches"], 1, "response: {response:?}");
+    assert_eq!(
+        response["index_status"], "Fallback",
+        "explicit-file grep must report actual runtime index state, not requested scope indexability: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn semantic_degraded_grep_fallback_respects_aftignore() {
+    let project = setup_project(&[
+        (
+            "src/lib.rs",
+            "pub fn retry() { /* how retry logic works */ }\n",
+        ),
+        (
+            "ignored/skip.rs",
+            "pub fn retry() { /* how retry logic works */ }\n",
+        ),
+        (".aftignore", "ignored/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    let configure = send(
+        &mut aft,
+        json!({
+            "id": "cfg-semantic-disabled",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "semantic_search": false,
+            "search_index": false,
+        }),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "semantic-degraded-aftignore",
+            "command": "semantic_search",
+            "query": "how retry logic works",
+            "top_k": 10,
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "semantic_search should succeed: {response:?}"
+    );
+    assert_eq!(response["semantic_status"], "disabled");
+    assert_eq!(response["interpreted_as"], "literal");
+    assert_eq!(response["lexical_only_fallback"], true);
+    let files = response["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|result| {
+            result["file"]
+                .as_str()
+                .expect("result file")
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        files,
+        vec![canonical_path_string(&project.path().join("src/lib.rs")).replace('\\', "/")],
+        ".aftignored file must be skipped by degraded semantic grep fallback: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn inspect_scoped_diagnostics_respects_aftignore() {
+    let fake_server = fake_server_path();
+    let project = setup_project(&[
+        ("fake.toml", "[project]\n"),
+        ("src/main.fake", "hello\n"),
+        ("ignored/skip.fake", "hello\n"),
+        (".aftignore", "ignored/\n"),
+    ]);
+    let fake_bin_dir = project.path().join("bin");
+    fs::create_dir_all(&fake_bin_dir).expect("create fake server bin dir");
+    let fake_binary_name = fake_server
+        .file_name()
+        .expect("fake server file name")
+        .to_string_lossy()
+        .to_string();
+    fs::copy(&fake_server, fake_bin_dir.join(&fake_binary_name)).expect("copy fake server");
+
+    let mut aft = AftProcess::spawn_with_env(&[("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1"))]);
+    let configure = send(
+        &mut aft,
+        json!({
+            "id": "cfg-inspect-aftignore",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "lsp_paths_extra": [fake_bin_dir],
+            "lsp_servers": [{
+                "id": "fake",
+                "extensions": ["fake"],
+                "binary": fake_binary_name,
+                "args": [],
+                "root_markers": ["fake.toml"]
+            }]
+        }),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "inspect-diagnostics-aftignore",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": ".",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "inspect should succeed: {response:?}"
+    );
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 1);
+    let details = response["details"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics details");
+    assert_eq!(
+        details.len(),
+        1,
+        ".aftignored file must be skipped by scoped inspect diagnostics: {response:?}"
+    );
+    assert_eq!(details[0]["file"], "src/main.fake");
+    assert_eq!(details[0]["message"], "test pull diagnostic");
 
     let status = aft.shutdown();
     assert!(status.success());
