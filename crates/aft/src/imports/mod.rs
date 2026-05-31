@@ -16,6 +16,7 @@ use crate::parser::{grammar_for, LangId};
 mod csharp;
 mod java;
 mod kotlin;
+mod lua;
 mod php;
 mod ruby;
 mod scala;
@@ -408,6 +409,7 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Solidity => Some(&SOLIDITY_SYNTAX),
         LangId::Java => Some(&java::JAVA_SYNTAX),
         LangId::Kotlin => Some(&kotlin::KOTLIN_SYNTAX),
+        LangId::Lua => Some(&lua::LUA_SYNTAX),
         LangId::CSharp => Some(&csharp::CSHARP_SYNTAX),
         LangId::Php => Some(&php::PHP_SYNTAX),
         LangId::Ruby => Some(&ruby::RUBY_SYNTAX),
@@ -419,7 +421,6 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::Bash
         | LangId::Vue
         | LangId::Json
-        | LangId::Lua
         | LangId::Perl
         | LangId::Html
         | LangId::Markdown => None,

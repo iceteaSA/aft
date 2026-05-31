@@ -1,0 +1,5 @@
+require("boot")
+local alpha = require("alpha")
+local zeta = require("zeta")
+
+return alpha, zeta

@@ -853,6 +853,44 @@ fn scenarios() -> Vec<Scenario> {
             input: "load \"boot.rb\"\nrequire_relative '../helper'\nrequire \"json\"\n\nputs 'hi'\n",
             ops: &[Op::Organize],
         },
+        // ---- Lua (require-style imports: local binding + bare require) ----
+        Scenario {
+            name: "lua_add_local_require",
+            ext: "lua",
+            input: "print('ready')\n",
+            ops: &[Op::Add {
+                module: "pkg.foo",
+                names: &[],
+                default_import: Some("foo"),
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "lua_add_bare_require",
+            ext: "lua",
+            input: "print('ready')\n",
+            ops: &[Op::Add {
+                module: "side.effect",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "lua_remove_require",
+            ext: "lua",
+            input: "local unused = require(\"pkg.unused\")\nlocal keep = require(\"pkg.keep\")\n\nreturn keep\n",
+            ops: &[Op::Remove {
+                module: "pkg.unused",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "lua_organize_requires",
+            ext: "lua",
+            input: "local zeta = require(\"zeta\")\nrequire(\"boot\")\nlocal alpha = require(\"alpha\")\n\nreturn alpha, zeta\n",
+            ops: &[Op::Organize],
+        },
     ]
 }
 
