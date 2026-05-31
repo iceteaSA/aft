@@ -97,6 +97,11 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         .get("context_lines")
         .and_then(|v| v.as_u64())
         .unwrap_or(3) as usize;
+    let include_callgraph = req
+        .params
+        .get("callgraph")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let start_line = req
         .params
@@ -347,81 +352,87 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         vec![]
     };
 
-    // Get all symbols in the resolved file for call matching
-    let all_symbols = match ctx.provider().list_symbols(resolved_file_path) {
-        Ok(s) => s,
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
-    };
+    let (calls_out, called_by) = if include_callgraph {
+        // Get all symbols in the resolved file for call matching
+        let all_symbols = match ctx.provider().list_symbols(resolved_file_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Response::error(&req.id, e.code(), e.to_string());
+            }
+        };
 
-    let known_names: Vec<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
+        let known_names: Vec<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
 
-    // Parse AST for call extraction (use resolved file for cross-file re-exports)
-    let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
-    let (tree, lang) = match parser.parse(resolved_file_path) {
-        Ok(r) => r,
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
-    };
+        // Parse AST for call extraction (use resolved file for cross-file re-exports)
+        let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
+        let (tree, lang) = match parser.parse(resolved_file_path) {
+            Ok(r) => r,
+            Err(e) => {
+                return Response::error(&req.id, e.code(), e.to_string());
+            }
+        };
 
-    // calls_out: calls within the target symbol's byte range
-    let resolved_source = if resolved_file_path != path {
-        std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.clone())
-    } else {
-        source.clone()
-    };
-    let target_byte_start = line_col_to_byte(
-        &resolved_source,
-        target.range.start_line,
-        target.range.start_col,
-    );
-    let target_byte_end = line_col_to_byte(
-        &resolved_source,
-        target.range.end_line,
-        target.range.end_col,
-    );
+        // calls_out: calls within the target symbol's byte range
+        let resolved_source = if resolved_file_path != path {
+            std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.clone())
+        } else {
+            source.clone()
+        };
+        let target_byte_start = line_col_to_byte(
+            &resolved_source,
+            target.range.start_line,
+            target.range.start_col,
+        );
+        let target_byte_end = line_col_to_byte(
+            &resolved_source,
+            target.range.end_line,
+            target.range.end_col,
+        );
 
-    let all_file_calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
+        let all_file_calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
 
-    let raw_calls = all_file_calls
-        .iter()
-        .filter(|call| call.start_byte >= target_byte_start && call.end_byte <= target_byte_end);
-    let calls_out: Vec<CallRef> = raw_calls
-        .filter(|call| known_names.contains(&call.name.as_str()) && call.name != target.name)
-        .map(|call| CallRef {
-            name: call.name.clone(),
-            line: call.line,
-        })
-        .collect();
+        let raw_calls = all_file_calls.iter().filter(|call| {
+            call.start_byte >= target_byte_start && call.end_byte <= target_byte_end
+        });
+        let calls_out: Vec<CallRef> = raw_calls
+            .filter(|call| known_names.contains(&call.name.as_str()) && call.name != target.name)
+            .map(|call| CallRef {
+                name: call.name.clone(),
+                line: call.line,
+            })
+            .collect();
 
-    // called_by: bucket the single file-wide call extraction by enclosing symbol range
-    let mut called_by: Vec<CallRef> = Vec::new();
-    for sym in &all_symbols {
-        if sym.name == target.name && sym.range.start_line == target.range.start_line {
-            continue; // skip self
-        }
-        let sym_byte_start =
-            line_col_to_byte(&resolved_source, sym.range.start_line, sym.range.start_col);
-        let sym_byte_end =
-            line_col_to_byte(&resolved_source, sym.range.end_line, sym.range.end_col);
-        for call in &all_file_calls {
-            if call.name == target.name
-                && call.start_byte >= sym_byte_start
-                && call.end_byte <= sym_byte_end
-            {
-                called_by.push(CallRef {
-                    name: sym.name.clone(),
-                    line: call.line,
-                });
+        // called_by: bucket the single file-wide call extraction by enclosing symbol range
+        let mut called_by: Vec<CallRef> = Vec::new();
+        for sym in &all_symbols {
+            if sym.name == target.name && sym.range.start_line == target.range.start_line {
+                continue; // skip self
+            }
+            let sym_byte_start =
+                line_col_to_byte(&resolved_source, sym.range.start_line, sym.range.start_col);
+            let sym_byte_end =
+                line_col_to_byte(&resolved_source, sym.range.end_line, sym.range.end_col);
+            for call in &all_file_calls {
+                if call.name == target.name
+                    && call.start_byte >= sym_byte_start
+                    && call.end_byte <= sym_byte_end
+                {
+                    called_by.push(CallRef {
+                        name: sym.name.clone(),
+                        line: call.line,
+                    });
+                }
             }
         }
-    }
 
-    // Dedup called_by by (name, line)
-    called_by.sort_by(|a, b| a.name.cmp(&b.name).then(a.line.cmp(&b.line)));
-    called_by.dedup_by(|a, b| a.name == b.name && a.line == b.line);
+        // Dedup called_by by (name, line)
+        called_by.sort_by(|a, b| a.name.cmp(&b.name).then(a.line.cmp(&b.line)));
+        called_by.dedup_by(|a, b| a.name == b.name && a.line == b.line);
+
+        (calls_out, called_by)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let kind_str = serde_json::to_value(&target.kind)
         .ok()
@@ -709,7 +720,7 @@ mod tests {
         let ctx = make_ctx();
         let path = fixture_path("calls.ts");
 
-        let req = make_zoom_request("z-1", path.to_str().unwrap(), "compute", None);
+        let req = make_zoom_request_cg("z-1", path.to_str().unwrap(), "compute");
         let resp = handle_zoom(&req, &ctx);
 
         let json = serde_json::to_value(&resp).unwrap();
@@ -747,7 +758,7 @@ mod tests {
         let ctx = make_ctx();
         let path = fixture_path("calls.ts");
 
-        let req = make_zoom_request("z-2", path.to_str().unwrap(), "unused", None);
+        let req = make_zoom_request_cg("z-2", path.to_str().unwrap(), "unused");
         let resp = handle_zoom(&req, &ctx);
 
         let json = serde_json::to_value(&resp).unwrap();
@@ -761,6 +772,35 @@ mod tests {
         assert!(
             called_by.is_empty(),
             "unused should not be called by anyone: {:?}",
+            called_by
+        );
+    }
+
+    #[test]
+    fn zoom_default_omits_callgraph_annotations() {
+        let ctx = make_ctx();
+        let path = fixture_path("calls.ts");
+
+        let req = make_zoom_request("z-1-default", path.to_str().unwrap(), "compute", None);
+        let resp = handle_zoom(&req, &ctx);
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true, "zoom should succeed: {:?}", json);
+
+        let calls_out = json["annotations"]["calls_out"]
+            .as_array()
+            .expect("calls_out array");
+        let called_by = json["annotations"]["called_by"]
+            .as_array()
+            .expect("called_by array");
+        assert!(
+            calls_out.is_empty(),
+            "default zoom should omit calls_out: {:?}",
+            calls_out
+        );
+        assert!(
+            called_by.is_empty(),
+            "default zoom should omit called_by: {:?}",
             called_by
         );
     }
@@ -854,6 +894,12 @@ mod tests {
             json["context_lines"] = serde_json::json!(cl);
         }
         serde_json::from_value(json).unwrap()
+    }
+
+    fn make_zoom_request_cg(id: &str, file: &str, symbol: &str) -> RawRequest {
+        let mut req = make_zoom_request(id, file, symbol, None);
+        req.params["callgraph"] = serde_json::json!(true);
+        req
     }
 
     fn make_raw_request(_id: &str, json_str: &str) -> RawRequest {

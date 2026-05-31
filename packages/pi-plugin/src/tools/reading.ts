@@ -66,6 +66,12 @@ const ZoomParams = Type.Object({
   contextLines: Type.Optional(
     Type.Number({ description: "Lines of context before/after (default: 3)" }),
   ),
+  callgraph: Type.Optional(
+    Type.Boolean({
+      description:
+        "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+    }),
+  ),
 });
 
 function isUrl(s: string): boolean {
@@ -381,7 +387,7 @@ export function registerReadingTools(
       name: "aft_zoom",
       label: "zoom",
       description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (calls/called-by). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them.",
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them.",
       parameters: ZoomParams,
       async execute(
         _toolCallId: string,
@@ -419,6 +425,7 @@ export function registerReadingTools(
         const hasUrl = !isEmptyParam(params.url);
         const hasTargets = hasTargetsProvided(params.targets);
         const hasSymbols = !isEmptyParam(params.symbols);
+        const wantCallgraph = params.callgraph === true;
 
         // Multi-target mode (cross-file). Mutually exclusive with the other
         // modes so the agent doesn't accidentally provide overlapping inputs
@@ -447,6 +454,7 @@ export function registerReadingTools(
             targets.map((t) => {
               const req: Record<string, unknown> = { file: t.filePath, symbol: t.symbol };
               if (params.contextLines !== undefined) req.context_lines = params.contextLines;
+              if (wantCallgraph) req.callgraph = true;
               return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
                 success: false,
                 message: err instanceof Error ? err.message : String(err),
@@ -490,6 +498,7 @@ export function registerReadingTools(
             symbolsArray.map((sym) => {
               const req: Record<string, unknown> = { file, symbol: sym };
               if (params.contextLines !== undefined) req.context_lines = params.contextLines;
+              if (wantCallgraph) req.callgraph = true;
               return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
                 success: false,
                 message: err instanceof Error ? err.message : String(err),
@@ -515,6 +524,7 @@ export function registerReadingTools(
         // No symbols specified: zoom by line-range fallback (or whole file).
         const req: Record<string, unknown> = { file };
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
+        if (wantCallgraph) req.callgraph = true;
         const response = await callBridge(bridge, "zoom", req, extCtx);
         if (response.success === false) {
           throw new Error((response.message as string) || "zoom failed");

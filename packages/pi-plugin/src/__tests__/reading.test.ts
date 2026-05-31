@@ -272,4 +272,38 @@ describe("reading tool adapters", () => {
     expect(calls[0]?.params).toMatchObject({ file: "src/a.ts", symbol: "foo" });
     expect(result.content[0].text).toContain("src/a.ts:1-2 [function foo]");
   });
+
+  test("aft_zoom threads callgraph true to all zoom request shapes and omits it by default", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
+      success: true,
+      name: (params.symbol as string | undefined) ?? "lines",
+      kind: params.symbol ? "function" : "lines",
+      range: { start_line: 1, end_line: 1 },
+      content: "ok\n",
+    }));
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    await executeTool(tools.get("aft_zoom")!, {
+      targets: [{ filePath: "src/a.ts", symbol: "foo" }],
+      callgraph: true,
+    });
+    await executeTool(tools.get("aft_zoom")!, {
+      filePath: "src/a.ts",
+      symbols: ["foo"],
+      callgraph: true,
+    });
+    await executeTool(tools.get("aft_zoom")!, { filePath: "src/a.ts", callgraph: true });
+
+    expect(calls.map((call) => call.params)).toEqual([
+      expect.objectContaining({ file: "src/a.ts", symbol: "foo", callgraph: true }),
+      expect.objectContaining({ file: "src/a.ts", symbol: "foo", callgraph: true }),
+      expect.objectContaining({ file: "src/a.ts", callgraph: true }),
+    ]);
+
+    calls.length = 0;
+    await executeTool(tools.get("aft_zoom")!, { filePath: "src/a.ts", symbols: "foo" });
+    expect(calls[0]?.params).toMatchObject({ file: "src/a.ts", symbol: "foo" });
+    expect(calls[0]?.params).not.toHaveProperty("callgraph");
+  });
 });

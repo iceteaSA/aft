@@ -317,4 +317,42 @@ describe("reading tool adapters", () => {
 
     expect(sendCalls).toHaveLength(0);
   });
+
+  test("aft_zoom threads callgraph true to all zoom request shapes and omits it by default", async () => {
+    const root = await tempProject();
+    const { sendCalls, tools } = createMockReadingHarness((_command, params) => ({
+      success: true,
+      name: (params.symbol as string | undefined) ?? "lines",
+      kind: params.symbol ? "function" : "lines",
+      range: { start_line: 1, end_line: 1 },
+      content: "ok\n",
+    }));
+
+    await tools.aft_zoom.execute(
+      { targets: [{ filePath: "src/a.ts", symbol: "foo" }], callgraph: true },
+      createMockSdkContext(root),
+    );
+    await tools.aft_zoom.execute(
+      { filePath: "src/a.ts", symbols: ["foo"], callgraph: true },
+      createMockSdkContext(root),
+    );
+    await tools.aft_zoom.execute(
+      { filePath: "src/a.ts", callgraph: true },
+      createMockSdkContext(root),
+    );
+
+    expect(sendCalls.map((call) => call.params)).toEqual([
+      expect.objectContaining({ file: "src/a.ts", symbol: "foo", callgraph: true }),
+      expect.objectContaining({ file: "src/a.ts", symbol: "foo", callgraph: true }),
+      expect.objectContaining({ file: "src/a.ts", callgraph: true }),
+    ]);
+
+    sendCalls.length = 0;
+    await tools.aft_zoom.execute(
+      { filePath: "src/a.ts", symbols: "foo" },
+      createMockSdkContext(root),
+    );
+    expect(sendCalls[0]?.params).toMatchObject({ file: "src/a.ts", symbol: "foo" });
+    expect(sendCalls[0]?.params).not.toHaveProperty("callgraph");
+  });
 });

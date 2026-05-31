@@ -332,7 +332,7 @@ function unused(): void {
     let mut aft = AftProcess::spawn();
     let resp = send(
         &mut aft,
-        json!({"id": "zoom-compute", "command": "zoom", "file": file, "symbol": "compute"}),
+        json!({"id": "zoom-compute", "command": "zoom", "file": file, "symbol": "compute", "callgraph": true}),
     );
 
     assert_eq!(resp["success"], true, "zoom should succeed: {:?}", resp);

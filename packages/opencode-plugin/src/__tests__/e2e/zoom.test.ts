@@ -1,6 +1,7 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { formatZoomText } from "@cortexkit/aft-bridge";
 import {
   cleanupHarnesses,
   createHarness,
@@ -34,12 +35,28 @@ maybeDescribe("e2e zoom command", () => {
   test("zooms a symbol with annotations", async () => {
     const h = await harness();
 
-    const response = await h.bridge.send("zoom", { file: h.path("sample.ts"), symbol: "funcB" });
+    const response = await h.bridge.send("zoom", {
+      file: h.path("sample.ts"),
+      symbol: "funcB",
+      callgraph: true,
+    });
 
     expect(response.success).toBe(true);
     expect(response.name).toBe("funcB");
     expect(String(response.content)).toContain("export function funcB");
     expect(Array.isArray((response.annotations as Record<string, unknown>).calls_out)).toBe(true);
+  });
+
+  test("zooms a symbol without callgraph omits annotations", async () => {
+    const h = await harness();
+
+    const response = await h.bridge.send("zoom", { file: h.path("sample.ts"), symbol: "funcB" });
+
+    expect(response.success).toBe(true);
+    expect(String(response.content)).toContain("export function funcB");
+    expect((response.annotations as Record<string, unknown>).calls_out).toEqual([]);
+    expect((response.annotations as Record<string, unknown>).called_by).toEqual([]);
+    expect(formatZoomText(h.path("sample.ts"), response)).not.toContain("calls_out");
   });
 
   test("zooms multiple symbols like the plugin helper", async () => {

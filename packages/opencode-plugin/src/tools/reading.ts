@@ -192,7 +192,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
 
     aft_zoom: {
       description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (what it calls and what calls it). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them.",
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them.",
       args: {
         filePath: z
           .string()
@@ -230,6 +230,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
           "Lines of context before/after the symbol (default: 3)",
         ),
+        callgraph: z
+          .boolean()
+          .optional()
+          .describe(
+            "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+          ),
       },
       execute: async (args, context): Promise<string> => {
         // GPT-family models send empty strings / empty arrays / empty objects
@@ -260,6 +266,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         const hasUrl = !isEmptyParam(args.url);
         const hasTargets = hasTargetsProvided(args.targets);
         const hasSymbols = !isEmptyParam(args.symbols);
+        const wantCallgraph = args.callgraph === true;
 
         // Set TUI title + scalar metadata BEFORE any bridge call so even
         // errors render with a meaningful tool-call header. OpenCode's UI
@@ -278,6 +285,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           }
           if (hasTargets) display.targets = JSON.stringify(args.targets);
           if (args.contextLines !== undefined) display.contextLines = args.contextLines;
+          if (wantCallgraph) display.callgraph = true;
           storeToolMetadata(context.sessionID, zoomCallID, { title, metadata: display });
         }
 
@@ -308,6 +316,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             targets.map((t) => {
               const params: Record<string, unknown> = { file: t.filePath, symbol: t.symbol };
               if (args.contextLines !== undefined) params.context_lines = args.contextLines;
+              if (wantCallgraph) params.callgraph = true;
               return callBridge(ctx, context, "zoom", params).catch((err) => ({
                 success: false,
                 message: err instanceof Error ? err.message : String(err),
@@ -350,6 +359,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             symbolsArray.map((sym) => {
               const params: Record<string, unknown> = { file, symbol: sym };
               if (args.contextLines !== undefined) params.context_lines = args.contextLines;
+              if (wantCallgraph) params.callgraph = true;
               return callBridge(ctx, context, "zoom", params).catch((err) => ({
                 success: false,
                 message: err instanceof Error ? err.message : String(err),
@@ -371,6 +381,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // No symbols specified: zoom by line-range fallback (or whole file).
         const params: Record<string, unknown> = { file };
         if (args.contextLines !== undefined) params.context_lines = args.contextLines;
+        if (wantCallgraph) params.callgraph = true;
 
         const data = await callBridge(ctx, context, "zoom", params);
         if (data.success === false) {
