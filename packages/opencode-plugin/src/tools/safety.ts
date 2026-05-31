@@ -1,14 +1,14 @@
 import * as path from "node:path";
-import type { ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, resolveProjectRoot } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
   resolveAbsolutePath,
-  resolveRelativePattern,
+  resolveRelativePatternFromAbsolute,
   workspacePattern,
 } from "./permissions.js";
 
@@ -24,6 +24,21 @@ function bridgeErrorMessage(response: Record<string, unknown>, fallback: string)
   return typeof response.message === "string" && response.message.length > 0
     ? response.message
     : fallback;
+}
+
+function relativePatternsFromPaths(context: ToolContext, paths: string[]): string[] {
+  const seen = new Set<string>();
+  const patterns: string[] = [];
+
+  for (const filePath of paths) {
+    const absolutePath = resolveAbsolutePath(context, filePath);
+    const pattern = resolveRelativePatternFromAbsolute(context, absolutePath);
+    if (seen.has(pattern)) continue;
+    seen.add(pattern);
+    patterns.push(pattern);
+  }
+
+  return patterns;
 }
 
 /**
@@ -82,19 +97,20 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
             throw new Error(bridgeErrorMessage(preview, "undo preview failed"));
           }
 
-          for (const filePath of new Set(responsePaths(preview))) {
+          const previewPaths = Array.from(new Set(responsePaths(preview)));
+          for (const filePath of previewPaths) {
             const denial = await assertExternalDirectoryPermission(context, filePath);
             if (denial) return permissionDeniedResponse(denial);
           }
-        }
 
-        if (op === "undo" && typeof args.filePath === "string") {
-          const filePath = resolveAbsolutePath(context, args.filePath);
-
+          const filePath =
+            typeof args.filePath === "string"
+              ? resolveAbsolutePath(context, args.filePath)
+              : undefined;
           const permissionError = await askEditPermission(
             context,
-            [resolveRelativePattern(context, args.filePath)],
-            { filepath: filePath },
+            relativePatternsFromPaths(context, previewPaths),
+            filePath ? { filepath: filePath } : { operation: "undo", paths: previewPaths },
           );
           if (permissionError) return permissionDeniedResponse(permissionError);
         }
@@ -106,14 +122,15 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
               ? [args.filePath]
               : undefined;
           if (Array.isArray(checkpointFiles)) {
+            const projectRoot = await resolveProjectRoot(ctx, context);
             const uniqueParents = new Set<string>();
             for (const file of checkpointFiles) {
               if (typeof file !== "string") continue;
-              const abs = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+              const abs = path.isAbsolute(file) ? file : path.resolve(projectRoot, file);
               const parent = path.dirname(abs);
               if (uniqueParents.has(parent)) continue;
               uniqueParents.add(parent);
-              const denial = await assertExternalDirectoryPermission(context, file, {
+              const denial = await assertExternalDirectoryPermission(context, abs, {
                 kind: "file",
               });
               if (denial) return permissionDeniedResponse(denial);

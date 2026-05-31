@@ -17,7 +17,12 @@ import { resolveBashConfig } from "../config.js";
 import { storeToolMetadata } from "../metadata-store.js";
 import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, optionalInt } from "./_shared.js";
+import {
+  callBridge,
+  optionalInt,
+  resolvePathFromProjectRoot,
+  resolveProjectRoot,
+} from "./_shared.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "./bash.js";
 import { createBashWatchTool } from "./bash_watch.js";
 import { createBashWriteTool } from "./bash_write.js";
@@ -398,9 +403,10 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
     },
     execute: async (args, context): Promise<string> => {
       const file = args.filePath as string;
+      const projectRoot = await resolveProjectRoot(ctx, context);
 
-      // Resolve relative paths
-      const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+      // Resolve relative paths from the same session/project root used by the bridge.
+      const filePath = resolvePathFromProjectRoot(projectRoot, file);
 
       // External-directory check first (mirrors opencode-native ordering in
       // tool/read.ts:175). Out-of-project paths prompt the user via the
@@ -463,7 +469,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         const imgCallID = getCallID(context);
         if (imgCallID) {
           storeToolMetadata(context.sessionID, imgCallID, {
-            title: path.relative(context.worktree, filePath),
+            title: path.relative(projectRoot, filePath),
             metadata: {
               preview: msg,
               filepath: filePath,
@@ -504,7 +510,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       // Directory response
       if (data.entries) {
         if (readCallID) {
-          const dp = relativeToWorktree(filePath, context.worktree) || file;
+          const dp = relativeToWorktree(filePath, projectRoot) || file;
           storeToolMetadata(context.sessionID, readCallID, { title: dp, metadata: { title: dp } });
         }
         return (data.entries as string[]).join("\n");
@@ -513,7 +519,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       // Binary response
       if (data.binary) {
         if (readCallID) {
-          const dp = relativeToWorktree(filePath, context.worktree) || file;
+          const dp = relativeToWorktree(filePath, projectRoot) || file;
           storeToolMetadata(context.sessionID, readCallID, { title: dp, metadata: { title: dp } });
         }
         return data.message as string;
@@ -521,7 +527,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
 
       // File content — already line-numbered from Rust
       if (readCallID) {
-        const dp = relativeToWorktree(filePath, context.worktree) || file;
+        const dp = relativeToWorktree(filePath, projectRoot) || file;
         storeToolMetadata(context.sessionID, readCallID, { title: dp, metadata: { title: dp } });
       }
       let output = data.content as string;
@@ -576,10 +582,11 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
     execute: async (args, context): Promise<string> => {
       const file = args.filePath as string;
       const content = args.content as string;
+      const projectRoot = await resolveProjectRoot(ctx, context);
 
-      const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+      const filePath = resolvePathFromProjectRoot(projectRoot, file);
 
-      const relPath = path.relative(context.worktree, filePath);
+      const relPath = path.relative(projectRoot, filePath);
 
       // External-directory check first (mirrors opencode-native write.ts:43).
       {
@@ -653,7 +660,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         | undefined;
       const callID = getCallID(context);
       if (callID) {
-        const dp = relativeToWorktree(filePath, context.worktree);
+        const dp = relativeToWorktree(filePath, projectRoot);
         const beforeContent = diff?.before ?? "";
         const afterContent = diff?.after ?? content;
         storeToolMetadata(context.sessionID, callID, {
@@ -799,12 +806,13 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       if (Array.isArray(args.operations)) {
         const ops = args.operations as Array<Record<string, unknown>>;
         const files = ops.map((op) => op.file as string).filter(Boolean);
+        const projectRoot = await resolveProjectRoot(ctx, context);
 
         // External-directory check first (mirrors opencode-native edit.ts:68).
         {
           const asked = new Set<string>();
           for (const file of files) {
-            const absPath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+            const absPath = resolvePathFromProjectRoot(projectRoot, file);
             if (asked.has(absPath)) continue;
             asked.add(absPath);
             const denial = await assertExternalDirectoryPermission(context, absPath);
@@ -816,7 +824,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
           context.ask({
             permission: "edit",
             patterns: files.map((f) =>
-              path.relative(context.worktree, path.resolve(context.directory, f)),
+              path.relative(projectRoot, resolvePathFromProjectRoot(projectRoot, f)),
             ),
             always: ["*"],
             metadata: {},
@@ -825,9 +833,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
         const resolvedOps = ops.map((op) => ({
           ...op,
-          file: path.isAbsolute(op.file as string)
-            ? op.file
-            : path.resolve(context.directory, op.file as string),
+          file: resolvePathFromProjectRoot(projectRoot, op.file as string),
         }));
 
         const response = await callBridge(ctx, context, "transaction", { operations: resolvedOps });
@@ -839,10 +845,11 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
       const file = args.filePath as string;
       if (!file) throw new Error("'filePath' parameter is required");
+      const projectRoot = await resolveProjectRoot(ctx, context);
 
-      const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+      const filePath = resolvePathFromProjectRoot(projectRoot, file);
 
-      const relPath = path.relative(context.worktree, filePath);
+      const relPath = path.relative(projectRoot, filePath);
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
@@ -931,7 +938,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         };
         const callID = getCallID(context);
         if (callID) {
-          const dp = relativeToWorktree(filePath, context.worktree);
+          const dp = relativeToWorktree(filePath, projectRoot);
           const beforeContent = diff.before ?? "";
           const afterContent = diff.after ?? "";
           storeToolMetadata(context.sessionID, callID, {
@@ -1088,6 +1095,8 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         throw new Error("Empty patch: no file operations found");
       }
 
+      const projectRoot = await resolveProjectRoot(ctx, context);
+
       // Resolve every path this patch touches — SOURCES (h.path) and
       // DESTINATIONS (h.move_path for move hunks). Move destinations have to
       // be tracked because the old code only checkpointed sources; a partial
@@ -1100,13 +1109,13 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       const newlyCreatedAbs = new Set<string>();
 
       for (const h of hunks) {
-        const srcAbs = path.resolve(context.directory, h.path);
+        const srcAbs = resolvePathFromProjectRoot(projectRoot, h.path);
         affectedAbs.add(srcAbs);
         if (h.type === "add") {
           newlyCreatedAbs.add(srcAbs);
         }
         if (h.type === "update" && h.move_path) {
-          const dstAbs = path.resolve(context.directory, h.move_path);
+          const dstAbs = resolvePathFromProjectRoot(projectRoot, h.move_path);
           affectedAbs.add(dstAbs);
           // Snapshot the destination if it exists so rollback restores the
           // original contents. If it doesn't exist, track it as newly
@@ -1117,7 +1126,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      const relPaths = Array.from(affectedAbs).map((abs) => path.relative(context.worktree, abs));
+      const relPaths = Array.from(affectedAbs).map((abs) => path.relative(projectRoot, abs));
       const multiFileWritePaths = Array.from(affectedAbs);
 
       // External-directory check first (mirrors opencode-native patch.ts:298).
@@ -1192,7 +1201,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       }> = [];
 
       for (const hunk of hunks) {
-        const filePath = path.resolve(context.directory, hunk.path);
+        const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
 
         switch (hunk.type) {
           case "add": {
@@ -1241,7 +1250,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               // hunk. Best-effort cleanup so we don't leave orphan partials.
               // (Failures here are tolerated: the agent will see the
               // creation failure in `results` either way.)
-              const filePath = path.resolve(context.directory, hunk.path);
+              const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
               if (fs.existsSync(filePath)) {
                 try {
                   fs.rmSync(filePath, { force: true });
@@ -1281,7 +1290,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               const newContent = applyUpdateChunks(original, filePath, hunk.chunks);
 
               const targetPath = hunk.move_path
-                ? path.resolve(context.directory, hunk.move_path)
+                ? resolvePathFromProjectRoot(projectRoot, hunk.move_path)
                 : filePath;
 
               const writeResult = await callBridge(ctx, context, "write", {
@@ -1300,7 +1309,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               if (diags && diags.length > 0) {
                 const errors = diags.filter((d) => d.severity === "error");
                 if (errors.length > 0) {
-                  const relPath = path.relative(context.worktree, targetPath);
+                  const relPath = path.relative(projectRoot, targetPath);
                   const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
                   results.push(`\nLSP errors detected in ${relPath}, please fix:\n${diagLines}`);
                 }
@@ -1462,14 +1471,16 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         // perFileDiffs population above for how counts are derived per
         // hunk type.
         const files = hunks.map((h) => {
-          const filePath = path.resolve(context.directory, h.path);
+          const filePath = resolvePathFromProjectRoot(projectRoot, h.path);
           // `move_path` only exists on UpdateHunk variants — narrow first.
           const rawMovePath = h.type === "update" ? h.move_path : undefined;
-          const movePath = rawMovePath ? path.resolve(context.directory, rawMovePath) : undefined;
+          const movePath = rawMovePath
+            ? resolvePathFromProjectRoot(projectRoot, rawMovePath)
+            : undefined;
           // For moved files, render the destination path as the visible
           // location (matches OpenCode's apply_patch behaviour).
           const displayPath = movePath ?? filePath;
-          const relPath = path.relative(context.worktree, displayPath);
+          const relPath = path.relative(projectRoot, displayPath);
 
           const diffEntry = diffByPath.get(filePath);
           const patch = diffEntry
@@ -1553,9 +1564,8 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
     execute: async (args, context): Promise<string> => {
       const inputs = args.files as string[];
       const recursive = args.recursive === true;
-      const absolutePaths = inputs.map((f) =>
-        path.isAbsolute(f) ? f : path.resolve(context.directory, f),
-      );
+      const projectRoot = await resolveProjectRoot(ctx, context);
+      const absolutePaths = inputs.map((f) => resolvePathFromProjectRoot(projectRoot, f));
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
@@ -1632,12 +1642,9 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
         .describe("Destination file path (absolute or relative to project root)"),
     },
     execute: async (args, context): Promise<string> => {
-      const filePath = path.isAbsolute(args.filePath as string)
-        ? (args.filePath as string)
-        : path.resolve(context.directory, args.filePath as string);
-      const destPath = path.isAbsolute(args.destination as string)
-        ? (args.destination as string)
-        : path.resolve(context.directory, args.destination as string);
+      const projectRoot = await resolveProjectRoot(ctx, context);
+      const filePath = resolvePathFromProjectRoot(projectRoot, args.filePath as string);
+      const destPath = resolvePathFromProjectRoot(projectRoot, args.destination as string);
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
@@ -1771,8 +1778,9 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
           typeof normalizedArgs.content === "string"
         ) {
           const file = normalizedArgs.filePath as string;
-          const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
-          const relPath = path.relative(context.worktree, filePath);
+          const projectRoot = await resolveProjectRoot(ctx, context);
+          const filePath = resolvePathFromProjectRoot(projectRoot, file);
+          const relPath = path.relative(projectRoot, filePath);
 
           // External-directory check first (mirrors opencode-native write.ts:43).
           {

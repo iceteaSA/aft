@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
@@ -16,6 +16,10 @@ let sdkCtx = createMockSdkContext(PROJECT_CWD);
 let tmpDir: string | null = null;
 const failingTest = ((test as typeof test & { failing?: typeof test }).failing ??
   test) as typeof test;
+
+async function makeTempDir(): Promise<string> {
+  return await realpath(await mkdtemp(resolve(tmpdir(), "aft-hoisted-")));
+}
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
@@ -89,7 +93,7 @@ afterEach(async () => {
 
 describe("Hoisted tool execute handlers", () => {
   test("read throws the Rust error response instead of accessing missing content", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
@@ -103,7 +107,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("write throws the Rust error response for invalid writes", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
@@ -117,7 +121,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("write defaults diagnostics off and omits LSP payload", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { calls, tools } = createMockHoistedHarness(async () => ({ success: true }));
@@ -145,7 +149,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("write uses lsp.diagnostics_on_edit as the default", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { calls, tools } = createMockHoistedHarness(async () => ({ success: true }), {
@@ -163,7 +167,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("write honors diagnostics true and includes LSP payload", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { calls, tools } = createMockHoistedHarness(async () => ({
@@ -182,7 +186,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("edit defaults diagnostics off and omits LSP payload", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { calls, tools } = createMockHoistedHarness(async () => ({
@@ -203,7 +207,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("edit honors diagnostics true and includes LSP payload", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const diagnostics = [{ severity: "error", line: 3, message: "Missing import" }];
@@ -230,7 +234,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("apply_patch defaults diagnostics off and omits LSP payload", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
     await writeFile(resolve(tmpDir, "file.ts"), "old\n");
 
@@ -259,7 +263,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("apply_patch honors diagnostics true and includes LSP payload", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
     await writeFile(resolve(tmpDir, "file.ts"), "old\n");
 
@@ -312,7 +316,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   failingTest("edit throws the Rust error response for failed replacements", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
@@ -336,7 +340,7 @@ describe("Hoisted tool execute handlers", () => {
   // to assert response.success === true (or throw) before treating the hunk
   // as a success.
   failingTest("apply_patch throws the Rust error response when a patch write fails", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const patchText = [
@@ -358,7 +362,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("delete throws when every file in the batch fails", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
@@ -378,7 +382,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("delete throws the Rust error response before synthesizing success", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
@@ -392,7 +396,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("delete returns partial-success payload when some files fail", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
@@ -429,7 +433,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("delete reports complete=true when every file succeeds", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
@@ -455,7 +459,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("move throws the Rust error response when rename fails", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
@@ -469,7 +473,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("edit batch mode translates oldString/newString fields for the Rust bridge", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { calls, tools } = createMockHoistedHarness(async () => ({
@@ -506,7 +510,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("transaction edit throws the Rust error response", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
@@ -525,7 +529,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test('legacy aft_edit mode:"write" throws the Rust error response', async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const pool = {
@@ -548,7 +552,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("edit forwards replaceAll to Rust for multiple occurrences", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { calls, tools } = createMockHoistedHarness(async () => ({
@@ -587,7 +591,7 @@ describe("Hoisted tool execute handlers", () => {
   /// strip the file content down to counts only. Echoing before/after into the
   /// model context makes the payload scale with file size, not edit size.
   test("edit agent result strips diff before/after to counts-only", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const bigBefore = `${"x".repeat(50_000)}\n`;
@@ -625,7 +629,7 @@ describe("Hoisted tool execute handlers", () => {
   /// throwing away the agent's correct work and forcing them to manually
   /// split patches. New behavior: each hunk commits independently.
   test("apply_patch keeps successful hunks when a later hunk fails (per-file commit)", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const createdFile = resolve(tmpDir, "created.ts");
@@ -697,7 +701,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("apply_patch restores checkpoint when move source delete fails", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const earlierFile = resolve(tmpDir, "src/earlier.ts");
@@ -764,7 +768,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("apply_patch restores pre-existing move destination when source delete fails", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const sourceFile = resolve(tmpDir, "src/original.ts");
@@ -819,7 +823,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("apply_patch reports both copies when move rollback delete also fails", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const sourceFile = resolve(tmpDir, "src/original.ts");
@@ -876,7 +880,7 @@ describe("Hoisted tool execute handlers", () => {
   /// drift used to roll back the 2 successes. Now the 2 successes commit
   /// and only the failed file is reported as failing.
   test("apply_patch keeps successful files when ONE of three updates fails (user repro)", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const okFile1 = resolve(tmpDir, "cli-program.ts");
@@ -950,7 +954,7 @@ describe("Hoisted tool execute handlers", () => {
   // Total-failure cases must throw so OpenCode classifies them as errored
   // (matching native apply_patch which uses Effect.fail for all errors).
   test("apply_patch throws when ALL hunks fail (so OpenCode marks it errored)", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const driftFile = resolve(tmpDir, "src/hooks/index.ts");
@@ -987,7 +991,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("read returns binary-file messages without trying to split missing content", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { calls, tools } = createMockHoistedHarness(async () => ({
@@ -1009,7 +1013,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("read handles directory listings and truncated content responses", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     let callIndex = 0;
@@ -1041,7 +1045,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("read does not append a footer when the file fits in default limit (case A)", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async () => ({
@@ -1064,7 +1068,7 @@ describe("Hoisted tool execute handlers", () => {
     // on a 191-line file and gets back lines 130-190 EXACTLY. Telling them
     // "use startLine/endLine to read other sections" right after they used
     // those exact params is patronizing. They have the math.
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async () => ({
@@ -1099,7 +1103,7 @@ describe("Hoisted tool execute handlers", () => {
     // re-teaching an agent that they got less than the whole file when
     // THEY chose to. Agent has the math: they sent the request and they
     // can see the content length.
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async () => ({
@@ -1125,7 +1129,7 @@ describe("Hoisted tool execute handlers", () => {
     // Same as the startLine/endLine case but for the OpenCode-built-in-
     // compatible offset/limit param shape. Agent that picked the slice
     // should not be re-taught how to pick a slice.
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async () => ({
@@ -1149,7 +1153,7 @@ describe("Hoisted tool execute handlers", () => {
   });
 
   test("write distinguishes new files from updates", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     let writeCount = 0;
@@ -1185,7 +1189,7 @@ describe("Hoisted tool execute handlers", () => {
   /// Pre-fix, AFT only sent `{ filePath, relativePath, type }`, so EVERY file
   /// was silently dropped and the TUI/desktop showed no diffs at all.
   test("apply_patch stores per-file diff metadata for the OpenCode renderer", async () => {
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
     // Inject callID — required for storeToolMetadata to fire (the production
     // ToolContext supplies it; our mock omits it by default).
