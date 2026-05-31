@@ -760,6 +760,46 @@ fn scenarios() -> Vec<Scenario> {
             input: "import scala.collection.mutable._\nimport java.util.{List => JList, Map => JMap}\n\nobject Main { val x = 1 }\n",
             ops: &[Op::Organize],
         },
+        // ---- Ruby (require-style method-call imports) ----
+        Scenario {
+            name: "ruby_add_require",
+            ext: "rb",
+            input: "puts 'hi'\n",
+            ops: &[Op::Add {
+                module: "json",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "ruby_add_require_relative",
+            ext: "rb",
+            input: "puts 'hi'\n",
+            ops: &[Op::AddForm {
+                module: "../lib/helper",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("require_relative"),
+            }],
+        },
+        Scenario {
+            name: "ruby_remove_require_relative",
+            ext: "rb",
+            input: "require 'json'\nrequire_relative '../unused'\nload 'boot.rb'\n\nputs 'hi'\n",
+            ops: &[Op::Remove {
+                module: "../unused",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "ruby_organize_preserves_require_kinds",
+            ext: "rb",
+            input: "load \"boot.rb\"\nrequire_relative '../helper'\nrequire \"json\"\n\nputs 'hi'\n",
+            ops: &[Op::Organize],
+        },
     ]
 }
 
