@@ -103,7 +103,14 @@ export function findSystemOnnxRuntime(): string | null {
 
 export function findCachedOnnxRuntime(storageDir: string): string | null {
   const ortDir = join(storageDir, "onnxruntime", ONNX_RUNTIME_VERSION);
-  return existsSync(join(ortDir, getOnnxLibraryName())) ? ortDir : null;
+  const libName = getOnnxLibraryName();
+  // Our own download flattens the library into the version root; a manual
+  // install of Microsoft's archive leaves it under lib/. Accept either and
+  // return the directory that actually contains the library (#71).
+  if (existsSync(join(ortDir, libName))) return ortDir;
+  const libSubdir = join(ortDir, "lib");
+  if (existsSync(join(libSubdir, libName))) return libSubdir;
+  return null;
 }
 
 /**

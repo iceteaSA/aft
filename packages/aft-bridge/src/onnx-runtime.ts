@@ -181,8 +181,16 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   const info = getPlatformInfo();
 
   // 1. Cached location with TOFU.
-  const ortDir = join(storageDir, "onnxruntime", ORT_VERSION);
-  const libPath = join(ortDir, info?.libName ?? "libonnxruntime.dylib");
+  const ortVersionDir = join(storageDir, "onnxruntime", ORT_VERSION);
+  const libName = info?.libName ?? "libonnxruntime.dylib";
+  // Our own auto-download flattens the library into the version root, but a
+  // manual install of Microsoft's archive leaves it under `lib/`. Accept
+  // either layout so manual installs are detected too (#71).
+  const ortDir =
+    !existsSync(join(ortVersionDir, libName)) && existsSync(join(ortVersionDir, "lib", libName))
+      ? join(ortVersionDir, "lib")
+      : ortVersionDir;
+  const libPath = join(ortDir, libName);
 
   if (existsSync(libPath)) {
     // Audit-3 v0.17 #1 (TOFU): if we recorded a hash for this version,
@@ -190,7 +198,9 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
     // partial install corruption. Refuse to use it and let the caller
     // either retry the download (after the user clears the cache) or
     // fall back to system install.
-    const meta = readOnnxInstalledMeta(ortDir);
+    // Our installer writes the TOFU meta file to the version root, never the
+    // lib/ subdir, so always read it from there.
+    const meta = readOnnxInstalledMeta(ortVersionDir);
     if (meta?.sha256) {
       try {
         const currentHash = sha256File(libPath);

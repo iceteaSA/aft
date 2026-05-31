@@ -4,7 +4,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findSystemOnnxRuntime } from "../lib/onnx.js";
+import {
+  ONNX_RUNTIME_VERSION,
+  findCachedOnnxRuntime,
+  findSystemOnnxRuntime,
+  getOnnxLibraryName,
+} from "../lib/onnx.js";
 
 type EnvSnapshot = Map<string, string | undefined>;
 
@@ -50,5 +55,28 @@ describe("CLI ONNX system detection", () => {
     const found = withPlatform("win32", () => findSystemOnnxRuntime());
 
     expect(found).toBe(runtimeDir);
+  });
+});
+
+describe("CLI ONNX cached detection (#71)", () => {
+  test("finds the cached library in the version root", () => {
+    const versionDir = join(workDir, "onnxruntime", ONNX_RUNTIME_VERSION);
+    mkdirSync(versionDir, { recursive: true });
+    writeFileSync(join(versionDir, getOnnxLibraryName()), "stub");
+    expect(findCachedOnnxRuntime(workDir)).toBe(versionDir);
+  });
+
+  test("finds the cached library in a lib/ subdir (manual install)", () => {
+    const versionDir = join(workDir, "onnxruntime", ONNX_RUNTIME_VERSION);
+    const libDir = join(versionDir, "lib");
+    mkdirSync(libDir, { recursive: true });
+    // Microsoft's archive lays the library out under lib/, not the version root.
+    writeFileSync(join(libDir, getOnnxLibraryName()), "stub");
+    expect(findCachedOnnxRuntime(workDir)).toBe(libDir);
+  });
+
+  test("returns null when no library is present in either layout", () => {
+    mkdirSync(join(workDir, "onnxruntime", ONNX_RUNTIME_VERSION), { recursive: true });
+    expect(findCachedOnnxRuntime(workDir)).toBeNull();
   });
 });
