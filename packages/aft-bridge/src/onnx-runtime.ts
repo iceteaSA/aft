@@ -183,14 +183,12 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   // 1. Cached location with TOFU.
   const ortVersionDir = join(storageDir, "onnxruntime", ORT_VERSION);
   const libName = info?.libName ?? "libonnxruntime.dylib";
-  // Our own auto-download flattens the library into the version root, but a
-  // manual install of Microsoft's archive leaves it under `lib/`. Accept
-  // either layout so manual installs are detected too (#71).
-  const ortDir =
-    !existsSync(join(ortVersionDir, libName)) && existsSync(join(ortVersionDir, "lib", libName))
-      ? join(ortVersionDir, "lib")
-      : ortVersionDir;
-  const libPath = join(ortDir, libName);
+  // Keep the version root separate from the resolved library directory. The
+  // root owns cleanup, downloads, and TOFU metadata; the resolved dir only
+  // feeds the return value / ORT_DYLIB_PATH and may be `<version>/lib` for
+  // manual Microsoft-archive installs (#71).
+  const resolvedOrtDir = resolveCachedOnnxRuntimeDir(ortVersionDir, libName);
+  const libPath = join(resolvedOrtDir, libName);
 
   if (existsSync(libPath)) {
     // Audit-3 v0.17 #1 (TOFU): if we recorded a hash for this version,
@@ -206,24 +204,24 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
         const currentHash = sha256File(libPath);
         if (currentHash !== meta.sha256) {
           error(
-            `ONNX Runtime at ${ortDir}: TOFU sha256 mismatch — refusing to use ` +
+            `ONNX Runtime at ${resolvedOrtDir}: TOFU sha256 mismatch — refusing to use ` +
               `tampered binary. Recorded ${meta.sha256}, current ${currentHash}. ` +
               `Run \`aft doctor --clear\` to re-download from scratch.`,
           );
           // Fall through to system path / re-download attempt below.
         } else {
-          log(`ONNX Runtime found at ${ortDir} (TOFU verified)`);
-          return ortDir;
+          log(`ONNX Runtime found at ${resolvedOrtDir} (TOFU verified)`);
+          return resolvedOrtDir;
         }
       } catch (err) {
-        warn(`Could not verify ONNX Runtime hash at ${ortDir}: ${err}`);
+        warn(`Could not verify ONNX Runtime hash at ${resolvedOrtDir}: ${err}`);
         // Treat unreadable hash as "trust on existence" since we already
         // owned this install — better than blocking semantic search.
-        return ortDir;
+        return resolvedOrtDir;
       }
     } else {
-      log(`ONNX Runtime found at ${ortDir} (no recorded hash, accepting)`);
-      return ortDir;
+      log(`ONNX Runtime found at ${resolvedOrtDir} (no recorded hash, accepting)`);
+      return resolvedOrtDir;
     }
   }
 
@@ -255,8 +253,8 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
 
   // Recover from SIGKILL'd previous attempts before acquiring the lock.
   // When the host process is killed mid-download (user closes OpenCode while
-  // ONNX is still downloading), the staging dir at `${ortDir}.tmp.<pid>.<ts>`
-  // and a half-populated `ortDir` can survive without a meta file. The
+  // ONNX is still downloading), the staging dir at `${ortVersionDir}.tmp.<pid>.<ts>`
+  // and a half-populated `ortVersionDir` can survive without a meta file. The
   // existing TOFU branch above already handles a tampered-but-complete
   // install, but this branch covers the "abandoned, incomplete" case where
   // the lib file isn't present (we wouldn't be here otherwise). Sweep them
@@ -271,8 +269,8 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   }
 
   try {
-    cleanupIncompleteTargetIfUnowned(ortDir);
-    return await downloadOnnxRuntime(info, ortDir);
+    cleanupIncompleteTargetIfUnowned(ortVersionDir);
+    return await downloadOnnxRuntime(info, ortVersionDir);
   } finally {
     releaseLock(lockPath);
   }
@@ -451,6 +449,16 @@ function directoryContainsLibrary(dir: string, libName: string): boolean {
   } catch {
     return false;
   }
+}
+
+function resolveCachedOnnxRuntimeDir(ortVersionDir: string, libName: string): string {
+  // AFT's own installer flattens the runtime libraries into the version root.
+  // Microsoft's archives keep them under lib/. Prefer the root when both exist
+  // because downloads and metadata are anchored there.
+  if (existsSync(join(ortVersionDir, libName))) return ortVersionDir;
+  const libSubdir = join(ortVersionDir, "lib");
+  if (existsSync(join(libSubdir, libName))) return libSubdir;
+  return ortVersionDir;
 }
 
 function findSystemOnnxRuntime(libName?: string): string | null {
@@ -1075,6 +1083,7 @@ export const __test__ = {
   cleanupAbandonedStagingDirs,
   cleanupIncompleteTargetIfUnowned,
   copyOnnxLibraries,
+  resolveCachedOnnxRuntimeDir,
   ORT_VERSION,
   ONNX_INSTALLED_META_FILE,
   detectOnnxVersion,

@@ -56,6 +56,35 @@ describe("sanitizeContent", () => {
     expect(out).not.toContain(originalHome);
     expect(out).toContain("~/secret-project");
   });
+
+  test("redacts bearer and GitHub tokens", () => {
+    const bearer = "Authorization: Bearer abc.def_1234567890-secret";
+    const github = "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+
+    const out = sanitizeContent([bearer, github].join("\n"));
+
+    expect(out).toContain("Authorization: Bearer <REDACTED_SECRET>");
+    expect(out).not.toContain("abc.def_1234567890-secret");
+    expect(out).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+  });
+
+  test("redacts common credentials, URL userinfo, and emails", () => {
+    const input = [
+      "api_key=sk-live-abcdefghijklmnopqrstuvwxyz123456",
+      "password: hunter2",
+      "remote=https://alice:swordfish@example.com/repo.git",
+      "contact alice@example.com",
+    ].join("\n");
+
+    const out = sanitizeContent(input);
+
+    expect(out).not.toContain("sk-live-abcdefghijklmnopqrstuvwxyz123456");
+    expect(out).not.toContain("hunter2");
+    expect(out).toContain("api_key=<REDACTED_SECRET>");
+    expect(out).toContain("password: <REDACTED_SECRET>");
+    expect(out).toContain("https://***@example.com/repo.git");
+    expect(out).toContain("contact <EMAIL>");
+  });
 });
 
 describe("sanitizeValue", () => {

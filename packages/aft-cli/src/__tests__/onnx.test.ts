@@ -1,14 +1,15 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { __test__ as bridgeOnnxTest } from "../../../aft-bridge/src/onnx-runtime.js";
 import {
-  ONNX_RUNTIME_VERSION,
   findCachedOnnxRuntime,
   findSystemOnnxRuntime,
   getOnnxLibraryName,
+  ONNX_RUNTIME_VERSION,
 } from "../lib/onnx.js";
 
 type EnvSnapshot = Map<string, string | undefined>;
@@ -78,5 +79,37 @@ describe("CLI ONNX cached detection (#71)", () => {
   test("returns null when no library is present in either layout", () => {
     mkdirSync(join(workDir, "onnxruntime", ONNX_RUNTIME_VERSION), { recursive: true });
     expect(findCachedOnnxRuntime(workDir)).toBeNull();
+  });
+});
+
+describe("bridge ONNX cached resolution (#71 stale metadata)", () => {
+  test("anchors cleanup/meta to the version root while returning the lib directory", () => {
+    const versionDir = join(workDir, "onnxruntime", bridgeOnnxTest.ORT_VERSION);
+    const libDir = join(versionDir, "lib");
+    const libName = "libonnxruntime.so";
+    mkdirSync(libDir, { recursive: true });
+    writeFileSync(join(libDir, libName), "manual archive layout");
+    writeFileSync(
+      join(versionDir, bridgeOnnxTest.ONNX_INSTALLED_META_FILE),
+      JSON.stringify({
+        version: bridgeOnnxTest.ORT_VERSION,
+        installedAt: "2026-01-01T00:00:00.000Z",
+        sha256: "stale-root-meta",
+      }),
+    );
+
+    const resolvedDir = bridgeOnnxTest.resolveCachedOnnxRuntimeDir(versionDir, libName);
+
+    expect(resolvedDir).toBe(libDir);
+    expect(existsSync(join(resolvedDir, libName))).toBe(true);
+
+    // Regression guard: with stale root metadata and a lib-only layout, the
+    // post-lock cleanup target must be the version root. Cleaning the resolved
+    // lib/ dir would treat it as unowned and delete the real library, causing a
+    // re-download loop.
+    bridgeOnnxTest.cleanupIncompleteTargetIfUnowned(versionDir);
+
+    expect(existsSync(join(versionDir, bridgeOnnxTest.ONNX_INSTALLED_META_FILE))).toBe(true);
+    expect(existsSync(join(libDir, libName))).toBe(true);
   });
 });

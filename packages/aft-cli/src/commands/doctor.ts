@@ -1,4 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { HarnessAdapter } from "../adapters/types.js";
@@ -717,12 +728,99 @@ function formatStorageSizes(sizes: Record<string, number>): string {
   return parts.length > 0 ? parts.join(", ") : "empty";
 }
 
+interface IssueReviewFile {
+  path: string;
+  realPath: string;
+}
+
+function isInteractiveTerminal(): boolean {
+  return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+function issueDescriptionSummaryFromBody(body: string): string {
+  const lines = body.split(/\r?\n/);
+  const descriptionStart = lines.findIndex((line) => line.trim() === "## Description");
+  if (descriptionStart !== -1) {
+    const parts: string[] = [];
+    for (let i = descriptionStart + 1; i < lines.length; i += 1) {
+      const trimmed = lines[i].trim();
+      if (trimmed.startsWith("## ")) break;
+      if (!trimmed) continue;
+      parts.push(trimmed);
+      if (parts.join(" ").length >= 72) break;
+    }
+    const summary = parts.join(" ").replace(/\s+/g, " ").trim();
+    if (summary) return summary;
+  }
+
+  return (
+    lines
+      .map((line) => line.trim())
+      .find((line) => line.length > 0 && !line.startsWith("#") && !line.startsWith("```")) ??
+    "diagnostic report"
+  );
+}
+
+export function deriveIssueTitleFromBody(body: string): string {
+  const summary = issueDescriptionSummaryFromBody(sanitizeContent(body));
+  return sanitizeContent(`AFT issue: ${summary.slice(0, 72)}`);
+}
+
+function writeIssueReviewFile(body: string): IssueReviewFile | null {
+  let reviewDir: string | null = null;
+  try {
+    reviewDir = mkdtempSync(join(tmpdir(), "aft-issue-"));
+    if (process.platform !== "win32") {
+      chmodSync(reviewDir, 0o700);
+    }
+    const outPath = join(reviewDir, "issue.md");
+    writeFileSync(outPath, `${body}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    return { path: outPath, realPath: realpathSync(outPath) };
+  } catch (err) {
+    if (reviewDir) {
+      try {
+        rmSync(reviewDir, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup failures after a failed review-file write
+      }
+    }
+    log.error(
+      `Failed to write sanitized issue report: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
+function readReviewedIssueFile(reviewFile: IssueReviewFile): string | null {
+  try {
+    const realPath = realpathSync(reviewFile.path);
+    if (realPath !== reviewFile.realPath) {
+      log.error(`Review file path changed before filing; refusing to read ${reviewFile.path}.`);
+      return null;
+    }
+    return readFileSync(reviewFile.path, "utf8");
+  } catch (err) {
+    log.error(
+      `Failed to read reviewed issue report: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
 /**
  * `aft doctor --issue` flow — collect diagnostics, sanitize user paths,
  * prompt for an issue description, optionally file via `gh`.
  */
 async function runIssueFlow(argv: string[]): Promise<number> {
   intro("AFT doctor --issue");
+
+  if (!isInteractiveTerminal()) {
+    note(
+      "Non-interactive terminal — not collecting or filing automatically. Run `aft doctor --issue` from an interactive terminal so you can describe and review the report before filing.",
+      "Manual filing",
+    );
+    outro("Done.");
+    return 0;
+  }
 
   const adapters = await resolveAdaptersForCommand(argv, {
     allowMulti: true,
@@ -795,9 +893,12 @@ async function runIssueFlow(argv: string[]): Promise<number> {
   // preserved intact.
   const body = capBodyToGithubLimit(sanitizeContent(rawBody));
 
-  const title = sanitizeContent(`AFT issue: ${description.slice(0, 72)}`);
-  const outPath = join(process.cwd(), `aft-issue-${Date.now()}.md`);
-  writeFileSync(outPath, `${body}\n`);
+  const reviewFile = writeIssueReviewFile(body);
+  if (!reviewFile) {
+    outro("Done — could not write the issue report.");
+    return 1;
+  }
+  const outPath = reviewFile.path;
   log.success(`Wrote sanitized issue body to ${outPath}`);
   note(
     `Open and review the report before filing:\n  ${outPath}\n\nHome paths and your username have been stripped, but it still contains log lines and file paths from your project. Edit the file to remove anything you don't want public — your edits are used when you confirm below.`,
@@ -805,18 +906,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
   );
 
   // Never file automatically. Only file after the user confirms they have
-  // reviewed (and possibly edited) the on-disk report. Non-interactive
-  // sessions never auto-file.
-  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
-  if (!interactive) {
-    note(
-      `Non-interactive terminal — not filing automatically. File manually at\nhttps://github.com/cortexkit/aft/issues/new and paste the contents of ${outPath}.`,
-      "Manual filing",
-    );
-    outro("Done.");
-    return 0;
-  }
-
+  // reviewed (and possibly edited) the on-disk report.
   const proceed = await confirm(
     "Have you reviewed the report above? File it as a GitHub issue now?",
     false,
@@ -832,12 +922,23 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   // Re-read the file so any edits the user made during review are filed, and
   // re-sanitize + re-cap as defense-in-depth in case editing reintroduced a
-  // home path or pushed the body over GitHub's limit.
-  const finalBody = capBodyToGithubLimit(sanitizeContent(readFileSync(outPath, "utf8")));
+  // home path or pushed the body over GitHub's limit. The filed title is also
+  // derived from this reviewed body so edited-out secrets cannot survive in it.
+  const reviewedBody = readReviewedIssueFile(reviewFile);
+  if (reviewedBody === null) {
+    note(
+      "No issue filed. Please review the report path above and file manually if needed.",
+      "Skipped",
+    );
+    outro("Done.");
+    return 1;
+  }
+  const finalBody = capBodyToGithubLimit(sanitizeContent(reviewedBody));
+  const finalTitle = deriveIssueTitleFromBody(finalBody);
 
   if (isGhInstalled()) {
     log.info("Opening GitHub issue via `gh`…");
-    const result = createGitHubIssue("cortexkit/aft", title, finalBody);
+    const result = createGitHubIssue("cortexkit/aft", finalTitle, finalBody);
     if (result.url) {
       log.success(`Issue filed: ${result.url}`);
       openBrowser(result.url);
@@ -847,7 +948,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     log.warn(`gh failed: ${result.stderr ?? "unknown error"}. Falling back to browser.`);
   }
 
-  const fallback = `https://github.com/cortexkit/aft/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(finalBody)}`;
+  const fallback = `https://github.com/cortexkit/aft/issues/new?title=${encodeURIComponent(finalTitle)}&body=${encodeURIComponent(finalBody)}`;
   log.info("Opening GitHub issue form in your browser…");
   openBrowser(fallback);
   note(

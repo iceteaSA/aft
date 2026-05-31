@@ -13,6 +13,38 @@ function safeRealpath(p: string): string | null {
   }
 }
 
+const SECRET_PLACEHOLDER = "<REDACTED_SECRET>";
+const URL_CREDENTIAL_PLACEHOLDER = "***";
+
+function redactSecrets(content: string): string {
+  let sanitized = content;
+
+  sanitized = sanitized.replace(
+    /\b(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi,
+    `$1${SECRET_PLACEHOLDER}`,
+  );
+  sanitized = sanitized.replace(/\bgh(?:p|o|s)_[A-Za-z0-9_]{16,}\b/g, SECRET_PLACEHOLDER);
+  sanitized = sanitized.replace(
+    /\bsk-(?:live-)?[A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g,
+    SECRET_PLACEHOLDER,
+  );
+  sanitized = sanitized.replace(
+    /\b((?:api[_-]?key|token|secret|password)\s*[=:]\s*)(["'])([^"'\r\n]+)\2/gi,
+    `$1$2${SECRET_PLACEHOLDER}$2`,
+  );
+  sanitized = sanitized.replace(
+    /\b((?:api[_-]?key|token|secret|password)\s*[=:]\s*)([^\s,;&"']+)/gi,
+    `$1${SECRET_PLACEHOLDER}`,
+  );
+  sanitized = sanitized.replace(
+    /\b([a-z][a-z0-9+.-]*:\/\/)[^@\s/?#]+@/gi,
+    `$1${URL_CREDENTIAL_PLACEHOLDER}@`,
+  );
+  sanitized = sanitized.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "<EMAIL>");
+
+  return sanitized;
+}
+
 /**
  * Strip personally identifiable path segments and usernames from arbitrary
  * text. Used on log contents, diagnostic JSON blocks, and the final issue body
@@ -22,7 +54,7 @@ export function sanitizeContent(content: string): string {
   const username = userInfo().username;
   const home = homedir();
 
-  let sanitized = content;
+  let sanitized = redactSecrets(content);
 
   // Redact the project/working-directory prefix first. It's the most specific
   // path and often the biggest leak in logs (it names the repo the user is
