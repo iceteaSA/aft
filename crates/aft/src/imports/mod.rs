@@ -13,6 +13,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::parser::{grammar_for, LangId};
 
+mod c;
 mod csharp;
 mod java;
 mod kotlin;
@@ -407,6 +408,8 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Rust => Some(&RUST_SYNTAX),
         LangId::Go => Some(&GO_SYNTAX),
         LangId::Solidity => Some(&SOLIDITY_SYNTAX),
+        LangId::C => Some(&c::C_SYNTAX),
+        LangId::Cpp => Some(&c::C_SYNTAX),
         LangId::Java => Some(&java::JAVA_SYNTAX),
         LangId::Kotlin => Some(&kotlin::KOTLIN_SYNTAX),
         LangId::Lua => Some(&lua::LUA_SYNTAX),
@@ -415,9 +418,7 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Ruby => Some(&ruby::RUBY_SYNTAX),
         LangId::Scala => Some(&scala::SCALA_SYNTAX),
         LangId::Swift => Some(&swift::SWIFT_SYNTAX),
-        LangId::C
-        | LangId::Cpp
-        | LangId::Zig
+        LangId::Zig
         | LangId::Bash
         | LangId::Vue
         | LangId::Json

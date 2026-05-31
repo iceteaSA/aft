@@ -891,6 +891,90 @@ fn scenarios() -> Vec<Scenario> {
             input: "local zeta = require(\"zeta\")\nrequire(\"boot\")\nlocal alpha = require(\"alpha\")\n\nreturn alpha, zeta\n",
             ops: &[Op::Organize],
         },
+        // ---- C (preprocessor #include: system angle + local quote) ----
+        Scenario {
+            name: "c_add_system_include",
+            ext: "c",
+            input: "int main(void) { return 0; }\n",
+            ops: &[Op::AddForm {
+                module: "stdio.h",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("system"),
+            }],
+        },
+        Scenario {
+            name: "c_add_local_include",
+            ext: "h",
+            input: "void f(void);\n",
+            ops: &[Op::AddForm {
+                module: "project/config.h",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("local"),
+            }],
+        },
+        Scenario {
+            name: "c_remove_include",
+            ext: "c",
+            input: "#include <stdio.h>\n#include \"unused.h\"\n#include \"keep.h\"\n\nint main(void) { return 0; }\n",
+            ops: &[Op::Remove {
+                module: "unused.h",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "c_organize_mixed_includes",
+            ext: "h",
+            input: "#include \"z_local.h\"\n#include <stdio.h>\n#include \"a_local.h\"\n#include <stdlib.h>\n\nvoid f(void);\n",
+            ops: &[Op::Organize],
+        },
+        // ---- C++ (same #include engine as C) ----
+        Scenario {
+            name: "cpp_add_system_include",
+            ext: "cpp",
+            input: "int main() { return 0; }\n",
+            ops: &[Op::AddForm {
+                module: "vector",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("system"),
+            }],
+        },
+        Scenario {
+            name: "cpp_add_local_include",
+            ext: "hpp",
+            input: "void f();\n",
+            ops: &[Op::AddForm {
+                module: "project/widget.hpp",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("local"),
+            }],
+        },
+        Scenario {
+            name: "cpp_remove_include",
+            ext: "cpp",
+            input: "#include <vector>\n#include \"unused.hpp\"\n#include \"keep.hpp\"\n\nint main() { return 0; }\n",
+            ops: &[Op::Remove {
+                module: "unused.hpp",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "cpp_organize_mixed_includes",
+            ext: "hpp",
+            input: "#include \"z_widget.hpp\"\n#include <vector>\n#include \"a_widget.hpp\"\n#include <string>\n\nvoid f();\n",
+            ops: &[Op::Organize],
+        },
     ]
 }
 
