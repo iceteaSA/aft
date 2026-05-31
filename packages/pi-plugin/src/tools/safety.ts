@@ -7,7 +7,7 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
-import { assertExternalDirectoryPermission } from "./hoisted.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asNumber,
@@ -174,16 +174,23 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         throw new Error(`op='${params.op}' requires 'name'`);
       }
 
-      if (params.op === "undo" && params.filePath) {
-        await assertExternalDirectoryPermission(extCtx, params.filePath, "modify", {
+      const filePath = params.filePath
+        ? await resolvePathArg(extCtx.cwd, params.filePath)
+        : undefined;
+      const files = params.files
+        ? await Promise.all(params.files.map((file) => resolvePathArg(extCtx.cwd, file)))
+        : undefined;
+
+      if (params.op === "undo" && filePath) {
+        await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
           restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
         });
       }
       if (params.op === "checkpoint") {
-        const files = params.files ?? (params.filePath ? [params.filePath] : undefined);
-        if (Array.isArray(files)) {
+        const checkpointFiles = files ?? (filePath ? [filePath] : undefined);
+        if (Array.isArray(checkpointFiles)) {
           const checked = new Set<string>();
-          for (const file of files) {
+          for (const file of checkpointFiles) {
             if (checked.has(file)) continue;
             checked.add(file);
             await assertExternalDirectoryPermission(extCtx, file, "modify", {
@@ -209,15 +216,15 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         // auto-promote it into a single-entry `files` list rather than
         // silently dropping it and falling back to the whole tracked-file
         // set.
-        if (params.files) {
-          req.files = params.files;
-        } else if (params.filePath) {
-          req.files = [params.filePath];
+        if (files) {
+          req.files = files;
+        } else if (filePath) {
+          req.files = [filePath];
         }
       } else {
         // undo / history / restore / list all take `file` as-is.
-        if (params.filePath) req.file = params.filePath;
-        if (params.files) req.files = params.files;
+        if (filePath) req.file = filePath;
+        if (files) req.files = files;
       }
       const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
       return textResult(JSON.stringify(response, null, 2));

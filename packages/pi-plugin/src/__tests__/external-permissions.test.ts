@@ -5,6 +5,8 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerAstTools } from "../tools/ast.js";
@@ -240,6 +242,184 @@ describe("AFT external-directory permissions", () => {
       );
 
       expect(prompts).toHaveLength(1);
+    }
+  });
+
+  test("tilde paths are expanded consistently in prompts and bridge requests", async () => {
+    const homePath = (leaf: string) => {
+      const relative = `aft-pi-tilde/${leaf}`;
+      return { input: `~/${relative}`, resolved: resolve(homedir(), relative) };
+    };
+
+    const importFile = homePath("imports.ts");
+    const refactorFile = homePath("refactor-source.ts");
+    const refactorDestination = homePath("refactor-destination.ts");
+    const safetyUndoFile = homePath("safety-undo.ts");
+    const safetyCheckpointFile = homePath("safety-checkpoint.ts");
+    const transformFile = homePath("structure.ts");
+    const astSearchPath = homePath("ast-search");
+    const astReplacePath = homePath("ast-replace");
+    const deleteFile = homePath("delete.ts");
+    const moveFile = homePath("move-source.ts");
+    const moveDestination = homePath("move-destination.ts");
+
+    const cases: Array<{
+      label: string;
+      toolName: string;
+      params: Record<string, unknown>;
+      command: string;
+      action: "modify" | "search";
+      promptPaths: string[];
+      expectedParams: Record<string, unknown>;
+    }> = [
+      {
+        label: "aft_import",
+        toolName: "aft_import",
+        params: { op: "organize", filePath: importFile.input },
+        command: "organize_imports",
+        action: "modify",
+        promptPaths: [importFile.resolved],
+        expectedParams: { file: importFile.resolved },
+      },
+      {
+        label: "aft_refactor",
+        toolName: "aft_refactor",
+        params: {
+          op: "move",
+          filePath: refactorFile.input,
+          destination: refactorDestination.input,
+          symbol: "Widget",
+        },
+        command: "move_symbol",
+        action: "modify",
+        promptPaths: [refactorFile.resolved, refactorDestination.resolved],
+        expectedParams: {
+          file: refactorFile.resolved,
+          destination: refactorDestination.resolved,
+        },
+      },
+      {
+        label: "aft_safety undo",
+        toolName: "aft_safety",
+        params: { op: "undo", filePath: safetyUndoFile.input },
+        command: "undo",
+        action: "modify",
+        promptPaths: [safetyUndoFile.resolved],
+        expectedParams: { file: safetyUndoFile.resolved },
+      },
+      {
+        label: "aft_safety checkpoint",
+        toolName: "aft_safety",
+        params: { op: "checkpoint", name: "tilde", files: [safetyCheckpointFile.input] },
+        command: "checkpoint",
+        action: "modify",
+        promptPaths: [safetyCheckpointFile.resolved],
+        expectedParams: { files: [safetyCheckpointFile.resolved] },
+      },
+      {
+        label: "aft_transform",
+        toolName: "aft_transform",
+        params: {
+          op: "add_member",
+          filePath: transformFile.input,
+          container: "Service",
+          code: "value = 1;",
+        },
+        command: "add_member",
+        action: "modify",
+        promptPaths: [transformFile.resolved],
+        expectedParams: { file: transformFile.resolved },
+      },
+      {
+        label: "ast_grep_search",
+        toolName: "ast_grep_search",
+        params: { pattern: "console.log($MSG)", lang: "typescript", paths: [astSearchPath.input] },
+        command: "ast_search",
+        action: "search",
+        promptPaths: [astSearchPath.resolved],
+        expectedParams: { paths: [astSearchPath.resolved] },
+      },
+      {
+        label: "ast_grep_replace",
+        toolName: "ast_grep_replace",
+        params: {
+          pattern: "console.log($MSG)",
+          rewrite: "logger.info($MSG)",
+          lang: "typescript",
+          paths: [astReplacePath.input],
+        },
+        command: "ast_replace",
+        action: "modify",
+        promptPaths: [astReplacePath.resolved],
+        expectedParams: { paths: [astReplacePath.resolved] },
+      },
+      {
+        label: "aft_delete",
+        toolName: "aft_delete",
+        params: { files: [deleteFile.input] },
+        command: "delete_file",
+        action: "modify",
+        promptPaths: [deleteFile.resolved],
+        expectedParams: { files: [deleteFile.resolved] },
+      },
+      {
+        label: "aft_move",
+        toolName: "aft_move",
+        params: { filePath: moveFile.input, destination: moveDestination.input },
+        command: "move_file",
+        action: "modify",
+        promptPaths: [moveFile.resolved, moveDestination.resolved],
+        expectedParams: {
+          file: moveFile.resolved,
+          destination: moveDestination.resolved,
+        },
+      },
+    ];
+
+    for (const entry of cases) {
+      const { api, tools } = makeMockApi();
+      const prompts: Prompt[] = [];
+      const { bridge, calls } = makeMockBridge((command, params) => {
+        if (command === "delete_file") {
+          return {
+            success: true,
+            deleted: ((params.files as string[] | undefined) ?? []).map((file) => ({ file })),
+          };
+        }
+        return { success: true, text: "ok" };
+      });
+
+      if (entry.label === "aft_import") registerImportTools(api, restrictedContext(bridge));
+      if (entry.label === "aft_refactor") registerRefactorTool(api, restrictedContext(bridge));
+      if (entry.label === "aft_safety undo" || entry.label === "aft_safety checkpoint") {
+        registerSafetyTool(api, restrictedContext(bridge));
+      }
+      if (entry.label === "aft_transform") registerStructureTool(api, restrictedContext(bridge));
+      if (entry.label === "ast_grep_search") {
+        registerAstTools(api, restrictedContext(bridge), { astSearch: true, astReplace: false });
+      }
+      if (entry.label === "ast_grep_replace") {
+        registerAstTools(api, restrictedContext(bridge), { astSearch: false, astReplace: true });
+      }
+      if (entry.label === "aft_delete") {
+        registerFsTools(api, restrictedContext(bridge), { delete: true, move: false });
+      }
+      if (entry.label === "aft_move") {
+        registerFsTools(api, restrictedContext(bridge), { delete: false, move: true });
+      }
+
+      await executeTool(tools.get(entry.toolName)!, entry.params, confirmingExtContext(prompts));
+
+      expect(prompts.map((prompt) => prompt.title)).toEqual(
+        entry.promptPaths.map(() => "Allow external directory access?"),
+      );
+      expect(prompts.map((prompt) => prompt.message)).toEqual(
+        entry.promptPaths.map(
+          (path) => `AFT wants to ${entry.action} outside the project: ${path}`,
+        ),
+      );
+      expect(calls[0].command).toBe(entry.command);
+      expect(calls[0].params).toMatchObject(entry.expectedParams);
     }
   });
 });

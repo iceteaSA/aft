@@ -8,7 +8,7 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
-import { assertExternalDirectoryPermission } from "./hoisted.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asNumber,
@@ -165,7 +165,8 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       if ((params.op === "add" || params.op === "remove") && !params.module) {
         throw new Error(`op='${params.op}' requires 'module'`);
       }
-      await assertExternalDirectoryPermission(extCtx, params.filePath, "modify", {
+      const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+      await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
         restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
       });
       const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -174,7 +175,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
         remove: "remove_import",
         organize: "organize_imports",
       };
-      const req: Record<string, unknown> = { file: params.filePath };
+      const req: Record<string, unknown> = { file: filePath };
       if (params.module !== undefined) req.module = params.module;
       if (params.names !== undefined) req.names = params.names;
       if (params.defaultImport !== undefined) req.default_import = params.defaultImport;

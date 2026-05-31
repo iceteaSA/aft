@@ -15,7 +15,7 @@ import {
   optionalInt,
   textResult,
 } from "./_shared.js";
-import { assertExternalDirectoryPermission } from "./hoisted.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asNumber,
@@ -146,10 +146,12 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
         throw new Error("'name' is required for 'extract' op");
       }
 
+      const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+      const destination = !isEmptyParam(params.destination)
+        ? await resolvePathArg(extCtx.cwd, params.destination as string)
+        : undefined;
       const permissionTargets =
-        params.op === "move" && !isEmptyParam(params.destination)
-          ? [params.filePath, params.destination as string]
-          : [params.filePath];
+        params.op === "move" && destination !== undefined ? [filePath, destination] : [filePath];
       const checked = new Set<string>();
       for (const target of permissionTargets) {
         if (checked.has(target)) continue;
@@ -160,11 +162,11 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       }
 
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const req: Record<string, unknown> = { file: params.filePath };
+      const req: Record<string, unknown> = { file: filePath };
       // Use isEmptyParam everywhere so "" / [] / null don't slip through as
       // valid string params that Rust then has to deal with.
       if (!isEmptyParam(params.symbol)) req.symbol = params.symbol;
-      if (!isEmptyParam(params.destination)) req.destination = params.destination;
+      if (destination !== undefined) req.destination = destination;
       if (!isEmptyParam(params.scope)) req.scope = params.scope;
       if (!isEmptyParam(params.name)) req.name = params.name;
       const startLine = coerceOptionalInt(

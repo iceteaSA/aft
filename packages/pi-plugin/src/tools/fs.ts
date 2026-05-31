@@ -7,7 +7,7 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
-import { assertExternalDirectoryPermission } from "./hoisted.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   type RenderContextLike,
@@ -132,8 +132,11 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         _onUpdate,
         extCtx,
       ) {
+        const files = await Promise.all(
+          params.files.map((file) => resolvePathArg(extCtx.cwd, file)),
+        );
         const checked = new Set<string>();
-        for (const file of params.files) {
+        for (const file of files) {
           if (checked.has(file)) continue;
           checked.add(file);
           await assertExternalDirectoryPermission(extCtx, file, "modify", {
@@ -148,7 +151,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           bridge,
           "delete_file",
           {
-            files: params.files,
+            files,
             recursive: params.recursive === true,
           },
           extCtx,
@@ -199,7 +202,9 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         _onUpdate,
         extCtx,
       ) {
-        const checked = new Set([params.filePath, params.destination]);
+        const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+        const destination = await resolvePathArg(extCtx.cwd, params.destination);
+        const checked = new Set([filePath, destination]);
         for (const file of checked) {
           await assertExternalDirectoryPermission(extCtx, file, "modify", {
             restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
@@ -211,8 +216,8 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           bridge,
           "move_file",
           {
-            file: params.filePath,
-            destination: params.destination,
+            file: filePath,
+            destination,
           },
           extCtx,
         );

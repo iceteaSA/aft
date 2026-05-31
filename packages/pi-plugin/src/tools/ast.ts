@@ -13,7 +13,7 @@ import type {
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
-import { assertExternalDirectoryPermission } from "./hoisted.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   asNumber,
   asRecord,
@@ -97,16 +97,28 @@ function appendScopeSections(response: Record<string, unknown>, sections: string
     );
   }
 }
-async function assertAstPathsPermission(
+async function resolveAstPaths(
   extCtx: ExtensionContext,
   paths: unknown,
+): Promise<string[] | undefined> {
+  if (isEmptyParam(paths) || !Array.isArray(paths)) return undefined;
+  return Promise.all(
+    paths
+      .filter((path): path is string => typeof path === "string")
+      .map((path) => resolvePathArg(extCtx.cwd, path)),
+  );
+}
+
+async function assertAstPathsPermission(
+  extCtx: ExtensionContext,
+  paths: string[] | undefined,
   action: "modify" | "search",
   restrictToProjectRoot: boolean,
 ): Promise<void> {
-  if (isEmptyParam(paths) || !Array.isArray(paths)) return;
+  if (paths === undefined || paths.length === 0) return;
   const checked = new Set<string>();
   for (const path of paths) {
-    if (typeof path !== "string" || checked.has(path)) continue;
+    if (checked.has(path)) continue;
     checked.add(path);
     await assertExternalDirectoryPermission(extCtx, path, action, { restrictToProjectRoot });
   }
@@ -281,9 +293,10 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         _onUpdate,
         extCtx,
       ) {
+        const paths = await resolveAstPaths(extCtx, params.paths);
         await assertAstPathsPermission(
           extCtx,
-          params.paths,
+          paths,
           "search",
           ctx.config.restrict_to_project_root ?? false,
         );
@@ -296,7 +309,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         // Use isEmptyParam so empty arrays sent by GPT-family models don't
         // get forwarded to Rust as "scope present" — let Rust default to whole
         // project_root instead of round-tripping a useless empty scope.
-        if (!isEmptyParam(params.paths)) req.paths = params.paths;
+        if (!isEmptyParam(paths)) req.paths = paths;
         if (!isEmptyParam(params.globs)) req.globs = params.globs;
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
         const response = await callBridge(bridge, "ast_search", req, extCtx);
@@ -325,9 +338,10 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         _onUpdate,
         extCtx,
       ) {
+        const paths = await resolveAstPaths(extCtx, params.paths);
         await assertAstPathsPermission(
           extCtx,
-          params.paths,
+          paths,
           params.dryRun === true ? "search" : "modify",
           ctx.config.restrict_to_project_root ?? false,
         );
@@ -339,7 +353,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
           lang: params.lang,
         };
         // Use isEmptyParam — see ast_search above for rationale.
-        if (!isEmptyParam(params.paths)) req.paths = params.paths;
+        if (!isEmptyParam(paths)) req.paths = paths;
         if (!isEmptyParam(params.globs)) req.globs = params.globs;
         // Rust ast_replace defaults to dry_run=true; apply by default to match description.
         req.dry_run = params.dryRun === true;
