@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { HarnessAdapter } from "../adapters/types.js";
@@ -799,10 +799,45 @@ async function runIssueFlow(argv: string[]): Promise<number> {
   const outPath = join(process.cwd(), `aft-issue-${Date.now()}.md`);
   writeFileSync(outPath, `${body}\n`);
   log.success(`Wrote sanitized issue body to ${outPath}`);
+  note(
+    `Open and review the report before filing:\n  ${outPath}\n\nHome paths and your username have been stripped, but it still contains log lines and file paths from your project. Edit the file to remove anything you don't want public — your edits are used when you confirm below.`,
+    "Review before filing",
+  );
+
+  // Never file automatically. Only file after the user confirms they have
+  // reviewed (and possibly edited) the on-disk report. Non-interactive
+  // sessions never auto-file.
+  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+  if (!interactive) {
+    note(
+      `Non-interactive terminal — not filing automatically. File manually at\nhttps://github.com/cortexkit/aft/issues/new and paste the contents of ${outPath}.`,
+      "Manual filing",
+    );
+    outro("Done.");
+    return 0;
+  }
+
+  const proceed = await confirm(
+    "Have you reviewed the report above? File it as a GitHub issue now?",
+    false,
+  );
+  if (!proceed) {
+    note(
+      `No issue filed. When ready, file manually at\nhttps://github.com/cortexkit/aft/issues/new and paste the contents of ${outPath}.`,
+      "Skipped",
+    );
+    outro("Done.");
+    return 0;
+  }
+
+  // Re-read the file so any edits the user made during review are filed, and
+  // re-sanitize + re-cap as defense-in-depth in case editing reintroduced a
+  // home path or pushed the body over GitHub's limit.
+  const finalBody = capBodyToGithubLimit(sanitizeContent(readFileSync(outPath, "utf8")));
 
   if (isGhInstalled()) {
     log.info("Opening GitHub issue via `gh`…");
-    const result = createGitHubIssue("cortexkit/aft", title, body);
+    const result = createGitHubIssue("cortexkit/aft", title, finalBody);
     if (result.url) {
       log.success(`Issue filed: ${result.url}`);
       openBrowser(result.url);
@@ -812,7 +847,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     log.warn(`gh failed: ${result.stderr ?? "unknown error"}. Falling back to browser.`);
   }
 
-  const fallback = `https://github.com/cortexkit/aft/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  const fallback = `https://github.com/cortexkit/aft/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(finalBody)}`;
   log.info("Opening GitHub issue form in your browser…");
   openBrowser(fallback);
   note(

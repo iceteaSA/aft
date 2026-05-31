@@ -1,7 +1,16 @@
+import { realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 
 export function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function safeRealpath(p: string): string | null {
+  try {
+    return realpathSync(p);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -14,6 +23,18 @@ export function sanitizeContent(content: string): string {
   const home = homedir();
 
   let sanitized = content;
+
+  // Redact the project/working-directory prefix first. It's the most specific
+  // path and often the biggest leak in logs (it names the repo the user is
+  // working on). Done before the home-dir pass because the cwd usually lives
+  // under home; in-project relative structure is left intact for debugging.
+  const cwd = process.cwd();
+  for (const candidate of new Set([cwd, safeRealpath(cwd)])) {
+    if (candidate && candidate !== "/" && candidate !== home) {
+      sanitized = sanitized.replace(new RegExp(escapeRegex(candidate), "g"), "<PROJECT>");
+    }
+  }
+
   if (home) {
     sanitized = sanitized.replace(new RegExp(escapeRegex(home), "g"), "~");
   }
