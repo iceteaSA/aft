@@ -33,4 +33,27 @@ describe("aft_conflicts adapter", () => {
 
     expect(result.content[0].text).toContain('"conflicts": []');
   });
+
+  test("forwards path to git_conflicts when provided", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerConflictsTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_conflicts")!, { path: "/tmp/other-worktree" });
+
+    expect(calls[0]).toMatchObject({
+      command: "git_conflicts",
+      params: { path: "/tmp/other-worktree" },
+    });
+  });
+
+  test("omits path from request when blank", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerConflictsTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_conflicts")!, { path: "   " });
+
+    expect(calls[0]).toMatchObject({ command: "git_conflicts", params: {} });
+  });
 });

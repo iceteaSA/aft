@@ -6,6 +6,7 @@ import { tool } from "@opencode-ai/plugin";
 import { astTools } from "../tools/ast.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
+import { conflictTools } from "../tools/conflicts.js";
 import { aftPrefixedTools, createReadTool, hoistedTools } from "../tools/hoisted.js";
 import { navigationTools } from "../tools/navigation.js";
 import { readingTools } from "../tools/reading.js";
@@ -62,6 +63,7 @@ function makeStubCtx(): PluginContext {
 function collectAllTools(ctx: PluginContext): Record<string, ToolDefinition> {
   return {
     ...astTools(ctx),
+    ...conflictTools(ctx),
     bash: createBashTool(ctx),
     bash_status: createBashStatusTool(ctx),
     bash_kill: createBashKillTool(ctx),

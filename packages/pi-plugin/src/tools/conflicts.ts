@@ -14,7 +14,14 @@ import {
   renderToolCall,
 } from "./render-helpers.js";
 
-const ConflictsParams = Type.Object({});
+const ConflictsParams = Type.Object({
+  path: Type.Optional(
+    Type.String({
+      description:
+        "Optional path inside the git repository or worktree to inspect (absolute or relative to project root). Conflicts are discovered from that repository's top level. Defaults to the session project root.",
+    }),
+  ),
+});
 
 /** Exported for renderer unit tests. */
 export function renderConflictCall(
@@ -71,9 +78,12 @@ export function registerConflictsTool(pi: ExtensionAPI, ctx: PluginContext): voi
     description:
       "Show all git merge conflicts across the repository — returns line-numbered conflict regions with context for every conflicted file in a single call.",
     parameters: ConflictsParams,
-    async execute(_toolCallId: string, _params, _signal, _onUpdate, extCtx) {
+    async execute(_toolCallId: string, params, _signal, _onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const response = await callBridge(bridge, "git_conflicts", {}, extCtx);
+      const reqParams: Record<string, unknown> = {};
+      const path = (params as { path?: unknown })?.path;
+      if (typeof path === "string" && path.trim() !== "") reqParams.path = path;
+      const response = await callBridge(bridge, "git_conflicts", reqParams, extCtx);
       return textResult((response.text as string | undefined) ?? JSON.stringify(response, null, 2));
     },
     renderCall(_args, theme, context) {

@@ -54,7 +54,7 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | `aft_outline` | Structural outline of a file, directory, files, or URL; or indexed file tree | `target` (string or array), `files` |
 | `aft_zoom` | Inspect symbols (same-file or cross-file); opt-in call-graph annotations | `filePath`, `symbols` (string or array), `targets`, `url`, `callgraph` |
 | `aft_import` | Language-aware import add/remove/organize | `op`, `filePath`, `module`, `names[]` |
-| `aft_conflicts` | Show all git merge conflicts with line-numbered regions | *(none)* |
+| `aft_conflicts` | Show all git merge conflicts with line-numbered regions | `path` (optional) |
 | `aft_search` | Hybrid semantic + lexical code search by meaning | `query`, `topK` |
 | `aft_inspect` | Codebase-health snapshot (TODOs, metrics, dead code, unused exports, duplicates) | `sections`, `scope`, `topK` |
 | `aft_safety` | Undo, history, checkpoints, restore | `op`, `filePath`, `name` |
@@ -530,15 +530,23 @@ heading text as the symbol name. Cross-file batches return partial results with 
 
 ### aft_conflicts
 
-Show all git merge conflicts across the repository in a single call. Auto-discovers conflicted
-files via `git ls-files --unmerged`, parses conflict markers, and returns line-numbered regions
-with 3 lines of surrounding context — the same format as `read` output.
+Show all git merge conflicts across a repository in a single call. Resolves the git top level,
+unions index-unmerged files (`git ls-files --unmerged`) with a tracked working-tree marker scan
+(so staged-but-still-marked files are caught), parses conflict markers, and returns line-numbered
+regions with 3 lines of surrounding context — the same format as `read` output. The output names
+the `Checked repo root` so a false "none" is obvious.
 
 ```json
+// Inspect the session project repository
 {}
+
+// Inspect a different repository or git worktree (e.g. where a rebase is running)
+{ "path": "/Users/me/work/some-other-worktree" }
 ```
 
-No parameters required. Returns output like:
+`path` is optional (defaults to the session project root); conflicts are discovered from that
+path's git top level, so it works even when the conflict is in a sibling worktree or a subdirectory.
+Returns output like:
 
 ```
 9 files, 13 conflicts
