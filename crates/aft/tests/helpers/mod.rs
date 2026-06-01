@@ -146,11 +146,7 @@ impl AftProcess {
         self.send_with_timeout(request, DEFAULT_RESPONSE_TIMEOUT)
     }
 
-    pub fn send_with_timeout(
-        &mut self,
-        request: &str,
-        timeout: Duration,
-    ) -> serde_json::Value {
+    pub fn send_with_timeout(&mut self, request: &str, timeout: Duration) -> serde_json::Value {
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         writeln!(stdin, "{}", request).expect("write to stdin");
         stdin.flush().expect("flush stdin");

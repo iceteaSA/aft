@@ -694,14 +694,12 @@ impl AppContext {
             .standard_filters(true)
             // Hidden files are filtered by default, but `.gitignore` starts with
             // `.` so we need to traverse "hidden" entries to find nested ones.
+            // No `max_depth`: nested `.gitignore`/`.aftignore` files are honored
+            // at arbitrary depth (see configure_watcher_honors_deep_nested_aftignore).
+            // The walk is pruned by standard gitignore filters plus the infra
+            // skip below; configure never runs this against `$HOME` (guarded by
+            // `home_match`), and tests use bounded roots rather than `/`.
             .hidden(false)
-            // Bound the nested-ignore-file discovery walk. Without this, a
-            // configure against a very high root (e.g. `/`) walks the entire
-            // filesystem and blocks the request for minutes. Eight levels is
-            // ample for real nested `.gitignore`/`.aftignore` files; this
-            // matches the cap that shipped through v0.33.0 (a refactor dropped
-            // it, which regressed `configure` on large/high roots).
-            .max_depth(Some(8))
             .filter_entry(|entry| {
                 let name = entry.file_name().to_string_lossy();
                 !matches!(
