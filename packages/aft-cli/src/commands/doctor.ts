@@ -27,17 +27,22 @@ import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
 import {
+  capBodyToGithubLimit,
+  extractRecentErrors,
+  filterLogToSession,
+} from "../lib/issue-body.js";
+import {
   AFT_SCHEMA_URL,
   ensureAftSchemaUrl,
   type JsoncFormat,
   readJsoncFile,
 } from "../lib/jsonc.js";
-import { capBodyToGithubLimit, extractRecentErrors } from "../lib/issue-body.js";
 import { type ClearResult, clearLspCaches } from "../lib/lsp-cache.js";
 import { findOnnxFixCandidates, runOnnxFix } from "../lib/onnx-fix.js";
-import { confirm, intro, log, note, outro, selectMany, text } from "../lib/prompts.js";
+import { confirm, intro, log, note, outro, selectMany, selectOne, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
+import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
 
 export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
 
@@ -885,6 +890,30 @@ function readReviewedIssueFile(reviewFile: IssueReviewFile): string | null {
     return null;
   }
 }
+
+async function promptForIssueSession(adapter: HarnessAdapter): Promise<RecentSession | null> {
+  const sessions = listRecentSessions(adapter);
+  if (sessions.length === 0) return null;
+
+  const allLogsValue = "__all__";
+  const selected = await selectOne("Is this issue about a specific session?", [
+    { label: "General — not session-specific (include all logs)", value: allLogsValue },
+    ...sessions.map((session) => ({
+      label: truncateTitle(session.title),
+      value: session.id,
+      hint: shortSessionId(session.id),
+    })),
+  ]);
+
+  if (selected === allLogsValue) return null;
+  return sessions.find((session) => session.id === selected) ?? null;
+}
+
+function shortSessionId(id: string): string {
+  const bareId = id.replace(/^ses_/, "");
+  return bareId.length <= 12 ? bareId : bareId.slice(0, 12);
+}
+
 /**
  * `aft doctor --issue` flow — collect diagnostics, sanitize user paths,
  * prompt for an issue description, optionally file via `gh`.
@@ -912,6 +941,9 @@ async function runIssueFlow(argv: string[]): Promise<number> {
       value.trim().length === 0 ? "Please enter a short description." : undefined,
   });
 
+  const selectedSession = await promptForIssueSession(adapters[0]);
+  const selectedBareSessionId = selectedSession?.id.replace(/^ses_/, "") ?? null;
+
   const report = await collectDiagnostics(adapters);
 
   // Build per-harness log sections (last 200 lines each) AND scan a wider
@@ -922,7 +954,10 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     .map((adapter) => {
       const path = adapter.getLogFile();
       const tail = tailLogFile(path, 200);
-      return `#### ${adapter.displayName} log (${path})\n\n\`\`\`\n${tail || "<no log output>"}\n\`\`\`\n`;
+      const scopedTail = selectedBareSessionId
+        ? filterLogToSession(tail, selectedBareSessionId)
+        : tail;
+      return `#### ${adapter.displayName} log (${path})\n\n\`\`\`\n${scopedTail || "<no log output>"}\n\`\`\`\n`;
     })
     .join("\n");
 
@@ -934,7 +969,11 @@ async function runIssueFlow(argv: string[]): Promise<number> {
   const errorScanWindow = adapters
     .map((adapter) => {
       const path = adapter.getLogFile();
-      return sanitizeContent(tailLogFile(path, 4000));
+      const tail = tailLogFile(path, 4000);
+      const scopedTail = selectedBareSessionId
+        ? filterLogToSession(tail, selectedBareSessionId)
+        : tail;
+      return sanitizeContent(scopedTail);
     })
     .join("\n");
   const recentErrorLines = extractRecentErrors(errorScanWindow, 20);
@@ -952,6 +991,9 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     `- AFT binary: ${report.binaryVersion ?? "unknown"}`,
     `- OS: ${report.platform} ${report.arch}`,
     `- Node: ${report.nodeVersion}`,
+    ...(selectedSession
+      ? [`- Session: ses_${selectedBareSessionId} (${truncateTitle(selectedSession.title)})`]
+      : []),
     "",
     "## Diagnostics",
     renderDiagnosticsMarkdown(report),

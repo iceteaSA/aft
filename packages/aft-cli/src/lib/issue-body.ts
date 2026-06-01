@@ -29,6 +29,17 @@
  */
 export const MAX_GITHUB_BODY_BYTES = 60_000;
 
+const SESSION_TAG_PATTERN = /\[ses_[^\]\s]+\]/;
+
+export function filterLogToSession(logText: string, sessionId: string): string {
+  const bareId = sessionId.replace(/^ses_/, "");
+  const keepToken = `[ses_${bareId}]`;
+  return logText
+    .split(/\r?\n/)
+    .filter((line) => !SESSION_TAG_PATTERN.test(line) || line.includes(keepToken))
+    .join("\n");
+}
+
 /**
  * Pattern tokens that mark a log line as ERROR-shaped. AFT's runtime uses
  * a small, predictable vocabulary in `sessionLog(...)` calls and Rust

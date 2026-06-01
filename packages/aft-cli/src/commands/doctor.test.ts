@@ -1,12 +1,12 @@
 /// <reference path="../bun-test.d.ts" />
 
+import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
-import { AFT_SCHEMA_URL } from "../lib/jsonc.js";
 import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
+import { AFT_SCHEMA_URL } from "../lib/jsonc.js";
 import {
   buildDoctorFixPlan,
   type DoctorFixPlanItem,
