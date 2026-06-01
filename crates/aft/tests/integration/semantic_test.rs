@@ -99,6 +99,15 @@ struct MockEmbeddingServer {
     base_url: String,
     addr: SocketAddr,
     running: Arc<AtomicBool>,
+    // Gate for the post-edit refresh embedding request. The refresh worker marks
+    // the file "refreshing" BEFORE calling embed and clears it AFTER, so blocking
+    // the embed response for the edited file's content holds `refreshing_count == 1`
+    // open until the test has observed it and queried, then flips this flag. This
+    // makes the transient refreshing state deterministically observable instead of
+    // racing the refresh-completion window, which is lost under full-suite parallel
+    // load (the test's status/search round-trips get starved). The query embed
+    // ("unchanged semantic target") is NOT gated, so the search still proceeds.
+    release_refresh: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -111,11 +120,13 @@ impl MockEmbeddingServer {
         let addr = listener.local_addr().expect("embedding server addr");
         let running = Arc::new(AtomicBool::new(true));
         let running_for_thread = Arc::clone(&running);
+        let release_refresh = Arc::new(AtomicBool::new(false));
+        let release_for_thread = Arc::clone(&release_refresh);
         let handle = thread::spawn(move || {
             while running_for_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ = handle_embedding_request(&mut stream);
+                        let _ = handle_embedding_request(&mut stream, &release_for_thread);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -129,8 +140,16 @@ impl MockEmbeddingServer {
             base_url: format!("http://{addr}"),
             addr,
             running,
+            release_refresh,
             handle: Some(handle),
         }
+    }
+
+    /// Release the held post-edit refresh embedding request. Call this once the
+    /// test has observed `refreshing_count == 1` and run its mid-refresh query so
+    /// the refresh can complete and the server thread can drain.
+    fn release_refresh(&self) {
+        self.release_refresh.store(true, Ordering::SeqCst);
     }
 }
 
@@ -144,8 +163,11 @@ impl Drop for MockEmbeddingServer {
     }
 }
 
-fn handle_embedding_request(stream: &mut TcpStream) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+fn handle_embedding_request(
+    stream: &mut TcpStream,
+    release_refresh: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut header_end = None;
@@ -189,6 +211,24 @@ fn handle_embedding_request(stream: &mut TcpStream) -> std::io::Result<()> {
         Value::String(value) => vec![value.clone()],
         _ => Vec::new(),
     };
+
+    if inputs
+        .iter()
+        .any(|input| input.to_ascii_lowercase().contains("after edit"))
+    {
+        // Hold the post-edit refresh embed open until the test observes
+        // `refreshing_count == 1`, runs its mid-refresh query, and releases it
+        // (see MockEmbeddingServer::release_refresh). The 30s cap exceeds the
+        // test's observe-query-release latency even under heavy parallel load
+        // (status/search round-trips can be starved); it only avoids wedging if
+        // the test panics before releasing. The query embed ("unchanged
+        // semantic target") never contains "after edit", so search proceeds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !release_refresh.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     let data = inputs
         .iter()
         .enumerate()
@@ -434,6 +474,11 @@ fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidati
         }),
         "expected semantic result from unchanged file, got {results:?}"
     );
+
+    // Release the held post-edit refresh embed now that the mid-refresh state
+    // has been observed and queried, so the refresh completes and the mock
+    // server thread can drain cleanly on shutdown.
+    server.release_refresh();
 
     let status = aft.shutdown();
     assert!(status.success());
