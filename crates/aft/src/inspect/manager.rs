@@ -42,6 +42,25 @@ struct ContributionFingerprint {
     hash_complete: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct Tier2RunSubmissionError {
+    pub category: InspectCategory,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Tier2RunSubmission {
+    pub queued_categories: Vec<InspectCategory>,
+    pub newly_queued_categories: Vec<InspectCategory>,
+    pub errors: Vec<Tier2RunSubmissionError>,
+}
+
+impl Tier2RunSubmission {
+    pub fn has_new_work(&self) -> bool {
+        !self.newly_queued_categories.is_empty()
+    }
+}
+
 pub struct InspectManager {
     request_tx: Sender<InspectJob>,
     result_rx: Receiver<InspectResult>,
@@ -185,6 +204,84 @@ impl InspectManager {
         Ok(key)
     }
 
+    pub fn submit_tier2_run_with_reuse_serial_background(
+        self: &Arc<Self>,
+        snapshot: InspectSnapshot,
+        categories: Vec<InspectCategory>,
+    ) -> Tier2RunSubmission {
+        let mut submission = Tier2RunSubmission::default();
+        let mut requested = Vec::new();
+
+        for category in categories {
+            if !category.is_active() {
+                submission.errors.push(Tier2RunSubmissionError {
+                    category,
+                    message: format!("inspect category '{category}' is disabled in v0.33"),
+                });
+                continue;
+            }
+            if !category.is_tier2() {
+                submission.errors.push(Tier2RunSubmissionError {
+                    category,
+                    message: format!("inspect category '{category}' is not a Tier 2 category"),
+                });
+                continue;
+            }
+            requested.push(category);
+        }
+
+        if requested.is_empty() {
+            return submission;
+        }
+
+        let mut in_flight = match self.in_flight.lock() {
+            Ok(in_flight) => in_flight,
+            Err(_) => {
+                for category in requested {
+                    submission.errors.push(Tier2RunSubmissionError {
+                        category,
+                        message: "inspect in-flight map lock poisoned".to_string(),
+                    });
+                }
+                return submission;
+            }
+        };
+
+        for category in requested {
+            let key = JobKey::for_project_category(category);
+            submission.queued_categories.push(category);
+            if in_flight.contains_key(&key) {
+                continue;
+            }
+            in_flight.insert(key, Vec::new());
+            submission.newly_queued_categories.push(category);
+        }
+        drop(in_flight);
+
+        if submission.newly_queued_categories.is_empty() {
+            return submission;
+        }
+
+        let categories_for_worker = submission.newly_queued_categories.clone();
+        let manager = Arc::clone(self);
+        let pool = Arc::clone(&self.pool);
+        pool.spawn(move || {
+            for category in categories_for_worker {
+                let result = manager.tier2_run_with_reuse_result(snapshot.clone(), category, None);
+                manager.route_tier2_reuse_completion(result);
+            }
+        });
+
+        submission
+    }
+
+    pub fn tier2_any_in_flight(&self) -> bool {
+        self.in_flight
+            .lock()
+            .map(|in_flight| in_flight.keys().any(|key| key.category.is_tier2()))
+            .unwrap_or(false)
+    }
+
     pub fn drain_completions(&self) -> usize {
         let mut drained = 0usize;
         while let Ok(result) = self.result_rx.try_recv() {
@@ -254,29 +351,61 @@ impl InspectManager {
     /// scanner — returns the latest cached aggregate if present and verifies
     /// its contribution freshness so warm cache hits are reported as fresh.
     /// This is the non-blocking variant intended for the synchronous `inspect`
-    /// command path; Tier 2 scans run via `aft_inspect_tier2_run` on
-    /// `session.idle`.
+    /// command path; Tier 2 scans run via the watcher-driven scheduler or the
+    /// compatibility `aft_inspect_tier2_run` command.
     pub fn tier2_read_cached(
         &self,
         snapshot: InspectSnapshot,
         category: InspectCategory,
         caller_scope: JobScope,
     ) -> JobOutcome {
-        if !category.is_active() {
-            return JobOutcome::Failed {
-                message: format!("inspect category '{category}' is disabled in v0.33"),
-            };
+        if let Err(outcome) = validate_tier2_read_category(category) {
+            return outcome;
         }
-        if !category.is_tier2() {
-            return JobOutcome::Failed {
-                message: format!("inspect category '{category}' is not a Tier 2 category"),
-            };
-        }
-
         let cache = match self.cache_for_snapshot(&snapshot) {
             Ok(cache) => cache,
             Err(message) => return JobOutcome::Failed { message },
         };
+        self.tier2_read_cached_from_cache(&snapshot, category, &caller_scope, cache.as_ref())
+    }
+
+    pub fn tier2_read_cached_readonly(
+        &self,
+        snapshot: InspectSnapshot,
+        category: InspectCategory,
+        caller_scope: JobScope,
+    ) -> JobOutcome {
+        if let Err(outcome) = validate_tier2_read_category(category) {
+            return outcome;
+        }
+        let key = JobKey::for_project_category(category);
+        let in_flight = self
+            .in_flight
+            .lock()
+            .map(|guard| guard.contains_key(&key))
+            .unwrap_or(false);
+        let cache = match InspectCache::open_readonly(
+            snapshot.inspect_dir.clone(),
+            snapshot.project_root.clone(),
+        ) {
+            Ok(Some(cache)) => cache,
+            Ok(None) => return JobOutcome::Pending { in_flight },
+            Err(error) => {
+                return JobOutcome::Failed {
+                    message: error.to_string(),
+                }
+            }
+        };
+        self.tier2_read_cached_from_cache(&snapshot, category, &caller_scope, &cache)
+    }
+
+    fn tier2_read_cached_from_cache(
+        &self,
+        snapshot: &InspectSnapshot,
+        category: InspectCategory,
+        caller_scope: &JobScope,
+        cache: &InspectCache,
+    ) -> JobOutcome {
         let key = JobKey::for_project_category(category);
         let in_flight = self
             .in_flight
@@ -285,23 +414,23 @@ impl InspectManager {
             .unwrap_or(false);
         match cache.get_aggregated(&key) {
             Ok(Some(payload)) => {
-                match self.tier2_cached_aggregate_is_fresh(&snapshot, category, cache.as_ref()) {
+                match self.tier2_cached_aggregate_is_fresh(snapshot, category, cache) {
                     Ok(true) => filter_outcome_for_scope_with_contributions(
                         JobOutcome::Fresh { payload },
-                        &snapshot,
+                        snapshot,
                         category,
-                        cache.as_ref(),
-                        &caller_scope,
+                        cache,
+                        caller_scope,
                     ),
                     Ok(false) => filter_outcome_for_scope_with_contributions(
                         JobOutcome::Stale {
                             cached: Some(payload),
                             in_flight,
                         },
-                        &snapshot,
+                        snapshot,
                         category,
-                        cache.as_ref(),
-                        &caller_scope,
+                        cache,
+                        caller_scope,
                     ),
                     Err(message) => JobOutcome::Failed { message },
                 }
@@ -312,10 +441,10 @@ impl InspectManager {
                         cached: Some(payload),
                         in_flight,
                     },
-                    &snapshot,
+                    snapshot,
                     category,
-                    cache.as_ref(),
-                    &caller_scope,
+                    cache,
+                    caller_scope,
                 ),
                 Ok(None) => JobOutcome::Pending { in_flight },
                 Err(error) => JobOutcome::Failed {
@@ -355,20 +484,7 @@ impl InspectManager {
                 snapshot.project_root.join(&record.file_path)
             };
             match verify_contribution_file_strict(&absolute, &record.freshness) {
-                ContributionFreshness::Fresh {
-                    metadata_changed,
-                    freshness,
-                } => {
-                    if metadata_changed {
-                        cache
-                            .update_content_fresh_metadata(
-                                category,
-                                &PathBuf::from(&relative),
-                                &freshness,
-                            )
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
+                ContributionFreshness::Fresh { .. } => {}
                 ContributionFreshness::Stale | ContributionFreshness::Deleted => return Ok(false),
             }
         }
@@ -889,6 +1005,20 @@ impl Default for InspectManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn validate_tier2_read_category(category: InspectCategory) -> Result<(), JobOutcome> {
+    if !category.is_active() {
+        return Err(JobOutcome::Failed {
+            message: format!("inspect category '{category}' is disabled in v0.33"),
+        });
+    }
+    if !category.is_tier2() {
+        return Err(JobOutcome::Failed {
+            message: format!("inspect category '{category}' is not a Tier 2 category"),
+        });
+    }
+    Ok(())
 }
 
 fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {

@@ -1661,6 +1661,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.backup().borrow().set_db_harness(harness);
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
+    ctx.reset_tier2_refresh_scheduler();
     ctx.backup()
         .borrow()
         .set_db_project_key(crate::search_index::project_cache_key(

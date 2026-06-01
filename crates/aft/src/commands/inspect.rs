@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::run_diagnostics_category;
-use crate::inspect::{InspectCategory, InspectSnapshot, JobOutcome, JobScope};
+use crate::inspect::{InspectCache, InspectCategory, InspectSnapshot, JobOutcome, JobScope};
 use crate::protocol::{RawRequest, Response};
 
 const DEFAULT_TOP_K: usize = 20;
@@ -37,6 +37,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     // Tier 1 (todos, metrics) does not consume the callgraph snapshot.
     let manager = ctx.inspect_manager();
     let mut outcomes = BTreeMap::new();
+    let mut tier2_refresh_needed = false;
     for category in InspectCategory::active() {
         let outcome = if *category == InspectCategory::Diagnostics {
             // Diagnostics are backed by the AppContext LSP manager (RefCell, not
@@ -45,17 +46,30 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
             run_diagnostics_category(ctx, &snapshot, &scope, scope_was_provided)
         } else if category.is_tier2() {
             // Tier 2 (dead_code, unused_exports, duplicates) are NEVER scanned
-            // synchronously here — scans run via aft_inspect_tier2_run on
-            // session.idle. handle_inspect just returns whatever aggregate the
-            // last Tier 2 run persisted, or Pending if nothing is cached yet.
-            manager.tier2_read_cached(snapshot.clone(), *category, scope.clone())
+            // synchronously here. handle_inspect just returns whatever aggregate
+            // the last Tier 2 run persisted, or Pending if nothing is cached yet.
+            let outcome =
+                manager.tier2_read_cached_readonly(snapshot.clone(), *category, scope.clone());
+            if !ctx.is_worktree_bridge()
+                && matches!(
+                    outcome,
+                    JobOutcome::Stale { .. } | JobOutcome::Pending { .. }
+                )
+            {
+                tier2_refresh_needed = true;
+            }
+            outcome
         } else {
             manager.submit_category_with_callgraph(snapshot.clone(), *category, scope.clone(), None)
         };
         outcomes.insert(*category, outcome);
     }
 
-    let payload = build_inspect_payload(&snapshot, &outcomes, &sections, top_k, &manager);
+    if tier2_refresh_needed {
+        ctx.request_tier2_refresh_pull();
+    }
+
+    let payload = build_inspect_payload(&snapshot, &outcomes, &sections, top_k, ctx);
     Response::success(&req.id, payload)
 }
 
@@ -64,23 +78,53 @@ pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response 
         Ok(categories) => categories,
         Err(message) => return invalid_request(&req.id, message),
     };
+
+    if ctx.is_worktree_bridge() {
+        let skipped = categories
+            .iter()
+            .map(|category| {
+                serde_json::json!({
+                    "category": category.as_str(),
+                    "reason": "worktree_bridge_read_only",
+                })
+            })
+            .collect::<Vec<_>>();
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "queued_categories": [],
+                "in_flight_categories": [],
+                "errors": [],
+                "skipped_categories": skipped,
+            }),
+        );
+    }
+
     let snapshot = match build_snapshot(ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => return response.with_id(&req.id),
     };
     let manager = ctx.inspect_manager();
-
-    let mut queued = Vec::new();
-    let mut errors = Vec::new();
-    for category in categories {
-        match manager.submit_tier2_run_with_reuse_background(snapshot.clone(), category) {
-            Ok(_) => queued.push(category.to_string()),
-            Err(message) => errors.push(serde_json::json!({
-                "category": category.as_str(),
-                "message": message,
-            })),
-        }
+    let submission = manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
+    if submission.has_new_work() {
+        ctx.note_tier2_refresh_started();
     }
+
+    let queued = submission
+        .queued_categories
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let errors = submission
+        .errors
+        .iter()
+        .map(|error| {
+            serde_json::json!({
+                "category": error.category.as_str(),
+                "message": error.message.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     Response::success(
         &req.id,
@@ -304,7 +348,7 @@ fn build_inspect_payload(
     outcomes: &BTreeMap<InspectCategory, JobOutcome>,
     sections: &Sections,
     top_k: usize,
-    manager: &crate::inspect::InspectManager,
+    ctx: &AppContext,
 ) -> Value {
     let mut summary = Map::new();
     let mut details = Map::new();
@@ -352,12 +396,13 @@ fn build_inspect_payload(
         .iter()
         .map(|category| category.as_str())
         .collect::<Vec<_>>();
-    let tier2_last_run = tier2_last_run(snapshot, manager);
+    let tier2_last_run = tier2_last_run(snapshot);
 
     let mut payload = serde_json::json!({
         "summary": Value::Object(summary),
         "scanner_state": {
             "tier2_last_run": tier2_last_run,
+            "tier2_trigger_reason": ctx.tier2_trigger_reason(),
             "stale_categories": stale_categories,
             "disabled_categories": disabled_categories,
             "pending_categories": pending_categories,
@@ -501,11 +546,11 @@ fn count_from_payload(payload: Option<&Value>) -> u64 {
         .unwrap_or(0)
 }
 
-fn tier2_last_run(
-    snapshot: &InspectSnapshot,
-    manager: &crate::inspect::InspectManager,
-) -> Option<i64> {
-    let cache = manager.cache_for_snapshot(snapshot).ok()?;
+fn tier2_last_run(snapshot: &InspectSnapshot) -> Option<i64> {
+    let cache =
+        InspectCache::open_readonly(snapshot.inspect_dir.clone(), snapshot.project_root.clone())
+            .ok()
+            .flatten()?;
     InspectCategory::active()
         .iter()
         .copied()

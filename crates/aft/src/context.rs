@@ -17,7 +17,9 @@ use crate::callgraph::CallGraph;
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::harness::Harness;
-use crate::inspect::InspectManager;
+use crate::inspect::{
+    InspectCategory, InspectManager, InspectSnapshot, Tier2RefreshScheduler, Tier2TriggerReason,
+};
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
@@ -467,6 +469,7 @@ pub struct AppContext {
     pending_search_index_paths: RefCell<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
+    tier2_refresh_scheduler: RefCell<Tier2RefreshScheduler>,
     semantic_index: RefCell<Option<SemanticIndex>>,
     semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RefCell<SemanticIndexStatus>,
@@ -546,6 +549,7 @@ impl AppContext {
             pending_search_index_paths: RefCell::new(BTreeSet::new()),
             symbol_cache,
             inspect_manager: Arc::new(InspectManager::new()),
+            tier2_refresh_scheduler: RefCell::new(Tier2RefreshScheduler::new()),
             semantic_index: RefCell::new(None),
             semantic_index_rx: RefCell::new(None),
             semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
@@ -1081,6 +1085,126 @@ impl AppContext {
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
         Arc::clone(&self.inspect_manager)
+    }
+
+    pub fn reset_tier2_refresh_scheduler(&self) {
+        self.reset_tier2_refresh_scheduler_at(Instant::now());
+    }
+
+    #[doc(hidden)]
+    pub fn reset_tier2_refresh_scheduler_at(&self, now: Instant) {
+        self.tier2_refresh_scheduler
+            .borrow_mut()
+            .reset_after_configure(now);
+    }
+
+    pub fn request_tier2_refresh_pull(&self) -> bool {
+        self.tier2_refresh_scheduler
+            .borrow_mut()
+            .request_pull(!self.is_worktree_bridge())
+    }
+
+    pub fn tick_tier2_refresh_scheduler(
+        &self,
+        changed_path_count: usize,
+    ) -> Option<Tier2TriggerReason> {
+        self.tick_tier2_refresh_scheduler_at(Instant::now(), changed_path_count)
+    }
+
+    #[doc(hidden)]
+    pub fn tick_tier2_refresh_scheduler_at(
+        &self,
+        now: Instant,
+        changed_path_count: usize,
+    ) -> Option<Tier2TriggerReason> {
+        let manager = self.inspect_manager();
+        let can_write = !self.is_worktree_bridge();
+        let in_flight = manager.tier2_any_in_flight();
+        let decision = self.tier2_refresh_scheduler.borrow_mut().tick(
+            now,
+            changed_path_count,
+            can_write,
+            in_flight,
+        );
+
+        if let Some(reason) = decision {
+            self.start_tier2_refresh(reason, manager);
+        }
+
+        decision
+    }
+
+    pub fn note_tier2_refresh_started(&self) {
+        self.note_tier2_refresh_started_at(Instant::now());
+    }
+
+    #[doc(hidden)]
+    pub fn note_tier2_refresh_started_at(&self, now: Instant) {
+        self.tier2_refresh_scheduler
+            .borrow_mut()
+            .note_external_scan_started(now);
+    }
+
+    pub fn tier2_trigger_reason(&self) -> Option<&'static str> {
+        self.tier2_refresh_scheduler
+            .borrow()
+            .last_trigger_reason()
+            .map(Tier2TriggerReason::as_str)
+    }
+
+    #[doc(hidden)]
+    pub fn tier2_pull_demand_pending(&self) -> bool {
+        self.tier2_refresh_scheduler.borrow().pull_demand_pending()
+    }
+
+    fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
+        if self.is_worktree_bridge() {
+            return;
+        }
+        let Some(snapshot) = self.tier2_refresh_snapshot() else {
+            return;
+        };
+        let categories = InspectCategory::active()
+            .iter()
+            .copied()
+            .filter(|category| category.is_tier2())
+            .collect::<Vec<_>>();
+        let submission =
+            manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
+        if submission.has_new_work() {
+            crate::slog_info!(
+                "tier2 refresh scheduled: reason={}, categories={:?}",
+                reason.as_str(),
+                submission
+                    .newly_queued_categories
+                    .iter()
+                    .map(|category| category.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        for error in submission.errors {
+            crate::slog_warn!(
+                "tier2 refresh schedule failed for {}: {}",
+                error.category,
+                error.message
+            );
+        }
+    }
+
+    fn tier2_refresh_snapshot(&self) -> Option<InspectSnapshot> {
+        self.harness_opt()?;
+        let config = self.config().clone();
+        let project_root = config
+            .project_root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+        Some(InspectSnapshot::new(
+            project_root,
+            self.inspect_dir(),
+            Arc::new(config),
+            self.symbol_cache(),
+        ))
     }
 
     /// Access the shared symbol cache.

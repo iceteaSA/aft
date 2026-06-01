@@ -1009,7 +1009,10 @@ fn drain_watcher_events(ctx: &AppContext) {
         let rx_ref = ctx.watcher_rx().borrow();
         let rx = match rx_ref.as_ref() {
             Some(rx) => rx,
-            None => return, // No watcher configured
+            None => {
+                ctx.tick_tier2_refresh_scheduler(0);
+                return; // No watcher configured
+            }
         };
 
         let mut raw_paths = Vec::new();
@@ -1048,12 +1051,19 @@ fn drain_watcher_events(ctx: &AppContext) {
         filter_watcher_raw_paths(ctx, raw_paths)
     }; // receiver borrow dropped here
 
-    if filtered.ignore_file_changed {
+    let ignore_file_changed = filtered.ignore_file_changed;
+    if ignore_file_changed {
         refresh_corpus_after_ignore_change(ctx);
     }
 
     let changed = filtered.changed;
+    let scheduler_changed_path_count = if ignore_file_changed {
+        changed.len().max(1)
+    } else {
+        changed.len()
+    };
     if changed.is_empty() {
+        ctx.tick_tier2_refresh_scheduler(scheduler_changed_path_count);
         return;
     }
 
@@ -1149,6 +1159,7 @@ fn drain_watcher_events(ctx: &AppContext) {
     if semantic_status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
+    ctx.tick_tier2_refresh_scheduler(scheduler_changed_path_count);
 }
 
 fn drain_search_index_events(ctx: &AppContext) {

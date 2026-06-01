@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 
@@ -303,13 +303,46 @@ impl InspectCache {
         let conn = Connection::open(&sqlite_path)?;
         configure_connection(&conn)?;
         initialize_schema(&conn)?;
-        Ok(Self {
+        Ok(Self::from_connection(
+            project_root,
+            project_key,
+            sqlite_path,
+            conn,
+        ))
+    }
+
+    pub fn open_readonly(
+        inspect_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Option<Self>, InspectCacheError> {
+        let project_key = crate::search_index::project_cache_key(&project_root);
+        let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
+        if !sqlite_path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(&sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(5_000))?;
+        Ok(Some(Self::from_connection(
+            project_root,
+            project_key,
+            sqlite_path,
+            conn,
+        )))
+    }
+
+    fn from_connection(
+        project_root: PathBuf,
+        project_key: String,
+        sqlite_path: PathBuf,
+        conn: Connection,
+    ) -> Self {
+        Self {
             project_root,
             project_key,
             sqlite_path,
             conn: Mutex::new(conn),
             memory: RwLock::new(HashMap::new()),
-        })
+        }
     }
 
     pub fn project_root(&self) -> &Path {

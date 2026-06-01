@@ -51,6 +51,7 @@ mod inspect_duplicates_test;
 mod inspect_engine_test;
 mod inspect_metrics_test;
 mod inspect_tier2_reuse_test;
+mod inspect_tier2_scheduler_test;
 mod inspect_todos_test;
 mod inspect_tsconfig_membership_test;
 mod inspect_unused_exports_test;
