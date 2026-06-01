@@ -173,6 +173,7 @@ _Coming soon._
 | Zig | ✓ | ✓ | ✓ | ✓ | | |
 | Bash | ✓ | ✓ | | ✓ | | |
 | HTML / Markdown | ✓ | ✓ | | | | |
+| YAML (incl. Kubernetes) | ✓ | ✓ | — | — |
 | JSON | ✓ | ✓ | ✓ | | | |
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Vue | ✓ | ✓ | ✓ | ✓ | ✓ | |
@@ -181,6 +182,7 @@ Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`w
 
 Indexes honor `.gitignore` and an optional `.aftignore` (same syntax) for paths git can't exclude, such as submodules. Naming a file explicitly in `grep` searches it even when ignored, matching ripgrep.
 
+**YAML / Kubernetes / CRDs.** YAML files are semantically indexed. Each document carrying `apiVersion` + `kind` (the Kubernetes/CRD contract, so this generalizes to any custom resource) becomes one rich symbol named `<namespace>/<Kind>/<name>` (falling back to `metadata.generateName` when no name is set). The symbol's embed text is enriched with high-signal spec fields so intent queries match: container `image`/ports, resource `cpu`/`memory` limits and requests, `volumeMounts`, env var names, RBAC `verbs`/`resources`/`apiGroups`, and Argo Workflow `entrypoint`/`templates`/`command`/`schedule`. Multi-document (`---`) streams are handled per document; plain non-k8s YAML (docker-compose, CI configs, Helm `values.yaml`) falls back to top-level keys as symbols.
 ---
 
 ## Architecture
