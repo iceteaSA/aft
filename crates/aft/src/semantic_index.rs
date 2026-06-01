@@ -924,7 +924,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
 
 /// Try to extract the ORT version from the library filename or resolved symlink.
 /// Examples: "libonnxruntime.so.1.19.0" → "1.19.0", "libonnxruntime.1.24.4.dylib" → "1.24.4"
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detect_ort_version_from_path(lib_path: &str) -> Option<String> {
     let path = std::path::Path::new(lib_path);
 
@@ -959,7 +959,7 @@ fn detect_ort_version_from_path(lib_path: &str) -> Option<String> {
 }
 
 /// Extract version from filenames like "libonnxruntime.so.1.19.0" or "libonnxruntime.1.24.4.dylib"
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn extract_version_from_filename(name: &str) -> Option<String> {
     // Match patterns: .so.X.Y.Z or .X.Y.Z.dylib or .X.Y.Z.so
     let re = regex::Regex::new(r"(\d+\.\d+\.\d+)").ok()?;

@@ -321,7 +321,10 @@ fn write_exit_marker(path: &Path, marker: &ExitMarker, task_id: &str) -> io::Res
     atomic_write(path, content.as_bytes(), task_id)
 }
 
-#[cfg(test)]
+// Every test in this module exercises Unix-only PTY paths (`#[cfg(unix)]`
+// shell resolution + the spawn_waiter), so gate the whole module on `unix` to
+// avoid unused-import / dead-code warnings when cross-compiling for Windows.
+#[cfg(all(test, unix))]
 mod tests {
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};

@@ -786,6 +786,7 @@ fn free_bytes_at(_path: &Path) -> io::Result<u64> {
     Ok(u64::MAX)
 }
 
+#[cfg(unix)]
 fn existing_ancestor(path: &Path) -> &Path {
     let mut current = path;
     while !current.exists() {
