@@ -68,7 +68,8 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
         })
         .collect::<Vec<_>>();
 
-    let aggregate = aggregate_dead_code_contributions(&contributions, &public_api_files);
+    let roles = crate::inspect::entry_points::resolve_project_roles(&job.project_root);
+    let aggregate = aggregate_dead_code_contributions(&contributions, &public_api_files, &roles);
     let success = InspectScanSuccess {
         scanned_files: job.scope_files.clone(),
         contributions,
@@ -281,10 +282,12 @@ pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_jso
 pub(crate) fn aggregate_dead_code_contributions(
     contributions: &[FileContribution],
     public_api_files: &BTreeSet<String>,
+    roles: &crate::inspect::entry_points::ProjectRoles,
 ) -> serde_json::Value {
     aggregate_dead_code_contributions_with_limit(
         contributions,
         public_api_files,
+        roles,
         Some(MAX_DRILL_DOWN_ITEMS),
     )
 }
@@ -292,6 +295,7 @@ pub(crate) fn aggregate_dead_code_contributions(
 pub(crate) fn aggregate_dead_code_contributions_with_limit(
     contributions: &[FileContribution],
     public_api_files: &BTreeSet<String>,
+    roles: &crate::inspect::entry_points::ProjectRoles,
     drill_down_limit: Option<usize>,
 ) -> serde_json::Value {
     let parsed = contributions
@@ -338,20 +342,26 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
             *by_language
                 .entry(language_for_file(&contribution.file).to_string())
                 .or_default() += 1;
-            if drill_down_limit.is_none_or(|limit| dead_items.len() < limit) {
-                dead_items.push(json!({
-                    "file": contribution.file,
-                    "symbol": export.symbol,
-                    "kind": export.kind,
-                    "line": export.line,
-                }));
-            }
+            // Collect ALL items here; rank by signal tier and truncate below so
+            // product findings survive the cap instead of being eaten by
+            // alphabetically-first benchmark/tooling files.
+            dead_items.push(json!({
+                "file": contribution.file,
+                "symbol": export.symbol,
+                "kind": export.kind,
+                "line": export.line,
+            }));
         }
     }
+
+    let dead_items =
+        crate::inspect::entry_points::rank_and_truncate_items(dead_items, roles, drill_down_limit);
+    let top = crate::inspect::entry_points::top_preview_symbols(&dead_items);
 
     json!({
         "count": count,
         "items": dead_items,
+        "top": top,
         "by_language": by_language,
         "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
         "uncertain_count": uncertain_count,

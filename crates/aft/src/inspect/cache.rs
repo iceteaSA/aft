@@ -90,7 +90,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v10: public-API entry resolution remaps build-output entries (dist/index.js)
 /// to their src/ source equivalent, so the source barrel is recognized as a
 /// public-API file and its re-exports are suppressed (changes public-API set).
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 10;
+/// v11: dead_code/unused_exports drill-down is ranked by signal tier (product
+/// findings before benchmark/tooling noise) before the cap, and a ranked `top`
+/// preview is folded into all three Tier-2 aggregates — changes cached payload.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 11;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1349,6 +1352,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 10);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 11);
     }
 }

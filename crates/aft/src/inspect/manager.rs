@@ -1424,9 +1424,11 @@ fn roll_up_dead_code_contributions(
     }
 
     let public_api_files = super::scanners::dead_code::collect_public_api_files(&job.project_root);
+    let roles = super::entry_points::resolve_project_roles(&job.project_root);
     super::scanners::dead_code::aggregate_dead_code_contributions_with_limit(
         contributions,
         &public_api_files,
+        &roles,
         drill_down_limit,
     )
 }
@@ -1510,20 +1512,24 @@ fn roll_up_unused_exports_contributions(
             }
 
             count += 1;
-            if drill_down_limit.is_none_or(|limit| items.len() < limit) {
-                items.push(json!({
-                    "file": scan.file,
-                    "symbol": export.symbol,
-                    "kind": export.kind,
-                    "line": export.line,
-                }));
-            }
+            // Collect uncapped; rank by signal tier and truncate below.
+            items.push(json!({
+                "file": scan.file,
+                "symbol": export.symbol,
+                "kind": export.kind,
+                "line": export.line,
+            }));
         }
     }
+
+    let roles = super::entry_points::resolve_project_roles(&job.project_root);
+    let items = super::entry_points::rank_and_truncate_items(items, &roles, drill_down_limit);
+    let top = super::entry_points::top_preview_symbols(&items);
 
     let mut aggregate = json!({
         "count": count,
         "items": items,
+        "top": top,
         "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),

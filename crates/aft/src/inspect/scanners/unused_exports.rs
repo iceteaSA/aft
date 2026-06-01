@@ -122,16 +122,24 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
             }
 
             count += 1;
-            if items.len() < DRILL_DOWN_LIMIT {
-                items.push(json!({
-                    "file": scan.relative_file,
-                    "symbol": export.symbol,
-                    "kind": export.kind,
-                    "line": export.line,
-                }));
-            }
+            // Collect uncapped; rank by signal tier and truncate below so
+            // product findings survive the cap over benchmark/tooling noise.
+            items.push(json!({
+                "file": scan.relative_file,
+                "symbol": export.symbol,
+                "kind": export.kind,
+                "line": export.line,
+            }));
         }
     }
+
+    let roles = crate::inspect::entry_points::resolve_project_roles(&project_root);
+    let items = crate::inspect::entry_points::rank_and_truncate_items(
+        items,
+        &roles,
+        Some(DRILL_DOWN_LIMIT),
+    );
+    let top = crate::inspect::entry_points::top_preview_symbols(&items);
 
     let languages_skipped = per_file
         .iter()
@@ -143,6 +151,7 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
     let mut aggregate = json!({
         "count": count,
         "items": items,
+        "top": top,
         "drill_down_capped": count > DRILL_DOWN_LIMIT,
         "scanned_files": per_file.len(),
         "languages_skipped": languages_skipped,

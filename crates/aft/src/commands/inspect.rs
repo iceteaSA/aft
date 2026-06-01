@@ -445,13 +445,16 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
         InspectCategory::DeadCode => serde_json::json!({
             "count": count_from_payload(payload),
             "by_language": payload.and_then(|p| p.get("by_language")).cloned().unwrap_or_else(|| serde_json::json!({})),
+            "top": top_preview_from_payload(payload),
         }),
         InspectCategory::UnusedExports => serde_json::json!({
             "count": count_from_payload(payload),
+            "top": top_preview_from_payload(payload),
         }),
         InspectCategory::Duplicates => serde_json::json!({
             "count": count_from_payload(payload),
             "total_groups": payload.and_then(|p| p.get("total_groups").or_else(|| p.get("groups_count"))).and_then(Value::as_u64).unwrap_or_else(|| count_from_payload(payload)),
+            "top": top_preview_from_payload(payload),
         }),
         _ => serde_json::json!({ "count": count_from_payload(payload) }),
     }
@@ -544,6 +547,17 @@ fn count_from_payload(payload: Option<&Value>) -> u64 {
         .and_then(|payload| payload.get("count"))
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+/// Pass through the scanner's already-ranked `top` preview (highest-signal
+/// findings) into the summary view. Omitted (empty array) when absent so the
+/// summary stays compact for empty/legacy payloads.
+fn top_preview_from_payload(payload: Option<&Value>) -> Value {
+    payload
+        .and_then(|payload| payload.get("top"))
+        .filter(|top| top.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
 }
 
 fn tier2_last_run(snapshot: &InspectSnapshot) -> Option<i64> {

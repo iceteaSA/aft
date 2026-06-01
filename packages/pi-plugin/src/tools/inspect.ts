@@ -184,6 +184,53 @@ function tier2SummaryPart(
   return `${label} ${status ?? "unavailable"}`;
 }
 
+/** Short basename for a `path:line-line` duplicate occurrence. */
+function shortDupOccurrence(entry: string): string {
+  const [path] = entry.split(":");
+  return path?.split("/").pop() ?? entry;
+}
+
+/**
+ * Compact TUI preview of the highest-signal Tier-2 findings (the ranked `top`
+ * field), so the one-glance view shows what to act on, not just totals.
+ */
+function tier2TopPreview(
+  summary: Record<string, unknown> | undefined,
+  theme: Theme,
+): string | undefined {
+  const lines: string[] = [];
+
+  const dup = asRecord(summary?.duplicates);
+  const dupTop = Array.isArray(dup?.top) ? dup.top : [];
+  for (const group of dupTop) {
+    const record = asRecord(group);
+    const files = Array.isArray(record?.files) ? record.files : [];
+    const cost = asNumber(record?.cost);
+    if (files.length < 2) continue;
+    const a = shortDupOccurrence(String(files[0]));
+    const b = shortDupOccurrence(String(files[1]));
+    lines.push(`  dup ${a} ↔ ${b}${cost !== undefined ? ` (${cost})` : ""}`);
+  }
+
+  for (const [key, label] of [
+    ["dead_code", "dead"],
+    ["unused_exports", "unused"],
+  ] as const) {
+    const section = asRecord(summary?.[key]);
+    const top = Array.isArray(section?.top) ? section.top : [];
+    for (const item of top) {
+      const record = asRecord(item);
+      const file = asString(record?.file);
+      const symbol = asString(record?.symbol);
+      if (!file || !symbol) continue;
+      lines.push(`  ${label} ${symbol} (${file.split("/").pop()})`);
+    }
+  }
+
+  if (lines.length === 0) return undefined;
+  return `${theme.fg("muted", "top findings:")}\n${lines.join("\n")}`;
+}
+
 function tier2RefreshCategories(response: Record<string, unknown>): string[] {
   const scannerState = asRecord(response.scanner_state);
   const categories = new Set<string>();
@@ -273,6 +320,9 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
   if (stale > 0 || pending > 0) {
     sections.push(theme.fg("warning", `scanner state: ${stale} stale · ${pending} pending`));
   }
+
+  const topPreview = tier2TopPreview(summary, theme);
+  if (topPreview) sections.push(topPreview);
 
   const details = asRecord(response.details);
   if (details) {

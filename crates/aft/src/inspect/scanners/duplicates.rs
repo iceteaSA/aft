@@ -10,6 +10,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use super::duplicates_classifier::{is_anonymizable, node_cost, AnonymizeAs};
 use crate::cache_freshness;
+use crate::inspect::entry_points::TOP_PREVIEW_ITEMS;
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
 };
@@ -393,11 +394,26 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         None => groups,
     };
 
+    // Cost-ranked top-N preview for the summary view (groups are already sorted
+    // by cost). One `aft_inspect` call surfaces the biggest duplications without
+    // a drill-down.
+    let top = items
+        .iter()
+        .take(TOP_PREVIEW_ITEMS)
+        .map(|group| {
+            json!({
+                "files": group.files,
+                "cost": group.cost,
+            })
+        })
+        .collect::<Vec<_>>();
+
     json!({
         "count": groups_count,
         "total_groups": groups_count,
         "groups_count": groups_count,
         "items": items,
+        "top": top,
         "drill_down_capped": drill_down_capped,
         "scanned_files": parsed.len(),
         "languages_skipped": languages_skipped,
