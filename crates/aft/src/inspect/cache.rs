@@ -73,8 +73,13 @@ impl From<serde_json::Error> for InspectCacheError {
 /// Persisted Tier-2 contribution/aggregate format version.
 ///
 /// Bump this when `FileContribution.contribution` JSON changes in a way that
-/// requires existing per-file contributions to be rebuilt before roll-up.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 5;
+/// requires existing per-file contributions to be rebuilt before roll-up, OR
+/// when the roll-up/aggregation LOGIC changes (e.g. dead_code reachability):
+/// cached aggregates are keyed by a `contribution_set_hash` that folds in this
+/// version, so a logic-only change is invisible to existing caches unless the
+/// version moves. v6: dead_code now propagates liveness through dispatch-only
+/// method bodies (free fns reached only via `obj.method()` were false-dead).
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 6;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1333,6 +1338,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 5);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 6);
     }
 }
