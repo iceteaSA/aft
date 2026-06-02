@@ -29,14 +29,27 @@
  */
 export const MAX_GITHUB_BODY_BYTES = 60_000;
 
-const SESSION_TAG_PATTERN = /\[ses_[^\]\s]+\]/;
+// A log line carries a session tag in one of two forms, depending on the
+// harness that wrote it:
+//   - OpenCode: `[ses_<id>]` (ids are `ses_`-prefixed).
+//   - Pi: `[<uuid>]` — Pi's `getSessionId()` returns a bare UUID, so its
+//     logger emits the raw id with no `ses_` prefix.
+// Recognizing only the `[ses_...]` form treated every Pi line as untagged, so
+// session scoping silently kept all sessions' logs for Pi (#8). Match both: a
+// `ses_`-prefixed tag, or a bare-UUID-shaped tag.
+const SESSION_TAG_PATTERN =
+  /\[ses_[^\]\s]+\]|\[[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\]/;
 
 export function filterLogToSession(logText: string, sessionId: string): string {
   const bareId = sessionId.replace(/^ses_/, "");
-  const keepToken = `[ses_${bareId}]`;
+  // Keep a line when it carries no session tag at all, or its tag matches the
+  // selected session in either harness form (`[ses_<id>]` or bare `[<id>]`).
+  const keepTokens = [`[ses_${bareId}]`, `[${bareId}]`];
   return logText
     .split(/\r?\n/)
-    .filter((line) => !SESSION_TAG_PATTERN.test(line) || line.includes(keepToken))
+    .filter(
+      (line) => !SESSION_TAG_PATTERN.test(line) || keepTokens.some((token) => line.includes(token)),
+    )
     .join("\n");
 }
 

@@ -900,6 +900,12 @@ export class BinaryBridge {
   }
 
   private spawnProcess(triggeringSessionId?: string): void {
+    // A freshly-spawned process has published no diagnostics yet, so its warm
+    // E/W set is empty. Drop the cached status bar from any prior process here
+    // (covers initial spawn, crash auto-restart, and version-swap respawn) so a
+    // dead process's stale counts are never re-emitted on the next tool result
+    // before the new process repopulates them (#6).
+    this.lastStatusBar = undefined;
     if (triggeringSessionId) {
       this.sessionLogVia(
         triggeringSessionId,
