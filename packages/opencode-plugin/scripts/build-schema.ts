@@ -49,12 +49,14 @@ function buildSchema(): Record<string, unknown> {
         type: "array",
         items: { type: "string", minLength: 1 },
         minItems: 1,
-        description: "File extensions this server handles (e.g. ['.tf', '.tfvars']).",
+        description:
+          "File extensions this server handles (e.g. ['.tf', '.tfvars']). Optional when overriding a built-in server — the built-in's extensions are inherited.",
       },
       binary: {
         type: "string",
         minLength: 1,
-        description: "LSP binary command (must be on PATH or absolute path).",
+        description:
+          "LSP binary command (must be on PATH or absolute path). Optional when overriding a built-in server — the built-in's binary is inherited.",
       },
       args: {
         type: "array",
@@ -84,7 +86,6 @@ function buildSchema(): Record<string, unknown> {
           "JSON value passed as `initializationOptions` in the LSP `initialize` request.",
       },
     },
-    required: ["extensions", "binary"],
     additionalProperties: false,
   };
 

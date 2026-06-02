@@ -463,8 +463,12 @@ fn parse_lsp_server(value: &Value, index: usize) -> Result<UserServerDef, String
     };
 
     let id = required_string(obj.get("id"), index, "id")?;
-    let extensions = required_extension_array(obj.get("extensions"), index)?;
-    let binary = required_string(obj.get("binary"), index, "binary")?;
+    // extensions/binary are optional: when a user overrides a *built-in* server
+    // (e.g. `rust`) to tweak one field, the built-in's extensions/binary are
+    // inherited downstream in `resolved_servers`. Requiring them here silently
+    // dropped the entire `lsp` section on a partial override (issue from #84).
+    let extensions = optional_extension_array(obj.get("extensions"), index)?;
+    let binary = optional_lsp_binary(obj.get("binary"), index)?;
     let args = optional_string_array(obj.get("args"), index, "args")?;
     let root_markers = optional_string_array(obj.get("root_markers"), index, "root_markers")?;
     let env = parse_lsp_server_env(obj.get("env"), index)?;
@@ -549,6 +553,27 @@ fn required_extension_array(value: Option<&Value>, index: usize) -> Result<Vec<S
         .into_iter()
         .map(|value| value.trim_start_matches('.').to_string())
         .collect())
+}
+
+/// Like `required_extension_array` but treats an absent value as an empty list
+/// (no validation error). Used so a partial override of a built-in server can
+/// omit `extensions` and inherit the built-in's set downstream.
+fn optional_extension_array(value: Option<&Value>, index: usize) -> Result<Vec<String>, String> {
+    let values = optional_string_array(value, index, "extensions")?;
+    Ok(values
+        .into_iter()
+        .map(|value| value.trim_start_matches('.').to_string())
+        .collect())
+}
+
+/// Like `required_string` for `binary` but treats an absent value as empty
+/// (inherited from the built-in downstream). A present-but-blank value is still
+/// rejected so typos like `"binary": ""` surface instead of silently inheriting.
+fn optional_lsp_binary(value: Option<&Value>, index: usize) -> Result<String, String> {
+    match value {
+        None => Ok(String::new()),
+        Some(value) => required_string(Some(value), index, "binary"),
+    }
 }
 
 fn optional_string_array(
@@ -1128,6 +1153,14 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
     }
 
     for server in &config.lsp_servers {
+        // A blank binary means "partial built-in override, inherit the built-in
+        // binary" — the resolvable binary is already covered by the built-in
+        // pass above, so skip the missing-binary probe here (probing "" never
+        // resolves and would emit a bogus warning).
+        if server.binary.is_empty() {
+            continue;
+        }
+
         if server.disabled || !seen.insert((server.id.clone(), server.binary.clone())) {
             continue;
         }
@@ -2683,6 +2716,33 @@ mod tests {
         assert_eq!(servers[0].extensions, vec!["ts", "tsx"]);
         assert_eq!(servers[0].args, vec!["--lsp", ".keep-dotted-arg"]);
         assert_eq!(servers[0].root_markers, vec![".oxlintrc.json", ".oxlintrc"]);
+    }
+
+    // A partial override of a built-in server (only `args`/`binary`) must parse
+    // successfully with empty extensions/binary inherited downstream — requiring
+    // them used to drop the entire `lsp` config section silently.
+    #[test]
+    fn parse_lsp_server_allows_partial_builtin_override() {
+        let value = json!([
+            {
+                "id": "rust",
+                "args": ["--extra-flag"]
+            }
+        ]);
+
+        let servers = super::parse_lsp_servers(&value).expect("partial override should parse");
+        assert_eq!(servers[0].id, "rust");
+        assert!(servers[0].extensions.is_empty());
+        assert!(servers[0].binary.is_empty());
+        assert_eq!(servers[0].args, vec!["--extra-flag"]);
+    }
+
+    // A present-but-blank binary is still rejected — that's a typo, not an
+    // intentional inherit (which is expressed by omitting the field entirely).
+    #[test]
+    fn parse_lsp_server_rejects_blank_binary() {
+        let value = json!([{ "id": "rust", "binary": "  " }]);
+        assert!(super::parse_lsp_servers(&value).is_err());
     }
 
     #[cfg(unix)]

@@ -49,8 +49,10 @@ export interface SemanticConfig {
 
 export interface LspServerConfig {
   id: string;
-  extensions: string[];
-  binary: string;
+  /** Omitted when overriding a built-in server to inherit its extensions. */
+  extensions?: string[];
+  /** Omitted when overriding a built-in server to inherit its binary. */
+  binary?: string;
   args: string[];
   root_markers: string[];
   disabled: boolean;
@@ -347,8 +349,11 @@ const LspExtensionSchema = z
   });
 
 const LspServerEntrySchema = z.object({
-  extensions: z.array(LspExtensionSchema).min(1),
-  binary: z.string().trim().min(1),
+  // Optional: overriding a built-in server (e.g. `rust`) to tweak one field
+  // inherits the built-in's extensions/binary downstream. Requiring them here
+  // silently dropped the whole `lsp` section on a partial override.
+  extensions: z.array(LspExtensionSchema).min(1).optional(),
+  binary: z.string().trim().min(1).optional(),
   args: z.array(z.string()).optional().default([]),
   root_markers: z.array(z.string().trim().min(1)).optional().default([".git"]),
   disabled: z.boolean().optional().default(false),
@@ -515,12 +520,16 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
   const servers = Object.entries(config.lsp?.servers ?? {}).map(([id, server]) => {
     const entry: LspServerConfig = {
       id,
-      extensions: server.extensions.map(normalizeLspExtension),
-      binary: server.binary,
       args: server.args,
       root_markers: server.root_markers,
       disabled: server.disabled,
     };
+    if (server.extensions && server.extensions.length > 0) {
+      entry.extensions = server.extensions.map(normalizeLspExtension);
+    }
+    if (server.binary) {
+      entry.binary = server.binary;
+    }
     if (server.env && Object.keys(server.env).length > 0) {
       entry.env = server.env;
     }
