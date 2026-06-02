@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
+use std::time::Instant;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
@@ -22,6 +23,7 @@ use crate::imports::{self, ImportBlock};
 use crate::language::LanguageProvider;
 use crate::parser::{detect_language, grammar_for, LangId};
 use crate::symbols::{Range, Symbol, SymbolKind};
+use crate::{slog_debug, slog_info};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -1218,13 +1220,27 @@ impl CallGraph {
             .cloned()
             .collect();
 
-        let computed: Vec<(PathBuf, FileCallData)> = uncached_files
-            .par_iter()
-            .filter_map(|f| build_file_data(f).ok().map(|data| (f.clone(), data)))
-            .collect();
+        // Parsing every uncached source file is the dominant cost of a cold
+        // call-graph query on a large repo. Log it so a slow (near-timeout)
+        // first call is attributable to parse work rather than appearing as an
+        // opaque bridge hang. Cheap no-op when nothing is uncached (warm cache).
+        if !uncached_files.is_empty() {
+            let started = Instant::now();
+            let computed: Vec<(PathBuf, FileCallData)> = uncached_files
+                .par_iter()
+                .filter_map(|f| build_file_data(f).ok().map(|data| (f.clone(), data)))
+                .collect();
 
-        for (file, data) in computed {
-            self.data.insert(file, data);
+            let parsed = computed.len();
+            for (file, data) in computed {
+                self.data.insert(file, data);
+            }
+            slog_info!(
+                "callgraph: parsed {} uncached files ({} total project files) in {}ms",
+                parsed,
+                all_files.len(),
+                started.elapsed().as_millis()
+            );
         }
 
         Ok(())
@@ -1238,6 +1254,11 @@ impl CallGraph {
     fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
         self.ensure_project_files_built(max_files)?;
         let all_files = self.project_files().to_vec();
+
+        // Cross-file edge resolution is the second dominant cost (after parsing)
+        // of a cold callers/impact query; time it so a slow first call is fully
+        // attributable across the two phases.
+        let reverse_started = Instant::now();
 
         // Now build the reverse map
         let mut reverse: ReverseIndex = HashMap::new();
@@ -1308,7 +1329,17 @@ impl CallGraph {
             }
         }
 
+        let edges: usize = reverse
+            .values()
+            .map(|m| m.values().map(Vec::len).sum::<usize>())
+            .sum();
         self.reverse_index = Some(reverse);
+        slog_debug!(
+            "callgraph: built reverse index ({} edges over {} files) in {}ms",
+            edges,
+            all_files.len(),
+            reverse_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
