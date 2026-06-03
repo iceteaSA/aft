@@ -32,6 +32,8 @@ export {
 } from "./downloader.js";
 // --- compact UI formatting ---
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
+// --- jsonc helpers ---
+export { stripJsoncSymbols } from "./jsonc.js";
 export type { Logger, LogMeta } from "./logger.js";
 export type { MigrationHarness, MigrationOptions, MigrationStatus } from "./migration.js";
 // --- storage migration ---

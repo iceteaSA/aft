@@ -88,6 +88,51 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("is not valid JSON");
   });
 
+  test("loads a config with comments inside nested objects (issue #88)", () => {
+    const fixture = createConfigFixture();
+    // A `//` comment inside a nested object makes comment-json attach a
+    // Symbol(before:<key>) property. Before the fix, Zod stringified that
+    // symbol while building validation paths and threw "Cannot convert a
+    // symbol to a string", which the outer catch swallowed and silently
+    // dropped the entire config to defaults.
+    //
+    // Written to the USER config because lsp.servers is a protected setting
+    // that project configs are not allowed to override; this mirrors the
+    // reporter's exact repro (comment inside lsp.servers) on a path where the
+    // section is actually honored.
+    writeFileSync(
+      fixture.userConfigPath,
+      `{
+        "search_index": true,
+        "semantic_search": true,
+        "formatter": {
+          // typescript uses biome
+          "typescript": "biome"
+        },
+        "lsp": {
+          "servers": {
+            // my custom server
+            "my-server": { "binary": "my-lsp" }
+          }
+        }
+      }`,
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const loaded = JSON.parse(result.stdout);
+    // The valid settings must survive rather than falling back to {} defaults.
+    expect(loaded.search_index).toBe(true);
+    expect(loaded.semantic_search).toBe(true);
+    expect(loaded.formatter).toEqual({ typescript: "biome" });
+    expect(loaded.lsp?.servers?.["my-server"]?.binary).toBe("my-lsp");
+    // No symbol-to-string crash should have been logged.
+    expect(result.stderr).not.toContain("Cannot convert a symbol to a string");
+  });
+
   test("keeps valid sections when invalid config values are present", () => {
     const fixture = createConfigFixture();
     writeFileSync(

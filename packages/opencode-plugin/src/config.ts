@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { stripJsoncSymbols } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { z } from "zod";
 import { error, log, warn } from "./logger.js";
@@ -945,7 +946,13 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
     const content = readFileSync(configPath, "utf-8");
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
     migrateRawConfig(rawConfig, configPath, { log, warn });
-    const result = AftConfigSchema.safeParse(rawConfig);
+    // comment-json attaches Symbol(before/after:<key>) props to track comments.
+    // Zod stringifies keys when building error paths, which throws on those
+    // symbols and would silently drop the whole config to defaults (issue #88).
+    // Validate against a symbol-free deep copy; the migration disk-write path
+    // above still uses the symbol-bearing object so comments survive.
+    const cleanConfig = stripJsoncSymbols(rawConfig);
+    const result = AftConfigSchema.safeParse(cleanConfig);
 
     if (result.success) {
       log(`Config loaded from ${configPath}`);
@@ -955,7 +962,7 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
 
-    return parseConfigPartially(rawConfig);
+    return parseConfigPartially(cleanConfig);
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);

@@ -61,6 +61,42 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("loads a config with comments inside nested objects (issue #88)", () => {
+    const fixture = createConfigFixture();
+    // comment-json attaches Symbol(before:<key>) properties for the comments.
+    // Before the fix, Zod stringified those symbols while building validation
+    // paths and threw "Cannot convert a symbol to a string", which the outer
+    // catch swallowed and silently dropped the entire config to defaults.
+    writeFileSync(
+      fixture.userConfigPath,
+      `{
+        "search_index": true,
+        "semantic_search": true,
+        "formatter": {
+          // typescript uses biome
+          "typescript": "biome"
+        },
+        "lsp": {
+          "servers": {
+            // my custom server
+            "my-server": { "extensions": [".foo"], "binary": "my-lsp" }
+          }
+        }
+      }`,
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+    });
+
+    const loaded = JSON.parse(result.stdout);
+    expect(loaded.search_index).toBe(true);
+    expect(loaded.semantic_search).toBe(true);
+    expect(loaded.formatter).toEqual({ typescript: "biome" });
+    expect(loaded.lsp?.servers?.["my-server"]?.binary).toBe("my-lsp");
+    expect(result.stderr).not.toContain("Cannot convert a symbol to a string");
+  });
+
   test("loads user object-map lsp servers with entry defaults", () => {
     const fixture = createConfigFixture();
     writeFileSync(
