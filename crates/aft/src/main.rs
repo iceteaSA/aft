@@ -1339,6 +1339,13 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                     entries_done,
                     entries_total,
                 };
+                // Push progress to the sidebar. Without this, a long rebuild
+                // (e.g. a slow local embedding backend re-indexing after a prior
+                // failure) leaves the sidebar showing the stale prior state —
+                // "failed" with an old error — for the entire build, even though
+                // it is actively embedding. Progress transitions are exactly
+                // when the user needs to see "building".
+                status_changed = true;
             }
             SemanticIndexEvent::Ready(mut index) => {
                 let pending_paths = ctx.take_pending_semantic_index_paths();
