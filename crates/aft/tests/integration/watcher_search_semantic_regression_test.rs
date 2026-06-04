@@ -498,14 +498,21 @@ fn semantic_corpus_refresh_replays_file_created_while_in_flight() {
     let mut attempts = 0usize;
     while !server.saw_corpus_refresh() && Instant::now() < deadline {
         if attempts.is_multiple_of(5) {
+            // Unique content each retouch so the content-hash freshness check
+            // can't dedup it away if the watcher dropped/coalesced the first
+            // event under parallel-suite load (the root cause of the flake).
+            // The asserted `alpha_anchor` symbol is preserved; only a trailing
+            // comment varies the hash.
             fs::write(
                 &source,
-                "pub fn alpha_anchor() -> &'static str {\n    \"corpus hold marker\"\n}\n",
+                format!(
+                    "pub fn alpha_anchor() -> &'static str {{\n    \"corpus hold marker\"\n}}\n// retouch {attempts}\n"
+                ),
             )
             .expect("retouch stale file for corpus refresh");
             fs::write(
                 project.path().join(".aftignore"),
-                "# trigger semantic corpus refresh\n",
+                format!("# trigger semantic corpus refresh {attempts}\n"),
             )
             .expect("retouch aftignore");
         }

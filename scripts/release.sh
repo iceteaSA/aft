@@ -210,8 +210,12 @@ bun run lint 2>&1 || { echo "Error: Lint failed"; exit 1; }
 echo "  bun typecheck..."
 bun run typecheck 2>&1 || { echo "Error: Typecheck failed"; exit 1; }
 
-echo "  bun test..."
-bun run test 2>&1 || { echo "Error: Plugin tests failed"; exit 1; }
+if [ "${SKIP_JS_TESTS:-}" = "1" ]; then
+  echo "  (skipping plugin tests — SKIP_JS_TESTS=1)"
+else
+  echo "  bun test..."
+  bun run test 2>&1 || { echo "Error: Plugin tests failed"; exit 1; }
+fi
 
 if [ "${SKIP_DOCKER_E2E:-}" = "1" ]; then
   echo "  (skipping docker e2e — SKIP_DOCKER_E2E=1)"

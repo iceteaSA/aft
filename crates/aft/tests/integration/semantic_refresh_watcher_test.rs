@@ -409,8 +409,15 @@ where
         }
         // Re-touch periodically (not every poll) so we keep emitting modify
         // events until the watcher attaches, without hammering the filesystem.
+        // Each re-touch writes UNIQUE content (a varying trailing comment) so
+        // the refresh's content-hash freshness check never dedups it away. With
+        // identical bytes, if the watcher dropped/coalesced the first event under
+        // parallel-suite load, every later re-touch hashed equal to the already-
+        // seen content and the refresh could never fire — the root cause of this
+        // test's flakiness. The asserted marker lives in the symbol body, which
+        // `contents` preserves; the trailing comment only perturbs the hash.
         if i % 3 == 0 {
-            let _ = fs::write(file, contents);
+            let _ = fs::write(file, format!("{contents}// retouch {i}\n"));
         }
         last_response = Some(response);
         thread::sleep(Duration::from_millis(100));

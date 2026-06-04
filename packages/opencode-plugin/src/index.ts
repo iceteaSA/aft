@@ -198,14 +198,12 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.35.0";
+const ANNOUNCEMENT_VERSION = "0.35.3";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Leaner semantic indexing — local embedding now uses about half the CPU and a fraction of the peak memory, with no change to results and no re-index needed.",
-  "New IDE-style status bar on tool results — live LSP errors/warnings plus dead-code, unused-export, duplicate, and TODO counts at a glance.",
-  "`aft_inspect` is more accurate (dead-code reachability, duplicate collapse, ranked findings) and a background scheduler keeps its counts fresh during long sessions.",
-  "The TUI sidebar is now collapsible — click the `AFT` header to toggle a condensed view.",
-  "`npx @cortexkit/aft --version` reports CLI, binary, and per-harness versions; `doctor --issue` can scope its report to a single session.",
-  "New SCSS support and `.inc` files parsed as PHP.",
+  "Code Health in the TUI sidebar and `/aft-status`: live LSP errors and warnings plus duplicate and TODO counts, shown as at-a-glance traffic lights when the sidebar is collapsed.",
+  "The semantic index now recovers on its own from a transient embedding-backend blip (a restarted local server, or a model still loading) instead of getting stuck on `failed`.",
+  "Fixed a background codebase-scan crash on very deep or minified files.",
+  "More reliable LSP auto-install when a parent directory has its own `package.json`.",
 ];
 
 /**
