@@ -20,6 +20,9 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("`aft_search` is the primary code-search tool");
     expect(out).toContain('`hint: "regex"`');
     expect(out).toContain("auto-routes by query shape");
+    // Generic anti-bash-batch code-search steer must be present.
+    expect(out).toContain("the raw-bash batch is unranked");
+    expect(out).toContain("in parallel when the lookups are independent");
     expect(out).toContain("Use `aft_callgraph`");
     expect(out).toContain("- `callers`");
     expect(out).toContain("- `impact`");

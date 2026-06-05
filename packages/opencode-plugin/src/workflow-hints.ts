@@ -63,18 +63,21 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
 
   // Code exploration — needs at least aft_outline + aft_zoom + (grep or aft_search).
   if (hasOutline && hasZoom && (hasGrep || hasSearch)) {
+    let codeExploration: string;
     if (hasSearch) {
       const grepFallback = hasGrep
         ? ` Use \`${grepName}\` directly only when you need exhaustive enumeration of literal text (every TODO, every import of X) without ranking.`
         : "";
-      sections.push(
-        `**Code exploration**: \`aft_search\` is the primary code-search tool. It auto-routes by query shape — exact identifiers, regex, error messages, natural language all use the same call. Very short queries fall back to literal scans; pass \`hint: "regex"\` / \`hint: "literal"\` / \`hint: "semantic"\` to override routing if needed. Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).${grepFallback}`,
-      );
+      codeExploration = `**Code exploration**: \`aft_search\` is the primary code-search tool. It auto-routes by query shape — exact identifiers, regex, error messages, natural language all use the same call. Very short queries fall back to literal scans; pass \`hint: "regex"\` / \`hint: "literal"\` / \`hint: "semantic"\` to override routing if needed. Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).${grepFallback}`;
     } else {
-      sections.push(
-        `**Code exploration**: \`${grepName}\` to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`,
-      );
+      codeExploration = `**Code exploration**: \`${grepName}\` to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`;
     }
+    // Generic anti-pattern steer (all models): locating code by batching
+    // grep/find/sed in one bash call is unranked and routinely picks the wrong
+    // hit. Route discovery through the AFT tools, fired in parallel.
+    codeExploration +=
+      " For code discovery, call these AFT tools (in parallel when the lookups are independent) rather than batching `grep`/`find`/`sed` in one `bash` call: the raw-bash batch is unranked and routinely surfaces the wrong code. Keep `bash` for shell facts (git state, file metadata, running commands).";
+    sections.push(codeExploration);
   }
 
   // Codebase health & diagnostics — needs aft_inspect (recommended+).
