@@ -26,7 +26,7 @@ use std::os::windows::process::CommandExt;
 use super::buffer::{combine_streams, BgBuffer, StreamKind, TokenCountInput};
 use super::output::{
     cap_completion_output, cap_completion_output_with_marker, cap_final_output,
-    cap_final_output_with_marker, json_output_pointer, COMPLETION_OUTPUT_PREVIEW_BYTES,
+    cap_final_output_with_marker, json_output_pointer, quote_path, COMPLETION_OUTPUT_PREVIEW_BYTES,
     COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES, COMPRESS_INPUT_TAIL_BYTES,
     FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
     RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
@@ -301,6 +301,8 @@ impl BgTaskRegistry {
             (state.metadata.clone(), state.buffer.clone())
         };
 
+        let mut cap_buffer = buffer.clone();
+        cap_buffer.enforce_terminal_cap();
         let cache = self.render_terminal_output(&metadata, &buffer);
         let mut state = task.state.lock().ok()?;
         if !state.metadata.status.is_terminal() || state.metadata.mode == BgMode::Pty {
@@ -2739,14 +2741,62 @@ fn render_compressed_with_recovery(
 }
 
 fn render_body_with_recovery_marker(body: &str, recovery: &mut RecoveryContext) -> (String, bool) {
+    render_body_with_recovery_marker_at_cap(
+        body,
+        recovery,
+        FINAL_OUTPUT_CAP_BYTES,
+        cap_final_output,
+        cap_final_output_with_marker,
+    )
+}
+
+fn render_raw_body_with_recovery_marker(
+    body: &str,
+    recovery: &mut RecoveryContext,
+) -> (String, bool) {
+    render_body_with_recovery_marker_at_cap(
+        body,
+        recovery,
+        RAW_PASSTHROUGH_CAP_BYTES,
+        |input| {
+            super::output::cap_head_tail(
+                input,
+                RAW_PASSTHROUGH_CAP_BYTES,
+                RAW_PASSTHROUGH_HEAD_BYTES,
+                RAW_PASSTHROUGH_TAIL_BYTES,
+            )
+        },
+        |input, marker| {
+            super::output::cap_head_tail_with_marker(
+                input,
+                RAW_PASSTHROUGH_CAP_BYTES,
+                RAW_PASSTHROUGH_HEAD_BYTES,
+                RAW_PASSTHROUGH_TAIL_BYTES,
+                marker,
+            )
+        },
+    )
+}
+
+fn render_body_with_recovery_marker_at_cap<F, G>(
+    body: &str,
+    recovery: &mut RecoveryContext,
+    cap_bytes: usize,
+    cap_plain: F,
+    cap_with_marker: G,
+) -> (String, bool)
+where
+    F: Fn(&str) -> super::output::CappedText,
+    G: Fn(&str, &str) -> super::output::CappedText,
+{
     let needs_marker = recovery.has_visible_drop();
-    if body.len() > FINAL_OUTPUT_CAP_BYTES {
+    if body.len() > cap_bytes {
         recovery.byte_truncated = true;
         if let Some(marker) = recovery_marker(recovery) {
-            let capped = cap_final_output_with_marker(body, &marker);
+            let capped = cap_with_marker(body, &marker);
             return (capped.text, true);
         }
-        let capped = cap_final_output(body);
+        let capped = cap_plain(body);
         return (capped.text, capped.truncated || needs_marker);
     }
 
@@ -2758,13 +2808,13 @@ fn render_body_with_recovery_marker(body: &str, recovery: &mut RecoveryContext) 
         return (body.to_string(), true);
     };
     let with_marker = append_recovery_marker(body, &marker);
-    if with_marker.len() <= FINAL_OUTPUT_CAP_BYTES {
+    if with_marker.len() <= cap_bytes {
         return (with_marker, true);
     }
 
     recovery.byte_truncated = true;
     let marker = recovery_marker(recovery).unwrap_or(marker);
-    let capped = cap_final_output_with_marker(body, &marker);
+    let capped = cap_with_marker(body, &marker);
     (capped.text, true)
 }
 
@@ -2842,11 +2892,6 @@ fn recovery_hint(recovery: &RecoveryContext) -> String {
     format!("full output: {reads}")
 }
 
-fn quote_path(path: &str) -> String {
-    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
 fn strip_plain_truncation_marker_lines(input: &str) -> String {
     input
         .lines()
@@ -2874,7 +2919,11 @@ fn is_plain_truncation_marker(line: &str) -> bool {
 }
 
 fn is_recovery_marker(line: &str) -> bool {
-    line.starts_with('[') && line.ends_with(']') && line.contains("full output: read ")
+    line.starts_with('[')
+        && line.ends_with(']')
+        && (line.contains("full output: read ")
+            || line.contains("see remaining: tail -n +")
+            || line.contains("full output unavailable"))
 }
 
 fn render_structured_output(command: &str, buffer: &BgBuffer) -> Option<TerminalOutputCache> {
@@ -2925,13 +2974,39 @@ fn render_raw_passthrough(buffer: &BgBuffer) -> TerminalOutputCache {
         RAW_PASSTHROUGH_HEAD_BYTES,
         RAW_PASSTHROUGH_TAIL_BYTES,
     );
+    let output_path = buffer.output_path().map(|path| path.display().to_string());
+    let stderr_path = buffer.stderr_path().map(|path| path.display().to_string());
+    if !raw.truncated {
+        return TerminalOutputCache {
+            output_preview: raw.text,
+            output_truncated: false,
+            kind: TerminalOutputKind::Raw,
+            output_path,
+            stderr_path,
+            recovery: None,
+        };
+    }
+
+    let include_stderr_path = buffer.stream_len(StreamKind::Stderr) > 0;
+    let mut recovery = RecoveryContext {
+        dropped_by_class: BTreeMap::new(),
+        had_inner_drop: false,
+        offset_hint_eligible: false,
+        offset_start_line: None,
+        byte_truncated: true,
+        output_path: output_path.clone(),
+        stderr_path: stderr_path.clone(),
+        include_stderr_path,
+    };
+    let (output_preview, output_truncated) =
+        render_raw_body_with_recovery_marker(&raw.text, &mut recovery);
     TerminalOutputCache {
-        output_preview: raw.text,
-        output_truncated: raw.truncated,
+        output_preview,
+        output_truncated,
         kind: TerminalOutputKind::Raw,
-        output_path: buffer.output_path().map(|path| path.display().to_string()),
-        stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
-        recovery: None,
+        output_path,
+        stderr_path,
+        recovery: Some(recovery),
     }
 }
 
@@ -3865,6 +3940,19 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_all_recovery_marker_forms() {
+        assert!(is_recovery_marker(
+            "[truncated output; full output: read \"/tmp/out\"]"
+        ));
+        assert!(is_recovery_marker(
+            "[omitted output; see remaining: tail -n +42 \"/tmp/out\"]"
+        ));
+        assert!(is_recovery_marker(
+            "[truncated output; full output unavailable]"
+        ));
+    }
+
+    #[test]
     fn terminal_status_polls_use_cached_render_once_and_off_lock() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
@@ -4132,12 +4220,55 @@ mod tests {
     }
 
     #[test]
+    fn toml_strip_tail_cap_uses_full_output_hint_not_offset_hint() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let filter_registry = crate::compress::toml_filter::build_registry(
+            crate::compress::builtin_filters::ALL,
+            None,
+            None,
+        );
+        registry.set_compressor(move |command, output| {
+            crate::compress::compress_with_registry(command, &output, &filter_registry)
+        });
+        let stdout = format!(
+            "make[1]: Entering directory `/tmp`\n{}",
+            (0..100)
+                .map(|index| format!("compile line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "make all", &stdout, "", true);
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert!(snapshot.output_preview.contains("compile line 99"));
+        assert!(snapshot.output_preview.contains(&format!(
+            "full output: read \"{}\"",
+            task.paths.stdout.display()
+        )));
+        assert!(!snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stderr.display())));
+        assert!(!snapshot.output_preview.contains("tail -n +"));
+    }
+
+    #[test]
     fn compressed_false_raw_passthrough_uses_wider_head_tail_cap() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
         let output = format!("RAW-HEAD\n{}RAW-TAIL\n", "raw-middle\n".repeat(8_000));
-        let (task_id, _task) =
-            insert_terminal_piped_task(&registry, &dir, "cat raw.log", &output, "", false);
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "cat raw.log", &output, "RAW-ERR\n", false);
 
         let snapshot = registry
             .status(
@@ -4151,7 +4282,14 @@ mod tests {
 
         assert!(snapshot.output_preview.contains("RAW-HEAD"));
         assert!(snapshot.output_preview.contains("RAW-TAIL"));
-        assert!(snapshot.output_preview.contains("...<truncated "));
+        assert!(snapshot.output_preview.contains("truncated output"));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stdout.display())));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stderr.display())));
+        assert!(!snapshot.output_preview.contains("tail -n +"));
         assert!(snapshot.output_preview.len() > 16 * 1024);
         assert!(snapshot.output_truncated);
     }

@@ -4,8 +4,6 @@ use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::{dedup_consecutive, strip_ansi, GenericCompressor};
 use crate::compress::{CompressionResult, Compressor};
 
-const MAX_FAILURE_MESSAGE_LINES: usize = 5;
-
 pub struct VitestCompressor;
 
 #[derive(Debug)]
@@ -122,7 +120,7 @@ fn compress_json(command: &str, input: &str) -> Option<CompressionResult> {
 
     for failure in failures {
         let mut lines = vec![format!("FAIL {}", failure.name)];
-        for message in failure.messages.iter().take(MAX_FAILURE_MESSAGE_LINES) {
+        for message in &failure.messages {
             lines.push(format!("  {message}"));
         }
         blocks.push(ClassifiedBlock::new(DropClass::Failure, lines.join("\n")));
@@ -214,7 +212,6 @@ fn failure_messages(assertion: &Value) -> Vec<String> {
 fn first_message_lines(message: &str) -> Vec<String> {
     message
         .lines()
-        .take(MAX_FAILURE_MESSAGE_LINES)
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
         .map(ToString::to_string)
@@ -381,6 +378,24 @@ Duration    1.26s
         assert!(compressed.starts_with("vitest: 12 pass, 2 fail (out of 14)"));
         assert!(compressed.contains("FAIL foo.test.ts > math adds"));
         assert!(compressed.contains("  Expected: 1"));
+    }
+
+    #[test]
+    fn keeps_full_json_failure_message_lines() {
+        let message = (0..8)
+            .map(|index| format!("stack line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let escaped = serde_json::to_string(&message).unwrap();
+        let output = format!(
+            r#"{{"numTotalTests":1,"numPassedTests":0,"numFailedTests":1,"testResults":[{{"name":"/repo/src/foo.test.ts","assertionResults":[{{"fullName":"math adds","status":"failed","failureMessages":[{escaped}]}}]}}]}}"#
+        );
+
+        let result = compress_test_runner("vitest --reporter=json", &output);
+
+        assert!(result.text.contains("  stack line 0"));
+        assert!(result.text.contains("  stack line 7"));
+        assert!(!result.had_inner_drop);
     }
 
     #[test]

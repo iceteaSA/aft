@@ -165,8 +165,25 @@ fn compress_test(output: &str) -> CompressionResult {
         }
 
         if trimmed == "failures:" {
-            blocks.push(ClassifiedBlock::unclassified(lines[index..].join("\n")));
-            break;
+            let start = index;
+            let mut next = index + 1;
+            while next < lines.len() && lines[next].trim().is_empty() {
+                next += 1;
+            }
+            if next < lines.len() && lines[next].starts_with("---- ") {
+                blocks.push(ClassifiedBlock::unclassified(line.to_string()));
+                index += 1;
+                continue;
+            }
+
+            index += 1;
+            while index < lines.len() && !lines[index].trim_start().starts_with("test result:") {
+                index += 1;
+            }
+            blocks.push(ClassifiedBlock::unclassified(
+                lines[start..index].join("\n"),
+            ));
+            continue;
         }
 
         if line.starts_with("---- ") {
@@ -174,7 +191,8 @@ fn compress_test(output: &str) -> CompressionResult {
             while index < lines.len() {
                 index += 1;
                 if index < lines.len()
-                    && (lines[index].trim_start().starts_with("test result:")
+                    && (lines[index].starts_with("---- ")
+                        || lines[index].trim_start().starts_with("test result:")
                         || lines[index].trim() == "failures:")
                 {
                     break;
@@ -200,4 +218,39 @@ fn trim_trailing_lines(input: &str) -> String {
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compress::caps::{DropClass, CAP_ERRORS};
+
+    #[test]
+    fn cargo_test_caps_failure_blocks_after_failures_header() {
+        let mut output = String::from("running 40 tests\n\nfailures:\n\n");
+        for index in 0..40 {
+            output.push_str(&format!(
+                "---- case_{index} stdout ----\nthread 'case_{index}' panicked at src/lib.rs:{index}:1\nstack line {index}\n\n"
+            ));
+        }
+        output.push_str("failures:\n");
+        for index in 0..40 {
+            output.push_str(&format!("    case_{index}\n"));
+        }
+        output.push_str(
+            "\ntest result: FAILED. 0 passed; 40 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+
+        let result = compress_test(&output);
+
+        assert_eq!(
+            result.dropped_by_class.get(&DropClass::Failure),
+            Some(&(40 - CAP_ERRORS))
+        );
+        assert_eq!(result.text.matches(" stdout ----").count(), CAP_ERRORS);
+        assert!(result.text.contains("---- case_19 stdout ----"));
+        assert!(!result.text.contains("---- case_20 stdout ----"));
+        assert!(result.had_inner_drop);
+        assert!(!result.offset_hint_eligible);
+    }
 }

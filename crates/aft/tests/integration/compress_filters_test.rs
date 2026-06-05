@@ -123,6 +123,25 @@ fn make_shortcircuit_only_matches_empty_body() {
 }
 
 #[test]
+fn make_strip_tail_cap_is_not_offset_eligible() {
+    let filter = load_filter("make");
+    let output = format!(
+        "make[1]: Entering directory `/tmp`\n{}",
+        (0..100)
+            .map(|index| format!("compile line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let result = apply_filter(&filter, &output);
+
+    assert!(result.had_inner_drop);
+    assert!(!result.offset_hint_eligible);
+    assert_eq!(result.offset_start_line, None);
+    assert!(result.text.contains("compile line 99"));
+}
+
+#[test]
 fn toml_filter_strip_ansi_false_sees_raw_ansi() {
     let registry = build_registry(
         &[(

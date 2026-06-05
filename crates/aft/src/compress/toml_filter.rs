@@ -425,10 +425,12 @@ pub fn apply_filter(filter: &TomlFilter, output: &str) -> CompressionResult {
     };
 
     // Phase 1: line strip
+    let original_line_count = stripped_ansi.lines().count();
     let kept: Vec<&str> = stripped_ansi
         .lines()
         .filter(|line| !filter.strip.iter().any(|re| re.is_match(line)))
         .collect();
+    let strip_removed_lines = kept.len() < original_line_count;
     let after_strip = kept.join("\n");
 
     // Phase 2: shortcircuit (against the after-strip body)
@@ -455,7 +457,12 @@ pub fn apply_filter(filter: &TomlFilter, output: &str) -> CompressionResult {
     }
 
     // Phase 5: plain line cap
-    cap_lines(&truncated, filter.max_lines, filter.keep)
+    cap_lines(
+        &truncated,
+        filter.max_lines,
+        filter.keep,
+        strip_removed_lines,
+    )
 }
 
 fn truncate_line(line: &str, line_max: usize) -> String {
@@ -502,7 +509,12 @@ fn cap_class_lines(lines: &[String], class_cap: &TomlClassCap) -> CompressionRes
     CompressionResult::with_class_drops(capped.text, capped.dropped_by_class)
 }
 
-fn cap_lines(lines: &[String], max_lines: usize, keep: KeepMode) -> CompressionResult {
+fn cap_lines(
+    lines: &[String],
+    max_lines: usize,
+    keep: KeepMode,
+    had_prior_line_drop: bool,
+) -> CompressionResult {
     if lines.len() <= max_lines || max_lines == usize::MAX {
         return CompressionResult::new(lines.join("\n"));
     }
@@ -526,7 +538,7 @@ fn cap_lines(lines: &[String], max_lines: usize, keep: KeepMode) -> CompressionR
             kept
         }
     };
-    if matches!(keep, KeepMode::Tail) {
+    if matches!(keep, KeepMode::Tail) && !had_prior_line_drop {
         let dropped_prefix_lines = lines.len().saturating_sub(max_lines);
         CompressionResult::with_prefix_drop(kept.join("\n"), dropped_prefix_lines + 1)
     } else {
@@ -722,6 +734,40 @@ keep = "tail"
         assert!(out.had_inner_drop);
         assert!(out.offset_hint_eligible);
         assert_eq!(out.text.lines().count(), 3);
+    }
+
+    #[test]
+    fn cap_tail_after_strip_disables_offset_hint() {
+        let filter = parse(
+            r#"
+[filter]
+matches = ["x"]
+
+[strip]
+patterns = ["^strip-me"]
+
+[cap]
+max_lines = 2
+keep = "tail"
+"#,
+        );
+        let out = apply_filter(
+            &filter,
+            "strip-me
+1
+2
+3
+4",
+        );
+
+        assert_eq!(
+            out.text,
+            "3
+4"
+        );
+        assert!(out.had_inner_drop);
+        assert!(!out.offset_hint_eligible);
+        assert_eq!(out.offset_start_line, None);
     }
 
     #[test]
