@@ -352,21 +352,43 @@ fn is_retryable_embedding_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
-/// Local backends (LM Studio, Ollama, llama.cpp) return a 4xx — usually 400 —
-/// while a model is loading or was just unloaded, with a body message like
-/// "Model was unloaded while the request was still in queue" or "model is
-/// loading". These are transient (the model will reload), not the permanent
-/// misconfigurations a 4xx normally signals, so we ride them out instead of
-/// parking the index in `Failed`. Matched case-insensitively on the response
-/// body so a mid-build model swap self-heals.
-fn embedding_response_body_is_transient(raw: &str) -> bool {
+/// Local backends (LM Studio, Ollama, llama.cpp) can return a 4xx — usually
+/// 400/409 — while a model is loading or was just unloaded. Only narrowly known
+/// local-backend loading/unloaded payloads are classified transient; generic
+/// 4xx bodies that merely mention phrases like "loading model" remain
+/// permanent so misconfigurations do not retry forever.
+fn embedding_response_body_is_transient(status: reqwest::StatusCode, raw: &str) -> bool {
+    if !matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::CONFLICT
+            | reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::LOCKED
+            | reqwest::StatusCode::TOO_EARLY
+    ) {
+        return false;
+    }
+
     let lower = raw.to_ascii_lowercase();
-    lower.contains("model was unloaded")
-        || lower.contains("model is loading")
-        || lower.contains("model not loaded")
-        || lower.contains("loading model")
-        || lower.contains("is currently loading")
-        || lower.contains("model is being loaded")
+    let normalized = lower.trim();
+
+    normalized.contains("model was unloaded while the request was still in queue")
+        || normalized == "model is loading"
+        || normalized.starts_with("model is loading,")
+        || normalized.contains(r#""error":"model is loading"#)
+        || normalized.contains(r#""message":"model is loading"#)
+        || normalized == "model not loaded"
+        || normalized.contains(r#""error":"model not loaded""#)
+        || normalized.contains(r#""message":"model not loaded""#)
+        || normalized == "loading model into memory"
+        || normalized.contains(r#""error":"loading model into memory""#)
+        || normalized.contains(r#""message":"loading model into memory""#)
+        || normalized == "model is being loaded"
+        || normalized.contains(r#""error":"model is being loaded""#)
+        || normalized.contains(r#""message":"model is being loaded""#)
+        || normalized == "model is currently loading"
+        || normalized.contains(r#""error":"model is currently loading""#)
+        || normalized.contains(r#""message":"model is currently loading""#)
 }
 
 fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
@@ -380,6 +402,10 @@ fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
 /// in-request attempts on it — the build-level retry rides it out instead.
 fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_timeout()
+}
+
+fn embedding_response_read_error_is_transient(error: &reqwest::Error) -> bool {
+    embedding_send_error_is_transient(error) || error.is_body() || error.is_decode()
 }
 
 /// Stable machine marker prefixed onto embedding error strings whose root cause
@@ -437,11 +463,18 @@ where
         let raw = match response.text() {
             Ok(raw) => raw,
             Err(error) => {
-                if !last_attempt && is_retryable_embedding_error(&error) {
+                if !last_attempt && embedding_response_read_error_is_transient(&error) {
                     sleep_before_embedding_retry(attempt_index);
                     continue;
                 }
-                return Err(format!("{backend_label} response read failed: {error}"));
+                let marker = if embedding_response_read_error_is_transient(&error) {
+                    TRANSIENT_EMBEDDING_MARKER
+                } else {
+                    ""
+                };
+                return Err(format!(
+                    "{marker}{backend_label} response read failed: {error}"
+                ));
             }
         };
 
@@ -452,7 +485,7 @@ where
         // A 4xx whose body says the model is loading/unloaded is transient on
         // local backends (LM Studio/Ollama), so treat it like a retryable
         // status: ride it out at both the in-request and build-retry layers.
-        let body_transient = embedding_response_body_is_transient(&raw);
+        let body_transient = embedding_response_body_is_transient(status, &raw);
         if !last_attempt && (is_retryable_embedding_status(status) || body_transient) {
             sleep_before_embedding_retry(attempt_index);
             continue;
@@ -833,13 +866,16 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                 ));
             }
 
-            // Try to detect the runtime version from the file path or soname.
-            // libonnxruntime.so.1.19.0, libonnxruntime.1.24.4.dylib, etc.
-            let detected_version = detect_ort_version_from_path(lib_name);
+            // Try to detect the runtime version from the actual loaded library
+            // path first. A bare dlopen("libonnxruntime.so") may resolve to an
+            // older system ORT through loader search paths; checking only the
+            // caller-supplied soname would miss that and let ort fail opaquely.
+            let (detected_version, version_source) =
+                detect_ort_version_from_loaded_library(handle, lib_name);
 
             libc::dlclose(handle);
 
-            // Check version compatibility — we need 1.24.x
+            // Check version compatibility — we need 1.20+.
             if let Some(ref version) = detected_version {
                 let parts: Vec<&str> = version.split('.').collect();
                 if let (Some(major), Some(minor)) = (
@@ -847,7 +883,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                     parts.get(1).and_then(|s| s.parse::<u32>().ok()),
                 ) {
                     if major != 1 || minor < 20 {
-                        return Err(format_ort_version_mismatch(version, lib_name));
+                        return Err(format_ort_version_mismatch(version, &version_source));
                     }
                 }
             }
@@ -986,6 +1022,60 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe fn loaded_library_path_from_handle(handle: *mut std::ffi::c_void) -> Option<String> {
+    let symbol_name = std::ffi::CString::new("OrtGetApiBase").ok()?;
+    let symbol = unsafe { libc::dlsym(handle, symbol_name.as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    if unsafe { libc::dladdr(symbol, info.as_mut_ptr()) } == 0 {
+        return None;
+    }
+
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return None;
+    }
+
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn detect_ort_version_from_resolved_or_requested(
+    resolved_path: Option<String>,
+    requested_lib_name: &str,
+) -> (Option<String>, String) {
+    if let Some(path) = resolved_path {
+        if let Some(version) = detect_ort_version_from_path(&path) {
+            return (Some(version), path);
+        }
+        return (detect_ort_version_from_path(requested_lib_name), path);
+    }
+
+    (
+        detect_ort_version_from_path(requested_lib_name),
+        requested_lib_name.to_string(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn detect_ort_version_from_loaded_library(
+    handle: *mut std::ffi::c_void,
+    requested_lib_name: &str,
+) -> (Option<String>, String) {
+    detect_ort_version_from_resolved_or_requested(
+        unsafe { loaded_library_path_from_handle(handle) },
+        requested_lib_name,
+    )
 }
 
 /// Try to extract the ORT version from the library filename or resolved symlink.
@@ -3086,22 +3176,34 @@ mod tests {
             "Loading model into memory",
         ] {
             assert!(
-                embedding_response_body_is_transient(body),
+                embedding_response_body_is_transient(reqwest::StatusCode::BAD_REQUEST, body),
                 "{body:?} should be body-transient"
             );
         }
 
-        // A genuine 4xx misconfiguration body must NOT be treated as transient.
+        // A genuine 4xx misconfiguration body must NOT be treated as transient,
+        // even when it happens to contain generic words from the old broad
+        // substring matcher.
         for body in [
             r#"{"error":"invalid api key"}"#,
             r#"{"error":"model 'foo' not found"}"#,
             "Bad Request: unknown field",
+            "Bad Request: invalid loading model option",
+            r#"{"error":"unauthorized while model is being loaded by another account"}"#,
         ] {
             assert!(
-                !embedding_response_body_is_transient(body),
+                !embedding_response_body_is_transient(reqwest::StatusCode::BAD_REQUEST, body),
                 "{body:?} must not be body-transient"
             );
         }
+
+        assert!(
+            !embedding_response_body_is_transient(
+                reqwest::StatusCode::UNAUTHORIZED,
+                r#"{"error":"model is loading, please wait"}"#
+            ),
+            "permanent auth failures must not become transient because of body text"
+        );
     }
 
     fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
@@ -3162,6 +3264,61 @@ mod tests {
         });
 
         (format!("http://{}", addr), handle)
+    }
+
+    fn start_truncated_body_server(attempts: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated test server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut accepted = 0usize;
+            while accepted < attempts && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepted += 1;
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).expect("read request");
+                        let response = "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 128
+Connection: close
+
+{";
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write truncated response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept request: {error}"),
+                }
+            }
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    #[test]
+    fn response_body_read_failures_are_marked_transient() {
+        let (url, handle) = start_truncated_body_server(EMBEDDING_REQUEST_MAX_ATTEMPTS);
+        let client = Client::builder()
+            .timeout(Duration::from_millis(250))
+            .build()
+            .expect("client");
+
+        let error = send_embedding_request(|| client.post(&url).body("{}"), "test backend")
+            .expect_err("truncated body should fail");
+
+        handle.join().unwrap();
+        assert!(
+            embedding_failure_is_transient(&error),
+            "body read failures should be transient-marked: {error}"
+        );
+        assert!(error.contains("response read failed"));
     }
 
     fn test_vector_for_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
@@ -4195,6 +4352,24 @@ mod tests {
             msg.contains("npx @cortexkit/aft doctor --fix"),
             "auto-fix command must be present and copy-pasteable: {msg}"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn loaded_ort_version_detection_prefers_actual_loaded_library_path() {
+        let requested = "libonnxruntime.so";
+        let actual = "/usr/local/lib/libonnxruntime.so.1.19.0";
+
+        assert_eq!(detect_ort_version_from_path(requested), None);
+        let (version, source) =
+            detect_ort_version_from_resolved_or_requested(Some(actual.to_string()), requested);
+
+        assert_eq!(version, Some("1.19.0".to_string()));
+        assert_eq!(source, actual);
+
+        let msg = format_ort_version_mismatch(&version.unwrap(), &source);
+        assert!(msg.contains("v1.19.0"));
+        assert!(msg.contains(actual));
     }
 
     /// macOS dylib paths must not produce a malformed message when the
