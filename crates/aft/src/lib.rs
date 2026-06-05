@@ -54,6 +54,7 @@ pub mod bash_permissions;
 pub mod bash_rewrite;
 pub mod cache_freshness;
 pub mod callgraph;
+pub mod callgraph_store;
 pub mod calls;
 pub mod checkpoint;
 pub mod commands;

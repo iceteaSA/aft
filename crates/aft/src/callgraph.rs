@@ -2770,7 +2770,7 @@ impl CallGraph {
 // ---------------------------------------------------------------------------
 
 /// Build call data for a single file.
-fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
+pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
     let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
         message: format!("unsupported file for call graph: {}", path.display()),
     })?;
