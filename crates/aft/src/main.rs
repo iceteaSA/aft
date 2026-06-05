@@ -885,6 +885,14 @@ where
                 return false;
             }
 
+            if watcher_path_is_global_gitignore(path)
+                || project_root
+                    .as_deref()
+                    .is_some_and(|root| watcher_path_is_git_info_exclude(ctx, root, path))
+            {
+                return false;
+            }
+
             if watcher_path_is_ignored_by_current_matcher(ctx, path) {
                 return false;
             }
@@ -1164,7 +1172,7 @@ fn drain_watcher_events(ctx: &AppContext) {
     // Phase 1: collect changed paths from the receiver without applying the
     // gitignore matcher yet; .gitignore writes in this same batch must rebuild
     // the matcher before any sibling path is filtered.
-    let filtered = {
+    let (filtered, watcher_failed) = {
         let rx_ref = ctx.watcher_rx().borrow();
         let rx = match rx_ref.as_ref() {
             Some(rx) => rx,
@@ -1175,43 +1183,66 @@ fn drain_watcher_events(ctx: &AppContext) {
         };
 
         let mut raw_paths = Vec::new();
-        while let Ok(event_result) = rx.try_recv() {
-            if let Ok(event) = event_result {
-                // Only process events that indicate actual file content changes.
-                //
-                // Skip Access events — on Linux with atime enabled, reading a file
-                // during update_file triggers an access event, creating a feedback
-                // loop.
-                //
-                // Skip Modify(Metadata(...)) events that don't imply content
-                // changes: AccessTime, Permissions, Ownership, Extended.
-                // The biome-lint case is the canonical reproducer — running
-                // `biome check` opens every TS file for read, which on Linux
-                // (and on macOS in some configurations) updates atime and fires
-                // notify `Modify(Metadata(AccessTime))` events. Without this
-                // filter, every read-only lint pass invalidates the entire
-                // symbol cache, search index, and semantic index — completely
-                // unnecessary work.
-                //
-                // We KEEP `Modify(Metadata(WriteTime))` because mtime change
-                // does indicate a real content modification on every supported
-                // platform. We KEEP `Modify(Metadata(Any))` and
-                // `Modify(Metadata(Other))` as catch-all "we can't tell what
-                // metadata changed" cases — better to over-invalidate than to
-                // miss a real edit.
-                if !watcher_event_invalidates(&event.kind) {
-                    continue;
+        let mut watcher_failed = None;
+        loop {
+            let event_result = match rx.try_recv() {
+                Ok(event_result) => event_result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    watcher_failed = Some("watcher channel disconnected".to_string());
+                    break;
                 }
-                for path in event.paths {
-                    raw_paths.push(path);
+            };
+            match event_result {
+                Ok(event) => {
+                    // Only process events that indicate actual file content changes.
+                    //
+                    // Skip Access events — on Linux with atime enabled, reading a file
+                    // during update_file triggers an access event, creating a feedback
+                    // loop.
+                    //
+                    // Skip Modify(Metadata(...)) events that don't imply content
+                    // changes: AccessTime, Permissions, Ownership, Extended.
+                    // The biome-lint case is the canonical reproducer — running
+                    // `biome check` opens every TS file for read, which on Linux
+                    // (and on macOS in some configurations) updates atime and fires
+                    // notify `Modify(Metadata(AccessTime))` events. Without this
+                    // filter, every read-only lint pass invalidates the entire
+                    // symbol cache, search index, and semantic index — completely
+                    // unnecessary work.
+                    //
+                    // We KEEP `Modify(Metadata(WriteTime))` because mtime change
+                    // does indicate a real content modification on every supported
+                    // platform. We KEEP `Modify(Metadata(Any))` and
+                    // `Modify(Metadata(Other))` as catch-all "we can't tell what
+                    // metadata changed" cases — better to over-invalidate than to
+                    // miss a real edit.
+                    if !watcher_event_invalidates(&event.kind) {
+                        continue;
+                    }
+                    for path in event.paths {
+                        raw_paths.push(path);
+                    }
+                }
+                Err(error) => {
+                    watcher_failed = Some(error.to_string());
+                    break;
                 }
             }
         }
-        filter_watcher_raw_paths(ctx, raw_paths)
+        (filter_watcher_raw_paths(ctx, raw_paths), watcher_failed)
     }; // receiver borrow dropped here
 
+    let mut watcher_status_changed = false;
+    if let Some(error) = watcher_failed {
+        *ctx.watcher_rx().borrow_mut() = None;
+        let _ = ctx.add_degraded_reason("watcher_unavailable".to_string());
+        aft::slog_warn!("watcher unavailable: {}", error);
+        watcher_status_changed = true;
+    }
+
     let ignore_file_changed = filtered.ignore_file_changed;
-    let mut status_changed = false;
+    let mut status_changed = watcher_status_changed;
     if ignore_file_changed {
         status_changed |= refresh_corpus_after_ignore_change(ctx);
     }
@@ -1399,20 +1430,28 @@ fn drain_search_index_events(ctx: &AppContext) {
 }
 
 fn drain_semantic_index_events(ctx: &AppContext) {
-    let events = {
+    let (events, disconnected) = {
         let rx_ref = ctx.semantic_index_rx().borrow();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
 
         let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
         }
-        events
+        (events, disconnected)
     };
 
-    if events.is_empty() {
+    if events.is_empty() && !disconnected {
         return;
     }
 
@@ -1466,6 +1505,18 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 status_changed = true;
             }
         }
+    }
+
+    if disconnected && keep_receiver {
+        let _ = ctx.take_pending_semantic_index_paths();
+        let _ = ctx.take_pending_semantic_corpus_refresh();
+        *ctx.semantic_index().borrow_mut() = None;
+        ctx.clear_semantic_refresh_worker();
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
+            "semantic index build worker disconnected before reporting completion".to_string(),
+        );
+        keep_receiver = false;
+        status_changed = true;
     }
 
     if !keep_receiver {
@@ -1544,23 +1595,32 @@ fn drain_semantic_index_events(ctx: &AppContext) {
 }
 
 fn drain_semantic_refresh_events(ctx: &AppContext) {
-    let events = {
+    let (events, disconnected) = {
         let rx_ref = ctx.semantic_refresh_event_rx().borrow();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
 
         let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
         }
-        events
+        (events, disconnected)
     };
 
-    if events.is_empty() {
+    if events.is_empty() && !disconnected {
         return;
     }
 
+    let had_events = !events.is_empty();
     let mut status_changed = false;
     let mut replay_refresh_paths = Vec::new();
     for event in events {
@@ -1678,6 +1738,26 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
         }
     }
 
+    if disconnected {
+        ctx.clear_semantic_refresh_worker();
+        let refreshing_paths = {
+            let status = ctx.semantic_index_status().borrow();
+            match &*status {
+                SemanticIndexStatus::Ready { refreshing } => refreshing.clone(),
+                _ => Vec::new(),
+            }
+        };
+        if !refreshing_paths.is_empty() {
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            for path in &refreshing_paths {
+                status.cancel_refreshing_file(path);
+            }
+        }
+        if !refreshing_paths.is_empty() || had_events {
+            status_changed = true;
+        }
+    }
+
     if !replay_refresh_paths.is_empty() {
         {
             let mut status = ctx.semantic_index_status().borrow_mut();
@@ -1765,14 +1845,14 @@ fn drain_lsp_events(ctx: &AppContext) {
 #[cfg(test)]
 mod watcher_filter_tests {
     use super::{
-        dispatch_panic_response, drain_configure_warning_events, drain_semantic_refresh_events,
-        drain_watcher_events, filter_watcher_raw_paths, watcher_event_invalidates,
-        write_push_frame_or_request_shutdown,
+        dispatch_panic_response, drain_configure_warning_events, drain_semantic_index_events,
+        drain_semantic_refresh_events, drain_watcher_events, filter_watcher_raw_paths,
+        watcher_event_invalidates, write_push_frame_or_request_shutdown,
     };
     use aft::config::Config;
     use aft::context::{
-        AppContext, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
-        SemanticRefreshWorkerSlot,
+        AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
+        SemanticRefreshRequest, SemanticRefreshWorkerSlot,
     };
     use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
     use aft::lsp::registry::ServerKind;
@@ -2167,6 +2247,90 @@ mod watcher_filter_tests {
 
         assert!(changed.ignore_file_changed);
         assert!(changed.changed.is_empty());
+    }
+
+    #[test]
+    fn shared_git_info_exclude_requests_corpus_refresh_without_indexing_external_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let common = TempDir::new().unwrap();
+        let git_info = common.path().join("info");
+        std::fs::create_dir_all(&git_info).unwrap();
+        let exclude = git_info.join("exclude");
+        std::fs::write(&exclude, "ignored/\n").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        ctx.set_cache_role(false, Some(common.path().to_path_buf()));
+        let changed = filter_watcher_raw_paths(&ctx, vec![exclude]);
+
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.is_empty());
+    }
+
+    #[test]
+    fn semantic_index_disconnect_without_terminal_event_marks_failed() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = make_ctx_with_root(&root);
+        let (tx, rx) = crossbeam_channel::unbounded::<SemanticIndexEvent>();
+        *ctx.semantic_index_rx().borrow_mut() = Some(rx);
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+            stage: "embedding".into(),
+            files: Some(1),
+            entries_done: Some(0),
+            entries_total: Some(1),
+        };
+        drop(tx);
+
+        drain_semantic_index_events(&ctx);
+
+        assert!(ctx.semantic_index_rx().borrow().is_none());
+        assert!(matches!(
+            &*ctx.semantic_index_status().borrow(),
+            SemanticIndexStatus::Failed(message)
+                if message.contains("disconnected before reporting completion")
+        ));
+    }
+
+    #[test]
+    fn semantic_refresh_disconnect_after_started_cancels_refreshing_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let ctx = make_ctx_with_root(&root);
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+        event_tx
+            .send(SemanticRefreshEvent::Started {
+                paths: vec![file.clone()],
+            })
+            .unwrap();
+        drop(event_tx);
+
+        drain_semantic_refresh_events(&ctx);
+
+        assert!(ctx.semantic_refresh_event_rx().borrow().is_none());
+        assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 0);
+    }
+
+    #[test]
+    fn watcher_error_clears_receiver_and_marks_degraded() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = make_ctx_with_root(&root);
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx
+            .send(Err(notify::Error::generic("watcher init failed")))
+            .unwrap();
+
+        drain_watcher_events(&ctx);
+
+        assert!(ctx.watcher_rx().borrow().is_none());
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&"watcher_unavailable".to_string()));
     }
 
     #[test]

@@ -47,22 +47,49 @@ fn resolve_home_dir() -> Option<PathBuf> {
 
 fn create_project_watcher(
     root_path: PathBuf,
+    extra_watch_paths: Vec<PathBuf>,
     tx: mpsc::Sender<notify::Result<notify::Event>>,
 ) -> notify::Result<notify::RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(tx)?;
     watcher.watch(&root_path, RecursiveMode::Recursive)?;
+    for path in extra_watch_paths {
+        if path.exists() {
+            watcher.watch(&path, RecursiveMode::NonRecursive)?;
+        }
+    }
     Ok(watcher)
+}
+
+fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
+        if global_ignore.is_file() {
+            paths.push(global_ignore);
+        }
+    }
+    let info_exclude = ctx
+        .git_common_dir()
+        .unwrap_or_else(|| root_path.join(".git"))
+        .join("info")
+        .join("exclude");
+    if info_exclude.is_file() {
+        paths.push(info_exclude);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn install_project_watcher_with<W, E, F>(
     ctx: &AppContext,
     root_path: &Path,
+    extra_watch_paths: Vec<PathBuf>,
     attach: F,
 ) -> thread::JoinHandle<()>
 where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
         + Send
         + 'static,
 {
@@ -79,21 +106,26 @@ where
     let root_path = root_path.to_path_buf();
     let session_id_for_bg = log_ctx::current_session();
     thread::spawn(move || {
-        log_ctx::with_session(session_id_for_bg, || match attach(root_path.clone(), tx) {
-            Ok(_watcher) => {
-                if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                    slog_info!("watcher started: {}", root_path.display());
+        log_ctx::with_session(session_id_for_bg, || {
+            match attach(root_path.clone(), extra_watch_paths, tx.clone()) {
+                Ok(_watcher) => {
+                    if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
+                        slog_info!("watcher started: {}", root_path.display());
+                    }
+                    while WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
+                        thread::sleep(Duration::from_millis(50));
+                    }
                 }
-                while WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                    thread::sleep(Duration::from_millis(50));
-                }
-            }
-            Err(error) => {
-                if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
-                    log::debug!(
-                        "watcher init failed: {} — callers will work with stale data",
-                        error
-                    );
+                Err(error) => {
+                    if WATCHER_GENERATION.load(Ordering::SeqCst) == generation {
+                        log::debug!(
+                            "watcher init failed: {} — callers will work with stale data",
+                            error
+                        );
+                        let _ = tx.send(Err(notify::Error::generic(&format!(
+                            "watcher init failed: {error}"
+                        ))));
+                    }
                 }
             }
         });
@@ -101,7 +133,8 @@ where
 }
 
 fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
-    let _ = install_project_watcher_with(ctx, root_path, create_project_watcher);
+    let extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
+    let _ = install_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
 }
 
 /// Backoff for build-level retries when the embedding backend is unreachable.
@@ -2409,8 +2442,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        install_project_watcher_with, parse_lsp_paths_extra, parse_semantic_config,
-        semantic_build_retry_backoff, validate_storage_dir, WATCHER_GENERATION,
+        external_ignore_watch_paths, install_project_watcher_with, parse_lsp_paths_extra,
+        parse_semantic_config, semantic_build_retry_backoff, validate_storage_dir,
+        WATCHER_GENERATION,
     };
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -2987,11 +3021,16 @@ mod tests {
         let attach_started_for_thread = Arc::clone(&attach_started);
 
         let started = Instant::now();
-        let handle = install_project_watcher_with(&ctx, root.path(), move |_root, _tx| {
-            attach_started_for_thread.wait();
-            std::thread::sleep(Duration::from_millis(250));
-            Ok::<(), &'static str>(())
-        });
+        let handle = install_project_watcher_with(
+            &ctx,
+            root.path(),
+            Vec::new(),
+            move |_root, _extra_watch_paths, _tx| {
+                attach_started_for_thread.wait();
+                std::thread::sleep(Duration::from_millis(250));
+                Ok::<(), &'static str>(())
+            },
+        );
 
         assert!(
             started.elapsed() < Duration::from_millis(100),
@@ -3003,6 +3042,55 @@ mod tests {
         attach_started.wait();
         WATCHER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn watcher_attach_failure_reports_error_on_receiver() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+
+        let handle = install_project_watcher_with(
+            &ctx,
+            root.path(),
+            Vec::new(),
+            |_root, _extra_watch_paths, _tx| Err::<(), _>("no watcher backend"),
+        );
+
+        let event = ctx
+            .watcher_rx()
+            .borrow()
+            .as_ref()
+            .expect("watcher receiver installed")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("watcher error event");
+        assert!(event
+            .unwrap_err()
+            .to_string()
+            .contains("no watcher backend"));
+        WATCHER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn external_ignore_watch_paths_includes_git_common_info_exclude() {
+        let root = tempfile::tempdir().unwrap();
+        let common = tempfile::tempdir().unwrap();
+        let info = common.path().join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        std::fs::write(
+            &exclude,
+            "ignored/
+",
+        )
+        .unwrap();
+
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.set_cache_role(false, Some(common.path().to_path_buf()));
+
+        let paths = external_ignore_watch_paths(&ctx, root.path());
+
+        assert!(paths.contains(&exclude));
     }
 
     #[test]

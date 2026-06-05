@@ -1124,6 +1124,16 @@ impl AppContext {
         *self.degraded_reasons.borrow_mut() = reasons;
     }
 
+    pub fn add_degraded_reason(&self, reason: impl Into<String>) -> bool {
+        let reason = reason.into();
+        let mut reasons = self.degraded_reasons.borrow_mut();
+        if reasons.iter().any(|existing| existing == &reason) {
+            return false;
+        }
+        reasons.push(reason);
+        true
+    }
+
     /// Snapshot of current degraded-mode reasons. Order is stable
     /// (insertion order from `set_degraded_reasons`) so UI rendering and
     /// snapshot diffs are deterministic.
