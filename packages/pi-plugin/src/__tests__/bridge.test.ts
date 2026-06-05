@@ -62,6 +62,36 @@ describe("Pi BinaryBridge", () => {
     ]);
   });
 
+  test("parses final stdout frame without trailing newline when stream ends", async () => {
+    const completions: unknown[] = [];
+    bridge = new BinaryBridge(
+      "/tmp/aft-does-not-need-to-exist",
+      PROJECT_CWD,
+      {
+        timeoutMs: 5_000,
+        onBashCompletion: (completion) => {
+          completions.push(completion);
+        },
+      },
+      { harness: "pi" },
+    );
+
+    (bridge as any).onStdoutData(
+      JSON.stringify({
+        type: "bash_completed",
+        task_id: "task-final",
+        session_id: "s1",
+        status: "completed",
+        exit_code: 0,
+        command: "echo done",
+      }),
+    );
+    (bridge as any).flushStdoutBuffer();
+
+    expect(completions).toHaveLength(1);
+    expect((completions[0] as { task_id?: string }).task_id).toBe("task-final");
+  });
+
   test("routes pushed configure_warnings frames with session_id to the warning handler", async () => {
     const deliveries: unknown[] = [];
     bridge = new BinaryBridge(

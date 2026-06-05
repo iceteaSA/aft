@@ -179,18 +179,7 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   // consume removes the only pending entry → wake timer would otherwise
   // fire with empty pending (defensive skip catches that), but firing
   // the timer at all consumes the scheduler slot.
-  if (
-    state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0 &&
-    state.pendingPatternMatches.length === 0 &&
-    state.debounceTimer
-  ) {
-    clearTimeout(state.debounceTimer);
-    state.debounceTimer = null;
-    state.firstCompletionAt = null;
-    state.scheduledFireAt = null;
-    state.scheduledCompletionCount = 0;
-  }
+  clearWakeTimerIfNoPending(state);
 }
 
 export async function markBgCompletionDelivered(
@@ -455,6 +444,7 @@ export async function appendInTurnBgCompletions(
   }
   state.pendingLongRunning = [];
   state.pendingPatternMatches = [];
+  state.retryDelayMs = null;
   state.wakeRetryAttempts = 0;
   state.wakeHardStopped = false;
   await ackCompletions(drainContext, completionAcks);
@@ -463,13 +453,7 @@ export async function appendInTurnBgCompletions(
   // build an empty-body system-reminder ("[BACKGROUND BASH STILL RUNNING]"
   // with no bullets) since the timer reads `state.pendingLongRunning`
   // again at fire time.
-  if (state.debounceTimer) {
-    clearTimeout(state.debounceTimer);
-    state.debounceTimer = null;
-    state.firstCompletionAt = null;
-    state.scheduledFireAt = null;
-    state.scheduledCompletionCount = 0;
-  }
+  clearWakeTimerIfNoPending(state);
 }
 
 export async function handleIdleBgCompletions(
@@ -848,17 +832,20 @@ function wakeEligibleCompletions(
 
 function clearWakeTimerIfNoPending(state: SessionBgState): void {
   if (
-    state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0 &&
-    state.pendingPatternMatches.length === 0 &&
-    state.debounceTimer
+    state.pendingCompletions.length > 0 ||
+    state.pendingLongRunning.length > 0 ||
+    state.pendingPatternMatches.length > 0
   ) {
-    clearTimeout(state.debounceTimer);
-    state.debounceTimer = null;
-    state.firstCompletionAt = null;
-    state.scheduledFireAt = null;
-    state.scheduledCompletionCount = 0;
+    return;
   }
+  if (state.debounceTimer) clearTimeout(state.debounceTimer);
+  state.debounceTimer = null;
+  state.firstCompletionAt = null;
+  state.scheduledFireAt = null;
+  state.scheduledCompletionCount = 0;
+  state.retryDelayMs = null;
+  state.wakeRetryAttempts = 0;
+  state.wakeHardStopped = false;
 }
 
 function scheduleWake(

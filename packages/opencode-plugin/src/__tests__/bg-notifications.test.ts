@@ -154,6 +154,7 @@ afterAll(() => {
 import {
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
+  consumeBgCompletion,
   formatPatternMatchReminder,
   formatSystemReminder,
   handleIdleBgCompletions,
@@ -554,6 +555,24 @@ describe("OpenCode background notifications", () => {
     expect(state?.pendingCompletions).toHaveLength(0);
     expect(state?.pendingPatternMatches).toHaveLength(1);
     expect(state?.pendingPatternMatches[0]?.reason).toBe("task_exit");
+  });
+
+  test("emptying pending queues resets wake hard-stop retry state", () => {
+    trackBgTask("s1", "task-1");
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    const state = sessionBgStates.get("s1");
+    expect(state?.pendingCompletions).toHaveLength(1);
+    if (!state) throw new Error("missing state");
+    state.retryDelayMs = 1000;
+    state.wakeRetryAttempts = 5;
+    state.wakeHardStopped = true;
+
+    consumeBgCompletion("s1", "task-1");
+
+    expect(state.pendingCompletions).toHaveLength(0);
+    expect(state.retryDelayMs).toBeNull();
+    expect(state.wakeRetryAttempts).toBe(0);
+    expect(state.wakeHardStopped).toBe(false);
   });
 
   test("markExplicitControl retroactively converts already-pending completion to pattern match", () => {

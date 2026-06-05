@@ -510,6 +510,22 @@ describe("bash_status tool", () => {
     );
   });
 
+  test("async bash_watch registration does not add synthetic outstanding task", async () => {
+    __resetBgNotificationStateForTests();
+    const { watchTool } = makeCtx((cmd) =>
+      cmd === "bash_notify"
+        ? { success: true, watch_id: "watch-1" }
+        : { success: true, status: "completed", exit_code: 0 },
+    );
+
+    await watchTool.execute(
+      { taskId: "bash-finished", pattern: "READY", background: true },
+      createMockSdkContext({ sessionID: "s-watch" }),
+    );
+
+    expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
+  });
+
   test("returns running status with anti-polling reminder, no output preview", async () => {
     const { statusTool } = makeCtx((_cmd, _params) => ({
       success: true,

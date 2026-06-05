@@ -96,7 +96,6 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           if (code === "too_many_watches") throw new Error(`invalid_request: ${message}`);
           throw new Error(`${code}: ${message}`);
         }
-        markExplicitControl(context.sessionID, taskId);
         const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
           .metadata;
         metadata?.({ taskId, registered: true, watchId: registered.watch_id });

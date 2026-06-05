@@ -15,6 +15,7 @@ import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
+import { __resetBgNotificationStateForTests, sessionBgStates } from "../bg-notifications.js";
 import { registerBashTool } from "../tools/bash.js";
 import type { PluginContext } from "../types.js";
 
@@ -293,6 +294,31 @@ describe("bash tool adapter", () => {
       expect(call[2].keepBridgeOnTimeout).toBe(true);
       expect(call[2].transportTimeoutMs).toBe(30_000);
     }
+  });
+
+  test("async bash_watch registration does not add synthetic outstanding task", async () => {
+    __resetBgNotificationStateForTests();
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const bridge = {
+      send: async (command: string) =>
+        command === "bash_notify"
+          ? { success: true, watch_id: "watch-1" }
+          : { success: true, status: "completed", exit_code: 0 },
+    } as unknown as BinaryBridge;
+    registerBashTool(api, makeMockContext(bridge));
+
+    await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-finished", pattern: "READY", background: true },
+        undefined,
+        undefined,
+        { cwd: "/test", sessionManager: { getSessionId: () => "s-watch" } },
+      );
+
+    expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
   });
 
   test("BashSpawnHook modifies command before bridge call", async () => {

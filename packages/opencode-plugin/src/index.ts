@@ -97,6 +97,7 @@ type BashLongRunningPayload = {
 
 type BridgePendingState = {
   hasPendingRequests(): boolean;
+  getCwd(): string;
 };
 
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
@@ -512,11 +513,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         delivery: projectConfig.configure_warnings_delivery ?? "toast",
       });
     },
-    onBashCompletion: (completion) => {
-      // Prefer the cached session directory; fall back to plugin-init cwd
-      // when we haven't seen this session yet (e.g. completion arriving
-      // before any tool call has populated the cache).
-      const sessionDir = getSessionDirectoryCached(completion.session_id) ?? input.directory;
+    onBashCompletion: (completion, bridge) => {
+      // Use the callback bridge's project root: the pushed completion originated
+      // from that bridge, so draining/acking against a session-dir cache fallback
+      // can target the wrong project on cold/stale cache.
+      const sessionDir = bridge.getCwd();
       void handlePushedBgCompletion(
         {
           ctx,
@@ -532,8 +533,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         completion,
       );
     },
-    onBashLongRunning: (reminder) => {
-      const sessionDir = getSessionDirectoryCached(reminder.session_id) ?? input.directory;
+    onBashLongRunning: (reminder, bridge) => {
+      const sessionDir = bridge.getCwd();
       void handlePushedBgLongRunning(
         {
           ctx,
@@ -547,8 +548,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         reminder,
       );
     },
-    onBashPatternMatch: (frame) => {
-      const sessionDir = getSessionDirectoryCached(frame.session_id) ?? input.directory;
+    onBashPatternMatch: (frame, bridge) => {
+      const sessionDir = bridge.getCwd();
       void handlePushedPatternMatch(
         {
           ctx,

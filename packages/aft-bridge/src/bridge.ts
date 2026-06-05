@@ -447,6 +447,11 @@ export class BinaryBridge {
     return this.pending.size > 0;
   }
 
+  /** Project root this bridge was spawned/configured for. */
+  getCwd(): string {
+    return this.cwd;
+  }
+
   /** Returns the latest pushed or primed status snapshot, or null before the cold path completes. */
   getCachedStatus(): StatusSnapshot | null {
     return this.cachedStatus;
@@ -1013,6 +1018,7 @@ export class BinaryBridge {
     child.stdout?.on("end", () => {
       const remaining = stdoutDecoder.end();
       if (remaining) this.onStdoutData(remaining);
+      this.flushStdoutBuffer();
     });
 
     const stderrDecoder = new StringDecoder("utf8");
@@ -1034,6 +1040,7 @@ export class BinaryBridge {
     child.on("exit", (code, signal) => {
       if (this.process !== currentChild) return;
       if (this._shuttingDown) return;
+      this.flushStdoutBuffer();
       this.logVia(`Process exited: code=${code}, signal=${signal}`);
       // External termination signals (SIGTERM/SIGKILL/SIGHUP/SIGINT) are almost
       // always intentional kills — from our own shutdown path, OpenCode tearing
@@ -1124,72 +1131,83 @@ export class BinaryBridge {
 
       if (!line) continue;
 
-      try {
-        const response = JSON.parse(line) as Record<string, unknown>;
-        this.lastChildActivityAt = Date.now();
-        if (response.type === "progress") {
-          const requestId = response.request_id as string | undefined;
-          const entry = requestId ? this.pending.get(requestId) : undefined;
-          const kind = response.kind === "stderr" ? "stderr" : "stdout";
-          const text = typeof response.chunk === "string" ? response.chunk : "";
-          entry?.onProgress?.({ kind, text });
-          continue;
-        }
-        if (response.type === "permission_ask") {
-          const requestId = response.request_id as string | undefined;
-          const entry = requestId ? this.pending.get(requestId) : undefined;
-          if (requestId && entry) {
-            this.pending.delete(requestId);
-            clearTimeout(entry.timer);
-            entry.resolve({
-              success: false,
-              code: "permission_required",
-              message: "bash command requires permission",
-              asks: response.asks,
-            });
-          }
-          continue;
-        }
-        if (response.type === "bash_completed") {
-          this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
-          continue;
-        }
-        if (response.type === "bash_long_running") {
-          this.onBashLongRunning?.(response as unknown as BashLongRunningPayload, this);
-          continue;
-        }
-        if (response.type === "bash_pattern_match") {
-          this.onBashPatternMatch?.(response as unknown as BashPatternMatchFrame, this);
-          continue;
-        }
-        if (response.type === "configure_warnings") {
-          this.handleConfigureWarningsFrame(response).catch((err) => {
-            this.warnVia(
-              `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-          continue;
-        }
-        if (response.type === "status_changed") {
-          this.handleStatusChangedFrame(response);
-          continue;
-        }
-        const id = response.id as string | undefined;
-        if (id && this.pending.has(id)) {
-          const entry = this.pending.get(id);
-          if (!entry) continue;
-          this.pending.delete(id);
-          clearTimeout(entry.timer);
-          this.consecutiveRequestTimeouts = 0;
-          this.scheduleRestartCountReset();
-          this.captureStatusBar(response);
-          entry.resolve(response);
-        } else if (typeof response.type === "string") {
-          this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
-        }
-      } catch (_err) {
-        this.warnVia(`Failed to parse stdout line: ${line}`);
+      this.processStdoutLine(line);
+    }
+  }
+
+  private flushStdoutBuffer(): void {
+    const line = this.stdoutBuffer.trim();
+    this.stdoutBuffer = "";
+    if (!line) return;
+    this.processStdoutLine(line);
+  }
+
+  private processStdoutLine(line: string): void {
+    try {
+      const response = JSON.parse(line) as Record<string, unknown>;
+      this.lastChildActivityAt = Date.now();
+      if (response.type === "progress") {
+        const requestId = response.request_id as string | undefined;
+        const entry = requestId ? this.pending.get(requestId) : undefined;
+        const kind = response.kind === "stderr" ? "stderr" : "stdout";
+        const text = typeof response.chunk === "string" ? response.chunk : "";
+        entry?.onProgress?.({ kind, text });
+        return;
       }
+      if (response.type === "permission_ask") {
+        const requestId = response.request_id as string | undefined;
+        const entry = requestId ? this.pending.get(requestId) : undefined;
+        if (requestId && entry) {
+          this.pending.delete(requestId);
+          clearTimeout(entry.timer);
+          entry.resolve({
+            success: false,
+            code: "permission_required",
+            message: "bash command requires permission",
+            asks: response.asks,
+          });
+        }
+        return;
+      }
+      if (response.type === "bash_completed") {
+        this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
+        return;
+      }
+      if (response.type === "bash_long_running") {
+        this.onBashLongRunning?.(response as unknown as BashLongRunningPayload, this);
+        return;
+      }
+      if (response.type === "bash_pattern_match") {
+        this.onBashPatternMatch?.(response as unknown as BashPatternMatchFrame, this);
+        return;
+      }
+      if (response.type === "configure_warnings") {
+        this.handleConfigureWarningsFrame(response).catch((err) => {
+          this.warnVia(
+            `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+        return;
+      }
+      if (response.type === "status_changed") {
+        this.handleStatusChangedFrame(response);
+        return;
+      }
+      const id = response.id as string | undefined;
+      if (id && this.pending.has(id)) {
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        this.pending.delete(id);
+        clearTimeout(entry.timer);
+        this.consecutiveRequestTimeouts = 0;
+        this.scheduleRestartCountReset();
+        this.captureStatusBar(response);
+        entry.resolve(response);
+      } else if (typeof response.type === "string") {
+        this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
+      }
+    } catch (_err) {
+      this.warnVia(`Failed to parse stdout line: ${line}`);
     }
   }
 

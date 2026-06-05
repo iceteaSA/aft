@@ -573,7 +573,6 @@ export function createBashWatchTool(ctx: PluginContext) {
           const message = String(registered.message ?? "bash_notify failed");
           throw new Error(`${String(registered.code ?? "invalid_request")}: ${message}`);
         }
-        markExplicitControl(sessionId, params.task_id);
         const watchDetails = { registered: true, watchId: registered.watch_id } as BashWatchDetails;
         return textResult(
           `Watch registered: ${registered.watch_id} on task ${params.task_id}\nA notification will fire when the pattern matches or the task exits.`,
