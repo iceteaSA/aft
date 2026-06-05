@@ -382,6 +382,22 @@ struct ProjectIndex<'a> {
     project_root: PathBuf,
     files: HashMap<String, DbFileIndex>,
     caller_data: HashMap<String, &'a FileCallData>,
+    /// Lazily-built `crate_name -> src prefix` map for Rust workspace resolution.
+    /// Built once (whole-tree walk) on first qualified-ref resolution and reused,
+    /// instead of re-walking the project per ref. Skipped entirely when no Rust
+    /// workspace ref is resolved (e.g. warm query path with no Rust changes).
+    workspace_crate_prefixes: std::sync::OnceLock<HashMap<String, String>>,
+}
+
+impl ProjectIndex<'_> {
+    /// Resolve a crate name to its `src` prefix, building the workspace map on
+    /// first use. The map walks the project tree exactly once per index.
+    fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
+        self.workspace_crate_prefixes
+            .get_or_init(|| build_workspace_crate_prefixes(&self.project_root))
+            .get(crate_name)
+            .cloned()
+    }
 }
 
 impl CallGraphStore {
@@ -582,25 +598,41 @@ impl CallGraphStore {
 
     pub fn cold_build(&self, files: &[PathBuf]) -> Result<ColdBuildStats> {
         let started = Instant::now();
+        let bench = std::env::var("AFT_BENCH_COLD").is_ok();
+        macro_rules! phase {
+            ($label:expr, $t:expr) => {
+                if bench {
+                    eprintln!("  cold_build[{}]: {} ms", $label, $t.elapsed().as_millis());
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+            };
+        }
         let files = normalize_file_list(&self.project_root, files)?;
+        let t = Instant::now();
         let build = build_extracts_parallel(&self.project_root, &files);
+        phase!("extract_parallel", t);
         let extracts = build.extracts;
         let failures = build.failures;
         let node_count = extracts.iter().map(|extract| extract.nodes.len()).sum();
 
+        let t = Instant::now();
         let index = ProjectIndex::from_extracts(&self.project_root, &extracts);
+        phase!("build_index", t);
+        let t = Instant::now();
         let mut resolved_refs = Vec::new();
         for extract in &extracts {
             for raw_ref in &extract.raw_refs {
                 resolved_refs.push(resolve_ref(raw_ref.clone(), &index)?);
             }
         }
+        phase!("resolve_refs", t);
         let ref_count = resolved_refs.len();
         let edge_count = resolved_refs
             .iter()
             .filter(|item| item.edge.is_some())
             .count();
 
+        let t = Instant::now();
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let tx = conn.transaction()?;
         clear_tables(&tx)?;
@@ -625,6 +657,7 @@ impl CallGraphStore {
         }
         set_meta_ready(&tx, true)?;
         tx.commit()?;
+        phase!("sqlite_insert", t);
 
         Ok(ColdBuildStats {
             files: extracts.len(),
@@ -2747,7 +2780,7 @@ fn rust_target_for_use(
 
 fn rust_workspace_file_for_segments(index: &ProjectIndex<'_>, segments: &[&str]) -> Option<String> {
     let crate_name = segments.first().copied()?;
-    let src_prefix = rust_workspace_src_prefix(&index.project_root, crate_name)?;
+    let src_prefix = index.crate_src_prefix(crate_name)?;
     let module_segments = segments[1..]
         .iter()
         .map(|segment| segment.to_string())
@@ -2755,7 +2788,12 @@ fn rust_workspace_file_for_segments(index: &ProjectIndex<'_>, segments: &[&str])
     rust_file_for_src_prefix(index, &src_prefix, &module_segments)
 }
 
-fn rust_workspace_src_prefix(project_root: &Path, crate_name: &str) -> Option<String> {
+/// Walk the project tree once and map every Rust crate name (package name with
+/// `-` normalized to `_`, plus any explicit `[lib] name`) to its `src` prefix.
+/// Replaces the previous per-ref tree walk: resolving 600k+ qualified refs no
+/// longer re-walks the filesystem once per ref.
+fn build_workspace_crate_prefixes(project_root: &Path) -> HashMap<String, String> {
+    let mut prefixes = HashMap::new();
     let mut stack = vec![project_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
@@ -2763,9 +2801,16 @@ fn rust_workspace_src_prefix(project_root: &Path, crate_name: &str) -> Option<St
             continue;
         }
         let manifest = dir.join("Cargo.toml");
-        if manifest.is_file() && rust_manifest_defines_crate(&manifest, crate_name) {
-            let src = dir.join("src");
-            return Some(relative_path(project_root, &canonicalize_path(&src)));
+        if manifest.is_file() {
+            let crate_names = rust_manifest_crate_names(&manifest);
+            if !crate_names.is_empty() {
+                let src_prefix = relative_path(project_root, &canonicalize_path(&dir.join("src")));
+                for crate_name in crate_names {
+                    prefixes
+                        .entry(crate_name)
+                        .or_insert_with(|| src_prefix.clone());
+                }
+            }
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -2777,12 +2822,15 @@ fn rust_workspace_src_prefix(project_root: &Path, crate_name: &str) -> Option<St
             }
         }
     }
-    None
+    prefixes
 }
 
-fn rust_manifest_defines_crate(manifest: &Path, crate_name: &str) -> bool {
+/// Extract the crate names a manifest defines: the normalized package name
+/// (`-` -> `_`) and any explicit `[lib] name`. Returns both so a crate is
+/// reachable by either spelling, matching the previous match semantics.
+fn rust_manifest_crate_names(manifest: &Path) -> Vec<String> {
     let Ok(source) = std::fs::read_to_string(manifest) else {
-        return false;
+        return Vec::new();
     };
     let mut in_lib = false;
     let mut package_name = None;
@@ -2804,11 +2852,17 @@ fn rust_manifest_defines_crate(manifest: &Path, crate_name: &str) -> bool {
             package_name = Some(value.to_string());
         }
     }
-    lib_name.as_deref() == Some(crate_name)
-        || package_name
-            .as_deref()
-            .map(|name| name.replace('-', "_") == crate_name)
-            .unwrap_or(false)
+    let mut names = Vec::new();
+    if let Some(lib) = lib_name {
+        names.push(lib);
+    }
+    if let Some(package) = package_name {
+        let normalized = package.replace('-', "_");
+        if !names.contains(&normalized) {
+            names.push(normalized);
+        }
+    }
+    names
 }
 
 fn rust_resolve_segments(caller_file: &str, segments: &[&str]) -> Option<Vec<String>> {
@@ -2929,6 +2983,7 @@ impl<'a> ProjectIndex<'a> {
             project_root: project_root.to_path_buf(),
             files,
             caller_data,
+            workspace_crate_prefixes: std::sync::OnceLock::new(),
         }
     }
 
@@ -2950,6 +3005,7 @@ impl<'a> ProjectIndex<'a> {
             project_root: project_root.to_path_buf(),
             files,
             caller_data,
+            workspace_crate_prefixes: std::sync::OnceLock::new(),
         })
     }
 

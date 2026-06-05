@@ -2257,6 +2257,95 @@ mod dead_code_projection_tests {
             .clone()
     }
 
+    /// Phase 3a Decision-B benchmark (cap removal). Measures, on a real large
+    /// repo, the three numbers that decide whether the `max_callgraph_files`
+    /// cap is still needed once the callgraph reparse is replaced by the store:
+    ///   (1) OLD snapshot build  = `build_tier2_callgraph_snapshot` full reparse
+    ///   (2) NEW snapshot build  = store cold_build + `project_dead_code_snapshot`
+    ///   (3) REMAINING cold cost = `run_dead_code_scan` given a ready snapshot
+    ///       (the par_iter scan + per-file reexport/type-ref reparse + BFS roll-up
+    ///        that the cap currently suppresses entirely above 5000 files)
+    /// (1) vs (2) is the #86 headline; (3) is what determines the cap decision.
+    /// Ignored by default; run with:
+    ///   AFT_BENCH_REPO=/path/to/large/repo cargo test -p agent-file-tools --lib \
+    ///     -- --ignored --nocapture --test-threads=1 dead_code_decision_b_benchmark
+    #[test]
+    #[ignore = "manual benchmark; needs AFT_BENCH_REPO pointing at a large checkout"]
+    fn dead_code_decision_b_benchmark() {
+        let Ok(repo) = std::env::var("AFT_BENCH_REPO") else {
+            eprintln!("AFT_BENCH_REPO unset; skipping");
+            return;
+        };
+        // Each phase flushes immediately so a file-redirected run shows live progress.
+        macro_rules! mark {
+            ($($a:tt)*) => {{ eprintln!($($a)*); let _ = std::io::Write::flush(&mut std::io::stderr()); }};
+        }
+        let root = canonical_root(Path::new(&repo));
+        let files = project_files(&root);
+        mark!(
+            "\n=== Phase 3a Decision-B benchmark ===\nrepo: {}\nsource files (walk_project_files): {}\nstarted phase (2)...",
+            root.display(),
+            files.len()
+        );
+
+        // (2) NEW snapshot path: store cold_build + projection. Run FIRST — this is
+        // the new per-cold-build cost that replaces the reparse.
+        let store_dir = root.join(".aft-bench-store");
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let store = CallGraphStore::open(store_dir.clone(), root.clone()).expect("open store");
+        let t = Instant::now();
+        let cold_stats = store.cold_build(&files).expect("store cold build");
+        let store_build_ms = t.elapsed().as_millis();
+        let t = Instant::now();
+        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("projection");
+        let proj_ms = t.elapsed().as_millis();
+        mark!(
+            "(2) NEW store cold_build: {} ms ({:?}) + projection: {} ms = {} ms  (exports={}, outbound={})\nstarted phase (3)...",
+            store_build_ms, cold_stats, proj_ms, store_build_ms + proj_ms,
+            projected.exported_symbols.len(), projected.outbound_calls.len()
+        );
+
+        // (3) REMAINING cold cost: run_dead_code_scan given a ready snapshot — the
+        // par_iter scan + per-file reexport/type-ref reparse + BFS roll-up the cap
+        // currently suppresses. THIS is the Decision-B number.
+        let t = Instant::now();
+        let _result = dead_code_aggregate(&root, files.clone(), projected.clone());
+        let scan_ms = t.elapsed().as_millis();
+        mark!(
+            "(3) REMAINING run_dead_code_scan (cold, uncapped): {} ms",
+            scan_ms
+        );
+
+        // (1) OLD full-reparse build — the #86 sink, headline only. OPT-IN
+        // (AFT_BENCH_OLD=1) because it can take many minutes on large repos.
+        let old_desc = if std::env::var("AFT_BENCH_OLD").is_ok() {
+            mark!("started phase (1) OLD reparse (the slow #86 sink)...");
+            let t = Instant::now();
+            let old = build_tier2_callgraph_snapshot(&root, usize::MAX).expect("old snapshot");
+            let ms = t.elapsed().as_millis();
+            mark!(
+                "(1) OLD build_tier2 reparse: {} ms  (exports={}, outbound={})",
+                ms,
+                old.exported_symbols.len(),
+                old.outbound_calls.len()
+            );
+            format!("{}ms", ms)
+        } else {
+            mark!("(1) OLD build_tier2 reparse: SKIPPED (set AFT_BENCH_OLD=1)");
+            "skipped".to_string()
+        };
+
+        mark!(
+            "\nSUMMARY  files={}  new_build={}ms  scan_cold={}ms  NEW_total={}ms  old_reparse={}",
+            files.len(),
+            store_build_ms + proj_ms,
+            scan_ms,
+            store_build_ms + proj_ms + scan_ms,
+            old_desc
+        );
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     fn store_projected_snapshot(root: &Path, store_name: &str) -> CallgraphSnapshot {
         let store =
             CallGraphStore::open(root.join(store_name), root.to_path_buf()).expect("open store");
