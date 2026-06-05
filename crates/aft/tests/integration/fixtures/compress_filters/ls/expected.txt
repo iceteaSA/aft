@@ -1,4 +1,4 @@
-… (21 more lines)
+-rw-r--r--  1 user staff   1021 May 09 12:21 file_021.log
 -rw-r--r--  1 user staff   1022 May 09 12:22 file_022.log
 -rw-r--r--  1 user staff   1023 May 09 12:23 file_023.log
 -rw-r--r--  1 user staff   1024 May 09 12:24 file_024.log

@@ -1,4 +1,4 @@
-… (7 more lines)
+      7 ./src/file_007.rs
       8 ./src/file_008.rs
       9 ./src/file_009.rs
      10 ./src/file_010.rs

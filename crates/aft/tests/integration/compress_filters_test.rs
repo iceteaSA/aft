@@ -26,9 +26,15 @@ fn load_filter(name: &str) -> aft::compress::toml_filter::TomlFilter {
 fn run_fixture(name: &str) {
     let dir = fixture_dir(name);
     let input = fs::read_to_string(dir.join("input.txt")).expect("input.txt");
-    let expected = fs::read_to_string(dir.join("expected.txt")).expect("expected.txt");
     let filter = load_filter(name);
-    let actual = apply_filter(&filter, &input);
+    let actual = apply_filter(&filter, &input).text;
+    // Golden bless: `AFT_BLESS_FIXTURES=1 cargo test ...` rewrites the expected
+    // files from current output. Off by default; the assert path is the gate.
+    if std::env::var("AFT_BLESS_FIXTURES").is_ok() {
+        fs::write(dir.join("expected.txt"), &actual).expect("write expected.txt");
+        return;
+    }
+    let expected = fs::read_to_string(dir.join("expected.txt")).expect("expected.txt");
     assert_eq!(
         normalize_newlines(actual.trim_end()),
         normalize_newlines(expected.trim_end()),
