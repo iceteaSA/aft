@@ -502,6 +502,8 @@ pub struct AppContext {
     callgraph: RefCell<Option<CallGraph>>,
     callgraph_store: RefCell<Option<CallGraphStore>>,
     callgraph_store_force_rebuild: RefCell<bool>,
+    callgraph_store_rx: RefCell<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
+    pending_callgraph_store_paths: RefCell<BTreeSet<PathBuf>>,
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     pending_search_index_paths: RefCell<BTreeSet<PathBuf>>,
@@ -563,6 +565,36 @@ pub struct AppContext {
     status_bar_tier2: RefCell<StatusBarTier2>,
 }
 
+/// Result of requesting the persisted callgraph store for a store-backed op.
+///
+/// The five edge-query ops never block the request thread on a cold build:
+/// a genuine cold build is kicked off in the background and `Building` is
+/// returned so the agent retries, mirroring how semantic search reports a
+/// build in progress. Warm restarts open the on-disk DB synchronously, so
+/// `Building` is only ever seen during a true first cold build.
+pub enum CallgraphStoreAccess<'a> {
+    /// Store is resident and queryable.
+    Ready(RefMut<'a, CallGraphStore>),
+    /// A cold build is in flight (or was just started); retry shortly.
+    Building,
+    /// Not configured, or a read-only worktree whose store was never built.
+    Unavailable,
+    /// A store open/build check failed with a real error (DB/IO).
+    Error(CallGraphStoreError),
+}
+
+/// Inline wait window for a callgraph-store cold build before returning
+/// `Building`. Default `0` (pure-async: never block the request thread).
+/// Tests set `AFT_CALLGRAPH_BUILD_WAIT_MS` large so small fixture builds
+/// resolve to `Ready` synchronously and exercise query correctness directly.
+fn callgraph_build_wait_window() -> Duration {
+    std::env::var("AFT_CALLGRAPH_BUILD_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO)
+}
+
 impl AppContext {
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
         let bash_compress_enabled = config.experimental_bash_compress;
@@ -592,6 +624,8 @@ impl AppContext {
             callgraph: RefCell::new(None),
             callgraph_store: RefCell::new(None),
             callgraph_store_force_rebuild: RefCell::new(false),
+            callgraph_store_rx: RefCell::new(None),
+            pending_callgraph_store_paths: RefCell::new(BTreeSet::new()),
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
             pending_search_index_paths: RefCell::new(BTreeSet::new()),
@@ -1194,16 +1228,6 @@ impl AppContext {
         self.ensure_callgraph_store_with_flag(true)
     }
 
-    /// Ensure the persisted callgraph store for store-backed callgraph commands.
-    ///
-    /// Phase 2a cuts the five edge-query ops over to the store unconditionally,
-    /// so the old off-by-default substrate flag no longer gates these consumers.
-    pub fn ensure_callgraph_store_for_ops(
-        &self,
-    ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
-        self.ensure_callgraph_store_with_flag(false)
-    }
-
     fn ensure_callgraph_store_with_flag(
         &self,
         respect_config_flag: bool,
@@ -1212,12 +1236,7 @@ impl AppContext {
             return Ok(None);
         }
         if self.callgraph_store.borrow().is_none() {
-            let Some(project_root) = self.canonical_cache_root_opt().or_else(|| {
-                self.config()
-                    .project_root
-                    .clone()
-                    .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
-            }) else {
+            let Some(project_root) = self.callgraph_project_root() else {
                 return Ok(None);
             };
             let callgraph_dir = self.callgraph_store_dir();
@@ -1241,6 +1260,204 @@ impl AppContext {
         }
         let borrow = self.callgraph_store.borrow_mut();
         Ok(RefMut::filter_map(borrow, Option::as_mut).ok())
+    }
+
+    /// Resolve the project root used for the callgraph store: prefer the
+    /// canonical cache root, falling back to the configured project root.
+    fn callgraph_project_root(&self) -> Option<PathBuf> {
+        self.canonical_cache_root_opt().or_else(|| {
+            self.config()
+                .project_root
+                .clone()
+                .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+        })
+    }
+
+    /// Access the persisted callgraph store for the five store-backed edge-query
+    /// ops **without ever blocking the request thread on a cold build**.
+    ///
+    /// - Store resident          -> `Ready`.
+    /// - Warm on-disk DB present  -> opened synchronously (cheap) -> `Ready`.
+    /// - Genuine cold build needed -> kicked off in the background, returns
+    ///   `Building`; the watcher keeps the store fresh once it lands.
+    /// - Worktree without a built store, or not configured -> `Unavailable`.
+    ///
+    /// A build already in flight (`callgraph_store_rx` set) also returns
+    /// `Building` without starting a second build.
+    pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess<'_> {
+        if self.callgraph_store.borrow().is_some() {
+            let borrow = self.callgraph_store.borrow_mut();
+            return match RefMut::filter_map(borrow, Option::as_mut).ok() {
+                Some(store) => CallgraphStoreAccess::Ready(store),
+                None => CallgraphStoreAccess::Unavailable,
+            };
+        }
+
+        // A background build is already running; don't start a second one.
+        if self.callgraph_store_rx.borrow().is_some() {
+            return CallgraphStoreAccess::Building;
+        }
+
+        let Some(project_root) = self.callgraph_project_root() else {
+            return CallgraphStoreAccess::Unavailable;
+        };
+        let callgraph_dir = self.callgraph_store_dir();
+
+        // Worktree bridges are read-only: open whatever the main checkout built,
+        // never cold-build here.
+        if self.is_worktree_bridge() {
+            match CallGraphStore::open_readonly(callgraph_dir, project_root) {
+                Ok(Some(store)) => {
+                    *self.callgraph_store.borrow_mut() = Some(store);
+                    let borrow = self.callgraph_store.borrow_mut();
+                    return match RefMut::filter_map(borrow, Option::as_mut).ok() {
+                        Some(store) => CallgraphStoreAccess::Ready(store),
+                        None => CallgraphStoreAccess::Unavailable,
+                    };
+                }
+                Ok(None) | Err(_) => return CallgraphStoreAccess::Unavailable,
+            }
+        }
+
+        let force_rebuild = *self.callgraph_store_force_rebuild.borrow();
+        // Warm path: a fresh on-disk DB exists -> open synchronously (cheap, no
+        // "building" delay). Only a genuine cold build goes to the background.
+        if !force_rebuild {
+            match CallGraphStore::needs_cold_build(&callgraph_dir, &project_root) {
+                Ok(false) => match CallGraphStore::open(callgraph_dir, project_root) {
+                    Ok(store) => {
+                        *self.callgraph_store.borrow_mut() = Some(store);
+                        let borrow = self.callgraph_store.borrow_mut();
+                        return match RefMut::filter_map(borrow, Option::as_mut).ok() {
+                            Some(store) => CallgraphStoreAccess::Ready(store),
+                            None => CallgraphStoreAccess::Unavailable,
+                        };
+                    }
+                    Err(error) => return CallgraphStoreAccess::Error(error),
+                },
+                Ok(true) => {}
+                Err(error) => return CallgraphStoreAccess::Error(error),
+            }
+        }
+
+        // Cold build required: run it off the request thread and return
+        // `Building` so the agent retries (the watcher keeps the store fresh
+        // once it lands). By default this never blocks the request thread.
+        //
+        // `AFT_CALLGRAPH_BUILD_WAIT_MS` (default 0) optionally waits a bounded
+        // window inline for the build to land before returning `Building`; tests
+        // set it large so fixture builds resolve to `Ready` synchronously.
+        self.spawn_callgraph_store_cold_build(project_root, callgraph_dir, force_rebuild);
+
+        let wait = callgraph_build_wait_window();
+        if !wait.is_zero() {
+            let received = {
+                let rx_ref = self.callgraph_store_rx.borrow();
+                let Some(rx) = rx_ref.as_ref() else {
+                    return CallgraphStoreAccess::Building;
+                };
+                rx.recv_timeout(wait)
+            };
+            match received {
+                Ok(store) => {
+                    // Replay any source files the watcher saw during the wait so
+                    // the installed store reflects mid-build edits (mirrors the
+                    // drain install path). Empty in the common case.
+                    let pending = self.take_pending_callgraph_store_paths();
+                    if !pending.is_empty() {
+                        if let Err(error) = store.refresh_files(&pending) {
+                            crate::slog_warn!(
+                                "callgraph store inline post-build refresh failed: {}",
+                                error
+                            );
+                            let _ = store.mark_files_stale(&pending);
+                        }
+                    }
+                    *self.callgraph_store.borrow_mut() = Some(store);
+                    *self.callgraph_store_rx.borrow_mut() = None;
+                    let borrow = self.callgraph_store.borrow_mut();
+                    return match RefMut::filter_map(borrow, Option::as_mut).ok() {
+                        Some(store) => CallgraphStoreAccess::Ready(store),
+                        None => CallgraphStoreAccess::Unavailable,
+                    };
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    // Build failed before sending; clear the receiver so a later
+                    // op restarts the build instead of waiting on a dead channel.
+                    *self.callgraph_store_rx.borrow_mut() = None;
+                }
+            }
+        }
+        CallgraphStoreAccess::Building
+    }
+
+    /// Spawn a background thread that cold-builds the callgraph store and sends
+    /// the finished store over `callgraph_store_rx`. The main loop installs it
+    /// via `drain_callgraph_store_events`. Mirrors the search-index build
+    /// lifecycle (channel + drain).
+    fn spawn_callgraph_store_cold_build(
+        &self,
+        project_root: PathBuf,
+        callgraph_dir: PathBuf,
+        force_rebuild: bool,
+    ) {
+        if force_rebuild {
+            // Consume the force flag now so a follow-up request doesn't queue a
+            // second forced build while this one is in flight.
+            self.take_callgraph_store_force_rebuild();
+        }
+        let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStore>();
+        *self.callgraph_store_rx.borrow_mut() = Some(rx);
+        let session_id = crate::log_ctx::current_session();
+        std::thread::spawn(move || {
+            crate::log_ctx::with_session(session_id, || {
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let built = if force_rebuild {
+                    CallGraphStore::cold_build_with_lease(callgraph_dir, project_root, &files)
+                        .map(|(store, _)| store)
+                } else {
+                    CallGraphStore::ensure_built_with_lease(callgraph_dir, project_root, &files)
+                        .map(|(store, _)| store)
+                };
+                match built {
+                    Ok(store) => {
+                        let _ = tx.send(store);
+                    }
+                    Err(error) => {
+                        crate::slog_warn!("callgraph store cold build failed: {}", error);
+                        // Dropping tx disconnects the channel; the drain clears
+                        // the receiver so a later op can retry the build.
+                    }
+                }
+            });
+        });
+    }
+
+    /// Access the callgraph-store background-build receiver (drained by the
+    /// main loop once the cold build completes).
+    pub fn callgraph_store_rx(
+        &self,
+    ) -> &RefCell<Option<crossbeam_channel::Receiver<CallGraphStore>>> {
+        &self.callgraph_store_rx
+    }
+
+    /// Record source-file paths that changed while a cold build was in flight,
+    /// so they can be refreshed once the freshly-built store is installed.
+    pub fn add_pending_callgraph_store_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.pending_callgraph_store_paths
+            .borrow_mut()
+            .extend(paths);
+    }
+
+    /// Take and clear the paths that changed during a background cold build.
+    pub fn take_pending_callgraph_store_paths(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.pending_callgraph_store_paths.borrow_mut())
+            .into_iter()
+            .collect()
     }
 
     /// Access the search index.
@@ -1289,6 +1506,7 @@ impl AppContext {
 
     pub fn clear_pending_index_updates(&self) {
         self.pending_search_index_paths.borrow_mut().clear();
+        self.pending_callgraph_store_paths.borrow_mut().clear();
         self.pending_semantic_index_paths.borrow_mut().clear();
         *self.pending_semantic_corpus_refresh.borrow_mut() = false;
     }

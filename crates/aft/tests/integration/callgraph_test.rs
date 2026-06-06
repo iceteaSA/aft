@@ -4,6 +4,7 @@
 //! using the fixtures in `tests/fixtures/callgraph/`.
 
 use crate::helpers::{fixture_path, AftProcess};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
@@ -2849,4 +2850,74 @@ fn callgraph_configure_rejects_non_integer_max_callgraph_files_payloads() {
 
         aft.shutdown();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Async cold-build lifecycle (A1): the five ops never block the request thread
+// on a cold build. With the inline-wait window disabled (`= 0`), the first op
+// after configure returns `callgraph_building`; the store is installed via the
+// drain loop and a subsequent op succeeds.
+// ---------------------------------------------------------------------------
+
+/// With pure-async cold build (wait window 0), the first callgraph op returns
+/// `callgraph_building`, then retries succeed once the background build lands.
+#[test]
+fn callgraph_ops_return_building_then_ready_async() {
+    // Disable the inline-wait window so the cold build is fully asynchronous.
+    let mut aft = AftProcess::spawn_with_env(&[("AFT_CALLGRAPH_BUILD_WAIT_MS", OsStr::new("0"))]);
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
+    ));
+    assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+
+    // First op kicks off the background cold build and must NOT block: it
+    // returns the transient `callgraph_building` signal.
+    let first = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
+    ));
+    assert_eq!(
+        first["success"], false,
+        "first async op should report building, not a synchronous result: {first:?}"
+    );
+    assert_eq!(
+        first["code"], "callgraph_building",
+        "first async op should report callgraph_building: {first:?}"
+    );
+
+    // Retry until the background build lands and the store is installed via the
+    // drain loop. Bounded retries so a genuine regression fails the test.
+    let mut succeeded = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let resp = aft.send(&format!(
+            r#"{{"id":"3","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
+            crate::helpers::json_string(&format!("{}/helpers.ts", root))
+        ));
+        if resp["success"] == true {
+            assert_eq!(resp["symbol"], "validate");
+            assert!(
+                resp["total_callers"].as_u64().unwrap() > 0,
+                "validate should have callers once the store is ready: {resp:?}"
+            );
+            succeeded = true;
+            break;
+        }
+        // While building, the only acceptable non-success code is the transient
+        // building signal — never a silent empty/clean result.
+        assert_eq!(
+            resp["code"], "callgraph_building",
+            "op should be either ready or building, got: {resp:?}"
+        );
+    }
+    assert!(
+        succeeded,
+        "callgraph store should finish building and serve callers within the retry window"
+    );
+
+    aft.shutdown();
 }

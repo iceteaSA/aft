@@ -2,9 +2,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::commands::callgraph_store_adapter::{
-    callers_result, store_error_response, unavailable_response,
+    building_response, callers_result, store_error_response, unavailable_response,
 };
-use crate::context::AppContext;
+use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
 use crate::{slog_info, slog_warn};
 
@@ -67,10 +67,15 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let store = match ctx.ensure_callgraph_store_for_ops() {
-        Ok(Some(store)) => store,
-        Ok(None) => return unavailable_response(&req.id, "callers", ctx.is_worktree_bridge()),
-        Err(error) => return store_error_response(&req.id, "callers", error),
+    let store = match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => store,
+        CallgraphStoreAccess::Building => return building_response(&req.id, "callers"),
+        CallgraphStoreAccess::Unavailable => {
+            return unavailable_response(&req.id, "callers", ctx.is_worktree_bridge())
+        }
+        CallgraphStoreAccess::Error(error) => {
+            return store_error_response(&req.id, "callers", error)
+        }
     };
 
     let started = Instant::now();

@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::commands::callgraph_store_adapter::{
-    ensure_symbol_resolves, store_error_response, trace_to_symbol_candidates,
+    building_response, ensure_symbol_resolves, store_error_response, trace_to_symbol_candidates,
     trace_to_symbol_result, unavailable_response,
 };
-use crate::context::AppContext;
+use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to_symbol` request.
@@ -76,12 +76,15 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
 
-    let store = match ctx.ensure_callgraph_store_for_ops() {
-        Ok(Some(store)) => store,
-        Ok(None) => {
+    let store = match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => store,
+        CallgraphStoreAccess::Building => return building_response(&req.id, "trace_to_symbol"),
+        CallgraphStoreAccess::Unavailable => {
             return unavailable_response(&req.id, "trace_to_symbol", ctx.is_worktree_bridge())
         }
-        Err(error) => return store_error_response(&req.id, "trace_to_symbol", error),
+        CallgraphStoreAccess::Error(error) => {
+            return store_error_response(&req.id, "trace_to_symbol", error)
+        }
     };
 
     if let Err(error) = ensure_symbol_resolves(&store, &file_path, symbol) {

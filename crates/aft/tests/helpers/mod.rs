@@ -77,6 +77,14 @@ impl AftProcess {
             // Integration tests often run from a linked git worktree, but their
             // fixture projects need to exercise main-checkout demand builds.
             .env("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD", "1")
+            // Callgraph store cold build is pure-async in production (returns
+            // `Building`, agent retries). Fixture projects are tiny (build in
+            // ~100ms), so default the test harness to a large inline-wait window
+            // so the first callgraph op resolves to `Ready` synchronously. A
+            // failed build disconnects the channel and returns immediately, so
+            // this never hangs. Lifecycle tests override it to "0" to exercise
+            // the real Building -> drain -> Ready path.
+            .env("AFT_CALLGRAPH_BUILD_WAIT_MS", "30000")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if pipe_stderr || diag_enabled {

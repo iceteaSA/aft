@@ -439,6 +439,17 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
     }
 }
 
+/// The persisted callgraph store is cold-building in the background. The op did
+/// not block the request thread; the agent should retry shortly. Mirrors how
+/// semantic search reports a build in progress.
+pub fn building_response(req_id: &str, operation: &str) -> Response {
+    Response::error(
+        req_id,
+        "callgraph_building",
+        format!("{operation}: callgraph store is building in the background; retry shortly"),
+    )
+}
+
 pub fn unavailable_response(req_id: &str, operation: &str, worktree: bool) -> Response {
     let message = if worktree {
         format!(

@@ -137,6 +137,7 @@ fn main() {
                 // on a channel and bails if empty.
                 drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
+                drain_callgraph_store_events(&ctx);
                 drain_semantic_index_events(&ctx);
                 drain_semantic_refresh_events(&ctx);
                 drain_inspect_events(&ctx);
@@ -172,6 +173,7 @@ fn main() {
                 // when the background-built index replaces it.
                 drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
+                drain_callgraph_store_events(&ctx);
                 drain_semantic_index_events(&ctx);
                 drain_semantic_refresh_events(&ctx);
                 drain_inspect_events(&ctx);
@@ -1207,6 +1209,13 @@ fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::
     }
     let mut store_ref = ctx.callgraph_store().borrow_mut();
     let Some(store) = store_ref.as_mut() else {
+        // Store not resident yet. If a cold build is in flight, record the
+        // changed paths so they're replayed once the freshly-built store lands
+        // (otherwise mid-build edits would be silently lost). If no build is
+        // running, there's nothing to refresh.
+        if ctx.callgraph_store_rx().borrow().is_some() {
+            ctx.add_pending_callgraph_store_paths(source_paths);
+        }
         return;
     };
     if let Err(error) = store.refresh_files(&source_paths) {
@@ -1481,6 +1490,73 @@ fn drain_search_index_events(ctx: &AppContext) {
         *ctx.search_index_rx().borrow_mut() = None;
         if disconnected && !installed_index {
             let _ = ctx.take_pending_search_index_paths();
+        }
+        status_changed = true;
+    }
+
+    if status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
+}
+
+/// Install a background-built callgraph store once its cold build completes.
+/// Mirrors `drain_search_index_events`: drains the receiver, installs the
+/// freshest store, replays paths that changed during the build, and clears the
+/// receiver. On build failure (channel disconnected with nothing installed) the
+/// receiver is cleared so a later op can retry the cold build.
+fn drain_callgraph_store_events(ctx: &AppContext) {
+    let (latest, disconnected) = {
+        let rx_ref = ctx.callgraph_store_rx().borrow();
+        let Some(rx) = rx_ref.as_ref() else {
+            return;
+        };
+
+        let mut latest = None;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(store) => latest = Some(store),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        (latest, disconnected)
+    };
+
+    let mut status_changed = false;
+    let mut installed = false;
+    if let Some(store) = latest {
+        // Replay source files that changed while the cold build was running so
+        // the freshly-installed store reflects mid-build edits.
+        let pending = ctx.take_pending_callgraph_store_paths();
+        if !pending.is_empty() {
+            if let Err(error) = store.refresh_files(&pending) {
+                aft::slog_warn!(
+                    "callgraph store post-build pending refresh failed: {}",
+                    error
+                );
+                if let Err(mark_error) = store.mark_files_stale(&pending) {
+                    aft::slog_warn!(
+                        "failed to mark callgraph store files stale after post-build refresh failure: {}",
+                        mark_error
+                    );
+                }
+            }
+        }
+        *ctx.callgraph_store().borrow_mut() = Some(store);
+        installed = true;
+        status_changed = true;
+    }
+
+    if disconnected || installed {
+        *ctx.callgraph_store_rx().borrow_mut() = None;
+        if disconnected && !installed {
+            // Build failed: discard pending paths (no store to apply them to);
+            // a later op restarts the build and re-walks the project.
+            let _ = ctx.take_pending_callgraph_store_paths();
         }
         status_changed = true;
     }

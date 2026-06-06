@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use crate::commands::callgraph_store_adapter::{
-    call_tree_result, store_error_response, unavailable_response,
+    building_response, call_tree_result, store_error_response, unavailable_response,
 };
-use crate::context::AppContext;
+use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `call_tree` request.
@@ -65,10 +65,15 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let store = match ctx.ensure_callgraph_store_for_ops() {
-        Ok(Some(store)) => store,
-        Ok(None) => return unavailable_response(&req.id, "call_tree", ctx.is_worktree_bridge()),
-        Err(error) => return store_error_response(&req.id, "call_tree", error),
+    let store = match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => store,
+        CallgraphStoreAccess::Building => return building_response(&req.id, "call_tree"),
+        CallgraphStoreAccess::Unavailable => {
+            return unavailable_response(&req.id, "call_tree", ctx.is_worktree_bridge())
+        }
+        CallgraphStoreAccess::Error(error) => {
+            return store_error_response(&req.id, "call_tree", error)
+        }
     };
 
     match call_tree_result(&store, &file_path, symbol, depth) {
