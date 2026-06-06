@@ -10,6 +10,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: true,
       bashBackgroundEnabled: true,
+      bashCompressionEnabled: true,
       disabledTools: new Set(),
     });
     expect(out).not.toBeNull();
@@ -55,6 +56,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(out).not.toBeNull();
@@ -67,12 +69,39 @@ describe("buildWorkflowHints", () => {
     expect(out).not.toContain("30 seconds");
   });
 
+  test("shows pipe guidance only when compression is enabled", () => {
+    const on = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: true,
+      disabledTools: new Set(),
+    });
+    expect(on).toContain(
+      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
+    );
+
+    const off = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      disabledTools: new Set(),
+    });
+    expect(off).not.toContain(
+      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
+    );
+  });
+
   test("omits the navigate section at tool_surface=recommended", () => {
     const out = buildWorkflowHints({
       toolSurface: "recommended",
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(out).not.toContain("Use `aft_callgraph`");
@@ -85,6 +114,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: false,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(out).toContain("`aft_grep`");
@@ -97,6 +127,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(off).not.toContain("aft_search");
@@ -106,6 +137,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: true,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(on).toContain("aft_search");
@@ -117,6 +149,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(registered).toContain("**Codebase health & diagnostics**");
@@ -127,6 +160,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       disabledTools: new Set(),
     });
     expect(minimal).not.toContain("**Codebase health & diagnostics**");
@@ -143,6 +177,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       // Disable all tools that could produce a hint section. At minimal
       // surface, aft_callgraph/grep/aft_search are already absent; disabling
       // outline+zoom kills URL+exploration sections, bash kills the timeout
@@ -160,6 +195,7 @@ describe("buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: true,
       bashBackgroundEnabled: true,
+      bashCompressionEnabled: true,
       disabledTools: new Set(["aft_callgraph", "bash_status"]),
     });
     // navigate section gated off (aft_callgraph disabled).

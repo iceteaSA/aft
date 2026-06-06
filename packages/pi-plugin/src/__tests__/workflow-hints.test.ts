@@ -10,6 +10,7 @@ describe("Pi buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: true,
       bashBackgroundEnabled: true,
+      bashCompressionEnabled: true,
       absentTools: new Set(),
     });
     expect(out).not.toBeNull();
@@ -53,9 +54,36 @@ describe("Pi buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       absentTools: new Set(),
     });
     expect(out).not.toContain("**Long-running commands**");
+  });
+
+  test("shows pipe guidance only when compression is enabled", () => {
+    const on = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: true,
+      absentTools: new Set(),
+    });
+    expect(on).toContain(
+      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
+    );
+
+    const off = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      absentTools: new Set(),
+    });
+    expect(off).not.toContain(
+      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail",
+    );
   });
 
   test("omits navigate at recommended surface", () => {
@@ -64,6 +92,7 @@ describe("Pi buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       absentTools: new Set(),
     });
     expect(out).not.toContain("Use `aft_callgraph`");
@@ -75,6 +104,7 @@ describe("Pi buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       absentTools: new Set(),
     });
     expect(registered).toContain("**Codebase health & diagnostics**");
@@ -85,6 +115,7 @@ describe("Pi buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       absentTools: new Set(),
     });
     expect(minimal).not.toContain("**Codebase health & diagnostics**");
@@ -97,6 +128,7 @@ describe("Pi buildWorkflowHints", () => {
       hoistBuiltins: true,
       semanticEnabled: false,
       bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
       absentTools: new Set(["aft_outline", "aft_zoom"]),
     });
     // null proves the parallel-tool-call frame is never emitted on its own

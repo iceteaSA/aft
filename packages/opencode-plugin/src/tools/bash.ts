@@ -1,4 +1,4 @@
-import type { BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import { type BridgeRequestOptions, maybeStripCompressorPipe } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
@@ -133,7 +133,10 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       let accumulatedOutput = "";
       const description = args.description as string | undefined;
       const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
-      const command = args.command as string;
+      const rawCommand = args.command as string;
+      const compressionEnabled = bashCfg.compress && args.compressed !== false;
+      const pipeStrip = maybeStripCompressorPipe(rawCommand, compressionEnabled);
+      const command = pipeStrip.command;
       const cwd = (args.workdir as string | undefined) ?? context.directory;
 
       // Detect whether the calling session is a subagent (has a non-empty
@@ -256,7 +259,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
             throw new Error((status.message as string | undefined) ?? "bash_status failed");
           }
           if (isTerminalStatus(status.status)) {
-            const rendered = formatForegroundResult(status);
+            const rendered = appendPipeStripNote(formatForegroundResult(status), pipeStrip.note);
             const metadataPayload = foregroundMetadata(description, status, rendered);
             metadata?.(metadataPayload);
             if (callID) {
@@ -339,9 +342,14 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       if (typeof exit === "number" && exit !== 0) {
         rendered += `\n[exit code: ${exit}]`;
       }
+      rendered = appendPipeStripNote(rendered, pipeStrip.note);
       return rendered;
     },
   };
+}
+
+function appendPipeStripNote(output: string, note: string | undefined): string {
+  return note ? `${output}\n\n${note}` : output;
 }
 
 export function createBashStatusTool(ctx: PluginContext): ToolDefinition {

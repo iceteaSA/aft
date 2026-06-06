@@ -67,6 +67,8 @@ export {
   resolveHarnessStoragePath,
   shouldShowAnnouncement,
 } from "./paths.js";
+export type { PipeStripResult } from "./pipe-strip.js";
+export { maybeStripCompressorPipe } from "./pipe-strip.js";
 // --- platform helpers ---
 export { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 export type { PoolOptions } from "./pool.js";

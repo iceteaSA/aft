@@ -4,6 +4,7 @@ import {
   type BridgeRequestOptions,
   maybeAppendConflictsHint,
   maybeAppendGrepHint,
+  maybeStripCompressorPipe,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -289,7 +290,8 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
     parameters: BashParams,
     async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const foregroundWaitMs = resolveBashConfig(ctx.config).foreground_wait_window_ms;
+      const bashCfg = resolveBashConfig(ctx.config);
+      const foregroundWaitMs = bashCfg.foreground_wait_window_ms;
       // ptyRows/ptyCols are silently ignored when pty is false so agents
       // that defensively pass them on normal bash calls don't get stuck in
       // a retry loop. pty: true silently implies background: true (Rust
@@ -318,12 +320,16 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
         }
       }
 
+      const compressionEnabled = bashCfg.compress && params.compressed !== false;
+      const pipeStrip = maybeStripCompressorPipe(spawnContext.command, compressionEnabled);
+      const bridgeCommand = pipeStrip.command;
+
       let streamed = "";
       const response = await callBashBridge(
         bridge,
         "bash",
         {
-          command: spawnContext.command,
+          command: bridgeCommand,
           timeout,
           workdir: spawnContext.cwd ?? params.workdir,
           env: spawnContext.env,
@@ -389,7 +395,10 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
           }
           if (isTerminalStatus(status.status)) {
             return bashResult(
-              withBashHints(formatForegroundResult(status), params.command, aftSearchAvailable),
+              appendPipeStripNote(
+                withBashHints(formatForegroundResult(status), bridgeCommand, aftSearchAvailable),
+                pipeStrip.note,
+              ),
               {
                 exit_code: status.exit_code as number | undefined,
                 duration_ms: status.duration_ms as number | undefined,
@@ -427,7 +436,13 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       };
 
       const output = (response.output as string | undefined) ?? "";
-      return bashResult(withBashHints(output, params.command, aftSearchAvailable), details);
+      return bashResult(
+        appendPipeStripNote(
+          withBashHints(output, bridgeCommand, aftSearchAvailable),
+          pipeStrip.note,
+        ),
+        details,
+      );
     },
     renderCall(args, theme, context) {
       return renderBashCall(args?.command, args?.description, theme, context);
@@ -447,6 +462,10 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
   pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
   pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
+}
+
+function appendPipeStripNote(output: string, note: string | undefined): string {
+  return note ? `${output}\n\n${note}` : output;
 }
 
 function formatBackgroundLaunch(taskId: string, isPty: boolean): string {

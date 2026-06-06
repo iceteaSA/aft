@@ -224,6 +224,38 @@ describe("OpenCode bash adapter", () => {
     expect(calls[0].params.env).toEqual({ FOO: "bar", TOKEN: "redacted" });
   });
 
+  test("strips compressor-handled filter pipes before bridge and appends note", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      output: "failure details",
+      exit_code: 1,
+      truncated: false,
+    }));
+
+    const output = await bash.execute({ command: "bun test | grep fail" }, createMockSdkContext());
+
+    expect(calls[0].params.command).toBe("bun test");
+    expect(output).toContain("failure details");
+    expect(output).toContain("[AFT removed `| grep fail`");
+  });
+
+  test("keeps filter pipes when compressed:false", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      output: "raw",
+      exit_code: 0,
+      truncated: false,
+    }));
+
+    const output = await bash.execute(
+      { command: "bun test | grep fail", compressed: false },
+      createMockSdkContext(),
+    );
+
+    expect(calls[0].params.command).toBe("bun test | grep fail");
+    expect(output).not.toContain("AFT removed");
+  });
+
   test("transport timeout is bounded by wait-window, not user-supplied task budget", async () => {
     // After the v0.20+ foreground-as-polled-background architecture, the
     // Rust `bash` call returns a `running` status immediately — it does NOT

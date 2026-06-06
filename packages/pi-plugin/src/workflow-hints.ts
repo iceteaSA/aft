@@ -15,6 +15,7 @@ export interface WorkflowHintsOpts {
   hoistBuiltins: boolean;
   semanticEnabled: boolean;
   bashBackgroundEnabled: boolean;
+  bashCompressionEnabled: boolean;
   /** Set of tool names KNOWN-ABSENT from the registered surface. */
   absentTools: Set<string>;
 }
@@ -38,10 +39,14 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.absentTools.has("aft_search");
   const hasNavigate = opts.toolSurface === "all" && !opts.absentTools.has("aft_callgraph");
   const hasInspect = opts.toolSurface !== "minimal" && !opts.absentTools.has("aft_inspect");
-  const hasBgBash =
-    opts.bashBackgroundEnabled &&
-    !opts.absentTools.has(bashName) &&
-    !opts.absentTools.has("bash_status");
+  const hasBash = !opts.absentTools.has(bashName);
+  const hasBgBash = opts.bashBackgroundEnabled && hasBash && !opts.absentTools.has("bash_status");
+
+  if (hasBash && opts.bashCompressionEnabled) {
+    sections.push(
+      "When AFT bash output compression is on, do NOT pipe test/build commands through grep/head/tail (e.g. `bun test | grep fail`) to summarize. The compressor already keeps failures and the summary; piping hides failures. Run the command bare.",
+    );
+  }
 
   if (hasOutline && hasZoom) {
     sections.push(
@@ -122,6 +127,7 @@ export function buildHintsFromConfig(
     hoistBuiltins,
     semanticEnabled: config.semantic_search === true,
     bashBackgroundEnabled: resolveBashConfig(config).background,
+    bashCompressionEnabled: resolveBashConfig(config).compress,
     absentTools,
   });
 }
