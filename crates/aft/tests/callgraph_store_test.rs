@@ -709,8 +709,8 @@ export function leaf() {}
         )
         .unwrap();
     conn.execute(
-        "INSERT INTO refs(ref_id, caller_node, caller_file, kind, short_name, full_ref, line, byte_start, byte_end, status, target_file, target_symbol, provenance, raw_payload)
-         VALUES('orphan-ref', ?1, 'main.ts', 'call', 'leaf', 'leaf', 1, 1, 5, 'resolved', 'main.ts', 'leaf', 'test', '{}')",
+        "INSERT INTO refs(ref_id, caller_node, caller_file, kind, short_name, full_ref, line, byte_start, byte_end, status, target_file, target_symbol, provenance)
+         VALUES('orphan-ref', ?1, 'main.ts', 'call', 'leaf', 'leaf', 1, 1, 5, 'resolved', 'main.ts', 'leaf', 'test')",
         rusqlite::params![source_node],
     )
     .unwrap();
