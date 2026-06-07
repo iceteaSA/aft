@@ -3,6 +3,7 @@
  * Both go through Rust so backups and checkpoint rollback work the same way.
  */
 
+import { coerceStringArray } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
@@ -132,9 +133,14 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         _onUpdate,
         extCtx,
       ) {
-        const files = await Promise.all(
-          params.files.map((file) => resolvePathArg(extCtx.cwd, file)),
-        );
+        // Coerce at the boundary: some hosts deliver `files` as a bare string
+        // or a JSON-stringified array despite the schema, which would crash the
+        // unchecked `.map` below before any validation runs.
+        const inputs = coerceStringArray(params.files);
+        if (inputs.length === 0) {
+          throw new Error("delete: `files` must be a non-empty array of paths");
+        }
+        const files = await Promise.all(inputs.map((file) => resolvePathArg(extCtx.cwd, file)));
         const checked = new Set<string>();
         for (const file of files) {
           if (checked.has(file)) continue;
@@ -171,7 +177,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         const summary =
           deleted.length === 1 && skipped.length === 0
             ? `Deleted ${deleted[0]}`
-            : `Deleted ${deleted.length}/${params.files.length} file(s)`;
+            : `Deleted ${deleted.length}/${inputs.length} file(s)`;
         return textResult(summary, {
           success: true,
           complete: skipped.length === 0,

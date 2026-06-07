@@ -23,6 +23,7 @@ export type {
 } from "./bridge.js";
 // --- transport ---
 export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";
+export { coerceStringArray } from "./coerce.js";
 // --- binary resolution ---
 export {
   downloadBinary,

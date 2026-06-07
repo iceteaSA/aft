@@ -11,7 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { formatEditSummary } from "@cortexkit/aft-bridge";
+import { coerceStringArray, formatEditSummary } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
@@ -1562,7 +1562,13 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
         ),
     },
     execute: async (args, context): Promise<string> => {
-      const inputs = args.files as string[];
+      // Coerce at the boundary: some hosts deliver `files` as a bare string or
+      // a JSON-stringified array despite the schema, which would crash the
+      // unchecked `.map` below before any validation runs.
+      const inputs = coerceStringArray(args.files);
+      if (inputs.length === 0) {
+        throw new Error("delete: `files` must be a non-empty array of paths");
+      }
       const recursive = args.recursive === true;
       const projectRoot = await resolveProjectRoot(ctx, context);
       const absolutePaths = inputs.map((f) => resolvePathFromProjectRoot(projectRoot, f));
