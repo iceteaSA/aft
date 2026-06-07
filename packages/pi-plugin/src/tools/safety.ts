@@ -2,6 +2,7 @@
  * aft_safety — operation undo, per-file history, named checkpoints, restore, list.
  */
 
+import { coerceStringArray } from "@cortexkit/aft-bridge";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
@@ -183,9 +184,13 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       const filePath = params.filePath
         ? await resolvePathArg(extCtx.cwd, params.filePath)
         : undefined;
-      const files = params.files
-        ? await Promise.all(params.files.map((file) => resolvePathArg(extCtx.cwd, file)))
-        : undefined;
+      // Coerce at the boundary: a bare-string/JSON-stringified `files` would
+      // otherwise crash the unchecked `.map` below before validation.
+      const fileInputs = coerceStringArray(params.files);
+      const files =
+        fileInputs.length > 0
+          ? await Promise.all(fileInputs.map((file) => resolvePathArg(extCtx.cwd, file)))
+          : undefined;
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const restrictToProjectRoot = ctx.config.restrict_to_project_root ?? false;
 

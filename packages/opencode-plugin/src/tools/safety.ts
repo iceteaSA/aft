@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { coerceStringArray } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
@@ -116,11 +117,13 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         }
 
         if (op === "checkpoint") {
-          const checkpointFiles = Array.isArray(args.files)
-            ? (args.files as string[])
-            : typeof args.filePath === "string"
-              ? [args.filePath]
-              : undefined;
+          const coercedFiles = coerceStringArray(args.files);
+          const checkpointFiles =
+            coercedFiles.length > 0
+              ? coercedFiles
+              : typeof args.filePath === "string"
+                ? [args.filePath]
+                : undefined;
           if (Array.isArray(checkpointFiles)) {
             const projectRoot = await resolveProjectRoot(ctx, context);
             const uniqueParents = new Set<string>();
@@ -164,21 +167,22 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         };
         const params: Record<string, unknown> = {};
         if (args.name !== undefined) params.name = args.name;
+        const payloadFiles = coerceStringArray(args.files);
         if (op === "checkpoint") {
           // For checkpoint, Rust only knows `files`. If the agent passes
           // `filePath` (a reasonable mistake — the tool schema exposes both),
           // auto-promote it into a single-entry `files` list rather than
           // silently dropping it and falling back to the whole tracked-file
           // set.
-          if (args.files !== undefined) {
-            params.files = args.files;
+          if (payloadFiles.length > 0) {
+            params.files = payloadFiles;
           } else if (args.filePath !== undefined) {
             params.files = [args.filePath];
           }
         } else {
           // undo / history / restore / list all take `file` as-is.
           if (args.filePath !== undefined) params.file = args.filePath;
-          if (args.files !== undefined) params.files = args.files;
+          if (payloadFiles.length > 0) params.files = payloadFiles;
         }
         const response = await callBridge(ctx, context, commandMap[op], params);
         if (response.success === false) {
