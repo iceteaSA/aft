@@ -132,7 +132,24 @@ where
     })
 }
 
+/// Harness-only seam: when `AFT_TEST_DISABLE_FILE_WATCHER=1`, `configure` skips
+/// installing the OS file watcher entirely. The integration suite spawns ~600
+/// `aft` processes; under that concurrent load the macOS FSEvents `watch()` call
+/// probabilistically hangs (it never returns and never delivers events for a
+/// fraction of processes), which flaked any test waiting on watcher-driven
+/// invalidation. The vast majority of tests mutate files through AFT's own tools
+/// (which invalidate caches directly, not via the watcher), so they need no
+/// watcher at all. The test helper disables it by default; the dedicated
+/// `watcher_integration` test binary (which runs alone, with no concurrent load)
+/// opts back in. Never set in production.
+fn file_watcher_disabled_for_test() -> bool {
+    std::env::var("AFT_TEST_DISABLE_FILE_WATCHER").is_ok_and(|value| value == "1")
+}
+
 fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
+    if file_watcher_disabled_for_test() {
+        return;
+    }
     let extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
     let _ = install_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
 }

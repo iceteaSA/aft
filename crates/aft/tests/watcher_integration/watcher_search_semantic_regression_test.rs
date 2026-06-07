@@ -76,6 +76,7 @@ where
 #[cfg(debug_assertions)]
 #[test]
 fn search_pending_replay_skips_file_that_becomes_ignored() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
     let project = tempfile::tempdir().expect("create project dir");
     fs::create_dir_all(project.path().join("src")).expect("create src");
     let secret = project.path().join("src/secret.rs");
@@ -85,7 +86,7 @@ fn search_pending_replay_skips_file_that_becomes_ignored() {
     )
     .expect("write secret");
 
-    let mut aft = AftProcess::spawn_with_env(&[(
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[(
         "AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS",
         std::ffi::OsStr::new("1200"),
     )]);
@@ -167,6 +168,7 @@ fn search_pending_replay_skips_file_that_becomes_ignored() {
 
 #[test]
 fn restart_drops_search_cache_entry_after_global_gitignore_change() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
     let project = tempfile::tempdir().expect("create project dir");
     let cache = tempfile::tempdir().expect("create cache dir");
     let xdg = tempfile::tempdir().expect("create xdg dir");
@@ -192,7 +194,7 @@ fn restart_drops_search_cache_entry_after_global_gitignore_change() {
         ("HOME", home.path().as_os_str()),
     ];
 
-    let mut first = AftProcess::spawn_with_env(&envs);
+    let mut first = AftProcess::spawn_with_real_watcher_env(&envs);
     configure_search_index(&mut first, project.path());
     wait_for_ready_grep(
         &mut first,
@@ -208,7 +210,7 @@ fn restart_drops_search_cache_entry_after_global_gitignore_change() {
         .expect("create global ignore parent");
     fs::write(&global_ignore, "global_secret.rs\n").expect("write global ignore");
 
-    let mut second = AftProcess::spawn_with_env(&envs);
+    let mut second = AftProcess::spawn_with_real_watcher_env(&envs);
     configure_search_index(&mut second, project.path());
     wait_for_ready_grep(
         &mut second,
@@ -468,6 +470,7 @@ fn wait_for_semantic_result(aft: &mut AftProcess, expected_suffix: &str) -> Valu
 
 #[test]
 fn semantic_corpus_refresh_replays_file_created_while_in_flight() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
     let project = tempfile::tempdir().expect("create project dir");
     let storage = tempfile::tempdir().expect("create storage dir");
     let source = project.path().join("src/a.rs");
@@ -479,7 +482,7 @@ fn semantic_corpus_refresh_replays_file_created_while_in_flight() {
     .expect("write initial source");
 
     let server = BlockingEmbeddingServer::start();
-    let mut aft = AftProcess::spawn();
+    let mut aft = AftProcess::spawn_with_real_watcher();
     configure_semantic_openai(&mut aft, project.path(), storage.path(), &server.base_url);
     wait_for_semantic_ready(&mut aft, "initial build");
 

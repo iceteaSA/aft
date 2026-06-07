@@ -64,6 +64,33 @@ impl AftProcess {
         Self::spawn_inner(&[], true)
     }
 
+    /// Spawn the aft binary with a REAL OS file watcher installed on configure.
+    ///
+    /// The default `spawn*` constructors disable the watcher
+    /// (`AFT_TEST_DISABLE_FILE_WATCHER=1`) so the ~600 integration spawns don't
+    /// collectively swamp the macOS `fseventsd` daemon. Only tests that actually
+    /// assert watcher-driven invalidation (mutate a file *outside* AFT's tools
+    /// after configure, then expect the index/cache to update) need a real
+    /// watcher; those use this constructor. It also enables synchronous watcher
+    /// startup (`AFT_TEST_SYNC_FILE_WATCHER_START=1`) so a write right after
+    /// configure can't race an un-attached watcher.
+    pub fn spawn_with_real_watcher() -> Self {
+        Self::spawn_with_real_watcher_env(&[])
+    }
+
+    /// Like `spawn_with_real_watcher` but with additional environment variables.
+    pub fn spawn_with_real_watcher_env(envs: &[(&str, &std::ffi::OsStr)]) -> Self {
+        let mut full: Vec<(&str, &std::ffi::OsStr)> = vec![
+            ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
+            (
+                "AFT_TEST_SYNC_FILE_WATCHER_START",
+                std::ffi::OsStr::new("1"),
+            ),
+        ];
+        full.extend_from_slice(envs);
+        Self::spawn_inner(&full, false)
+    }
+
     fn spawn_inner(envs: &[(&str, &std::ffi::OsStr)], pipe_stderr: bool) -> Self {
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
             .map(std::path::PathBuf::from)
@@ -85,6 +112,13 @@ impl AftProcess {
             // this never hangs. Lifecycle tests override it to "0" to exercise
             // the real Building -> drain -> Ready path.
             .env("AFT_CALLGRAPH_BUILD_WAIT_MS", "30000")
+            // Disable the OS file watcher by default. ~600 integration spawns
+            // each installing a recursive FsEventWatcher swamp the single macOS
+            // fseventsd daemon, throttling event delivery and flaking the few
+            // tests that wait on watcher-driven invalidation. Real-watcher tests
+            // opt back in via spawn_with_real_watcher (which overrides this to
+            // "0"). Explicit `envs` below can override it.
+            .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if pipe_stderr || diag_enabled {

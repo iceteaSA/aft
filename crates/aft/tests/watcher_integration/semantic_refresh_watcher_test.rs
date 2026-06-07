@@ -353,19 +353,15 @@ fn wait_for_semantic_status<F>(aft: &mut AftProcess, label: &str, predicate: F) 
 where
     F: Fn(&Value) -> bool,
 {
-    // Generous budget: this e2e test depends on an OS file-watcher event being
-    // delivered to a spawned aft process, then a refresh worker reacting. Under
-    // full-suite parallelism (1150+ concurrent tests saturating every core) the
-    // bridge's watcher *thread* can be starved well past 40s before it gets
-    // scheduled to drain FSEvents — observed failing at 400 polls (40s) during
-    // an 86s release-gate run. The loop returns immediately on match (~2s on the
-    // happy path), so a high cap costs nothing when passing and only buys
-    // headroom under that pathological load. The barrier in the mock embedding
-    // server holds the refreshing window open once the refresh fires, so the
-    // only thing this budget needs to absorb is watcher/worker scheduling
-    // latency.
+    // Generous budget: this e2e test waits on an OS FSEvents delivery (a watched
+    // write reaching the spawned aft process) then a refresh worker reacting.
+    // The loop returns immediately on match (~2s happy path), so a high cap
+    // costs nothing when passing and only buys headroom. The real defense
+    // against gate flakiness is `watcher_serial_lock` (these fseventsd-delivery
+    // tests run one at a time so the daemon isn't swamped); this budget only
+    // absorbs ordinary scheduling latency on top of that.
     let mut last_response = None;
-    for _ in 0..800 {
+    for _ in 0..400 {
         let response = status(aft);
         assert_eq!(
             response["success"], true,
@@ -401,7 +397,7 @@ where
     F: Fn(&Value) -> bool,
 {
     let mut last_response = None;
-    for i in 0..800 {
+    for i in 0..400 {
         let response = status(aft);
         assert_eq!(
             response["success"], true,
@@ -471,6 +467,7 @@ fn refreshing_status_keeps_repeated_same_file_invalidations_until_last_completio
 
 #[test]
 fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
     let project = setup_project(&[
         (
             "src/a.rs",
@@ -487,7 +484,7 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     ]);
     let storage = tempfile::tempdir().expect("create storage dir");
     let server = MockEmbeddingServer::start();
-    let mut aft = AftProcess::spawn();
+    let mut aft = AftProcess::spawn_with_real_watcher();
 
     let configure =
         configure_semantic_openai(&mut aft, project.path(), storage.path(), &server.base_url);
@@ -693,6 +690,7 @@ fn watcher_deleted_alias_path_invalidates_canonical_search_and_semantic_entries(
 
 #[test]
 fn semantic_build_recovers_when_backend_returns_after_transient_outage() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
     // Regression for the "Semantic Index: failed (won't recover)" report: a
     // transient backend outage during the initial build must NOT park the index
     // in `Failed` (a state nothing re-triggers short of a restart). The build
@@ -705,7 +703,7 @@ fn semantic_build_recovers_when_backend_returns_after_transient_outage() {
     let storage = tempfile::tempdir().expect("create storage dir");
     let server = FlakyEmbeddingServer::start_down();
     // Shrink the retry backoff so the test doesn't wait the real 15s schedule.
-    let mut aft = AftProcess::spawn_with_env(&[(
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[(
         "AFT_SEMANTIC_RETRY_BACKOFF_MS",
         std::ffi::OsStr::new("200"),
     )]);

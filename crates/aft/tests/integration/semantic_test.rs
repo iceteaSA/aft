@@ -407,7 +407,11 @@ fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidati
     ]);
     let storage = tempfile::tempdir().expect("create storage dir");
     let server = MockEmbeddingServer::start();
-    let mut aft = AftProcess::spawn();
+    // Watcher-dependent: edits src/b.rs after configure and waits for the
+    // watcher-driven refresh. The default `spawn()` disables the OS watcher
+    // (see AftProcess::spawn_with_real_watcher); this test must opt in. Runs in
+    // its own standalone `semantic_test` binary (sequential, no concurrent load).
+    let mut aft = AftProcess::spawn_with_real_watcher();
 
     let configure =
         configure_semantic_openai(&mut aft, project.path(), storage.path(), &server.base_url);

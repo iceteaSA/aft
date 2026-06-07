@@ -11,23 +11,6 @@ fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
 }
 
-fn configure_with_search_index(aft: &mut AftProcess, root: &Path) {
-    let configure = aft.send(
-        &json!({
-            "id": "cfg-search-index",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": root,
-            "search_index": true,
-        })
-        .to_string(),
-    );
-    assert_eq!(
-        configure["success"], true,
-        "configure should succeed: {configure:?}"
-    );
-}
-
 fn configure_with_search_index_and_storage(aft: &mut AftProcess, root: &Path, storage: &Path) {
     let configure = aft.send(
         &json!({
@@ -174,49 +157,6 @@ fn configure_rejects_nonpositive_semantic_max_files() {
 }
 
 #[test]
-fn configure_ignore_change_purges_indexed_file_from_grep() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::create_dir_all(dir.path().join("src")).unwrap();
-    fs::write(
-        dir.path().join("src/secret.rs"),
-        "fn secret() { println!(\"purge_secret_marker\"); }\n",
-    )
-    .unwrap();
-
-    let mut aft = AftProcess::spawn();
-    configure_with_search_index(&mut aft, dir.path());
-    wait_for_ready_grep(
-        &mut aft,
-        "initial indexed secret",
-        "purge_secret_marker",
-        |response| response["total_matches"] == 1,
-    );
-
-    let aftignore = dir.path().join(".aftignore");
-    fs::write(&aftignore, "src/secret.rs\n").unwrap();
-    for attempt in 0..200 {
-        let response = grep_marker(&mut aft, "purge_secret_marker");
-        assert_eq!(
-            response["success"], true,
-            "grep should succeed: {response:?}"
-        );
-        if response["index_status"] == "Ready" && response["total_matches"] == 0 {
-            let shutdown = aft.shutdown();
-            assert!(shutdown.success());
-            return;
-        }
-        if attempt % 3 == 0 {
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    panic!(
-        "ignore-rule change did not purge indexed file; last grep: {:?}",
-        grep_marker(&mut aft, "purge_secret_marker")
-    );
-}
-
-#[test]
 fn configure_cold_reuse_rebuilds_search_index_when_ignore_rules_change() {
     let dir = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
@@ -251,119 +191,6 @@ fn configure_cold_reuse_rebuilds_search_index_when_ignore_rules_change() {
     );
 
     let shutdown = second.shutdown();
-    assert!(shutdown.success());
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn watcher_replays_search_edit_seen_during_in_flight_build() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::create_dir_all(dir.path().join("src")).unwrap();
-    let source = dir.path().join("src/live.rs");
-    fs::write(
-        &source,
-        r#"fn live() { println!("before_replay_marker"); }
-"#,
-    )
-    .unwrap();
-
-    let mut aft = AftProcess::spawn_with_env(&[(
-        "AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS",
-        std::ffi::OsStr::new("1500"),
-    )]);
-    configure_with_search_index(&mut aft, dir.path());
-
-    let changed = r#"fn live() { println!("after_replay_marker"); }
-"#;
-    let edit_deadline = Instant::now() + Duration::from_millis(700);
-    while Instant::now() < edit_deadline {
-        fs::write(&source, changed).unwrap();
-        let _ = grep_marker(&mut aft, "after_replay_marker");
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    wait_for_ready_grep(
-        &mut aft,
-        "replayed edit after search build",
-        "after_replay_marker",
-        |response| response["total_matches"] == 1,
-    );
-
-    let shutdown = aft.shutdown();
-    assert!(shutdown.success());
-}
-
-#[test]
-fn configure_watcher_honors_deep_nested_aftignore() {
-    let dir = tempfile::tempdir().unwrap();
-    let deep_dir = (0..10).fold(dir.path().to_path_buf(), |path, index| {
-        path.join(format!("level{index}"))
-    });
-    fs::create_dir_all(&deep_dir).unwrap();
-    fs::write(deep_dir.join(".aftignore"), "ignored.rs\n").unwrap();
-    let ignored_file = deep_dir.join("ignored.rs");
-    fs::write(
-        &ignored_file,
-        "fn ignored() { println!(\"deep_ignored_marker_before\"); }\n",
-    )
-    .unwrap();
-
-    let live_file = dir.path().join("src/live.rs");
-    fs::create_dir_all(live_file.parent().unwrap()).unwrap();
-    fs::write(&live_file, "fn live() {}\n").unwrap();
-
-    let mut aft = AftProcess::spawn();
-    configure_with_search_index(&mut aft, dir.path());
-    wait_for_ready_grep(
-        &mut aft,
-        "initial ignored absence",
-        "deep_ignored_marker",
-        |response| response["total_matches"] == 0,
-    );
-
-    let live_contents = "fn live() { println!(\"deep_live_watcher_marker\"); }\n";
-    let mut saw_live_watcher_update = false;
-    for _ in 0..200 {
-        fs::write(&live_file, live_contents).unwrap();
-        let response = grep_marker(&mut aft, "deep_live_watcher_marker");
-        assert_eq!(
-            response["success"], true,
-            "grep should succeed: {response:?}"
-        );
-        if response["index_status"] == "Ready" && response["total_matches"] == 1 {
-            saw_live_watcher_update = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        saw_live_watcher_update,
-        "watcher should index a non-ignored edit before checking ignored edits"
-    );
-
-    let ignored_contents = "fn ignored() { println!(\"deep_ignored_marker_after\"); }\n";
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last_response = None;
-    while Instant::now() < deadline {
-        fs::write(&ignored_file, ignored_contents).unwrap();
-        let response = grep_marker(&mut aft, "deep_ignored_marker_after");
-        assert_eq!(
-            response["success"], true,
-            "grep should succeed: {response:?}"
-        );
-        assert_eq!(
-            response["total_matches"], 0,
-            "deep .aftignore should keep watcher from indexing ignored file: {response:?}"
-        );
-        last_response = Some(response);
-        thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        last_response.is_some(),
-        "deep ignored marker should be checked at least once"
-    );
-
-    let shutdown = aft.shutdown();
     assert!(shutdown.success());
 }
 
