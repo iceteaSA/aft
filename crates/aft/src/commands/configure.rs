@@ -2754,6 +2754,18 @@ mod tests {
         M.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    /// Shared mutex serializing the watcher tests below. They share the
+    /// process-global `WATCHER_GENERATION` atomic: each test bumps it to tear
+    /// down its spawned thread, and the install path gates its event/error send
+    /// on a generation match. Run in parallel, one test's bump invalidates
+    /// another's in-flight generation check, so a legitimate error send is
+    /// skipped and the receiver observes `Disconnected` instead. Serializing
+    /// them keeps the global stable for the duration of each test.
+    fn watcher_test_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn handle_configure_enters_degraded_mode_when_project_root_is_home() {
         let _guard = home_env_mutex().lock().unwrap();
@@ -3037,6 +3049,7 @@ mod tests {
 
     #[test]
     fn watcher_attach_runs_off_configure_foreground_when_slow() {
+        let _guard = watcher_test_mutex().lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let attach_started = Arc::new(Barrier::new(2));
@@ -3068,6 +3081,7 @@ mod tests {
 
     #[test]
     fn watcher_attach_failure_reports_error_on_receiver() {
+        let _guard = watcher_test_mutex().lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
 
