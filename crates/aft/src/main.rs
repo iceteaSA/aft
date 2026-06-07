@@ -2234,6 +2234,15 @@ mod watcher_filter_tests {
     use notify::EventKind;
     use tempfile::TempDir;
 
+    /// Generous wait for an async dispatch (semantic-refresh request / status
+    /// frame) that the worker thread produces on a separate thread. These waits
+    /// return the instant the value arrives, so the budget is zero-cost on the
+    /// happy path and only matters when CI thread-scheduling is starved under
+    /// full-suite parallel load. A tight budget (100-250ms) was the source of
+    /// `semantic refresh request: Timeout` flakes on Linux CI. Negative waits
+    /// (asserting *absence* of a value) must stay short and are NOT this const.
+    const RECV_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     fn make_ctx_with_root(root: &std::path::Path) -> AppContext {
         AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -2285,7 +2294,7 @@ mod watcher_filter_tests {
         request_rx: &crossbeam_channel::Receiver<SemanticRefreshRequest>,
     ) -> Vec<std::path::PathBuf> {
         match request_rx
-            .recv_timeout(std::time::Duration::from_millis(250))
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
             .expect("semantic refresh request")
         {
             SemanticRefreshRequest::Files { paths } => paths,
@@ -2303,7 +2312,7 @@ mod watcher_filter_tests {
 
     fn recv_status_changed(rx: &std::sync::mpsc::Receiver<PushFrame>) -> serde_json::Value {
         match rx
-            .recv_timeout(std::time::Duration::from_millis(1_600))
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
             .expect("status_changed frame")
         {
             PushFrame::StatusChanged(frame) => frame.snapshot,
@@ -2791,7 +2800,7 @@ mod watcher_filter_tests {
         drain_watcher_events(&ctx);
 
         match request_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
             .expect("semantic refresh request")
         {
             SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file]),
@@ -2827,7 +2836,7 @@ mod watcher_filter_tests {
             drain_semantic_refresh_events(&ctx);
 
             match request_rx
-                .recv_timeout(std::time::Duration::from_millis(250))
+                .recv_timeout(RECV_DISPATCH_TIMEOUT)
                 .expect("retry request")
             {
                 SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file.clone()]),
