@@ -58,6 +58,7 @@ import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
 import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
+import { instrumentToolMap } from "./tool-perf.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
@@ -896,6 +897,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     }
     log(`Disabled ${disabled.size} tool(s): ${[...disabled].join(", ")}`);
   }
+
+  // Wrap every tool's execute() with latency instrumentation: one log line per
+  // call breaking total time into pre-bridge / bridge round-trip / post-bridge.
+  // Applied after disabled-tool filtering so suppressed tools aren't wrapped.
+  instrumentToolMap(allTools);
 
   const autoUpdateEventHook = createAutoUpdateCheckerHook(input, {
     enabled: true,

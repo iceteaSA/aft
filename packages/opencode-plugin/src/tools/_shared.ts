@@ -27,6 +27,7 @@ import {
   getSessionDirectoryCached,
   warmSessionDirectory,
 } from "../shared/session-directory.js";
+import { markBridgeEnd, markBridgeStart } from "../tool-perf.js";
 import type { PluginContext } from "../types.js";
 
 const z = tool.schema;
@@ -409,11 +410,17 @@ export async function callBridge(
     configureWarningClient: ctx.client,
     ...options,
   };
-  const response = await bridgeFor(ctx, runtime).send(
-    command,
-    merged,
-    Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
-  );
+  markBridgeStart();
+  let response: Awaited<ReturnType<BinaryBridge["send"]>>;
+  try {
+    response = await bridgeFor(ctx, runtime).send(
+      command,
+      merged,
+      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+    );
+  } finally {
+    markBridgeEnd();
+  }
   ingestBgCompletions(runtime.sessionID, response.bg_completions);
   return response;
 }
