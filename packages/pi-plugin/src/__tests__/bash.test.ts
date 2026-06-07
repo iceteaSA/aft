@@ -324,13 +324,19 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const result = (await bashTool.execute(
-      "test-call",
-      { command: "sleep 2", timeout: 1 },
-      undefined,
-      undefined,
-      { cwd: "/test" },
-    )) as { content: Array<{ text: string }> };
+    // 50ms foreground wait: first status poll (~0ms elapsed) keeps polling, the
+    // second (~100ms after a poll-interval sleep) crosses the window and
+    // promotes — exactly two status calls. Production floors the window at 5s;
+    // bun caps tests at 5s, so this seam exercises the promote path fast.
+    process.env.AFT_TEST_FOREGROUND_WAIT_MS = "50";
+    let result: { content: Array<{ text: string }> };
+    try {
+      result = (await bashTool.execute("test-call", { command: "sleep 2" }, undefined, undefined, {
+        cwd: "/test",
+      })) as { content: Array<{ text: string }> };
+    } finally {
+      delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+    }
 
     expect(result.content[0].text).toContain("promoted to background: task-promote");
     expect(calls.map((call) => (call as [string])[0])).toEqual([

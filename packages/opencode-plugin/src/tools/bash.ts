@@ -1,4 +1,8 @@
-import { type BridgeRequestOptions, maybeStripCompressorPipe } from "@cortexkit/aft-bridge";
+import {
+  type BridgeRequestOptions,
+  maybeStripCompressorPipe,
+  resolveBashKillTimeout,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
@@ -30,6 +34,20 @@ const FOREGROUND_POLL_INTERVAL_MS = 100;
 // poll-window when no explicit timeout was provided — subagents cannot survive
 // background promotion, so we poll until the task is terminal or this cap fires.
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
+
+// Test-only override for the foreground wait window. Production resolves the
+// window from config (floored at 5000ms), but bun caps each test at 5000ms, so
+// promotion tests need a sub-floor window to exercise the promote path
+// deterministically. Mirrors the Rust `AFT_CALLGRAPH_BUILD_WAIT_MS` test seam.
+// Never set outside tests.
+function resolveForegroundWaitMs(configured: number): number {
+  const override = process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+  if (override !== undefined) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return configured;
+}
 
 const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, optional background execution, and PTY mode for interactive programs. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a taskId for bash_status/bash_kill. Pass pty: true for interactive REPLs and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically). Use bash_watch to block on or register for pattern matches and exit events.`;
 
@@ -165,6 +183,18 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       const allowSubagentBg = bashCfg.subagent_background;
       const subagentForcedForeground = isSubagent && !allowSubagentBg;
       const effectiveBackground = subagentForcedForeground ? false : requestedBackground;
+
+      // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
+      // small `timeout` is a legitimate kill cap (kill after N ms), so honor it
+      // verbatim. For the FOREGROUND path a `timeout` below the foreground wait
+      // window is incoherent (the task would be killed before we promote it to
+      // background), so treat it as unset and let the bridge apply its
+      // 30-minute default — this is the #102 fix. Used for the bridge payload,
+      // the wait calc, and the promotion message so all three agree.
+      const rawTimeout = args.timeout as number | undefined;
+      const effectiveTimeout = effectiveBackground
+        ? rawTimeout
+        : resolveBashKillTimeout(rawTimeout, bashCfg.foreground_wait_window_ms);
       // Only log when the gate actually changes behavior (subagent path).
       // The common primary-session foreground case is the overwhelming
       // majority of calls and produces no useful log signal.
@@ -185,7 +215,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         context,
         {
           command,
-          timeout: args.timeout,
+          timeout: effectiveTimeout,
           workdir: args.workdir,
           env: shellEnv?.env ?? {},
           description,
@@ -245,12 +275,15 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         //
         // Schema validation guarantees `args.timeout` is a positive
         // integer or undefined, so these expressions are well-defined.
-        const argTimeout = args.timeout as number | undefined;
-        const foregroundWaitMs = bashCfg.foreground_wait_window_ms;
+        // effectiveTimeout already folded the sub-window guard (#102): it is
+        // either >= foregroundWaitMs or undefined, so the primary-session
+        // Math.min can no longer collapse the wait window below the configured
+        // value.
+        const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
         const waitTimeoutMs = subagentForcedForeground
-          ? (argTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
-          : argTimeout !== undefined
-            ? Math.min(argTimeout, foregroundWaitMs)
+          ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
+          : effectiveTimeout !== undefined
+            ? Math.min(effectiveTimeout, foregroundWaitMs)
             : foregroundWaitMs;
         const startedAt = Date.now();
         while (true) {
@@ -282,11 +315,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
             trackBgTask(context.sessionID, taskId);
-            let message = formatPromotionMessage(
-              taskId,
-              args.timeout as number | undefined,
-              foregroundWaitMs,
-            );
+            let message = formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs);
             if (isSubagent && allowSubagentBg) message += subagentGuidance(taskId);
             const metadataPayload = { description, output: message, status: "running", taskId };
             metadata?.(metadataPayload);

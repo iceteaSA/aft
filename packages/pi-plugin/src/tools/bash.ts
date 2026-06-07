@@ -4,6 +4,7 @@ import {
   type BridgeRequestOptions,
   maybeAppendConflictsHint,
   maybeStripCompressorPipe,
+  resolveBashKillTimeout,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -49,6 +50,20 @@ const FOREGROUND_POLL_INTERVAL_MS = 100;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
 const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
+
+// Test-only override for the foreground wait window. Production resolves the
+// window from config (floored at 5000ms), but bun caps each test at 5000ms, so
+// promotion tests need a sub-floor window to exercise the promote path
+// deterministically. Mirrors the Rust `AFT_CALLGRAPH_BUILD_WAIT_MS` test seam.
+// Never set outside tests.
+function resolveForegroundWaitMs(configured: number): number {
+  const override = process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+  if (override !== undefined) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return configured;
+}
 // Bridge transport budget for `bash` calls. Rust returns `running` immediately
 // and the plugin polls separately, so transport only needs to cover spawn +
 // protocol round-trip; not a function of params.timeout. See council audit
@@ -281,7 +296,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
     async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const bashCfg = resolveBashConfig(ctx.config);
-      const foregroundWaitMs = bashCfg.foreground_wait_window_ms;
+      const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
       // ptyRows/ptyCols are silently ignored when pty is false so agents
       // that defensively pass them on normal bash calls don't get stuck in
       // a retry loop. pty: true silently implies background: true (Rust
@@ -291,6 +306,16 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       const ptyRows = coerceOptionalInt(params.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
       const effectiveBackground = params.background === true || params.pty === true;
+      // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
+      // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
+      // FOREGROUND path a `timeout` below the foreground wait window is
+      // incoherent (the task would be killed before we promote it to
+      // background), so treat it as unset and let the bridge apply its
+      // 30-minute default — this is the #102 fix. Used for the bridge payload,
+      // the wait calc, and the promotion message so all three agree.
+      const effectiveTimeout = effectiveBackground
+        ? timeout
+        : resolveBashKillTimeout(timeout, foregroundWaitMs);
 
       // Build spawn context for potential hook modification
       let spawnContext: BashSpawnContext = {
@@ -320,7 +345,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
         "bash",
         {
           command: bridgeCommand,
-          timeout,
+          timeout: effectiveTimeout,
           workdir: spawnContext.cwd ?? params.workdir,
           env: spawnContext.env,
           description: params.description,
@@ -373,10 +398,13 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
         // foregroundWaitMs so agents get a fast promotion message
         // for unexpectedly long commands. Honor a shorter explicit timeout
         // when present — polling beyond the task's kill cap is pointless.
-        // Schema validation guarantees params.timeout is a positive integer
-        // or undefined, so this Math.min is always well-defined.
+        // effectiveTimeout already folded the sub-window guard (#102): it is
+        // either >= foregroundWaitMs or undefined, so this Math.min can no
+        // longer collapse the wait window below the configured value.
         const waitTimeoutMs =
-          timeout !== undefined ? Math.min(timeout, foregroundWaitMs) : foregroundWaitMs;
+          effectiveTimeout !== undefined
+            ? Math.min(effectiveTimeout, foregroundWaitMs)
+            : foregroundWaitMs;
         const startedAt = Date.now();
         while (true) {
           const status = await callBashBridge(bridge, "bash_status", { task_id: taskId }, extCtx);
@@ -406,7 +434,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
             trackBgTask(resolveSessionId(extCtx), taskId);
-            return bashResult(formatPromotionMessage(taskId, params.timeout, foregroundWaitMs), {
+            return bashResult(formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs), {
               task_id: taskId,
             });
           }

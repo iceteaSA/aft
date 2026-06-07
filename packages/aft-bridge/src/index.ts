@@ -11,6 +11,7 @@
 export { setActiveLogger } from "./active-logger.js";
 // --- bash output hints (shared by both plugin hosts) ---
 export { maybeAppendConflictsHint } from "./bash-hints.js";
+export { resolveBashKillTimeout } from "./bash-timeout.js";
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,

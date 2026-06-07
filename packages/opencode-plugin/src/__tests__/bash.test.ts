@@ -282,6 +282,42 @@ describe("OpenCode bash adapter", () => {
     expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
   });
 
+  test("foreground sub-window timeout is dropped so the bridge applies its default (#102)", async () => {
+    // A model passing timeout: 100 must NOT become the bridge kill cap (that
+    // killed commands at 100ms). On the foreground path, a timeout below the
+    // wait window is incoherent, so it's sent as undefined and Rust uses its
+    // 30-minute default.
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      output: "done",
+      exit_code: 0,
+      truncated: false,
+    }));
+
+    await bash.execute({ command: "echo hi", timeout: 100 }, createMockSdkContext());
+
+    expect(calls[0].command).toBe("bash");
+    expect(calls[0].params.timeout).toBeUndefined();
+  });
+
+  test("explicit background honors a small timeout verbatim as a real kill cap", async () => {
+    // Background is the opposite of foreground: a small timeout IS a legitimate
+    // kill cap there (kill after N ms), so it must pass through unchanged.
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      task_id: "task-bg",
+      status: "running",
+    }));
+
+    await bash.execute(
+      { command: "sleep 9", background: true, timeout: 200 },
+      createMockSdkContext(),
+    );
+
+    expect(calls[0].command).toBe("bash");
+    expect(calls[0].params.timeout).toBe(200);
+  });
+
   test("progress callback forwards rolling output previews through ctx.metadata", async () => {
     const metadata = mock(() => {});
     const { tool: bash } = createHarness((_command, _params, options) => {
@@ -434,10 +470,18 @@ describe("OpenCode bash adapter", () => {
       return { success: true, task_id: "task-promote", promoted: true };
     });
 
-    const output = await bash.execute(
-      { command: "sleep 2", timeout: 0 },
-      createMockSdkContext({ sessionID: "promote-session" }),
-    );
+    // Force a 0ms foreground wait so the promote path fires after the first
+    // status poll (production floors the window at 5s; bun caps tests at 5s).
+    process.env.AFT_TEST_FOREGROUND_WAIT_MS = "0";
+    let output: string;
+    try {
+      output = (await bash.execute(
+        { command: "sleep 2" },
+        createMockSdkContext({ sessionID: "promote-session" }),
+      )) as string;
+    } finally {
+      delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+    }
 
     expect(output).toContain("promoted to background: task-promote");
     expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status", "bash_promote"]);
@@ -1117,10 +1161,16 @@ describe("OpenCode bash adapter — subagent gating", () => {
       undefined,
       { bash: { subagent_background: true } } as PluginContext["config"],
     );
-    const result = await bash.execute(
-      { command: "sleep 30", timeout: 0 },
-      createMockSdkContext({ sessionID: "ses_subagent_promote" }),
-    );
+    process.env.AFT_TEST_FOREGROUND_WAIT_MS = "0";
+    let result: unknown;
+    try {
+      result = await bash.execute(
+        { command: "sleep 30" },
+        createMockSdkContext({ sessionID: "ses_subagent_promote" }),
+      );
+    } finally {
+      delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+    }
     expect(result as string).toContain("promoted to background: bash-sub-promote");
     expect(result as string).toContain(
       'bash_watch({ taskId: "bash-sub-promote", timeoutMs: 60000 })',
