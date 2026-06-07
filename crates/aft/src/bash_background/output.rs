@@ -253,7 +253,14 @@ fn marker_output(input: &str, head_end: usize, tail_start: usize, marker: &str) 
 }
 
 pub fn quote_path(path: &str) -> String {
-    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+    // The path is shown to the agent as `read "<path>"` for the AFT read tool
+    // (and, for the Unix-only `tail -n +N` form, a shell hint). The read tool
+    // consumes the path literally, so we must NOT backslash-double: on Windows
+    // `C:\Users\foo` would become `C:\\Users\\foo` and the agent would copy a
+    // corrupted path. Only escape an embedded `"` so the surrounding quotes
+    // can't be broken (paths containing `"` are illegal on Windows and rare on
+    // Unix). Realistic Unix paths have no backslashes, so this is a no-op there.
+    let escaped = path.replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
 
@@ -268,6 +275,22 @@ pub fn json_output_pointer(total_bytes: u64, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_path_preserves_windows_backslashes() {
+        // The recovery marker shows the agent `read "<path>"` for the AFT read
+        // tool, which consumes the path literally. A Windows path must survive
+        // verbatim (no backslash doubling), otherwise the agent copies a broken
+        // path. Regression for the cross-platform CI failure.
+        assert_eq!(
+            quote_path(r"C:\Users\foo\stdout"),
+            r#""C:\Users\foo\stdout""#
+        );
+        assert_eq!(quote_path(r"C:\a\b"), r#""C:\a\b""#);
+        assert_eq!(quote_path("/tmp/out"), r#""/tmp/out""#);
+        // An embedded double-quote is still escaped so the wrapping can't break.
+        assert_eq!(quote_path(r#"a"b"#), r#""a\"b""#);
+    }
 
     #[test]
     fn head_tail_cap_respects_utf8_boundaries() {
