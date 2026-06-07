@@ -2924,8 +2924,19 @@ mod watcher_filter_tests {
             drain_semantic_refresh_events(&ctx);
             assert!(semantic_refresh_circuit_is_open());
 
+            // The pre-breaker failures each schedule a retry on an independent
+            // thread with the same backoff, so their arrival order at the channel
+            // is nondeterministic. Collect them and assert the set, not the order
+            // (matches the sibling breaker tests).
+            let mut retry_batches = Vec::new();
+            for _ in 0..(BREAKER_TRIP_THRESHOLD - 1) {
+                retry_batches.push(recv_files_request(&request_rx));
+            }
             for file in files.iter().take(BREAKER_TRIP_THRESHOLD - 1) {
-                assert_eq!(recv_files_request(&request_rx), vec![file.clone()]);
+                assert!(
+                    retry_batches.contains(&vec![file.clone()]),
+                    "missing retry for {file:?}; got {retry_batches:?}"
+                );
             }
 
             event_tx
