@@ -108,6 +108,45 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    // A named meta-var in the REWRITE that the PATTERN never captured (e.g. a
+    // typo: pattern `console.log($MSG)`, rewrite `logger.info($MGS)`) is NOT an
+    // error to ast-grep — it emits the literal text `$MGS` into the output,
+    // silently corrupting the file with success:true. Reject up front: every
+    // rewrite meta-var must be bound by the pattern.
+    let pattern_vars = extract_meta_var_names(&pattern);
+    let rewrite_vars = extract_meta_var_names(&rewrite);
+    let unbound: Vec<String> = rewrite_vars
+        .difference(&pattern_vars)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unbound.is_empty() {
+        let mut unbound = unbound;
+        unbound.sort();
+        return Response::error(
+            &req.id,
+            "invalid_rewrite",
+            format!(
+                "ast_replace: the rewrite references meta-variable(s) the pattern never \
+                 captures: {}. ast-grep would emit them as literal text (e.g. `$MGS`) instead \
+                 of expanding a capture, corrupting the output. Check for a typo — every `$VAR` \
+                 in the rewrite must also appear in the pattern. Pattern captures: {}.",
+                unbound
+                    .iter()
+                    .map(|v| format!("${v}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if pattern_vars.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    let mut pv: Vec<String> =
+                        pattern_vars.iter().map(|v| format!("${v}")).collect();
+                    pv.sort();
+                    pv.join(", ")
+                }
+            ),
+        );
+    }
+
     let lang_str = match req.params.get("lang").and_then(|v| v.as_str()) {
         Some(l) => l,
         None => {
@@ -488,9 +527,49 @@ fn has_anonymous_variadic(rewrite: &str) -> bool {
     false
 }
 
+/// Extract the set of meta-variable NAMES referenced in an ast-grep pattern or
+/// rewrite template (e.g. `console.log($MSG, $$$ARGS)` -> {"MSG", "ARGS"}).
+///
+/// Matches ast-grep's binding rule: a meta-var is `$` (or a `$$$` variadic run)
+/// followed by a name that STARTS with an uppercase letter or `_` and continues
+/// with uppercase/`_`/digits. Lowercase-led (`$msg`) and digit-led (`$1`) runs
+/// are NOT meta-vars to ast-grep, so they are ignored here (conservative — we
+/// never want to false-reject a legitimate rewrite).
+fn extract_meta_var_names(s: &str) -> std::collections::HashSet<String> {
+    fn is_name_char(c: char) -> bool {
+        matches!(c, 'A'..='Z' | '_' | '0'..='9')
+    }
+    let mut names = std::collections::HashSet::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            // Skip a run of `$` (covers `$NAME` and `$$$NAME`).
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] == '$' {
+                j += 1;
+            }
+            // The name must START with an uppercase letter or underscore.
+            if j < chars.len() && matches!(chars[j], 'A'..='Z' | '_') {
+                let start = j;
+                while j < chars.len() && is_name_char(chars[j]) {
+                    j += 1;
+                }
+                names.insert(chars[start..j].iter().collect());
+                i = j;
+                continue;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
-    use super::has_anonymous_variadic;
+    use super::{extract_meta_var_names, has_anonymous_variadic};
 
     #[test]
     fn detects_anonymous_variadic_in_block() {
@@ -540,5 +619,44 @@ mod tests {
     fn allows_empty_and_no_dollars() {
         assert!(!has_anonymous_variadic(""));
         assert!(!has_anonymous_variadic("plain text"));
+    }
+
+    #[test]
+    fn extracts_meta_var_names() {
+        let names = extract_meta_var_names("console.log($MSG, $$$ARGS)");
+        assert!(names.contains("MSG"));
+        assert!(names.contains("ARGS"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn extract_ignores_non_metavar_dollars() {
+        // lowercase-led, digit-led, and bare `$` are not ast-grep meta-vars.
+        let names = extract_meta_var_names("price = $$.99 + $msg + $1 + $");
+        assert!(names.is_empty(), "got: {names:?}");
+    }
+
+    #[test]
+    fn extract_handles_underscore_led_names() {
+        let names = extract_meta_var_names("$_PRIVATE = $VALUE");
+        assert!(names.contains("_PRIVATE"));
+        assert!(names.contains("VALUE"));
+    }
+
+    // The subset relationship the handler enforces: a rewrite var absent from
+    // the pattern is the typo/corruption case.
+    #[test]
+    fn rewrite_var_not_in_pattern_is_detectable() {
+        let pattern = extract_meta_var_names("console.log($MSG)");
+        let rewrite = extract_meta_var_names("logger.info($MGS)"); // typo
+        let unbound: Vec<_> = rewrite.difference(&pattern).collect();
+        assert_eq!(unbound, vec![&"MGS".to_string()]);
+    }
+
+    #[test]
+    fn rewrite_subset_of_pattern_is_clean() {
+        let pattern = extract_meta_var_names("test($NAME, () => { $$$BODY })");
+        let rewrite = extract_meta_var_names("test($NAME, async () => { $$$BODY })");
+        assert!(rewrite.difference(&pattern).next().is_none());
     }
 }

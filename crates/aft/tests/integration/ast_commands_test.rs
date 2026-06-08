@@ -378,6 +378,46 @@ fn ast_replace_real_run_rejects_invalid_rewrite_without_writing() {
     assert!(status.success());
 }
 
+/// A rewrite that references a meta-var the pattern never captures (a typo)
+/// must be rejected up front — ast-grep would otherwise emit the literal text
+/// `$MGS` into the file with success:true (silent corruption).
+#[test]
+fn ast_replace_rejects_rewrite_var_not_in_pattern() {
+    let project = setup_project(&[("src/a.ts", "console.log(alpha);\n")]);
+    let original = read_file(project.path(), "src/a.ts");
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-unbound-metavar",
+            "command": "ast_replace",
+            "pattern": "console.log($MSG)",
+            "rewrite": "logger.info($MGS)", // typo: $MGS not in pattern
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+
+    assert_eq!(
+        replace["success"], false,
+        "unbound rewrite meta-var should fail: {replace:?}"
+    );
+    assert_eq!(replace["code"], "invalid_rewrite");
+    let msg = replace["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("$MGS"),
+        "message should name the unbound var: {msg}"
+    );
+    // File must be untouched (no literal `$MGS` written).
+    assert_eq!(read_file(project.path(), "src/a.ts"), original);
+    assert!(!read_file(project.path(), "src/a.ts").contains("$MGS"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn ast_search_respects_explicit_node_modules_root() {
     let project = setup_project(&[
