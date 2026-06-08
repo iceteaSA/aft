@@ -312,15 +312,17 @@ describe("Pi background notifications", () => {
       },
       completion("task-1", "npm test"),
     );
-    await sleep(300);
 
+    // Same-turn completions are deferred synchronously: they remain pending,
+    // but no wake timer is scheduled until a turn-end boundary clears the
+    // deferral. No wall-clock sleep is needed to prove the negative path.
     expect(sendUserMessage).toHaveBeenCalledTimes(0);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
     expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
 
     markTaskWaiting("s1", "task-1");
-    await sleep(300);
 
+    // A synchronous bash_watch wait consumes the pending completion immediately.
     expect(sendUserMessage).toHaveBeenCalledTimes(0);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
@@ -465,20 +467,21 @@ describe("Pi background notifications", () => {
     const sendUserMessage = mock(() => {});
 
     for (const taskId of ["task-1", "task-2", "task-3"]) trackBgTask("s1", taskId);
+    // Each turn-end drain synchronously queues one completion and extends the
+    // same debounce timer. Driving the drains back-to-back keeps coverage of
+    // coalescing without relying on short sleeps landing inside a timer window.
     await handleTurnEndBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(50);
     await handleTurnEndBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
       runtime: { sendUserMessage },
     });
-    await sleep(50);
     await handleTurnEndBgCompletions({
       ctx,
       directory: "/tmp/project",

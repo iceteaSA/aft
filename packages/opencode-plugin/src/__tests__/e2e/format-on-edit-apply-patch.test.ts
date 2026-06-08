@@ -68,6 +68,21 @@ function createSdkContext(directory: string): ToolContext {
   };
 }
 
+async function waitForBridgeReady(
+  pool: BridgePool,
+  directory: string,
+  sessionId: string | undefined,
+): Promise<void> {
+  const response = await pool.getBridge(directory).send("ping", {
+    ...(sessionId ? { session_id: sessionId } : {}),
+  });
+  if (response.success !== true) {
+    throw new Error(
+      `bridge readiness check failed: ${String(response.message ?? response.code ?? "unknown")}`,
+    );
+  }
+}
+
 async function createToolHarness(
   preparedBinary: PreparedBinary,
   preset: FormatPreset,
@@ -85,10 +100,12 @@ async function createToolHarness(
     { timeoutMs: 20_000 },
     { storage_dir: join(h.tempDir, ".storage"), harness: "opencode", ...configOverrides },
   );
+  const sdkCtx = createSdkContext(h.tempDir);
+  await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);
   return {
     h,
     tools: hoistedTools(createPluginContext(pool, join(h.tempDir, ".storage"))),
-    sdkCtx: createSdkContext(h.tempDir),
+    sdkCtx,
     pool,
   };
 }

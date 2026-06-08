@@ -63,6 +63,21 @@ function createSdkContext(directory: string): ToolContext {
   };
 }
 
+async function waitForBridgeReady(
+  pool: BridgePool,
+  directory: string,
+  sessionId: string | undefined,
+): Promise<void> {
+  const response = await pool.getBridge(directory).send("ping", {
+    ...(sessionId ? { session_id: sessionId } : {}),
+  });
+  if (response.success !== true) {
+    throw new Error(
+      `bridge readiness check failed: ${String(response.message ?? response.code ?? "unknown")}`,
+    );
+  }
+}
+
 function formatterPreset(tool: string): FormatPreset {
   return { configFiles: [], explicitFormatter: { typescript: tool } };
 }
@@ -203,10 +218,10 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
       },
     );
     pools.push(pool);
+    const sdkCtx = createSdkContext(h.tempDir);
+    await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage")));
-    return toolResultText(
-      await tools.write.execute({ filePath, content }, createSdkContext(h.tempDir)),
-    );
+    return toolResultText(await tools.write.execute({ filePath, content }, sdkCtx));
   }
 
   async function executeHoistedEdit(
@@ -230,10 +245,10 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
       },
     );
     pools.push(pool);
+    const sdkCtx = createSdkContext(h.tempDir);
+    await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage-edit")));
-    return toolResultText(
-      await tools.edit.execute({ filePath, oldString, newString }, createSdkContext(h.tempDir)),
-    );
+    return toolResultText(await tools.edit.execute({ filePath, oldString, newString }, sdkCtx));
   }
 
   async function writeAndExpectSkip(

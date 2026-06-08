@@ -772,51 +772,38 @@ fn hybrid_ready_semantic_reports_complete_success() {
 /// convention of quoting a phrase, and AFT's pure-substring matching would
 /// otherwise silently return zero matches when the quotes are included.
 #[test]
-fn literal_query_strips_surrounding_double_quotes() {
+fn literal_query_strips_surrounding_paired_quotes() {
     let (project, _source_file, _) = project_with_needle();
     let ctx = test_context(project.path());
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
 
-    let response = response_value(handle_semantic_search(
-        &request_with("\"needle_symbol\"", Some("literal")),
-        &ctx,
-    ));
+    for (query, label) in [
+        ("\"needle_symbol\"", "double-quoted"),
+        ("'needle_symbol'", "single-quoted"),
+    ] {
+        let response = response_value(handle_semantic_search(
+            &request_with(query, Some("literal")),
+            &ctx,
+        ));
 
-    assert_eq!(
-        response["success"], true,
-        "quoted literal query should succeed after quote-strip: {response:?}"
-    );
-    assert_eq!(response["interpreted_as"], "literal");
-    assert_eq!(
-        response["query"], "needle_symbol",
-        "response query echo should reflect stripped form"
-    );
-    assert!(
-        response["results"]
-            .as_array()
-            .expect("results array")
-            .iter()
-            .any(|r| r["kind"] == "GrepLine"),
-        "stripped query should match needle_symbol in source: {response:?}"
-    );
-}
-
-#[test]
-fn literal_query_strips_surrounding_single_quotes() {
-    let (project, _source_file, _) = project_with_needle();
-    let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
-
-    let response = response_value(handle_semantic_search(
-        &request_with("'needle_symbol'", Some("literal")),
-        &ctx,
-    ));
-
-    assert_eq!(
-        response["success"], true,
-        "single-quoted literal query should succeed: {response:?}"
-    );
-    assert_eq!(response["query"], "needle_symbol");
+        assert_eq!(
+            response["success"], true,
+            "{label} literal query should succeed after quote-strip: {response:?}"
+        );
+        assert_eq!(response["interpreted_as"], "literal");
+        assert_eq!(
+            response["query"], "needle_symbol",
+            "response query echo should reflect stripped form for {label} input"
+        );
+        assert!(
+            response["results"]
+                .as_array()
+                .expect("results array")
+                .iter()
+                .any(|r| r["kind"] == "GrepLine"),
+            "stripped {label} query should match needle_symbol in source: {response:?}"
+        );
+    }
 }
 
 #[test]

@@ -66,6 +66,21 @@ fn test_worker(worker_count: Arc<AtomicUsize>, sleep_for: Duration, count: u64) 
     })
 }
 
+fn wait_for_worker_count(worker_count: &AtomicUsize, expected: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if worker_count.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker_count did not reach {expected} before timeout; current={}",
+            worker_count.load(Ordering::SeqCst)
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn inspect_engine_active_categories_include_diagnostics() {
     assert!(InspectCategory::active().contains(&InspectCategory::Diagnostics));
@@ -179,7 +194,7 @@ fn inspect_engine_deduplicates_in_flight_waiters() {
         first_manager.submit_category(first_snapshot, InspectCategory::DeadCode, first_scope)
     });
 
-    thread::sleep(Duration::from_millis(25));
+    wait_for_worker_count(worker_count.as_ref(), 1, Duration::from_secs(2));
 
     let second_manager = Arc::clone(&manager);
     let second = thread::spawn(move || {

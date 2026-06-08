@@ -18,42 +18,42 @@ import { describe, expect, test } from "bun:test";
 import { tagStderrLine } from "../bridge.js";
 
 describe("tagStderrLine — never doubles the [aft] prefix", () => {
-  test("line already tagged with [aft] is left as-is (no doubling)", () => {
-    const line = "[aft] semantic index: rebuilding from scratch";
-    expect(tagStderrLine(line)).toBe(line);
-  });
-
-  test("line already tagged with [aft-lsp] is left as-is (preserves LSP tag)", () => {
-    const line = "[aft-lsp] [ses_abc123] failed to spawn TypeScript Language Server";
-    expect(tagStderrLine(line)).toBe(line);
-  });
-
-  test("line tagged with [aft-bridge] (forward-compat with future tags) is preserved", () => {
-    // `[aft-<word>]` family. We don't currently emit `[aft-bridge]` from Rust
-    // but the regex must not collapse hypothetical future tags into `[aft]`.
-    const line = "[aft-bridge] something happened";
-    expect(tagStderrLine(line)).toBe(line);
-  });
-
-  test("untagged line gets [aft] prepended (rare child-library output)", () => {
-    const line = "stack overflow at 0xdeadbeef";
-    expect(tagStderrLine(line)).toBe("[aft] stack overflow at 0xdeadbeef");
-  });
-
-  test("line containing [aft] mid-string but starting differently is treated as untagged", () => {
-    // The tag check is anchored to start-of-line. A panic message that
-    // mentions `[aft]` later in the text must still get the outer `[aft]`
-    // prefix, otherwise it'd render as a bare unowned message.
-    const line = "panicked at 'unwrap on None'; see [aft] log for details";
-    expect(tagStderrLine(line)).toBe(`[aft] ${line}`);
-  });
-
-  test("line with numeric subtag like [aft1] is NOT recognized as a tag", () => {
-    // The regex requires `[aft-<word>]` or exactly `[aft]`. A weird literal
-    // `[aft1]` is treated as untagged so we still own the outer prefix.
-    const line = "[aft1] weird";
-    expect(tagStderrLine(line)).toBe(`[aft] ${line}`);
-  });
+  for (const { name, line, expected } of [
+    {
+      name: "line already tagged with [aft] is left as-is (no doubling)",
+      line: "[aft] semantic index: rebuilding from scratch",
+      expected: "[aft] semantic index: rebuilding from scratch",
+    },
+    {
+      name: "line already tagged with [aft-lsp] is left as-is (preserves LSP tag)",
+      line: "[aft-lsp] [ses_abc123] failed to spawn TypeScript Language Server",
+      expected: "[aft-lsp] [ses_abc123] failed to spawn TypeScript Language Server",
+    },
+    {
+      name: "line tagged with [aft-bridge] (forward-compat with future tags) is preserved",
+      line: "[aft-bridge] something happened",
+      expected: "[aft-bridge] something happened",
+    },
+    {
+      name: "untagged line gets [aft] prepended (rare child-library output)",
+      line: "stack overflow at 0xdeadbeef",
+      expected: "[aft] stack overflow at 0xdeadbeef",
+    },
+    {
+      name: "line containing [aft] mid-string but starting differently is treated as untagged",
+      line: "panicked at 'unwrap on None'; see [aft] log for details",
+      expected: "[aft] panicked at 'unwrap on None'; see [aft] log for details",
+    },
+    {
+      name: "line with numeric subtag like [aft1] is NOT recognized as a tag",
+      line: "[aft1] weird",
+      expected: "[aft] [aft1] weird",
+    },
+  ]) {
+    test(name, () => {
+      expect(tagStderrLine(line)).toBe(expected);
+    });
+  }
 
   test("no double-tag regression for the canonical LSP spawn-failure shape", () => {
     // Reproduces the exact line shape that produced

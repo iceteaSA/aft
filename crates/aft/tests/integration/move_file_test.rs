@@ -1,7 +1,7 @@
 //! Integration tests for the `move_file` command, focused on error-message
 //! quality (BUG-7 from the dogfooding triage).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,18 @@ fn fake_server_path() -> PathBuf {
         .expect("fake-lsp-server binary path not set")
 }
 
-fn collect_watched_file_events(ctx: &AppContext, expected: usize) -> Vec<serde_json::Value> {
+fn watched_file_change_count(events: &[serde_json::Value]) -> usize {
+    events
+        .iter()
+        .filter_map(|event| event["changes"].as_array())
+        .map(Vec::len)
+        .sum()
+}
+
+fn collect_watched_file_events(
+    ctx: &AppContext,
+    expected_changes: usize,
+) -> Vec<serde_json::Value> {
     let mut collected = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -50,7 +61,7 @@ fn collect_watched_file_events(ctx: &AppContext, expected: usize) -> Vec<serde_j
             if let LspEvent::Notification { method, params, .. } = event {
                 if method == "custom/watchedFilesChanged" {
                     collected.push(params.expect("watched event params"));
-                    if collected.len() == expected {
+                    if watched_file_change_count(&collected) >= expected_changes {
                         return collected;
                     }
                 }
@@ -58,27 +69,20 @@ fn collect_watched_file_events(ctx: &AppContext, expected: usize) -> Vec<serde_j
         }
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(
-        !collected.is_empty(),
-        "timed out waiting for watched-file notification"
+
+    let actual_changes = watched_file_change_count(&collected);
+    panic!(
+        "timed out waiting for {expected_changes} watched-file changes; saw {actual_changes}: {collected:?}"
     );
-    collected
 }
 
-fn wait_for_publish(ctx: &AppContext) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        for event in ctx.lsp().drain_events() {
-            if matches!(
-                event,
-                LspEvent::Notification { method, .. } if method == "textDocument/publishDiagnostics"
-            ) {
-                return;
-            }
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for publishDiagnostics");
+fn notify_and_wait_for_publish(ctx: &AppContext, file_path: &Path, content: &str) {
+    let outcome =
+        ctx.lsp_notify_and_collect_diagnostics(file_path, content, Duration::from_secs(2));
+    assert!(
+        outcome.complete(),
+        "timed out waiting for publishDiagnostics: {outcome:?}"
+    );
 }
 
 #[test]
@@ -101,8 +105,7 @@ fn move_file_config_rename_notifies_deleted_and_created_in_one_event() {
     );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
-    ctx.lsp_notify_file_changed(&source, "export const open = 2;\n");
-    wait_for_publish(&ctx);
+    notify_and_wait_for_publish(&ctx, &source, "export const open = 2;\n");
 
     let req: RawRequest = serde_json::from_value(json!({
         "id": "move-tsconfig",

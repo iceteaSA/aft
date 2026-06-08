@@ -114,7 +114,6 @@ fn search_index_ready_status_does_not_wait_for_symbol_prewarm() {
     let mut aft =
         AftProcess::spawn_with_env(&[("AFT_TEST_SYMBOL_PREWARM_DELAY_MS", OsStr::new("5000"))]);
 
-    let configured_at = Instant::now();
     let configure = configure_search_index(&mut aft, project.path(), "cfg-prewarm-delay");
     assert_eq!(
         configure["success"], true,
@@ -123,10 +122,9 @@ fn search_index_ready_status_does_not_wait_for_symbol_prewarm() {
 
     let ready = wait_for_search_index_ready(&mut aft, Duration::from_secs(3));
     assert_eq!(ready["search_index"]["status"], "ready");
-    assert!(
-        configured_at.elapsed() < Duration::from_secs(5),
-        "search index readiness was blocked by symbol prewarm delay"
-    );
+    // Polling readiness while a 5s symbol prewarm delay is configured proves the
+    // ready status is not gated on prewarm, without comparing wall-clock elapsed
+    // time against the delay under shared CPU contention.
 
     let status = aft.shutdown();
     assert!(status.success());

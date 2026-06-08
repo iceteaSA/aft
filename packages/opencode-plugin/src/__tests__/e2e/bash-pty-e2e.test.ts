@@ -88,6 +88,30 @@ maybeDescribe("e2e bash PTY (OpenCode adapter + bridge + Rust)", () => {
     return String(await status.execute({ taskId, outputMode: "screen" }, runtime(h)));
   }
 
+  async function waitForScreenText(
+    status: ReturnType<typeof createBashStatusTool>,
+    h: E2EHarness,
+    taskId: string,
+    expected: string[],
+    timeoutMs = 5_000,
+  ): Promise<string> {
+    const started = Date.now();
+    let out = "";
+    while (Date.now() - started < timeoutMs) {
+      out = await screen(status, h, taskId);
+      if (expected.every((text) => out.includes(text))) return out;
+      await sleep(100);
+    }
+    throw new Error(
+      `timed out waiting for PTY screen to contain ${expected.join(", ")}; last screen:
+${out}`,
+    );
+  }
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   test.skipIf(!python)("Test 28: pty_e2e_python_repl", async () => {
     const { h, bash, status, write } = await pluginHarness();
     const launched = toolResultText(
@@ -96,13 +120,7 @@ maybeDescribe("e2e bash PTY (OpenCode adapter + bridge + Rust)", () => {
     const taskId = launched.match(/bash-[a-zA-Z0-9_-]+/)?.[0];
     expect(taskId).toBeDefined();
     await write.execute({ taskId, input: "print('hello')\n" }, runtime(h));
-    const started = Date.now();
-    let out = "";
-    while (Date.now() - started < 5_000) {
-      out = await screen(status, h, taskId!);
-      if (out.includes("hello")) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    const out = await waitForScreenText(status, h, taskId!, ["hello"]);
     expect(out).toContain("hello");
     await write.execute({ taskId, input: "exit()\n" }, runtime(h));
   });
@@ -115,13 +133,7 @@ maybeDescribe("e2e bash PTY (OpenCode adapter + bridge + Rust)", () => {
     );
     const taskId = launched.match(/bash-[a-zA-Z0-9_-]+/)?.[0];
     expect(taskId).toBeDefined();
-    const started = Date.now();
-    let out = "";
-    while (Date.now() - started < 5_000) {
-      out = await screen(status, h, taskId!);
-      if (out.includes("alpha") && out.includes("beta")) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    const out = await waitForScreenText(status, h, taskId!, ["alpha", "beta"]);
     expect(out).toContain("alpha");
     expect(out).toContain("beta");
   });

@@ -130,7 +130,6 @@ defineSearchParitySuite("e2e search parity", {
 defineSearchParitySuite("search-parity (indexed)", {
   experimentalSearchIndex: true,
   expectedIndexStatus: "ready",
-  indexBuildDelayMs: 500,
 });
 
 function defineSearchParitySuite(
@@ -138,7 +137,6 @@ function defineSearchParitySuite(
   options: {
     experimentalSearchIndex: boolean;
     expectedIndexStatus: string;
-    indexBuildDelayMs?: number;
   },
 ): void {
   maybeDescribe(name, () => {
@@ -166,8 +164,8 @@ function defineSearchParitySuite(
         experimentalSearchIndex: options.experimentalSearchIndex,
       });
 
-      if (options.indexBuildDelayMs) {
-        await delay(options.indexBuildDelayMs);
+      if (options.experimentalSearchIndex) {
+        await waitForSearchIndexStatus(created, options.expectedIndexStatus);
       }
 
       return created;
@@ -297,7 +295,30 @@ async function configureBridge(
   }
 }
 
-async function delay(ms: number): Promise<void> {
+async function waitForSearchIndexStatus(
+  harness: E2EHarness,
+  expectedIndexStatus: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const started = Date.now();
+  let lastStatus = "unknown";
+  while (Date.now() - started < timeoutMs) {
+    const response = await harness.bridge.send("grep", { pattern: "SearchIndex", path: "src" });
+    if (response.success !== true) {
+      throw new Error(
+        `index readiness grep failed: ${String(response.message ?? response.code ?? "unknown")}`,
+      );
+    }
+    lastStatus = String(response.index_status ?? "unknown").toLowerCase();
+    if (lastStatus === expectedIndexStatus) return;
+    await sleep(100);
+  }
+  throw new Error(
+    `timed out waiting for search index status ${expectedIndexStatus}; last status=${lastStatus}`,
+  );
+}
+
+async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 

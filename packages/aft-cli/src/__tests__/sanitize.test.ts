@@ -1,17 +1,12 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { homedir, userInfo } from "node:os";
 import { sanitizeContent, sanitizeValue } from "../lib/sanitize.js";
 
 describe("sanitizeContent", () => {
   const originalHome = homedir();
   const originalUser = userInfo().username;
-
-  afterEach(() => {
-    // These tests never mutate env/os, but keep the pattern in case future
-    // tests need it.
-  });
 
   test("replaces home directory with ~", () => {
     const input = `Error at ${originalHome}/foo/bar`;

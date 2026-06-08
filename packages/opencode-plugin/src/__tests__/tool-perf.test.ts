@@ -58,7 +58,6 @@ describe("tool-perf instrumentation", () => {
       bridged: makeTool(async () => {
         // Simulate the callBridge marks bracketing the bridge round-trip.
         markBridgeStart();
-        await new Promise((r) => setTimeout(r, 5));
         markBridgeEnd();
         return "done";
       }),
@@ -93,7 +92,6 @@ describe("tool-perf instrumentation", () => {
       multi: makeTool(async () => {
         markBridgeStart();
         markBridgeStart(); // ignored — first wins
-        await new Promise((r) => setTimeout(r, 2));
         markBridgeEnd();
         markBridgeEnd(); // last wins
         return "ok";

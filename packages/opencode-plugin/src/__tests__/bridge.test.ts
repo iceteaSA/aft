@@ -439,8 +439,8 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("crash error stays clean for the agent and points to the log", async () => {
-    // Fake binary: writes recognizable stderr lines, briefly sleeps so the
-    // bridge has time to queue `configure`, then exits non-zero.
+    // Fake binary: writes recognizable stderr lines, waits until the bridge
+    // queues `configure`, then exits non-zero.
     //
     // Agent-facing rejection contract: the rejection error must NOT carry
     // stderr tail noise (loaded N backups, invalidated K files, or — as in
@@ -454,10 +454,11 @@ describe("BinaryBridge lifecycle", () => {
         "#!/bin/sh",
         'echo "fatal: semantic index corrupted" >&2',
         'echo "caused by: bad cache magic" >&2',
-        // Sleep long enough for the bridge to write `configure` to stdin
+        // Wait for the bridge to write the first request (`configure`) to stdin
         // before the process dies, so the request is in `pending` when the
-        // exit handler runs.
-        "sleep 0.3",
+        // exit handler runs. This is the real synchronization point; a fixed
+        // sleep made the test flaky under CPU contention.
+        "IFS= read -r _ || true",
         "exit 1",
         "",
       ].join("\n"),

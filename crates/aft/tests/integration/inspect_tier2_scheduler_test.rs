@@ -166,14 +166,11 @@ fn inspect_stale_tier2_sets_pull_demand_without_blocking() {
     let base = Instant::now();
     ctx.reset_tier2_refresh_scheduler_at(base);
 
-    let started = Instant::now();
     let response = inspect(&ctx);
-    let elapsed = started.elapsed();
 
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "inspect should return promptly without running tier2 inline; elapsed={elapsed:?} response={response:#}"
-    );
+    // Pending scanner state plus pull demand is the non-flaky proof that inspect
+    // returned without running tier2 inline. Wall-clock promptness checks are
+    // noisy on the shared test host.
     assert!(
         scanner_state_contains(&response, "pending_categories", "dead_code"),
         "cold tier2 should be pending before the pull-triggered refresh: {response:#}"

@@ -45,6 +45,27 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+async function waitForBashTerminalStatus(
+  h: E2EHarness,
+  taskId: string,
+  sessionId: string,
+  timeoutMs = 5_000,
+): Promise<Record<string, unknown>> {
+  const started = Date.now();
+  let lastStatus: Record<string, unknown> = {};
+  while (Date.now() - started < timeoutMs) {
+    lastStatus = await h.bridge.send("bash_status", {
+      task_id: taskId,
+      session_id: sessionId,
+    });
+    if (lastStatus.status !== "running") return lastStatus;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(
+    `timed out waiting for ${taskId} to finish; last status=${String(lastStatus.status ?? "unknown")}`,
+  );
+}
+
 maybeDescribe("e2e bridge transport resilience (OpenCode)", () => {
   let preparedBinary: PreparedBinary = initialBinary;
   const harnesses: E2EHarness[] = [];
@@ -122,16 +143,11 @@ maybeDescribe("e2e bridge transport resilience (OpenCode)", () => {
     });
     expect(commandCollision.success).toBe(true);
     expect(commandCollision.status).toBe("running");
-    let status: Record<string, unknown> = {};
-    const started = Date.now();
-    while (Date.now() - started < 5_000) {
-      status = await h.bridge.send("bash_status", {
-        task_id: commandCollision.task_id,
-        session_id: "reserved-session",
-      });
-      if (status.status !== "running") break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
+    const status = await waitForBashTerminalStatus(
+      h,
+      String(commandCollision.task_id),
+      "reserved-session",
+    );
     expect(status.output_preview).toBe("collision-ok");
 
     const sessionSnapshot = await h.bridge.send("snapshot", {

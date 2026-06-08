@@ -2,6 +2,7 @@
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { join } from "node:path";
+import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import type { StatusCompression } from "../shared/status";
 
 // These module mocks are applied process-globally by Bun. Restore them after
@@ -49,15 +50,10 @@ const compression = (overrides: Partial<StatusCompression> = {}): StatusCompress
 });
 
 describe("sidebar compression rows", () => {
-  test("TUI storage resolution matches CortexKit storage without importing the bridge barrel", () => {
-    const original = process.env.XDG_DATA_HOME;
-    process.env.XDG_DATA_HOME = "/tmp/aft-tui-storage-test";
-    try {
+  test("TUI storage resolution matches CortexKit storage without importing the bridge barrel", async () => {
+    await withEnv({ XDG_DATA_HOME: "/tmp/aft-tui-storage-test" }, () => {
       expect(resolveTuiStorageDir()).toBe(join("/tmp/aft-tui-storage-test", "cortexkit", "aft"));
-    } finally {
-      if (original === undefined) delete process.env.XDG_DATA_HOME;
-      else process.env.XDG_DATA_HOME = original;
-    }
+    });
   });
 
   test("sidebar snapshot is scoped to the current directory and session", () => {

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { BridgePool, BridgeRequestOptions } from "@cortexkit/aft-bridge";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
+import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   __resetBgNotificationStateForTests,
   sessionBgStates,
@@ -495,18 +496,14 @@ describe("OpenCode bash adapter", () => {
 
     // Force a 0ms foreground wait so the promote path fires after the first
     // status poll (production floors the window at 5s; bun caps tests at 5s).
-    process.env.AFT_TEST_FOREGROUND_WAIT_MS = "0";
-    let output: string;
-    try {
-      output = bashText(
+    const output = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "0" }, async () =>
+      bashText(
         await bash.execute(
           { command: "sleep 2" },
           createMockSdkContext({ sessionID: "promote-session" }),
         ),
-      ) as string;
-    } finally {
-      delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
-    }
+      ),
+    );
 
     expect(output).toContain("promoted to background: task-promote");
     expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status", "bash_promote"]);
@@ -1199,18 +1196,14 @@ describe("OpenCode bash adapter — subagent gating", () => {
       undefined,
       { bash: { subagent_background: true } } as PluginContext["config"],
     );
-    process.env.AFT_TEST_FOREGROUND_WAIT_MS = "0";
-    let result: unknown;
-    try {
-      result = bashText(
+    const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "0" }, async () =>
+      bashText(
         await bash.execute(
           { command: "sleep 30" },
           createMockSdkContext({ sessionID: "ses_subagent_promote" }),
         ),
-      );
-    } finally {
-      delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
-    }
+      ),
+    );
     expect(result as string).toContain("promoted to background: bash-sub-promote");
     expect(result as string).toContain(
       'bash_watch({ taskId: "bash-sub-promote", timeoutMs: 60000 })',

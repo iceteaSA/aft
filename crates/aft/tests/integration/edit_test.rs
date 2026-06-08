@@ -48,6 +48,38 @@ fn path_with_node_bin(dir: &std::path::Path) -> std::ffi::OsString {
     paths.insert(0, dir.join("node_modules").join(".bin"));
     std::env::join_paths(paths).unwrap()
 }
+
+fn inline_lsp_diagnostics_fixture(
+    package_name: &str,
+    configure_id: &str,
+) -> (tempfile::TempDir, PathBuf, AftProcess) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("main.rs");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        &file,
+        "fn main() { let value = 1; println!(\"{}\", value); }\n",
+    )
+    .unwrap();
+
+    let fake_server = fake_server_path();
+    let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
+    let configure = aft.send(&format!(
+        r#"{{"id":"{configure_id}","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
+    ));
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    (dir, file, aft)
+}
 // ============================================================================
 // write command tests
 // ============================================================================
@@ -590,32 +622,7 @@ fn edit_match_single_occurrence() {
 
 #[test]
 fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let file = root.join("main.rs");
-    let cargo_toml = root.join("Cargo.toml");
-    fs::write(
-        &cargo_toml,
-        "[package]\nname = \"inline-diag\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(
-        &file,
-        "fn main() { let value = 1; println!(\"{}\", value); }\n",
-    )
-    .unwrap();
-
-    let fake_server = fake_server_path();
-    let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
-
-    let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root.display())
-    ));
-    assert_eq!(
-        configure["success"], true,
-        "configure failed: {configure:?}"
-    );
+    let (_dir, file, mut aft) = inline_lsp_diagnostics_fixture("inline-diag", "cfg-inline");
 
     let req = serde_json::json!({
         "id": "em-inline-diag",
@@ -655,32 +662,8 @@ fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
 
 #[test]
 fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let file = root.join("main.rs");
-    let cargo_toml = root.join("Cargo.toml");
-    fs::write(
-        &cargo_toml,
-        "[package]\nname = \"inline-diag-fast\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(
-        &file,
-        "fn main() { let value = 1; println!(\"{}\", value); }\n",
-    )
-    .unwrap();
-
-    let fake_server = fake_server_path();
-    let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
-
-    let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline-fast","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root.display())
-    ));
-    assert_eq!(
-        configure["success"], true,
-        "configure failed: {configure:?}"
-    );
+    let (_dir, file, mut aft) =
+        inline_lsp_diagnostics_fixture("inline-diag-fast", "cfg-inline-fast");
 
     let start = std::time::Instant::now();
     let req = serde_json::json!({

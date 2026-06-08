@@ -1,7 +1,5 @@
 use std::fs;
 use std::path::PathBuf;
-use std::thread;
-use std::time::Duration;
 
 use aft::commands::lsp_find_references::handle_lsp_find_references;
 use aft::commands::lsp_goto_definition::handle_lsp_goto_definition;
@@ -51,11 +49,6 @@ fn app_context_with_fake_lsp() -> AppContext {
     ctx
 }
 
-fn wait_for_server(ctx: &AppContext) {
-    thread::sleep(Duration::from_millis(200));
-    ctx.lsp().drain_events();
-}
-
 #[test]
 fn test_lsp_hover_returns_content() {
     let (_temp_dir, main_rs) = rust_workspace_with_file();
@@ -71,7 +64,6 @@ fn test_lsp_hover_returns_content() {
     .expect("request parses");
 
     let response = handle_lsp_hover(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], true, "expected success: {json:#}");
@@ -102,7 +94,6 @@ fn test_lsp_hover_no_info() {
     .expect("request parses");
 
     let response = handle_lsp_hover(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], true, "expected success: {json:#}");
@@ -127,7 +118,6 @@ fn test_lsp_goto_definition_single() {
     .expect("request parses");
 
     let response = handle_lsp_goto_definition(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], true, "expected success: {json:#}");
@@ -161,7 +151,6 @@ fn test_lsp_find_references_multiple() {
     .expect("request parses");
 
     let response = handle_lsp_find_references(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], true, "expected success: {json:#}");
@@ -200,7 +189,6 @@ fn test_lsp_find_references_with_declaration() {
     .expect("request parses");
 
     let response = handle_lsp_find_references(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], true, "expected success: {json:#}");
@@ -233,7 +221,6 @@ fn test_lsp_find_references_defaults_include_declaration_true() {
     .expect("request parses");
 
     let response = handle_lsp_find_references(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], true, "expected success: {json:#}");

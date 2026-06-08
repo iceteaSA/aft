@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -217,8 +217,17 @@ describe("AFT RPC auth", () => {
   test("client call can be aborted while an RPC request is in flight", async () => {
     const fixture = makeFixture();
     const server = new AftRpcServer(fixture.storageDir, fixture.directory);
+    let markHandlerStarted!: () => void;
+    const handlerStarted = new Promise<void>((resolve) => {
+      markHandlerStarted = resolve;
+    });
+    let releaseHandler!: () => void;
+    const keepHandlerOpen = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
     server.handle("slow", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      markHandlerStarted();
+      await keepHandlerOpen;
       return { ok: true };
     });
 
@@ -227,10 +236,13 @@ describe("AFT RPC auth", () => {
       const client = new AftRpcClient(fixture.storageDir, fixture.directory);
       const controller = new AbortController();
       const pending = client.call("slow", {}, { signal: controller.signal });
-      setTimeout(() => controller.abort(), 10);
 
+      await handlerStarted;
+      controller.abort();
+      releaseHandler();
       await expect(pending).rejects.toThrow();
     } finally {
+      releaseHandler();
       server.stop();
     }
   });
@@ -379,10 +391,13 @@ describe("AFT RPC auth", () => {
     older.handle("echo", async () => ({ which: "older" }));
     const newer = new AftRpcServer(fixture.storageDir, fixture.directory);
     newer.handle("echo", async () => ({ which: "newer" }));
+    let now = 1_000;
+    const dateNow = spyOn(Date, "now").mockImplementation(() => now);
     try {
       await older.start();
-      // Ensure a distinct, later started_at for the newer server.
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      // The client orders candidates by the recorded started_at field; set it
+      // deterministically instead of sleeping and hoping the clock advances.
+      now = 2_000;
       await newer.start();
 
       const client = new AftRpcClient(fixture.storageDir, fixture.directory);
@@ -390,6 +405,7 @@ describe("AFT RPC auth", () => {
       // Both are live (same pid, this test process); newest-by-started_at wins.
       expect(result.which).toBe("newer");
     } finally {
+      dateNow.mockRestore();
       older.stop();
       newer.stop();
     }

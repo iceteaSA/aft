@@ -314,7 +314,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     expect(running.success).toBe(true);
     expect(running.status).toBe("running");
 
-    const completed = await waitForStatus(h, taskId, "completed");
+    const completed = await waitForStatus(h.bridge, taskId, "completed");
     expect(completed.exit_code).toBe(0);
     expect(completed.output_preview).toBe("done\n");
   });
@@ -420,7 +420,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const pluginBridge = pool.getBridge(h.tempDir);
     const spawned = await pluginBridge.send("bash", { command: "echo bg-done", background: true });
     const taskId = String(spawned.task_id);
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitForStatus(pluginBridge, taskId, "completed");
 
     const result = await callBash(bash, h, { command: "echo foreground" });
 
@@ -440,15 +440,19 @@ function toConfigureOverrides(config: Record<string, unknown>): Record<string, u
   };
 }
 
-async function waitForStatus(h: Harness, taskId: string, expected: string) {
+async function waitForStatus(
+  bridge: Pick<Harness["bridge"], "send">,
+  taskId: string,
+  expected: string,
+) {
   const started = Date.now();
   while (Date.now() - started < 5_000) {
-    const response = await h.bridge.send("bash_status", { task_id: taskId });
+    const response = await bridge.send("bash_status", { task_id: taskId });
     expect(response.success).toBe(true);
     if (response.status === expected) return response;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error(`timed out waiting for ${expected}`);
+  throw new Error(`timed out waiting for ${taskId} to reach ${expected}`);
 }
 async function waitForToolStatus(
   h: Harness,

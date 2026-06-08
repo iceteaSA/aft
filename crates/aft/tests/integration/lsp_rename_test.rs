@@ -50,11 +50,6 @@ fn app_context_with_fake_lsp() -> AppContext {
     ctx
 }
 
-fn wait_for_server(ctx: &AppContext) {
-    thread::sleep(Duration::from_millis(200));
-    ctx.lsp().drain_events();
-}
-
 fn collect_event<F>(ctx: &AppContext, predicate: F) -> Option<LspEvent>
 where
     F: Fn(&LspEvent) -> bool,
@@ -114,7 +109,6 @@ fn test_prepare_rename_success() {
     .expect("request parses");
 
     let response = handle_lsp_prepare_rename(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], true, "expected success: {json:#}");
@@ -142,7 +136,6 @@ fn test_rename_applies_changes() {
     .expect("request parses");
 
     let response = handle_lsp_rename(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], true, "expected success: {json:#}");
@@ -156,7 +149,6 @@ fn test_rename_applies_changes() {
         content.contains("println!(\"hello\");"),
         "content was: {content}"
     );
-    assert!(content.contains("\ngreet\n"), "content was: {content}");
     assert!(content.contains("\ngreet\n"), "content was: {content}");
 }
 
@@ -177,7 +169,6 @@ fn test_rename_rollback_on_failure() {
     .expect("request parses");
 
     let response = handle_lsp_rename(&req, &ctx);
-    wait_for_server(&ctx);
     let json = serde_json::to_value(&response).expect("response serializes");
 
     assert_eq!(json["success"], false, "expected failure: {json:#}");
