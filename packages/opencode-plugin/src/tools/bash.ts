@@ -246,6 +246,10 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
           trackBgTask(context.sessionID, taskId);
           let startedLine = formatBackgroundLaunch(taskId, requestedPty);
           if (isSubagent && allowSubagentBg) startedLine += subagentGuidance(taskId);
+          // Tell the agent the pipe was stripped even on the background path, so
+          // when they later read the task output they know why it isn't filtered
+          // and can re-run with compressed:false to keep their pipeline.
+          startedLine = appendPipeStripNote(startedLine, pipeStrip.note);
           const metadataPayload = { description, output: startedLine, status: "running", taskId };
           metadata?.(metadataPayload);
           return { output: startedLine, title: uiTitle, metadata: metadataPayload };
@@ -304,6 +308,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
             trackBgTask(context.sessionID, taskId);
             let message = formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs);
             if (isSubagent && allowSubagentBg) message += subagentGuidance(taskId);
+            message = appendPipeStripNote(message, pipeStrip.note);
             const metadataPayload = { description, output: message, status: "running", taskId };
             metadata?.(metadataPayload);
             return { output: message, title: uiTitle, metadata: metadataPayload };

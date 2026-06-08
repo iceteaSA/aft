@@ -71,6 +71,86 @@ describe("maybeStripCompressorPipe", () => {
     expect(maybeStripCompressorPipe("bun test | wc -l", true).stripped).toBe(false);
   });
 
+  test("BAILS on filter-stage redirection — stripping would lose the written file", () => {
+    // `> failures.txt` is a real side effect produced by the dropped filter
+    // stage; silently dropping it is data loss.
+    expect(maybeStripCompressorPipe("bun test | grep FAIL > failures.txt", true).stripped).toBe(
+      false,
+    );
+    expect(maybeStripCompressorPipe("bun test | grep FAIL >> failures.txt", true).stripped).toBe(
+      false,
+    );
+    expect(maybeStripCompressorPipe("cargo test | grep err 2> errs.log", true).stripped).toBe(
+      false,
+    );
+    // `2>&1` on the RUNNER stage is fine — it survives the strip.
+    expect(maybeStripCompressorPipe("bun test 2>&1 | grep FAIL", true).command).toBe(
+      "bun test 2>&1",
+    );
+  });
+
+  test("BAILS on backgrounding (`&`) — changes execution semantics", () => {
+    expect(maybeStripCompressorPipe("bun test | grep FAIL &", true).stripped).toBe(false);
+  });
+
+  test("BAILS on command-substitution / backticks / process-substitution (misparse risk)", () => {
+    // The naive pipe-splitter would carve at the INNER pipe and rebuild a
+    // malformed runner; never strip when these constructs are present.
+    expect(
+      maybeStripCompressorPipe(
+        "pytest $(find tests -name '*_test.py' | head -20) | grep FAILED",
+        true,
+      ).stripped,
+    ).toBe(false);
+    expect(maybeStripCompressorPipe("bun test | grep -f <(printf 'fail')", true).stripped).toBe(
+      false,
+    );
+    expect(maybeStripCompressorPipe("bun test | grep `cat pat`", true).stripped).toBe(false);
+  });
+
+  test("TIGHTEN: xcodebuild strips only for test/build, not query subcommands", () => {
+    expect(maybeStripCompressorPipe("xcodebuild -list | grep Schemes", true).stripped).toBe(false);
+    expect(
+      maybeStripCompressorPipe("xcodebuild -showBuildSettings | grep BUNDLE", true).stripped,
+    ).toBe(false);
+    expect(maybeStripCompressorPipe("xcodebuild test | tail -5", true).stripped).toBe(true);
+  });
+
+  test("TIGHTEN: make/gradle/mvn bail when a stateful goal rides along an allowed task", () => {
+    expect(maybeStripCompressorPipe("make deploy test | tail", true).stripped).toBe(false);
+    expect(maybeStripCompressorPipe("gradle publish test | grep FAIL", true).stripped).toBe(false);
+    expect(maybeStripCompressorPipe("mvn deploy test | tail", true).stripped).toBe(false);
+    // pure test/build invocations (incl. the idiomatic `clean test`) still strip
+    expect(maybeStripCompressorPipe("make test | grep Error", true).stripped).toBe(true);
+    expect(maybeStripCompressorPipe("gradle clean test | tail", true).stripped).toBe(true);
+    expect(maybeStripCompressorPipe("gradle test --info | grep FAIL", true).stripped).toBe(true);
+  });
+
+  test("TIGHTEN: rake strips only exact test/spec tasks, not arbitrary project tasks", () => {
+    expect(maybeStripCompressorPipe("rake test_db_reset | tail", true).stripped).toBe(false);
+    expect(maybeStripCompressorPipe("rake test | tail", true).stripped).toBe(true);
+    expect(maybeStripCompressorPipe("rake spec | grep fail", true).stripped).toBe(true);
+  });
+
+  test("BAILS on subshell / grouping parens — stripping would leave them unbalanced", () => {
+    // `(cd d && bun test | tail)` → stripping `| tail` leaves `(cd d && bun test`
+    // which is a syntax error. The splitter can't track paren balance, so bail.
+    expect(maybeStripCompressorPipe("(cd packages/x && bun test | tail -4)", true).stripped).toBe(
+      false,
+    );
+    expect(maybeStripCompressorPipe("(bun test | grep fail)", true).stripped).toBe(false);
+  });
+
+  test("footgun stays covered: a transform stage in the chain still strips (no regression)", () => {
+    // The exact `grep | sed | head` shape that previously leaked failures.
+    const r = maybeStripCompressorPipe(
+      'bun test 2>&1 | grep -E "fail" | sed -E "s/ ms//" | head -20',
+      true,
+    );
+    expect(r.stripped).toBe(true);
+    expect(r.command).toBe("bun test 2>&1");
+  });
+
   test("does not split on pipes inside quotes", () => {
     expect(maybeStripCompressorPipe('bun test --name "a|b"', true)).toEqual({
       command: 'bun test --name "a|b"',

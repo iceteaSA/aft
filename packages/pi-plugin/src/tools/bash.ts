@@ -389,9 +389,15 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       if (response.status === "running" && taskId) {
         if (effectiveBackground) {
           trackBgTask(resolveSessionId(extCtx), taskId);
-          return bashResult(formatBackgroundLaunch(taskId, params.pty === true), {
-            task_id: taskId,
-          });
+          // Surface the strip note on the background path too, so the agent
+          // knows their pipe was dropped when they read the task output later.
+          return bashResult(
+            appendPipeStripNote(
+              formatBackgroundLaunch(taskId, params.pty === true),
+              pipeStrip.note,
+            ),
+            { task_id: taskId },
+          );
         }
 
         // Wait-window decoupled from params.timeout. Always cap polling at
@@ -434,9 +440,13 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
             trackBgTask(resolveSessionId(extCtx), taskId);
-            return bashResult(formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs), {
-              task_id: taskId,
-            });
+            return bashResult(
+              appendPipeStripNote(
+                formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs),
+                pipeStrip.note,
+              ),
+              { task_id: taskId },
+            );
           }
           await sleep(FOREGROUND_POLL_INTERVAL_MS);
         }

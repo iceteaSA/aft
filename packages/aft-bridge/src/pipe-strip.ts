@@ -47,6 +47,14 @@ export function maybeStripCompressorPipe(
 ): PipeStripResult {
   if (!compressionEnabled) return { command, stripped: false };
 
+  // Bail on shell constructs our lightweight pipe-splitter cannot reason about
+  // safely. Command substitution / backticks / process substitution can embed
+  // their own pipes, so naive top-level splitting would carve the command at an
+  // INNER pipe and rebuild a malformed runner (e.g.
+  // `pytest $(find . | head) | grep FAIL` → `pytest $(find .`). Never strip
+  // when these appear anywhere.
+  if (containsUnsplittableConstruct(command)) return { command, stripped: false };
+
   // Peel a leading `cmd && ... &&` prefix (e.g. `cd dir && bun test | grep`).
   // Since `&&` binds looser than `|`, `A && B | C` means `A && (B | C)`, so the
   // pipeline to strip is the LAST `&&`-segment and the earlier segments are a
@@ -67,6 +75,13 @@ export function maybeStripCompressorPipe(
 
   const filterStages = stages.slice(1).map((stage) => stage.trim());
   for (const stage of filterStages) {
+    // A redirection or backgrounding on a filter stage produces a real side
+    // effect (a written file) or changes execution semantics — dropping the
+    // stage would silently lose it. Bail. Covers `bun test | grep FAIL > out`,
+    // `... | tee` (tee isn't a noise filter anyway), and `... | grep FAIL &`.
+    // (Redirects like `2>&1` on the RUNNER stage are fine — they survive the
+    // strip — so this check is only applied to the dropped filter stages.)
+    if (hasFilterSideEffect(stage)) return { command, stripped: false };
     if (!isPlainNoiseFilter(stage)) return { command, stripped: false };
   }
 
@@ -220,8 +235,10 @@ function isCompressorHandledRunner(stage: string): boolean {
   if (first === "go") return ["test", "build", "vet"].includes(second ?? "");
 
   // --- Java / JVM (tasks can appear anywhere: `gradle clean test`) ---
+  // `clean` is allowed — `clean test`/`clean build` is the canonical fresh run
+  // and only removes build output, unlike stateful goals (publish/deploy).
   if (first === "gradle" || first === "gradlew") {
-    return hasBuildTask(rest, ["test", "check", "build", "assemble"]);
+    return hasBuildTask(rest, ["test", "check", "build", "assemble", "clean"]);
   }
   if (first === "mvn" || first === "mvnw") {
     return hasBuildTask(rest, ["test", "verify", "package", "install"]);
@@ -232,19 +249,24 @@ function isCompressorHandledRunner(stage: string): boolean {
 
   // --- Ruby ---
   if (first === "rspec") return true;
-  if (first === "rake") return startsWithTest(second) || second === "spec";
+  // Exact task match only — `rake test`/`rake spec`, not arbitrary
+  // project tasks like `rake test_db_reset` that merely start with "test".
+  if (first === "rake") return second === "test" || second === "spec";
 
   // --- PHP ---
   if (first === "phpunit" || first === "pest") return true;
 
   // --- Apple / Swift ---
-  if (first === "xcodebuild") return true;
+  // Only the build/test invocations — NOT query commands like
+  // `xcodebuild -list` / `xcodebuild -showBuildSettings` whose piped output is
+  // the agent's actual intent.
+  if (first === "xcodebuild") return rest.includes("test") || rest.includes("build");
   if (first === "swift") return second === "test" || second === "build";
 
   // --- Make (require an explicit test/lint target — bare `make` is a generic
   //     build that may legitimately be grepped for errors) ---
   if (first === "make" || first === "gmake") {
-    return hasBuildTask(rest, ["test", "check", "lint"]);
+    return hasBuildTask(rest, ["test", "check", "lint", "clean"]);
   }
 
   // --- Bare test / lint / typecheck runners ---
@@ -270,16 +292,101 @@ function runnerName(token: string | undefined): string {
 }
 
 /**
- * Does any argument name one of the given build/test tasks? Matches the bare
- * task (`test`) and qualified Gradle forms (`:app:test`), but not substrings
- * (`my-test-module` does not match `test`).
+ * Should a make/gradle/mvn invocation be treated as a pure test/build run that
+ * is safe to strip? Requires (1) at least one of the allowed tasks present, and
+ * (2) EVERY positional (non-flag) arg to be an allowed task — so a mixed
+ * invocation like `make deploy test` or `gradle publish test` bails, because
+ * the stateful goal (deploy/publish) is the real intent whose output matters.
+ *
+ * Allowed-task match accepts the bare task (`test`) and qualified Gradle forms
+ * (`:app:test`), but not substrings (`my-test-module` ≠ `test`). Flags
+ * (`-x`, `--info`, `-Dkey=val`) and `key=value` make/property args are ignored.
  */
 function hasBuildTask(args: string[], tasks: string[]): boolean {
-  return args.some((arg) => tasks.some((task) => arg === task || arg.endsWith(`:${task}`)));
+  const isAllowedTask = (arg: string): boolean =>
+    tasks.some((task) => arg === task || arg.endsWith(`:${task}`));
+  const isFlagOrProperty = (arg: string): boolean => arg.startsWith("-") || arg.includes("=");
+
+  let sawAllowed = false;
+  for (const arg of args) {
+    if (isFlagOrProperty(arg)) continue;
+    if (!isAllowedTask(arg)) return false; // a non-flag positional that isn't an allowed task
+    sawAllowed = true;
+  }
+  return sawAllowed;
 }
 
 function startsWithTest(token: string | undefined): boolean {
   return token?.startsWith("test") === true;
+}
+
+/**
+ * Does the command contain a shell construct that can embed its own pipe and so
+ * break naive top-level pipe-splitting? Command substitution `$(...)`,
+ * backticks, process substitution `<(...)`/`>(...)`, and any subshell/grouping
+ * parentheses `( ... )`. The splitter tracks neither nesting nor paren balance,
+ * so a pipe inside (or a paren spanning) any of these would be mis-split or
+ * leave unbalanced parens after the strip (e.g. `(cd d && bun test | tail)`
+ * → `(cd d && bun test`). Quote-aware so a literal `(` inside quotes is fine.
+ */
+function containsUnsplittableConstruct(command: string): boolean {
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === "`") return true;
+    // Any unquoted paren — command/process substitution, subshell, or grouping.
+    if (char === "(" || char === ")") return true;
+  }
+  return false;
+}
+
+/**
+ * Does a (to-be-dropped) filter stage carry a real side effect — output
+ * redirection (`>`, `>>`, `2>`, `<`) or backgrounding (`&`)? Such a stage
+ * cannot be silently dropped. Quote-aware. Note: process substitution `>(`/`<(`
+ * is already rejected upstream by {@link containsUnsplittableConstruct}.
+ */
+function hasFilterSideEffect(stage: string): boolean {
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  for (let i = 0; i < stage.length; i++) {
+    const char = stage[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === ">" || char === "<" || char === "&") return true;
+  }
+  return false;
 }
 
 function isPlainNoiseFilter(stage: string): boolean {
