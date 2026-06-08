@@ -30,7 +30,12 @@ pub fn terminate_pgid(pgid: i32, mut child: Option<&mut Child>) {
     while grace_started.elapsed() < TERMINATE_GRACE {
         if let Some(child) = child.as_deref_mut() {
             if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
+                // The direct child (process-group leader) exited. Stop waiting,
+                // but still SIGKILL the whole group below — a descendant that
+                // ignored SIGTERM can outlive the leader (the wrapper-shell /
+                // CLI-spawns-child orphan class). killpg on an already-empty
+                // group is a harmless ESRCH.
+                break;
             }
         }
         thread::sleep(Duration::from_millis(50));
@@ -126,5 +131,68 @@ mod tests {
         child.wait().expect("wait for child");
 
         assert!(!is_process_alive(pid));
+    }
+
+    /// Regression: when the process-group LEADER exits during the SIGTERM grace
+    /// window, `terminate_pgid` must still SIGKILL the rest of the group. A
+    /// TERM-ignoring descendant (the wrapper-shell / CLI-spawns-child orphan
+    /// class) used to survive because the old code returned the instant the
+    /// leader was reaped, skipping the group SIGKILL.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_pgid_kills_term_ignoring_descendant_after_leader_exits() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("desc.pid");
+        let ready = dir.path().join("ready");
+
+        // Leader becomes its own process-group leader (setsid → pgid == pid).
+        // It backgrounds a descendant shell that ignores SIGTERM, signals
+        // readiness (so the trap is definitely installed before we terminate),
+        // then sleeps. The leader waits for readiness and exits — so by the time
+        // we call terminate_pgid, the leader is gone and only SIGKILL can reap
+        // the descendant.
+        let script = format!(
+            "sh -c \"trap '' TERM; echo \\$$ > '{pid}'; touch '{ready}'; sleep 30\" & \
+             while [ ! -f '{ready}' ]; do sleep 0.02; done; exit 0",
+            pid = pidfile.display(),
+            ready = ready.display(),
+        );
+        let mut leader = unsafe {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+                .expect("spawn leader")
+        };
+        let pgid = leader.id() as i32;
+
+        // Wait for the descendant to be ready (trap installed + pid written).
+        let start = Instant::now();
+        while !ready.exists() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let desc_pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("descendant pid file")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        assert!(is_process_alive(desc_pid), "descendant should be alive");
+
+        terminate_pgid(pgid, Some(&mut leader));
+
+        // The TERM-ignoring descendant must be gone (SIGKILL'd via the group).
+        let start = Instant::now();
+        while is_process_alive(desc_pid) && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !is_process_alive(desc_pid),
+            "TERM-ignoring descendant must be SIGKILLed when the group is terminated"
+        );
     }
 }
