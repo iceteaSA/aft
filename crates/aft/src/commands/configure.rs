@@ -28,7 +28,7 @@ use crate::search_index::{
     walk_project_files_bounded_matching, CacheLock, SearchIndex,
 };
 use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
-use crate::{slog_info, slog_warn};
+use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -2429,6 +2429,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Sync compression/filter state before snapshotting the async warning worker.
     ctx.sync_bash_compress_flag();
     ctx.reset_filter_registry();
+
+    // Forget cached LSP spawn FAILURES on every configure. A configure means
+    // something changed (the user may have just installed the missing server,
+    // fixed PATH, or changed a version pin), so a previously-failed server
+    // should be retried on the next file event instead of staying skipped until
+    // a full restart. Bounded — configure is not a per-request hot path.
+    let cleared = ctx.lsp().clear_failed_spawns();
+    if cleared > 0 {
+        slog_debug!(
+            "configure: cleared {} cached LSP spawn failure(s) for retry",
+            cleared
+        );
+    }
 
     let configure_generation = ctx.advance_configure_generation();
     let config_snapshot = ctx.config().clone();

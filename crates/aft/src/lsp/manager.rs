@@ -1422,6 +1422,34 @@ impl LspManager {
     /// name, which reproduces the publish-time key even across `/var`↔
     /// `/private/var`-style symlink aliasing. Returns true if anything was
     /// removed.
+    /// Forget all cached spawn FAILURES so the next file event retries them.
+    /// Called on `configure`: a configure means something changed (the user may
+    /// have just installed the missing language server, or fixed PATH / a
+    /// version pin), so a previously-failed (kind, root) pair deserves a fresh
+    /// attempt instead of being skipped until a full restart. Bounded: configure
+    /// is not a per-request hot path, so this cannot cause a spawn storm.
+    /// Returns the number of cleared entries.
+    pub fn clear_failed_spawns(&mut self) -> usize {
+        let n = self.failed_spawns.len();
+        self.failed_spawns.clear();
+        n
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_failed_spawn_for_test(&mut self) {
+        let key = ServerKey {
+            kind: crate::lsp::registry::ServerKind::Rust,
+            root: std::path::PathBuf::from("/tmp/test-root"),
+        };
+        self.failed_spawns.insert(
+            key,
+            ServerAttemptResult::SpawnFailed {
+                binary: "rust-analyzer".to_string(),
+                reason: "test".to_string(),
+            },
+        );
+    }
+
     pub fn clear_diagnostics_for_file(&mut self, file: &Path) -> bool {
         let mut removed = self.diagnostics.clear_for_file(file);
 
@@ -1912,6 +1940,17 @@ mod diagnostic_capacity_tests {
         assert_eq!(manager.diagnostics_store_for_test().capacity_for_test(), 7);
         manager.set_diagnostic_capacity(0); // 0 = unbounded
         assert_eq!(manager.diagnostics_store_for_test().capacity_for_test(), 0);
+    }
+
+    // configure clears cached spawn failures so a just-installed server retries
+    // without a full restart.
+    #[test]
+    fn clear_failed_spawns_empties_the_cache() {
+        let mut manager = LspManager::new();
+        assert_eq!(manager.clear_failed_spawns(), 0);
+        manager.insert_failed_spawn_for_test();
+        assert_eq!(manager.clear_failed_spawns(), 1);
+        assert_eq!(manager.clear_failed_spawns(), 0);
     }
 }
 
