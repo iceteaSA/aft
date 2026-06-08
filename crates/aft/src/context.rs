@@ -1660,7 +1660,10 @@ impl AppContext {
     }
 
     fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
-        if self.is_worktree_bridge() {
+        if self.is_worktree_bridge()
+            || self.degraded_reasons.borrow().iter().any(|r| r == "home_root")
+            || !self.config().inspect.enabled
+        {
             return;
         }
         let Some(snapshot) = self.tier2_refresh_snapshot() else {

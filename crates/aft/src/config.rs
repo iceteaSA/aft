@@ -79,6 +79,18 @@ impl Default for SemanticBackendConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InspectConfig {
+    pub enabled: bool,
+}
+
+impl Default for InspectConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 impl Config {
@@ -153,6 +165,7 @@ pub struct Config {
     /// very large projects if you accept multi-minute per-call latency).
     pub max_callgraph_files: usize,
     pub semantic: SemanticBackendConfig,
+    pub inspect: InspectConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
@@ -244,6 +257,7 @@ impl Default for Config {
             // dead-code snapshots, and `aft_refactor op="move"`.
             max_callgraph_files: 5_000,
             semantic: SemanticBackendConfig::default(),
+            inspect: InspectConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),

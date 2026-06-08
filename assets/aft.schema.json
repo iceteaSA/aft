@@ -375,6 +375,24 @@
       "type": "boolean",
       "default": true,
       "description": "OpenCode only: auto-refresh the cached @cortexkit/aft-opencode package when a newer channel version is published. User-scoped only — project configs cannot disable updates silently."
+    },
+    "inspect": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable codebase health inspection and background scans. Set false to disable aft_inspect and turn off Tier-2 scans entirely."
+        },
+        "tier2_idle_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "Delay in minutes after session activity before triggering background Tier-2 scans."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Codebase health inspection configuration."
     }
   },
   "additionalProperties": false

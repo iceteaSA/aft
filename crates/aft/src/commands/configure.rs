@@ -439,6 +439,26 @@ fn semantic_fingerprint_config_changed(
         || previous.base_url != next.base_url
 }
 
+fn parse_inspect_config(
+    value: &serde_json::Value,
+    current: &crate::config::InspectConfig,
+) -> Result<crate::config::InspectConfig, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("configure: inspect must be an object".to_string());
+    };
+
+    let mut inspect = current.clone();
+
+    if let Some(raw) = obj.get("enabled") {
+        let Some(value) = raw.as_bool() else {
+            return Err("configure: inspect.enabled must be a boolean".to_string());
+        };
+        inspect.enabled = value;
+    }
+
+    Ok(inspect)
+}
+
 fn parse_semantic_config(
     value: &serde_json::Value,
     current: &SemanticBackendConfig,
@@ -1634,6 +1654,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
     }
+    if let Some(v) = params.get("inspect") {
+        next_config.inspect = match parse_inspect_config(v, &next_config.inspect) {
+            Ok(config) => config,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+    }
     if let Some(raw) = params.get("max_callgraph_files") {
         // Reject invalid values explicitly so user typos surface instead of
         // being silently swallowed (Oracle v0.15.1 review blocker).
@@ -2394,7 +2420,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Spawn file watcher for live invalidation off the configure foreground.
     // FSEvents startup can synchronously wait for seconds on very large roots;
     // configure should return while the watcher attaches in the background.
-    install_project_watcher(ctx, &canonical_cache_root);
+    if !home_match {
+        install_project_watcher(ctx, &canonical_cache_root);
+    }
 
     slog_info!("project root set: {}", root_path.display());
 
@@ -2410,7 +2438,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // On a normal project this finishes in <1 s and pushes a
     // `ConfigureWarningsFrame` for the plugin to surface; on a huge directory
     // it may take seconds-to-minutes, but configure itself returns now.
-    if ctx.progress_sender_handle().is_some() {
+    let warnings_pending = !home_match && ctx.progress_sender_handle().is_some();
+    if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
         let warning_generation = configure_generation;
         let walk_root = root_path.clone();
@@ -2464,7 +2493,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "max_callgraph_files": config_snapshot.max_callgraph_files,
             "source_file_count_bounded": true,
             "warnings": [],
-            "warnings_pending": true,
+            "warnings_pending": warnings_pending,
             "search_index_cache_reused": search_index_cache_reused,
         }),
     );
