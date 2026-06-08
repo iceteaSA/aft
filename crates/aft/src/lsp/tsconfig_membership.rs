@@ -248,6 +248,14 @@ fn build_resolved_config(tsconfig_dir: &Path, fields: ResolvedFields) -> Option<
 
     let include = if let Some(field) = fields.include.as_ref() {
         PatternGroup::new(vec![compile_origin_globs(&field.origin_dir, &field.value)?])
+    } else if fields.files.is_some() {
+        // TypeScript semantics: when `files` is specified and `include` is
+        // absent, ONLY the listed files are members — `include` does NOT default
+        // to `**/*`. Defaulting it here made a files-only tsconfig match every
+        // file, so build-excluded files leaked into the status-bar / aft_inspect
+        // diagnostic counts. An empty include matches nothing; `files` membership
+        // is still handled by the explicit list in ResolvedTsConfig::contains.
+        PatternGroup::new(Vec::new())
     } else {
         PatternGroup::new(vec![compile_origin_globs(
             tsconfig_dir,
@@ -616,6 +624,31 @@ mod tests {
 
         let mut cache = TsconfigMembershipCache::new();
         assert!(!cache.should_skip_diagnostics(&test_file));
+    }
+
+    #[test]
+    fn files_only_tsconfig_excludes_unlisted_files() {
+        // `files` present + `include` absent → ONLY the listed files are members;
+        // `include` must NOT default to **/*. An unlisted sibling should be
+        // skipped (not counted in diagnostics).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("tsconfig.json"),
+            r#"{
+              "files": ["src/entry.ts"]
+            }"#,
+        );
+        let listed = root.join("src/entry.ts");
+        let unlisted = root.join("src/other.ts");
+        write(&listed, "export const a = 1;\n");
+        write(&unlisted, "export const b = 2;\n");
+
+        let mut cache = TsconfigMembershipCache::new();
+        // Listed file is a member (not skipped).
+        assert!(!cache.should_skip_diagnostics(&listed));
+        // Unlisted file is NOT a member → skipped.
+        assert!(cache.should_skip_diagnostics(&unlisted));
     }
 
     #[test]
