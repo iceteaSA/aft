@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -12,8 +13,9 @@ use crate::context::AppContext;
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
-    build_path_filters, has_any_project_file_from, read_searchable_text, resolve_search_scope,
-    sort_grep_matches_by_mtime_desc, walk_project_files_from, GrepMatch, GrepResult, IndexStatus,
+    build_path_filters, for_each_walk_project_file_from, has_any_project_file_from,
+    read_searchable_text, resolve_search_scope, sort_grep_matches_by_mtime_desc,
+    walk_project_files_from, GrepMatch, GrepResult, IndexStatus,
 };
 
 #[derive(Clone, Debug)]
@@ -361,6 +363,29 @@ pub fn weakest_index_status(left: IndexStatus, right: IndexStatus) -> IndexStatu
     }
 }
 
+/// Hidden entry for `search_startup_bench` timing (fallback grep path).
+#[doc(hidden)]
+pub fn fallback_grep_bench(
+    project_root: &Path,
+    search_root: &Path,
+    filter_root: &Path,
+    pattern: &CompiledPattern,
+    include: &[String],
+    exclude: &[String],
+    max_results: usize,
+) -> GrepResult {
+    fallback_grep(
+        project_root,
+        search_root,
+        filter_root,
+        pattern,
+        include,
+        exclude,
+        max_results,
+        IndexStatus::Fallback,
+    )
+}
+
 fn fallback_grep(
     project_root: &Path,
     search_root: &Path,
@@ -372,7 +397,6 @@ fn fallback_grep(
     index_status: IndexStatus,
 ) -> GrepResult {
     let filters = build_path_filters(include, exclude).unwrap_or_default();
-    let files = walk_project_files_from(filter_root, search_root, &filters);
 
     let total_matches = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
@@ -380,26 +404,55 @@ fn fallback_grep(
     let truncated = AtomicBool::new(false);
     let engine_capped = AtomicBool::new(false);
     let stop_after = max_results.saturating_mul(2);
+    let stop_scan = Arc::new(AtomicBool::new(false));
 
-    let mut matches = files
-        .par_iter()
-        .map(|file| {
-            fallback_search_file(
-                file,
-                pattern,
-                max_results,
-                stop_after,
-                &total_matches,
-                &files_searched,
-                &files_with_matches,
-                &truncated,
-                &engine_capped,
-            )
-        })
-        .reduce(Vec::new, |mut left, mut right| {
-            left.append(&mut right);
-            left
-        });
+    let mut matches = Vec::new();
+    let mut batch: Vec<PathBuf> = Vec::with_capacity(256);
+
+    let flush_batch = |batch: &mut Vec<PathBuf>, matches: &mut Vec<GrepMatch>| {
+        if batch.is_empty() {
+            return;
+        }
+        let chunk = std::mem::take(batch);
+        let partial: Vec<GrepMatch> = chunk
+            .par_iter()
+            .filter_map(|file| {
+                if stop_scan.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let file_matches = fallback_search_file(
+                    file,
+                    pattern,
+                    max_results,
+                    stop_after,
+                    &total_matches,
+                    &files_searched,
+                    &files_with_matches,
+                    &truncated,
+                    &engine_capped,
+                );
+                if truncated.load(Ordering::Relaxed)
+                    && total_matches.load(Ordering::Relaxed) >= stop_after
+                {
+                    stop_scan.store(true, Ordering::Relaxed);
+                }
+                (!file_matches.is_empty()).then_some(file_matches)
+            })
+            .flatten()
+            .collect();
+        matches.extend(partial);
+    };
+
+    for_each_walk_project_file_from(filter_root, search_root, &filters, |path| {
+        if stop_scan.load(Ordering::Relaxed) {
+            return;
+        }
+        batch.push(path.clone());
+        if batch.len() >= 256 {
+            flush_batch(&mut batch, &mut matches);
+        }
+    });
+    flush_batch(&mut batch, &mut matches);
 
     sort_grep_matches_by_mtime_desc(&mut matches, project_root);
 

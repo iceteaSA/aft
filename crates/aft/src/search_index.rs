@@ -306,21 +306,92 @@ impl SearchIndex {
         };
 
         let filters = PathFilters::default();
-        let mut indexed = 0usize;
-        for path in walk_project_files(&project_root, &filters) {
-            index.update_file(&path);
-            indexed += 1;
-        }
+        let paths: Vec<PathBuf> = walk_project_files(&project_root, &filters);
+        let indexed = index.ingest_paths_parallel(&paths);
 
         index.git_head = current_git_head(&project_root);
         index.ready = true;
         crate::slog_info!(
-            "search index cold build: {} files, {} trigrams, {} ms",
+            "search index cold build: {} files, {} trigrams, {} ms (pool={})",
             indexed,
             index.postings.len(),
-            started.elapsed().as_millis()
+            started.elapsed().as_millis(),
+            search_index_build_pool_size()
         );
         index
+    }
+
+    /// Serial cold build for tests and parity checks against [`build_with_limit`].
+    #[cfg(test)]
+    pub fn build_with_limit_serial(root: &Path, max_file_size: u64) -> Self {
+        let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let mut index = SearchIndex {
+            project_root: project_root.clone(),
+            max_file_size,
+            ignore_rules_fingerprint: ignore_rules_fingerprint(&project_root),
+            ..SearchIndex::new()
+        };
+        let filters = PathFilters::default();
+        for path in walk_project_files(&project_root, &filters) {
+            index.update_file(&path);
+        }
+        index.git_head = current_git_head(&project_root);
+        index.ready = true;
+        index
+    }
+
+    fn ingest_paths_parallel(&mut self, paths: &[PathBuf]) -> usize {
+        let max_file_size = self.max_file_size;
+
+        let parallel_read = || -> Vec<(PathBuf, Vec<u8>)> {
+            paths
+                .par_iter()
+                .filter_map(|path| {
+                    let metadata = fs::metadata(path).ok()?;
+                    if !metadata.is_file() {
+                        return None;
+                    }
+                    if is_binary_path(path, metadata.len()) || metadata.len() > max_file_size {
+                        return None;
+                    }
+                    let content = fs::read(path).ok()?;
+                    if is_binary_bytes(&content) {
+                        return None;
+                    }
+                    Some((path.clone(), content))
+                })
+                .collect()
+        };
+
+        let readable: Vec<(PathBuf, Vec<u8>)> = match rayon::ThreadPoolBuilder::new()
+            .num_threads(search_index_build_pool_size())
+            .thread_name(|index| format!("aft-search-build-{index}"))
+            .stack_size(8 * 1024 * 1024)
+            .build()
+        {
+            Ok(pool) => pool.install(parallel_read),
+            Err(error) => {
+                log::warn!(
+                    "search index: bounded build pool unavailable ({error}); using global pool"
+                );
+                parallel_read()
+            }
+        };
+
+        let mut readable_by_path: HashMap<PathBuf, Vec<u8>> = readable.into_iter().collect();
+        let mut indexed = 0usize;
+        for path in paths {
+            if let Some(content) = readable_by_path.remove(path) {
+                self.index_file(path, &content);
+                indexed += 1;
+            } else {
+                self.update_file(path);
+                if self.path_to_id.contains_key(path) {
+                    indexed += 1;
+                }
+            }
+        }
+        indexed
     }
 
     pub fn index_file(&mut self, path: &Path, content: &[u8]) {
@@ -499,11 +570,21 @@ impl SearchIndex {
         let truncated = AtomicBool::new(false);
         let engine_capped = AtomicBool::new(false);
         let stop_after = max_results.saturating_mul(2);
+        let stop_scan = Arc::new(AtomicBool::new(false));
 
         let mut matches = if candidate_files.len() > 10 {
             candidate_files
                 .par_iter()
                 .map(|file| {
+                    if grep_scan_should_stop(
+                        Some(&stop_scan),
+                        &truncated,
+                        &total_matches,
+                        stop_after,
+                    ) {
+                        engine_capped.store(true, Ordering::Relaxed);
+                        return Vec::new();
+                    }
                     search_candidate_file(
                         file,
                         &matcher,
@@ -514,10 +595,15 @@ impl SearchIndex {
                         &files_with_matches,
                         &truncated,
                         &engine_capped,
+                        Some(&stop_scan),
                     )
                 })
                 .reduce(Vec::new, |mut left, mut right| {
                     left.append(&mut right);
+
+                    {
+                        engine_capped.store(true, Ordering::Relaxed);
+                    }
                     left
                 })
         } else {
@@ -533,6 +619,7 @@ impl SearchIndex {
                     &files_with_matches,
                     &truncated,
                     &engine_capped,
+                    None,
                 ));
 
                 if should_stop_search(&truncated, &total_matches, stop_after) {
@@ -1191,8 +1278,9 @@ fn search_candidate_file(
     files_with_matches: &AtomicUsize,
     truncated: &AtomicBool,
     engine_capped: &AtomicBool,
+    stop_scan: Option<&Arc<AtomicBool>>,
 ) -> Vec<SharedGrepMatch> {
-    if should_stop_search(truncated, total_matches, stop_after) {
+    if grep_scan_should_stop(stop_scan, truncated, total_matches, stop_after) {
         engine_capped.store(true, Ordering::Relaxed);
         return Vec::new();
     }
@@ -1225,7 +1313,7 @@ fn search_candidate_file(
             let mut start = 0;
 
             while let Some(position) = finder.find(&content[start..]) {
-                if should_stop_search(truncated, total_matches, stop_after) {
+                if grep_scan_should_stop(stop_scan, truncated, total_matches, stop_after) {
                     engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -1243,6 +1331,7 @@ fn search_candidate_file(
                 let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
                 if match_number > max_results {
                     truncated.store(true, Ordering::Relaxed);
+                    signal_grep_scan_cap(stop_scan, total_matches, stop_after);
                     break;
                 }
 
@@ -1263,7 +1352,7 @@ fn search_candidate_file(
             let mut start = 0;
 
             while let Some(position) = finder.find(&search_content[start..]) {
-                if should_stop_search(truncated, total_matches, stop_after) {
+                if grep_scan_should_stop(stop_scan, truncated, total_matches, stop_after) {
                     engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -1281,6 +1370,7 @@ fn search_candidate_file(
                 let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
                 if match_number > max_results {
                     truncated.store(true, Ordering::Relaxed);
+                    signal_grep_scan_cap(stop_scan, total_matches, stop_after);
                     break;
                 }
 
@@ -1296,7 +1386,7 @@ fn search_candidate_file(
         }
         SearchMatcher::Regex(regex) => {
             for matched in regex.find_iter(&content) {
-                if should_stop_search(truncated, total_matches, stop_after) {
+                if grep_scan_should_stop(stop_scan, truncated, total_matches, stop_after) {
                     engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -1312,6 +1402,7 @@ fn search_candidate_file(
                 let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
                 if match_number > max_results {
                     truncated.store(true, Ordering::Relaxed);
+                    signal_grep_scan_cap(stop_scan, total_matches, stop_after);
                     break;
                 }
 
@@ -1339,6 +1430,37 @@ fn should_stop_search(
     stop_after: usize,
 ) -> bool {
     truncated.load(Ordering::Relaxed) && total_matches.load(Ordering::Relaxed) >= stop_after
+}
+
+fn grep_scan_should_stop(
+    stop_scan: Option<&Arc<AtomicBool>>,
+    truncated: &AtomicBool,
+    total_matches: &AtomicUsize,
+    stop_after: usize,
+) -> bool {
+    stop_scan.is_some_and(|flag| flag.load(Ordering::Relaxed))
+        || should_stop_search(truncated, total_matches, stop_after)
+}
+
+fn signal_grep_scan_cap(
+    stop_scan: Option<&Arc<AtomicBool>>,
+    total_matches: &AtomicUsize,
+    stop_after: usize,
+) {
+    if let Some(flag) = stop_scan {
+        if total_matches.load(Ordering::Relaxed) >= stop_after {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Bound cold search-index ingestion to half the cores (cap 8), matching callgraph store.
+fn search_index_build_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .div_ceil(2)
+        .clamp(1, 8)
 }
 
 fn intersect_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
@@ -1509,7 +1631,7 @@ pub fn walk_project_files_bounded_default(
     root: &Path,
     max_files: usize,
 ) -> Result<Vec<PathBuf>, usize> {
-    walk_project_files_from_inner(root, root, &PathFilters::default(), Some(max_files))
+    walk_project_files_from_inner(root, root, &PathFilters::default(), Some(max_files), true)
 }
 
 pub(crate) fn walk_project_files_bounded_matching<F>(
@@ -1521,7 +1643,7 @@ pub(crate) fn walk_project_files_bounded_matching<F>(
 where
     F: Fn(&Path) -> bool,
 {
-    walk_project_files_from_inner_matching(root, root, filters, Some(max_files), matches_file)
+    walk_project_files_from_inner_matching(root, root, filters, Some(max_files), matches_file, true)
 }
 
 pub fn walk_project_files_bounded_default_matching<F>(
@@ -1538,6 +1660,7 @@ where
         &PathFilters::default(),
         Some(max_files),
         matches_file,
+        true,
     )
 }
 
@@ -1546,8 +1669,31 @@ pub(crate) fn walk_project_files_from(
     search_root: &Path,
     filters: &PathFilters,
 ) -> Vec<PathBuf> {
-    walk_project_files_from_inner(filter_root, search_root, filters, None)
+    walk_project_files_from_inner(filter_root, search_root, filters, None, true)
         .expect("unbounded project walk cannot exceed a file limit")
+}
+
+pub(crate) fn for_each_walk_project_file_from<F>(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    mut on_file: F,
+) where
+    F: FnMut(&PathBuf),
+{
+    let builder = project_walk_builder(search_root);
+    for entry in builder.build().filter_map(|entry| entry.ok()) {
+        if !entry
+            .file_type()
+            .map_or(false, |file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.into_path();
+        if filters.matches(filter_root, &path) {
+            on_file(&path);
+        }
+    }
 }
 
 pub(crate) fn has_any_project_file_from(
@@ -1555,7 +1701,7 @@ pub(crate) fn has_any_project_file_from(
     search_root: &Path,
     filters: &PathFilters,
 ) -> bool {
-    walk_project_files_from_inner(filter_root, search_root, filters, Some(0)).is_err()
+    walk_project_files_from_inner(filter_root, search_root, filters, Some(0), true).is_err()
 }
 
 fn walk_project_files_from_inner(
@@ -1563,29 +1709,25 @@ fn walk_project_files_from_inner(
     search_root: &Path,
     filters: &PathFilters,
     max_files: Option<usize>,
+    sort_by_mtime: bool,
 ) -> Result<Vec<PathBuf>, usize> {
-    walk_project_files_from_inner_matching(filter_root, search_root, filters, max_files, |_| true)
+    walk_project_files_from_inner_matching(
+        filter_root,
+        search_root,
+        filters,
+        max_files,
+        |_| true,
+        sort_by_mtime,
+    )
 }
 
-fn walk_project_files_from_inner_matching<F>(
-    filter_root: &Path,
-    search_root: &Path,
-    filters: &PathFilters,
-    max_files: Option<usize>,
-    matches_file: F,
-) -> Result<Vec<PathBuf>, usize>
-where
-    F: Fn(&Path) -> bool,
-{
+fn project_walk_builder(search_root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     builder
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        // `.aftignore` — AFT-specific ignores layered on top of .gitignore.
-        // Honored hierarchically like .gitignore (works in non-git projects too),
-        // so users can exclude paths git can't (e.g. submodules) from indexing.
         .add_custom_ignore_filename(".aftignore")
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
@@ -1605,6 +1747,21 @@ where
             }
             true
         });
+    builder
+}
+
+fn walk_project_files_from_inner_matching<F>(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    max_files: Option<usize>,
+    matches_file: F,
+    sort_by_mtime: bool,
+) -> Result<Vec<PathBuf>, usize>
+where
+    F: Fn(&Path) -> bool,
+{
+    let builder = project_walk_builder(search_root);
 
     let mut files = Vec::new();
     for entry in builder.build().filter_map(|entry| entry.ok()) {
@@ -1623,7 +1780,9 @@ where
         }
     }
 
-    sort_paths_by_mtime_desc(&mut files);
+    if sort_by_mtime {
+        sort_paths_by_mtime_desc(&mut files);
+    }
     Ok(files)
 }
 
@@ -1867,8 +2026,72 @@ fn git_info_exclude_path(root: &Path) -> PathBuf {
 }
 
 fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore")
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                return !matches!(
+                    name.as_ref(),
+                    ".git"
+                        | "node_modules"
+                        | "target"
+                        | "venv"
+                        | ".venv"
+                        | "__pycache__"
+                        | ".tox"
+                        | "dist"
+                        | "build"
+                );
+            }
+            true
+        });
+
+    for entry in builder.build().filter_map(|entry| entry.ok()) {
+        if !entry
+            .file_type()
+            .map_or(false, |file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let file_name = entry.file_name();
+        if file_name == ".gitignore" || file_name == ".aftignore" {
+            files.push(entry.into_path());
+        }
+    }
+}
+
+/// Count directories visited when discovering ignore rule files (for perf regression tests).
+#[cfg(test)]
+pub(crate) fn count_ignore_rule_discovery_dirs(root: &Path) -> usize {
+    let mut dirs = 0usize;
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore");
+    for entry in builder.build().filter_map(|entry| entry.ok()) {
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            dirs += 1;
+        }
+    }
+    dirs
+}
+
+/// Legacy stack-based discovery (pre ignore-walker fix); used only in perf tests.
+#[cfg(test)]
+pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usize {
     let mut stack = vec![root.to_path_buf()];
+    let mut dirs = 0usize;
     while let Some(dir) = stack.pop() {
+        dirs += 1;
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
@@ -1876,39 +2099,32 @@ fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
             let path = entry.path();
             let file_name = entry.file_name();
             if file_name == ".gitignore" || file_name == ".aftignore" {
-                if path.is_file() {
-                    files.push(path);
-                }
                 continue;
             }
-
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
             if !file_type.is_dir() || file_type.is_symlink() {
                 continue;
             }
-            if ignore_rule_fingerprint_skips_dir(&file_name) {
+            if matches!(
+                file_name.to_str().unwrap_or(""),
+                ".git"
+                    | "node_modules"
+                    | "target"
+                    | "venv"
+                    | ".venv"
+                    | "__pycache__"
+                    | ".tox"
+                    | "dist"
+                    | "build"
+            ) {
                 continue;
             }
             stack.push(path);
         }
     }
-}
-
-fn ignore_rule_fingerprint_skips_dir(name: &std::ffi::OsStr) -> bool {
-    matches!(
-        name.to_str().unwrap_or(""),
-        ".git"
-            | "node_modules"
-            | "target"
-            | "venv"
-            | ".venv"
-            | "__pycache__"
-            | ".tox"
-            | "dist"
-            | "build"
-    )
+    dirs
 }
 
 impl PathFilters {
@@ -3026,6 +3242,88 @@ mod tests {
         fs::write(cache_dir.join("cache.bin"), cache).expect("write cache");
 
         assert!(SearchIndex::read_from_disk(&cache_dir, dir.path()).is_none());
+    }
+
+    #[test]
+    fn parallel_cold_build_matches_serial_index() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        for index in 0..80 {
+            let sub = project.join(format!("pkg_{index:03}"));
+            fs::create_dir_all(&sub).expect("create subdir");
+            fs::write(
+                sub.join("lib.rs"),
+                format!(
+                    "pub fn unique_marker_{index}() {{ println!(\"aft_perf_marker_{index}\"); }}\n"
+                ),
+            )
+            .expect("write lib");
+        }
+
+        let serial = SearchIndex::build_with_limit_serial(&project, DEFAULT_MAX_FILE_SIZE);
+        let parallel = SearchIndex::build_with_limit(&project, DEFAULT_MAX_FILE_SIZE);
+
+        assert_eq!(serial.file_count(), parallel.file_count());
+        assert_eq!(serial.trigram_count(), parallel.trigram_count());
+        assert_eq!(serial.path_to_id.len(), parallel.path_to_id.len());
+        for (path, id) in &serial.path_to_id {
+            assert_eq!(parallel.path_to_id.get(path), Some(id));
+        }
+    }
+
+    #[test]
+    fn ignore_rule_discovery_respects_gitignore() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join("src")).expect("mkdir src");
+        fs::write(project.join("src/.gitignore"), "data/\n").expect("write gitignore");
+        let data = project.join("src/data");
+        fs::create_dir_all(&data).expect("mkdir data");
+        for index in 0..200 {
+            fs::create_dir_all(data.join(format!("d{index}"))).expect("mkdir nested");
+            fs::write(data.join(format!("d{index}/f.rs")), "fn ignored() {}\n")
+                .expect("write ignored file");
+        }
+
+        Command::new("git")
+            .arg("init")
+            .arg(&project)
+            .status()
+            .expect("git init");
+        for args in [
+            ["config", "user.email", "aft@example.invalid"],
+            ["config", "user.name", "AFT Test"],
+        ] {
+            Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .expect("git config");
+        }
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["add", "."])
+            .status()
+            .expect("git add");
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .expect("git commit");
+
+        let legacy_dirs = count_ignore_rule_discovery_dirs_legacy_stack(&project);
+        let walker_dirs = count_ignore_rule_discovery_dirs(&project);
+        assert!(
+            legacy_dirs > walker_dirs,
+            "legacy stack should descend into gitignored data/ (legacy={legacy_dirs}, walker={walker_dirs})"
+        );
+        assert!(
+            walker_dirs < 50,
+            "ignore walker should not descend deeply into ignored tree (dirs={walker_dirs})"
+        );
     }
 
     /// Regression: v0.15.2 — sort_paths_by_mtime_desc panicked when files
