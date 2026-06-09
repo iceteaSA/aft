@@ -1200,6 +1200,19 @@ fn build_tier2_callgraph_snapshot(
         );
         return None;
     }
+
+    // Prewarm the parse in ONE bounded-parallel pass before the per-file loop
+    // below. Without this, the loop's `graph.build_file(file)` calls parse every
+    // project file SEQUENTIALLY on this single thread (N× slower). Prewarm makes
+    // each `build_file` a cache hit; the parse runs on a bounded half-cores pool
+    // (not the global all-cores pool — avoids starving the bridge). Bounded by
+    // the same max_callgraph_files cap already checked above.
+    if let Err(error) = graph.prewarm_project_files(max_callgraph_files) {
+        crate::slog_info!(
+            "tier2 dead_code: callgraph prewarm bailed ({error}); reporting callgraph_unavailable"
+        );
+        return None;
+    }
     if tier2_benchmark_logging_enabled() {
         crate::slog_info!(
             "settle bench: tier2_callgraph_snapshot_start files={}",

@@ -712,6 +712,12 @@ pub struct CallGraph {
     /// Reverse index: target_file → target_symbol → callers.
     /// Built lazily on first `callers_of` call, cleared on `invalidate_file`.
     reverse_index: Option<ReverseIndex>,
+    /// Memoized `std::fs::canonicalize` results. canonicalize is a realpath
+    /// syscall (disk I/O, slow on large repos / Windows) and the same file paths
+    /// are canonicalized repeatedly across reverse-index builds (every cold
+    /// callers/impact/trace query and after each invalidation). A file's
+    /// canonical form is stable for the life of the graph, so cache it.
+    canon_cache: RefCell<HashMap<PathBuf, Arc<PathBuf>>>,
 }
 
 impl CallGraph {
@@ -723,6 +729,31 @@ impl CallGraph {
             project_root,
             project_files: None,
             reverse_index: None,
+            canon_cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Canonicalize a path, memoized. The first call does the realpath syscall;
+    /// repeat calls for the same path (common across reverse-index rebuilds)
+    /// return the cached `Arc` without touching disk. Falls back to the input
+    /// path when canonicalize fails (e.g. the file was deleted), same as the
+    /// previous inline behavior.
+    fn canonicalize_cached(&self, path: &Path) -> Arc<PathBuf> {
+        if let Some(hit) = self.canon_cache.borrow().get(path) {
+            return Arc::clone(hit);
+        }
+        match std::fs::canonicalize(path) {
+            Ok(canon) => {
+                let canon = Arc::new(canon);
+                self.canon_cache
+                    .borrow_mut()
+                    .insert(path.to_path_buf(), Arc::clone(&canon));
+                canon
+            }
+            // Do NOT cache the fallback: canonicalize fails for a (temporarily)
+            // missing file, and caching the non-canonical input would serve a
+            // stale path if the file returns. Re-resolve next time instead.
+            Err(_) => Arc::new(path.to_path_buf()),
         }
     }
 
@@ -1195,6 +1226,14 @@ impl CallGraph {
 
     /// Build call data for all project files, failing fast when the configured
     /// source-file cap is exceeded.
+    /// Parse all uncached project files in parallel (bounded pool) and cache the
+    /// results, so subsequent `build_file` calls are cache hits. Used by the
+    /// tier2 dead_code snapshot, whose loop would otherwise parse every file
+    /// sequentially on one thread. No-op when the cache is already warm.
+    pub(crate) fn prewarm_project_files(&mut self, max_files: usize) -> Result<(), AftError> {
+        self.ensure_project_files_built(max_files)
+    }
+
     fn ensure_project_files_built(&mut self, max_files: usize) -> Result<(), AftError> {
         // Bounded count first — never populate project_files on oversized roots.
         // `walk_project_files(...).take(max_files + 1)` is lazy (Walk is an
@@ -1226,20 +1265,30 @@ impl CallGraph {
         // opaque bridge hang. Cheap no-op when nothing is uncached (warm cache).
         if !uncached_files.is_empty() {
             let started = Instant::now();
-            let computed: Vec<(PathBuf, FileCallData)> = uncached_files
-                .par_iter()
-                .filter_map(|f| build_file_data(f).ok().map(|data| (f.clone(), data)))
-                .collect();
+            // Parse on a BOUNDED pool (half the cores, cap 8), not the global
+            // rayon pool. A cold `callers`/`impact`/`trace`/dead_code query runs
+            // this parse, and on the global all-cores pool it pins every core and
+            // starves the single-threaded bridge (the 800% spike). Half-cores
+            // matches the store cold-build and inspect dispatch pools. 8MB worker
+            // stacks match the main thread (tree-sitter AST walks are deep).
+            let pool = callgraph_parse_pool();
+            let computed: Vec<(PathBuf, FileCallData)> = pool.install(|| {
+                uncached_files
+                    .par_iter()
+                    .filter_map(|f| build_file_data(f).ok().map(|data| (f.clone(), data)))
+                    .collect()
+            });
 
             let parsed = computed.len();
             for (file, data) in computed {
                 self.data.insert(file, data);
             }
             slog_info!(
-                "callgraph: parsed {} uncached files ({} total project files) in {}ms",
+                "perf callgraph: parsed {} uncached files ({} total project files) in {}ms (bounded {}-thread pool)",
                 parsed,
                 all_files.len(),
-                started.elapsed().as_millis()
+                started.elapsed().as_millis(),
+                pool.current_num_threads(),
             );
         }
 
@@ -1264,10 +1313,10 @@ impl CallGraph {
         let mut reverse: ReverseIndex = HashMap::new();
 
         for caller_file in &all_files {
-            // Canonicalize the caller file path for consistent lookups
-            let canon_caller = Arc::new(
-                std::fs::canonicalize(caller_file).unwrap_or_else(|_| caller_file.clone()),
-            );
+            // Canonicalize the caller file path for consistent lookups (memoized
+            // so repeated reverse-index builds don't re-issue the realpath
+            // syscall for every project file).
+            let canon_caller = self.canonicalize_cached(caller_file);
             let file_data = match self
                 .data
                 .get(caller_file)
@@ -2776,6 +2825,31 @@ impl CallGraph {
 // ---------------------------------------------------------------------------
 
 /// Build call data for a single file.
+/// Bounded rayon pool for the cold parse pass: half the cores (cap 8), 8MB
+/// worker stacks. Built fresh per cold build (infrequent, and the parse cost
+/// dominates the pool-spawn cost). Bounds the parse so it never monopolizes
+/// every core and starves the single-threaded bridge — matching
+/// `callgraph_store::build_pool_size` and `inspect::dispatch::default_pool_size`.
+fn callgraph_parse_pool() -> rayon::ThreadPool {
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .div_ceil(2)
+        .clamp(1, 8);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("aft-callgraph-{i}"))
+        .stack_size(8 * 1024 * 1024)
+        .build()
+        .unwrap_or_else(|_| {
+            // Fallback: a 1-thread pool (still off the global pool).
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("single-thread rayon pool must build")
+        })
+}
+
 pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
     let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
         message: format!("unsupported file for call graph: {}", path.display()),
