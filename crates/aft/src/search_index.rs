@@ -599,11 +599,14 @@ impl SearchIndex {
                     )
                 })
                 .reduce(Vec::new, |mut left, mut right| {
+                    // NOTE: do NOT set engine_capped here. reduce() runs on every
+                    // partial-result merge in a multi-chunk parallel search,
+                    // capped or not — setting it unconditionally would falsely
+                    // report every indexed grep over >10 candidates as capped.
+                    // Cap detection is owned by grep_scan_should_stop (in the map
+                    // closure) and should_stop_search (serial path), which set
+                    // engine_capped only when the result cap is actually reached.
                     left.append(&mut right);
-
-                    {
-                        engine_capped.store(true, Ordering::Relaxed);
-                    }
                     left
                 })
         } else {
@@ -3366,6 +3369,37 @@ mod tests {
             sort_paths_by_mtime_desc(&mut copy);
             assert_eq!(copy.len(), paths.len());
         }
+    }
+
+    /// Regression: the indexed parallel search's reduce() combine closure must
+    /// NOT set engine_capped. reduce runs on every partial-result merge in a
+    /// multi-chunk parallel search (>10 candidate files), capped or not — an
+    /// unconditional store there falsely reported every such grep as capped,
+    /// lying to the agent that results were truncated.
+    #[test]
+    fn uncapped_indexed_grep_over_many_files_is_not_engine_capped() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // >10 files so the parallel (reduce) branch is taken, each with exactly
+        // one match, and a generous cap so the search is NOT actually capped.
+        for i in 0..40 {
+            fs::write(
+                dir.path().join(format!("file-{i}.rs")),
+                format!("fn unique_marker_{i}() {{ let _ = \"needle_token\"; }}\n"),
+            )
+            .expect("write");
+        }
+        let index = SearchIndex::build_with_limit(dir.path(), DEFAULT_MAX_FILE_SIZE);
+        let result = index.grep("needle_token", false, &[], &[], dir.path(), 1000);
+        assert!(
+            result.matches.len() >= 40,
+            "expected a match per file, got {}",
+            result.matches.len()
+        );
+        assert!(
+            !result.engine_capped,
+            "an uncapped grep over >10 files must not report engine_capped"
+        );
+        assert!(!result.truncated, "uncapped grep must not be truncated");
     }
 
     /// Regression: v0.15.2 — sort_grep_matches_by_mtime_desc panicked under
