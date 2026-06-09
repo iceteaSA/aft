@@ -13,8 +13,18 @@ impl Compressor for RuffCompressor {
         command_tokens(command).any(|token| token == "ruff")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
-        compress_ruff(output)
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        let compressed = compress_ruff(output);
+        if matches!(exit_code, Some(code) if code != 0) && compressed.text.trim() == "ruff: clean" {
+            GenericCompressor::compress_output(output).into()
+        } else {
+            compressed
+        }
     }
 
     fn matches_output(&self, output: &str) -> bool {

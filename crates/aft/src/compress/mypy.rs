@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi};
+use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
 use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 300;
@@ -16,7 +16,17 @@ impl Compressor for MypyCompressor {
                 .any(|window| matches!(window, [python, flag, module] if (python == "python" || python == "python3") && flag == "-m" && module == "mypy"))
     }
 
-    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        if matches!(exit_code, Some(code) if code != 0)
+            && output.trim().starts_with("Success: no issues found")
+        {
+            return GenericCompressor::compress_output(output).into();
+        }
         compress_mypy(output).into()
     }
 

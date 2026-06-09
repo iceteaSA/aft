@@ -11,7 +11,12 @@ impl Compressor for NextCompressor {
         tokens.iter().any(|token| token == "next") && tokens.iter().any(|token| token == "build")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         compress_next(output).into()
     }
 }

@@ -12,10 +12,15 @@ impl Compressor for CargoCompressor {
             .is_some_and(|head| head == "cargo")
     }
 
-    fn compress(&self, command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
         match cargo_subcommand(command).as_deref() {
             Some("build" | "check" | "clippy") => compress_build_like(output),
-            Some("test") => compress_test(output),
+            Some("test") => compress_test(output, exit_code),
             _ => GenericCompressor::compress_output(output).into(),
         }
     }
@@ -24,8 +29,12 @@ impl Compressor for CargoCompressor {
         output.lines().any(is_cargo_test_signature_line)
     }
 
-    fn compress_output_match(&self, output: &str) -> CompressionResult {
-        compress_test(output)
+    fn compress_output_match_with_exit_code(
+        &self,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        compress_test(output, exit_code)
     }
 }
 
@@ -136,10 +145,18 @@ fn is_final_cargo_summary(line: &str) -> bool {
         || trimmed.starts_with("test result:")
 }
 
-fn compress_test(output: &str) -> CompressionResult {
+fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let has_failures = lines.iter().any(|line| line.trim() == "failures:");
     if !has_failures {
+        if matches!(exit_code, Some(code) if code != 0)
+            && lines
+                .iter()
+                .any(|line| is_warning_or_error(line) || line.trim_start().starts_with("error["))
+        {
+            return compress_build_like(output);
+        }
+
         let result: Vec<String> = lines
             .iter()
             .filter(|line| {
@@ -241,7 +258,7 @@ mod tests {
             "\ntest result: FAILED. 0 passed; 40 failed; 0 ignored; 0 measured; 0 filtered out\n",
         );
 
-        let result = compress_test(&output);
+        let result = compress_test(&output, None);
 
         assert_eq!(
             result.dropped_by_class.get(&DropClass::Failure),

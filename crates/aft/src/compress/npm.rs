@@ -15,7 +15,12 @@ impl Compressor for NpmCompressor {
             .is_some_and(|head| head == "npm")
     }
 
-    fn compress(&self, command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         match npm_subcommand(command).as_deref() {
             Some("install" | "i" | "ci") => compress_install(output).into(),
             Some("run" | "test") => GenericCompressor::compress_output(output).into(),

@@ -16,7 +16,12 @@ impl Compressor for BunCompressor {
             .is_some_and(|head| head == "bun")
     }
 
-    fn compress(&self, command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         match bun_subcommand(command).as_deref() {
             Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
             Some("test") => compress_test(output),
@@ -41,7 +46,11 @@ impl Compressor for BunCompressor {
         false
     }
 
-    fn compress_output_match(&self, output: &str) -> CompressionResult {
+    fn compress_output_match_with_exit_code(
+        &self,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         compress_test(output)
     }
 }

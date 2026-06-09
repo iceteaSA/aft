@@ -9,8 +9,18 @@ impl Compressor for TscCompressor {
         command.split_whitespace().any(|token| token == "tsc")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
-        compress_tsc(output).into()
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        let compressed = compress_tsc(output);
+        if matches!(exit_code, Some(code) if code != 0) && compressed == "No errors. [cmpaft]" {
+            GenericCompressor::compress_output(output).into()
+        } else {
+            compressed.into()
+        }
     }
 
     fn matches_output(&self, output: &str) -> bool {

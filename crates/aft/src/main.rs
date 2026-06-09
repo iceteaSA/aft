@@ -80,8 +80,8 @@ fn main() {
     {
         let filter_registry_handle = ctx.shared_filter_registry();
         let compress_flag = ctx.bash_compress_flag();
-        ctx.bash_background()
-            .set_compressor(move |command: &str, output: String| {
+        ctx.bash_background().set_compressor_with_exit_code(
+            move |command: &str, output: String, exit_code: Option<i32>| {
                 if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     return aft::compress::CompressionResult::new(output);
                 }
@@ -89,8 +89,14 @@ fn main() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                aft::compress::compress_with_registry(command, &output, &registry_guard)
-            });
+                aft::compress::compress_with_registry_exit_code(
+                    command,
+                    &output,
+                    exit_code,
+                    &registry_guard,
+                )
+            },
+        );
     }
 
     let stdout_writer = ctx.stdout_writer();

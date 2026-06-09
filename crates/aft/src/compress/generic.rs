@@ -143,7 +143,12 @@ impl Compressor for GenericCompressor {
         true
     }
 
-    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         Self::compress_output(output).into()
     }
 }

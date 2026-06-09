@@ -418,6 +418,14 @@ fn build_regex(pattern: &str, multiline: bool) -> Result<Regex, String> {
 /// 4. `[truncate]` — middle-truncate per line at `line_max`
 /// 5. `[cap]` — apply `max_lines` with `keep` mode
 pub fn apply_filter(filter: &TomlFilter, output: &str) -> CompressionResult {
+    apply_filter_with_exit_code(filter, output, None)
+}
+
+pub fn apply_filter_with_exit_code(
+    filter: &TomlFilter,
+    output: &str,
+    exit_code: Option<i32>,
+) -> CompressionResult {
     let stripped_ansi = if filter.strip_ansi {
         crate::compress::generic::strip_ansi(output)
     } else {
@@ -434,11 +442,13 @@ pub fn apply_filter(filter: &TomlFilter, output: &str) -> CompressionResult {
     let after_strip = kept.join("\n");
 
     // Phase 2: shortcircuit (against the after-strip body)
-    if let (Some(when), Some(replacement)) =
-        (&filter.shortcircuit_when, &filter.shortcircuit_replacement)
-    {
-        if when.is_match(&after_strip) {
-            return CompressionResult::new(replacement.clone());
+    if !matches!(exit_code, Some(code) if code != 0) {
+        if let (Some(when), Some(replacement)) =
+            (&filter.shortcircuit_when, &filter.shortcircuit_replacement)
+        {
+            if when.is_match(&after_strip) {
+                return CompressionResult::new(replacement.clone());
+            }
         }
     }
 

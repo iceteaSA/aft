@@ -17,7 +17,12 @@ impl Compressor for VitestCompressor {
         command_tokens(command).any(|token| matches!(token.as_str(), "vitest" | "jest"))
     }
 
-    fn compress(&self, command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         compress_test_runner(command, output)
     }
 
@@ -27,7 +32,11 @@ impl Compressor for VitestCompressor {
             || looks_like_jest_json_output(output)
     }
 
-    fn compress_output_match(&self, output: &str) -> CompressionResult {
+    fn compress_output_match_with_exit_code(
+        &self,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         if looks_like_jest_output(output) {
             compress_test_runner("jest", output)
         } else {

@@ -172,12 +172,12 @@ pub(crate) struct RegistryInner {
     #[cfg(test)]
     persisted_gc_runs: AtomicU64,
     /// Output compression callback. Set by `AppContext` after construction.
-    /// Takes (command, raw_output) and returns compressed text. Called from
+    /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
     /// `bash_status`/`list` snapshot reads. When `None`, output is returned
     /// uncompressed.
     pub(crate) compressor:
-        Mutex<Option<Box<dyn Fn(&str, String) -> CompressionResult + Send + Sync>>>,
+        Mutex<Option<Box<dyn Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     pub(crate) db_harness: RwLock<Option<String>>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
@@ -272,6 +272,15 @@ impl BgTaskRegistry {
     where
         F: Fn(&str, String) -> CompressionResult + Send + Sync + 'static,
     {
+        self.set_compressor_with_exit_code(move |command, output, _exit_code| {
+            compressor(command, output)
+        });
+    }
+
+    pub fn set_compressor_with_exit_code<F>(&self, compressor: F)
+    where
+        F: Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync + 'static,
+    {
         if let Ok(mut slot) = self.inner.compressor.lock() {
             *slot = Some(Box::new(compressor));
         }
@@ -279,12 +288,17 @@ impl BgTaskRegistry {
 
     /// Apply the installed compressor (if any) to `output`. Returns `output`
     /// untouched when no compressor is installed.
-    pub(crate) fn compress_output(&self, command: &str, output: String) -> CompressionResult {
+    pub(crate) fn compress_output(
+        &self,
+        command: &str,
+        output: String,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
         let Ok(slot) = self.inner.compressor.lock() else {
             return CompressionResult::new(output);
         };
         match slot.as_ref() {
-            Some(compressor) => compressor(command, output),
+            Some(compressor) => compressor(command, output, exit_code),
             None => CompressionResult::new(output),
         }
     }
@@ -344,7 +358,7 @@ impl BgTaskRegistry {
             COMPRESS_INPUT_HEAD_BYTES,
             COMPRESS_INPUT_TAIL_BYTES,
         );
-        let compressed = self.compress_output(&metadata.command, raw.text);
+        let compressed = self.compress_output(&metadata.command, raw.text, metadata.exit_code);
         render_compressed_with_recovery(buffer, compressed, raw.truncated)
     }
 
@@ -3982,7 +3996,7 @@ mod tests {
         let calls_for_closure = Arc::clone(&calls);
         let unlocked_for_closure = Arc::clone(&saw_unlocked_state);
         let task_for_closure = Arc::clone(&task_holder);
-        registry.set_compressor(move |_command, output| {
+        registry.set_compressor_with_exit_code(move |_command, output, _exit_code| {
             calls_for_closure.fetch_add(1, Ordering::SeqCst);
             if let Some(task) = task_for_closure.lock().unwrap().as_ref() {
                 if task.state.try_lock().is_ok() {
@@ -4052,7 +4066,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_closure = Arc::clone(&calls);
-        registry.set_compressor(move |_command, output| {
+        registry.set_compressor_with_exit_code(move |_command, output, _exit_code| {
             calls_for_closure.fetch_add(1, Ordering::SeqCst);
             CompressionResult::new(output)
         });
@@ -4089,7 +4103,7 @@ mod tests {
     fn registry_emits_single_recovery_marker_for_class_drops() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
-        registry.set_compressor(move |_command, _output| {
+        registry.set_compressor_with_exit_code(move |_command, _output, _exit_code| {
             let mut dropped = BTreeMap::new();
             dropped.insert(DropClass::Error, 18);
             dropped.insert(DropClass::Warning, 6);
@@ -4122,7 +4136,7 @@ mod tests {
     fn registry_marker_reports_semantic_and_byte_drops_once() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
-        registry.set_compressor(move |_command, _output| {
+        registry.set_compressor_with_exit_code(move |_command, _output, _exit_code| {
             let mut dropped = BTreeMap::new();
             dropped.insert(DropClass::Error, 1);
             CompressionResult::with_class_drops(
@@ -4157,8 +4171,13 @@ mod tests {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
         let filter_registry = crate::compress::toml_filter::FilterRegistry::default();
-        registry.set_compressor(move |command, output| {
-            crate::compress::compress_with_registry(command, &output, &filter_registry)
+        registry.set_compressor_with_exit_code(move |command, output, exit_code| {
+            crate::compress::compress_with_registry_exit_code(
+                command,
+                &output,
+                exit_code,
+                &filter_registry,
+            )
         });
         let stderr = (0..22)
             .map(|index| {
@@ -4240,8 +4259,13 @@ mod tests {
             None,
             None,
         );
-        registry.set_compressor(move |command, output| {
-            crate::compress::compress_with_registry(command, &output, &filter_registry)
+        registry.set_compressor_with_exit_code(move |command, output, exit_code| {
+            crate::compress::compress_with_registry_exit_code(
+                command,
+                &output,
+                exit_code,
+                &filter_registry,
+            )
         });
         let stdout = format!(
             "make[1]: Entering directory `/tmp`\n{}",
@@ -4312,7 +4336,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_closure = Arc::clone(&calls);
-        registry.set_compressor(move |_command, output| {
+        registry.set_compressor_with_exit_code(move |_command, output, _exit_code| {
             calls_for_closure.fetch_add(1, Ordering::SeqCst);
             CompressionResult::new(output)
         });

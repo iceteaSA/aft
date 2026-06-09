@@ -22,8 +22,18 @@ impl Compressor for PlaywrightCompressor {
         command_tokens(command).any(|token| token == "playwright")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
-        compress_playwright(output).into()
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        let compressed = compress_playwright(output);
+        if matches!(exit_code, Some(code) if code != 0) && is_success_summary(&compressed) {
+            GenericCompressor::compress_output(output).into()
+        } else {
+            compressed.into()
+        }
     }
 
     fn matches_output(&self, output: &str) -> bool {
@@ -32,6 +42,12 @@ impl Compressor for PlaywrightCompressor {
             .any(|line| is_playwright_running_signature(line.trim_start()))
             || looks_like_playwright_json_output(output)
     }
+}
+
+fn is_success_summary(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("playwright:")
+        || (lower.contains(" tests: ") && lower.contains(" passed") && lower.contains("0 failed"))
 }
 
 fn looks_like_playwright_json_output(output: &str) -> bool {

@@ -12,7 +12,12 @@ impl Compressor for PytestCompressor {
                 .any(|window| matches!(window, ["python" | "python3", "-m", "pytest"]))
     }
 
-    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         compress_pytest(output)
     }
 

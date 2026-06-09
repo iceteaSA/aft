@@ -22,7 +22,12 @@ impl Compressor for EslintCompressor {
         command_tokens(command).any(|token| token == "eslint")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        _command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         compress_eslint(output)
     }
 

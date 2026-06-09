@@ -61,7 +61,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use toml_filter::{apply_filter, FilterRegistry};
+use toml_filter::{apply_filter_with_exit_code, FilterRegistry};
 use tsc::TscCompressor;
 use vitest::VitestCompressor;
 
@@ -209,8 +209,18 @@ pub trait Compressor: Send + Sync {
     /// Called after generic detection (ANSI strip, dedup) so this is per-command logic only.
     fn matches(&self, command: &str) -> bool;
 
+    /// Compress the output when the process exit code is unknown.
+    fn compress(&self, command: &str, output: &str) -> CompressionResult {
+        self.compress_with_exit_code(command, output, None)
+    }
+
     /// Compress the output. Original is left untouched if compression fails.
-    fn compress(&self, command: &str, output: &str) -> CompressionResult;
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult;
 
     fn specificity(&self) -> Specificity {
         Specificity::Specific
@@ -224,19 +234,36 @@ pub trait Compressor: Send + Sync {
         false
     }
 
+    /// Compress output after an output-shape match when the process exit code is unknown.
+    fn compress_output_match(&self, output: &str) -> CompressionResult {
+        self.compress_output_match_with_exit_code(output, None)
+    }
+
     /// Compress output after an output-shape match. Compressors that branch by
     /// subcommand override this to jump directly to the matched branch.
-    fn compress_output_match(&self, output: &str) -> CompressionResult {
-        self.compress("", output)
+    fn compress_output_match_with_exit_code(
+        &self,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        self.compress_with_exit_code("", output, exit_code)
     }
 }
-
 /// Top-level dispatch: try specific Rust modules, output-shape sniffers, package-manager modules, TOML filters, then generic fallback.
 ///
 /// Convenience wrapper for command handlers that already hold an `AppContext`.
 /// Backs onto [`compress_with_registry`] which is thread-safe for use from the
 /// `BgTaskRegistry` watchdog.
 pub fn compress(command: &str, output: String, ctx: &AppContext) -> CompressionResult {
+    compress_with_exit_code(command, output, None, ctx)
+}
+
+pub fn compress_with_exit_code(
+    command: &str,
+    output: String,
+    exit_code: Option<i32>,
+    ctx: &AppContext,
+) -> CompressionResult {
     if !ctx.config().experimental_bash_compress {
         return CompressionResult::new(output);
     }
@@ -245,7 +272,7 @@ pub fn compress(command: &str, output: String, ctx: &AppContext) -> CompressionR
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    compress_with_registry(command, &output, &guard)
+    compress_with_registry_exit_code(command, &output, exit_code, &guard)
 }
 
 /// Thread-safe dispatch that does not need `AppContext`. Caller is responsible
@@ -256,6 +283,15 @@ pub fn compress(command: &str, output: String, ctx: &AppContext) -> CompressionR
 pub fn compress_with_registry(
     command: &str,
     output: &str,
+    registry: &FilterRegistry,
+) -> CompressionResult {
+    compress_with_registry_exit_code(command, output, None, registry)
+}
+
+pub fn compress_with_registry_exit_code(
+    command: &str,
+    output: &str,
+    exit_code: Option<i32>,
     registry: &FilterRegistry,
 ) -> CompressionResult {
     let stripped_for_generic = strip_ansi(output);
@@ -294,7 +330,9 @@ pub fn compress_with_registry(
         .filter(|c| c.specificity() == Specificity::Specific)
     {
         if compressor.matches(dispatch_cmd) {
-            return compressor.compress(dispatch_cmd, &stripped_for_generic);
+            let result =
+                compressor.compress_with_exit_code(dispatch_cmd, &stripped_for_generic, exit_code);
+            return failure_preserving_result(command, &stripped_for_generic, result, exit_code);
         }
     }
 
@@ -309,7 +347,14 @@ pub fn compress_with_registry(
             .filter(|c| c.specificity() == specificity)
         {
             if compressor.matches_output(&stripped_for_generic) {
-                return compressor.compress_output_match(&stripped_for_generic);
+                let result = compressor
+                    .compress_output_match_with_exit_code(&stripped_for_generic, exit_code);
+                return failure_preserving_result(
+                    command,
+                    &stripped_for_generic,
+                    result,
+                    exit_code,
+                );
             }
         }
     }
@@ -320,18 +365,114 @@ pub fn compress_with_registry(
         .filter(|c| c.specificity() == Specificity::PackageManager)
     {
         if compressor.matches(dispatch_cmd) {
-            return compressor.compress(dispatch_cmd, &stripped_for_generic);
+            let result =
+                compressor.compress_with_exit_code(dispatch_cmd, &stripped_for_generic, exit_code);
+            return failure_preserving_result(command, &stripped_for_generic, result, exit_code);
         }
     }
 
     // Tier 2: TOML filters. Pass raw output so `[ansi].strip = false` filters
     // can intentionally match escape sequences; `apply_filter` owns ANSI policy.
     if let Some(filter) = registry.lookup(dispatch_cmd) {
-        return apply_filter(filter, output);
+        let result = apply_filter_with_exit_code(filter, output, exit_code);
+        return failure_preserving_result(command, &stripped_for_generic, result, exit_code);
     }
 
     // Tier 3: generic fallback.
-    GenericCompressor.compress(command, &stripped_for_generic)
+    GenericCompressor.compress_with_exit_code(command, &stripped_for_generic, exit_code)
+}
+
+fn failure_preserving_result(
+    command: &str,
+    stripped_raw_output: &str,
+    result: CompressionResult,
+    exit_code: Option<i32>,
+) -> CompressionResult {
+    if !matches!(exit_code, Some(code) if code != 0) {
+        return result;
+    }
+
+    if result_looks_successful(&result.text)
+        || raw_failure_signal_absent_from_compressed(stripped_raw_output, &result.text)
+    {
+        GenericCompressor.compress_with_exit_code(command, stripped_raw_output, exit_code)
+    } else {
+        result
+    }
+}
+
+fn raw_failure_signal_absent_from_compressed(raw_output: &str, compressed_text: &str) -> bool {
+    let mut saw_signal_line = false;
+    for line in raw_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !line_has_failure_signal(trimmed) {
+            continue;
+        }
+        saw_signal_line = true;
+        if compressed_text.contains(trimmed) {
+            return false;
+        }
+    }
+
+    saw_signal_line && !text_has_failure_signal(compressed_text)
+}
+
+fn result_looks_successful(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    !text_has_failure_signal(text)
+        && (lower.contains("clean")
+            || lower.contains(" ok")
+            || lower.contains(":ok")
+            || lower.contains(": ok")
+            || lower.contains("passed")
+            || lower.contains("no errors")
+            || lower.contains("all checks passed")
+            || lower.contains("formatted")
+            || lower.contains("0 fail")
+            || lower.contains("found 0")
+            || lower.contains("up to date")
+            || lower.contains("up-to-date"))
+}
+
+fn text_has_failure_signal(text: &str) -> bool {
+    text.lines()
+        .any(|line| line_has_failure_signal(line.trim()))
+}
+
+fn line_has_failure_signal(line: &str) -> bool {
+    line.contains("error[")
+        || line.contains("error:")
+        || line.contains("Error")
+        || line.contains("FAILED")
+        || line.contains("FAIL")
+        || contains_nonzero_failure_word(line, "failed")
+        || contains_nonzero_failure_word(line, "failure")
+        || contains_nonzero_failure_word(line, "failures")
+        || line.contains("panic")
+        || line.contains("cannot find")
+        || line.contains("not found")
+        || line.contains("no such")
+}
+
+fn contains_nonzero_failure_word(line: &str, word: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    for (index, _) in lower.match_indices(word) {
+        let prefix = lower[..index].trim_end();
+        let digits_start = prefix
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| ch.is_ascii_digit())
+            .last()
+            .map(|(idx, _)| idx);
+        let Some(digits_start) = digits_start else {
+            return true;
+        };
+        let digits = &prefix[digits_start..];
+        if digits.parse::<usize>().ok() != Some(0) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build the registry of TOML filters from the standard sources for the
@@ -897,6 +1038,145 @@ mod dispatch_specificity_tests {
         let compressed = dispatch("pnpm install", output);
         // PnpmCompressor's compress_package keeps "+ pkg" or "Added X packages" type lines.
         assert!(compressed.contains("Added") || compressed.contains("Progress"));
+    }
+}
+
+#[cfg(test)]
+mod exit_code_safety_tests {
+    use super::*;
+    use crate::compress::toml_filter::{build_registry, FilterRegistry};
+
+    fn empty_registry() -> FilterRegistry {
+        FilterRegistry::default()
+    }
+
+    #[test]
+    fn go_build_nonzero_preserves_missing_module_error_but_zero_keeps_old_summary() {
+        let output = "go: go.mod file not found in current directory or any parent directory; see 'go help modules'\n";
+
+        let failed =
+            compress_with_registry_exit_code("go build ./...", output, Some(1), &empty_registry());
+        assert!(!failed.text.contains("go build: ok"));
+        assert!(failed.text.contains("go.mod file not found"));
+
+        let successful =
+            compress_with_registry_exit_code("go build ./...", output, Some(0), &empty_registry());
+        assert_eq!(successful.text, "go build: ok");
+    }
+
+    #[test]
+    fn playwright_nonzero_crash_does_not_become_passed_summary() {
+        let output = r#"Running 4 tests using 2 workers
+
+  ✓  1 [chromium] › example.spec.ts:5:1 › has title (2.3s)
+  ✓  2 [chromium] › example.spec.ts:9:1 › get started link (1.8s)
+  ✓  3 [chromium] › nav.spec.ts:3:1 › navigates (1.2s)
+  ✓  4 [chromium] › auth.spec.ts:7:1 › logs out (1.0s)
+
+  4 passed (6.3s)
+Error: browserType.launch: Target page, context or browser has been closed
+"#;
+
+        let failed = compress_with_registry_exit_code(
+            "npx playwright test",
+            output,
+            Some(1),
+            &empty_registry(),
+        );
+        assert!(!failed.text.starts_with("playwright: 4 tests passed"));
+        assert!(failed.text.contains("browserType.launch"));
+    }
+
+    #[test]
+    fn cargo_test_compile_error_nonzero_preserves_error_code_diagnostic() {
+        let output = r#"   Compiling demo v0.1.0 (/tmp/demo)
+error[E0432]: unresolved import `crate::missing`
+ --> src/lib.rs:1:5
+  |
+1 | use crate::missing;
+  |     ^^^^^^^^^^^^^^ no `missing` in the root
+
+error: could not compile `demo` (lib test) due to 1 previous error
+"#;
+
+        let failed =
+            compress_with_registry_exit_code("cargo test", output, Some(101), &empty_registry());
+        assert!(failed.text.contains("error[E0432]"));
+        assert!(failed.text.contains("unresolved import"));
+        assert!(failed.text.contains("error: could not compile"));
+    }
+
+    #[test]
+    fn chained_mypy_success_then_later_failure_uses_failure_preserving_output() {
+        let output = "Success: no issues found in 1 source file\nError: node process exploded\n";
+
+        let failed = compress_with_registry_exit_code(
+            "mypy src && node fail.js",
+            output,
+            Some(1),
+            &empty_registry(),
+        );
+        assert_ne!(failed.text, "mypy: clean");
+        assert!(failed.text.contains("Error: node process exploded"));
+    }
+
+    #[test]
+    fn toml_shortcircuit_is_skipped_for_nonzero_exit() {
+        let registry = build_registry(
+            &[(
+                "wget",
+                r#"[filter]
+matches = ["wget"]
+
+[shortcircuit]
+when = '(?s).*'
+replacement = "wget: ok"
+"#,
+            )],
+            None,
+            None,
+        );
+        let output = "Connecting to example.invalid\nerror: connection refused\n";
+
+        let failed = compress_with_registry_exit_code(
+            "wget https://example.invalid",
+            output,
+            Some(1),
+            &registry,
+        );
+        assert_ne!(failed.text, "wget: ok");
+        assert!(failed.text.contains("error: connection refused"));
+    }
+
+    #[test]
+    fn unknown_exit_code_keeps_byte_identical_legacy_compressor_output() {
+        let output =
+            "Success: no issues found in 1 source file\nError: later chained command failed\n";
+
+        let legacy = compress_with_registry_exit_code(
+            "mypy src && node fail.js",
+            output,
+            None,
+            &empty_registry(),
+        );
+        assert_eq!(legacy.text, "mypy: clean");
+    }
+
+    #[test]
+    fn successful_exit_still_gets_concise_success_summary() {
+        let output = r#"Running 4 tests using 2 workers
+
+  ✓  1 [chromium] › example.spec.ts:5:1 › has title (2.3s)
+  ✓  2 [chromium] › example.spec.ts:9:1 › get started link (1.8s)
+  ✓  3 [chromium] › nav.spec.ts:3:1 › navigates (1.2s)
+  ✓  4 [chromium] › auth.spec.ts:7:1 › logs out (1.0s)
+
+  4 passed (6.3s)
+"#;
+
+        let successful =
+            compress_with_registry_exit_code("playwright test", output, Some(0), &empty_registry());
+        assert_eq!(successful.text, "playwright: 4 tests passed (6.3s)");
     }
 }
 

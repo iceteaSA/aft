@@ -21,23 +21,43 @@ impl Compressor for GitCompressor {
         command_head(command).is_some_and(|head| head == "git")
     }
 
-    fn compress(&self, command: &str, output: &str) -> CompressionResult {
-        match git_subcommand(command).as_deref() {
-            Some("add") => compress_add(output).into(),
-            Some("status") => compress_status(output).into(),
-            Some("diff") => compress_diff(output, false).into(),
-            Some("log") => compress_log(output).into(),
-            Some("show") => compress_diff(output, true).into(),
-            Some("branch") => trim_trailing_lines(&dedup_consecutive(output)).into(),
-            Some("blame") => compress_blame(output).into(),
-            Some("commit") => compress_commit(output).into(),
-            Some("push") => compress_push(output).into(),
-            Some("pull") => compress_pull(output).into(),
-            Some("fetch") => compress_fetch(output).into(),
-            Some("stash") => compress_stash(command, output).into(),
-            _ => GenericCompressor::compress_output(output).into(),
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> CompressionResult {
+        let compressed = match git_subcommand(command).as_deref() {
+            Some("add") => compress_add(output),
+            Some("status") => compress_status(output),
+            Some("diff") => compress_diff(output, false),
+            Some("log") => compress_log(output),
+            Some("show") => compress_diff(output, true),
+            Some("branch") => trim_trailing_lines(&dedup_consecutive(output)),
+            Some("blame") => compress_blame(output),
+            Some("commit") => compress_commit(output),
+            Some("push") => compress_push(output),
+            Some("pull") => compress_pull(output),
+            Some("fetch") => compress_fetch(output),
+            Some("stash") => compress_stash(command, output),
+            _ => GenericCompressor::compress_output(output),
+        };
+        if matches!(exit_code, Some(code) if code != 0)
+            && looks_like_git_success_summary(&compressed)
+        {
+            GenericCompressor::compress_output(output).into()
+        } else {
+            compressed.into()
         }
     }
+}
+
+fn looks_like_git_success_summary(text: &str) -> bool {
+    let trimmed = text.trim();
+    matches!(
+        trimmed,
+        "git: ok" | "git fetch: ok" | "Everything up-to-date" | "Already up to date."
+    ) || trimmed.contains("working tree clean")
 }
 
 fn command_head(command: &str) -> Option<&str> {
@@ -587,15 +607,20 @@ fn trim_trailing_lines(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::compress::Compressor;
+
+    fn compress(command: &str, output: &str) -> CompressionResult {
+        GitCompressor.compress(command, output)
+    }
+
     #[test]
     fn test_add_empty_output_ok() {
-        let compressed = GitCompressor.compress("git add .", "");
+        let compressed = compress("git add .", "");
         assert_eq!(compressed, "git: ok");
     }
     #[test]
     fn test_add_verbose_many_files() {
         let raw = "add 'src/a.rs'\nadd 'src/b.rs'\nadd 'src/c.rs'\nadd 'src/d.rs'\nadd 'src/e.rs'\nadd 'src/f.rs'\nadd 'src/g.rs'\n";
-        let compressed = GitCompressor.compress("git add --verbose .", raw);
+        let compressed = compress("git add --verbose .", raw);
         assert!(compressed.contains("add 'src/a.rs'"));
         assert!(compressed.contains("add 'src/e.rs'"));
         assert!(compressed.contains("... (2 more files added)"));
@@ -604,7 +629,7 @@ mod tests {
     #[test]
     fn test_add_error_passthrough() {
         let raw = "fatal: pathspec 'missing.rs' did not match any files\n";
-        let compressed = GitCompressor.compress("git add missing.rs", raw);
+        let compressed = compress("git add missing.rs", raw);
         assert_eq!(
             compressed,
             "fatal: pathspec 'missing.rs' did not match any files"
@@ -613,7 +638,7 @@ mod tests {
     #[test]
     fn test_commit_success_extracts_subject_and_summary() {
         let raw = "[main 1a2b3c4] add git write compression\n 3 files changed, 42 insertions(+), 7 deletions(-)\n create mode 100644 crates/aft/src/foo.rs\n rewrite crates/aft/src/bar.rs (80%)\n";
-        let compressed = GitCompressor.compress("git commit -m 'add git write compression'", raw);
+        let compressed = compress("git commit -m 'add git write compression'", raw);
         assert_eq!(
             compressed,
             "[main 1a2b3c4] add git write compression\n3 files changed, 42 insertions(+), 7 deletions(-)"
@@ -622,20 +647,20 @@ mod tests {
     #[test]
     fn test_commit_nothing_to_commit_verbatim() {
         let raw = "On branch main\nnothing to commit, working tree clean\n";
-        let compressed = GitCompressor.compress("git commit -m noop", raw);
+        let compressed = compress("git commit -m noop", raw);
         assert_eq!(compressed, "nothing to commit, working tree clean");
     }
     #[test]
     fn test_commit_error_passthrough() {
         let raw = "error: Committing is not possible because you have unmerged files.\nhint: Fix them up in the work tree, and then use 'git add/rm <file>'\nfatal: Exiting because of an unresolved conflict.\n";
-        let compressed = GitCompressor.compress("git commit", raw);
+        let compressed = compress("git commit", raw);
         assert!(compressed.contains("error: Committing is not possible"));
         assert!(compressed.contains("fatal: Exiting because of an unresolved conflict."));
     }
     #[test]
     fn test_push_success_drops_progress_keeps_remote_and_ref() {
         let raw = "Counting objects: 12, done.\nDelta compression using up to 8 threads\nCompressing objects: 100% (7/7), done.\nWriting objects: 100% (7/7), 1.23 KiB | 1.23 MiB/s, done.\nTotal 7 (delta 4), reused 0 (delta 0), pack-reused 0\nremote: Resolving deltas: 100% (4/4), completed with 4 local objects.\nTo github.com:example/repo.git\n   9d8c7b6..1a2b3c4  main -> main\n";
-        let compressed = GitCompressor.compress("git push", raw);
+        let compressed = compress("git push", raw);
         assert_eq!(
             compressed,
             "To github.com:example/repo.git\n   9d8c7b6..1a2b3c4  main -> main"
@@ -644,22 +669,22 @@ mod tests {
     #[test]
     fn test_push_everything_up_to_date_and_empty() {
         assert_eq!(
-            GitCompressor.compress("git push", "Everything up-to-date\n"),
+            compress("git push", "Everything up-to-date\n"),
             "Everything up-to-date"
         );
-        assert_eq!(GitCompressor.compress("git push", ""), "");
+        assert_eq!(compress("git push", ""), "");
     }
     #[test]
     fn test_push_error_passthrough() {
         let raw = "To github.com:example/repo.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'github.com:example/repo.git'\n";
-        let compressed = GitCompressor.compress("git push", raw);
+        let compressed = compress("git push", raw);
         assert!(compressed.contains("! [rejected]        main -> main (fetch first)"));
         assert!(compressed.contains("error: failed to push some refs"));
     }
     #[test]
     fn test_pull_fast_forward_keeps_summary() {
         let raw = "remote: Enumerating objects: 9, done.\nremote: Counting objects: 100% (9/9), done.\nFrom github.com:example/repo\n   1111111..2222222  main       -> origin/main\nUpdating 1111111..2222222\nFast-forward\n crates/aft/src/compress/git.rs | 12 +++++++++---\n 1 file changed, 9 insertions(+), 3 deletions(-)\n";
-        let compressed = GitCompressor.compress("git pull --ff-only", raw);
+        let compressed = compress("git pull --ff-only", raw);
         assert_eq!(
             compressed,
             "Updating 1111111..2222222\nFast-forward\n 1 file changed, 9 insertions(+), 3 deletions(-)"
@@ -668,31 +693,28 @@ mod tests {
     #[test]
     fn test_pull_already_up_to_date_empty_and_error() {
         assert_eq!(
-            GitCompressor.compress("git pull", "Already up to date.\n"),
+            compress("git pull", "Already up to date.\n"),
             "Already up to date."
         );
-        assert_eq!(GitCompressor.compress("git pull", ""), "");
+        assert_eq!(compress("git pull", ""), "");
         let raw = "CONFLICT (content): Merge conflict in README.md\nAutomatic merge failed; fix conflicts and then commit the result.\n";
-        let compressed = GitCompressor.compress("git pull", raw);
+        let compressed = compress("git pull", raw);
         assert!(compressed.contains("CONFLICT (content): Merge conflict in README.md"));
         assert!(compressed.contains("Automatic merge failed"));
     }
     #[test]
     fn test_fetch_success_empty_and_error() {
         let raw = "remote: Enumerating objects: 5, done.\nremote: Counting objects: 100% (5/5), done.\nFrom github.com:example/repo\n * [new branch]      feature/git-compress -> origin/feature/git-compress\n   abc1234..def5678  main                 -> origin/main\n";
-        let compressed = GitCompressor.compress("git fetch --all", raw);
+        let compressed = compress("git fetch --all", raw);
         assert_eq!(
             compressed,
             "From github.com:example/repo\n * [new branch]      feature/git-compress -> origin/feature/git-compress\n   abc1234..def5678  main                 -> origin/main"
         );
-        assert_eq!(
-            GitCompressor.compress("git fetch", "   \n"),
-            "git fetch: ok"
-        );
+        assert_eq!(compress("git fetch", "   \n"), "git fetch: ok");
         let error =
             "fatal: unable to access 'https://example.invalid/repo.git/': Could not resolve host\n";
         assert_eq!(
-            GitCompressor.compress("git fetch", error),
+            compress("git fetch", error),
             "fatal: unable to access 'https://example.invalid/repo.git/': Could not resolve host"
         );
     }
@@ -700,21 +722,18 @@ mod tests {
     fn test_stash_push_pop_list_empty_and_error() {
         let push = "Saved working directory and index state WIP on main: 1a2b3c4 add tests\nHEAD is now at 1a2b3c4 add tests\n";
         assert_eq!(
-            GitCompressor.compress("git stash push", push),
+            compress("git stash push", push),
             "Saved working directory and index state WIP on main: 1a2b3c4 add tests"
         );
         let pop = "On branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   README.md\nDropped refs/stash@{0} (abc123456789)\n";
-        let compressed_pop = GitCompressor.compress("git stash pop", pop);
+        let compressed_pop = compress("git stash pop", pop);
         assert!(compressed_pop.contains("On branch main"));
         assert!(compressed_pop.contains("Dropped refs/stash@{0}"));
         let list = "stash@{0}: WIP on main: 1111111 first\nstash@{1}: On feature: second\n";
-        assert_eq!(
-            GitCompressor.compress("git stash list", list),
-            list.trim_end()
-        );
-        assert_eq!(GitCompressor.compress("git stash", ""), "");
+        assert_eq!(compress("git stash list", list), list.trim_end());
+        assert_eq!(compress("git stash", ""), "");
         let error = "error: Your local changes to the following files would be overwritten by merge:\n\tREADME.md\n";
-        let compressed_error = GitCompressor.compress("git stash apply", error);
+        let compressed_error = compress("git stash apply", error);
         assert!(compressed_error.contains("error: Your local changes"));
         assert!(compressed_error.contains("README.md"));
     }

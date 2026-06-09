@@ -15,7 +15,12 @@ impl Compressor for PnpmCompressor {
             .is_some_and(|head| head == "pnpm")
     }
 
-    fn compress(&self, command: &str, output: &str) -> CompressionResult {
+    fn compress_with_exit_code(
+        &self,
+        command: &str,
+        output: &str,
+        _exit_code: Option<i32>,
+    ) -> CompressionResult {
         match pnpm_subcommand(command).as_deref() {
             Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
             Some("run" | "test" | "build") => GenericCompressor::compress_output(output).into(),
