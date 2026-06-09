@@ -13,8 +13,6 @@ import { noopAsk } from "./test-helpers";
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 let sdkCtx = createMockSdkContext(PROJECT_CWD);
 let tmpDir: string | null = null;
-const failingTest = ((test as typeof test & { failing?: typeof test }).failing ??
-  test) as typeof test;
 
 /**
  * read/write/edit/apply_patch now return `{ output, title, metadata }` so UI

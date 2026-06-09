@@ -1,7 +1,6 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 import {
   callBridge,
   expandTilde,
@@ -9,6 +8,7 @@ import {
   resolvePathFromProjectRoot,
   resolveProjectRoot,
 } from "./_shared.js";
+import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
 
