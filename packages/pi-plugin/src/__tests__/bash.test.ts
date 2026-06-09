@@ -302,6 +302,67 @@ describe("bash tool adapter", () => {
     expect((calls[0] as [string, Record<string, unknown>])[1].notify_on_completion).toBe(false);
   });
 
+  test("foreground leading grep appends aft_search hint", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const bridge = {
+      send: async (command: string) => {
+        if (command === "bash") return { success: true, status: "running", task_id: "task-grep" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "src/file.ts:1:x",
+          output_truncated: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx, true);
+
+    const result = (await tools
+      .get("bash")!
+      .execute("test-call", { command: 'grep -nE "x" src/' }, undefined, undefined, {
+        cwd: "/test",
+      })) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toContain("src/file.ts:1:x");
+    expect(result.content[0].text).toContain("DO NOT search code by running grep/rg in bash");
+    expect(result.content[0].text).toContain("Use the `aft_search` tool instead");
+  });
+
+  test("foreground filtering grep does not append code-search hint", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const bridge = {
+      send: async (command: string) => {
+        if (command === "bash") return { success: true, status: "running", task_id: "task-filter" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "failure details",
+          output_truncated: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx, true);
+
+    const result = (await tools
+      .get("bash")!
+      .execute("test-call", { command: "bun test | grep fail" }, undefined, undefined, {
+        cwd: "/test",
+      })) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toContain("failure details");
+    expect(result.content[0].text).not.toContain("DO NOT search code by running grep/rg in bash");
+  });
+
   test("foreground running command promotes to background after timeout", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);

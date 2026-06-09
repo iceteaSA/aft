@@ -1,9 +1,10 @@
 import {
   type BridgeRequestOptions,
+  maybeAppendGrepSearchHint,
   maybeStripCompressorPipe,
   resolveBashKillTimeout,
 } from "@cortexkit/aft-bridge";
-import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
+import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
@@ -96,7 +97,10 @@ async function withPermissionLoop(
   return second;
 }
 
-export function createBashTool(ctx: PluginContext): ToolDefinition {
+export function createBashTool(
+  ctx: PluginContext,
+  aftSearchRegisteredOverride?: boolean,
+): ToolDefinition {
   return {
     description: BASH_DESCRIPTION,
     args: {
@@ -147,6 +151,9 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
     },
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);
+      const ctxAftSearchRegistered =
+        (ctx as { aftSearchRegistered?: boolean }).aftSearchRegistered === true;
+      const aftSearchRegistered = aftSearchRegisteredOverride ?? ctxAftSearchRegistered;
       let accumulatedOutput = "";
       const description = args.description as string | undefined;
       const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
@@ -289,7 +296,11 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
             throw new Error((status.message as string | undefined) ?? "bash_status failed");
           }
           if (isTerminalStatus(status.status)) {
-            const rendered = appendPipeStripNote(formatForegroundResult(status), pipeStrip.note);
+            const rendered = maybeAppendGrepSearchHint(
+              appendPipeStripNote(formatForegroundResult(status), pipeStrip.note),
+              command,
+              aftSearchRegistered,
+            );
             const metadataPayload = foregroundMetadata(description, status, rendered);
             metadata?.(metadataPayload);
             return { output: rendered, title: uiTitle, metadata: metadataPayload };

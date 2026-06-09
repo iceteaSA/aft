@@ -68,6 +68,7 @@ function createHarness(
     options?: BridgeRequestOptions & { onProgress?: ProgressHandler },
   ) => Promise<BridgeResponse> | BridgeResponse,
   triggerImpl?: PluginContext["plugin"],
+  aftSearchRegistered = false,
 ) {
   const calls: SendCall[] = [];
   const bridge = {
@@ -88,7 +89,7 @@ function createHarness(
     config: {} as PluginContext["config"],
     storageDir: "/tmp/aft-test",
   };
-  return { calls, tool: createBashTool(ctx) };
+  return { calls, tool: createBashTool(ctx, aftSearchRegistered) };
 }
 
 function safeParse(schema: unknown, value: unknown): { success: boolean } {
@@ -485,6 +486,57 @@ describe("OpenCode bash adapter", () => {
       expect(call.options?.transportTimeoutMs).toBe(30_000);
     }
     expect(calls[0].params.notify_on_completion).toBe(false);
+  });
+
+  test("foreground leading grep appends aft_search hint", async () => {
+    const { tool: bash } = createHarness(
+      (command) => {
+        if (command === "bash") return { success: true, status: "running", task_id: "task-grep" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "src/file.ts:1:x",
+          output_truncated: false,
+        };
+      },
+      undefined,
+      true,
+    );
+
+    const output = bashText(
+      await bash.execute({ command: 'grep -nE "x" src/' }, createMockSdkContext()),
+    );
+
+    expect(output).toContain("src/file.ts:1:x");
+    expect(output).toContain("DO NOT search code by running grep/rg in bash");
+    expect(output).toContain("Use the `aft_search` tool instead");
+  });
+
+  test("foreground filtering grep does not append code-search hint", async () => {
+    const { tool: bash } = createHarness(
+      (command) => {
+        if (command === "bash") return { success: true, status: "running", task_id: "task-filter" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "failure details",
+          output_truncated: false,
+        };
+      },
+      undefined,
+      true,
+    );
+
+    const output = bashText(
+      await bash.execute({ command: "bun test | grep fail" }, createMockSdkContext()),
+    );
+
+    expect(output).toContain("failure details");
+    expect(output).not.toContain("DO NOT search code by running grep/rg in bash");
   });
 
   test("foreground running task promotes to background after wait timeout", async () => {

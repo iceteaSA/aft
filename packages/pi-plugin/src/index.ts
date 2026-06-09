@@ -753,7 +753,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // resolved config. registerBashTool handles per-flag gating internally
   // for bash_status / bash_kill.
   if (surface.hoistBash && resolveBashConfig(config).enabled) {
-    registerBashTool(pi, ctx);
+    registerBashTool(pi, ctx, surface.semantic);
   }
   registerHoistedTools(pi, ctx, surface);
 

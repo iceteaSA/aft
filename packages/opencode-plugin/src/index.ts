@@ -932,11 +932,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "bash_status",
   ];
   const registeredTools = new Set(Object.keys(allTools));
+  const aftSearchRegistered = registeredTools.has("aft_search");
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer can steer to it (vs the grep tool). The pool holds
   // configOverrides by reference and bridges spawn lazily, so a late set here
   // reaches every bridge — same pattern as `_ort_dylib_dir`/`lsp_paths_extra`.
-  pool.setConfigureOverride("aft_search_registered", registeredTools.has("aft_search"));
+  pool.setConfigureOverride("aft_search_registered", aftSearchRegistered);
+  // Also expose the same surface decision to the TypeScript-side native bash
+  // output finalizer, which catches leading grep/rg commands that Rust could
+  // not rewrite (for example, greps with unsupported flags or pipes).
+  (ctx as PluginContext & { aftSearchRegistered?: boolean }).aftSearchRegistered =
+    aftSearchRegistered;
   const hintsAbsentTools = new Set<string>();
   for (const name of HINTS_TOOL_NAMES) {
     if (!registeredTools.has(name)) hintsAbsentTools.add(name);
