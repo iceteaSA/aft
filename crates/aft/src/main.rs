@@ -807,6 +807,15 @@ fn watcher_project_root(ctx: &AppContext) -> Option<std::path::PathBuf> {
         .or_else(|| configured_root.map(canonicalize_watcher_path))
 }
 
+/// Returns true only when the canonical cache root has been configured
+/// (via set_canonical_cache_root) to a path that no longer exists on disk.
+/// This is the guard used by drain_watcher_events to avoid processing
+/// a delete-storm after the project root (e.g. a worktree) has been
+/// force-removed from underneath the bridge.
+fn project_root_was_deleted(ctx: &AppContext) -> bool {
+    matches!(ctx.canonical_cache_root_opt(), Some(root) if !root.exists())
+}
+
 fn watcher_same_path(path: &std::path::Path, target: &std::path::Path) -> bool {
     if path == target {
         return true;
@@ -1460,6 +1469,23 @@ fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::
 /// RefCell borrow conflicts. Events are deduplicated by PathBuf — notify
 /// fires multiple events per file write (Create, Modify, etc.).
 fn drain_watcher_events(ctx: &AppContext) {
+    // Root-gone guard: if the project root has been deleted (e.g. rm -rf of
+    // an Alfonso worktree), drop the watcher immediately so the OS stops
+    // delivering the delete-storm, record degraded, log once, and return
+    // without draining/processing any pending events. This prevents the
+    // CPU pin observed when hundreds of thousands of delete events drive
+    // per-file cache invalidation.
+    if ctx.watcher_rx().borrow().is_some() && project_root_was_deleted(ctx) {
+        *ctx.watcher().borrow_mut() = None;
+        *ctx.watcher_rx().borrow_mut() = None;
+        let _ = ctx.add_degraded_reason("project_root_deleted".to_string());
+        aft::slog_warn!(
+            "project root deleted; dropping watcher to avoid delete-storm: {:?}",
+            ctx.canonical_cache_root_opt()
+        );
+        return;
+    }
+
     // Phase 1: collect changed paths from the receiver without applying the
     // gitignore matcher yet; .gitignore writes in this same batch must rebuild
     // the matcher before any sibling path is filtered.
@@ -2225,8 +2251,9 @@ mod watcher_filter_tests {
     use super::{
         dispatch_panic_response, drain_configure_warning_events, drain_semantic_index_events,
         drain_semantic_refresh_events, drain_watcher_events, filter_watcher_raw_paths,
-        reset_semantic_refresh_retry_state_for_test, schedule_semantic_refresh_retry,
-        semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
+        project_root_was_deleted, reset_semantic_refresh_retry_state_for_test,
+        schedule_semantic_refresh_retry, semantic_refresh_circuit_is_open,
+        semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_event_invalidates,
         watcher_path_is_callgraph_indexed, write_push_frame_or_request_shutdown,
         BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
@@ -2866,6 +2893,34 @@ mod watcher_filter_tests {
         assert!(ctx
             .degraded_reasons()
             .contains(&"watcher_unavailable".to_string()));
+    }
+
+    #[test]
+    fn project_root_deleted_drops_watcher_rx_and_marks_degraded() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let ctx = make_ctx_with_root(&root);
+        ctx.set_canonical_cache_root(root.clone());
+
+        // Happy path: root exists → no deletion detected.
+        assert!(!project_root_was_deleted(&ctx));
+
+        // Simulate the worktree root being force-removed (rm -rf).
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(project_root_was_deleted(&ctx));
+
+        // Watcher rx present (as if a watcher was configured for this bridge).
+        let _watcher_tx = install_watcher_rx(&ctx);
+        assert!(ctx.watcher_rx().borrow().is_some());
+
+        // Drain must early-exit, drop both watcher and rx, record the specific
+        // degraded reason, and not process any (delete-storm) events.
+        drain_watcher_events(&ctx);
+
+        assert!(ctx.watcher_rx().borrow().is_none());
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&"project_root_deleted".to_string()));
     }
 
     #[test]
