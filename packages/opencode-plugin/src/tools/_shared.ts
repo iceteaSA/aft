@@ -20,6 +20,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import { timeoutForCommand } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import {
@@ -111,35 +112,15 @@ export function isEmptyParam(value: unknown): boolean {
   return false;
 }
 
-/**
- * Per-command timeout overrides (milliseconds).
- *
- * Commands not listed fall back to the bridge-wide default (30s). Only
- * extend budgets for operations that legitimately walk the project
- * file tree or wait on external I/O (embedding API, index build). The
- * goal is to absorb slow first-call spikes without masking real hangs.
- */
 // Bridge transport budget for bash-family calls. Rust bash returns `running`
 // promptly and plugin-side polling handles task lifetime, so transport only
 // covers spawn/control RPC round-trips. Keep this centralized so every
 // bash-family RPC also keeps the shared bridge alive on transport timeout.
 export const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 
-export const LONG_RUNNING_COMMAND_TIMEOUT_MS: Record<string, number> = {
-  callers: 60_000,
-  trace_to: 60_000,
-  trace_to_symbol: 60_000,
-  trace_data: 60_000,
-  impact: 60_000,
-  grep: 60_000,
-  glob: 60_000,
-  semantic_search: 60_000,
-};
-
-/** Returns the per-command timeout override, or undefined to use the bridge default. */
-export function timeoutForCommand(command: string): number | undefined {
-  return LONG_RUNNING_COMMAND_TIMEOUT_MS[command];
-}
+// Re-exported from @cortexkit/aft-bridge — the table lives next to the
+// bridge's semantic-timeout clamp so the two can never drift apart.
+export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "@cortexkit/aft-bridge";
 
 function asPlainObject(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;

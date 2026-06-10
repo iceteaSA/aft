@@ -28,6 +28,7 @@ export type {
 // --- transport ---
 export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";
 export { coerceStringArray } from "./coerce.js";
+export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
 // --- binary resolution ---
 export {
   downloadBinary,

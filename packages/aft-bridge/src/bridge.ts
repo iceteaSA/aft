@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
+import { LONG_RUNNING_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
 import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
@@ -105,7 +106,7 @@ export function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-function clampSemanticTimeout(
+export function clampSemanticTimeout(
   configOverrides: Record<string, unknown>,
   bridgeTimeoutMs: number,
 ): Record<string, unknown> {
@@ -119,17 +120,28 @@ function clampSemanticTimeout(
     return configOverrides;
   }
 
+  // The clamp exists so a Rust-side embed request fails BEFORE the transport
+  // gives up on the request that carries it. But `semantic_search` doesn't
+  // run on the bridge default budget — plugins send it with the per-command
+  // override from LONG_RUNNING_COMMAND_TIMEOUT_MS. Clamping against the bare
+  // default (30s) silently cut user-configured cold-load headroom (e.g.
+  // LMStudio 8B: 60s → 25s) and aborted background refresh batches that have
+  // no transport constraint at all. Clamp against the real budget.
+  const semanticTransportBudgetMs = Math.max(
+    bridgeTimeoutMs,
+    LONG_RUNNING_COMMAND_TIMEOUT_MS.semantic_search ?? 0,
+  );
   const maxSemanticTimeoutMs =
-    bridgeTimeoutMs > SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
-      ? bridgeTimeoutMs - SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
-      : Math.max(1, bridgeTimeoutMs - 1);
+    semanticTransportBudgetMs > SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
+      ? semanticTransportBudgetMs - SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
+      : Math.max(1, semanticTransportBudgetMs - 1);
 
   if (timeoutMs <= maxSemanticTimeoutMs) {
     return configOverrides;
   }
 
   warn(
-    `semantic.timeout_ms=${timeoutMs} exceeds bridge timeout budget; clamping to ${maxSemanticTimeoutMs}ms (bridge timeout: ${bridgeTimeoutMs}ms)`,
+    `semantic.timeout_ms=${timeoutMs} exceeds the semantic transport budget; clamping to ${maxSemanticTimeoutMs}ms (budget: ${semanticTransportBudgetMs}ms)`,
   );
 
   return {
