@@ -12,7 +12,12 @@ import {
   trackBgTask,
 } from "../bg-notifications.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
-import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
+import {
+  bashToolDescription,
+  createBashKillTool,
+  createBashStatusTool,
+  createBashTool,
+} from "../tools/bash.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import { createBashWriteTool } from "../tools/bash_write.js";
 import type { PluginContext } from "../types.js";
@@ -100,7 +105,7 @@ describe("OpenCode bash adapter", () => {
   test("schema accepts valid unified bash params and rejects invalid shapes", () => {
     const { tool: bash } = createHarness(() => ({ success: true, output: "" }));
 
-    expect(bash.description).toContain("By default, output is compressed");
+    expect(bash.description).toContain("Output is compressed by default");
     expect(bash.description).toContain("compressed: false");
     expect(bash.description).toContain("background: true");
 
@@ -1261,5 +1266,29 @@ describe("OpenCode bash adapter — subagent gating", () => {
       'bash_watch({ taskId: "bash-sub-promote", timeoutMs: 60000 })',
     );
     expect(calls.map((c) => c.command)).toEqual(["bash", "bash_status", "bash_promote"]);
+  });
+});
+
+describe("bash tool description (agent-facing wording)", () => {
+  test("prohibits bash code search and steers to aft_search when registered", () => {
+    const desc = bashToolDescription(true);
+    expect(desc).toContain("DO NOT use bash for code search");
+    expect(desc).toContain("STOP");
+    expect(desc).toContain("aft_search");
+  });
+
+  test("steers to the grep tool when aft_search is not registered", () => {
+    const desc = bashToolDescription(false);
+    expect(desc).toContain("DO NOT use bash for code search");
+    expect(desc).toContain("grep tool");
+    expect(desc).not.toContain("aft_search");
+  });
+
+  test("contains no internal vocabulary agents don't care about", () => {
+    for (const variant of [bashToolDescription(true), bashToolDescription(false)]) {
+      expect(variant.toLowerCase()).not.toContain("hoisted");
+      expect(variant.toLowerCase()).not.toContain("rewrit");
+      expect(variant.toLowerCase()).not.toContain("unified bash schema");
+    }
   });
 });

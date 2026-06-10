@@ -60,6 +60,7 @@ import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { astTools } from "./tools/ast.js";
+import { bashToolDescription } from "./tools/bash.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
@@ -974,6 +975,14 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // not rewrite (for example, greps with unsupported flags or pipes).
   (ctx as PluginContext & { aftSearchRegistered?: boolean }).aftSearchRegistered =
     aftSearchRegistered;
+  // The bash tool description embeds a code-search prohibition that steers to
+  // aft_search when registered (else the grep tool). Registration is only
+  // known once the full tool map exists, so select the variant here — the
+  // factory default assumes aft_search is absent.
+  for (const name of ["bash", "aft_bash"]) {
+    const def = allTools[name];
+    if (def) def.description = bashToolDescription(aftSearchRegistered);
+  }
   const hintsAbsentTools = new Set<string>();
   for (const name of HINTS_TOOL_NAMES) {
     if (!registeredTools.has(name)) hintsAbsentTools.add(name);

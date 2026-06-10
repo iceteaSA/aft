@@ -992,3 +992,47 @@ describe("registerBashTool registers bash + bash_status + bash_kill as a unit", 
     expect((calls[1] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bash-123" });
   });
 });
+
+describe("bash tool description (agent-facing wording)", () => {
+  function registeredDescription(aftSearchRegistered: boolean): {
+    description: string;
+    promptGuidelines: string[];
+  } {
+    let captured: { description: string; promptGuidelines: string[] } | null = null;
+    const api = {
+      registerTool: (def: { name: string; description: string; promptGuidelines: string[] }) => {
+        // registerBashTool registers bash + bash_status/kill/watch/write —
+        // only the bash tool itself carries the code-search prohibition.
+        if (def.name !== "bash") return;
+        captured = { description: def.description, promptGuidelines: def.promptGuidelines };
+      },
+    } as unknown as ExtensionAPI;
+    registerBashTool(api, makeMockContext({} as BinaryBridge), aftSearchRegistered);
+    if (!captured) throw new Error("registerTool was not called");
+    return captured;
+  }
+
+  test("prohibits bash code search and steers to aft_search when registered", () => {
+    const { description, promptGuidelines } = registeredDescription(true);
+    expect(description).toContain("DO NOT use bash for code search");
+    expect(description).toContain("STOP");
+    expect(description).toContain("aft_search");
+    expect(promptGuidelines.join("\n")).toContain("DO NOT use bash for code search");
+  });
+
+  test("steers to the grep tool when aft_search is not registered", () => {
+    const { description } = registeredDescription(false);
+    expect(description).toContain("DO NOT use bash for code search");
+    expect(description).toContain("`grep` tool");
+    expect(description).not.toContain("aft_search");
+  });
+
+  test("contains no internal vocabulary agents don't care about", () => {
+    for (const flag of [true, false]) {
+      const { description } = registeredDescription(flag);
+      expect(description.toLowerCase()).not.toContain("hoisted");
+      expect(description.toLowerCase()).not.toContain("rust bash handler");
+      expect(description.toLowerCase()).not.toContain("rewrit");
+    }
+  });
+});
