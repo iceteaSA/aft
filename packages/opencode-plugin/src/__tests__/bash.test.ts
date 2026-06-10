@@ -1271,24 +1271,45 @@ describe("OpenCode bash adapter — subagent gating", () => {
 
 describe("bash tool description (agent-facing wording)", () => {
   test("prohibits bash code search and steers to aft_search when registered", () => {
-    const desc = bashToolDescription(true);
+    const desc = bashToolDescription(true, true, true);
     expect(desc).toContain("DO NOT use bash for code search");
     expect(desc).toContain("STOP");
     expect(desc).toContain("aft_search");
   });
 
   test("steers to the grep tool when aft_search is not registered", () => {
-    const desc = bashToolDescription(false);
+    const desc = bashToolDescription(false, true, true);
     expect(desc).toContain("DO NOT use bash for code search");
     expect(desc).toContain("grep tool");
     expect(desc).not.toContain("aft_search");
   });
 
   test("contains no internal vocabulary agents don't care about", () => {
-    for (const variant of [bashToolDescription(true), bashToolDescription(false)]) {
+    for (const variant of [
+      bashToolDescription(true, true, true),
+      bashToolDescription(false, false, false),
+    ]) {
       expect(variant.toLowerCase()).not.toContain("hoisted");
       expect(variant.toLowerCase()).not.toContain("rewrit");
       expect(variant.toLowerCase()).not.toContain("unified bash schema");
     }
+  });
+
+  test("compression sentence only appears when compression is on", () => {
+    expect(bashToolDescription(true, true, true)).toContain("compressed: false");
+    expect(bashToolDescription(true, false, true)).not.toContain("compressed");
+  });
+
+  test("background/PTY sentences track bash.background config", () => {
+    const on = bashToolDescription(true, true, true);
+    expect(on).toContain("background: true");
+    expect(on).toContain("pty: true");
+    // Background off: never advertise a guaranteed feature_disabled error,
+    // but still explain auto-promoted tasks (promotion is not gated).
+    const off = bashToolDescription(true, true, false);
+    expect(off).not.toContain("background: true");
+    expect(off).not.toContain("pty: true");
+    expect(off).toContain("promoted to background");
+    expect(off).toContain("bash_status");
   });
 });

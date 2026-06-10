@@ -21,7 +21,7 @@ import {
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
 } from "./bg-notifications.js";
-import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
+import { loadAftConfig, resolveBashConfig, resolveProjectOverridesForConfigure } from "./config.js";
 import {
   enqueueConfigureWarningsForSession,
   flushConfigureWarningsOnIdle,
@@ -978,10 +978,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // The bash tool description embeds a code-search prohibition that steers to
   // aft_search when registered (else the grep tool). Registration is only
   // known once the full tool map exists, so select the variant here — the
-  // factory default assumes aft_search is absent.
+  // factory default assumes aft_search is absent. The compression and
+  // background/PTY sentences are config-gated too: only advertised when the
+  // feature is actually on for this project.
   for (const name of ["bash", "aft_bash"]) {
     const def = allTools[name];
-    if (def) def.description = bashToolDescription(aftSearchRegistered);
+    if (def) {
+      const bashCfg = resolveBashConfig(aftConfig);
+      def.description = bashToolDescription(
+        aftSearchRegistered,
+        bashCfg.compress,
+        bashCfg.background,
+      );
+    }
   }
   const hintsAbsentTools = new Set<string>();
   for (const name of HINTS_TOOL_NAMES) {

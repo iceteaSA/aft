@@ -289,14 +289,27 @@ export function registerBashTool(
   // Agent-facing wording: no internal vocabulary ("hoisted", "Rust handler",
   // "command rewriting") — describe what the tool does and what NOT to use it
   // for. The code-search prohibition steers to aft_search when registered,
-  // else to the grep tool (same surface logic as the Rust grep footer).
+  // else to the grep tool (same surface logic as the Rust grep footer). The
+  // compression sentence only appears when compression is actually on —
+  // advertising `compressed: false` when compression is disabled would
+  // describe a no-op.
   const searchSteer = aftSearchRegistered
     ? "use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead"
     : "use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead";
+  const bashCfg = resolveBashConfig(ctx.config);
+  const compressionSentence = bashCfg.compress
+    ? " Output is compressed by default; pass `compressed: false` for raw output."
+    : "";
+  // `bash.background` gates explicit background/PTY spawning (Rust returns
+  // feature_disabled); foreground promotion happens regardless, so the
+  // no-background variant still explains promoted tasks.
+  const tasksSentence = bashCfg.background
+    ? ' Pass `background: true` to run in the background and get a task_id for `bash_status`/`bash_kill`. Pass `pty: true` for interactive programs (REPLs, TUIs) and drive them with `bash_status({ output_mode: "screen" })` plus `bash_write`.'
+    : " Commands that outlive the foreground wait window are promoted to background tasks; inspect them with `bash_status({ task_id })` or terminate with `bash_kill`.";
   pi.registerTool<typeof BashParams, BashDetails>({
     name: "bash",
     label: "bash",
-    description: `Execute shell commands. Output is compressed by default; pass \`compressed: false\` for raw output. Pass \`background: true\` to run in the background and get a task_id for \`bash_status\`/\`bash_kill\`. Pass \`pty: true\` for interactive programs (REPLs, TUIs) and drive them with \`bash_status({ output_mode: "screen" })\` plus \`bash_write\`.
+    description: `Execute shell commands.${compressionSentence}${tasksSentence}
 
 DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}.`,
     promptSnippet:

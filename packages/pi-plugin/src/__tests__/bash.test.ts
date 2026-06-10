@@ -994,7 +994,10 @@ describe("registerBashTool registers bash + bash_status + bash_kill as a unit", 
 });
 
 describe("bash tool description (agent-facing wording)", () => {
-  function registeredDescription(aftSearchRegistered: boolean): {
+  function registeredDescription(
+    aftSearchRegistered: boolean,
+    configOverride?: Record<string, unknown>,
+  ): {
     description: string;
     promptGuidelines: string[];
   } {
@@ -1007,7 +1010,9 @@ describe("bash tool description (agent-facing wording)", () => {
         captured = { description: def.description, promptGuidelines: def.promptGuidelines };
       },
     } as unknown as ExtensionAPI;
-    registerBashTool(api, makeMockContext({} as BinaryBridge), aftSearchRegistered);
+    const ctx = makeMockContext({} as BinaryBridge);
+    if (configOverride) ctx.config = configOverride as PluginContext["config"];
+    registerBashTool(api, ctx, aftSearchRegistered);
     if (!captured) throw new Error("registerTool was not called");
     return captured;
   }
@@ -1034,5 +1039,24 @@ describe("bash tool description (agent-facing wording)", () => {
       expect(description.toLowerCase()).not.toContain("rust bash handler");
       expect(description.toLowerCase()).not.toContain("rewrit");
     }
+  });
+
+  test("compression and background sentences track the resolved bash config", () => {
+    // Default mock config resolves to compress+background on.
+    const on = registeredDescription(true).description;
+    expect(on).toContain("compressed: false");
+    expect(on).toContain("background: true");
+    expect(on).toContain("pty: true");
+
+    // Both features off: never advertise a guaranteed feature_disabled error,
+    // but still explain auto-promoted tasks (promotion is not gated).
+    const off = registeredDescription(true, {
+      bash: { compress: false, background: false },
+    }).description;
+    expect(off).not.toContain("compressed: false");
+    expect(off).not.toContain("background: true");
+    expect(off).not.toContain("pty: true");
+    expect(off).toContain("promoted to background");
+    expect(off).toContain("bash_status");
   });
 });
