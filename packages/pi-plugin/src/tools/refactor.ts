@@ -119,7 +119,7 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
     name: "aft_refactor",
     label: "refactor",
     description:
-      "Workspace-wide refactoring that updates imports and references across files. `move` relocates a top-level symbol; `extract` pulls a line range into a new function; `inline` replaces a call site. Use aft_safety checkpoint/undo before risky refactors.",
+      "Workspace-wide refactoring that updates imports and references across files. `move` relocates a top-level symbol (not nested functions or class methods) to another file, rewriting imports workspace-wide; a checkpoint is created first. To move/rename a whole file, use aft_move. `extract` pulls a line range into a new function (TS/JS/TSX, Python). `inline` replaces a call with the function's body.",
     parameters: RefactorParams,
     async execute(
       _toolCallId: string,

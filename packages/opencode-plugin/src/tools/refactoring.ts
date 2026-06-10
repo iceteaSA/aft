@@ -20,15 +20,14 @@ const z = tool.schema;
 export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinition> {
   return {
     aft_refactor: {
+      // Per-op parameter requirements live on the param descriptions — the
+      // tool description names the ops and their one defining behavior each.
       description:
-        "Workspace-wide refactoring operations that update imports and references across files.\n\n" +
+        "Workspace-wide refactoring that updates imports and references across files.\n\n" +
         "Ops:\n" +
-        "- 'move': Move a top-level symbol to another file, updating all imports workspace-wide. Requires 'symbol', 'destination'. Creates a checkpoint before mutating. Only works on top-level exports (not nested functions or class methods).\n" +
-        "   Note: This moves code symbols between files. To rename/move an entire file, use aft_move instead.\n" +
-        "- 'extract': Extract a line range into a new function with auto-detected parameters. Requires 'name', 'startLine', 'endLine' (1-based, both inclusive). Supports TS/JS/TSX and Python.\n" +
-        "- 'inline': Replace a function call with the function's body, substituting args for params. Requires 'symbol', 'callSiteLine' (1-based). Validates single-return constraint.\n\n" +
-        "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
-        "All ops need 'filePath'. Use aft_safety checkpoint/undo before risky refactors.",
+        "- 'move': move a top-level symbol (not nested functions or class methods) to another file, rewriting imports workspace-wide. A checkpoint is created first. To move/rename a whole file, use aft_move.\n" +
+        "- 'extract': extract a line range into a new function with auto-detected parameters (TS/JS/TSX, Python).\n" +
+        "- 'inline': replace a function call with the function's body.",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {
