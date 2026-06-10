@@ -37,7 +37,6 @@ import { registerReadingTools } from "../../tools/reading.js";
 import { registerRefactorTool } from "../../tools/refactor.js";
 import { registerSafetyTool } from "../../tools/safety.js";
 import { registerSemanticTool } from "../../tools/semantic.js";
-import { registerStructureTool } from "../../tools/structure.js";
 import type { PluginContext } from "../../types.js";
 
 // Windows cargo produces `aft.exe`; Unix produces `aft`. Resolve the
@@ -217,7 +216,6 @@ export async function createHarness(
     move: true,
     astSearch: true,
     astReplace: true,
-    structure: true,
     refactor: true,
     // E2E surface defaults to restricted mode so the existing tests that
     // expect ui.confirm prompts for external paths keep working. The new
@@ -234,7 +232,6 @@ export async function createHarness(
   registerSafetyTool(api, ctx);
   registerAstTools(api, ctx, surface);
   registerFsTools(api, ctx, surface);
-  registerStructureTool(api, ctx);
   registerRefactorTool(api, ctx);
 
   const extCtx: MockExtensionContext = {
