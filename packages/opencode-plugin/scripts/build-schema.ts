@@ -413,7 +413,7 @@ function buildSchema(): Record<string, unknown> {
             type: "boolean",
             default: false,
             description:
-              "Wait for inline LSP diagnostics on every edit/write/apply_patch call unless the tool call overrides diagnostics. Default: false.",
+              "Wait for inline LSP diagnostics on every edit/write/apply_patch call. Default: false.",
           },
           auto_install: {
             type: "boolean",
