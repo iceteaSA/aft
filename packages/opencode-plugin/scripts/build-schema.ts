@@ -186,6 +186,92 @@ function buildSchema(): Record<string, unknown> {
           "Enable semantic search via aft_search. Backend defaults to local fastembed; configurable via the `semantic` field.",
       },
 
+      inspect: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            default: true,
+            description:
+              "Master switch for the aft_inspect tool. Defaults to true. Set false to hide aft_inspect from the tool surface.",
+          },
+          tier2_idle_minutes: {
+            type: "number",
+            minimum: 0,
+            default: 4,
+            description:
+              "OpenCode session.idle delay in minutes before Tier 2 inspect prewarm runs. Default: 4.",
+          },
+          categories: {
+            type: "object",
+            additionalProperties: { type: "boolean" },
+            description:
+              "Per-category enable/disable overrides keyed by category id (e.g. { 'dead-code': false, 'todos': true }).",
+          },
+          tier2_soft_deadline_ms: {
+            type: "integer",
+            minimum: 1,
+            description:
+              "Soft deadline for Tier 2 inspect analysis in milliseconds. Analysis may be truncated beyond this.",
+          },
+          max_drill_down_items: {
+            type: "integer",
+            minimum: 1,
+            maximum: 100,
+            description:
+              "Maximum number of drill-down items returned per inspect category. Capped at 100.",
+          },
+          duplicates: {
+            type: "object",
+            properties: {
+              lower_bound: {
+                type: "integer",
+                minimum: 1,
+                description: "Minimum clone size (in AST nodes) to report as a duplicate group.",
+              },
+              discard_cost: {
+                type: "integer",
+                minimum: 0,
+                description: "Discard threshold for near-duplicate detection cost metric.",
+              },
+              anonymize: {
+                type: "object",
+                properties: {
+                  variables: {
+                    type: "boolean",
+                    description: "Anonymize variable names in duplicate group display.",
+                  },
+                  fields: {
+                    type: "boolean",
+                    description: "Anonymize field names in duplicate group display.",
+                  },
+                  methods: {
+                    type: "boolean",
+                    description: "Anonymize method names in duplicate group display.",
+                  },
+                  types: {
+                    type: "boolean",
+                    description: "Anonymize type names in duplicate group display.",
+                  },
+                  literals: {
+                    type: "boolean",
+                    description: "Anonymize literal values in duplicate group display.",
+                  },
+                },
+                additionalProperties: false,
+                description:
+                  "Control which AST node kinds are anonymized when displaying duplicate groups.",
+              },
+            },
+            additionalProperties: false,
+            description: "Tuning knobs for the duplicate/near-duplicate code detection category.",
+          },
+        },
+        additionalProperties: false,
+        description:
+          "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect.",
+      },
+
       bash: {
         oneOf: [
           {
@@ -322,6 +408,12 @@ function buildSchema(): Record<string, unknown> {
             default: "pyright",
             description:
               "Which Python LSP to use. 'ty' is experimental and falls back to pyright if unavailable.",
+          },
+          diagnostics_on_edit: {
+            type: "boolean",
+            default: false,
+            description:
+              "Wait for inline LSP diagnostics on every edit/write/apply_patch call unless the tool call overrides diagnostics. Default: false.",
           },
           auto_install: {
             type: "boolean",
