@@ -43,7 +43,6 @@ import {
   sendFeatureAnnouncement,
   sendWarning,
 } from "./notifications.js";
-import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
@@ -59,6 +58,7 @@ import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
 import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
+import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { astTools } from "./tools/ast.js";
 import { bashToolDescription } from "./tools/bash.js";
