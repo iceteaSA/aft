@@ -31,6 +31,7 @@ import {
   readPtyBytes,
   renderScreen,
 } from "../shared/pty-cache.js";
+import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -198,7 +199,7 @@ interface BashDetails {
 }
 
 interface BashStatusWaited {
-  reason: "matched" | "exited" | "timeout";
+  reason: "matched" | "exited" | "timeout" | "user_message";
   elapsed_ms: number;
   match?: string;
   match_offset?: number;
@@ -675,6 +676,20 @@ export function createBashWatchTool(ctx: PluginContext) {
           MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
         ),
       );
+      // User-message abort: the sync wait was interrupted because the user
+      // sent a message. Auto-register the equivalent async watch so the
+      // notification still arrives, and return text explaining the conversion.
+      if (data.waited?.reason === "user_message") {
+        const convertedText = await convertToAsyncWatchOnAbort(
+          ctx,
+          bridge,
+          extCtx,
+          params.task_id,
+          waitFor,
+          params.once !== false,
+        );
+        return textResult(convertedText, { waited: data.waited } as BashWatchDetails);
+      }
       const text = await formatBashStatus(
         extCtx,
         params.task_id,
@@ -684,6 +699,67 @@ export function createBashWatchTool(ctx: PluginContext) {
       return textResult(text, data as BashWatchDetails);
     },
   };
+}
+
+/**
+ * When a sync bash_watch wait is aborted because the user sent a message,
+ * auto-register the equivalent async watch so the notification still arrives.
+ * If the original sync watch had a pattern, register an async watch with the
+ * same pattern. If it had no pattern (exit-only), the auto-reminder system
+ * already handles exit notifications, so just return the conversion message.
+ */
+async function convertToAsyncWatchOnAbort(
+  ctx: PluginContext,
+  bridge: BinaryBridge,
+  extCtx: ExtensionContext,
+  taskId: string,
+  waitFor: BashWaitPattern | undefined,
+  once: boolean,
+): Promise<string> {
+  // No pattern: the auto-reminder system already handles exit notifications
+  // for background tasks, so no explicit watch registration is needed.
+  if (!waitFor) {
+    return (
+      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      `The task is still running in the background. A completion reminder will be ` +
+      `delivered automatically when the task exits; don't poll bash_status.`
+    );
+  }
+  // Register the equivalent async watch so the pattern/exit notification
+  // still arrives. Reuse the same registration path as the explicit async mode.
+  const notifyParams: Record<string, unknown> = {
+    task_id: taskId,
+    once,
+  };
+  if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
+  else notifyParams.pattern = waitFor.value;
+  const sessionId = resolveSessionId(extCtx);
+  markExplicitControl(sessionId, taskId, false);
+  try {
+    const registered = await callBashBridge(bridge, "bash_notify", notifyParams, extCtx);
+    if (registered.success === false) {
+      unmarkExplicitControl(sessionId, taskId);
+      return (
+        `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+        `Auto-registering an async watch failed (${String(registered.message ?? "unknown error")}). ` +
+        `The task is still running in the background. A completion reminder will be ` +
+        `delivered automatically when the task exits.`
+      );
+    }
+    return (
+      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      `The wait has been converted to an async watch (${registered.watch_id}). ` +
+      `A notification will fire when the pattern matches or the task exits.`
+    );
+  } catch (err) {
+    unmarkExplicitControl(sessionId, taskId);
+    return (
+      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      `Auto-registering an async watch failed (${err instanceof Error ? err.message : String(err)}). ` +
+      `The task is still running in the background. A completion reminder will be ` +
+      `delivered automatically when the task exits.`
+    );
+  }
 }
 
 export function createBashWriteTool(ctx: PluginContext) {
@@ -832,6 +908,9 @@ async function waitForBashStatus(
   // frame that arrives while we're waiting, so no wake is ever scheduled for
   // this task. Mirrors the OpenCode fix; see bg-notifications.markTaskWaiting.
   const sessionId = resolveSessionId(extCtx);
+  // Clear any stale abort flag from a previous turn so it doesn't insta-abort
+  // this new wait.
+  clearSyncWatchAbort(sessionId);
   if (waitForExit) markTaskWaiting(sessionId, taskId);
   let sawTerminal = false;
   try {
@@ -876,6 +955,13 @@ async function waitForBashStatus(
           );
         }
         return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+      }
+
+      // User-message abort: if the user sent a message while we were
+      // blocking, convert this sync wait to an async watch so the agent's
+      // turn ends promptly. The match/exit checks above win over abort.
+      if (isSyncWatchAborted(sessionId)) {
+        return withWaited(data, { reason: "user_message", elapsed_ms: Date.now() - startedAt });
       }
 
       if (Date.now() >= deadline) {

@@ -13,6 +13,7 @@ import {
 import { resolveBashConfig } from "../config.js";
 import { disposePtyTerminal, getOrCreatePtyTerminal, readPtyBytes } from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
+import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
 import { callBashBridge, optionalInt, projectRootFor } from "./_shared.js";
 
@@ -26,7 +27,7 @@ export type BashWaitPattern =
   | { kind: "substring"; value: string }
   | { kind: "regex"; value: RegExp; source: string };
 export type BashStatusWaited = {
-  reason: "matched" | "exited" | "timeout";
+  reason: "matched" | "exited" | "timeout" | "user_message";
   elapsed_ms: number;
   match?: string;
   match_offset?: number;
@@ -117,11 +118,88 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         effectiveWaitMs,
       );
       const waited = data.waited;
+      // User-message abort: the sync wait was interrupted because the user
+      // sent a message. Auto-register the equivalent async watch so the
+      // notification still arrives, and return text explaining the conversion.
+      if (waited?.reason === "user_message") {
+        const convertedText = await convertToAsyncWatchOnAbort(
+          ctx,
+          context,
+          taskId,
+          waitFor,
+          args.once !== false,
+        );
+        const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
+          .metadata;
+        metadata?.({ taskId, status: data.status, waited, convertedToAsync: true });
+        return convertedText;
+      }
       const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
       if (waited) metadata?.({ taskId, status: data.status, waited });
       return formatWatchResultText(taskId, data, waited);
     },
   };
+}
+
+/**
+ * When a sync bash_watch wait is aborted because the user sent a message,
+ * auto-register the equivalent async watch so the notification still arrives.
+ * If the original sync watch had a pattern, register an async watch with the
+ * same pattern. If it had no pattern (exit-only), the auto-reminder system
+ * already handles exit notifications, so just return the conversion message.
+ */
+async function convertToAsyncWatchOnAbort(
+  ctx: PluginContext,
+  context: ToolContext,
+  taskId: string,
+  waitFor: BashWaitPattern | undefined,
+  once: boolean,
+): Promise<string> {
+  // No pattern: the auto-reminder system already handles exit notifications
+  // for background tasks, so no explicit watch registration is needed.
+  if (!waitFor) {
+    return (
+      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      `The task is still running in the background. A completion reminder will be ` +
+      `delivered automatically when the task exits; don't poll bash_status.`
+    );
+  }
+  // Register the equivalent async watch so the pattern/exit notification
+  // still arrives. Reuse the same registration path as the explicit async mode.
+  const notifyParams: Record<string, unknown> = {
+    task_id: taskId,
+    once,
+  };
+  if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
+  else notifyParams.pattern = waitFor.value;
+  markExplicitControl(context.sessionID, taskId, false);
+  try {
+    const registered = await callBashBridge(ctx, context, "bash_notify", notifyParams);
+    if (registered.success === false) {
+      unmarkExplicitControl(context.sessionID, taskId);
+      // Registration failed — fall back to the auto-reminder path.
+      return (
+        `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+        `Auto-registering an async watch failed (${String(registered.message ?? "unknown error")}). ` +
+        `The task is still running in the background. A completion reminder will be ` +
+        `delivered automatically when the task exits.`
+      );
+    }
+    return (
+      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      `The wait has been converted to an async watch (${registered.watch_id}). ` +
+      `A notification will fire when the pattern matches or the task exits.`
+    );
+  } catch (err) {
+    unmarkExplicitControl(context.sessionID, taskId);
+    // Registration failed — fall back to the auto-reminder path.
+    return (
+      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      `Auto-registering an async watch failed (${err instanceof Error ? err.message : String(err)}). ` +
+      `The task is still running in the background. A completion reminder will be ` +
+      `delivered automatically when the task exits.`
+    );
+  }
 }
 
 function formatWatchResultText(
@@ -185,6 +263,9 @@ export async function waitForBashStatus(
   let scanText = "";
   let scanBaseOffset = 0;
   const bridgeOptions: BridgeRequestOptions = {};
+  // Clear any stale abort flag from a previous turn so it doesn't insta-abort
+  // this new wait.
+  clearSyncWatchAbort(runtime.sessionID);
   markTaskWaiting(runtime.sessionID, taskId);
   let sawTerminal = false;
   try {
@@ -228,6 +309,14 @@ export async function waitForBashStatus(
           taskId,
         );
         return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+      }
+      // User-message abort: if the user sent a message while we were
+      // blocking, convert this sync wait to an async watch so the agent's
+      // turn ends promptly. The match/exit checks above win over abort —
+      // if the task already matched or exited in this iteration, we return
+      // that result instead of aborting.
+      if (isSyncWatchAborted(runtime.sessionID)) {
+        return withWaited(data, { reason: "user_message", elapsed_ms: Date.now() - startedAt });
       }
       if (Date.now() >= deadline) {
         return withWaited(data, { reason: "timeout", elapsed_ms: Date.now() - startedAt });

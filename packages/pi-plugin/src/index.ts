@@ -78,6 +78,7 @@ setActiveLogger(bridgeLogger);
 
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
+import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { resolveSessionId } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
 import { registerBashTool } from "./tools/bash.js";
@@ -842,6 +843,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       sessionID: resolveSessionId(extCtx),
       runtime: pi,
     });
+  });
+
+  // User-message abort: when the user sends a message while the agent is
+  // blocked in a sync bash_watch wait, signal the wait to abort and convert
+  // to an async watch so the user isn't locked out.
+  (
+    pi.on as (
+      event: "input",
+      handler: (
+        event: { type: string; text: string; source: string },
+        ctx: Parameters<typeof resolveSessionId>[0] & { cwd: string },
+      ) => unknown,
+    ) => void
+  )("input", (_event, extCtx) => {
+    signalSyncWatchAbort(resolveSessionId(extCtx));
   });
 
   // Also register process-level signal handlers so children get an orderly

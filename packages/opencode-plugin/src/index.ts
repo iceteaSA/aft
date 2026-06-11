@@ -43,6 +43,7 @@ import {
   sendFeatureAnnouncement,
   sendWarning,
 } from "./notifications.js";
+import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
@@ -1053,6 +1054,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // Eagerly warm the session-directory cache so the first tool call from
       // this turn routes to the right project (covers `opencode -s`-from-cwd).
       warmSessionDirectory(input.client, sid, input.directory);
+      // Signal any in-flight sync bash_watch to abort and convert to async
+      // so the user's message isn't blocked by a long-running wait.
+      signalSyncWatchAbort(sid);
     },
     "tool.execute.before": async (toolInput: { sessionID?: string }) => {
       if (toolInput.sessionID) inspectTier2Idle.clear(toolInput.sessionID);

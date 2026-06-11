@@ -12,6 +12,7 @@ import {
   trackBgTask,
 } from "../bg-notifications.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
+import { __resetSyncWatchAbortForTests, signalSyncWatchAbort } from "../sync-watch-abort.js";
 import {
   bashToolDescription,
   createBashKillTool,
@@ -970,6 +971,77 @@ describe("bash_status tool", () => {
     await expect(killTool.execute({ taskId: "bash-done" }, createMockSdkContext())).rejects.toThrow(
       "task already finished",
     );
+  });
+
+  // ─── sync-watch user-message abort ───
+  test("bash_watch sync wait aborts on user message and converts to async (with pattern)", async () => {
+    __resetBgNotificationStateForTests();
+    __resetSyncWatchAbortForTests();
+    const sessionId = "s-abort-pattern";
+    let pollCount = 0;
+    const { calls, watchTool } = makeCtx((cmd) => {
+      if (cmd === "bash_notify") return { success: true, watch_id: "watch-aborted" };
+      pollCount++;
+      // Signal abort after the first poll
+      if (pollCount === 1) signalSyncWatchAbort(sessionId);
+      return { success: true, status: "running", mode: "pipes" };
+    });
+    const result = await watchTool.execute(
+      { taskId: "bash-abort", pattern: "READY" },
+      createMockSdkContext({ sessionID: sessionId }),
+    );
+    // Should contain the conversion message
+    expect(result).toContain("interrupted because you sent a message");
+    expect(result).toContain("converted to an async watch");
+    expect(result).toContain("watch-aborted");
+    // Should have called bash_notify to register the async watch
+    const notifyCall = calls.find((c) => c.cmd === "bash_notify");
+    expect(notifyCall).toBeDefined();
+    expect(notifyCall?.params.task_id).toBe("bash-abort");
+    expect(notifyCall?.params.pattern).toBe("READY");
+  });
+
+  test("bash_watch sync wait aborts on user message without pattern (exit-only)", async () => {
+    __resetBgNotificationStateForTests();
+    __resetSyncWatchAbortForTests();
+    const sessionId = "s-abort-no-pattern";
+    let pollCount = 0;
+    const { calls, watchTool } = makeCtx((cmd) => {
+      pollCount++;
+      if (pollCount === 1) signalSyncWatchAbort(sessionId);
+      return { success: true, status: "running", mode: "pipes" };
+    });
+    const result = await watchTool.execute(
+      { taskId: "bash-abort-exit" },
+      createMockSdkContext({ sessionID: sessionId }),
+    );
+    // Should contain the conversion message mentioning auto-reminder
+    expect(result).toContain("interrupted because you sent a message");
+    expect(result).toContain("completion reminder will be delivered automatically");
+    // Should NOT have called bash_notify (no pattern = auto-reminder handles it)
+    const notifyCall = calls.find((c) => c.cmd === "bash_notify");
+    expect(notifyCall).toBeUndefined();
+  });
+
+  test("bash_watch stale abort flag is cleared at wait start", async () => {
+    __resetBgNotificationStateForTests();
+    __resetSyncWatchAbortForTests();
+    const sessionId = "s-stale-abort";
+    // Set a stale flag before the wait starts
+    signalSyncWatchAbort(sessionId);
+    const { watchTool } = makeCtx(() => ({
+      success: true,
+      status: "completed",
+      exit_code: 0,
+      duration_ms: 5,
+    }));
+    const result = await watchTool.execute(
+      { taskId: "bash-stale" },
+      createMockSdkContext({ sessionID: sessionId }),
+    );
+    // Should return normally (task exited), not abort
+    expect(result).toContain("task exited");
+    expect(result).not.toContain("interrupted");
   });
 });
 
