@@ -265,11 +265,84 @@ describe("maybeStripCompressorPipe", () => {
     expect(maybeStripCompressorPipe("cd packages/a && ls | grep foo", true).stripped).toBe(false);
   });
 
-  test("bails on top-level semicolon or || in the chain", () => {
-    expect(maybeStripCompressorPipe("cd a; bun test | grep fail", true).stripped).toBe(false);
-    expect(maybeStripCompressorPipe("cd a || exit && bun test | grep fail", true).stripped).toBe(
-      false,
-    );
+  describe("top-level command chains", () => {
+    test("strips every safe runner pipeline in the live chained miss", () => {
+      const result = maybeStripCompressorPipe(
+        "cd packages/opencode-plugin && bun test src/x.test.ts 2>&1 | tail -3 && bun run typecheck 2>&1 | tail -1",
+        true,
+      );
+
+      expect(result).toEqual({
+        command:
+          "cd packages/opencode-plugin && bun test src/x.test.ts 2>&1 && bun run typecheck 2>&1",
+        stripped: true,
+        note: "[AFT dropped `| tail -3`, `| tail -1` (compressed:false to keep)]",
+      });
+    });
+
+    test("strips safe pipelines on both sides of an && chain", () => {
+      const result = maybeStripCompressorPipe(
+        "bun test | grep x && cargo test | tail -1",
+        true,
+      );
+      expect(result.command).toBe("bun test && cargo test");
+      expect(result.stripped).toBe(true);
+      expect(result.note).toContain("| grep x");
+      expect(result.note).toContain("| tail -1");
+    });
+
+    test("strips a runner segment and leaves an unpiped echo segment untouched", () => {
+      const result = maybeStripCompressorPipe("bun test | tail -3 && echo done", true);
+      expect(result).toEqual({
+        command: "bun test && echo done",
+        stripped: true,
+        note: "[AFT dropped `| tail -3` (compressed:false to keep)]",
+      });
+    });
+
+    test("strips a runner segment before an || fallback", () => {
+      const result = maybeStripCompressorPipe("bun test | tail -3 || fallback-cmd", true);
+      expect(result.command).toBe("bun test || fallback-cmd");
+      expect(result.stripped).toBe(true);
+      expect(result.note).toContain("| tail -3");
+    });
+
+    test("keeps a backgrounded segment verbatim but strips later safe segments", () => {
+      const result = maybeStripCompressorPipe(
+        "bun test | tail -3 & echo done && cargo test | tail -1",
+        true,
+      );
+      expect(result.command).toBe("bun test | tail -3 & echo done && cargo test");
+      expect(result.stripped).toBe(true);
+      expect(result.note).not.toContain("tail -3");
+      expect(result.note).toContain("| tail -1");
+    });
+
+    test("does not treat a quoted && as a chain separator", () => {
+      const cmd = 'echo "a && b" | head';
+      expect(maybeStripCompressorPipe(cmd, true)).toEqual({ command: cmd, stripped: false });
+    });
+
+    test("does not split on && inside command substitution", () => {
+      const result = maybeStripCompressorPipe(
+        "echo $(printf a && printf b) | head && bun test | tail -1",
+        true,
+      );
+      expect(result.command).toBe("echo $(printf a && printf b) | head && bun test");
+      expect(result.stripped).toBe(true);
+      expect(result.note).toContain("| tail -1");
+      expect(result.note).not.toContain("head");
+    });
+  });
+
+  test("strips top-level semicolon and || chain segments independently", () => {
+    const semicolon = maybeStripCompressorPipe("cd a; bun test | grep fail", true);
+    expect(semicolon.stripped).toBe(true);
+    expect(semicolon.command).toBe("cd a; bun test");
+
+    const orChain = maybeStripCompressorPipe("cd a || exit && bun test | grep fail", true);
+    expect(orChain.stripped).toBe(true);
+    expect(orChain.command).toBe("cd a || exit && bun test");
   });
 
   test("does not strip wc or intent-changing grep flags", () => {

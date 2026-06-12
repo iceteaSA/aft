@@ -41,66 +41,109 @@ const GREP_GUARD_FLAGS = new Set([
   "files-with-matches",
 ]);
 
+type ChainSeparator = "&&" | "||" | ";" | "";
+
+interface ChainSegment {
+  segment: string;
+  separator: ChainSeparator;
+}
+
+type SegmentStripResult =
+  | { segment: string; stripped: false }
+  | { segment: string; stripped: true; filters: string };
+
 export function maybeStripCompressorPipe(
   command: string,
   compressionEnabled: boolean,
 ): PipeStripResult {
   if (!compressionEnabled) return { command, stripped: false };
 
+  const chain = splitTopLevelCommandChain(command);
+  if (chain === null) return { command, stripped: false };
+
+  let stripped = false;
+  const droppedFilterChains: string[] = [];
+  const rebuilt = chain
+    .map(({ segment, separator }) => {
+      const result = stripSinglePipelineSegment(segment);
+      if (result.stripped) {
+        stripped = true;
+        droppedFilterChains.push(result.filters);
+      }
+      return `${result.segment}${separator}`;
+    })
+    .join("");
+
+  if (!stripped) return { command, stripped: false };
+
+  return {
+    command: rebuilt,
+    stripped: true,
+    note: formatStripNote(droppedFilterChains),
+  };
+}
+
+function stripSinglePipelineSegment(segment: string): SegmentStripResult {
+  const leading = /^\s*/.exec(segment)?.[0] ?? "";
+  const trailing = /\s*$/.exec(segment)?.[0] ?? "";
+  const coreStart = leading.length;
+  const coreEnd = segment.length - trailing.length;
+  if (coreEnd <= coreStart) return { segment, stripped: false };
+
+  const core = segment.slice(coreStart, coreEnd);
+
   // Bail on shell constructs our lightweight pipe-splitter cannot reason about
   // safely. Command substitution / backticks / process substitution can embed
-  // their own pipes, so naive top-level splitting would carve the command at an
+  // their own pipes, so naive top-level splitting would carve the segment at an
   // INNER pipe and rebuild a malformed runner (e.g.
-  // `pytest $(find . | head) | grep FAIL` → `pytest $(find .`). Never strip
-  // when these appear anywhere.
-  if (containsUnsplittableConstruct(command)) return { command, stripped: false };
+  // `pytest $(find . | head) | grep FAIL` → `pytest $(find .`).
+  if (containsUnsplittableConstruct(core)) return { segment, stripped: false };
 
-  // Peel a leading `cmd && ... &&` prefix (e.g. `cd dir && bun test | grep`).
-  // Since `&&` binds looser than `|`, `A && B | C` means `A && (B | C)`, so the
-  // pipeline to strip is the LAST `&&`-segment and the earlier segments are a
-  // verbatim prefix to reattach. Bail on top-level `||`/`;` (ambiguous/risky).
-  const chain = splitTopLevelAndChain(command);
-  if (chain === null) return { command, stripped: false };
-  const prefix = chain
-    .slice(0, -1)
-    .map((segment) => segment.trim())
-    .filter(Boolean);
-  const pipeline = chain[chain.length - 1] ?? "";
+  // Standalone backgrounding changes command grouping/exit semantics. Keep this
+  // segment verbatim, but let other top-level chain segments strip independently.
+  if (hasUnquotedBackground(core)) return { segment, stripped: false };
 
-  const stages = splitTopLevelPipeline(pipeline);
-  if (stages.length < 2) return { command, stripped: false };
+  const stages = splitTopLevelPipeline(core);
+  if (stages.length < 2) return { segment, stripped: false };
 
   const firstStage = stages[0]?.trim() ?? "";
-  if (!isCompressorHandledRunner(firstStage)) return { command, stripped: false };
+  if (!isCompressorHandledRunner(firstStage)) return { segment, stripped: false };
 
   const filterStages = stages.slice(1).map((stage) => stage.trim());
   for (const stage of filterStages) {
     // A dropped filter stage must be a pure stdin→stdout view. If it writes a
     // file, reads a file (bypassing stdin), or backgrounds, dropping it would
-    // silently lose data or change intent — bail and run the command verbatim.
-    if (!filterStageIsSafeToDrop(stage)) return { command, stripped: false };
+    // silently lose data or change intent — bail and run the segment verbatim.
+    if (!filterStageIsSafeToDrop(stage)) return { segment, stripped: false };
   }
 
-  const filters = filterStages.join(" | ");
-  const rebuilt = [...prefix, firstStage].join(" && ");
   return {
-    command: rebuilt,
+    segment: `${leading}${firstStage}${trailing}`,
     stripped: true,
-    note: `[AFT dropped \`| ${filters}\` (compressed:false to keep)]`,
+    filters: filterStages.join(" | "),
   };
 }
 
+function formatStripNote(droppedFilterChains: string[]): string {
+  const filters = droppedFilterChains.map((filter) => `\`| ${filter}\``).join(", ");
+  return `[AFT dropped ${filters} (compressed:false to keep)]`;
+}
+
 /**
- * Split a command into its top-level `&&`-joined segments, respecting quotes
- * and escapes. Returns `null` if the command contains a top-level `||` or `;`,
- * which make prefix-peeling ambiguous, so the caller bails. Single `&`
- * (redirects like `2>&1`, background) is left intact inside a segment.
+ * Split a command into top-level chain segments, respecting quotes, escapes,
+ * backticks, and parenthesis/substitution depth. Separators inside quotes,
+ * `$()`, backticks, process substitution, or grouping parens are left inside the
+ * segment. Returns `null` when the top-level structure is not parseable with
+ * confidence (unclosed quotes/substitutions/parens, stray closing parens, or a
+ * top-level newline separator).
  */
-function splitTopLevelAndChain(command: string): string[] | null {
-  const segments: string[] = [];
+function splitTopLevelCommandChain(command: string): ChainSegment[] | null {
+  const segments: ChainSegment[] = [];
   let start = 0;
   let quote: "'" | '"' | null = null;
   let escaped = false;
+  let inBacktick = false;
+  let parenDepth = 0;
 
   for (let index = 0; index < command.length; index++) {
     const char = command[index];
@@ -108,6 +151,11 @@ function splitTopLevelAndChain(command: string): string[] | null {
 
     if (escaped) {
       escaped = false;
+      continue;
+    }
+    if (inBacktick) {
+      if (char === "\\") escaped = true;
+      else if (char === "`") inBacktick = false;
       continue;
     }
     if (char === "\\" && quote !== "'") {
@@ -122,27 +170,46 @@ function splitTopLevelAndChain(command: string): string[] | null {
       quote = char;
       continue;
     }
+    if (char === "`") {
+      inBacktick = true;
+      continue;
+    }
+    if (char === "(") {
+      parenDepth++;
+      continue;
+    }
+    if (char === ")") {
+      if (parenDepth === 0) return null;
+      parenDepth--;
+      continue;
+    }
+    if (parenDepth > 0) continue;
+
+    // Top-level newline is a command separator, but not one this conservative
+    // rewriter reassembles; keep the whole command verbatim.
+    if (char === "\n" || char === "\r") return null;
 
     if (char === "&" && next === "&") {
-      segments.push(command.slice(start, index));
+      segments.push({ segment: command.slice(start, index), separator: "&&" });
       start = index + 2;
       index++;
       continue;
     }
-    if (char === "|" && next === "|") return null;
-    if (char === ";") return null;
-    // Top-level newline is a command separator: `bun test\necho x | grep x`
-    // means the pipe belongs to `echo`, not the runner. Bail.
-    if (char === "\n" || char === "\r") return null;
-    // Standalone background `&` (not `&&`, not a `>&`/`&>` fd dup) separates
-    // commands too: `bun test & echo x | grep x`. Bail.
-    if (char === "&") {
-      const prev = command[index - 1];
-      if (prev !== ">" && next !== ">") return null;
+    if (char === "|" && next === "|") {
+      segments.push({ segment: command.slice(start, index), separator: "||" });
+      start = index + 2;
+      index++;
+      continue;
+    }
+    if (char === ";") {
+      segments.push({ segment: command.slice(start, index), separator: ";" });
+      start = index + 1;
     }
   }
 
-  segments.push(command.slice(start));
+  if (escaped || quote || inBacktick || parenDepth !== 0) return null;
+
+  segments.push({ segment: command.slice(start), separator: "" });
   return segments;
 }
 
@@ -233,15 +300,15 @@ function isCompressorHandledRunner(stage: string): boolean {
     else if (args[0]?.startsWith("--cwd=")) args = args.slice(1);
     const sub = args[0];
     const subNext = args[1];
-    return sub === "test" || (sub === "run" && startsWithTest(subNext));
+    return sub === "test" || (sub === "run" && isJsVerificationScript(subNext));
   }
   if (first === "npm" || first === "pnpm") {
-    return second === "test" || (second === "run" && startsWithTest(third));
+    return second === "test" || (second === "run" && isJsVerificationScript(third));
   }
   if (first === "yarn") {
     // yarn berry runs a script by name directly (`yarn test:unit`) and also
     // supports `yarn run <script>`.
-    return startsWithTest(second) || (second === "run" && startsWithTest(third));
+    return isJsVerificationScript(second) || (second === "run" && isJsVerificationScript(third));
   }
   if (first === "deno") return ["test", "lint", "check", "bench"].includes(second ?? "");
   if (first === "npx") {
@@ -358,8 +425,9 @@ function hasBuildTask(args: string[], tasks: string[]): boolean {
   return sawAllowed;
 }
 
-function startsWithTest(token: string | undefined): boolean {
-  return token?.startsWith("test") === true;
+function isJsVerificationScript(token: string | undefined): boolean {
+  if (!token) return false;
+  return token.startsWith("test") || token === "typecheck" || token.startsWith("typecheck:");
 }
 
 // xcodebuild options that take a value (the following token is NOT an action).
