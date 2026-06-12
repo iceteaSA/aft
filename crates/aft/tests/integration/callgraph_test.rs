@@ -2607,20 +2607,28 @@ fn callgraph_ops_return_building_then_ready_async() {
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 
-    // First op kicks off the background cold build and must NOT block: it
-    // returns the transient `callgraph_building` signal.
+    // Configure eagerly warms the store in the background. The first op must
+    // never block on that build: it either returns the transient
+    // `callgraph_building` signal (build still in flight) or a correct
+    // synchronous result (eager build already landed — common on fast runners
+    // with this small fixture). Both are valid; what is forbidden is a silent
+    // empty/clean result while the build is in flight.
     let first = aft.send(&format!(
         r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
         crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
-    assert_eq!(
-        first["success"], false,
-        "first async op should report building, not a synchronous result: {first:?}"
-    );
-    assert_eq!(
-        first["code"], "callgraph_building",
-        "first async op should report callgraph_building: {first:?}"
-    );
+    if first["success"] == true {
+        assert_eq!(first["symbol"], "validate");
+        assert!(
+            first["total_callers"].as_u64().unwrap() > 0,
+            "eagerly-built store should serve real callers: {first:?}"
+        );
+    } else {
+        assert_eq!(
+            first["code"], "callgraph_building",
+            "first async op should report callgraph_building or succeed: {first:?}"
+        );
+    }
 
     // Retry until the background build lands and the store is installed via the
     // drain loop. Deadline-bounded so a genuine regression still fails the test,

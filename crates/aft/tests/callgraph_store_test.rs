@@ -776,7 +776,10 @@ export function dead() { return 2; }
         .iter()
         .find(|call| {
             call.caller_file.ends_with(Path::new("src/index.ts"))
-                && call.target.ends_with("src/used.ts::used")
+                && call
+                    .target
+                    .replace('\\', "/")
+                    .ends_with("src/used.ts::used")
         })
         .expect("projected used() call");
     assert_eq!(call.caller_symbol, "<top-level>");
