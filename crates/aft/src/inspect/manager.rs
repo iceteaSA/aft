@@ -328,6 +328,14 @@ impl InspectManager {
                 .ok()
                 .flatten()
                 .and_then(|payload| {
+                    if category == InspectCategory::DeadCode
+                        && payload
+                            .get("callgraph_available")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                    {
+                        return None;
+                    }
                     payload
                         .get("count")
                         .and_then(serde_json::Value::as_u64)

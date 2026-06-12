@@ -1,16 +1,24 @@
 use aft::callgraph::{walk_project_files, CallGraph};
-use aft::callgraph_store::{live_callgraph_edge_snapshot, CallGraphStore, StoredEdge};
+use aft::callgraph_store::{
+    live_callgraph_edge_snapshot, project_dead_code_snapshot, CallGraphStore, StoredEdge,
+};
 use aft::commands::callgraph_store_adapter;
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::harness::Harness;
-use aft::parser::TreeSitterProvider;
+use aft::inspect::scanners::dead_code::run_dead_code_scan;
+use aft::inspect::{InspectCategory, InspectJob, JobKey};
+use aft::parser::{SymbolCache, TreeSitterProvider};
 use filetime::FileTime;
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc, RwLock,
+};
 use tempfile::tempdir;
 
 static NEXT_MTIME: AtomicI64 = AtomicI64::new(1_800_000_000);
@@ -733,6 +741,147 @@ export function leaf() {}
 }
 
 #[test]
+fn dead_code_projection_falls_back_to_top_level_for_stale_caller_node() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("src/index.ts"),
+        "import { used } from './used';
+used();
+",
+    );
+    write_file(
+        &dir.path().join("src/used.ts"),
+        "export function used() { return 1; }
+export function dead() { return 2; }
+",
+    );
+    let root = fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    let store = CallGraphStore::open(root.join(".store-projection-orphan"), root.clone()).unwrap();
+    store.cold_build(&project_files(&root)).unwrap();
+
+    {
+        let conn = Connection::open(store.sqlite_path()).unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE refs SET caller_node = ?1 WHERE caller_file = ?2 AND kind = 'call' AND short_name = 'used'",
+                params!["pos:missing-caller-node", "src/index.ts"],
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "fixture should have one top-level call ref");
+    }
+
+    let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("projection succeeds");
+    let call = snapshot
+        .outbound_calls
+        .iter()
+        .find(|call| {
+            call.caller_file.ends_with(Path::new("src/index.ts"))
+                && call.target.ends_with("src/used.ts::used")
+        })
+        .expect("projected used() call");
+    assert_eq!(call.caller_symbol, "<top-level>");
+
+    let success = run_dead_code_scan(&dead_code_job(&root, project_files(&root), snapshot))
+        .outcome
+        .expect("dead_code scan succeeds");
+    assert_eq!(success.aggregate["callgraph_available"], true);
+    assert!(
+        success.aggregate["count"].as_u64().unwrap_or(0) > 0,
+        "aggregate should be a real dead_code result, not callgraph_unavailable: {:#}",
+        success.aggregate
+    );
+    assert_ne!(
+        success.aggregate.get("notes"),
+        Some(&json!(["callgraph_unavailable"]))
+    );
+}
+
+#[test]
+fn refresh_files_promotes_dependency_caller_when_fresh_nodes_drift_from_store() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("src/caller.ts"),
+        "import { used } from './target';
+export function caller() { used(); }
+",
+    );
+    write_file(
+        &dir.path().join("src/target.ts"),
+        "export function used() { return 1; }
+",
+    );
+    let root = fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    let store = CallGraphStore::open(root.join(".store-refresh-drift"), root.clone()).unwrap();
+    store.cold_build(&project_files(&root)).unwrap();
+
+    let original_node = {
+        let conn = Connection::open(store.sqlite_path()).unwrap();
+        conn.query_row(
+            "SELECT caller_node FROM refs WHERE caller_file = ?1 AND kind = 'call' AND short_name = 'used'",
+            params!["src/caller.ts"],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .expect("call ref has caller_node")
+    };
+    let stale_node = format!("{original_node}:stale");
+    {
+        let conn = Connection::open(store.sqlite_path()).unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE nodes SET id = ?1 WHERE id = ?2",
+                params![&stale_node, &original_node],
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute(
+            "UPDATE refs SET caller_node = ?1 WHERE caller_node = ?2",
+            params![&stale_node, &original_node],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE edges SET source_node = ?1 WHERE source_node = ?2",
+            params![&stale_node, &original_node],
+        )
+        .unwrap();
+    }
+    assert_no_dangling_caller_nodes(store.sqlite_path());
+
+    let target = root.join("src/target.ts");
+    write_file(
+        &target,
+        "export function used() { return 1; }
+export function extra() { return 2; }
+",
+    );
+    bump_mtime(&target);
+
+    let stats = store.refresh_files(std::slice::from_ref(&target)).unwrap();
+    assert_eq!(stats.refreshed_own_files, 2);
+    assert_no_dangling_caller_nodes(store.sqlite_path());
+
+    let conn = Connection::open(store.sqlite_path()).unwrap();
+    let refreshed_node = conn
+        .query_row(
+            "SELECT caller_node FROM refs WHERE caller_file = ?1 AND kind = 'call' AND short_name = 'used'",
+            params!["src/caller.ts"],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .expect("refreshed call ref has caller_node");
+    assert_eq!(refreshed_node, original_node);
+    let matching_nodes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE id = ?1",
+            params![refreshed_node],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(matching_nodes, 1);
+}
+
+#[test]
 fn cold_build_skips_failed_extracts_and_marks_them_stale() {
     let dir = tempdir().unwrap();
     let good = dir.path().join("good.ts");
@@ -1249,6 +1398,42 @@ fn cold_edges(root: &Path) -> BTreeSet<StoredEdge> {
 
 fn project_files(root: &Path) -> Vec<PathBuf> {
     walk_project_files(root).collect()
+}
+
+fn dead_code_job(
+    root: &Path,
+    scope_files: Vec<PathBuf>,
+    snapshot: aft::inspect::CallgraphSnapshot,
+) -> InspectJob {
+    InspectJob {
+        job_id: 1,
+        key: JobKey::for_project_category(InspectCategory::DeadCode),
+        category: InspectCategory::DeadCode,
+        scope_files,
+        project_root: root.to_path_buf(),
+        inspect_dir: root.join(".aft-cache").join("inspect"),
+        config: Arc::new(Config {
+            project_root: Some(root.to_path_buf()),
+            ..Config::default()
+        }),
+        symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+        callgraph_snapshot: Some(Arc::new(snapshot)),
+    }
+}
+
+fn assert_no_dangling_caller_nodes(sqlite_path: &Path) {
+    let conn = Connection::open(sqlite_path).unwrap();
+    let dangling: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM refs r
+             LEFT JOIN nodes n ON n.id = r.caller_node
+             WHERE r.caller_node IS NOT NULL AND n.id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dangling, 0, "refs.caller_node must match a nodes row");
 }
 
 fn write_file(path: &Path, content: &str) {

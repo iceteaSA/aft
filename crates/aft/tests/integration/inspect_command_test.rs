@@ -645,6 +645,62 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
     assert_eq!(success.aggregate["count"], 0);
 }
 
+#[test]
+fn inspect_dead_code_unavailable_renders_honestly_and_preserves_status_bar_count() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }
+",
+    );
+    let ctx = configured_context(&root);
+    ctx.update_status_bar_tier2(Some(7), Some(2), Some(3), Some(0), false);
+
+    let inspect_dir = ctx.inspect_dir();
+    let success = ctx
+        .inspect_manager()
+        .tier2_run_with_reuse_result(
+            dead_code_tier2_snapshot(&root, &inspect_dir),
+            InspectCategory::DeadCode,
+            None,
+        )
+        .outcome
+        .expect("dead_code unavailable aggregate succeeds");
+    assert_eq!(success.aggregate["callgraph_available"], false);
+
+    let (dead_code, _, _) = ctx
+        .inspect_manager()
+        .latest_tier2_counts(inspect_dir, root.clone());
+    assert_eq!(dead_code, None, "unavailable dead_code must not publish D0");
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-dead-code-unavailable-text",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["summary"]["dead_code"]["status"], "unavailable");
+    assert_eq!(
+        response["summary"]["dead_code"]["reason"],
+        "call graph building/retrying"
+    );
+    let text = response["text"].as_str().expect("inspect text");
+    assert!(
+        text.contains("Dead code: unavailable (call graph building/retrying)"),
+        "unavailable callgraph should not render as zero: {text}"
+    );
+    assert!(!text.contains("Dead code: 0"));
+
+    let status_bar = ctx
+        .status_bar_counts()
+        .expect("seeded status bar remains visible");
+    assert_eq!(status_bar.dead_code, 7);
+}
+
 fn run_duplicates_reuse(
     manager: &InspectManager,
     project_root: &Path,

@@ -867,6 +867,24 @@ impl CallGraphStore {
             }
         }
 
+        let dependency_callers = touched_callers
+            .iter()
+            .filter(|rel_path| !deleted.contains(*rel_path) && !own_refresh.contains(*rel_path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for rel_path in dependency_callers {
+            let Some(extract) = caller_extracts.get(&rel_path) else {
+                continue;
+            };
+            if stored_node_ids_match_extract(&tx, &rel_path, extract)? {
+                continue;
+            }
+
+            own_refresh.insert(rel_path.clone());
+            delete_file_rows(&tx, &rel_path)?;
+            insert_file_extract(&tx, &self.project_root, extract)?;
+        }
+
         let index = ProjectIndex::from_db_and_callers(&tx, &self.project_root, &caller_extracts)?;
         for rel_path in &touched_callers {
             if deleted.contains(rel_path) {
@@ -5340,6 +5358,25 @@ fn load_file_row(tx: &Transaction<'_>, rel_path: &str) -> Result<Option<FileRow>
     )
     .optional()
     .map_err(CallGraphStoreError::from)
+}
+
+fn stored_node_ids_match_extract(
+    tx: &Transaction<'_>,
+    rel_path: &str,
+    extract: &FileExtract,
+) -> Result<bool> {
+    let mut stmt = tx.prepare("SELECT id FROM nodes WHERE file_path = ?1")?;
+    let rows = stmt.query_map(params![rel_path], |row| row.get::<_, String>(0))?;
+    let mut stored = BTreeSet::new();
+    for row in rows {
+        stored.insert(row?);
+    }
+    let extracted = extract
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    Ok(stored == extracted)
 }
 
 fn update_file_fresh_metadata(

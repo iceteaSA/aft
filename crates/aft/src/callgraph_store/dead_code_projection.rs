@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 use crate::inspect::job::{CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot};
 use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
 
-use super::{database_ready, CallGraphStoreError, Result, BACKEND_TREESITTER};
+use super::{database_ready, CallGraphStoreError, Result, BACKEND_TREESITTER, TOP_LEVEL_SYMBOL};
 
 pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     if !db_path.is_file() {
@@ -125,8 +125,8 @@ fn outbound_calls_from_store(
     paths: &mut SnapshotPathResolver<'_>,
 ) -> Result<Vec<CallgraphOutboundCall>> {
     let mut statement = conn.prepare(
-        "SELECT r.ref_id,
-                r.caller_file,
+        "SELECT r.caller_file,
+                r.caller_node,
                 n.name,
                 r.short_name,
                 r.full_ref,
@@ -144,8 +144,8 @@ fn outbound_calls_from_store(
     )?;
     let rows = statement.query_map([], |row| {
         Ok(OutboundRow {
-            ref_id: row.get(0)?,
-            caller_file: row.get(1)?,
+            caller_file: row.get(0)?,
+            caller_node: row.get(1)?,
             caller_symbol: row.get(2)?,
             short_name: row.get(3)?,
             full_ref: row.get(4)?,
@@ -158,10 +158,14 @@ fn outbound_calls_from_store(
     })?;
 
     let mut calls = Vec::new();
+    let mut stale_caller_nodes = 0usize;
     for row in rows {
         let row = row?;
         let caller_file = paths.resolve(&row.caller_file);
-        let caller_symbol = caller_symbol_from_row(&row)?;
+        let (caller_symbol, stale_caller_node) = caller_symbol_from_row(&row);
+        if stale_caller_node {
+            stale_caller_nodes += 1;
+        }
         let short_name = row
             .short_name
             .as_deref()
@@ -196,6 +200,12 @@ fn outbound_calls_from_store(
             provenance: row.provenance,
         });
     }
+    if stale_caller_nodes > 0 {
+        crate::slog_info!(
+            "dead_code projection: {} refs had stale caller nodes (fell back to <top-level>)",
+            stale_caller_nodes
+        );
+    }
     Ok(calls)
 }
 
@@ -208,13 +218,16 @@ fn entry_points_for_files(project_root: &Path, files: &[PathBuf]) -> BTreeSet<Pa
         .collect()
 }
 
-fn caller_symbol_from_row(row: &OutboundRow) -> Result<String> {
-    row.caller_symbol.clone().ok_or_else(|| {
-        CallGraphStoreError::Unavailable(format!(
-            "call ref {} is missing caller symbol",
-            row.ref_id
-        ))
-    })
+fn caller_symbol_from_row(row: &OutboundRow) -> (String, bool) {
+    if let Some(symbol) = &row.caller_symbol {
+        return (symbol.clone(), false);
+    }
+
+    // Legacy CallGraph treats top-level calls as coming from the synthetic
+    // `<top-level>` caller. A stale store row can point at a caller_node that no
+    // longer exists in `nodes` (refs and nodes are refreshed by different
+    // passes), so preserve the edge rather than failing the whole projection.
+    (TOP_LEVEL_SYMBOL.to_string(), row.caller_node.is_some())
 }
 
 fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
@@ -286,8 +299,8 @@ struct ExportRow {
 
 #[derive(Debug)]
 struct OutboundRow {
-    ref_id: String,
     caller_file: String,
+    caller_node: Option<String>,
     caller_symbol: Option<String>,
     short_name: Option<String>,
     full_ref: Option<String>,

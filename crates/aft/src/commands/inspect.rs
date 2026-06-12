@@ -91,9 +91,7 @@ fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCatego
         outcomes
             .get(&category)
             .and_then(JobOutcome::payload)
-            .and_then(|payload| payload.get("count"))
-            .and_then(Value::as_u64)
-            .map(|count| count as usize)
+            .and_then(|payload| available_count_from_payload(category, payload))
     };
     let any_tier2_stale = [
         InspectCategory::DeadCode,
@@ -558,7 +556,11 @@ fn render_symbol_category(
         return;
     };
     if let Some(status) = section.get("status").and_then(Value::as_str) {
-        lines.push(format!("{label}: {status}"));
+        if let Some(reason) = section.get("reason").and_then(Value::as_str) {
+            lines.push(format!("{label}: {status} ({reason})"));
+        } else {
+            lines.push(format!("{label}: {status}"));
+        }
         return;
     }
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
@@ -738,11 +740,25 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
             "count": count_from_payload(payload),
             "by_kind": payload.and_then(|p| p.get("by_kind").or_else(|| p.get("by_marker"))).cloned().unwrap_or_else(|| serde_json::json!({})),
         }),
-        InspectCategory::DeadCode => serde_json::json!({
-            "count": count_from_payload(payload),
-            "by_language": payload.and_then(|p| p.get("by_language")).cloned().unwrap_or_else(|| serde_json::json!({})),
-            "top": top_preview_from_payload(payload),
-        }),
+        InspectCategory::DeadCode => {
+            if payload
+                .and_then(|payload| payload.get("callgraph_available"))
+                .and_then(Value::as_bool)
+                == Some(false)
+            {
+                serde_json::json!({
+                    "status": "unavailable",
+                    "reason": "call graph building/retrying",
+                    "callgraph_available": false,
+                })
+            } else {
+                serde_json::json!({
+                    "count": count_from_payload(payload),
+                    "by_language": payload.and_then(|p| p.get("by_language")).cloned().unwrap_or_else(|| serde_json::json!({})),
+                    "top": top_preview_from_payload(payload),
+                })
+            }
+        }
         InspectCategory::UnusedExports => serde_json::json!({
             "count": count_from_payload(payload),
             "top": top_preview_from_payload(payload),
@@ -836,6 +852,18 @@ fn details_for(category: InspectCategory, payload: Option<&Value>, top_k: usize)
         Some(items) => Value::Array(items.iter().take(top_k).cloned().collect()),
         None => serde_json::json!([]),
     }
+}
+
+fn available_count_from_payload(category: InspectCategory, payload: &Value) -> Option<usize> {
+    if category == InspectCategory::DeadCode
+        && payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
+    {
+        return None;
+    }
+    payload
+        .get("count")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
 }
 
 fn count_from_payload(payload: Option<&Value>) -> u64 {
