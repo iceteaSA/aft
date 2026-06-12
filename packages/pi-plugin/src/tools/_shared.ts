@@ -146,7 +146,10 @@ export function formatBridgeErrorMessage(
  * already-shown nested `data` (handled separately when present).
  */
 function collectStructuredExtras(response: Record<string, unknown>): string | undefined {
-  const reserved = new Set(["id", "success", "code", "message", "data"]);
+  // status_bar is transport metadata attached to EVERY bridge response (the
+  // [AFT ...] health bar) — never error context. Without this exclusion every
+  // structured error dumped the raw status-bar JSON as `data:`.
+  const reserved = new Set(["id", "success", "code", "message", "data", "status_bar"]);
   const extras: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(response)) {
     if (reserved.has(key)) continue;
