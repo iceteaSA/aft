@@ -211,12 +211,17 @@ impl ModuleResolver {
         if is_external_builtin_or_url(specifier) {
             return None;
         }
+        // Keep the resolver's path identity stable before handing paths to oxc_resolver.
+        // On Windows, std::fs::canonicalize returns verbatim (`\\?\`) paths, but
+        // oxc_resolver's tsconfig discovery can miss `compilerOptions.paths` aliases
+        // when the issuer is verbatim even though relative imports still resolve.
+        let from_file = normalize_path(from_file);
         let from_dir = from_file.parent().unwrap_or(&self.project_root);
         tracker.record_nearest(from_dir, &self.project_root, "tsconfig.json");
         tracker.record_nearest(from_dir, &self.project_root, "package.json");
 
         let resolved_path = self
-            .resolve_with_oxc(from_file, from_dir, specifier)
+            .resolve_with_oxc(&from_file, from_dir, specifier)
             .or_else(|| self.resolve_local_fallback(from_dir, specifier))
             .or_else(|| self.resolve_package_fallback(specifier, tracker));
 
@@ -480,7 +485,17 @@ fn remap_build_output_to_src(rel: &str) -> Option<String> {
     Some(format!("src/{}", rest.join("/")))
 }
 
+#[cfg(windows)]
 pub fn normalize_path(path: &Path) -> PathBuf {
+    normalize_path_components(&windows_non_verbatim_path(path))
+}
+
+#[cfg(not(windows))]
+pub fn normalize_path(path: &Path) -> PathBuf {
+    normalize_path_components(path)
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -492,6 +507,35 @@ pub fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+#[cfg(windows)]
+fn windows_non_verbatim_path(path: &Path) -> PathBuf {
+    let mut raw = path.to_string_lossy().replace('/', "\\");
+    if let Some(stripped) = strip_ascii_prefix(&raw, "\\\\?\\UNC\\") {
+        raw = format!("\\\\{}", stripped);
+    } else if let Some(stripped) = strip_ascii_prefix(&raw, "\\\\?\\") {
+        raw = stripped.to_string();
+    } else if let Some(stripped) = strip_ascii_prefix(&raw, "\\\\??\\") {
+        raw = stripped.to_string();
+    }
+
+    if raw.as_bytes().get(1) == Some(&b':') {
+        let drive = raw.as_bytes()[0];
+        if drive.is_ascii_lowercase() {
+            raw.replace_range(0..1, &(drive as char).to_ascii_uppercase().to_string());
+        }
+    }
+
+    PathBuf::from(raw)
+}
+
+#[cfg(windows)]
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        .then(|| &value[prefix.len()..])
 }
 
 fn slash_path(path: &Path) -> String {

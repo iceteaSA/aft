@@ -500,25 +500,35 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     // a wildcard "*" ask in that case (Oracle audit MEDIUM #2). The plugin
     // layer must then forward that ask to ctx.ask through the same Promise
     // path — proving the scanner+plugin chain doesn't silently let
-    // command-less inputs bypass `bash: { "*": deny }`.
-    const ask = mock(async () => {});
+    // command-less inputs bypass `bash: { "*": deny }`. Reject after the ask
+    // is observed so the assertion covers the permission path without waiting
+    // for a platform shell to execute this intentionally odd input.
+    let askInput: { patterns: string[]; permission: string } | undefined;
+    const ask = mock(async (input: unknown) => {
+      askInput = input as { patterns: string[]; permission: string };
+      throw new Error("wildcard ask observed");
+    });
 
-    await callPluginBash(
-      bash,
-      h,
-      { command: "((i++))" },
-      { ask: ask as unknown as ToolContext["ask"] },
-    );
+    let captured: unknown;
+    try {
+      await callPluginBash(
+        bash,
+        h,
+        { command: "((i++))" },
+        { ask: ask as unknown as ToolContext["ask"] },
+      );
+    } catch (err) {
+      captured = err;
+    }
 
+    expect(captured).toBeInstanceOf(Error);
+    expect((captured as Error).message).toContain("wildcard ask observed");
     expect(ask).toHaveBeenCalled();
-    const askInput = ask.mock.calls[0][0] as unknown as {
-      patterns: string[];
-      permission: string;
-    };
-    expect(askInput.permission).toBe("bash");
+    expect(askInput).toBeDefined();
+    expect(askInput?.permission).toBe("bash");
     // Wildcard or literal echo of the input — either is acceptable as long
     // as the agent is forced to consult OpenCode's permission rules.
-    expect(askInput.patterns.length).toBeGreaterThan(0);
+    expect(askInput?.patterns.length ?? 0).toBeGreaterThan(0);
   });
 });
 
