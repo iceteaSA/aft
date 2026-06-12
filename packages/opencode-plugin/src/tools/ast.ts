@@ -68,16 +68,24 @@ async function checkAstPathsPermission(
   return undefined;
 }
 
-const SUPPORTED_LANGS = ["typescript", "tsx", "javascript", "python", "rust", "go"] as const;
+const SUPPORTED_LANGS = [
+  "typescript",
+  "tsx",
+  "javascript",
+  "python",
+  "rust",
+  "go",
+  "pascal",
+] as const;
 
 export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const searchTool: ToolDefinition = {
     description:
-      "Search code patterns across filesystem using AST-aware matching. Supports 6 languages.\n\n" +
+      "Search code patterns across filesystem using AST-aware matching. Supports 7 languages.\n\n" +
       "Use meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n" +
       "For functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\n" +
-      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python'",
+      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal'",
     args: {
       pattern: z
         .string()

@@ -3,7 +3,7 @@
 //! H1-1 intentionally stops at an engine/API boundary: scanners wire this into
 //! inspect contributions in H1-2. The engine is pure (files in, verdicts out)
 //! and keeps only an in-memory facts cache keyed by file content hash + parser
-//! facts format. That is enough for the required warm-cache perf gate while
+//! source type + facts format. That is enough for the required warm-cache perf gate while
 //! avoiding premature persistence coupling to InspectCache/AppContext.
 
 mod facts;
@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use oxc_span::SourceType;
+
 use facts::parse_file_facts;
 use graph::compute_verdicts;
 use resolver::{normalize_path, ModuleResolver};
@@ -25,7 +27,7 @@ pub use types::{
     OXC_PROVENANCE,
 };
 
-const FACTS_FORMAT_VERSION: u32 = 1;
+const FACTS_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeOptions {
@@ -64,10 +66,12 @@ impl OxcFactsCache {
         source: &str,
         stats: &mut OxcFactsCacheStats,
     ) -> FileFacts {
+        let source_type = SourceType::from_path(path).unwrap_or_default();
+        let source_type_key = source_type_cache_key(source_type);
         let content_hash = crate::cache_freshness::hash_bytes(source.as_bytes())
             .to_hex()
             .to_string();
-        let cache_key = format!("v{FACTS_FORMAT_VERSION}:{content_hash}");
+        let cache_key = format!("v{FACTS_FORMAT_VERSION}:{source_type_key}:{content_hash}");
         if let Some(cached) = self.entries_by_hash.get(&cache_key) {
             stats.hits += 1;
             let mut facts = cached.clone();
@@ -78,10 +82,36 @@ impl OxcFactsCache {
         }
 
         stats.misses += 1;
-        let facts = parse_file_facts(file_id, path, source, content_hash);
+        let facts = parse_file_facts(file_id, path, source, content_hash, source_type);
         self.entries_by_hash.insert(cache_key, facts.clone());
         facts
     }
+}
+
+fn source_type_cache_key(source_type: SourceType) -> String {
+    let language = if source_type.is_typescript_definition() {
+        "dts"
+    } else if source_type.is_typescript() {
+        "ts"
+    } else {
+        "js"
+    };
+    let module_kind = if source_type.is_commonjs() {
+        "commonjs"
+    } else if source_type.is_module() {
+        "module"
+    } else if source_type.is_script() {
+        "script"
+    } else {
+        "unambiguous"
+    };
+    let variant = if source_type.is_jsx() {
+        "jsx"
+    } else {
+        "standard"
+    };
+
+    format!("{language}:{module_kind}:{variant}")
 }
 
 pub fn analyze_files(
@@ -101,7 +131,9 @@ pub fn analyze_files_with_cache(
 ) -> Result<OxcEngineResult, String> {
     let project_root =
         fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root));
-    let files = normalize_file_set(files);
+    let normalized_files = normalize_file_set(&project_root, files);
+    let files = normalized_files.files;
+    let skipped_outside_root = normalized_files.skipped_outside_root;
     let mut cache_stats = OxcFactsCacheStats::default();
     let mut errors = Vec::new();
     let mut facts = Vec::with_capacity(files.len());
@@ -166,18 +198,42 @@ pub fn analyze_files_with_cache(
             unresolved_edges,
         },
         errors,
+        skipped_outside_root,
     })
 }
 
-fn normalize_file_set(files: &[PathBuf]) -> Vec<PathBuf> {
-    let mut files = files
-        .iter()
-        .filter(|path| is_ts_js_file(path))
-        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path)))
-        .collect::<Vec<_>>();
-    files.sort();
-    files.dedup();
-    files
+#[derive(Debug, Default)]
+struct NormalizedFileSet {
+    files: Vec<PathBuf>,
+    skipped_outside_root: Vec<PathBuf>,
+}
+
+fn normalize_file_set(project_root: &Path, files: &[PathBuf]) -> NormalizedFileSet {
+    let mut normalized = NormalizedFileSet::default();
+    for path in files.iter().filter(|path| is_ts_js_file(path)) {
+        let path = normalize_input_path(project_root, path);
+        if path.strip_prefix(project_root).is_ok() {
+            normalized.files.push(path);
+        } else {
+            normalized.skipped_outside_root.push(path);
+        }
+    }
+
+    normalized.files.sort();
+    normalized.files.dedup();
+    normalized.skipped_outside_root.sort();
+    normalized.skipped_outside_root.dedup();
+    normalized
+}
+
+fn normalize_input_path(project_root: &Path, path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            normalize_path(path)
+        } else {
+            normalize_path(&project_root.join(path))
+        }
+    })
 }
 
 fn normalize_option_paths(paths: &[PathBuf]) -> BTreeSet<PathBuf> {

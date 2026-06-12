@@ -55,6 +55,90 @@ fn assert_verdict(result: &OxcEngineResult, file: &str, symbol: &str, expected: 
 }
 
 #[test]
+fn oxc_engine_facts_cache_is_source_type_aware() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("a.ts", "export const identity = <T>(x: T) => x;\n"),
+        ("b.tsx", "export const identity = <T>(x: T) => x;\n"),
+    ]);
+    let mut cache = OxcFactsCache::new();
+
+    let result = analyze_files_with_cache(&root, &paths, AnalyzeOptions::default(), &mut cache)
+        .expect("oxc analyze succeeds");
+
+    assert_eq!(result.stats.cache_hits, 0);
+    assert_eq!(result.stats.cache_misses, 2);
+    assert_eq!(cache.len(), 2);
+    assert!(
+        result.files.iter().any(|file| file.relative_file == "a.ts"
+            && file
+                .exports
+                .iter()
+                .any(|export| export.symbol == "identity")),
+        "TypeScript parse should see the generic arrow export: {:#?}",
+        result.files
+    );
+    assert!(
+        result
+            .errors
+            .iter()
+            .all(|error| !error.file.ends_with("a.ts")),
+        "a.ts should parse as TypeScript: {:#?}",
+        result.errors
+    );
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|error| error.file.ends_with("b.tsx")),
+        "b.tsx should be parsed independently as TSX and report the JSX ambiguity: {:#?}",
+        result.errors
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn oxc_engine_skips_symlinked_inputs_outside_project_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project");
+    fs::create_dir_all(root.join("src")).expect("create project src");
+    let inside = write_file(&root, "src/inside.ts", "export const inside = 1;\n");
+    let external_dir = temp_dir.path().join("external");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external = external_dir.join("outside.ts");
+    fs::write(&external, "export const outside = 1;\n").expect("write external file");
+    let external_link = root.join("src/outside_link.ts");
+    symlink(&external, &external_link).expect("create outside symlink");
+
+    let mut cache = OxcFactsCache::new();
+    let result = analyze_files_with_cache(
+        &root,
+        &[inside, external_link],
+        AnalyzeOptions::default(),
+        &mut cache,
+    )
+    .expect("oxc analyze succeeds");
+    let canonical_external = fs::canonicalize(&external).expect("canonical external file");
+
+    assert_eq!(
+        result.skipped_outside_root,
+        vec![canonical_external.clone()]
+    );
+    assert_eq!(result.stats.files, 1);
+    assert_eq!(cache.len(), 1);
+    assert!(result.errors.is_empty(), "{:#?}", result.errors);
+    assert!(
+        result
+            .files
+            .iter()
+            .all(|file| file.file != canonical_external && !file.relative_file.contains("outside")),
+        "outside symlink target should not enter verdict output: {:#?}",
+        result.files
+    );
+}
+
+#[test]
 fn oxc_engine_named_barrel_reexport_chain_marks_consumed_exports_used() {
     let (_temp, root, paths) = fixture_project(&[
         (

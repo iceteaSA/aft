@@ -207,6 +207,8 @@ pub struct OxcEngineResult {
     pub edges: Vec<OxcResolvedEdge>,
     pub stats: OxcEngineStats,
     pub errors: Vec<OxcEngineError>,
+    #[serde(default)]
+    pub skipped_outside_root: Vec<PathBuf>,
 }
 
 impl OxcEngineResult {

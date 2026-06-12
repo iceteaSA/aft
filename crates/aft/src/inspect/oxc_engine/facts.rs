@@ -65,9 +65,9 @@ pub fn parse_file_facts(
     path: &Path,
     source: &str,
     content_hash: String,
+    source_type: SourceType,
 ) -> FileFacts {
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path).unwrap_or_default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if !parsed.errors.is_empty() {
         let joined = parsed
