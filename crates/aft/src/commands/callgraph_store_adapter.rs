@@ -2,15 +2,23 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use tree_sitter::{Node, Parser};
 
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     CallGraphStore, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
 };
+use crate::edit::line_col_to_byte;
 use crate::error::AftError;
+use crate::parser::{
+    detect_language, extract_symbols_from_tree, grammar_for, FileParser, SharedSymbolCache,
+};
 use crate::protocol::Response;
+use crate::symbols::Symbol;
 
 pub type StoreAdapterResult<T> = Result<T, CallGraphStoreError>;
+
+const TRACE_DATA_RESOLVER_PROVENANCE: &str = "treesitter+resolver";
 
 #[derive(Debug, Clone, Default)]
 struct EdgeMarker {
@@ -145,6 +153,39 @@ pub struct StoreTraceToSymbolResult {
 enum ForwardCall {
     Resolved(StoreCallSite),
     Unresolved(StoreUnresolvedCall),
+}
+
+#[derive(Clone)]
+enum TraceForwardCall {
+    Resolved(StoreCallSite),
+    Unresolved(StoreUnresolvedCall),
+}
+
+impl TraceForwardCall {
+    fn byte_start(&self) -> usize {
+        match self {
+            Self::Resolved(site) => site.byte_start,
+            Self::Unresolved(call) => call.byte_start,
+        }
+    }
+
+    fn byte_end(&self) -> usize {
+        match self {
+            Self::Resolved(site) => site.byte_end,
+            Self::Unresolved(call) => call.byte_end,
+        }
+    }
+
+    fn line(&self) -> u32 {
+        match self {
+            Self::Resolved(site) => site.line,
+            Self::Unresolved(call) => call.line,
+        }
+    }
+
+    fn matches_position(&self, byte_start: usize, byte_end: usize) -> bool {
+        self.byte_start() == byte_start && self.byte_end() == byte_end
+    }
 }
 
 impl ForwardCall {
@@ -572,6 +613,604 @@ pub fn trace_to_symbol_result(
             reason: Some("no_path_found".to_string()),
         })
     }
+}
+
+pub fn trace_data_result(
+    store: &CallGraphStore,
+    file: &Path,
+    symbol: &str,
+    expression: &str,
+    max_depth: usize,
+    symbol_cache: SharedSymbolCache,
+) -> StoreAdapterResult<callgraph::TraceDataResult> {
+    let origin_path = absolute_file(store, file);
+    let origin_file = relative_file(store, &origin_path);
+    let origin_symbol = resolve_symbol_query_with_cache(&origin_path, symbol, &symbol_cache)?;
+
+    let mut hops = Vec::new();
+    let mut depth_limited = false;
+    let mut visited = HashSet::new();
+    trace_data_inner(
+        store,
+        &symbol_cache,
+        &origin_path,
+        &origin_symbol,
+        expression,
+        max_depth,
+        0,
+        &mut hops,
+        &mut depth_limited,
+        &mut visited,
+    )?;
+
+    Ok(callgraph::TraceDataResult {
+        expression: expression.to_string(),
+        origin_file,
+        origin_symbol,
+        hops,
+        depth_limited,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_data_inner(
+    store: &CallGraphStore,
+    symbol_cache: &SharedSymbolCache,
+    file: &Path,
+    symbol: &str,
+    tracking_name: &str,
+    max_depth: usize,
+    current_depth: usize,
+    hops: &mut Vec<callgraph::DataFlowHop>,
+    depth_limited: &mut bool,
+    visited: &mut HashSet<(String, String, String)>,
+) -> StoreAdapterResult<()> {
+    let rel_file = relative_file(store, file);
+    let visit_key = (
+        rel_file.clone(),
+        symbol.to_string(),
+        tracking_name.to_string(),
+    );
+    if visited.contains(&visit_key) {
+        return Ok(());
+    }
+    visited.insert(visit_key);
+
+    let current = resolve_exact_symbol(store, &rel_file, symbol, None)?
+        .ok_or_else(|| CallGraphStoreError::StaleFiles(vec![rel_file.clone()]))?;
+    let current_calls = trace_forward_calls_for_nodes(store, &current.nodes)?;
+
+    // Keep the legacy value-flow posture: parse the current source for body walks
+    // and use the store only for cross-hop call facts.
+    let source = std::fs::read_to_string(file)?;
+    let Some(lang) = detect_language(file) else {
+        return Ok(());
+    };
+    let grammar = grammar_for(lang);
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .map_err(|error| AftError::ParseError {
+            message: format!("grammar init failed for {:?}: {}", lang, error),
+        })?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| AftError::ParseError {
+            message: format!("parse failed for {}", file.display()),
+        })?;
+    let symbols = extract_symbols_from_tree(&source, &tree, lang)?;
+    let sym_info = symbols
+        .iter()
+        .find(|candidate| {
+            symbol_identity_from_cache(candidate) == symbol || candidate.name == symbol
+        })
+        .ok_or_else(|| CallGraphStoreError::StaleFiles(vec![rel_file.clone()]))?;
+
+    let body_start = line_col_to_byte(&source, sym_info.range.start_line, sym_info.range.start_col);
+    let body_end = line_col_to_byte(&source, sym_info.range.end_line, sym_info.range.end_col);
+    let Some(body_node) = find_node_covering_range(tree.root_node(), body_start, body_end) else {
+        return Ok(());
+    };
+
+    let mut tracked_names = vec![tracking_name.to_string()];
+    walk_for_data_flow(
+        store,
+        symbol_cache,
+        body_node,
+        &source,
+        &current_calls,
+        &mut tracked_names,
+        symbol,
+        &rel_file,
+        max_depth,
+        current_depth,
+        hops,
+        depth_limited,
+        visited,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_for_data_flow(
+    store: &CallGraphStore,
+    symbol_cache: &SharedSymbolCache,
+    node: Node<'_>,
+    source: &str,
+    current_calls: &[TraceForwardCall],
+    tracked_names: &mut Vec<String>,
+    symbol: &str,
+    rel_file: &str,
+    max_depth: usize,
+    current_depth: usize,
+    hops: &mut Vec<callgraph::DataFlowHop>,
+    depth_limited: &mut bool,
+    visited: &mut HashSet<(String, String, String)>,
+) -> StoreAdapterResult<()> {
+    let kind = node.kind();
+    let is_var_decl = matches!(
+        kind,
+        "variable_declarator"
+            | "assignment_expression"
+            | "augmented_assignment_expression"
+            | "assignment"
+            | "let_declaration"
+            | "short_var_declaration"
+    );
+
+    if is_var_decl {
+        if let Some((new_name, init_text, line, is_approx)) =
+            extract_assignment_info(node, source, tracked_names)
+        {
+            if !is_approx {
+                hops.push(callgraph::DataFlowHop {
+                    file: rel_file.to_string(),
+                    symbol: symbol.to_string(),
+                    variable: new_name.clone(),
+                    line,
+                    flow_type: "assignment".to_string(),
+                    approximate: false,
+                });
+                tracked_names.push(new_name);
+            } else {
+                hops.push(callgraph::DataFlowHop {
+                    file: rel_file.to_string(),
+                    symbol: symbol.to_string(),
+                    variable: init_text,
+                    line,
+                    flow_type: "assignment".to_string(),
+                    approximate: true,
+                });
+                return Ok(());
+            }
+        }
+    }
+
+    if kind == "call_expression" || kind == "call" || kind == "macro_invocation" {
+        check_call_for_data_flow(
+            store,
+            symbol_cache,
+            node,
+            source,
+            current_calls,
+            tracked_names,
+            symbol,
+            rel_file,
+            max_depth,
+            current_depth,
+            hops,
+            depth_limited,
+            visited,
+        )?;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            walk_for_data_flow(
+                store,
+                symbol_cache,
+                cursor.node(),
+                source,
+                current_calls,
+                tracked_names,
+                symbol,
+                rel_file,
+                max_depth,
+                current_depth,
+                hops,
+                depth_limited,
+                visited,
+            )?;
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_assignment_info(
+    node: Node<'_>,
+    source: &str,
+    tracked_names: &[String],
+) -> Option<(String, String, u32, bool)> {
+    let kind = node.kind();
+    let line = node.start_position().row as u32 + 1;
+
+    match kind {
+        "variable_declarator" => {
+            let name_node = node.child_by_field_name("name")?;
+            let value_node = node.child_by_field_name("value")?;
+            let name_text = trace_node_text(name_node, source);
+            let value_text = trace_node_text(value_node, source);
+
+            if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+                if tracked_names
+                    .iter()
+                    .any(|tracked| value_text.contains(tracked))
+                {
+                    return Some((name_text.clone(), name_text, line, true));
+                }
+                return None;
+            }
+
+            if tracked_names.iter().any(|tracked| {
+                value_text == *tracked
+                    || value_text.starts_with(&format!("{}.", tracked))
+                    || value_text.starts_with(&format!("{}[", tracked))
+            }) {
+                return Some((name_text, value_text, line, false));
+            }
+            None
+        }
+        "assignment_expression" | "augmented_assignment_expression" => {
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            let left_text = trace_node_text(left, source);
+            let right_text = trace_node_text(right, source);
+
+            if tracked_names.iter().any(|tracked| right_text == *tracked) {
+                return Some((left_text, right_text, line, false));
+            }
+            None
+        }
+        "assignment" => {
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            let left_text = trace_node_text(left, source);
+            let right_text = trace_node_text(right, source);
+
+            if tracked_names.iter().any(|tracked| right_text == *tracked) {
+                return Some((left_text, right_text, line, false));
+            }
+            None
+        }
+        "let_declaration" | "short_var_declaration" => {
+            let left = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("left"))?;
+            let right = node
+                .child_by_field_name("value")
+                .or_else(|| node.child_by_field_name("right"))?;
+            let left_text = trace_node_text(left, source);
+            let right_text = trace_node_text(right, source);
+
+            if tracked_names.iter().any(|tracked| right_text == *tracked) {
+                return Some((left_text, right_text, line, false));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_call_for_data_flow(
+    store: &CallGraphStore,
+    symbol_cache: &SharedSymbolCache,
+    node: Node<'_>,
+    source: &str,
+    current_calls: &[TraceForwardCall],
+    tracked_names: &[String],
+    symbol: &str,
+    rel_file: &str,
+    max_depth: usize,
+    current_depth: usize,
+    hops: &mut Vec<callgraph::DataFlowHop>,
+    depth_limited: &mut bool,
+    visited: &mut HashSet<(String, String, String)>,
+) -> StoreAdapterResult<()> {
+    let args_node =
+        find_child_by_kind(node, "arguments").or_else(|| find_child_by_kind(node, "argument_list"));
+    let Some(args_node) = args_node else {
+        return Ok(());
+    };
+
+    let mut arg_positions = Vec::new();
+    let mut arg_idx = 0usize;
+    let mut cursor = args_node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            let child_kind = child.kind();
+            if child_kind == "(" || child_kind == ")" || child_kind == "," {
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+                continue;
+            }
+
+            let arg_text = trace_node_text(child, source);
+            if child_kind == "spread_element" || child_kind == "dictionary_splat" {
+                if tracked_names
+                    .iter()
+                    .any(|tracked| arg_text.contains(tracked))
+                {
+                    hops.push(callgraph::DataFlowHop {
+                        file: rel_file.to_string(),
+                        symbol: symbol.to_string(),
+                        variable: arg_text,
+                        line: child.start_position().row as u32 + 1,
+                        flow_type: "parameter".to_string(),
+                        approximate: true,
+                    });
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+                arg_idx += 1;
+                continue;
+            }
+
+            if tracked_names.iter().any(|tracked| arg_text == *tracked) {
+                arg_positions.push((arg_idx, arg_text));
+            }
+
+            arg_idx += 1;
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    if arg_positions.is_empty() {
+        return Ok(());
+    }
+
+    let matched_call = current_calls
+        .iter()
+        .find(|call| call.matches_position(node.start_byte(), node.end_byte()));
+
+    match matched_call {
+        Some(TraceForwardCall::Resolved(site)) => {
+            let Some(target) = trace_target_node(store, site)? else {
+                return Ok(());
+            };
+            if target.file != rel_file && current_depth + 1 > max_depth {
+                *depth_limited = true;
+                return Ok(());
+            }
+            let params = target
+                .signature
+                .as_deref()
+                .map(|signature| callgraph::extract_parameters(signature, target.lang))
+                .unwrap_or_default();
+            let target_file = store.project_root().join(&target.file);
+            for (pos, _tracked) in &arg_positions {
+                if let Some(param_name) = params.get(*pos) {
+                    hops.push(callgraph::DataFlowHop {
+                        file: target.file.clone(),
+                        symbol: target.symbol.clone(),
+                        variable: param_name.clone(),
+                        line: target.line,
+                        flow_type: "parameter".to_string(),
+                        approximate: false,
+                    });
+                    trace_data_inner(
+                        store,
+                        symbol_cache,
+                        &target_file,
+                        &target.symbol,
+                        param_name,
+                        max_depth,
+                        current_depth + 1,
+                        hops,
+                        depth_limited,
+                        visited,
+                    )?;
+                }
+            }
+        }
+        Some(TraceForwardCall::Unresolved(call)) => {
+            push_unresolved_parameter_hops(hops, rel_file, &call.symbol, &arg_positions, node);
+        }
+        None => {
+            let (_full_callee, short_callee) = extract_callee_names(node, source);
+            if let Some(callee_name) = short_callee {
+                push_unresolved_parameter_hops(hops, rel_file, &callee_name, &arg_positions, node);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn push_unresolved_parameter_hops(
+    hops: &mut Vec<callgraph::DataFlowHop>,
+    rel_file: &str,
+    callee_name: &str,
+    arg_positions: &[(usize, String)],
+    call_node: Node<'_>,
+) {
+    for (_pos, tracked) in arg_positions {
+        hops.push(callgraph::DataFlowHop {
+            file: rel_file.to_string(),
+            symbol: callee_name.to_string(),
+            variable: tracked.clone(),
+            line: call_node.start_position().row as u32 + 1,
+            flow_type: "parameter".to_string(),
+            approximate: true,
+        });
+    }
+}
+
+fn trace_target_node(
+    store: &CallGraphStore,
+    site: &StoreCallSite,
+) -> StoreAdapterResult<Option<StoreNode>> {
+    if let Some(target) = &site.target {
+        return Ok(Some(target.clone()));
+    }
+    resolve_exact_symbol(store, &site.target_file, &site.target_symbol, None)
+        .map(|resolved| resolved.map(|symbol| symbol.representative))
+}
+
+fn trace_forward_calls_for_nodes(
+    store: &CallGraphStore,
+    nodes: &[StoreNode],
+) -> StoreAdapterResult<Vec<TraceForwardCall>> {
+    let mut calls = Vec::new();
+    for node in nodes {
+        calls.extend(
+            store
+                .outgoing_calls_of(node)?
+                .into_iter()
+                .filter(|site| site.resolved_by() == TRACE_DATA_RESOLVER_PROVENANCE)
+                .map(TraceForwardCall::Resolved),
+        );
+        calls.extend(
+            store
+                .unresolved_calls_of(node)?
+                .into_iter()
+                .map(TraceForwardCall::Unresolved),
+        );
+    }
+    calls.sort_by(|left, right| {
+        left.byte_start()
+            .cmp(&right.byte_start())
+            .then(left.byte_end().cmp(&right.byte_end()))
+            .then(left.line().cmp(&right.line()))
+    });
+    Ok(calls)
+}
+
+fn resolve_symbol_query_with_cache(
+    file: &Path,
+    symbol: &str,
+    symbol_cache: &SharedSymbolCache,
+) -> StoreAdapterResult<String> {
+    let mut parser = FileParser::with_symbol_cache(symbol_cache.clone());
+    let symbols = parser.extract_symbols(file)?;
+    let candidates = symbol_query_candidates_from_symbols(&symbols, symbol);
+    match candidates.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Err(AftError::SymbolNotFound {
+            name: symbol.to_string(),
+            file: file.display().to_string(),
+        }
+        .into()),
+        _ => Err(AftError::AmbiguousSymbol {
+            name: symbol.to_string(),
+            candidates,
+        }
+        .into()),
+    }
+}
+
+fn symbol_query_candidates_from_symbols(symbols: &[Symbol], symbol_name: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let qualified_query = symbol_name.contains("::");
+
+    let mut consider = |candidate: String| {
+        let matches = if qualified_query {
+            candidate == symbol_name
+        } else {
+            candidate == symbol_name || unqualified_name(&candidate) == symbol_name
+        };
+        if matches && seen.insert(candidate.clone()) {
+            candidates.push(candidate);
+        }
+    };
+
+    for symbol in symbols {
+        consider(symbol_identity_from_cache(symbol));
+        if symbol.exported {
+            consider(symbol.name.clone());
+        }
+    }
+
+    candidates.sort();
+    candidates
+}
+
+fn symbol_identity_from_cache(symbol: &Symbol) -> String {
+    if symbol.scope_chain.is_empty() {
+        symbol.name.clone()
+    } else {
+        format!("{}::{}", symbol.scope_chain.join("::"), symbol.name)
+    }
+}
+
+fn trace_node_text(node: Node<'_>, source: &str) -> String {
+    source[node.start_byte()..node.end_byte()].to_string()
+}
+
+fn find_node_covering_range(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
+    let mut best = None;
+    let mut cursor = root.walk();
+
+    fn walk_covering<'a>(
+        cursor: &mut tree_sitter::TreeCursor<'a>,
+        start: usize,
+        end: usize,
+        best: &mut Option<Node<'a>>,
+    ) {
+        let node = cursor.node();
+        if node.start_byte() <= start && node.end_byte() >= end {
+            *best = Some(node);
+            if cursor.goto_first_child() {
+                loop {
+                    walk_covering(cursor, start, end, best);
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+                cursor.goto_parent();
+            }
+        }
+    }
+
+    walk_covering(&mut cursor, start, end, &mut best);
+    best
+}
+
+fn find_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if cursor.node().kind() == kind {
+                return Some(cursor.node());
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn extract_callee_names(node: Node<'_>, source: &str) -> (Option<String>, Option<String>) {
+    let Some(callee) = node.child_by_field_name("function") else {
+        return (None, None);
+    };
+    let full = trace_node_text(callee, source);
+    let short = if full.contains('.') {
+        full.rsplit('.').next().unwrap_or(&full).to_string()
+    } else {
+        full.clone()
+    };
+    (Some(full), Some(short))
 }
 
 pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStoreError) -> Response {

@@ -2446,9 +2446,9 @@ fn callgraph_impact_ignores_legacy_project_size_cap() {
     aft.shutdown();
 }
 
-/// `trace_data` returns `project_too_large` when project exceeds `max_callgraph_files`.
+/// Store-backed `trace_data` ignores the legacy `max_callgraph_files` cap.
 #[test]
-fn callgraph_trace_data_project_too_large() {
+fn callgraph_trace_data_ignores_legacy_project_size_cap() {
     let mut aft = AftProcess::spawn();
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
@@ -2464,8 +2464,12 @@ fn callgraph_trace_data_project_too_large() {
         crate::helpers::json_string(&format!("{}/data_flow.ts", root))
     ));
 
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["code"], "project_too_large");
+    assert_eq!(
+        resp["success"], true,
+        "store-backed trace_data should succeed despite cap=1: {resp:?}"
+    );
+    assert_eq!(resp["origin_symbol"], "transformData");
+    assert!(resp["hops"].as_array().is_some());
 
     aft.shutdown();
 }

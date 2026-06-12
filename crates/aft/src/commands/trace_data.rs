@@ -1,7 +1,9 @@
 use std::path::Path;
 
-use crate::context::AppContext;
-use crate::error::AftError;
+use crate::commands::callgraph_store_adapter::{
+    building_response, store_error_response, trace_data_result, unavailable_response,
+};
+use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_data` request.
@@ -65,18 +67,6 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(5)
         .min(100) as usize;
 
-    let mut cg_ref = ctx.callgraph().borrow_mut();
-    let graph = match cg_ref.as_mut() {
-        Some(g) => g,
-        None => {
-            return Response::error(
-                &req.id,
-                "not_configured",
-                "trace_data: project not configured — send 'configure' first",
-            );
-        }
-    };
-
     let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return resp,
@@ -105,21 +95,29 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let symbol = match graph.resolve_symbol_query(&file_path, symbol) {
-        Ok(symbol) => symbol,
-        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    let store = match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => store,
+        CallgraphStoreAccess::Building => return building_response(&req.id, "trace_data"),
+        CallgraphStoreAccess::Unavailable => {
+            return unavailable_response(&req.id, "trace_data", ctx.is_worktree_bridge())
+        }
+        CallgraphStoreAccess::Error(error) => {
+            return store_error_response(&req.id, "trace_data", error)
+        }
     };
 
-    let max_files = ctx.config().max_callgraph_files;
-
-    match graph.trace_data(&file_path, &symbol, expression, depth, max_files) {
+    match trace_data_result(
+        &store,
+        &file_path,
+        symbol,
+        expression,
+        depth,
+        ctx.symbol_cache(),
+    ) {
         Ok(result) => {
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }
-        Err(err @ AftError::ProjectTooLarge { .. }) => {
-            Response::error(&req.id, "project_too_large", format!("{}", err))
-        }
-        Err(e) => Response::error(&req.id, e.code(), e.to_string()),
+        Err(error) => store_error_response(&req.id, "trace_data", error),
     }
 }

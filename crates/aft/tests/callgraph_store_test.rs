@@ -429,6 +429,92 @@ fn store_op_outputs_match_legacy_for_tier1_languages() {
 }
 
 #[test]
+fn store_trace_data_outputs_match_legacy_for_callgraph_fixtures() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/callgraph");
+    let root = std::fs::canonicalize(root).unwrap();
+    let dir = tempdir().unwrap();
+    let store =
+        CallGraphStore::open(dir.path().join("trace-data-fixture-store"), root.clone()).unwrap();
+    store.cold_build(&project_files(&root)).unwrap();
+
+    assert_trace_data_parity(
+        &root,
+        &store,
+        "trace_data fixture assignment plus cross-file parameter",
+        "data_flow.ts",
+        "transformData",
+        "rawInput",
+        5,
+    );
+    assert_trace_data_parity(
+        &root,
+        &store,
+        "trace_data fixture destructuring approximation",
+        "data_flow.ts",
+        "complexFlow",
+        "data",
+        5,
+    );
+}
+
+#[test]
+fn store_trace_data_outputs_match_legacy_for_edge_cases() {
+    let dir = tempdir().unwrap();
+    write_trace_data_parity_project(dir.path());
+    let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    let store = CallGraphStore::open(root.join(".trace-data-parity-store"), root.clone()).unwrap();
+    store.cold_build(&project_files(&root)).unwrap();
+
+    for (label, file, symbol, expression, depth) in [
+        (
+            "same-body assignment chain, cross-file parameter, unresolved callee",
+            "src/flow.ts",
+            "start",
+            "raw",
+            5,
+        ),
+        (
+            "cross-file depth limiting",
+            "src/flow.ts",
+            "start",
+            "raw",
+            0,
+        ),
+        (
+            "same-file local calls ignore depth like legacy fallback",
+            "src/flow.ts",
+            "depthStart",
+            "raw",
+            0,
+        ),
+        ("visited-set cycle", "src/flow.ts", "cycleA", "value", 5),
+        (
+            "scoped class method",
+            "src/flow.ts",
+            "Worker::run",
+            "raw",
+            5,
+        ),
+        (
+            "spread argument approximation",
+            "src/flow.ts",
+            "spreadStart",
+            "items",
+            5,
+        ),
+        (
+            "supplemental method-dispatch edge remains approximate",
+            "src/flow.ts",
+            "supplemental",
+            "value",
+            5,
+        ),
+    ] {
+        assert_trace_data_parity(&root, &store, label, file, symbol, expression, depth);
+    }
+}
+
+#[test]
 fn store_edges_match_live_callgraph_for_tier1_languages() {
     let dir = tempdir().unwrap();
     write_parity_project(dir.path());
@@ -1361,6 +1447,46 @@ where
     );
 }
 
+fn assert_trace_data_parity(
+    root: &Path,
+    store: &CallGraphStore,
+    label: &str,
+    file: &str,
+    symbol: &str,
+    expression: &str,
+    depth: usize,
+) {
+    let file_path = root.join(file);
+    assert_op_parity(
+        root,
+        store,
+        label,
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .trace_data(&file_path, symbol, expression, depth, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            let symbol_cache = Arc::new(RwLock::new(SymbolCache::new()));
+            serde_json::to_value(
+                callgraph_store_adapter::trace_data_result(
+                    store,
+                    &file_path,
+                    symbol,
+                    expression,
+                    depth,
+                    symbol_cache,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+}
+
 fn run_scenario(
     name: &str,
     setup: fn(&Path),
@@ -1454,6 +1580,71 @@ fn bump_mtime(path: &Path) {
 
 fn remove_file(path: &Path) {
     fs::remove_file(path).unwrap();
+}
+
+fn write_trace_data_parity_project(root: &Path) {
+    write_file(
+        &root.join("package.json"),
+        r#"{"name":"trace-data-parity-fixture","type":"module"}"#,
+    );
+    write_file(
+        &root.join("src/flow.ts"),
+        r#"import { externalSink } from "./sink";
+
+export function start(raw: string): string {
+  const first = raw;
+  const second = first;
+  externalSink(second);
+  missingCall(second);
+  return second;
+}
+
+export function depthStart(raw: string): void {
+  depthMiddle(raw);
+}
+
+export function depthMiddle(input: string): void {
+  depthLeaf(input);
+}
+
+export function depthLeaf(value: string): void {}
+
+export function cycleA(value: string): void {
+  cycleB(value);
+}
+
+export function cycleB(value: string): void {
+  cycleA(value);
+}
+
+export class Worker {
+  run(raw: string): string {
+    const copy = raw;
+    return copy;
+  }
+}
+
+export function spreadStart(items: string[]): void {
+  externalSink(...items);
+}
+
+export class Service {
+  handle(value: string): void {}
+}
+
+export function supplemental(value: string, service: Service): void {
+  service.handle(value);
+}
+"#,
+    );
+    write_file(
+        &root.join("src/sink.ts"),
+        r#"export function externalSink(input: string): void {
+  const local = input;
+  console.log(local);
+}
+"#,
+    );
 }
 
 fn write_parity_project(root: &Path) {
