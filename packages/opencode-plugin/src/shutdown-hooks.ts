@@ -94,7 +94,10 @@ function installProcessHandlers(): void {
       // registered after plugin load). See shouldForceExit.
       const others = process.listenerCount(sig) - 1;
       if (!shouldForceExit(others)) {
-        // Host owns termination; run best-effort cleanup alongside it.
+        // Host owns termination; run best-effort cleanup alongside it. The log
+        // line names the deferral so a hang is attributable to the OTHER
+        // listener (this exact triage cost a cross-team debugging round).
+        log(`${sig}: deferring termination to ${others} other listener(s); cleanup only`);
         void runCleanups(sig);
         return;
       }

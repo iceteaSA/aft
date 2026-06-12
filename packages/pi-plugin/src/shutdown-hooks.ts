@@ -82,6 +82,9 @@ function installProcessHandlers(): void {
     process.on(sig, () => {
       const others = process.listenerCount(sig) - 1;
       if (!shouldForceExit(others)) {
+        // Named deferral: a shutdown hang is then attributable to the OTHER
+        // listener from the log alone.
+        log(`${sig}: deferring termination to ${others} other listener(s); cleanup only`);
         void runCleanups(sig);
         return;
       }
