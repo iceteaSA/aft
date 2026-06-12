@@ -558,10 +558,16 @@ fn pty_write_python_repl_round_trip() {
     );
     let paths = task_paths(storage.path(), SESSION, &task_id);
 
+    // Barrier: wait for the REPL prompt before writing. On cold Windows CI
+    // runners shell + python startup alone can exceed 5s, and measuring the
+    // read deadline from the write (issued before the REPL exists) flaked two
+    // release runs. `-q` suppresses the banner, so the prompt is the first
+    // thing the REPL prints.
+    read_pty_until(&paths.pty, ">>>", Duration::from_secs(30));
     registry
         .write_pty(&task_id, SESSION, b"print('pty-repl-ok')\n")
         .unwrap();
-    let output = read_pty_until(&paths.pty, "pty-repl-ok", Duration::from_secs(5));
+    let output = read_pty_until(&paths.pty, "pty-repl-ok", Duration::from_secs(10));
     assert!(output.contains("pty-repl-ok"));
     registry.kill(&task_id, SESSION).unwrap();
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
