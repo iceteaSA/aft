@@ -766,3 +766,228 @@ fn http_error_status_is_not_retried() {
         "HTTP error status must NOT trigger a retry"
     );
 }
+
+#[test]
+fn mjs_url_served_as_javascript_cached_and_outlined_as_js() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let body = br#"export function greet() { return "hi"; }
+export class Agent { run() {} }
+"#;
+    let server = spawn_mock_server(1, move |_path, stream| {
+        write_response(stream, "200 OK", "text/javascript", body);
+    });
+    let url = server.url("/dist/index.mjs");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+
+    let resp = aft.send(
+        &json!({
+            "id": "mjs-outline",
+            "command": "outline",
+            "file": url,
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "mjs outline should succeed: {resp:?}"
+    );
+    let text = resp["text"].as_str().expect("outline text");
+    assert!(
+        text.contains("greet") || text.contains("function"),
+        "outline should list JS symbols, not markdown headings: {text}"
+    );
+    assert!(
+        !text.lines().any(|line| line.trim_start().starts_with("# ")),
+        "should not be markdown heading outline: {text}"
+    );
+    assert!(
+        cache_content_path_for_url(storage.path(), &url, ".mjs").exists(),
+        "mjs URL should cache with .mjs extension"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn rs_url_served_as_plain_text_cached_as_rust() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let body = b"pub fn alpha() {}\npub struct Beta;\n";
+    let server = spawn_mock_server(1, move |_path, stream| {
+        write_response(stream, "200 OK", "text/plain", body);
+    });
+    let url = server.url("/crates/aft/src/lib.rs");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+
+    let resp = aft.send(
+        &json!({
+            "id": "rs-outline",
+            "command": "outline",
+            "file": url,
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "rust outline should succeed: {resp:?}"
+    );
+    let text = resp["text"].as_str().expect("outline text");
+    assert!(
+        text.contains("alpha") || text.contains("Beta"),
+        "outline should expose Rust symbols: {text}"
+    );
+    assert!(
+        cache_content_path_for_url(storage.path(), &url, ".rs").exists(),
+        "plain-text .rs URL must cache as .rs not .md"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn extensionless_javascript_url_falls_back_to_js_extension() {
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "application/javascript",
+            b"function noop() {}\n",
+        );
+    });
+    let url = server.url("/bundle");
+    let cached = fetch_url_to_cache(
+        &url,
+        storage.path(),
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        },
+    )
+    .expect("extensionless JS fetch");
+    assert_eq!(
+        cached,
+        cache_content_path_for_url(storage.path(), &url, ".js")
+    );
+}
+
+#[test]
+fn extensionless_plain_text_still_cached_as_markdown() {
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(stream, "200 OK", "text/plain", b"# Hello\n");
+    });
+    let url = server.url("/notes");
+    let cached = fetch_url_to_cache(
+        &url,
+        storage.path(),
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        },
+    )
+    .expect("plain text fetch");
+    assert_eq!(
+        cached,
+        cache_content_path_for_url(storage.path(), &url, ".md")
+    );
+}
+
+#[test]
+fn stale_wrong_extension_cache_entry_is_refetched() {
+    let storage = TempDir::new().unwrap();
+    let body = b"pub fn fresh() {}\n";
+    let fetch_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fetch_count_handler = Arc::clone(&fetch_count);
+    let server = spawn_mock_server(2, move |_path, stream| {
+        fetch_count_handler.fetch_add(1, Ordering::SeqCst);
+        write_response(stream, "200 OK", "text/plain", body);
+    });
+    let url = server.url("/lib.rs");
+
+    let meta_path = cache_meta_path_for_url(storage.path(), &url);
+    fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let stale_meta = json!({
+        "url": url,
+        "contentType": "text/plain",
+        "extension": ".md",
+        "fetchedAt": fetched_at
+    });
+    fs::write(&meta_path, stale_meta.to_string()).unwrap();
+    fs::write(
+        cache_content_path_for_url(storage.path(), &url, ".md"),
+        b"# stale markdown\n",
+    )
+    .unwrap();
+
+    let cached = fetch_url_to_cache(
+        &url,
+        storage.path(),
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        },
+    )
+    .expect("should re-fetch after stale extension");
+    assert_eq!(
+        cached,
+        cache_content_path_for_url(storage.path(), &url, ".rs")
+    );
+    assert_eq!(fs::read(&cached).unwrap(), body);
+    assert_eq!(
+        fetch_count.load(Ordering::SeqCst),
+        1,
+        "mock server should be hit once"
+    );
+}
+
+#[test]
+fn nul_bytes_in_source_body_rejected_as_binary() {
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(stream, "200 OK", "text/plain", b"pub fn x() {}\0");
+    });
+    let url = server.url("/bad.rs");
+    let err = fetch_url_to_cache(
+        &url,
+        storage.path(),
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        },
+    )
+    .expect_err("binary rust body must fail");
+    assert!(
+        err.to_string().contains("Binary content"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn url_with_query_resolves_ts_extension() {
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(stream, "200 OK", "text/plain", b"export const x = 1;\n");
+    });
+    let url = format!("{}?v=2#L10", server.url("/src/mod.ts"));
+    let cached = fetch_url_to_cache(
+        &url,
+        storage.path(),
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        },
+    )
+    .expect("ts with query fetch");
+    assert_eq!(
+        cached,
+        cache_content_path_for_url(storage.path(), &url, ".ts")
+    );
+}

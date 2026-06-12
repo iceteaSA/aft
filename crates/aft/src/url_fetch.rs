@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::parser::detect_language;
+
 const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(30_000);
@@ -110,7 +112,7 @@ pub fn fetch_url_to_cache(
 
     let hash = hash_url(url);
     let meta_file = meta_path(storage_dir, &hash);
-    if let Some(cached) = fresh_cached_path(storage_dir, &hash, &meta_file)? {
+    if let Some(cached) = fresh_cached_path(storage_dir, &hash, &meta_file, &parsed)? {
         return Ok(cached);
     }
 
@@ -129,11 +131,12 @@ pub fn fetch_url_to_cache(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("text/plain")
         .to_string();
-    let extension = resolve_extension(&content_type).ok_or_else(|| {
-        UrlFetchError::new(format!(
-            "Unsupported content type '{content_type}' for {url}. Supported: text/html, text/markdown, application/json, text/plain"
-        ))
-    })?;
+    let (extension, from_source_path) =
+        resolve_fetch_extension(&parsed, &content_type).ok_or_else(|| {
+            UrlFetchError::new(format!(
+                "Unsupported content type '{content_type}' for {url}. Supported: text/html, text/markdown, application/json, text/plain; source files via URL path extension (e.g. .rs, .ts, .mjs)"
+            ))
+        })?;
 
     if let Some(length) = response.content_length() {
         if length > MAX_RESPONSE_BYTES {
@@ -144,6 +147,11 @@ pub fn fetch_url_to_cache(
     }
 
     let body = read_response_body(response, url)?;
+    if from_source_path && body_contains_nul_in_prefix(&body) {
+        return Err(UrlFetchError::new(format!(
+            "Binary content detected for source URL {url}"
+        )));
+    }
     let (body, content_type, extension) = if extension == ".html" {
         (
             convert_html_body_to_markdown(&body, url)?,
@@ -256,6 +264,7 @@ fn fresh_cached_path(
     storage_dir: &Path,
     hash: &str,
     meta_file: &Path,
+    url: &Url,
 ) -> Result<Option<PathBuf>, UrlFetchError> {
     if !meta_file.exists() {
         return Ok(None);
@@ -270,6 +279,13 @@ fn fresh_cached_path(
     };
     let age = now_ms().saturating_sub(meta.fetched_at);
     if meta.extension == ".html" {
+        return Ok(None);
+    }
+
+    let content_type = meta.content_type.as_str();
+    let current = resolve_fetch_extension(url, content_type);
+    let expected_ext = current.map(|(ext, _)| ext);
+    if expected_ext != Some(meta.extension.as_str()) {
         return Ok(None);
     }
 
@@ -527,7 +543,106 @@ fn is_private_ipv6(ip: Ipv6Addr) -> bool {
     (0xfe80..=0xfebf).contains(&first) || (0xfc00..=0xfdff).contains(&first) || first >= 0xff00
 }
 
-fn resolve_extension(content_type: &str) -> Option<&'static str> {
+const BINARY_SNIFF_PREFIX: usize = 8 * 1024;
+
+fn body_contains_nul_in_prefix(body: &[u8]) -> bool {
+    let end = body.len().min(BINARY_SNIFF_PREFIX);
+    body[..end].contains(&0)
+}
+
+/// Resolve cache extension: URL path (parsed, percent-decoded) first for source
+/// languages AFT parses; otherwise content-type mapping.
+fn resolve_fetch_extension(url: &Url, content_type: &str) -> Option<(&'static str, bool)> {
+    if let Some(ext) = extension_from_url_path(url) {
+        return Some((ext, true));
+    }
+    resolve_extension_from_content_type(content_type).map(|ext| (ext, false))
+}
+
+fn extension_from_url_path(url: &Url) -> Option<&'static str> {
+    let path = url.path();
+    if path.is_empty() || path == "/" {
+        return None;
+    }
+    let segment = path.rsplit('/').next().unwrap_or(path);
+    let file_name = percent_decode_path_segment(segment);
+    let dot = file_name.rfind('.')?;
+    let ext = &file_name[dot + 1..];
+    if ext.is_empty() {
+        return None;
+    }
+    let probe = Path::new("file").with_extension(ext);
+    if detect_language(&probe).is_some() {
+        static_extension_for_lang_ext(ext)
+    } else {
+        None
+    }
+}
+
+fn percent_decode_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h1), Some(h2)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push(char::from(h1 << 4 | h2));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Dotted cache extension for a path extension that `detect_language` accepts.
+fn static_extension_for_lang_ext(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "ts" | "mts" | "cts" => Some(".ts"),
+        "tsx" => Some(".tsx"),
+        "js" => Some(".js"),
+        "jsx" => Some(".jsx"),
+        "mjs" => Some(".mjs"),
+        "cjs" => Some(".cjs"),
+        "py" | "pyi" => Some(".py"),
+        "rs" => Some(".rs"),
+        "go" => Some(".go"),
+        "c" | "h" => Some(".c"),
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => Some(".cpp"),
+        "zig" => Some(".zig"),
+        "cs" => Some(".cs"),
+        "sh" | "bash" | "zsh" => Some(".sh"),
+        "html" | "htm" => Some(".html"),
+        "md" | "markdown" | "mdx" => Some(".md"),
+        "sol" => Some(".sol"),
+        "scss" => Some(".scss"),
+        "vue" => Some(".vue"),
+        "json" | "jsonc" => Some(".json"),
+        "scala" | "sc" => Some(".scala"),
+        "java" => Some(".java"),
+        "rb" => Some(".rb"),
+        "kt" | "kts" => Some(".kt"),
+        "swift" => Some(".swift"),
+        "inc" | "php" => Some(".php"),
+        "lua" => Some(".lua"),
+        "pl" | "pm" | "t" => Some(".pl"),
+        "yaml" | "yml" => Some(".yaml"),
+        _ => None,
+    }
+}
+
+fn resolve_extension_from_content_type(content_type: &str) -> Option<&'static str> {
     let lower = content_type.to_ascii_lowercase();
     let media_type = lower
         .split(';')
@@ -552,6 +667,8 @@ fn resolve_extension(content_type: &str) -> Option<&'static str> {
         | "text/plain" => Some(".md"),
         "application/json" | "application/ld+json" => Some(".json"),
         other if other.ends_with("+json") => Some(".json"),
+        "text/javascript" | "application/javascript" | "application/ecmascript" => Some(".js"),
+        "text/typescript" | "application/typescript" => Some(".ts"),
         _ => None,
     }
 }
@@ -800,4 +917,71 @@ fn reqwest_error_detail(error: &reqwest::Error) -> String {
         return format!("{source}");
     }
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use url::Url;
+
+    #[test]
+    fn extension_from_path_uses_parser_mapping() {
+        let url = Url::parse("https://example.com/pkg/index.mjs").unwrap();
+        let (ext, from_path) = resolve_fetch_extension(&url, "text/javascript").unwrap();
+        assert_eq!(ext, ".mjs");
+        assert!(from_path);
+    }
+
+    #[test]
+    fn text_plain_rs_url_ignores_content_type_gate() {
+        let url = Url::parse("https://raw.githubusercontent.com/o/r/main/lib.rs").unwrap();
+        let (ext, from_path) = resolve_fetch_extension(&url, "text/plain").unwrap();
+        assert_eq!(ext, ".rs");
+        assert!(from_path);
+    }
+
+    #[test]
+    fn extensionless_javascript_maps_to_js() {
+        let url = Url::parse("https://cdn.example/bundle").unwrap();
+        let (ext, from_path) = resolve_fetch_extension(&url, "text/javascript").unwrap();
+        assert_eq!(ext, ".js");
+        assert!(!from_path);
+    }
+
+    #[test]
+    fn extensionless_plain_stays_md() {
+        let url = Url::parse("https://example.com/readme").unwrap();
+        let (ext, _) = resolve_fetch_extension(&url, "text/plain").unwrap();
+        assert_eq!(ext, ".md");
+    }
+
+    #[test]
+    fn query_and_fragment_do_not_break_path_extension() {
+        let url = Url::parse("https://example.com/src/file.ts?v=2#L10").unwrap();
+        let (ext, from_path) = resolve_fetch_extension(&url, "text/plain").unwrap();
+        assert_eq!(ext, ".ts");
+        assert!(from_path);
+    }
+
+    #[test]
+    fn percent_encoded_path_segment() {
+        let url = Url::parse("https://example.com/foo%2Fbar.rs").unwrap();
+        // path is /foo%2Fbar.rs - segment is foo%2Fbar.rs -> decode to foo/bar.rs -> ext rs
+        let (ext, _) = resolve_fetch_extension(&url, "text/plain").unwrap();
+        assert_eq!(ext, ".rs");
+    }
+
+    #[test]
+    fn binary_sniff_detects_nul() {
+        let mut body = vec![b'f', b'n', 0, b' '];
+        assert!(body_contains_nul_in_prefix(&body));
+        body = vec![b'h'; 9000];
+        assert!(!body_contains_nul_in_prefix(&body));
+    }
+
+    #[test]
+    fn unsupported_pdf_still_errors_via_resolve() {
+        let url = Url::parse("https://example.com/doc.pdf").unwrap();
+        assert!(resolve_fetch_extension(&url, "application/pdf").is_none());
+    }
 }
