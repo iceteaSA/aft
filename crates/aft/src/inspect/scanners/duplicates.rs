@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -31,6 +33,10 @@ const MAX_GROUP_ITEMS: usize = 100;
 const VARIABLE_SENTINEL: &str = "_var";
 const FIELD_SENTINEL: &str = "_field";
 
+thread_local! {
+    static DUPLICATES_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct DuplicateFragment {
     hash: String,
@@ -50,7 +56,7 @@ struct FileScan {
 
 #[derive(Debug, Clone)]
 struct FragmentOccurrence {
-    file: String,
+    file: Rc<str>,
     start_line: u32,
     end_line: u32,
     cost: u32,
@@ -90,14 +96,12 @@ pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
         Err(message) => return InspectResult::failed(job, message, started.elapsed()),
     };
 
+    let aggregate =
+        aggregate_file_scans(&file_scans, skipped_languages_from_file_scans(&file_scans));
     let contributions = file_scans
         .iter()
         .map(file_scan_to_contribution)
         .collect::<Vec<_>>();
-    let aggregate = aggregate_duplicate_contributions(
-        &contributions,
-        skipped_languages_from_file_scans(&file_scans),
-    );
     let scanned_files = file_scans
         .iter()
         .map(|scan| scan.path.clone())
@@ -139,7 +143,15 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
         .map_err(|error| format!("read failed for {}: {error}", path.display()))?;
     let tree = parse_source(path, lang, &source)?;
     let mut fragments = Vec::new();
-    collect_fragments(tree.root_node(), &source, lang, &mut fragments, 0);
+    let mut hash_scratch = Vec::new();
+    collect_fragments(
+        tree.root_node(),
+        &source,
+        lang,
+        &mut fragments,
+        &mut hash_scratch,
+        0,
+    );
     fragments.sort_by(|left, right| {
         left.start_line
             .cmp(&right.start_line)
@@ -157,14 +169,23 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
 }
 
 fn parse_source(path: &Path, lang: LangId, source: &str) -> Result<Tree, String> {
-    let grammar = grammar_for(lang);
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .map_err(|error| format!("grammar init failed for {:?}: {error}", lang))?;
-    parser
-        .parse(source, None)
-        .ok_or_else(|| format!("tree-sitter parse returned None for {}", path.display()))
+    DUPLICATES_PARSERS.with(|parsers| {
+        let mut parsers = parsers.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(lang) {
+            let grammar = grammar_for(lang);
+            let mut parser = Parser::new();
+            parser
+                .set_language(&grammar)
+                .map_err(|error| format!("grammar init failed for {:?}: {error}", lang))?;
+            entry.insert(parser);
+        }
+
+        parsers
+            .get_mut(&lang)
+            .expect("parser inserted for language")
+            .parse(source, None)
+            .ok_or_else(|| format!("tree-sitter parse returned None for {}", path.display()))
+    })
 }
 
 fn collect_fragments(
@@ -172,6 +193,7 @@ fn collect_fragments(
     source: &str,
     lang: LangId,
     fragments: &mut Vec<DuplicateFragment>,
+    hash_scratch: &mut Vec<blake3::Hash>,
     depth: u32,
 ) -> NodeDigest {
     let mut cost = node_cost(lang, node.kind());
@@ -183,27 +205,30 @@ fn collect_fragments(
     if depth >= MAX_FRAGMENT_DEPTH {
         let leaf = leaf_hash_text(node, source);
         return NodeDigest {
-            hash: hash_node(node.kind(), &[], Some(&leaf)),
+            hash: hash_node(node.kind(), &[], Some(leaf)),
             cost,
         };
     }
-    let mut child_hashes = Vec::new();
+    let child_start = hash_scratch.len();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.is_extra() {
             continue;
         }
-        let child_digest = collect_fragments(child, source, lang, fragments, depth + 1);
+        let child_digest =
+            collect_fragments(child, source, lang, fragments, hash_scratch, depth + 1);
         cost = cost.saturating_add(child_digest.cost);
-        child_hashes.push(child_digest.hash);
+        hash_scratch.push(child_digest.hash);
     }
 
+    let child_hashes = &hash_scratch[child_start..];
     let leaf_text = if child_hashes.is_empty() {
         Some(leaf_hash_text(node, source))
     } else {
         None
     };
-    let hash = hash_node(node.kind(), &child_hashes, leaf_text.as_deref());
+    let hash = hash_node(node.kind(), child_hashes, leaf_text);
+    hash_scratch.truncate(child_start);
 
     if node.is_named() && (LOWER_BOUND..=MAX_COST).contains(&cost) {
         fragments.push(DuplicateFragment {
@@ -217,19 +242,41 @@ fn collect_fragments(
     NodeDigest { hash, cost }
 }
 
-fn leaf_hash_text(node: Node<'_>, source: &str) -> String {
+fn leaf_hash_text<'source>(node: Node<'_>, source: &'source str) -> &'source str {
     match anonymize_leaf(node) {
-        AnonymizeAs::Variable => VARIABLE_SENTINEL.to_string(),
-        AnonymizeAs::Field => FIELD_SENTINEL.to_string(),
-        AnonymizeAs::None => node.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
+        AnonymizeAs::Variable => VARIABLE_SENTINEL,
+        AnonymizeAs::Field => FIELD_SENTINEL,
+        // Anonymous tree-sitter leaves are usually fixed tokens whose kind is
+        // their source text. Reuse the kind only after comparing the source
+        // bytes, so generated/external zero-width tokens keep the old hash.
+        AnonymizeAs::None if !node.is_named() => {
+            let source_text = source
+                .as_bytes()
+                .get(node.start_byte()..node.end_byte())
+                .unwrap_or_default();
+            if source_text == node.kind().as_bytes() {
+                node.kind()
+            } else {
+                node.utf8_text(source.as_bytes()).unwrap_or("")
+            }
+        }
+        AnonymizeAs::None => node.utf8_text(source.as_bytes()).unwrap_or(""),
     }
 }
 
 fn anonymize_leaf(node: Node<'_>) -> AnonymizeAs {
-    if is_method_or_callee_name(node) || node.kind() == "type_identifier" {
+    // Most leaves (punctuation, keywords, literals, type identifiers) are not
+    // anonymizable. Avoid parent/field callee checks unless the kind can be
+    // anonymized in the first place.
+    let anonymize_as = is_anonymizable(node.kind());
+    if anonymize_as == AnonymizeAs::None || node.kind() == "type_identifier" {
         return AnonymizeAs::None;
     }
-    is_anonymizable(node.kind())
+    if is_method_or_callee_name(node) {
+        AnonymizeAs::None
+    } else {
+        anonymize_as
+    }
 }
 
 fn is_method_or_callee_name(node: Node<'_>) -> bool {
@@ -332,6 +379,7 @@ fn file_scan_to_contribution(scan: &FileScan) -> FileContribution {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn aggregate_duplicate_contributions(
     contributions: &[FileContribution],
     languages_skipped: Vec<String>,
@@ -357,19 +405,80 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
     let mut by_hash = BTreeMap::<String, Vec<FragmentOccurrence>>::new();
 
     for scan in &parsed {
+        let file = Rc::<str>::from(scan.file.as_str());
         for fragment in &scan.fragments {
-            by_hash
-                .entry(fragment.hash.clone())
-                .or_default()
-                .push(FragmentOccurrence {
-                    file: scan.file.clone(),
+            push_occurrence(
+                &mut by_hash,
+                fragment.hash.as_str(),
+                FragmentOccurrence {
+                    file: Rc::clone(&file),
                     start_line: fragment.start_line,
                     end_line: fragment.end_line,
                     cost: fragment.cost,
-                });
+                },
+            );
         }
     }
 
+    aggregate_duplicate_occurrences(by_hash, parsed.len(), languages_skipped, drill_down_limit)
+}
+
+fn aggregate_file_scans(
+    file_scans: &[FileScan],
+    languages_skipped: Vec<String>,
+) -> serde_json::Value {
+    aggregate_file_scans_with_limit(file_scans, languages_skipped, Some(MAX_GROUP_ITEMS))
+}
+
+fn aggregate_file_scans_with_limit(
+    file_scans: &[FileScan],
+    languages_skipped: Vec<String>,
+    drill_down_limit: Option<usize>,
+) -> serde_json::Value {
+    let mut by_hash = BTreeMap::<String, Vec<FragmentOccurrence>>::new();
+
+    for scan in file_scans {
+        let file = Rc::<str>::from(scan.display_path.as_str());
+        for fragment in &scan.fragments {
+            push_occurrence(
+                &mut by_hash,
+                fragment.hash.as_str(),
+                FragmentOccurrence {
+                    file: Rc::clone(&file),
+                    start_line: fragment.start_line,
+                    end_line: fragment.end_line,
+                    cost: fragment.cost,
+                },
+            );
+        }
+    }
+
+    aggregate_duplicate_occurrences(
+        by_hash,
+        file_scans.len(),
+        languages_skipped,
+        drill_down_limit,
+    )
+}
+
+fn push_occurrence(
+    by_hash: &mut BTreeMap<String, Vec<FragmentOccurrence>>,
+    hash: &str,
+    occurrence: FragmentOccurrence,
+) {
+    if let Some(occurrences) = by_hash.get_mut(hash) {
+        occurrences.push(occurrence);
+    } else {
+        by_hash.insert(hash.to_string(), vec![occurrence]);
+    }
+}
+
+fn aggregate_duplicate_occurrences(
+    by_hash: BTreeMap<String, Vec<FragmentOccurrence>>,
+    scanned_files: usize,
+    languages_skipped: Vec<String>,
+    drill_down_limit: Option<usize>,
+) -> serde_json::Value {
     // Collapse nested/overlapping duplicate fragments. tree-sitter records a
     // duplicate hash for EVERY named subtree, so one duplicated block emits the
     // outer node PLUS every nested descendant as a separate group — inflating
@@ -437,7 +546,7 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         "items": items,
         "top": top,
         "drill_down_capped": drill_down_capped,
-        "scanned_files": parsed.len(),
+        "scanned_files": scanned_files,
         "languages_skipped": languages_skipped,
     })
 }
@@ -450,7 +559,7 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
 /// currently-open intervals yields each fragment's enclosing ancestors.
 fn surfaced_duplicate_hashes(
     by_hash: &BTreeMap<String, Vec<FragmentOccurrence>>,
-) -> BTreeSet<String> {
+) -> BTreeSet<&str> {
     // Per-file intervals, restricted to fragments whose hash is actually
     // duplicated (>= 2 occurrences project-wide). Only such fragments can
     // subsume — and only such fragments are eligible to surface.
@@ -460,7 +569,7 @@ fn surfaced_duplicate_hashes(
             continue;
         }
         for occ in occurrences {
-            by_file.entry(occ.file.as_str()).or_default().push((
+            by_file.entry(occ.file.as_ref()).or_default().push((
                 occ.start_line,
                 occ.end_line,
                 hash.as_str(),
@@ -487,7 +596,7 @@ fn surfaced_duplicate_hashes(
             // Unenclosed by any larger duplicate fragment in this file → this
             // occurrence is maximal here, so the group surfaces.
             if open.is_empty() {
-                surfaced.insert(hash.to_string());
+                surfaced.insert(hash);
             }
             open.push((start, end));
         }
@@ -514,12 +623,14 @@ fn occurrences_to_group(occurrences: &[FragmentOccurrence]) -> DuplicateGroup {
             .map(|occurrence| {
                 format!(
                     "{}:{}-{}",
-                    occurrence.file, occurrence.start_line, occurrence.end_line
+                    occurrence.file.as_ref(),
+                    occurrence.start_line,
+                    occurrence.end_line
                 )
             })
             .collect(),
         cost: sample.cost,
-        sample_file: sample.file.clone(),
+        sample_file: sample.file.to_string(),
         sample_start_line: sample.start_line,
         sample_end_line: sample.end_line,
     }
@@ -721,7 +832,15 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
             .spawn(move || {
-                collect_fragments(tree.root_node(), &source, lang, &mut fragments, 0);
+                let mut hash_scratch = Vec::new();
+                collect_fragments(
+                    tree.root_node(),
+                    &source,
+                    lang,
+                    &mut fragments,
+                    &mut hash_scratch,
+                    0,
+                );
             })
             .expect("spawn bounded-stack worker")
             .join()
