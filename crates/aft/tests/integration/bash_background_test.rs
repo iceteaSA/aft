@@ -461,7 +461,11 @@ fn background_concurrent_task_cap_is_enforced() {
 
     let mut task_ids = Vec::new();
     for i in 0..8 {
-        task_ids.push(spawn_bg(&mut aft, &format!("spawn-cap-{i}"), "sleep 2"));
+        // Long sleep so the cap-filling tasks cannot self-complete and free a
+        // slot during the spawn + 9th-send window on a slow runner (Windows CI
+        // flaked here with `sleep 2`). They are killed in the cleanup loop
+        // below, so the duration costs no wall-clock time.
+        task_ids.push(spawn_bg(&mut aft, &format!("spawn-cap-{i}"), "sleep 30"));
     }
     let rejected = aft.send(
         &json!({
