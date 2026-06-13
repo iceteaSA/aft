@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -28,6 +28,11 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     }
 
     let project_root = project_root_from_backend_state(&conn)?;
+    if stale_backend_file_count(&conn, &project_root)? > 0 {
+        return Err(CallGraphStoreError::Unavailable(
+            "callgraph has stale files pending refresh".to_string(),
+        ));
+    }
     let mut paths = SnapshotPathResolver::new(&project_root);
     let files = project_files_from_store(&conn, &mut paths)?;
     let exported_symbols = exported_symbols_from_store(&conn, &mut paths)?;
@@ -64,6 +69,16 @@ fn project_root_from_backend_state(conn: &Connection) -> Result<PathBuf> {
             roots.join(", ")
         ))),
     }
+}
+
+fn stale_backend_file_count(conn: &Connection, project_root: &Path) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM backend_file_state
+         WHERE backend = ?1 AND workspace_root = ?2 AND status = 'stale'",
+        params![BACKEND_TREESITTER, project_root.display().to_string()],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn project_files_from_store(
@@ -328,6 +343,47 @@ mod tests {
     #[test]
     fn projection_result_is_send() {
         assert_send::<Result<CallgraphSnapshot>>();
+    }
+
+    #[test]
+    fn dead_code_projection_rejects_stale_backend_rows_after_fresh_control() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        let source = src_dir.join("lib.ts");
+        fs::write(
+            &source,
+            r#"export function used(): number {
+  return 1;
+}
+"#,
+        )
+        .expect("write fixture");
+        let root = fs::canonicalize(&root).expect("canonical project root");
+        let source = fs::canonicalize(&source).expect("canonical source");
+
+        let store = CallGraphStore::open(root.join(".store"), root).expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&source))
+            .expect("cold build fixture");
+        let snapshot = project_dead_code_snapshot(store.sqlite_path())
+            .expect("fresh backend rows should project");
+        assert_eq!(snapshot.files.len(), 1);
+
+        let marked = store
+            .mark_files_stale(std::slice::from_ref(&source))
+            .expect("mark source stale");
+        assert_eq!(marked, vec!["src/lib.ts".to_string()]);
+        let error = project_dead_code_snapshot(store.sqlite_path())
+            .expect_err("stale backend rows should block projection");
+        match error {
+            CallGraphStoreError::Unavailable(message) => assert_eq!(
+                message, "callgraph has stale files pending refresh",
+                "stale projection should report a clear unavailable reason"
+            ),
+            other => panic!("expected Unavailable for stale backend rows, got {other:?}"),
+        }
     }
 
     #[test]

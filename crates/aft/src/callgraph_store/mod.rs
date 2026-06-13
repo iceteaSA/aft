@@ -896,7 +896,7 @@ impl CallGraphStore {
                         &rel_path,
                     )?);
                     delete_file_rows(&tx, &rel_path)?;
-                    mark_backend_state(&tx, &self.project_root, &rel_path, None, "stale")?;
+                    clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
                 }
                 continue;
             }
@@ -926,7 +926,7 @@ impl CallGraphStore {
                             &rel_path,
                         )?);
                         delete_file_rows(&tx, &rel_path)?;
-                        mark_backend_state(&tx, &self.project_root, &rel_path, None, "stale")?;
+                        clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
                         continue;
                     }
                     FreshnessVerdict::Stale => {}
@@ -5883,6 +5883,7 @@ fn mark_backend_state(
     content_hash: Option<&blake3::Hash>,
     status: &str,
 ) -> Result<()> {
+    clear_backend_state_for_file(tx, project_root, rel_path)?;
     let hash = content_hash
         .map(|hash| hash_to_hex(*hash))
         .unwrap_or_else(|| hash_to_hex(cache_freshness::zero_hash()));
@@ -5897,6 +5898,23 @@ fn mark_backend_state(
             hash,
             status,
             unix_seconds_now(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn clear_backend_state_for_file(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM backend_file_state
+         WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
+        params![
+            BACKEND_TREESITTER,
+            project_root.display().to_string(),
+            rel_path
         ],
     )?;
     Ok(())
