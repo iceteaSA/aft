@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use aft::callgraph_store::{project_dead_code_snapshot, CallGraphStore};
 use aft::config::Config;
 use aft::inspect::scanners::dead_code::run_dead_code_scan;
 use aft::inspect::{
@@ -99,6 +100,79 @@ fn target(root: &Path, file: &str, symbol: &str) -> String {
 
 fn scan(job: InspectJob) -> InspectScanSuccess {
     run_dead_code_scan(&job).outcome.expect("scan succeeds")
+}
+
+fn projected_snapshot_from_store(
+    root: &Path,
+    files: &[PathBuf],
+    store_dir: &str,
+) -> CallgraphSnapshot {
+    let store = CallGraphStore::open(root.join(store_dir), root.to_path_buf()).expect("open store");
+    store.cold_build(files).expect("cold build store");
+    project_dead_code_snapshot(store.sqlite_path()).expect("project dead-code snapshot")
+}
+
+fn outbound_call_set_bytes(snapshot: &CallgraphSnapshot) -> String {
+    let mut rows = snapshot
+        .outbound_calls
+        .iter()
+        .map(|call| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                call.caller_file.display(),
+                call.caller_symbol,
+                call.target,
+                call.line,
+                call.provenance
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    serde_json::to_string(&rows).expect("serialize outbound rows")
+}
+
+fn aggregate_has_item(success: &InspectScanSuccess, file: &str, symbol: &str) -> bool {
+    success.aggregate["items"]
+        .as_array()
+        .expect("dead-code items")
+        .iter()
+        .any(|item| item["file"] == file && item["symbol"] == symbol)
+}
+
+fn contribution_has_internal_call(
+    success: &InspectScanSuccess,
+    caller_file: &str,
+    target_file: &str,
+    symbol: &str,
+    provenance: &str,
+) -> bool {
+    success.contributions.iter().any(|contribution| {
+        contribution.contribution["file"] == caller_file
+            && contribution.contribution["internal_calls"]
+                .as_array()
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call["file"] == target_file
+                            && call["symbol"] == symbol
+                            && call["provenance"] == provenance
+                    })
+                })
+    })
+}
+
+fn type_match_fixture_exports(root: &Path) -> Vec<CallgraphExport> {
+    vec![
+        export(root, "src/factory.rs", "make_live", "function", 3),
+        export(root, "src/live_widget.rs", "new", "method", 4),
+        export(
+            root,
+            "src/planted_dead.rs",
+            "orphan_function",
+            "function",
+            1,
+        ),
+        export(root, "src/planted_dead.rs", "new", "method", 6),
+    ]
 }
 
 #[test]
@@ -846,6 +920,105 @@ fn inspect_dead_code_parses_rust_scoped_targets_after_file_separator() {
     let success = scan(job(&root, paths, Some(graph)));
 
     assert_eq!(success.aggregate["count"], 0, "{:#}", success.aggregate);
+}
+
+#[test]
+fn inspect_dead_code_keeps_type_match_constructor_live_without_rescuing_dead_new_symbols() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/main.rs",
+            r#"mod factory;
+mod live_widget;
+mod planted_dead;
+
+fn main() {
+    let _ = factory::make_live();
+}
+"#,
+        ),
+        (
+            "src/factory.rs",
+            r#"use crate::live_widget::LiveWidget;
+
+pub fn make_live() -> LiveWidget {
+    LiveWidget::new()
+}
+"#,
+        ),
+        (
+            "src/live_widget.rs",
+            r#"pub struct LiveWidget;
+
+impl LiveWidget {
+    pub fn new() -> Self { Self }
+}
+"#,
+        ),
+        (
+            "src/planted_dead.rs",
+            r#"pub fn orphan_function() {}
+
+struct NeverConstructed;
+
+impl NeverConstructed {
+    pub fn new() -> Self { Self }
+}
+"#,
+        ),
+    ]);
+    let project_root = std::fs::canonicalize(&root).expect("canonical fixture root");
+
+    let mut first_snapshot = projected_snapshot_from_store(&project_root, &paths, ".store-one");
+    first_snapshot.exported_symbols = type_match_fixture_exports(&project_root);
+    let first_outbound = outbound_call_set_bytes(&first_snapshot);
+    let first_scope_files = first_snapshot.files.clone();
+    let first_success = scan(job(&project_root, first_scope_files, Some(first_snapshot)));
+
+    let mut second_snapshot = projected_snapshot_from_store(&project_root, &paths, ".store-two");
+    second_snapshot.exported_symbols = type_match_fixture_exports(&project_root);
+    let second_outbound = outbound_call_set_bytes(&second_snapshot);
+    let second_scope_files = second_snapshot.files.clone();
+    let second_success = scan(job(
+        &project_root,
+        second_scope_files,
+        Some(second_snapshot),
+    ));
+
+    assert_eq!(
+        first_outbound, second_outbound,
+        "projected outbound-call set must be byte-identical across cold builds"
+    );
+    assert_eq!(
+        first_success.aggregate["count"], second_success.aggregate["count"],
+        "dead-code count must be deterministic across cold builds"
+    );
+
+    assert!(
+        contribution_has_internal_call(
+            &first_success,
+            "src/factory.rs",
+            "src/live_widget.rs",
+            "new",
+            "type_match",
+        ),
+        "qualified type_match constructor edge should project to an existing dead-code node; contributions: {:#?}",
+        first_success.contributions
+    );
+    assert!(
+        !aggregate_has_item(&first_success, "src/live_widget.rs", "new"),
+        "LiveWidget::new is reached only through a type_match edge and must not be dead: {:#}",
+        first_success.aggregate
+    );
+    assert!(
+        aggregate_has_item(&first_success, "src/planted_dead.rs", "orphan_function"),
+        "genuinely-dead pub fn should remain reported: {:#}",
+        first_success.aggregate
+    );
+    assert!(
+        aggregate_has_item(&first_success, "src/planted_dead.rs", "new"),
+        "genuinely-dead constructor should remain reported: {:#}",
+        first_success.aggregate
+    );
 }
 
 #[test]

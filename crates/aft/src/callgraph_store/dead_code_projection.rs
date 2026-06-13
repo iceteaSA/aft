@@ -6,7 +6,10 @@ use std::time::{Duration, SystemTime};
 use crate::inspect::job::{CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot};
 use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
 
-use super::{database_ready, CallGraphStoreError, Result, BACKEND_TREESITTER, TOP_LEVEL_SYMBOL};
+use super::{
+    database_ready, CallGraphStoreError, Result, BACKEND_TREESITTER, PROVENANCE_NAME_MATCH,
+    PROVENANCE_TYPE_MATCH, TOP_LEVEL_SYMBOL,
+};
 
 pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     if !db_path.is_file() {
@@ -233,8 +236,9 @@ fn caller_symbol_from_row(row: &OutboundRow) -> (String, bool) {
 fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
     matches!(status, "resolved" | "resolved_local")
         || provenance.is_some_and(|provenance| {
-            provenance != "name_match"
-                && (provenance.contains("treesitter") || provenance.contains("resolver"))
+            provenance == PROVENANCE_TYPE_MATCH
+                || (provenance != PROVENANCE_NAME_MATCH
+                    && (provenance.contains("treesitter") || provenance.contains("resolver")))
         })
 }
 
@@ -324,6 +328,68 @@ mod tests {
     #[test]
     fn projection_result_is_send() {
         assert_send::<Result<CallgraphSnapshot>>();
+    }
+
+    #[test]
+    fn type_match_constructor_target_is_file_qualified_for_dead_code() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        let source = src_dir.join("lib.rs");
+        let target_source = src_dir.join("other.rs");
+        fs::write(
+            &source,
+            r#"mod other;
+use other::OtherType;
+
+fn run() {
+    let _ = OtherType::new();
+}
+"#,
+        )
+        .expect("write type-match caller fixture");
+        fs::write(
+            &target_source,
+            r#"pub struct OtherType;
+impl OtherType {
+    pub fn new() -> Self { Self }
+}
+"#,
+        )
+        .expect("write type-match constructor fixture");
+
+        let store = CallGraphStore::open(root.join(".store"), root.clone()).expect("open store");
+        store
+            .cold_build(&[source.clone(), target_source.clone()])
+            .expect("cold build type-match constructor fixture");
+        let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        let expected_target = format!(
+            "{}::new",
+            std::fs::canonicalize(&target_source)
+                .expect("canonical target source")
+                .display()
+        );
+        let type_match_calls = snapshot
+            .outbound_calls
+            .iter()
+            .filter(|call| call.provenance == PROVENANCE_TYPE_MATCH)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            type_match_calls.len(),
+            1,
+            "expected one type_match constructor call; calls: {:#?}",
+            snapshot.outbound_calls
+        );
+        assert_eq!(type_match_calls[0].target, expected_target);
+        assert_ne!(type_match_calls[0].target, "new");
+        assert!(
+            !type_match_calls[0].target.ends_with("OtherType::new"),
+            "dead_code nodes use bare symbol names, not scoped method names: {:#?}",
+            type_match_calls[0]
+        );
     }
 
     #[test]
