@@ -280,7 +280,6 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { calls, tools } = createMockHoistedHarness(async (command) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: true };
       throw new Error(`Unexpected command: ${command}`);
@@ -311,7 +310,6 @@ describe("Hoisted tool execute handlers", () => {
 
     const { calls, tools } = createMockHoistedHarness(
       async (command) => {
-        if (command === "apply_patch") return previewResponse();
         if (command === "checkpoint") return { success: true };
         if (command === "write") {
           return {
@@ -487,33 +485,55 @@ describe("Hoisted tool execute handlers", () => {
     expect(calls[0]?.params.preview).toBe(true);
   });
 
-  test("apply_patch approval ask uses the Rust preview diff", async () => {
+  test("apply_patch approval ask uses TS preview diff for add/update/delete/move", async () => {
     tmpDir = await makeTempDir();
     const askCalls: Array<Record<string, unknown>> = [];
     sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
-    await writeFile(resolve(tmpDir, "file.ts"), "old\n");
-    const previewDiff = "Index: file.ts\n--- file.ts\n+++ file.ts\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+    await writeFile(resolve(tmpDir, "updated.ts"), "old update\n");
+    await writeFile(resolve(tmpDir, "deleted.ts"), "delete me\n");
+    await writeFile(resolve(tmpDir, "from.ts"), "move source\n");
+
     const patchText = [
       "*** Begin Patch",
-      "*** Update File: file.ts",
+      "*** Add File: new.ts",
+      "+added line",
+      "*** Update File: updated.ts",
       "@@",
-      "-old",
-      "+new",
+      "-old update",
+      "+new update",
+      "*** Delete File: deleted.ts",
+      "*** Update File: from.ts",
+      "*** Move to: to.ts",
+      "@@",
+      "-move source",
+      "+move dest",
       "*** End Patch",
     ].join("\n");
 
-    const { tools } = createMockHoistedHarness(async (command) => {
-      if (command === "apply_patch") return previewResponse(previewDiff);
+    const { calls, tools } = createMockHoistedHarness(async (command) => {
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: true };
+      if (command === "delete_file") return { success: true };
       throw new Error(`Unexpected command: ${command}`);
     });
 
     await tools.apply_patch.execute({ patchText }, sdkCtx);
 
     const editAsk = askCalls.find((call) => call.permission === "edit");
-    expect(editAsk?.metadata?.filepath).toBe(resolve(tmpDir, "file.ts"));
-    expect(editAsk?.metadata?.diff).toBe(previewDiff);
+    expect(editAsk?.metadata?.filepath).toBe(resolve(tmpDir, "new.ts"));
+    const diff = editAsk?.metadata?.diff as string;
+    expect(diff).toBeTypeOf("string");
+    expect(diff).toContain(`Index: ${resolve(tmpDir, "new.ts")}`);
+    expect(diff).toContain("+added line");
+    expect(diff).toContain(`Index: ${resolve(tmpDir, "updated.ts")}`);
+    expect(diff).toContain("-old update");
+    expect(diff).toContain("+new update");
+    expect(diff).toContain(`Index: ${resolve(tmpDir, "deleted.ts")}`);
+    expect(diff).toContain("-delete me");
+    expect(diff).toContain(`Index: ${resolve(tmpDir, "to.ts")}`);
+    expect(diff).toContain("-move source");
+    expect(diff).toContain("+move dest");
+    expect(calls.some((call) => call.command === "apply_patch")).toBe(false);
   });
 
   test("apply_patch preview errors surface before asking for approval", async () => {
@@ -530,19 +550,15 @@ describe("Hoisted tool execute handlers", () => {
       "*** End Patch",
     ].join("\n");
 
-    const { calls, tools } = createMockHoistedHarness(async (command) => {
-      if (command === "apply_patch")
-        return { success: false, message: "Failed to find expected lines" };
-      throw new Error("real patch should not run after preview failure");
+    const { calls, tools } = createMockHoistedHarness(async (_command) => {
+      throw new Error(`Unexpected command after preview failure: ${_command}`);
     });
 
     await expect(tools.apply_patch.execute({ patchText }, sdkCtx)).rejects.toThrow(
-      "Failed to find expected lines",
+      "Failed to update file.ts",
     );
     expect(askCalls).toHaveLength(0);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.command).toBe("apply_patch");
-    expect(calls[0]?.params.preview).toBe(true);
+    expect(calls).toHaveLength(0);
   });
 
   test("edit throws the Rust error response for failed replacements", async () => {
@@ -600,7 +616,6 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { tools } = createMockHoistedHarness(async (command) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: false, message: "Disk full while writing patch" };
       throw new Error(`Unexpected command: ${command}`);
@@ -634,7 +649,6 @@ describe("Hoisted tool execute handlers", () => {
 
     let deleteFileCalled = false;
     const { tools } = createMockHoistedHarness(async (command) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: false, message: "Disk full writing destination" };
       if (command === "delete_file") {
@@ -937,7 +951,6 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { calls, tools } = createMockHoistedHarness(async (command, params) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
 
       if (command === "write") {
@@ -1021,7 +1034,6 @@ describe("Hoisted tool execute handlers", () => {
 
     let destWritten = false;
     const { calls, tools } = createMockHoistedHarness(async (command, params) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") {
         const file = params.file as string;
@@ -1084,7 +1096,6 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { calls, tools } = createMockHoistedHarness(async (command, params) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") {
         await writeFile(params.file as string, params.content as string);
@@ -1139,7 +1150,6 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") {
         await writeFile(params.file as string, params.content as string);
@@ -1172,19 +1182,15 @@ describe("Hoisted tool execute handlers", () => {
     expect(message).toContain("Both copies may exist or destination content may be changed");
   });
 
-  /// BUG-6a dogfooding repro: the user's exact 3-file complaint. A multi-
-  /// file patch where 2 files patch cleanly and the 3rd hits a fuzzy-match
-  /// drift used to roll back the 2 successes. Now the 2 successes commit
-  /// and only the failed file is reported as failing.
-  test("apply_patch keeps successful files when ONE of three updates fails (user repro)", async () => {
+  test("apply_patch preview stops before approval when ONE of three updates cannot match", async () => {
     tmpDir = await makeTempDir();
-    sdkCtx = createMockSdkContext(tmpDir);
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
 
     const okFile1 = resolve(tmpDir, "cli-program.ts");
     const okFile2 = resolve(tmpDir, "cli-installer.ts");
     const driftFile = resolve(tmpDir, "athena-council-guard.ts");
 
-    // Seed all three files with realistic pre-patch content.
     await writeFile(okFile1, "old line 1\n");
     await writeFile(okFile2, "old line 2\n");
     await writeFile(driftFile, "drifted content that won't match\n");
@@ -1206,43 +1212,19 @@ describe("Hoisted tool execute handlers", () => {
       "*** End Patch",
     ].join("\n");
 
-    const { calls, tools } = createMockHoistedHarness(async (command, params) => {
-      if (command === "apply_patch") return previewResponse();
-      if (command === "checkpoint") return { success: true };
-      if (command === "write") {
-        const file = params.file as string;
-        await writeFile(file, params.content as string);
-        return { success: true };
-      }
-      throw new Error(`Unexpected command: ${command}`);
+    const { calls, tools } = createMockHoistedHarness(async (command) => {
+      throw new Error(`Unexpected bridge command after preview failure: ${command}`);
     });
 
-    const result = text(await tools.apply_patch.execute({ patchText }, sdkCtx));
-
-    expect(result).toContain("Updated cli-program.ts");
-    expect(result).toContain("Updated cli-installer.ts");
-    expect(result).toContain("Failed to update athena-council-guard.ts");
-    expect(result).toContain("Patch partially applied");
-    expect(result).toContain("2 of 3 hunk(s) succeeded");
-    expect(result).toContain("aft_safety");
-
-    // The two successful files must reflect the new content on disk.
-    expect((await import("node:fs/promises")).readFile(okFile1, "utf-8")).resolves.toBe(
-      "new line 1\n",
-    );
-    expect((await import("node:fs/promises")).readFile(okFile2, "utf-8")).resolves.toBe(
-      "new line 2\n",
-    );
-    // The drifted file is unchanged (applyUpdateChunks throws BEFORE write).
-    expect((await import("node:fs/promises")).readFile(driftFile, "utf-8")).resolves.toBe(
-      "drifted content that won't match\n",
+    await expect(tools.apply_patch.execute({ patchText }, sdkCtx)).rejects.toThrow(
+      "Failed to update athena-council-guard.ts",
     );
 
-    // No restore_checkpoint anywhere — that's the whole fix.
-    expect(calls.some((c) => c.command === "restore_checkpoint")).toBe(false);
-    // No delete_file on the successful files — we keep them.
-    expect(calls.some((c) => c.command === "delete_file" && c.params.file === okFile1)).toBe(false);
-    expect(calls.some((c) => c.command === "delete_file" && c.params.file === okFile2)).toBe(false);
+    expect(askCalls).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+    expect(await readFile(okFile1, "utf-8")).toBe("old line 1\n");
+    expect(await readFile(okFile2, "utf-8")).toBe("old line 2\n");
+    expect(await readFile(driftFile, "utf-8")).toBe("drifted content that won't match\n");
   });
 
   // Regression test for the dogfooded report where a single-file patch hit
@@ -1269,7 +1251,6 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { tools } = createMockHoistedHarness(async (command) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: true };
       throw new Error(`Unexpected command: ${command}`);
@@ -1285,8 +1266,7 @@ describe("Hoisted tool execute handlers", () => {
     expect(caught).toBeInstanceOf(Error);
     const message = (caught as Error).message;
     expect(message).toContain("Failed to update src/hooks/index.ts");
-    expect(message).toContain("Patch failed");
-    expect(message).toContain("none of the 1 hunk(s) applied");
+    expect(message).toContain("Failed to find expected lines");
   });
 
   test("read returns binary-file messages without trying to split missing content", async () => {
@@ -1513,7 +1493,6 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { tools } = createMockHoistedHarness(async (command) => {
-      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: true };
       if (command === "delete_file") return { success: true };

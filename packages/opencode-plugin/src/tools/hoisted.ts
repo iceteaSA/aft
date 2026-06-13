@@ -15,7 +15,7 @@ import { coerceStringArray, formatEditSummary } from "@cortexkit/aft-bridge";
 import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
-import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
+import { applyUpdateChunks, type Hunk as PatchHunk, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
 import {
   callBridge,
@@ -377,6 +377,92 @@ function previewDiffFromResponse(data: Record<string, unknown>, filePath: string
   }
 
   return "";
+}
+
+function virtualPatchContent(
+  virtualFiles: Map<string, string | null>,
+  filePath: string,
+): string | null | undefined {
+  return virtualFiles.has(filePath) ? (virtualFiles.get(filePath) ?? null) : undefined;
+}
+
+async function readPatchPreviewContent(
+  virtualFiles: Map<string, string | null>,
+  filePath: string,
+  action: "delete" | "update",
+  patchPath: string,
+): Promise<string> {
+  const virtualContent = virtualPatchContent(virtualFiles, filePath);
+  if (virtualContent !== undefined) {
+    if (virtualContent === null) {
+      throw new Error(`Failed to ${action} ${patchPath}: file not found: ${filePath}`);
+    }
+    return virtualContent;
+  }
+
+  try {
+    return await fs.promises.readFile(filePath, "utf-8");
+  } catch (error) {
+    throw new Error(`Failed to ${action} ${patchPath}: ${formatError(error)}`);
+  }
+}
+
+async function buildApplyPatchPreview(
+  hunks: PatchHunk[],
+  projectRoot: string,
+): Promise<{ filepath: string; diff: string }> {
+  const virtualFiles = new Map<string, string | null>();
+  const patches: string[] = [];
+  let firstFilePath = "";
+
+  for (const hunk of hunks) {
+    const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
+    if (!firstFilePath) firstFilePath = filePath;
+
+    switch (hunk.type) {
+      case "add": {
+        const virtualContent = virtualPatchContent(virtualFiles, filePath);
+        const exists =
+          virtualContent !== undefined ? virtualContent !== null : fs.existsSync(filePath);
+        if (exists) {
+          throw new Error(
+            `Failed to create ${hunk.path}: file already exists. Use *** Update File: to modify, or *** Delete File: first if you want to replace it entirely.`,
+          );
+        }
+        const after = hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`;
+        patches.push(buildUnifiedDiff(filePath, "", after));
+        virtualFiles.set(filePath, after);
+        break;
+      }
+
+      case "delete": {
+        const before = await readPatchPreviewContent(virtualFiles, filePath, "delete", hunk.path);
+        patches.push(buildUnifiedDiff(filePath, before, ""));
+        virtualFiles.set(filePath, null);
+        break;
+      }
+
+      case "update": {
+        const before = await readPatchPreviewContent(virtualFiles, filePath, "update", hunk.path);
+        let after: string;
+        try {
+          after = applyUpdateChunks(before, filePath, hunk.chunks);
+        } catch (error) {
+          throw new Error(`Failed to update ${hunk.path}: ${formatError(error)}`);
+        }
+
+        const targetPath = hunk.move_path
+          ? resolvePathFromProjectRoot(projectRoot, hunk.move_path)
+          : filePath;
+        patches.push(buildUnifiedDiff(targetPath, before, after));
+        if (hunk.move_path) virtualFiles.set(filePath, null);
+        virtualFiles.set(targetPath, after);
+        break;
+      }
+    }
+  }
+
+  return { filepath: firstFilePath || projectRoot, diff: patches.join("\n") };
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,7 +1133,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       if (!patchText) throw new Error("'patchText' is required");
 
       // Parse the patch
-      let hunks: import("../patch-parser.js").Hunk[];
+      let hunks: PatchHunk[];
       try {
         hunks = parsePatch(patchText);
       } catch (e) {
@@ -1103,19 +1189,10 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      const previewData = await callBridge(ctx, context, "apply_patch", {
-        patch_text: patchText,
-        preview: true,
-        include_diff_content: true,
-      });
-      if (previewData.success === false) {
-        throw new Error((previewData.message as string) || "apply_patch preview failed");
-      }
-      const previewFilePath = Array.from(affectedAbs)[0] ?? projectRoot;
-      const previewDiff = previewDiffFromResponse(previewData, previewFilePath);
+      const preview = await buildApplyPatchPreview(hunks, projectRoot);
       const denial = await askEditPermission(context, relPaths, {
-        filepath: previewFilePath,
-        diff: previewDiff,
+        filepath: preview.filepath,
+        diff: preview.diff,
       });
       if (denial) return permissionDeniedResponse(denial);
 
