@@ -251,6 +251,21 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if edit::wants_preview(&req.params) {
+        let mut result = serde_json::json!({
+            "file": file,
+            "symbol": symbol_name,
+            "operation": operation,
+            "range": original_range,
+            "formatted": false,
+        });
+        if source == new_source {
+            result["no_op"] = serde_json::json!(true);
+        }
+        edit::attach_preview_diff(&mut result, &req.params, file, &source, &new_source);
+        return Response::success(&req.id, result);
+    }
+
     // Auto-backup before writing
     let backup_id = match edit::auto_backup(
         ctx,

@@ -164,6 +164,56 @@ pub fn wants_diff_content(params: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Check whether the caller requested an internal, side-effect-free preview.
+///
+/// This is deliberately a wire-only flag used by host integrations before they
+/// ask for edit approval. It is not exposed in any agent-facing tool schema.
+pub fn wants_preview(params: &serde_json::Value) -> bool {
+    params
+        .get("preview")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Build the unified-diff string used by internal permission previews.
+///
+/// The OpenCode approval prompt expects a plain unified-diff string in
+/// `metadata.diff`. Host wrappers may alternatively consume the `diff.before` /
+/// `diff.after` response fields and render their own patch, but returning the
+/// ready-to-display string keeps the bridge contract self-contained.
+pub fn build_unified_diff(file: &str, before: &str, after: &str) -> String {
+    if before == after {
+        return format!(
+            "Index: {file}
+===================================================================
+--- {file}
++++ {file}
+"
+        );
+    }
+
+    let text_diff = similar::TextDiff::from_lines(before, after);
+    let patch = text_diff.unified_diff().header(file, file).to_string();
+    format!(
+        "Index: {file}
+===================================================================
+{patch}"
+    )
+}
+
+/// Attach the standard preview diff fields to a command response payload.
+pub fn attach_preview_diff(
+    result: &mut serde_json::Value,
+    params: &serde_json::Value,
+    file: &str,
+    before: &str,
+    after: &str,
+) {
+    result["preview"] = serde_json::json!(true);
+    result["diff"] = compute_diff_for_response(params, before, after);
+    result["preview_diff"] = serde_json::json!(build_unified_diff(file, before, after));
+}
+
 /// Compute compact diff counts (additions/deletions) without echoing any file
 /// content. This is the agent-facing default — the payload is constant-size
 /// regardless of how large the edited file is.

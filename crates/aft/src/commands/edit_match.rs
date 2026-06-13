@@ -136,6 +136,50 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         Err(resp) => return resp,
     };
 
+    let existed = path.exists();
+
+    if edit::wants_preview(&req.params) {
+        if !create_dirs {
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    return Response::error(
+                        &req.id,
+                        "write_error",
+                        format!(
+                            "edit_match append: failed to open {}: parent directory does not exist",
+                            file
+                        ),
+                    );
+                }
+            }
+        }
+
+        let before_content = if existed {
+            std::fs::read_to_string(path.as_path()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let final_content = format!("{}{}", before_content, append_content);
+        let mut result = serde_json::json!({
+            "ok": true,
+            "file": file,
+            "created": !existed,
+            "bytes_written": append_content.len(),
+            "formatted": false,
+        });
+        if existed && before_content == final_content {
+            result["no_op"] = serde_json::json!(true);
+        }
+        edit::attach_preview_diff(
+            &mut result,
+            &req.params,
+            file,
+            &before_content,
+            &final_content,
+        );
+        return Response::success(&req.id, result);
+    }
+
     if create_dirs {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -149,8 +193,6 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             }
         }
     }
-
-    let existed = path.exists();
     let backup_id = if existed {
         match edit::auto_backup(
             ctx,
@@ -431,6 +473,49 @@ fn handle_glob_edit_match(
                 "edit_match: '{}' not found in any files matching '{}'",
                 match_str, pattern
             ),
+        );
+    }
+
+    if edit::wants_preview(&req.params) {
+        let mut preview_diff = String::new();
+        let mut additions = 0usize;
+        let mut deletions = 0usize;
+        let files = pending
+            .iter()
+            .map(|edit| {
+                let diff = edit::compute_diff_info(&edit.original_source, &edit.new_source);
+                additions += diff.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                deletions += diff.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                preview_diff.push_str(&edit::build_unified_diff(
+                    &edit.file_str,
+                    &edit.original_source,
+                    &edit.new_source,
+                ));
+                if !preview_diff.ends_with('\n') {
+                    preview_diff.push('\n');
+                }
+                serde_json::json!({
+                    "file": edit.file_str,
+                    "replacements": edit.count,
+                    "diff": diff,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "ok": true,
+                "preview": true,
+                "files": files,
+                "total_replacements": total_replacements,
+                "total_files": total_files,
+                "diff": {
+                    "additions": additions,
+                    "deletions": deletions,
+                },
+                "preview_diff": preview_diff,
+            }),
         );
     }
 
@@ -955,24 +1040,6 @@ fn handle_single_file_edit_match(
         );
     }
 
-    // Auto-backup before mutation
-    let label = if replace_all {
-        format!(
-            "edit_match: {} (replace_all x{})",
-            match_str,
-            positions.len()
-        )
-    } else {
-        format!("edit_match: {}", match_str)
-    };
-    let backup_id = match edit::auto_backup(ctx, req.session(), path.as_path(), &label, Some(op_id))
-    {
-        Ok(id) => id,
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
-    };
-
     // Fuzzy passes (rstrip/trim/unicode) are line-based: `find_line_matches`
     // sets the byte range to include the trailing newline after the last
     // matched line, even when the user's `oldString` had no trailing newline.
@@ -1051,6 +1118,37 @@ fn handle_single_file_edit_match(
             },
             1,
         )
+    };
+
+    if edit::wants_preview(&req.params) {
+        let mut result = serde_json::json!({
+            "file": file,
+            "replacements": count,
+            "formatted": false,
+        });
+        if source == new_source {
+            result["no_op"] = serde_json::json!(true);
+        }
+        edit::attach_preview_diff(&mut result, &req.params, file, &source, &new_source);
+        return Response::success(&req.id, result);
+    }
+
+    // Auto-backup before mutation
+    let label = if replace_all {
+        format!(
+            "edit_match: {} (replace_all x{})",
+            match_str,
+            positions.len()
+        )
+    } else {
+        format!("edit_match: {}", match_str)
+    };
+    let backup_id = match edit::auto_backup(ctx, req.session(), path.as_path(), &label, Some(op_id))
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
     };
 
     // Write, format, and validate via shared pipeline

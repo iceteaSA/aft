@@ -89,21 +89,7 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    // Phase 2: Auto-backup once before applying
-    let backup_id = match edit::auto_backup(
-        ctx,
-        req.session(),
-        &path,
-        "batch: pre-batch backup",
-        Some(&op_id),
-    ) {
-        Ok(id) => id,
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
-    };
-
-    // Phase 3: Sort edits by byte_start descending (bottom-to-top) to prevent drift
+    // Phase 2: Sort edits by byte_start descending (bottom-to-top) to prevent drift
     resolved.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
 
     // Phase 3.5: Detect overlapping byte ranges after sort (sorted descending by byte_start)
@@ -136,7 +122,34 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         };
     }
 
-    // Phase 5: Write, format, and validate via shared pipeline
+    if edit::wants_preview(&req.params) {
+        let mut result = serde_json::json!({
+            "file": file,
+            "edits_applied": edits.len(),
+            "formatted": false,
+        });
+        if source == content {
+            result["no_op"] = serde_json::json!(true);
+        }
+        edit::attach_preview_diff(&mut result, &req.params, file, &source, &content);
+        return Response::success(&req.id, result);
+    }
+
+    // Phase 5: Auto-backup once before applying
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "batch: pre-batch backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
+
+    // Phase 6: Write, format, and validate via shared pipeline
     let mut write_result =
         match edit::write_format_validate(&path, &content, &ctx.config(), &req.params) {
             Ok(r) => r,

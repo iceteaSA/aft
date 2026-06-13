@@ -65,6 +65,18 @@ function createMockSdkContext(directory: string): ToolContext {
   };
 }
 
+function recordingAsk(calls: Array<Record<string, unknown>>): ToolContext["ask"] {
+  return (async (input: Record<string, unknown>) => {
+    calls.push(input);
+  }) as unknown as ToolContext["ask"];
+}
+
+function previewResponse(
+  diff = "Index: preview.ts\n--- preview.ts\n+++ preview.ts\n",
+): BridgeResponse {
+  return { success: true, preview: true, preview_diff: diff };
+}
+
 function createMockHoistedHarness(
   sendImpl: (
     command: string,
@@ -217,8 +229,12 @@ describe("Hoisted tool execute handlers", () => {
     expect(result).not.toContain("lsp_diagnostics");
     expect(result).not.toContain("LSP errors detected");
     expect(result).not.toContain("backup_id");
-    expect(calls[0].command).toBe("edit_match");
-    expect(calls[0].params.diagnostics).toBe(false);
+    const previewCall = calls.find((call) => call.params.preview === true);
+    const realCall = calls.find((call) => call.params.preview !== true);
+    expect(previewCall?.command).toBe("edit_match");
+    expect(previewCall?.params.diagnostics).toBeUndefined();
+    expect(realCall?.command).toBe("edit_match");
+    expect(realCall?.params.diagnostics).toBe(false);
   });
 
   test("edit surfaces LSP payload when diagnostics_on_edit is configured", async () => {
@@ -244,7 +260,8 @@ describe("Hoisted tool execute handlers", () => {
 
     // Headline is the compact summary; LSP errors are appended below it.
     expect(result.split("\n\n")[0]).toBe("Edited (+0/-0).");
-    expect(calls[0].params.diagnostics).toBe(true);
+    const realCall = calls.find((call) => call.params.preview !== true);
+    expect(realCall?.params.diagnostics).toBe(true);
     expect(result).toContain("Line 3: Missing import");
   });
 
@@ -263,6 +280,7 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { calls, tools } = createMockHoistedHarness(async (command) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: true };
       throw new Error(`Unexpected command: ${command}`);
@@ -293,6 +311,7 @@ describe("Hoisted tool execute handlers", () => {
 
     const { calls, tools } = createMockHoistedHarness(
       async (command) => {
+        if (command === "apply_patch") return previewResponse();
         if (command === "checkpoint") return { success: true };
         if (command === "write") {
           return {
@@ -331,7 +350,199 @@ describe("Hoisted tool execute handlers", () => {
       prefixedTools.aft_apply_patch,
     ]) {
       expect(toolDef.args.diagnostics).toBeUndefined();
+      expect(toolDef.args.preview).toBeUndefined();
+      expect(toolDef.args.dryRun).toBeUndefined();
     }
+  });
+
+  test("write approval ask includes unified diff metadata for existing changes", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+    await writeFile(resolve(tmpDir, "src.ts"), "export const value = 1;\n");
+
+    const { tools } = createMockHoistedHarness(async () => ({ success: true, created: false }));
+
+    await tools.write.execute({ filePath: "src.ts", content: "export const value = 2;\n" }, sdkCtx);
+
+    const editAsk = askCalls.find((call) => call.permission === "edit");
+    expect(editAsk?.metadata?.filepath).toBe(resolve(tmpDir, "src.ts"));
+    expect(editAsk?.metadata?.diff).toBeTypeOf("string");
+    const diff = editAsk?.metadata?.diff as string;
+    expect(diff).toContain("--- ");
+    expect(diff).toContain("-export const value = 1;");
+    expect(diff).toContain("+export const value = 2;");
+  });
+
+  test("write approval ask includes all-additions diff metadata for a new file", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+
+    const { tools } = createMockHoistedHarness(async () => ({ success: true, created: true }));
+
+    await tools.write.execute(
+      { filePath: "new.ts", content: "export const fresh = true;\n" },
+      sdkCtx,
+    );
+
+    const editAsk = askCalls.find((call) => call.permission === "edit");
+    expect(editAsk?.metadata?.filepath).toBe(resolve(tmpDir, "new.ts"));
+    const diff = editAsk?.metadata?.diff as string;
+    expect(diff).toBeTypeOf("string");
+    expect(diff).toContain("+export const fresh = true;");
+    expect(diff).not.toContain("-export const fresh = true;");
+  });
+
+  test("edit oldString approval ask uses the Rust preview diff", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+
+    const { tools } = createMockHoistedHarness(async (_command, params) => {
+      if (params.preview === true) {
+        return {
+          success: true,
+          diff: { before: "const value = 1;\n", after: "const value = 2;\n" },
+        };
+      }
+      return { success: true, replacements: 1 };
+    });
+
+    await tools.edit.execute({ filePath: "src.ts", oldString: "1", newString: "2" }, sdkCtx);
+
+    const diff = askCalls.find((call) => call.permission === "edit")?.metadata?.diff as string;
+    expect(diff).toContain("-const value = 1;");
+    expect(diff).toContain("+const value = 2;");
+  });
+
+  test("edit symbol approval ask uses the Rust preview diff", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+    const previewDiff =
+      "Index: symbol.ts\n--- symbol.ts\n+++ symbol.ts\n@@ -1,1 +1,1 @@\n-export function oldName() {}\n+export function newName() {}\n";
+
+    const { calls, tools } = createMockHoistedHarness(async (command, params) => {
+      expect(command).toBe("edit_symbol");
+      if (params.preview === true) return previewResponse(previewDiff);
+      return {
+        success: true,
+        symbol: "oldName",
+        operation: "replace",
+        diff: { additions: 1, deletions: 1 },
+      };
+    });
+
+    await tools.edit.execute(
+      { filePath: "symbol.ts", symbol: "oldName", content: "export function newName() {}\n" },
+      sdkCtx,
+    );
+
+    expect(calls[0]?.params.preview).toBe(true);
+    const diff = askCalls.find((call) => call.permission === "edit")?.metadata?.diff as string;
+    expect(diff).toBe(previewDiff);
+  });
+
+  test("edit batch approval ask uses the Rust preview diff", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+    const previewDiff =
+      "Index: batch.ts\n--- batch.ts\n+++ batch.ts\n@@ -1,2 +1,2 @@\n-before\n+after\n";
+
+    const { tools } = createMockHoistedHarness(async (command, params) => {
+      expect(command).toBe("batch");
+      if (params.preview === true) return previewResponse(previewDiff);
+      return { success: true, edits_applied: 1 };
+    });
+
+    await tools.edit.execute(
+      { filePath: "batch.ts", edits: [{ oldString: "before", newString: "after" }] },
+      sdkCtx,
+    );
+
+    const diff = askCalls.find((call) => call.permission === "edit")?.metadata?.diff as string;
+    expect(diff).toBe(previewDiff);
+  });
+
+  test("edit preview errors surface before asking for approval", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+
+    const { calls, tools } = createMockHoistedHarness(async (_command, params) => {
+      if (params.preview === true) return { success: false, message: "match_not_found" };
+      throw new Error("real edit should not run after preview failure");
+    });
+
+    await expect(
+      tools.edit.execute(
+        { filePath: "missing.ts", oldString: "before", newString: "after" },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("match_not_found");
+    expect(askCalls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.params.preview).toBe(true);
+  });
+
+  test("apply_patch approval ask uses the Rust preview diff", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+    await writeFile(resolve(tmpDir, "file.ts"), "old\n");
+    const previewDiff = "Index: file.ts\n--- file.ts\n+++ file.ts\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: file.ts",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+
+    const { tools } = createMockHoistedHarness(async (command) => {
+      if (command === "apply_patch") return previewResponse(previewDiff);
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") return { success: true };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    await tools.apply_patch.execute({ patchText }, sdkCtx);
+
+    const editAsk = askCalls.find((call) => call.permission === "edit");
+    expect(editAsk?.metadata?.filepath).toBe(resolve(tmpDir, "file.ts"));
+    expect(editAsk?.metadata?.diff).toBe(previewDiff);
+  });
+
+  test("apply_patch preview errors surface before asking for approval", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+    await writeFile(resolve(tmpDir, "file.ts"), "actual\n");
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: file.ts",
+      "@@",
+      "-expected",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+
+    const { calls, tools } = createMockHoistedHarness(async (command) => {
+      if (command === "apply_patch")
+        return { success: false, message: "Failed to find expected lines" };
+      throw new Error("real patch should not run after preview failure");
+    });
+
+    await expect(tools.apply_patch.execute({ patchText }, sdkCtx)).rejects.toThrow(
+      "Failed to find expected lines",
+    );
+    expect(askCalls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.command).toBe("apply_patch");
+    expect(calls[0]?.params.preview).toBe(true);
   });
 
   test("edit throws the Rust error response for failed replacements", async () => {
@@ -389,6 +600,7 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { tools } = createMockHoistedHarness(async (command) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: false, message: "Disk full while writing patch" };
       throw new Error(`Unexpected command: ${command}`);
@@ -422,6 +634,7 @@ describe("Hoisted tool execute handlers", () => {
 
     let deleteFileCalled = false;
     const { tools } = createMockHoistedHarness(async (command) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: false, message: "Disk full writing destination" };
       if (command === "delete_file") {
@@ -575,8 +788,17 @@ describe("Hoisted tool execute handlers", () => {
 
     // 2 edits applied, no diff in the mock -> counts default to 0.
     expect(result).toBe("Edited (+0/-0, 2 edits).");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toEqual({
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({
+      command: "batch",
+      params: {
+        file: resolve(tmpDir, "batch.ts"),
+        preview: true,
+        include_diff_content: true,
+        session_id: "test",
+      },
+    });
+    expect(calls[1]).toEqual({
       command: "batch",
       params: {
         file: resolve(tmpDir, "batch.ts"),
@@ -637,8 +859,20 @@ describe("Hoisted tool execute handlers", () => {
 
     // replaceAll with 3 replacements -> count surfaced; no diff -> +0/-0.
     expect(result).toBe("Edited (+0/-0, 3 replacements).");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toEqual({
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({
+      command: "edit_match",
+      params: {
+        file: resolve(tmpDir, "repeated.ts"),
+        match: "oldName",
+        replacement: "newName",
+        replace_all: true,
+        preview: true,
+        include_diff_content: true,
+        session_id: "test",
+      },
+    });
+    expect(calls[1]).toEqual({
       command: "edit_match",
       params: {
         file: resolve(tmpDir, "repeated.ts"),
@@ -703,6 +937,7 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { calls, tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
 
       if (command === "write") {
@@ -786,6 +1021,7 @@ describe("Hoisted tool execute handlers", () => {
 
     let destWritten = false;
     const { calls, tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") {
         const file = params.file as string;
@@ -848,6 +1084,7 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { calls, tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") {
         await writeFile(params.file as string, params.content as string);
@@ -902,6 +1139,7 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") {
         await writeFile(params.file as string, params.content as string);
@@ -969,6 +1207,7 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { calls, tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") {
         const file = params.file as string;
@@ -1030,6 +1269,7 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { tools } = createMockHoistedHarness(async (command) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: true };
       throw new Error(`Unexpected command: ${command}`);
@@ -1273,6 +1513,7 @@ describe("Hoisted tool execute handlers", () => {
     ].join("\n");
 
     const { tools } = createMockHoistedHarness(async (command) => {
+      if (command === "apply_patch") return previewResponse();
       if (command === "checkpoint") return { success: true };
       if (command === "write") return { success: true };
       if (command === "delete_file") return { success: true };

@@ -342,13 +342,14 @@ EOF
     expect(response.format_skipped_reason).toBe("error");
   });
 
-  test("partial patch failure: successful Add gets formatted, failed Update does not", async () => {
+  test("patch preview failure does not format or apply earlier hunks", async () => {
     const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
     await writeFile(h.path("target.ts"), "export const target = 1;\n", "utf8");
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+    await expect(
+      tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Add File: ok.ts
 +export    const   ok   = 1;
 *** Update File: target.ts
@@ -356,14 +357,12 @@ EOF
 -export const missing = 1;
 +export    const   target   = 2;
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("Failed to update target.ts");
 
-    expect(toolResultText(output)).toContain("Created ok.ts");
-    expect(toolResultText(output)).toContain("Failed to update target.ts");
-    expect(toolResultText(output)).toContain("Patch partially applied");
-    expect(await readTextFile(h.path("ok.ts"))).toBe("export const ok = 1;\n");
+    await expect(readTextFile(h.path("ok.ts"))).rejects.toThrow();
     expect(await readTextFile(h.path("target.ts"))).toBe("export const target = 1;\n");
   });
 
@@ -383,7 +382,7 @@ EOF
         },
         sdkCtx,
       ),
-    ).rejects.toThrow("Patch failed");
+    ).rejects.toThrow("Failed to update unchanged.ts");
     expect(await readTextFile(h.path("unchanged.ts"))).toBe("export    const   unchanged   = 1;\n");
   });
 

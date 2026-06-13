@@ -79,6 +79,7 @@ mod outline_zoom_test;
 mod parser_audit_fixes_test;
 mod parser_test;
 mod pascal_test;
+mod preview_diff_test;
 mod protocol_test;
 mod query_shape_test;
 mod r_test;

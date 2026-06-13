@@ -27,6 +27,7 @@ import { createBashKillTool, createBashStatusTool, createBashTool } from "./bash
 import { createBashWatchTool } from "./bash_watch.js";
 import { createBashWriteTool } from "./bash_write.js";
 import {
+  askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
   runAsk,
@@ -350,6 +351,34 @@ function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
   return ctx.config.lsp?.diagnostics_on_edit ?? false;
 }
 
+async function readCurrentFileForPreview(filePath: string): Promise<string> {
+  try {
+    return await fs.promises.readFile(filePath, "utf-8");
+  } catch (error) {
+    if (
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { code?: string }).code === "ENOENT"
+    ) {
+      return "";
+    }
+    throw error;
+  }
+}
+
+function previewDiffFromResponse(data: Record<string, unknown>, filePath: string): string {
+  const previewDiff = data.preview_diff;
+  if (typeof previewDiff === "string") return previewDiff;
+
+  const diff = data.diff as { before?: unknown; after?: unknown } | undefined;
+  if (typeof diff?.before === "string" && typeof diff.after === "string") {
+    return buildUnifiedDiff(filePath, diff.before, diff.after);
+  }
+
+  return "";
+}
+
 // ---------------------------------------------------------------------------
 // Tool descriptions focus on behavior, modes, and return values.
 // Parameter docs live in Zod .describe() and reach the LLM via JSON Schema.
@@ -563,15 +592,14 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         if (denial) return permissionDeniedResponse(denial);
       }
 
-      // Permission check
-      await runAsk(
-        context.ask({
-          permission: "edit",
-          patterns: [relPath],
-          always: ["*"],
-          metadata: { filepath: filePath },
-        }),
-      );
+      const currentContent = await readCurrentFileForPreview(filePath);
+      const previewDiff = buildUnifiedDiff(filePath, currentContent, content);
+
+      const denial = await askEditPermission(context, [relPath], {
+        filepath: filePath,
+        diff: previewDiff,
+      });
+      if (denial) return permissionDeniedResponse(denial);
 
       const data = await callBridge(ctx, context, "write", {
         file: filePath,
@@ -780,15 +808,6 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         if (denial) return permissionDeniedResponse(denial);
       }
 
-      await runAsk(
-        context.ask({
-          permission: "edit",
-          patterns: [relPath],
-          always: ["*"],
-          metadata: { filepath: filePath },
-        }),
-      );
-
       const params: Record<string, unknown> = { file: filePath };
 
       // Route to appropriate Rust command
@@ -844,6 +863,22 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
             : " Provide 'oldString' (+ optional 'newString'), 'symbol' + 'content', or an 'edits' array.";
         throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
       }
+
+      const previewData = await callBridge(ctx, context, command, {
+        ...params,
+        preview: true,
+        include_diff_content: true,
+      });
+      if (previewData.success === false) {
+        throw new Error((previewData.message as string) || "edit preview failed");
+      }
+
+      const previewDiff = previewDiffFromResponse(previewData, filePath);
+      const denial = await askEditPermission(context, [relPath], {
+        filepath: filePath,
+        diff: previewDiff,
+      });
+      if (denial) return permissionDeniedResponse(denial);
 
       params.diagnostics = diagnosticsOnEditDefault(ctx);
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
@@ -1068,14 +1103,21 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      await runAsk(
-        context.ask({
-          permission: "edit",
-          patterns: relPaths,
-          always: ["*"],
-          metadata: {},
-        }),
-      );
+      const previewData = await callBridge(ctx, context, "apply_patch", {
+        patch_text: patchText,
+        preview: true,
+        include_diff_content: true,
+      });
+      if (previewData.success === false) {
+        throw new Error((previewData.message as string) || "apply_patch preview failed");
+      }
+      const previewFilePath = Array.from(affectedAbs)[0] ?? projectRoot;
+      const previewDiff = previewDiffFromResponse(previewData, previewFilePath);
+      const denial = await askEditPermission(context, relPaths, {
+        filepath: previewFilePath,
+        diff: previewDiff,
+      });
+      if (denial) return permissionDeniedResponse(denial);
 
       // Pre-patch checkpoint covers files that exist pre-patch (so the
       // agent can `aft_safety` undo if they want to abort after seeing a
@@ -1769,14 +1811,17 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
             if (denial) return permissionDeniedResponse(denial);
           }
 
-          await runAsk(
-            context.ask({
-              permission: "edit",
-              patterns: [relPath],
-              always: ["*"],
-              metadata: { filepath: filePath },
-            }),
+          const currentContent = await readCurrentFileForPreview(filePath);
+          const previewDiff = buildUnifiedDiff(
+            filePath,
+            currentContent,
+            normalizedArgs.content as string,
           );
+          const denial = await askEditPermission(context, [relPath], {
+            filepath: filePath,
+            diff: previewDiff,
+          });
+          if (denial) return permissionDeniedResponse(denial);
           const writeParams: Record<string, unknown> = {
             file: filePath,
             content: normalizedArgs.content as string,

@@ -172,14 +172,16 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
     }
   });
 
-  test("add hunk to existing path should fail without rolling back unrelated successful file", async () => {
+  test("add hunk to existing path fails during preview without applying earlier hunks", async () => {
     const { h, tools, sdkCtx } = await toolHarness();
     await writeFile(h.path("kept.txt"), "before\n", "utf8");
     await writeFile(h.path("exists.txt"), "already here\n", "utf8");
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+    let caught: unknown;
+    try {
+      await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Update File: kept.txt
 @@
 -before
@@ -187,14 +189,16 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
 *** Add File: exists.txt
 +new content
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
+    } catch (e) {
+      caught = e;
+    }
 
-    expect(toolResultText(output)).toContain("Updated kept.txt");
-    expect(toolResultText(output)).toContain("Failed to create exists.txt");
-    expect(toolResultText(output)).toContain("Patch partially applied");
-    expect(await readTextFile(h.path("kept.txt"))).toBe("after\n");
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("Failed to create exists.txt");
+    expect(await readTextFile(h.path("kept.txt"))).toBe("before\n");
     expect(await readTextFile(h.path("exists.txt"))).toBe("already here\n");
   });
 });
