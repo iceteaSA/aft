@@ -41,6 +41,19 @@ function extractHint(response: Record<string, unknown>): string | null {
   return typeof hint === "string" && hint.length > 0 ? hint : null;
 }
 
+type SkippedFile = { file?: string; reason?: string };
+
+function appendSkippedFiles(output: string, skippedFiles: SkippedFile[] | undefined): string {
+  if (!skippedFiles || skippedFiles.length === 0) return output;
+
+  const lines = skippedFiles.map((skipped) => {
+    const file = skipped.file ?? "unknown";
+    const reason = skipped.reason ?? "unknown reason";
+    return `  ${file}: ${reason}`;
+  });
+  return `${output}\n\nIncomplete: skipped ${skippedFiles.length} file(s)\n${lines.join("\n")}`;
+}
+
 async function resolveAstPaths(
   ctx: PluginContext,
   context: Parameters<ToolDefinition["execute"]>[1],
@@ -76,16 +89,17 @@ const SUPPORTED_LANGS = [
   "rust",
   "go",
   "pascal",
+  "r",
 ] as const;
 
 export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const searchTool: ToolDefinition = {
     description:
-      "Search code patterns across filesystem using AST-aware matching. Supports 7 languages.\n\n" +
+      "Search code patterns across filesystem using AST-aware matching. Supports 8 languages.\n\n" +
       "Use meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n" +
       "For functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\n" +
-      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal'",
+      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r'",
     args: {
       pattern: z
         .string()
@@ -131,6 +145,8 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         total_matches?: number;
         files_with_matches?: number;
         files_searched?: number;
+        complete?: boolean;
+        skipped_files?: SkippedFile[];
         no_files_matched_scope?: boolean;
         scope_warnings?: string[];
       };
@@ -179,6 +195,10 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
             output += "\n";
           }
         }
+      }
+
+      if (data.complete === false || (data.skipped_files?.length ?? 0) > 0) {
+        output = appendSkippedFiles(output, data.skipped_files);
       }
 
       // Show output in UI

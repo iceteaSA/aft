@@ -1,6 +1,6 @@
 /**
  * ast_grep_search + ast_grep_replace — AST-aware pattern search/rewrite.
- * 7 languages: typescript, tsx, javascript, python, rust, go, pascal.
+ * 8 languages: typescript, tsx, javascript, python, rust, go, pascal, r.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -32,7 +32,7 @@ import {
 } from "./render-helpers.js";
 
 const AstLang = StringEnum(
-  ["typescript", "tsx", "javascript", "python", "rust", "go", "pascal"] as const,
+  ["typescript", "tsx", "javascript", "python", "rust", "go", "pascal", "r"] as const,
   {
     description: "Target language",
   },

@@ -970,11 +970,6 @@ function scheduleWake(
   state.debounceTimer.unref?.();
 }
 
-function _getSessionState(sessionID: string | undefined): SessionBgState | undefined {
-  cleanupIdleSessionStates(Date.now());
-  return sessionBgStates.get(sessionID || DEFAULT_SESSION_ID);
-}
-
 function stateFor(sessionID: string | undefined): SessionBgState {
   const now = Date.now();
   cleanupIdleSessionStates(now);

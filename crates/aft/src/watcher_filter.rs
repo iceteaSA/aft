@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -81,27 +81,6 @@ impl Drop for WatcherThreadHandle {
     fn drop(&mut self) {
         self.request_shutdown();
     }
-}
-
-struct ActiveWatcherThreadGuard;
-
-static ACTIVE_WATCHER_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-impl ActiveWatcherThreadGuard {
-    fn new() -> Self {
-        ACTIVE_WATCHER_THREADS.fetch_add(1, Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for ActiveWatcherThreadGuard {
-    fn drop(&mut self) {
-        ACTIVE_WATCHER_THREADS.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-pub fn active_watcher_thread_count_for_test() -> usize {
-    ACTIVE_WATCHER_THREADS.load(Ordering::SeqCst)
 }
 
 pub fn watcher_dispatch_channel() -> (Sender<WatcherDispatchEvent>, Receiver<WatcherDispatchEvent>)
@@ -281,7 +260,6 @@ pub fn run_watcher_thread<W, E, F>(
     E: std::fmt::Display,
     F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>,
 {
-    let _active_guard = ActiveWatcherThreadGuard::new();
     let (raw_tx, raw_rx) = mpsc::channel();
     let root_path = config.project_root.clone();
     match attach(root_path.clone(), extra_watch_paths, raw_tx) {

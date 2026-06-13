@@ -706,6 +706,75 @@ fn ast_search_and_replace_report_empty_results_for_valid_patterns() {
     assert!(status.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn ast_search_reports_unreadable_files_as_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = setup_project(&[("locked.ts", "console.log(value);\n")]);
+    let locked = project.path().join("locked.ts");
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let mut perms = fs::metadata(&locked).expect("metadata").permissions();
+    perms.set_mode(0o000);
+    fs::set_permissions(&locked, perms).expect("make fixture unreadable");
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "unreadable-search",
+            "command": "ast_search",
+            "pattern": "console.log($ARG)",
+            "lang": "typescript",
+            "paths": [locked.display().to_string()],
+        }),
+    );
+
+    let mut restore = fs::metadata(&locked)
+        .expect("metadata after search")
+        .permissions();
+    restore.set_mode(0o600);
+    fs::set_permissions(&locked, restore).expect("restore fixture permissions");
+
+    assert_eq!(
+        search["success"], true,
+        "ast_search should succeed: {search:?}"
+    );
+    assert_eq!(
+        search["complete"], false,
+        "skipped file should make response incomplete: {search:?}"
+    );
+    assert_eq!(search["total_matches"], 0);
+    assert_eq!(search["files_searched"], 0);
+    let skipped = search["skipped_files"]
+        .as_array()
+        .expect("skipped_files array");
+    assert_eq!(
+        skipped.len(),
+        1,
+        "one unreadable file should be skipped: {search:?}"
+    );
+    assert!(
+        skipped[0]["file"]
+            .as_str()
+            .expect("skipped file")
+            .replace('\\', "/")
+            .ends_with("locked.ts"),
+        "skipped file should name locked.ts: {search:?}"
+    );
+    assert!(
+        skipped[0]["reason"]
+            .as_str()
+            .expect("skip reason")
+            .contains("read_error"),
+        "skip reason should report read error: {search:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn ast_search_and_replace_reject_nonexistent_paths() {
     let project = setup_project(&[("sample.ts", "console.log(value);\n")]);

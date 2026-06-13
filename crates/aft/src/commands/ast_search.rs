@@ -20,7 +20,7 @@ use crate::protocol::{RawRequest, Response};
 ///   - `globs` (string[], optional) — include/exclude glob filters; prefix `!` to exclude
 ///   - `context` (integer, optional) — lines of context around each match (default: 0)
 ///
-/// Returns: `{ matches: [{ file, line, column, text, meta_variables, context? }], total_matches, files_with_matches, files_searched }`
+/// Returns: `{ matches: [{ file, line, column, text, meta_variables, context? }], total_matches, files_with_matches, files_searched, complete, skipped_files }`
 pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
@@ -137,38 +137,59 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
                     "files_searched": 0,
                     "no_files_matched_scope": scope.no_files_matched_scope,
                     "scope_warnings": scope.scope_warnings,
+                    "complete": true,
+                    "skipped_files": [],
                 }),
             );
         }
     };
 
     use rayon::prelude::*;
-    let per_file: Vec<(usize, Vec<serde_json::Value>)> = scope
+    let per_file: Vec<(usize, Vec<serde_json::Value>, Option<serde_json::Value>)> = scope
         .files
         .par_iter()
         .map(|file_path| {
             let source = match std::fs::read_to_string(file_path) {
                 Ok(s) => s,
-                Err(_) => return (0usize, Vec::new()),
+                Err(err) => {
+                    return (
+                        0usize,
+                        Vec::new(),
+                        Some(serde_json::json!({
+                            "file": file_path.display().to_string(),
+                            "reason": format!("read_error: {err}"),
+                        })),
+                    );
+                }
             };
             let matches =
                 search_file_compiled(&source, file_path, &compiled_pattern, &lang, context_lines);
-            (1usize, matches)
+            (1usize, matches, None)
         })
         .collect();
 
     let mut all_matches: Vec<serde_json::Value> = Vec::new();
+    let mut skipped_files: Vec<serde_json::Value> = Vec::new();
     let mut files_searched: usize = 0;
     let mut files_with_matches: usize = 0;
-    for (counted, matches) in per_file {
+    for (counted, matches, skipped) in per_file {
         files_searched += counted;
         if !matches.is_empty() {
             files_with_matches += 1;
         }
         all_matches.extend(matches);
+        if let Some(skipped) = skipped {
+            skipped_files.push(skipped);
+        }
     }
+    skipped_files.sort_by(|a, b| {
+        let a_file = a.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let b_file = b.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        a_file.cmp(b_file)
+    });
 
     let total_matches = all_matches.len();
+    let complete = skipped_files.is_empty();
 
     let mut payload = serde_json::json!({
         "matches": all_matches,
@@ -177,6 +198,8 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         "files_searched": files_searched,
         "no_files_matched_scope": scope.no_files_matched_scope,
         "scope_warnings": scope.scope_warnings,
+        "complete": complete,
+        "skipped_files": skipped_files,
     });
 
     // When the search succeeded but matched zero AST nodes, attach a hint if

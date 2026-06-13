@@ -214,10 +214,7 @@ pub fn attach_preview_diff(
     result["preview_diff"] = serde_json::json!(build_unified_diff(file, before, after));
 }
 
-/// Compute compact diff counts (additions/deletions) without echoing any file
-/// content. This is the agent-facing default — the payload is constant-size
-/// regardless of how large the edited file is.
-pub fn compute_diff_counts(before: &str, after: &str) -> serde_json::Value {
+fn diff_counts(before: &str, after: &str) -> (usize, usize) {
     use similar::ChangeTag;
 
     let diff = similar::TextDiff::from_lines(before, after);
@@ -230,6 +227,14 @@ pub fn compute_diff_counts(before: &str, after: &str) -> serde_json::Value {
             ChangeTag::Equal => {}
         }
     }
+    (additions, deletions)
+}
+
+/// Compute compact diff counts (additions/deletions) without echoing any file
+/// content. This is the agent-facing default — the payload is constant-size
+/// regardless of how large the edited file is.
+pub fn compute_diff_counts(before: &str, after: &str) -> serde_json::Value {
+    let (additions, deletions) = diff_counts(before, after);
     serde_json::json!({
         "additions": additions,
         "deletions": deletions,
@@ -257,18 +262,7 @@ pub fn compute_diff_for_response(
 /// Returns a JSON value with before, after, additions, deletions.
 /// For files >512KB, omits full content and returns only counts.
 pub fn compute_diff_info(before: &str, after: &str) -> serde_json::Value {
-    use similar::ChangeTag;
-
-    let diff = similar::TextDiff::from_lines(before, after);
-    let mut additions = 0usize;
-    let mut deletions = 0usize;
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => additions += 1,
-            ChangeTag::Delete => deletions += 1,
-            ChangeTag::Equal => {}
-        }
-    }
+    let (additions, deletions) = diff_counts(before, after);
 
     // For large files, skip sending full content to avoid bloating JSON
     let size_limit = 512 * 1024; // 512KB
