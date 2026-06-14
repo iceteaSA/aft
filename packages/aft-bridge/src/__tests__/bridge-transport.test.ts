@@ -220,6 +220,100 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
+  test("custom hangThreshold delays bridge kill until threshold silent timeouts", async () => {
+    const script = writeExecutable(
+      "hang-threshold-five.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+function writeFrame(frame) {
+  process.stdout.write(JSON.stringify(frame) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      writeFrame({ id: req.id, success: true, warnings: [] });
+    } else if (req.command === "sibling") {
+      setTimeout(() => writeFrame({ id: req.id, success: true, command: req.command }), 80);
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, {
+      timeoutMs: 1_000,
+      hangThreshold: 5,
+      maxRestarts: 0,
+    });
+
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+
+      for (let i = 0; i < 4; i++) {
+        const msg = await bridge.send(`silent-${i}`, {}, { timeoutMs: 25 }).then(
+          () => "resolved",
+          (err) => String(err instanceof Error ? err.message : err),
+        );
+        expect(msg).toContain("bridge kept warm");
+        expect(bridge.isAlive()).toBe(true);
+      }
+
+      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 500 }).then(
+        (response) => String(response.command),
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+      expect(await siblingResult).toBe("sibling");
+      expect(bridge.isAlive()).toBe(true);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("custom timeoutMs is used as default per-request transport budget", async () => {
+    const script = writeExecutable(
+      "slow-ping.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+function writeFrame(frame) {
+  process.stdout.write(JSON.stringify(frame) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      writeFrame({ id: req.id, success: true, warnings: [] });
+    } else if (req.command === "ping") {
+      setTimeout(() => writeFrame({ id: req.id, success: true, command: "ping" }), 120);
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 80, maxRestarts: 0 });
+
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      const fastFail = await bridge.send("ping", {}).then(
+        () => "resolved",
+        (err) => String(err instanceof Error ? err.message : err),
+      );
+      expect(fastFail).toMatch(/timed out after 80ms/);
+      expect(bridge.isAlive()).toBe(true);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
   test("successful response between timeouts resets hang escalation", async () => {
     const script = writeExecutable(
       "timeout-reset.js",

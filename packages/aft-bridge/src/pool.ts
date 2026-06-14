@@ -142,6 +142,7 @@ export class BridgePool {
     this.projectConfigLoader = options.projectConfigLoader;
     this.bridgeOptions = {
       timeoutMs: options.timeoutMs,
+      hangThreshold: options.hangThreshold,
       maxRestarts: options.maxRestarts,
       minVersion: options.minVersion,
       onVersionMismatch: options.onVersionMismatch,

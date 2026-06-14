@@ -450,6 +450,25 @@
       "additionalProperties": false,
       "description": "External semantic backend configuration for embedding and retrieval."
     },
+    "bridge": {
+      "type": "object",
+      "properties": {
+        "request_timeout_ms": {
+          "type": "integer",
+          "minimum": 1000,
+          "default": 30000,
+          "description": "Per-request bridge transport timeout in milliseconds. Default 30000. Raise on slow filesystems (WSL/DrvFs/NFS) where cold aft operations exceed the default."
+        },
+        "hang_threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2,
+          "description": "Consecutive silent request timeouts before the shared bridge process is killed and respawned (aborting all pending requests). Default 2. Raise when many editor windows share one bridge."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Shared NDJSON bridge transport tuning (OpenCode and Pi). User and project configs merge; project overrides user per field."
+    },
     "max_callgraph_files": {
       "type": "integer",
       "minimum": 1,
