@@ -1117,13 +1117,40 @@ fn update_resolver_config_fingerprint_hash(
     Ok(())
 }
 
+struct ResolverConfigDependency {
+    path: PathBuf,
+    follow_extends: bool,
+}
+
+impl ResolverConfigDependency {
+    fn resolver_config(path: PathBuf) -> Self {
+        Self {
+            path,
+            follow_extends: true,
+        }
+    }
+
+    fn hashed_file(path: PathBuf) -> Self {
+        Self {
+            path,
+            follow_extends: false,
+        }
+    }
+}
+
 fn collect_resolver_config_dependency_files(project_root: &Path) -> BTreeSet<PathBuf> {
     let mut configs = walk_resolver_config_files(project_root);
     let mut pending = configs.iter().cloned().collect::<Vec<_>>();
+    let mut queued = configs.clone();
     while let Some(config) = pending.pop() {
-        for extended in resolver_config_extends_targets(&config, project_root) {
-            if configs.insert(extended.clone()) {
-                pending.push(extended);
+        for dependency in resolver_config_extends_targets(&config, project_root) {
+            let ResolverConfigDependency {
+                path,
+                follow_extends,
+            } = dependency;
+            configs.insert(path.clone());
+            if follow_extends && queued.insert(path.clone()) {
+                pending.push(path);
             }
         }
     }
@@ -1184,7 +1211,10 @@ fn is_resolver_config_file_name(name: &str) -> bool {
             && name.ends_with(".json"))
 }
 
-fn resolver_config_extends_targets(config: &Path, project_root: &Path) -> Vec<PathBuf> {
+fn resolver_config_extends_targets(
+    config: &Path,
+    project_root: &Path,
+) -> Vec<ResolverConfigDependency> {
     let Ok(source) = fs::read_to_string(config) else {
         return Vec::new();
     };
@@ -1196,7 +1226,7 @@ fn resolver_config_extends_targets(config: &Path, project_root: &Path) -> Vec<Pa
     collect_extends_specs(value.get("extends"), &mut specs);
     specs
         .into_iter()
-        .filter_map(|spec| resolve_resolver_config_extends(config, project_root, spec))
+        .flat_map(|spec| resolve_resolver_config_extends(config, project_root, spec))
         .collect()
 }
 
@@ -1331,36 +1361,105 @@ fn resolve_resolver_config_extends(
     config: &Path,
     project_root: &Path,
     spec: &str,
-) -> Option<PathBuf> {
+) -> Vec<ResolverConfigDependency> {
     let config_dir = config.parent().unwrap_or(project_root);
     let spec_path = Path::new(spec);
-    let candidates = if spec_path.is_absolute() || spec.starts_with('.') {
-        resolver_config_extends_candidates(&config_dir.join(spec_path))
-    } else {
-        node_modules_resolver_config_candidates(config_dir, project_root, spec)
-    };
-    candidates.into_iter().find_map(canonical_file_path)
+    if spec_path.is_absolute() || spec.starts_with('.') {
+        return resolver_config_extends_target(&config_dir.join(spec_path))
+            .map(ResolverConfigDependency::resolver_config)
+            .into_iter()
+            .collect();
+    }
+
+    node_modules_resolver_config_dependencies(config_dir, project_root, spec)
 }
 
-fn node_modules_resolver_config_candidates(
+fn node_modules_resolver_config_dependencies(
     config_dir: &Path,
     project_root: &Path,
     spec: &str,
-) -> Vec<PathBuf> {
+) -> Vec<ResolverConfigDependency> {
     let boundary = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let config_dir = fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
     let enforce_project_boundary = config_dir.starts_with(&boundary);
-    let mut candidates = Vec::new();
+    let is_bare_package = is_bare_package_extends_spec(spec);
+    let mut dependencies = Vec::new();
     for ancestor in config_dir.ancestors() {
         let ancestor = fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
         if enforce_project_boundary && !ancestor.starts_with(&boundary) {
             break;
         }
-        candidates.extend(resolver_config_extends_candidates(
-            &ancestor.join("node_modules").join(spec),
-        ));
+        let package_dir = ancestor.join("node_modules").join(spec);
+        let mut ancestor_dependencies = Vec::new();
+        if is_bare_package {
+            if let Some(mut package_dependencies) =
+                package_json_resolver_config_dependencies(&package_dir)
+            {
+                let has_resolver_config = package_dependencies
+                    .iter()
+                    .any(|dependency| dependency.follow_extends);
+                ancestor_dependencies.append(&mut package_dependencies);
+                if has_resolver_config {
+                    dependencies.extend(ancestor_dependencies);
+                    return dependencies;
+                }
+            }
+        }
+        if let Some(target) = resolver_config_extends_target(&package_dir) {
+            ancestor_dependencies.push(ResolverConfigDependency::resolver_config(target));
+            dependencies.extend(ancestor_dependencies);
+            return dependencies;
+        }
+        dependencies.extend(ancestor_dependencies);
     }
-    candidates
+    dependencies
+}
+
+fn package_json_resolver_config_dependencies(
+    package_dir: &Path,
+) -> Option<Vec<ResolverConfigDependency>> {
+    let package_json = canonical_file_path(package_dir.join("package.json"))?;
+    let package_root = package_json
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| package_dir.to_path_buf());
+    let mut dependencies = vec![ResolverConfigDependency::hashed_file(package_json.clone())];
+
+    let Ok(source) = fs::read_to_string(&package_json) else {
+        return Some(dependencies);
+    };
+    let Ok(value) = parse_resolver_config_json(&source) else {
+        return Some(dependencies);
+    };
+    let selected_config = value
+        .get("tsconfig")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tsconfig.json");
+    if let Some(target) = resolver_config_extends_target(&package_root.join(selected_config)) {
+        dependencies.push(ResolverConfigDependency::resolver_config(target));
+    }
+
+    Some(dependencies)
+}
+
+fn is_bare_package_extends_spec(spec: &str) -> bool {
+    let mut parts = spec.split('/').filter(|part| !part.is_empty());
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if first.starts_with('@') {
+        parts.next().is_some() && parts.next().is_none()
+    } else {
+        parts.next().is_none()
+    }
+}
+
+fn resolver_config_extends_target(base: &Path) -> Option<PathBuf> {
+    resolver_config_extends_candidates(base)
+        .into_iter()
+        .find_map(canonical_file_path)
 }
 
 fn resolver_config_extends_candidates(base: &Path) -> Vec<PathBuf> {

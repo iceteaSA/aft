@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use aft::callgraph_store::CallGraphStore;
 use aft::config::Config;
-use aft::inspect::{InspectCategory, InspectManager, InspectScanSuccess, InspectSnapshot};
+use aft::inspect::{
+    InspectCache, InspectCategory, InspectManager, InspectScanSuccess, InspectSnapshot,
+};
 use aft::parser::SymbolCache;
 use serde_json::Value;
 
@@ -452,11 +454,11 @@ fn inspect_unused_exports_tracks_external_package_tsconfig_extends_change() {
     write_file(
         &repo,
         "node_modules/@scope/tsconfig/package.json",
-        r#"{"name":"@scope/tsconfig","version":"1.0.0","tsconfig":"tsconfig.json"}"#,
+        r#"{"name":"@scope/tsconfig","version":"1.0.0","main":"base.json","tsconfig":"base.json"}"#,
     );
     write_file(
         &repo,
-        "node_modules/@scope/tsconfig/tsconfig.json",
+        "node_modules/@scope/tsconfig/base.json",
         r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/a.ts"]}}}"#,
     );
     write_file(
@@ -497,7 +499,7 @@ console.log(x);
 
     write_file(
         &repo,
-        "node_modules/@scope/tsconfig/tsconfig.json",
+        "node_modules/@scope/tsconfig/base.json",
         r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/b.ts"]}}}"#,
     );
 
@@ -535,6 +537,184 @@ console.log(x);
     assert!(
         aggregate_contains_symbol(&warm, "src/a.ts", "x"),
         "updated package tsconfig alias target should make src/a.ts::x unused"
+    );
+}
+
+#[test]
+fn inspect_unused_exports_tracks_external_package_tsconfig_package_json_field_change() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let repo = temp_dir.path().join("repo");
+    let root = repo.join("pkg");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "tsconfig.json",
+        r#"{"extends":"../tsconfig.base.json"}"#,
+    );
+    write_file(
+        &repo,
+        "tsconfig.base.json",
+        r#"{"extends":"@scope/tsconfig"}"#,
+    );
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/package.json",
+        r#"{"name":"@scope/tsconfig","version":"1.0.0","main":"base-a.json","tsconfig":"base-a.json"}"#,
+    );
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/base-a.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/a.ts"]}}}"#,
+    );
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/base-b.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/b.ts"]}}}"#,
+    );
+    write_file(
+        &root,
+        "src/a.ts",
+        "export const x = 'a';
+export const onlyA = 'a-only';
+",
+    );
+    write_file(
+        &root,
+        "src/b.ts",
+        "export const x = 'b';
+export const onlyB = 'b-only';
+",
+    );
+    write_file(
+        &root,
+        "src/use.ts",
+        "import { x } from '@lib';
+console.log(x);
+",
+    );
+
+    let warm_inspect_dir = temp_dir
+        .path()
+        .join("inspect-warm-external-package-json-tsconfig");
+    let warm_manager = InspectManager::new();
+    let (first, _first_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    assert!(
+        aggregate_contains_symbol(&first, "src/b.ts", "x"),
+        "initial package.json tsconfig target should make src/b.ts::x unused"
+    );
+
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/package.json",
+        r#"{"name":"@scope/tsconfig","version":"1.0.0","main":"base-b.json","tsconfig":"base-b.json"}"#,
+    );
+
+    let (warm, _warm_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    let cold_inspect_dir = temp_dir
+        .path()
+        .join("inspect-cold-external-package-json-tsconfig");
+    let cold_manager = InspectManager::new();
+    let (cold, _cold_elapsed) = run_reuse_category(
+        &cold_manager,
+        snapshot(&root, &cold_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+
+    assert_eq!(
+        warm.aggregate, cold.aggregate,
+        "package.json tsconfig field edit should recompute the same roll-up as a cold scan"
+    );
+    assert_ne!(
+        warm.aggregate, first.aggregate,
+        "warm result must include the package.json-selected resolver config"
+    );
+    assert!(
+        warm.scanned_files.is_empty(),
+        "package.json resolver-config edit should not require source rescans"
+    );
+    assert!(
+        !warm.contributions.is_empty(),
+        "quick reuse should miss and roll up cached per-file contributions"
+    );
+    assert!(
+        aggregate_contains_symbol(&warm, "src/a.ts", "x"),
+        "updated package.json tsconfig target should make src/a.ts::x unused"
+    );
+}
+
+#[test]
+fn inspect_unused_exports_hash_tracks_package_json_tsconfig_dependencies() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let repo = temp_dir.path().join("repo");
+    let root = repo.join("pkg");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "tsconfig.json",
+        r#"{"extends":"../tsconfig.base.json"}"#,
+    );
+    write_file(
+        &repo,
+        "tsconfig.base.json",
+        r#"{"extends":"@scope/tsconfig"}"#,
+    );
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/package.json",
+        r#"{"name":"@scope/tsconfig","version":"1.0.0","tsconfig":"base.json"}"#,
+    );
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/base.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/a.ts"]}}}"#,
+    );
+
+    let cache = InspectCache::open(
+        temp_dir.path().join("inspect-hash-package-json-tsconfig"),
+        root,
+    )
+    .expect("open cache");
+    let first = cache
+        .contribution_set_hash(InspectCategory::UnusedExports)
+        .expect("initial hash");
+
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/base.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/b.ts"]}}}"#,
+    );
+    let selected_config_changed = cache
+        .contribution_set_hash(InspectCategory::UnusedExports)
+        .expect("selected config hash");
+    assert_ne!(
+        selected_config_changed, first,
+        "package.json-selected tsconfig edits must invalidate contribution hashes"
+    );
+
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/alternate.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/a.ts"]}}}"#,
+    );
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/package.json",
+        r#"{"name":"@scope/tsconfig","version":"1.0.0","tsconfig":"alternate.json"}"#,
+    );
+    let package_json_changed = cache
+        .contribution_set_hash(InspectCategory::UnusedExports)
+        .expect("package.json hash");
+    assert_ne!(
+        package_json_changed, selected_config_changed,
+        "package.json tsconfig field edits must invalidate contribution hashes"
     );
 }
 
