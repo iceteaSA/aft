@@ -43,6 +43,7 @@ impl WatcherFilterConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatcherDispatchEvent {
     Paths(Vec<PathBuf>),
+    RescanRequired,
     IgnoreRulesChanged { path: PathBuf },
     RootDeleted,
     Error(String),
@@ -340,6 +341,14 @@ impl WatcherFilterThread {
 
             match raw_rx.recv_timeout(self.next_recv_timeout()) {
                 Ok(Ok(event)) => {
+                    if event.need_rescan() {
+                        self.raw_paths.clear();
+                        self.flush_deadline = None;
+                        if !self.send_dispatch(WatcherDispatchEvent::RescanRequired) {
+                            return;
+                        }
+                        continue;
+                    }
                     if watcher_event_invalidates(&event.kind) && !self.push_raw_paths(event.paths) {
                         return;
                     }
@@ -467,7 +476,9 @@ impl WatcherFilterThread {
 mod tests {
     use super::*;
     use ignore::gitignore::GitignoreBuilder;
-    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind};
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, Flag, MetadataKind, ModifyKind,
+    };
     use notify::EventKind;
     use tempfile::TempDir;
 
@@ -506,6 +517,52 @@ mod tests {
             AccessKind::Open(AccessMode::Read)
         )));
         assert!(!watcher_event_invalidates(&EventKind::Other));
+    }
+
+    #[test]
+    fn rescan_event_dispatches_control_and_supersedes_pending_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let pending = root.join("pending.rs");
+        std::fs::write(&pending, "fn main() {}\n").unwrap();
+        let matcher = Arc::new(RwLock::new(None));
+        let generation = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let config = WatcherFilterConfig::new(root, None);
+        let mut filter = WatcherFilterThread::new(
+            config,
+            matcher,
+            generation,
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || filter.run(raw_rx));
+
+        let mut granular = notify::Event::new(EventKind::Create(CreateKind::File));
+        granular.paths.push(pending);
+        raw_tx.send(Ok(granular)).unwrap();
+        raw_tx
+            .send(Ok(
+                notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
+            ))
+            .unwrap();
+
+        let event = dispatch_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rescan event");
+        assert_eq!(event, WatcherDispatchEvent::RescanRequired);
+        assert!(
+            dispatch_rx
+                .recv_timeout(WATCHER_FLUSH_WINDOW + Duration::from_millis(100))
+                .is_err(),
+            "pending granular paths should be cleared by a rescan signal"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
     }
 
     #[test]

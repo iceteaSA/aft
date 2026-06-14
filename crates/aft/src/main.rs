@@ -1158,16 +1158,18 @@ fn spawn_search_corpus_refresh(
     });
 }
 
-fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
+fn refresh_project_corpus(ctx: &AppContext, reason: &str, invalidate_ignore_paths: bool) -> bool {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return false;
     };
     let config = ctx.config().clone();
     let mut status_changed = false;
 
-    if let Some(graph) = ctx.callgraph().borrow_mut().as_mut() {
-        graph.invalidate_file(&root.join(".gitignore"));
-        graph.invalidate_file(&root.join(".aftignore"));
+    if invalidate_ignore_paths {
+        if let Some(graph) = ctx.callgraph().borrow_mut().as_mut() {
+            graph.invalidate_file(&root.join(".gitignore"));
+            graph.invalidate_file(&root.join(".aftignore"));
+        }
     }
 
     if !ctx.is_worktree_bridge() {
@@ -1176,7 +1178,8 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
             match store.refresh_corpus(&current_files) {
                 Ok(stats) => {
                     aft::slog_info!(
-                        "callgraph store corpus refresh after ignore-rule change: {} files, {} edges",
+                        "callgraph store corpus refresh after {}: {} files, {} edges",
+                        reason,
                         stats.files,
                         stats.edges
                     );
@@ -1184,7 +1187,8 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
                 }
                 Err(error) => {
                     aft::slog_warn!(
-                        "callgraph store corpus refresh after ignore-rule change failed: {}",
+                        "callgraph store corpus refresh after {} failed: {}",
+                        reason,
                         error
                     );
                     if let Err(mark_error) = store.mark_files_stale(&current_files) {
@@ -1201,7 +1205,7 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
     if config.search_index {
         spawn_search_corpus_refresh(ctx, root.clone(), config.clone());
         status_changed = true;
-        aft::slog_info!("started search index refresh after ignore-rule change");
+        aft::slog_info!("started search index refresh after {}", reason);
     }
 
     if config.semantic_search {
@@ -1228,6 +1232,28 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
         }
     }
 
+    status_changed
+}
+
+fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
+    refresh_project_corpus(ctx, "ignore-rule change", true)
+}
+
+fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return false;
+    };
+    ctx.clear_pending_index_updates();
+    ctx.reset_symbol_cache();
+    let _ = ctx.mark_status_bar_tier2_stale();
+    ctx.clear_tsconfig_membership_cache();
+    let mut status_changed = true;
+
+    if ctx.callgraph().borrow().is_some() {
+        *ctx.callgraph().borrow_mut() = Some(aft::callgraph::CallGraph::new(root));
+    }
+
+    status_changed |= refresh_project_corpus(ctx, "watcher overflow", false);
     status_changed
 }
 
@@ -1282,6 +1308,7 @@ fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::
 fn drain_watcher_events(ctx: &AppContext) {
     let mut changed: HashSet<std::path::PathBuf> = HashSet::new();
     let mut ignore_file_changed = false;
+    let mut rescan_required = false;
     let mut watcher_failed = None;
     let mut root_deleted = false;
 
@@ -1298,7 +1325,13 @@ fn drain_watcher_events(ctx: &AppContext) {
         loop {
             match rx.try_recv() {
                 Ok(WatcherDispatchEvent::Paths(paths)) => {
-                    changed.extend(paths);
+                    if !rescan_required {
+                        changed.extend(paths);
+                    }
+                }
+                Ok(WatcherDispatchEvent::RescanRequired) => {
+                    rescan_required = true;
+                    changed.clear();
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { path }) => {
                     ignore_file_changed = true;
@@ -1306,7 +1339,9 @@ fn drain_watcher_events(ctx: &AppContext) {
                         "watcher: ignore rules changed at {}, rebuilding matcher",
                         path.display()
                     );
-                    ctx.rebuild_gitignore();
+                    if !rescan_required {
+                        ctx.rebuild_gitignore();
+                    }
                 }
                 Ok(WatcherDispatchEvent::RootDeleted) => {
                     root_deleted = true;
@@ -1335,19 +1370,28 @@ fn drain_watcher_events(ctx: &AppContext) {
         );
         watcher_status_changed = true;
         changed.clear();
+        rescan_required = false;
     } else if let Some(error) = watcher_failed {
         ctx.stop_watcher_runtime();
         let _ = ctx.add_degraded_reason("watcher_unavailable".to_string());
         aft::slog_warn!("watcher unavailable: {}", error);
         watcher_status_changed = true;
+        rescan_required = false;
     }
 
     let mut status_changed = watcher_status_changed;
-    if ignore_file_changed {
+    if rescan_required {
+        aft::slog_warn!("watcher overflow: forcing project rescan");
+        ctx.rebuild_gitignore();
+        status_changed |= refresh_project_after_watcher_rescan(ctx);
+        changed.clear();
+    } else if ignore_file_changed {
         status_changed |= refresh_corpus_after_ignore_change(ctx);
     }
 
-    let scheduler_changed_path_count = if ignore_file_changed {
+    let scheduler_changed_path_count = if rescan_required {
+        aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1
+    } else if ignore_file_changed {
         changed.len().max(1)
     } else {
         changed.len()
@@ -2749,6 +2793,52 @@ mod watcher_filter_tests {
             SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file]),
             SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
         }
+    }
+
+    #[test]
+    fn watcher_rescan_required_coalesces_and_requests_one_corpus_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.rebuild_gitignore();
+        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root, 3));
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx.send(watcher_paths_event(file.clone())).unwrap();
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired)
+            .unwrap();
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired)
+            .unwrap();
+        watcher_tx.send(watcher_paths_event(file)).unwrap();
+
+        drain_watcher_events(&ctx);
+
+        match request_rx
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
+            .expect("semantic corpus refresh request")
+        {
+            SemanticRefreshRequest::Corpus => {}
+            SemanticRefreshRequest::Files { paths } => {
+                panic!("expected corpus refresh, got file refresh for {paths:?}")
+            }
+        }
+        assert!(request_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
     }
 
     #[test]
