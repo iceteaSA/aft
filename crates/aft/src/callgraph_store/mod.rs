@@ -879,6 +879,7 @@ impl CallGraphStore {
         let mut deleted = BTreeSet::new();
         let mut own_refresh = BTreeSet::new();
         let mut selected_ref_ids = BTreeSet::new();
+        let mut selected_refs_by_caller = BTreeMap::new();
         let mut changed_extracts: HashMap<String, FileExtract> = HashMap::new();
 
         for input in changed_files {
@@ -890,11 +891,11 @@ impl CallGraphStore {
                 if old_row.is_some() {
                     surface_changed.insert(rel_path.clone());
                     deleted.insert(rel_path.clone());
-                    selected_ref_ids.extend(ref_ids_depending_on(
-                        &tx,
-                        &self.project_root,
-                        &rel_path,
-                    )?);
+                    record_dependent_refs(
+                        &mut selected_ref_ids,
+                        &mut selected_refs_by_caller,
+                        ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                    );
                     delete_file_rows(&tx, &rel_path)?;
                     clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
                 }
@@ -920,11 +921,11 @@ impl CallGraphStore {
                     FreshnessVerdict::Deleted => {
                         surface_changed.insert(rel_path.clone());
                         deleted.insert(rel_path.clone());
-                        selected_ref_ids.extend(ref_ids_depending_on(
-                            &tx,
-                            &self.project_root,
-                            &rel_path,
-                        )?);
+                        record_dependent_refs(
+                            &mut selected_ref_ids,
+                            &mut selected_refs_by_caller,
+                            ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                        );
                         delete_file_rows(&tx, &rel_path)?;
                         clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
                         continue;
@@ -940,7 +941,11 @@ impl CallGraphStore {
                 .unwrap_or(true);
             if surface_is_changed {
                 surface_changed.insert(rel_path.clone());
-                selected_ref_ids.extend(ref_ids_depending_on(&tx, &self.project_root, &rel_path)?);
+                record_dependent_refs(
+                    &mut selected_ref_ids,
+                    &mut selected_refs_by_caller,
+                    ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                );
             }
             own_refresh.insert(rel_path.clone());
             delete_file_rows(&tx, &rel_path)?;
@@ -949,7 +954,6 @@ impl CallGraphStore {
         }
 
         let dependency_selected_refs = selected_ref_ids.len();
-        let selected_refs_by_caller = refs_by_caller_for_ref_ids(&tx, &selected_ref_ids)?;
         let mut touched_callers: BTreeSet<String> =
             selected_refs_by_caller.keys().cloned().collect();
         touched_callers.extend(own_refresh.iter().cloned());
@@ -5980,11 +5984,17 @@ fn update_file_fresh_metadata(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DependentRefSelection {
+    ref_id: String,
+    caller_file: String,
+}
+
 fn ref_ids_depending_on(
     tx: &Transaction<'_>,
     project_root: &Path,
     rel_path: &str,
-) -> Result<Vec<String>> {
+) -> Result<Vec<DependentRefSelection>> {
     let mut stmt = tx.prepare(
         "SELECT DISTINCT r.ref_id, r.kind, r.caller_file, r.module_path, r.target_file
          FROM refs r
@@ -6007,12 +6017,34 @@ fn ref_ids_depending_on(
     for row in rows {
         let row = row?;
         if ref_dependency_row_depends_on(project_root, &row, rel_path) {
-            ids.push(row.ref_id);
+            ids.push(DependentRefSelection {
+                ref_id: row.ref_id,
+                caller_file: row.caller_file,
+            });
         }
     }
     Ok(ids)
 }
 
+fn record_dependent_refs(
+    selected_ref_ids: &mut BTreeSet<String>,
+    selected_refs_by_caller: &mut BTreeMap<String, BTreeSet<String>>,
+    dependent_refs: Vec<DependentRefSelection>,
+) {
+    for dependent_ref in dependent_refs {
+        let DependentRefSelection {
+            ref_id,
+            caller_file,
+        } = dependent_ref;
+        selected_ref_ids.insert(ref_id.clone());
+        selected_refs_by_caller
+            .entry(caller_file)
+            .or_default()
+            .insert(ref_id);
+    }
+}
+
+#[cfg(test)]
 fn refs_by_caller_for_ref_ids(
     tx: &Transaction<'_>,
     ref_ids: &BTreeSet<String>,
@@ -6736,6 +6768,92 @@ export function leaf() {}
         assert_eq!(secondary_indexes(&reference), secondary_indexes(&optimized));
     }
 
+    #[test]
+    fn incremental_barrel_refresh_matches_per_ref_lookup_and_cold_rebuild() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path();
+        let files =
+            write_barrel_refresh_fixture(project_root, "export { target } from \"./target\";\n");
+        let index_path = project_root.join("src/index.ts");
+
+        let store = CallGraphStore::open(
+            project_root.join(".store-incremental-barrel"),
+            project_root.to_path_buf(),
+        )
+        .expect("open incremental store");
+        store.cold_build(&files).expect("initial cold build");
+
+        {
+            let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            let tx = conn.transaction().expect("dependency transaction");
+            let dependent_refs = ref_ids_depending_on(&tx, project_root, "src/index.ts")
+                .expect("dependent refs for barrel");
+            let selected_ref_ids = dependent_refs
+                .iter()
+                .map(|dependent_ref| dependent_ref.ref_id.clone())
+                .collect::<BTreeSet<_>>();
+            let mut threaded_ref_ids = BTreeSet::new();
+            let mut threaded_by_caller = BTreeMap::new();
+            record_dependent_refs(
+                &mut threaded_ref_ids,
+                &mut threaded_by_caller,
+                dependent_refs,
+            );
+            let old_by_caller = refs_by_caller_for_ref_ids(&tx, &selected_ref_ids)
+                .expect("old per-ref caller lookup");
+
+            assert_eq!(threaded_ref_ids, selected_ref_ids);
+            assert_eq!(threaded_by_caller, old_by_caller);
+            for consumer in [
+                "src/consumer_a.ts",
+                "src/consumer_b.ts",
+                "src/consumer_c.ts",
+            ] {
+                assert!(
+                    threaded_by_caller.contains_key(consumer),
+                    "barrel edit should select dependent refs from {consumer}"
+                );
+            }
+        }
+
+        fs::write(
+            &index_path,
+            "export { target } from \"./target\";\nexport function extra() { return 1; }\n",
+        )
+        .expect("edit barrel");
+        let stats = store
+            .refresh_files(std::slice::from_ref(&index_path))
+            .expect("incremental refresh");
+        assert_eq!(stats.surface_changed, vec!["src/index.ts".to_string()]);
+        assert!(
+            stats.dependency_selected_refs > 0,
+            "barrel surface edit should select dependent refs"
+        );
+
+        let cold_store = CallGraphStore::open(
+            project_root.join(".store-cold-barrel"),
+            project_root.to_path_buf(),
+        )
+        .expect("open cold rebuild store");
+        cold_store
+            .cold_build(&files)
+            .expect("comparison cold build");
+
+        for table in [
+            "nodes",
+            "refs",
+            "file_dependencies",
+            "edges",
+            "dispatch_hints",
+        ] {
+            assert_eq!(
+                graph_table_rows(&store, table),
+                graph_table_rows(&cold_store, table),
+                "incremental refresh {table} rows must match cold rebuild"
+            );
+        }
+    }
+
     fn build_reference_connection(
         project_root: &Path,
         extract: &FileExtract,
@@ -6884,6 +7002,41 @@ export function leaf() {}
             target_symbol: Some("helper".to_string()),
             dependencies,
         }
+    }
+
+    fn write_barrel_refresh_fixture(project_root: &Path, barrel_source: &str) -> Vec<PathBuf> {
+        let src_dir = project_root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let target_path = src_dir.join("target.ts");
+        fs::write(&target_path, "export function target() {\n  return 1;\n}\n")
+            .expect("write target");
+
+        let index_path = src_dir.join("index.ts");
+        fs::write(&index_path, barrel_source).expect("write barrel");
+
+        let mut files = vec![target_path, index_path];
+        for (file_name, function_name) in [
+            ("consumer_a.ts", "consumerA"),
+            ("consumer_b.ts", "consumerB"),
+            ("consumer_c.ts", "consumerC"),
+        ] {
+            let path = src_dir.join(file_name);
+            fs::write(
+                &path,
+                format!(
+                    "import {{ target }} from \"./index\";\n\nexport function {function_name}() {{\n  return target();\n}}\n"
+                ),
+            )
+            .expect("write consumer");
+            files.push(path);
+        }
+        files
+    }
+
+    fn graph_table_rows(store: &CallGraphStore, table: &str) -> Vec<String> {
+        let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+        table_rows(&conn, table)
     }
 
     fn table_rows(conn: &Connection, table: &str) -> Vec<String> {
