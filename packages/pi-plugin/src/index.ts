@@ -54,6 +54,7 @@ import {
   type AftConfig,
   loadAftConfig,
   resolveBashConfig,
+  resolveBridgePoolTransportOptions,
   resolveExperimentalConfigForConfigure,
   resolveLspConfigForConfigure,
 } from "./config.js";
@@ -565,6 +566,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
     onBashPatternMatch: (frame: BashPatternMatchPayload, bridge: BridgePendingState) => void;
   } = {
+    ...resolveBridgePoolTransportOptions(config),
     errorPrefix: "[aft-pi]",
     minVersion: PLUGIN_VERSION,
     onVersionMismatch: createVersionMismatchHandler(() => pool),

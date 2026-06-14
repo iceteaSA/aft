@@ -38,6 +38,11 @@ export type ConfigureWarningsDelivery = "toast" | "log" | "chat";
 
 export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama";
 
+export interface BridgeConfig {
+  request_timeout_ms?: number;
+  hang_threshold?: number;
+}
+
 export interface SemanticConfig {
   backend?: SemanticBackend;
   model?: string;
@@ -188,6 +193,7 @@ export interface AftConfig {
    * Default: 20000 (applied Rust-side; undefined here means "use default").
    */
   max_callgraph_files?: number;
+  bridge?: BridgeConfig;
 }
 
 /**
@@ -431,6 +437,19 @@ const BashFeaturesSchema = z.object({
 });
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
+const BridgeConfigSchema = z.object({
+  request_timeout_ms: z
+    .number()
+    .int()
+    .min(1000, { message: "bridge.request_timeout_ms must be at least 1000" })
+    .optional(),
+  hang_threshold: z
+    .number()
+    .int()
+    .min(1, { message: "bridge.hang_threshold must be at least 1" })
+    .optional(),
+});
+
 const InspectConfigSchema = z.object({
   enabled: z.boolean().optional(),
   tier2_idle_minutes: z.number().min(0).optional(),
@@ -486,6 +505,7 @@ export const AftConfigSchema = z
     url_fetch_allow_private: z.boolean().optional(),
     semantic: SemanticConfigSchema.optional(),
     max_callgraph_files: z.number().int().positive().optional(),
+    bridge: BridgeConfigSchema.optional(),
   })
   .strict();
 
@@ -1065,6 +1085,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "max_callgraph_files" — USER ONLY (resource budget).
+  // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
 ]);
 
 function pickProjectSafeFields(override: AftConfig): Partial<AftConfig> {
@@ -1083,6 +1104,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.restrict_to_project_root !== undefined) stripped.push("restrict_to_project_root");
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.max_callgraph_files !== undefined) stripped.push("max_callgraph_files");
+  if (override.bridge !== undefined) stripped.push("bridge");
   return stripped;
 }
 
@@ -1095,6 +1117,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
+  const bridge = base.bridge;
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
   // See PROJECT_SAFE_TOP_LEVEL_FIELDS above for the full security rationale.
@@ -1115,7 +1138,23 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(inspect !== undefined ? { inspect } : {}),
     experimental,
     semantic,
+    ...(bridge !== undefined ? { bridge } : {}),
     ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),
+  };
+}
+
+/** Defaults for bridge transport when omitted from config. */
+export const DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_BRIDGE_HANG_THRESHOLD = 2;
+
+/** Resolved pool/bridge options from `config.bridge` (defaults 30000 / 2). */
+export function resolveBridgePoolTransportOptions(config: AftConfig): {
+  timeoutMs: number;
+  hangThreshold: number;
+} {
+  return {
+    timeoutMs: config.bridge?.request_timeout_ms ?? DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS,
+    hangThreshold: config.bridge?.hang_threshold ?? DEFAULT_BRIDGE_HANG_THRESHOLD,
   };
 }
 

@@ -176,6 +176,27 @@ const BashFeaturesSchema = z.object({
 
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
+const BridgeConfigSchema = z.object({
+  /**
+   * Per-request bridge transport timeout in milliseconds. Default: 30000.
+   * Raise on slow filesystems (WSL/DrvFs/NFS) where cold `aft` operations exceed the default.
+   */
+  request_timeout_ms: z
+    .number()
+    .int()
+    .min(1000, { message: "bridge.request_timeout_ms must be at least 1000" })
+    .optional(),
+  /**
+   * Consecutive silent request timeouts before the bridge is killed and respawned.
+   * Default: 2. Raise when many editor windows share one bridge process.
+   */
+  hang_threshold: z
+    .number()
+    .int()
+    .min(1, { message: "bridge.hang_threshold must be at least 1" })
+    .optional(),
+});
+
 const InspectConfigSchema = z.object({
   /** Master switch for the aft_inspect tool. Defaults to true. */
   enabled: z.boolean().optional(),
@@ -297,6 +318,8 @@ export const AftConfigSchema = z
     max_callgraph_files: z.number().int().positive().optional(),
     /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
     auto_update: z.boolean().optional(),
+    /** Per-bridge transport timeout and hang-escalation (USER-only; shared pool). */
+    bridge: BridgeConfigSchema.optional(),
   })
   .strict();
 
@@ -1198,6 +1221,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "storage_dir" — USER ONLY (controls where AFT writes).
   // "max_callgraph_files" — USER ONLY (resource budget).
   // "auto_update" — USER ONLY (silently suppressing security updates is a real risk).
+  // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
 ]);
 
 function pickProjectSafeFields(override: AftConfig): Partial<AftConfig> {
@@ -1217,6 +1241,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.max_callgraph_files !== undefined) stripped.push("max_callgraph_files");
   if (override.auto_update !== undefined) stripped.push("auto_update");
+  if (override.bridge !== undefined) stripped.push("bridge");
   return stripped;
 }
 
@@ -1233,9 +1258,9 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
+  const bridge = base.bridge;
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
-  // See PROJECT_SAFE_TOP_LEVEL_FIELDS above for the full security rationale.
   // We deep-merge `bash` separately so the field-by-field union beats the
   // shallow allowlist spread; otherwise project's `bash: { compress: false }`
   // would wipe out user's `bash: { rewrite: true }`.
@@ -1256,8 +1281,24 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.
     semantic,
+    ...(bridge !== undefined ? { bridge } : {}),
     // Union — both levels contribute to the disabled set
     ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),
+  };
+}
+
+/** Defaults for bridge transport when omitted from config. */
+export const DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_BRIDGE_HANG_THRESHOLD = 2;
+
+/** Resolved pool/bridge options from `config.bridge` (defaults 30000 / 2). */
+export function resolveBridgePoolTransportOptions(config: AftConfig): {
+  timeoutMs: number;
+  hangThreshold: number;
+} {
+  return {
+    timeoutMs: config.bridge?.request_timeout_ms ?? DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS,
+    hangThreshold: config.bridge?.hang_threshold ?? DEFAULT_BRIDGE_HANG_THRESHOLD,
   };
 }
 

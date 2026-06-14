@@ -21,7 +21,12 @@ import {
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
 } from "./bg-notifications.js";
-import { loadAftConfig, resolveBashConfig, resolveProjectOverridesForConfigure } from "./config.js";
+import {
+  loadAftConfig,
+  resolveBashConfig,
+  resolveBridgePoolTransportOptions,
+  resolveProjectOverridesForConfigure,
+} from "./config.js";
 import {
   enqueueConfigureWarningsForSession,
   flushConfigureWarningsOnIdle,
@@ -439,6 +444,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
     onBashPatternMatch: (frame: BashPatternMatchPayload, bridge: BridgePendingState) => void;
   } = {
+    ...resolveBridgePoolTransportOptions(aftConfig),
     errorPrefix: "[aft-plugin]",
     minVersion: PLUGIN_VERSION,
     // Per-project configure overrides — fixes OpenCode Desktop /

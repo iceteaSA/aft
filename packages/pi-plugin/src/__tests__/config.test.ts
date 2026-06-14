@@ -5,7 +5,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AftConfigSchema } from "../config.js";
+import { AftConfigSchema, resolveBridgePoolTransportOptions } from "../config.js";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const tempRoots = new Set<string>();
@@ -733,5 +733,55 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain(
       `Ignoring lsp.servers, lsp.versions, lsp.auto_install, lsp.grace_days, lsp.disabled from project config ${fixture.projectConfigPath}`,
     );
+  });
+
+  test("bridge config defaults when omitted", () => {
+    expect(resolveBridgePoolTransportOptions({})).toEqual({
+      timeoutMs: 30_000,
+      hangThreshold: 2,
+    });
+  });
+
+  test("project config cannot set bridge (strict allowlist)", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ bridge: { request_timeout_ms: 45_000, hang_threshold: 3 } }, null, 2),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ bridge: { hang_threshold: 99, request_timeout_ms: 999_999 } }, null, 2),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+    });
+
+    const config = JSON.parse(result.stdout) as {
+      bridge?: { request_timeout_ms?: number; hang_threshold?: number };
+    };
+    expect(config.bridge).toEqual({ request_timeout_ms: 45_000, hang_threshold: 3 });
+    expect(result.stderr).toContain("Ignoring bridge from project config");
+  });
+
+  test("bridge rejects request_timeout_ms below 1000 and hang_threshold below 1", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify(
+        { bridge: { request_timeout_ms: 500, hang_threshold: 0 }, format_on_edit: true },
+        null,
+        2,
+      ),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.bridge).toBeUndefined();
+    expect(config.format_on_edit).toBe(true);
+    expect(result.stderr).toContain("Partial config loaded");
   });
 });

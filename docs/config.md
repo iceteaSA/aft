@@ -136,12 +136,7 @@ The schema is identical across harnesses. Only file location differs.
   // build, so 5000 ≈ 5–10s on cold start. The previous 20000 default exceeded
   // the bridge timeout on real ~7K-file projects, surfacing as bridge restart
   // instead of `project_too_large`. Raise this if you have patience and want
-  // call-graph navigation on bigger projects.
-  "max_callgraph_files": 5000,
 
-  // Language servers used for post-edit diagnostics.
-  //
-  // Built-in servers (auto-registered when their binary is on PATH):
   //   typescript-language-server, pyright-langserver, rust-analyzer, gopls,
   //   bash-language-server, yaml-language-server
   //
