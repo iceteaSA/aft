@@ -139,6 +139,15 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn apply_same_file_references_for_module(&mut self, idx: usize) {
+        let mut newly_live_modules = BTreeSet::new();
+        self.apply_same_file_references_for_module_collect(idx, &mut newly_live_modules);
+    }
+
+    fn apply_same_file_references_for_module_collect(
+        &mut self,
+        idx: usize,
+        newly_live_modules: &mut BTreeSet<usize>,
+    ) {
         let Some(module) = self.modules.get(idx) else {
             return;
         };
@@ -152,8 +161,10 @@ impl<'a> GraphBuilder<'a> {
             let Some(local_name) = export.fact.local_name.as_deref() else {
                 continue;
             };
-            if module.facts.same_file_value_references.contains(local_name) {
-                mark_used(export, "same_file_value_reference");
+            if module.facts.same_file_value_references.contains(local_name)
+                && mark_used(export, "same_file_value_reference")
+            {
+                newly_live_modules.insert(idx);
             }
         }
     }
@@ -163,8 +174,9 @@ impl<'a> GraphBuilder<'a> {
         let mut queue = live_modules.iter().copied().collect::<VecDeque<_>>();
 
         while let Some(module_idx) = queue.pop_front() {
-            self.apply_same_file_references_for_module(module_idx);
-            self.enqueue_status_live_modules(&mut live_modules, &mut queue);
+            let mut newly_live_modules = BTreeSet::new();
+            self.apply_same_file_references_for_module_collect(module_idx, &mut newly_live_modules);
+            enqueue_newly_live_modules(newly_live_modules, &mut live_modules, &mut queue);
 
             let Some(module) = self.modules.get(module_idx).cloned() else {
                 continue;
@@ -177,25 +189,43 @@ impl<'a> GraphBuilder<'a> {
                 if !import_binding_is_used(&module, import) {
                     continue;
                 }
+                let mut newly_live_modules = BTreeSet::new();
                 match import.fact.kind {
                     ImportKind::Named => {
                         if let Some(name) = import.fact.imported_name.as_deref() {
                             let mut visited = BTreeSet::new();
-                            self.mark_imported_name(target, name, "import", &mut visited);
+                            self.mark_imported_name_collect(
+                                target,
+                                name,
+                                "import",
+                                &mut visited,
+                                &mut newly_live_modules,
+                            );
                         }
                     }
                     ImportKind::Default => {
                         let mut visited = BTreeSet::new();
-                        self.mark_imported_name(target, "default", "import", &mut visited);
+                        self.mark_imported_name_collect(
+                            target,
+                            "default",
+                            "import",
+                            &mut visited,
+                            &mut newly_live_modules,
+                        );
                     }
                     ImportKind::Namespace => {
                         let mut visited = BTreeSet::new();
-                        self.mark_all_uncertain(target, "namespace_import", &mut visited);
+                        self.mark_all_uncertain_collect(
+                            target,
+                            "namespace_import",
+                            &mut visited,
+                            &mut newly_live_modules,
+                        );
                     }
                     ImportKind::SideEffect => {}
                 }
                 enqueue_module(target, &mut live_modules, &mut queue);
-                self.enqueue_status_live_modules(&mut live_modules, &mut queue);
+                enqueue_newly_live_modules(newly_live_modules, &mut live_modules, &mut queue);
             }
 
             for re_export in &module.re_exports {
@@ -217,23 +247,39 @@ impl<'a> GraphBuilder<'a> {
                         if exported_is_live {
                             if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
                                 let mut visited = BTreeSet::new();
-                                self.mark_imported_name(
+                                let mut newly_live_modules = BTreeSet::new();
+                                self.mark_imported_name_collect(
                                     target,
                                     imported_name,
                                     "re_export",
                                     &mut visited,
+                                    &mut newly_live_modules,
                                 );
                                 enqueue_module(target, &mut live_modules, &mut queue);
-                                self.enqueue_status_live_modules(&mut live_modules, &mut queue);
+                                enqueue_newly_live_modules(
+                                    newly_live_modules,
+                                    &mut live_modules,
+                                    &mut queue,
+                                );
                             }
                         }
                     }
                     ReExportKind::Star => {
                         if self.root_modules.contains(&module_idx) {
                             let mut visited = BTreeSet::new();
-                            self.mark_all_uncertain(target, "wildcard_import", &mut visited);
+                            let mut newly_live_modules = BTreeSet::new();
+                            self.mark_all_uncertain_collect(
+                                target,
+                                "wildcard_import",
+                                &mut visited,
+                                &mut newly_live_modules,
+                            );
                             enqueue_module(target, &mut live_modules, &mut queue);
-                            self.enqueue_status_live_modules(&mut live_modules, &mut queue);
+                            enqueue_newly_live_modules(
+                                newly_live_modules,
+                                &mut live_modules,
+                                &mut queue,
+                            );
                         }
                     }
                     ReExportKind::Namespace => {
@@ -249,9 +295,19 @@ impl<'a> GraphBuilder<'a> {
                         });
                         if namespace_is_live {
                             let mut visited = BTreeSet::new();
-                            self.mark_all_uncertain(target, "namespace_import", &mut visited);
+                            let mut newly_live_modules = BTreeSet::new();
+                            self.mark_all_uncertain_collect(
+                                target,
+                                "namespace_import",
+                                &mut visited,
+                                &mut newly_live_modules,
+                            );
                             enqueue_module(target, &mut live_modules, &mut queue);
-                            self.enqueue_status_live_modules(&mut live_modules, &mut queue);
+                            enqueue_newly_live_modules(
+                                newly_live_modules,
+                                &mut live_modules,
+                                &mut queue,
+                            );
                         }
                     }
                 }
@@ -261,29 +317,21 @@ impl<'a> GraphBuilder<'a> {
                 if dynamic.fact.is_literal {
                     if let Some(target) = dynamic.target {
                         let mut visited = BTreeSet::new();
-                        self.mark_all_uncertain(target, "dynamic_import", &mut visited);
+                        let mut newly_live_modules = BTreeSet::new();
+                        self.mark_all_uncertain_collect(
+                            target,
+                            "dynamic_import",
+                            &mut visited,
+                            &mut newly_live_modules,
+                        );
                         enqueue_module(target, &mut live_modules, &mut queue);
-                        self.enqueue_status_live_modules(&mut live_modules, &mut queue);
+                        enqueue_newly_live_modules(
+                            newly_live_modules,
+                            &mut live_modules,
+                            &mut queue,
+                        );
                     }
                 }
-            }
-        }
-    }
-
-    fn enqueue_status_live_modules(
-        &self,
-        live_modules: &mut BTreeSet<usize>,
-        queue: &mut VecDeque<usize>,
-    ) {
-        for (idx, state) in self.states.iter().enumerate() {
-            if state.exports.iter().any(|export| {
-                matches!(
-                    export.status,
-                    ExportStatus::Used(_) | ExportStatus::Uncertain(_)
-                )
-            }) && live_modules.insert(idx)
-            {
-                queue.push_back(idx);
             }
         }
     }
@@ -380,54 +428,17 @@ impl<'a> GraphBuilder<'a> {
         reason: &str,
         visited: &mut BTreeSet<(usize, String)>,
     ) {
-        if !visited.insert((target.0, name.to_string())) {
-            return;
-        }
-        if let Some(state) = self.states.get_mut(target.0) {
-            for export in state
-                .exports
-                .iter_mut()
-                .filter(|export| export.fact.name.matches_str(name))
-            {
-                mark_used(export, reason);
-            }
-        }
-
-        let Some(module) = self.modules.get(target.0) else {
-            return;
-        };
-        let re_exports = module.re_exports.clone();
-        for re_export in re_exports {
-            let Some(source) = re_export.target else {
-                continue;
-            };
-            match re_export.fact.kind {
-                ReExportKind::Named => {
-                    if re_export.fact.exported_name.as_deref() == Some(name) {
-                        if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
-                            self.mark_imported_name(source, imported_name, "re_export", visited);
-                        }
-                    }
-                }
-                ReExportKind::Star => {
-                    self.mark_imported_name(source, name, "re_export", visited);
-                }
-                ReExportKind::Namespace => {
-                    if re_export.fact.exported_name.as_deref() == Some(name) {
-                        let mut uncertain_visited = BTreeSet::new();
-                        self.mark_all_uncertain(source, "namespace_import", &mut uncertain_visited);
-                    }
-                }
-            }
-        }
+        let mut newly_live_modules = BTreeSet::new();
+        self.mark_imported_name_collect(target, name, reason, visited, &mut newly_live_modules);
     }
 
-    fn mark_imported_name_uncertain(
+    fn mark_imported_name_collect(
         &mut self,
         target: FileId,
         name: &str,
         reason: &str,
         visited: &mut BTreeSet<(usize, String)>,
+        newly_live_modules: &mut BTreeSet<usize>,
     ) {
         if !visited.insert((target.0, name.to_string())) {
             return;
@@ -438,7 +449,78 @@ impl<'a> GraphBuilder<'a> {
                 .iter_mut()
                 .filter(|export| export.fact.name.matches_str(name))
             {
-                mark_uncertain(export, reason);
+                if mark_used(export, reason) {
+                    newly_live_modules.insert(target.0);
+                }
+            }
+        }
+
+        let Some(module) = self.modules.get(target.0) else {
+            return;
+        };
+        let re_exports = module.re_exports.clone();
+        for re_export in re_exports {
+            let Some(source) = re_export.target else {
+                continue;
+            };
+            match re_export.fact.kind {
+                ReExportKind::Named => {
+                    if re_export.fact.exported_name.as_deref() == Some(name) {
+                        if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
+                            self.mark_imported_name_collect(
+                                source,
+                                imported_name,
+                                "re_export",
+                                visited,
+                                newly_live_modules,
+                            );
+                        }
+                    }
+                }
+                ReExportKind::Star => {
+                    self.mark_imported_name_collect(
+                        source,
+                        name,
+                        "re_export",
+                        visited,
+                        newly_live_modules,
+                    );
+                }
+                ReExportKind::Namespace => {
+                    if re_export.fact.exported_name.as_deref() == Some(name) {
+                        let mut uncertain_visited = BTreeSet::new();
+                        self.mark_all_uncertain_collect(
+                            source,
+                            "namespace_import",
+                            &mut uncertain_visited,
+                            newly_live_modules,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn mark_imported_name_uncertain_collect(
+        &mut self,
+        target: FileId,
+        name: &str,
+        reason: &str,
+        visited: &mut BTreeSet<(usize, String)>,
+        newly_live_modules: &mut BTreeSet<usize>,
+    ) {
+        if !visited.insert((target.0, name.to_string())) {
+            return;
+        }
+        if let Some(state) = self.states.get_mut(target.0) {
+            for export in state
+                .exports
+                .iter_mut()
+                .filter(|export| export.fact.name.matches_str(name))
+            {
+                if mark_uncertain(export, reason) {
+                    newly_live_modules.insert(target.0);
+                }
             }
         }
         let Some(module) = self.modules.get(target.0) else {
@@ -453,17 +535,24 @@ impl<'a> GraphBuilder<'a> {
                 ReExportKind::Named => {
                     if re_export.fact.exported_name.as_deref() == Some(name) {
                         if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
-                            self.mark_imported_name_uncertain(
+                            self.mark_imported_name_uncertain_collect(
                                 source,
                                 imported_name,
                                 reason,
                                 visited,
+                                newly_live_modules,
                             );
                         }
                     }
                 }
                 ReExportKind::Star => {
-                    self.mark_imported_name_uncertain(source, name, reason, visited);
+                    self.mark_imported_name_uncertain_collect(
+                        source,
+                        name,
+                        reason,
+                        visited,
+                        newly_live_modules,
+                    );
                 }
                 ReExportKind::Namespace => {}
             }
@@ -471,12 +560,25 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn mark_all_uncertain(&mut self, target: FileId, reason: &str, visited: &mut BTreeSet<usize>) {
+        let mut newly_live_modules = BTreeSet::new();
+        self.mark_all_uncertain_collect(target, reason, visited, &mut newly_live_modules);
+    }
+
+    fn mark_all_uncertain_collect(
+        &mut self,
+        target: FileId,
+        reason: &str,
+        visited: &mut BTreeSet<usize>,
+        newly_live_modules: &mut BTreeSet<usize>,
+    ) {
         if !visited.insert(target.0) {
             return;
         }
         if let Some(state) = self.states.get_mut(target.0) {
             for export in &mut state.exports {
-                mark_uncertain(export, reason);
+                if mark_uncertain(export, reason) {
+                    newly_live_modules.insert(target.0);
+                }
             }
         }
         let Some(module) = self.modules.get(target.0) else {
@@ -488,15 +590,18 @@ impl<'a> GraphBuilder<'a> {
                 continue;
             };
             match re_export.fact.kind {
-                ReExportKind::Star => self.mark_all_uncertain(source, reason, visited),
+                ReExportKind::Star => {
+                    self.mark_all_uncertain_collect(source, reason, visited, newly_live_modules)
+                }
                 ReExportKind::Named => {
                     if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
                         let mut name_visited = BTreeSet::new();
-                        self.mark_imported_name_uncertain(
+                        self.mark_imported_name_uncertain_collect(
                             source,
                             imported_name,
                             reason,
                             &mut name_visited,
+                            newly_live_modules,
                         );
                     }
                 }
@@ -547,9 +652,27 @@ impl<'a> GraphBuilder<'a> {
     }
 }
 
+fn enqueue_newly_live_modules(
+    newly_live_modules: BTreeSet<usize>,
+    live_modules: &mut BTreeSet<usize>,
+    queue: &mut VecDeque<usize>,
+) {
+    for module_idx in newly_live_modules {
+        enqueue_module_idx(module_idx, live_modules, queue);
+    }
+}
+
 fn enqueue_module(target: FileId, live_modules: &mut BTreeSet<usize>, queue: &mut VecDeque<usize>) {
-    if live_modules.insert(target.0) {
-        queue.push_back(target.0);
+    enqueue_module_idx(target.0, live_modules, queue);
+}
+
+fn enqueue_module_idx(
+    module_idx: usize,
+    live_modules: &mut BTreeSet<usize>,
+    queue: &mut VecDeque<usize>,
+) {
+    if live_modules.insert(module_idx) {
+        queue.push_back(module_idx);
     }
 }
 
@@ -590,15 +713,26 @@ fn push_synthetic_export(
     });
 }
 
-fn mark_used(export: &mut ExportState, reason: &str) {
-    if !matches!(export.status, ExportStatus::Used(_)) {
-        export.status = ExportStatus::Used(reason.to_string());
+fn mark_used(export: &mut ExportState, reason: &str) -> bool {
+    match export.status {
+        ExportStatus::Used(_) => false,
+        ExportStatus::Uncertain(_) => {
+            export.status = ExportStatus::Used(reason.to_string());
+            false
+        }
+        ExportStatus::Unused => {
+            export.status = ExportStatus::Used(reason.to_string());
+            true
+        }
     }
 }
 
-fn mark_uncertain(export: &mut ExportState, reason: &str) {
+fn mark_uncertain(export: &mut ExportState, reason: &str) -> bool {
     if matches!(export.status, ExportStatus::Unused) {
         export.status = ExportStatus::Uncertain(reason.to_string());
+        true
+    } else {
+        false
     }
 }
 

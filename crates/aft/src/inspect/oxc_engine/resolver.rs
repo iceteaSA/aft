@@ -50,17 +50,13 @@ impl ResolverConfigTracker {
         if !path.is_file() {
             return;
         }
-        if let Ok(bytes) = fs::read(path) {
-            self.inputs.insert(
-                normalize_path(path),
-                blake3::hash(&bytes).to_hex().to_string(),
-            );
+        let normalized = normalize_path(path);
+        if self.inputs.contains_key(&normalized) {
+            return;
         }
-    }
-
-    pub fn record_nearest(&mut self, start_dir: &Path, boundary: &Path, file_name: &str) {
-        if let Some(path) = nearest_named_file(start_dir, boundary, file_name) {
-            self.record_if_file(&path);
+        if let Ok(bytes) = fs::read(path) {
+            self.inputs
+                .insert(normalized, blake3::hash(&bytes).to_hex().to_string());
         }
     }
 
@@ -92,6 +88,34 @@ pub struct ModuleResolver {
     path_to_id: FxHashMap<PathBuf, FileId>,
     file_set: BTreeSet<PathBuf>,
     root_package_name: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ResolverPassCache {
+    nearest_configs: FxHashMap<(PathBuf, String), Option<PathBuf>>,
+    package_entries: FxHashMap<PathBuf, Option<Vec<String>>>,
+    resolutions: FxHashMap<(PathBuf, String), Option<FileId>>,
+    resolved_path_ids: FxHashMap<PathBuf, Option<FileId>>,
+}
+
+impl ResolverPassCache {
+    fn record_nearest_config(
+        &mut self,
+        tracker: &mut ResolverConfigTracker,
+        start_dir: &Path,
+        boundary: &Path,
+        file_name: &str,
+    ) {
+        let key = (start_dir.to_path_buf(), file_name.to_string());
+        let path = self
+            .nearest_configs
+            .entry(key)
+            .or_insert_with(|| nearest_named_file(start_dir, boundary, file_name))
+            .clone();
+        if let Some(path) = path {
+            tracker.record_if_file(&path);
+        }
+    }
 }
 
 impl ModuleResolver {
@@ -127,6 +151,7 @@ impl ModuleResolver {
         Vec<OxcResolvedEdge>,
     ) {
         let mut tracker = ResolverConfigTracker::default();
+        let mut cache = ResolverPassCache::default();
         let mut edges = Vec::new();
         let modules = facts
             .iter()
@@ -135,8 +160,12 @@ impl ModuleResolver {
                     .imports
                     .iter()
                     .map(|import| {
-                        let target =
-                            self.resolve_specifier(&file_facts.path, &import.source, &mut tracker);
+                        let target = self.resolve_specifier(
+                            &file_facts.path,
+                            &import.source,
+                            &mut tracker,
+                            &mut cache,
+                        );
                         edges.push(OxcResolvedEdge {
                             from_file: file_facts.path.clone(),
                             specifier: import.source.clone(),
@@ -157,6 +186,7 @@ impl ModuleResolver {
                             &file_facts.path,
                             &re_export.source,
                             &mut tracker,
+                            &mut cache,
                         );
                         edges.push(OxcResolvedEdge {
                             from_file: file_facts.path.clone(),
@@ -175,7 +205,12 @@ impl ModuleResolver {
                     .iter()
                     .map(|dynamic| {
                         let target = dynamic.source.as_ref().and_then(|source| {
-                            self.resolve_specifier(&file_facts.path, source, &mut tracker)
+                            self.resolve_specifier(
+                                &file_facts.path,
+                                source,
+                                &mut tracker,
+                                &mut cache,
+                            )
                         });
                         if let Some(source) = &dynamic.source {
                             edges.push(OxcResolvedEdge {
@@ -207,6 +242,7 @@ impl ModuleResolver {
         from_file: &Path,
         specifier: &str,
         tracker: &mut ResolverConfigTracker,
+        cache: &mut ResolverPassCache,
     ) -> Option<FileId> {
         if is_external_builtin_or_url(specifier) {
             return None;
@@ -217,17 +253,25 @@ impl ModuleResolver {
         // when the issuer is verbatim even though relative imports still resolve.
         let from_file = normalize_path(from_file);
         let from_dir = from_file.parent().unwrap_or(&self.project_root);
-        tracker.record_nearest(from_dir, &self.project_root, "tsconfig.json");
-        tracker.record_nearest(from_dir, &self.project_root, "package.json");
+        let cache_key = (from_dir.to_path_buf(), specifier.to_string());
+        if let Some(target) = cache.resolutions.get(&cache_key) {
+            return *target;
+        }
+
+        cache.record_nearest_config(tracker, from_dir, &self.project_root, "tsconfig.json");
+        cache.record_nearest_config(tracker, from_dir, &self.project_root, "package.json");
 
         let resolved_path = self
             .resolve_with_oxc(&from_file, from_dir, specifier)
             .or_else(|| self.resolve_local_fallback(from_dir, specifier))
-            .or_else(|| self.resolve_package_fallback(specifier, tracker));
+            .or_else(|| self.resolve_package_fallback(specifier, tracker, cache));
 
-        let resolved_path = resolved_path?;
-        self.id_for_resolved_path(&resolved_path)
-            .or_else(|| self.id_for_build_output_remap(&resolved_path))
+        let target = resolved_path.and_then(|resolved_path| {
+            self.id_for_resolved_path(&resolved_path, cache)
+                .or_else(|| self.id_for_build_output_remap(&resolved_path))
+        });
+        cache.resolutions.insert(cache_key, target);
+        target
     }
 
     fn resolve_with_oxc(
@@ -263,6 +307,7 @@ impl ModuleResolver {
         &self,
         specifier: &str,
         tracker: &mut ResolverConfigTracker,
+        cache: &mut ResolverPassCache,
     ) -> Option<PathBuf> {
         let (package_name, subpath) = package_name_and_subpath(specifier)?;
         let package_dir = if self.root_package_name.as_deref() == Some(package_name.as_str()) {
@@ -270,18 +315,28 @@ impl ModuleResolver {
         } else {
             self.project_root.join("node_modules").join(&package_name)
         };
-        let package_json = package_dir.join("package.json");
-        tracker.record_if_file(&package_json);
-        let value = fs::read_to_string(&package_json)
-            .ok()
-            .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
+        let cached_entries = cache
+            .package_entries
+            .entry(package_dir.clone())
+            .or_insert_with(|| {
+                let package_json = package_dir.join("package.json");
+                tracker.record_if_file(&package_json);
+                let value = fs::read_to_string(&package_json)
+                    .ok()
+                    .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
+                let mut entries = Vec::new();
+                collect_package_entries(&value, &mut entries);
+                Some(entries)
+            });
+        let package_entries = cached_entries.as_ref()?;
 
-        let mut entries = Vec::new();
-        if let Some(subpath) = subpath {
-            entries.push(subpath.trim_start_matches('/').to_string());
+        let subpath_entries;
+        let entries = if let Some(subpath) = subpath {
+            subpath_entries = vec![subpath.trim_start_matches('/').to_string()];
+            subpath_entries.as_slice()
         } else {
-            collect_package_entries(&value, &mut entries);
-        }
+            package_entries.as_slice()
+        };
 
         entries
             .iter()
@@ -291,13 +346,18 @@ impl ModuleResolver {
             .find(|candidate| self.file_set.contains(candidate) || candidate.is_file())
     }
 
-    fn id_for_resolved_path(&self, path: &Path) -> Option<FileId> {
+    fn id_for_resolved_path(&self, path: &Path, cache: &mut ResolverPassCache) -> Option<FileId> {
         let normalized = normalize_path(path);
-        self.path_to_id.get(&normalized).copied().or_else(|| {
+        if let Some(id) = cache.resolved_path_ids.get(&normalized) {
+            return *id;
+        }
+        let id = self.path_to_id.get(&normalized).copied().or_else(|| {
             fs::canonicalize(path)
                 .ok()
                 .and_then(|canonical| self.path_to_id.get(&normalize_path(&canonical)).copied())
-        })
+        });
+        cache.resolved_path_ids.insert(normalized, id);
+        id
     }
 
     fn id_for_build_output_remap(&self, path: &Path) -> Option<FileId> {
