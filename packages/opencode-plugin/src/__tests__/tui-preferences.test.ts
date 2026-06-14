@@ -224,9 +224,13 @@ describe("queueTuiPreferenceUpdate interop", () => {
     expect(root["anthropic-auth"]).toEqual({ pollMs: 2000, collapsed: false });
     expect((root.aft as Record<string, unknown>).collapsed).toBe(true);
     expect(() => readTuiPreferencesFile()).not.toThrow();
-    // comment-json round-trip may not preserve all inline comments; sibling values must survive.
+    // comment-json round-trips sibling comments faithfully (verified): the
+    // sibling key's values AND both its block and inline comments must survive
+    // AFT writing only its own key.
     expect(text).toContain("anthropic-auth");
     expect(text).toContain("pollMs");
-    expect(text.includes("// my shared notes") || text.includes("my shared notes")).toBe(true);
+    expect(text).toContain("// my shared notes");
+    expect(text).toContain("// anthropic-auth plugin");
+    expect(text).toContain("// tuned");
   });
 });
