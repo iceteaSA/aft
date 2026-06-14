@@ -107,6 +107,9 @@ export {
   shouldEmitStatusBar,
   statusBarLine,
 } from "./status-bar.js";
+// --- shared agent-facing tool formatting ---
+export type { ReadFooterOptions } from "./tool-format.js";
+export { formatBridgeErrorMessage, formatReadFooter } from "./tool-format.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
 export type {
   ZoomMultiTargetEntry,

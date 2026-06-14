@@ -11,6 +11,7 @@ import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerAstTools } from "../tools/ast.js";
 import { registerFsTools } from "../tools/fs.js";
+import { registerHoistedTools } from "../tools/hoisted.js";
 import { registerImportTools } from "../tools/imports.js";
 import { registerInspectTool } from "../tools/inspect.js";
 import { registerNavigateTool } from "../tools/navigate.js";
@@ -204,6 +205,120 @@ describe("AFT external-directory permissions", () => {
       ),
     ).rejects.toThrow("cannot prompt for modify outside the project");
     expect(calls).toHaveLength(0);
+  });
+
+  test("hoisted read/write/edit/grep prompt for external absolute, parent-relative, and tilde paths", async () => {
+    const pathForms = [
+      { input: "/outside/hoisted.ts", expected: "/outside/hoisted.ts" },
+      { input: "../outside/hoisted.ts", expected: resolve("/repo", "../outside/hoisted.ts") },
+      {
+        input: "~/aft-pi-hoisted/hoisted.ts",
+        expected: resolve(homedir(), "aft-pi-hoisted/hoisted.ts"),
+      },
+    ];
+    const cases = [
+      {
+        toolName: "read",
+        command: "read",
+        action: "read",
+        params: (target: string) => ({ path: target }),
+      },
+      {
+        toolName: "write",
+        command: "write",
+        action: "modify",
+        params: (target: string) => ({ filePath: target, content: "updated\n" }),
+      },
+      {
+        toolName: "edit",
+        command: "edit_match",
+        action: "modify",
+        params: (target: string) => ({ filePath: target, oldString: "before", newString: "after" }),
+      },
+      {
+        toolName: "grep",
+        command: "grep",
+        action: "search",
+        params: (target: string) => ({ pattern: "needle", path: target }),
+      },
+    ];
+
+    for (const entry of cases) {
+      for (const form of pathForms) {
+        const { api, tools } = makeMockApi();
+        const prompts: Prompt[] = [];
+        const { bridge, calls } = makeMockBridge((command) => {
+          if (command === "read") return { success: true, content: "ok" };
+          if (command === "grep") return { success: true, text: "ok" };
+          return {
+            success: true,
+            diff: { before: "", after: "updated\n", additions: 1, deletions: 0 },
+          };
+        });
+        registerHoistedTools(api, restrictedContext(bridge), {
+          hoistRead: true,
+          hoistWrite: true,
+          hoistEdit: true,
+          hoistGrep: true,
+          restrictToProjectRoot: true,
+        });
+
+        await executeTool(
+          tools.get(entry.toolName)!,
+          entry.params(form.input),
+          confirmingExtContext(prompts),
+        );
+
+        expect(prompts).toHaveLength(1);
+        expect(prompts[0]).toEqual({
+          title: "Allow external directory access?",
+          message: `AFT wants to ${entry.action} outside the project: ${form.expected}`,
+        });
+        expect(calls.some((call) => call.command === entry.command)).toBe(true);
+      }
+    }
+  });
+
+  test("hoisted read/write/edit/grep deny external paths without UI before bridge calls", async () => {
+    const cases = [
+      {
+        toolName: "read",
+        action: "read",
+        params: { path: "/outside/no-ui.ts" },
+      },
+      {
+        toolName: "write",
+        action: "modify",
+        params: { filePath: "/outside/no-ui.ts", content: "updated\n" },
+      },
+      {
+        toolName: "edit",
+        action: "modify",
+        params: { filePath: "/outside/no-ui.ts", oldString: "before", newString: "after" },
+      },
+      {
+        toolName: "grep",
+        action: "search",
+        params: { pattern: "needle", path: "/outside" },
+      },
+    ];
+
+    for (const entry of cases) {
+      const { api, tools } = makeMockApi();
+      const { bridge, calls } = makeMockBridge();
+      registerHoistedTools(api, restrictedContext(bridge), {
+        hoistRead: true,
+        hoistWrite: true,
+        hoistEdit: true,
+        hoistGrep: true,
+        restrictToProjectRoot: true,
+      });
+
+      await expect(
+        executeTool(tools.get(entry.toolName)!, entry.params, makeExtContext("/repo")),
+      ).rejects.toThrow(`cannot prompt for ${entry.action} outside the project`);
+      expect(calls).toHaveLength(0);
+    }
   });
 
   test("restrict_to_project_root=false skips external prompts", async () => {

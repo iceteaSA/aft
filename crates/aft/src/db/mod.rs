@@ -378,6 +378,60 @@ mod tests {
     }
 
     #[test]
+    fn migration_v2_deduplicates_compression_events_and_adds_unique_index() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (1)", [])
+            .unwrap();
+        insert_compression_event(
+            &conn,
+            1,
+            "opencode",
+            Some("session-1"),
+            "project-key",
+            "bash",
+            Some("task-1"),
+        )
+        .unwrap();
+        insert_compression_event(
+            &conn,
+            2,
+            "opencode",
+            Some("session-1"),
+            "project-key",
+            "bash",
+            Some("task-1"),
+        )
+        .unwrap();
+        insert_compression_event(&conn, 3, "opencode", None, "project-key", "bash", None).unwrap();
+        drop(conn);
+
+        let conn = open(&path).unwrap();
+
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+        let ids = compression_event_ids(&conn);
+        assert_eq!(ids, vec![1, 3]);
+        let indexes = sqlite_names(&conn, "index");
+        assert!(
+            indexes.contains(&"idx_compression_event_identity".to_string()),
+            "missing v2 unique compression event identity index"
+        );
+        assert_unique_constraint(insert_compression_event(
+            &conn,
+            4,
+            "opencode",
+            Some("session-1"),
+            "project-key",
+            "bash",
+            Some("task-1"),
+        ));
+    }
+
+    #[test]
     fn migration_runner_no_op_when_current() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("aft.db");
@@ -512,6 +566,48 @@ mod tests {
                 1_i64
             ],
         )
+    }
+
+    fn insert_compression_event(
+        conn: &Connection,
+        id: i64,
+        harness: &str,
+        session_id: Option<&str>,
+        project_key: &str,
+        tool: &str,
+        task_id: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO compression_events (
+                id, harness, session_id, project_key, tool, task_id, command, compressor,
+                original_bytes, compressed_bytes, original_tokens, compressed_tokens, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                id,
+                harness,
+                session_id,
+                project_key,
+                tool,
+                task_id,
+                "echo ok",
+                "test-compressor",
+                100_i64,
+                50_i64,
+                20_i64,
+                10_i64,
+                id
+            ],
+        )
+    }
+
+    fn compression_event_ids(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM compression_events ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     fn insert_backup(

@@ -11,7 +11,11 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { coerceStringArray, formatEditSummary } from "@cortexkit/aft-bridge";
+import {
+  coerceStringArray,
+  formatEditSummary,
+  formatReadFooter as formatSharedReadFooter,
+} from "@cortexkit/aft-bridge";
 import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
@@ -41,52 +45,12 @@ function relativeToWorktree(fp: string, worktree: string): string {
 /**
  * Build the navigation footer for a `read` response.
  *
- * Two cases (kept aligned with the Pi plugin's helper of the same name):
- *
- *   A. Agent did NOT specify a range
- *      → if the response is clamped (Rust's default limit / byte cap
- *        kicked in), emit a hint footer so they know more exists and
- *        how to get it. Otherwise no footer (the response IS the file).
- *
- *   B. Agent EXPLICITLY supplied startLine/endLine OR offset/limit
- *      → no footer. The agent picked the range, so:
- *         - they already have the math
- *         - if the range was clamped vs. what they asked for, they can
- *           see that from `content` length vs. their requested range
- *         - telling them "use startLine/endLine to read other sections"
- *           right after they used those exact params is patronizing
- *           and burns tokens (the user's exact dogfooding complaint
- *           when this returned the hint for read({130, 190}) on a
- *           191-line file).
- *
- * `data.truncated` from Rust means "response is a slice of the file" — TRUE
- * even when the slice matches what the agent asked for. So we cannot key
- * the hint off that flag alone; we also need to know whether the agent
- * picked the range.
- *
- * Earlier drafts emitted a compact `(Lines X-Y of Z)` when the agent
- * picked a range AND `endLine < totalLines`, on the theory that this
- * meant their range was clamped. But that condition fires whenever the
- * agent's chosen range happens not to extend to EOF (the user's exact
- * complaint case: they asked 130-190 of 191 → end_line(190) < total(191)
- * → spurious compact footer). Removed.
+ * The pure clamping/range logic lives in aft-bridge. OpenCode keeps the
+ * host-specific parameter hint (`startLine/endLine`) here so existing
+ * agent-facing output stays byte-for-byte identical.
  */
 function formatReadFooter(agentSpecifiedRange: boolean, data: Record<string, unknown>): string {
-  // CASE B: agent picked the range. No footer at all. They have the math.
-  if (agentSpecifiedRange) return "";
-
-  if (!data.truncated) return "";
-
-  const startLine = data.start_line as number | undefined;
-  const endLine = data.end_line as number | undefined;
-  const totalLines = data.total_lines as number | undefined;
-  if (startLine === undefined || endLine === undefined || totalLines === undefined) {
-    return "";
-  }
-
-  // CASE A: agent did not pick a range, response was clamped — hint is
-  // useful, tell them how to read more.
-  return `\n(Showing lines ${startLine}-${endLine} of ${totalLines}. Use startLine/endLine to read other sections.)`;
+  return formatSharedReadFooter(agentSpecifiedRange, data, { rangeHint: "startLine/endLine" });
 }
 
 /** Test-only export. Production code uses buildUnifiedDiff directly. */
@@ -1152,24 +1116,38 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       // move that succeeded at the destination but failed at source deletion
       // left orphan files behind that rollback never cleaned up (audit #8).
       const affectedAbs = new Set<string>();
-      // Files that did NOT exist before this patch — add targets plus move
-      // destinations whose path was empty. On rollback we delete these
-      // instead of restoring content that was never there.
-      const newlyCreatedAbs = new Set<string>();
+      // Snapshot initial existence for every touched path BEFORE applying any
+      // hunk. A patch can delete an existing file and then add the same path
+      // back; that add target is not "new" for checkpoint purposes because
+      // aft_safety must be able to restore the original pre-patch contents.
+      const initiallyExistsAbs = new Map<string, boolean>();
+      const rememberAffectedPath = (abs: string) => {
+        affectedAbs.add(abs);
+        if (!initiallyExistsAbs.has(abs)) {
+          initiallyExistsAbs.set(abs, fs.existsSync(abs));
+        }
+      };
 
       for (const h of hunks) {
         const srcAbs = resolvePathFromProjectRoot(projectRoot, h.path);
-        affectedAbs.add(srcAbs);
-        if (h.type === "add") {
+        rememberAffectedPath(srcAbs);
+        if (h.type === "update" && h.move_path) {
+          rememberAffectedPath(resolvePathFromProjectRoot(projectRoot, h.move_path));
+        }
+      }
+
+      // Files that did NOT exist before this patch — add targets plus move
+      // destinations whose path was empty at patch start. On rollback we
+      // delete these instead of restoring content that was never there.
+      const newlyCreatedAbs = new Set<string>();
+      for (const h of hunks) {
+        const srcAbs = resolvePathFromProjectRoot(projectRoot, h.path);
+        if (h.type === "add" && initiallyExistsAbs.get(srcAbs) === false) {
           newlyCreatedAbs.add(srcAbs);
         }
         if (h.type === "update" && h.move_path) {
           const dstAbs = resolvePathFromProjectRoot(projectRoot, h.move_path);
-          affectedAbs.add(dstAbs);
-          // Snapshot the destination if it exists so rollback restores the
-          // original contents. If it doesn't exist, track it as newly
-          // created so rollback removes it.
-          if (!fs.existsSync(dstAbs)) {
+          if (initiallyExistsAbs.get(dstAbs) === false) {
             newlyCreatedAbs.add(dstAbs);
           }
         }

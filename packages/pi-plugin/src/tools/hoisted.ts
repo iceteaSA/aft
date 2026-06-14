@@ -20,7 +20,10 @@
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { formatEditSummary } from "@cortexkit/aft-bridge";
+import {
+  formatEditSummary,
+  formatReadFooter as formatSharedReadFooter,
+} from "@cortexkit/aft-bridge";
 import {
   type AgentToolResult,
   type ExtensionAPI,
@@ -279,9 +282,15 @@ export function registerHoistedTools(
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const offset = coerceOptionalInt(params.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
         const limit = coerceOptionalInt(params.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
-        // Resolve ~ / relative so Rust gets a real path, not a literal `~/...`.
+        // Resolve ~ / relative once and use the same value for the permission
+        // check and the bridge. Without this, hoisted read bypassed Pi's
+        // external-path prompt/deny layer while write/edit/grep were guarded.
+        const filePath = await resolvePathArg(extCtx.cwd, params.path);
+        await assertExternalDirectoryPermission(extCtx, filePath, "read", {
+          restrictToProjectRoot: surface.restrictToProjectRoot,
+        });
         const req: Record<string, unknown> = {
-          file: await resolvePathArg(extCtx.cwd, params.path),
+          file: filePath,
         };
         if (offset !== undefined) {
           req.start_line = offset;
@@ -768,29 +777,15 @@ export function splitIncludeGlobs(include: string): string[] {
 }
 
 /**
- * Build the navigation footer for a `read` response. Mirrors the OpenCode
- * plugin's helper of the same name. See packages/opencode-plugin/src/tools/
- * hoisted.ts::formatReadFooter for the case rationale; the two are kept in
- * sync deliberately. (Not factored into a shared package because there is no
- * cross-plugin shared module yet and ~40 lines doesn't justify creating one.)
+ * Build the navigation footer for a `read` response.
+ *
+ * The pure clamping/range logic lives in aft-bridge. Pi keeps the
+ * host-specific parameter hint (`offset/limit`) here so existing agent-facing
+ * output stays byte-for-byte identical.
  */
 export function formatReadFooter(
   agentSpecifiedRange: boolean,
   data: Record<string, unknown>,
 ): string {
-  // CASE B: agent picked the range. No footer at all. They have the math.
-  if (agentSpecifiedRange) return "";
-
-  if (!data.truncated) return "";
-
-  const startLine = data.start_line as number | undefined;
-  const endLine = data.end_line as number | undefined;
-  const totalLines = data.total_lines as number | undefined;
-  if (startLine === undefined || endLine === undefined || totalLines === undefined) {
-    return "";
-  }
-
-  // CASE A: agent did not pick a range, response was clamped — hint
-  // is useful, tell them how to read more.
-  return `\n(Showing lines ${startLine}-${endLine} of ${totalLines}. Use offset/limit to read other sections.)`;
+  return formatSharedReadFooter(agentSpecifiedRange, data, { rangeHint: "offset/limit" });
 }
