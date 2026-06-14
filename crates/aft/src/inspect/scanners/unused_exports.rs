@@ -12,7 +12,8 @@ use crate::cache_freshness;
 use crate::imports::{parse_file_imports, specifier_imported_name, ImportBlock, ImportStatement};
 use crate::inspect::job::is_test_support_file;
 use crate::inspect::oxc_engine::{
-    ExportFact, FileFacts, LivenessVerdict, OxcEngineResult, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
+    ExportFact, FileFacts, LivenessVerdict, OxcEngineError, OxcEngineResult, FACTS_FORMAT_VERSION,
+    OXC_PROVENANCE,
 };
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
@@ -295,6 +296,15 @@ fn run_unused_exports_oxc_scan(
         }
     }
 
+    for error in &oxc_result.errors {
+        if facts_by_file.contains_key(&normalize_path(&error.file)) {
+            continue;
+        }
+        if let Some(contribution) = oxc_read_error_contribution(&project_root, error) {
+            contributions.push(contribution);
+        }
+    }
+
     let non_js_scans = job
         .scope_files
         .iter()
@@ -410,6 +420,44 @@ fn oxc_unused_exports_contribution(
         freshness,
         contribution_with_relative_file(project_root, contribution, &facts.path),
     ))
+}
+
+fn oxc_read_error_contribution(
+    project_root: &Path,
+    error: &OxcEngineError,
+) -> Option<FileContribution> {
+    let error_file_path = absolute_path(project_root, &error.file);
+    let relative_file = relative_string(project_root, &error_file_path);
+    let file_path = if Path::new(&relative_file).is_absolute() {
+        error_file_path
+    } else {
+        normalize_path(&project_root.join(&relative_file))
+    };
+    let freshness = freshness_for_oxc_error_file(&file_path)?;
+    let contribution = json!({
+        "file": relative_file,
+        "exports": [],
+        "imports": [],
+        "parse_errors": [{
+            "file": relative_file,
+            "message": error.message,
+        }],
+    });
+    Some(FileContribution::new(
+        InspectCategory::UnusedExports,
+        file_path,
+        freshness,
+        contribution,
+    ))
+}
+
+fn freshness_for_oxc_error_file(path: &Path) -> Option<cache_freshness::FileFreshness> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(cache_freshness::FileFreshness {
+        mtime: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        size: metadata.len(),
+        content_hash: cache_freshness::zero_hash(),
+    })
 }
 
 fn contribution_with_relative_file(
@@ -1290,11 +1338,27 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {
-    normalize_path(path)
-        .strip_prefix(project_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    let normalized_root = normalize_path(project_root);
+    let normalized_path = normalize_path(path);
+    if let Ok(relative) = normalized_path.strip_prefix(&normalized_root) {
+        return slash_path(relative);
+    }
+
+    if let (Ok(canonical_root), Ok(canonical_path)) =
+        (fs::canonicalize(project_root), fs::canonicalize(path))
+    {
+        let canonical_root = normalize_path(&canonical_root);
+        let canonical_path = normalize_path(&canonical_path);
+        if let Ok(relative) = canonical_path.strip_prefix(&canonical_root) {
+            return slash_path(relative);
+        }
+    }
+
+    slash_path(&normalized_path)
+}
+
+fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn strip_quotes(text: &str) -> &str {

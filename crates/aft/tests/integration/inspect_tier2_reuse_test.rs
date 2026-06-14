@@ -769,6 +769,48 @@ console.log(x);
     );
 
     assert_unused_exports_incremental_matches_cold(
+        "tsconfig_base_alias_change",
+        |root| {
+            write_file(
+                root,
+                "tsconfig.json",
+                r#"{"extends":"./tsconfig.base.json"}"#,
+            );
+            write_file(
+                root,
+                "tsconfig.base.json",
+                r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib":["src/a.ts"]}}}"#,
+            );
+            write_file(
+                root,
+                "src/a.ts",
+                "export const x = 'a';
+",
+            );
+            write_file(
+                root,
+                "src/b.ts",
+                "export const x = 'b';
+",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import { x } from '@lib';
+console.log(x);
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "tsconfig.base.json",
+                r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib":["src/b.ts"]}}}"#,
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
         "barrel_target_changed",
         |root| {
             write_file(
@@ -922,6 +964,95 @@ export const newOnly = 3;
             );
         },
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn inspect_unused_exports_oxc_read_error_surfaces_after_cached_rollup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn assert_read_error(success: &InspectScanSuccess, relative_file: &str) {
+        assert_eq!(
+            success.aggregate["complete"].as_bool(),
+            Some(false),
+            "read error should make aggregate incomplete: {:#}",
+            success.aggregate
+        );
+        let parse_errors = success.aggregate["parse_errors"]
+            .as_array()
+            .expect("parse_errors array");
+        assert!(
+            parse_errors.iter().any(|error| {
+                error.get("file").and_then(Value::as_str) == Some(relative_file)
+                    && error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|message| message.contains("read:"))
+            }),
+            "expected read error for {relative_file}: {:#}",
+            success.aggregate
+        );
+    }
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project-unreadable-unused-exports");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(&root, "package.json", r#"{}"#);
+    write_file(
+        &root,
+        "src/good.ts",
+        "export const good = 1;
+",
+    );
+    let unreadable = write_file(
+        &root,
+        "src/unreadable.ts",
+        "export const hidden = 1;
+",
+    );
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+        .expect("make fixture unreadable");
+
+    let inspect_dir = temp_dir.path().join("inspect-unreadable");
+    let manager = InspectManager::new();
+    let (first, _first_elapsed) = run_reuse_category(
+        &manager,
+        snapshot(&root, &inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    if first.aggregate["complete"].as_bool() != Some(false) {
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644))
+            .expect("restore readable fixture");
+        eprintln!("skipping unreadable-file assertion because this process can read chmod 000");
+        return;
+    }
+    assert_read_error(&first, "src/unreadable.ts");
+
+    write_file(&root, "package.json", r#"{"main":"src/good.ts"}"#);
+    let (second, _second_elapsed) = run_reuse_category(
+        &manager,
+        snapshot(&root, &inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+
+    let second_scanned = relative_paths(&root, &second.scanned_files);
+    assert!(
+        !second_scanned.iter().any(|path| path == "src/good.ts"),
+        "error-only contributions should not force a full JS/TS facts refresh: {second_scanned:?}"
+    );
+    assert_read_error(&second, "src/unreadable.ts");
+    assert!(
+        second.contributions.iter().any(|contribution| {
+            contribution.contribution["file"].as_str() == Some("src/unreadable.ts")
+                && contribution.contribution["parse_errors"]
+                    .as_array()
+                    .is_some_and(|errors| !errors.is_empty())
+        }),
+        "cached roll-up should load an error contribution for unreadable.ts"
+    );
+
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644))
+        .expect("restore readable fixture");
 }
 
 #[test]

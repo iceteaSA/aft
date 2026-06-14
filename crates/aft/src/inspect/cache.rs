@@ -107,7 +107,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// roll-up, enabling incremental one-file reparses without stale verdicts.
 /// v17: dead_code stores raw per-file facts and recomputes callgraph/re-export,
 /// entry-root, imported-export, and oxc verdict liveness during roll-up.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 17;
+/// v18: dead_code/unused_exports aggregate hashes include the full TS/JS
+/// resolver-config dependency set (tsconfig/jsconfig variants and extends
+/// chains), so alias-only config edits invalidate verdict roll-ups.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 18;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1096,16 +1099,7 @@ fn update_resolver_config_fingerprint_hash(
     let manifest_root =
         fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     hasher.update(b"ts-js-resolver-configs\0");
-    let mut configs = crate::callgraph::walk_project_files(project_root)
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "tsconfig.json")
-        })
-        .collect::<Vec<_>>();
-    configs.sort();
-    configs.dedup();
-    for config in configs {
+    for config in collect_resolver_config_dependency_files(project_root) {
         let relative_path = config
             .strip_prefix(&manifest_root)
             .unwrap_or(config.as_path())
@@ -1118,6 +1112,266 @@ fn update_resolver_config_fingerprint_hash(
         hasher.update(b"\0");
     }
     Ok(())
+}
+
+fn collect_resolver_config_dependency_files(project_root: &Path) -> BTreeSet<PathBuf> {
+    let mut configs = walk_resolver_config_files(project_root);
+    let mut pending = configs.iter().cloned().collect::<Vec<_>>();
+    while let Some(config) = pending.pop() {
+        for extended in resolver_config_extends_targets(&config, project_root) {
+            if configs.insert(extended.clone()) {
+                pending.push(extended);
+            }
+        }
+    }
+    configs
+}
+
+fn walk_resolver_config_files(project_root: &Path) -> BTreeSet<PathBuf> {
+    let walker = ignore::WalkBuilder::new(project_root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore")
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+            {
+                return !matches!(
+                    name.as_ref(),
+                    "node_modules"
+                        | "target"
+                        | "venv"
+                        | ".venv"
+                        | ".git"
+                        | "__pycache__"
+                        | ".tox"
+                        | "dist"
+                        | "build"
+                );
+            }
+            true
+        })
+        .build();
+
+    walker
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+        })
+        .map(|entry| entry.into_path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_resolver_config_file_name)
+        })
+        .filter_map(canonical_file_path)
+        .collect()
+}
+
+fn is_resolver_config_file_name(name: &str) -> bool {
+    name == "tsconfig.json"
+        || name == "jsconfig.json"
+        || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
+            && name.ends_with(".json"))
+}
+
+fn resolver_config_extends_targets(config: &Path, project_root: &Path) -> Vec<PathBuf> {
+    let Ok(source) = fs::read_to_string(config) else {
+        return Vec::new();
+    };
+    let Ok(value) = parse_resolver_config_json(&source) else {
+        return Vec::new();
+    };
+
+    let mut specs = Vec::new();
+    collect_extends_specs(value.get("extends"), &mut specs);
+    specs
+        .into_iter()
+        .filter_map(|spec| resolve_resolver_config_extends(config, project_root, spec))
+        .collect()
+}
+
+fn parse_resolver_config_json(source: &str) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(source).or_else(|_| serde_json::from_str(&strip_jsonc(source)))
+}
+
+fn strip_jsonc(source: &str) -> String {
+    strip_trailing_commas(&strip_jsonc_comments(source))
+}
+
+fn strip_jsonc_comments(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+            continue;
+        }
+
+        if ch == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut previous = '\0';
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            output.push('\n');
+                        }
+                        if previous == '*' && next == '/' {
+                            break;
+                        }
+                        previous = next;
+                    }
+                }
+                _ => output.push(ch),
+            }
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn strip_trailing_commas(source: &str) -> String {
+    let chars = source.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(source.len());
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+
+        if ch == ',' {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].is_whitespace() {
+                next += 1;
+            }
+            if next < chars.len() && matches!(chars[next], '}' | ']') {
+                index += 1;
+                continue;
+            }
+        }
+
+        output.push(ch);
+        index += 1;
+    }
+
+    output
+}
+
+fn collect_extends_specs<'a>(value: Option<&'a serde_json::Value>, specs: &mut Vec<&'a str>) {
+    match value {
+        Some(serde_json::Value::String(spec)) => specs.push(spec),
+        Some(serde_json::Value::Array(values)) => {
+            for value in values {
+                collect_extends_specs(Some(value), specs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_resolver_config_extends(
+    config: &Path,
+    project_root: &Path,
+    spec: &str,
+) -> Option<PathBuf> {
+    let config_dir = config.parent().unwrap_or(project_root);
+    let spec_path = Path::new(spec);
+    let candidates = if spec_path.is_absolute() || spec.starts_with('.') {
+        resolver_config_extends_candidates(&config_dir.join(spec_path))
+    } else {
+        node_modules_resolver_config_candidates(config_dir, project_root, spec)
+    };
+    candidates.into_iter().find_map(canonical_file_path)
+}
+
+fn node_modules_resolver_config_candidates(
+    config_dir: &Path,
+    project_root: &Path,
+    spec: &str,
+) -> Vec<PathBuf> {
+    let boundary = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let mut candidates = Vec::new();
+    for ancestor in config_dir.ancestors() {
+        let ancestor = fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+        if !ancestor.starts_with(&boundary) {
+            break;
+        }
+        candidates.extend(resolver_config_extends_candidates(
+            &ancestor.join("node_modules").join(spec),
+        ));
+    }
+    candidates
+}
+
+fn resolver_config_extends_candidates(base: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![base.to_path_buf()];
+    if base.extension().is_none() {
+        candidates.push(base.with_extension("json"));
+        candidates.push(base.join("tsconfig.json"));
+    }
+    candidates
+}
+
+fn canonical_file_path(path: PathBuf) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    Some(fs::canonicalize(&path).unwrap_or(path))
 }
 
 fn update_manifest_fingerprint_hash(
@@ -1158,10 +1412,19 @@ fn update_contribution_fingerprint_hash(
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {
-    path.strip_prefix(project_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        return relative.to_string_lossy().to_string();
+    }
+
+    if let (Ok(canonical_root), Ok(canonical_path)) =
+        (fs::canonicalize(project_root), fs::canonicalize(path))
+    {
+        if let Ok(relative) = canonical_path.strip_prefix(canonical_root) {
+            return relative.to_string_lossy().to_string();
+        }
+    }
+
+    path.to_string_lossy().to_string()
 }
 
 fn system_time_to_ns(time: SystemTime) -> i64 {
@@ -1403,6 +1666,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 17);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 18);
     }
 }
