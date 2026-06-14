@@ -1348,10 +1348,12 @@ fn node_modules_resolver_config_candidates(
     spec: &str,
 ) -> Vec<PathBuf> {
     let boundary = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let config_dir = fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+    let enforce_project_boundary = config_dir.starts_with(&boundary);
     let mut candidates = Vec::new();
     for ancestor in config_dir.ancestors() {
         let ancestor = fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
-        if !ancestor.starts_with(&boundary) {
+        if enforce_project_boundary && !ancestor.starts_with(&boundary) {
             break;
         }
         candidates.extend(resolver_config_extends_candidates(

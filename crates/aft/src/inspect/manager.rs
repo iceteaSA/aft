@@ -692,17 +692,21 @@ impl InspectManager {
         job: &InspectJob,
         cache: &InspectCache,
     ) -> Result<Option<InspectScanSuccess>, String> {
-        let Some(aggregate) = cache
-            .get_aggregated(&job.key)
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
         let cached = load_contribution_fingerprint(cache, job.category)?;
         let current = current_file_fingerprint(&job.project_root, &job.scope_files)?;
         if !cached.hash_complete || !current.hash_complete || cached != current {
             return Ok(None);
         }
+
+        let contribution_set_hash = cache
+            .contribution_set_hash(job.category)
+            .map_err(|error| error.to_string())?;
+        let Some(aggregate) = cache
+            .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
 
         cache
             .touch_tier2_last_full_run(job.category)
@@ -2390,11 +2394,6 @@ fn display_file_from_occurrence(value: &str) -> &str {
     } else {
         value
     }
-}
-
-#[allow(dead_code)]
-fn normalize_scope_root(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
 #[cfg(test)]

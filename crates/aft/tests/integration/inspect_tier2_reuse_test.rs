@@ -192,6 +192,18 @@ fn aggregate_item_symbols(success: &InspectScanSuccess) -> Vec<(String, String)>
     symbols
 }
 
+fn aggregate_contains_symbol(
+    success: &InspectScanSuccess,
+    file_suffix: &str,
+    symbol: &str,
+) -> bool {
+    aggregate_item_symbols(success)
+        .iter()
+        .any(|(file, item_symbol)| {
+            file.replace('\\', "/").ends_with(file_suffix) && item_symbol == symbol
+        })
+}
+
 #[test]
 fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
     let (_temp_dir, root, mutated_file) = build_fixture();
@@ -322,6 +334,207 @@ where
         unused_contribution_payloads(&root, &warm),
         unused_contribution_payloads(&root, &cold),
         "{name}: per-file contribution payload mismatch"
+    );
+}
+
+#[test]
+fn inspect_unused_exports_quick_reuse_invalidates_node_modules_tsconfig_change() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir
+        .path()
+        .join("project-quick-reuse-node-modules-tsconfig");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "tsconfig.json",
+        r#"{"extends":"./node_modules/@scope/tsconfig/tsconfig.base.json"}"#,
+    );
+    write_file(
+        &root,
+        "node_modules/@scope/tsconfig/tsconfig.base.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["src/a.ts"]}}}"#,
+    );
+    write_file(
+        &root,
+        "src/a.ts",
+        "export const x = 'a';
+export const onlyA = 'a-only';
+",
+    );
+    write_file(
+        &root,
+        "src/b.ts",
+        "export const x = 'b';
+export const onlyB = 'b-only';
+",
+    );
+    write_file(
+        &root,
+        "src/use.ts",
+        "import { x } from '@lib';
+console.log(x);
+",
+    );
+
+    let warm_inspect_dir = temp_dir
+        .path()
+        .join("inspect-warm-quick-reuse-node-modules-tsconfig");
+    let warm_manager = InspectManager::new();
+    let (first, _first_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    assert!(
+        aggregate_contains_symbol(&first, "src/b.ts", "x"),
+        "initial alias target should make src/b.ts::x unused"
+    );
+
+    write_file(
+        &root,
+        "node_modules/@scope/tsconfig/tsconfig.base.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["src/b.ts"]}}}"#,
+    );
+
+    let (warm, _warm_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    let cold_inspect_dir = temp_dir
+        .path()
+        .join("inspect-cold-quick-reuse-node-modules-tsconfig");
+    let cold_manager = InspectManager::new();
+    let (cold, _cold_elapsed) = run_reuse_category(
+        &cold_manager,
+        snapshot(&root, &cold_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+
+    assert_eq!(
+        warm.aggregate, cold.aggregate,
+        "resolver-config-only edit should recompute the same roll-up as a cold scan"
+    );
+    assert_ne!(
+        warm.aggregate, first.aggregate,
+        "warm result must not reuse the stale pre-edit aggregate"
+    );
+    assert!(
+        warm.scanned_files.is_empty(),
+        "node_modules resolver-config edit should exercise the no-source-rescan reuse path"
+    );
+    assert!(
+        !warm.contributions.is_empty(),
+        "quick reuse should miss and roll up cached per-file contributions"
+    );
+    assert!(
+        aggregate_contains_symbol(&warm, "src/a.ts", "x"),
+        "updated alias target should make src/a.ts::x unused"
+    );
+}
+
+#[test]
+fn inspect_unused_exports_tracks_external_package_tsconfig_extends_change() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let repo = temp_dir.path().join("repo");
+    let root = repo.join("pkg");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "tsconfig.json",
+        r#"{"extends":"../tsconfig.base.json"}"#,
+    );
+    write_file(
+        &repo,
+        "tsconfig.base.json",
+        r#"{"extends":"@scope/tsconfig"}"#,
+    );
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/package.json",
+        r#"{"name":"@scope/tsconfig","version":"1.0.0","tsconfig":"tsconfig.json"}"#,
+    );
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/tsconfig.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/a.ts"]}}}"#,
+    );
+    write_file(
+        &root,
+        "src/a.ts",
+        "export const x = 'a';
+export const onlyA = 'a-only';
+",
+    );
+    write_file(
+        &root,
+        "src/b.ts",
+        "export const x = 'b';
+export const onlyB = 'b-only';
+",
+    );
+    write_file(
+        &root,
+        "src/use.ts",
+        "import { x } from '@lib';
+console.log(x);
+",
+    );
+
+    let warm_inspect_dir = temp_dir
+        .path()
+        .join("inspect-warm-external-package-extends");
+    let warm_manager = InspectManager::new();
+    let (first, _first_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    assert!(
+        aggregate_contains_symbol(&first, "src/b.ts", "x"),
+        "initial package tsconfig alias target should make src/b.ts::x unused"
+    );
+
+    write_file(
+        &repo,
+        "node_modules/@scope/tsconfig/tsconfig.json",
+        r#"{"compilerOptions":{"baseUrl":"../../..","paths":{"@lib":["pkg/src/b.ts"]}}}"#,
+    );
+
+    let (warm, _warm_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    let cold_inspect_dir = temp_dir
+        .path()
+        .join("inspect-cold-external-package-extends");
+    let cold_manager = InspectManager::new();
+    let (cold, _cold_elapsed) = run_reuse_category(
+        &cold_manager,
+        snapshot(&root, &cold_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+
+    assert_eq!(
+        warm.aggregate, cold.aggregate,
+        "external package tsconfig edit should recompute the same roll-up as a cold scan"
+    );
+    assert_ne!(
+        warm.aggregate, first.aggregate,
+        "warm result must include the second-order bare-package extends dependency"
+    );
+    assert!(
+        warm.scanned_files.is_empty(),
+        "external config edit should not require source rescans"
+    );
+    assert!(
+        !warm.contributions.is_empty(),
+        "quick reuse should miss and roll up cached per-file contributions"
+    );
+    assert!(
+        aggregate_contains_symbol(&warm, "src/a.ts", "x"),
+        "updated package tsconfig alias target should make src/a.ts::x unused"
     );
 }
 
