@@ -17,6 +17,7 @@ import { npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
 import type { HarnessAdapter } from "../adapters/types.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
 import { probeAftBinary } from "../lib/binary-probe.js";
+import { buildRecentAftToolFailuresSectionFromLog } from "../lib/bridge-tool-failures.js";
 import {
   collectDiagnostics,
   type DiagnosticReport,
@@ -1079,6 +1080,8 @@ async function runIssueFlow(argv: string[]): Promise<number> {
       ? "_No error-shaped log lines found in recent history._"
       : ["```", recentErrorLines.join("\n"), "```"].join("\n");
 
+  const toolFailuresSection = buildRecentAftToolFailuresSectionFromLog();
+
   const rawBody = [
     "## Description",
     description,
@@ -1097,6 +1100,8 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     "",
     "## Recent errors (last 20, sanitized)",
     recentErrorsSection,
+    "",
+    toolFailuresSection,
     "",
     "## Logs (last 200 lines per harness)",
     logSections,
