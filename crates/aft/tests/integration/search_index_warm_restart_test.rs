@@ -96,12 +96,19 @@ fn unchanged_head_warm_configure_reuses_verified_cache_without_rebuild_thread() 
     let second = configure_search_index(&mut aft, project.path(), "cfg-second");
     assert_eq!(second["success"], true, "configure failed: {second:?}");
     assert_eq!(second["search_index_cache_reused"], true);
+    // Warm reuse now VERIFIES the cached index on a background thread instead of
+    // inline on the dispatch thread (verify_against_disk content-hashes every
+    // cached file, O(repo) — blocking configure past the 30s transport timeout
+    // on a large repo). So the unchanged-HEAD warm path DOES spawn the
+    // background marker now, and configure returns without doing the hash-all
+    // work synchronously. (Previously this asserted `!marker.exists()`, which
+    // encoded the buggy inline-verify behavior.)
     assert!(
-        !marker.exists(),
-        "unchanged-HEAD warm configure should not spawn the rebuild thread"
+        marker.exists(),
+        "warm reuse should verify the cached index on a background thread"
     );
 
-    let ready = wait_for_search_index_ready(&mut aft, Duration::from_secs(1));
+    let ready = wait_for_search_index_ready(&mut aft, Duration::from_secs(5));
     assert_eq!(ready["search_index"]["status"], "ready");
 
     let status = aft.shutdown();

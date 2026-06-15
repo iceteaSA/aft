@@ -2028,19 +2028,55 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
         match baseline {
             Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
-                index.verify_against_disk(current_head.clone());
-                let symbol_files = search_index_symbol_files(&index);
-                *ctx.search_index().borrow_mut() = Some(index);
-                spawn_symbol_cache_prewarm(
-                    root_for_prewarm,
-                    symbol_cache,
-                    symbol_storage,
-                    symbol_project_key,
-                    symbol_cache_generation,
-                    symbol_files,
-                    is_worktree_bridge_for_search,
-                    session_id_for_bg,
-                );
+                // Install the cached index immediately as NOT-ready, then VERIFY
+                // it against disk on a BACKGROUND thread. `verify_against_disk`
+                // walks the project and content-hashes every cached file
+                // (verify_file_strict → blake3), which is O(repo) and MUST NOT
+                // run on the dispatch thread: configure is dispatched on the
+                // single request loop, so an inline verify blocks configure and
+                // every queued request (bash/read/edit) past the 30s transport
+                // timeout on a large repo. This regressed in v0.39.1 — v0.39.0
+                // verify was stat-only (mtime+size); content_hash was added to
+                // FileFreshness so verify now hashes all files. While ready=false
+                // grep/glob fall back to a walk, exactly like the cache-miss
+                // branch below. The drain installs the verified, ready index.
+                index.set_ready(false);
+                *ctx.search_index().borrow_mut() = Some(index.clone());
+
+                let (tx, rx): (
+                    crossbeam_channel::Sender<SearchIndex>,
+                    crossbeam_channel::Receiver<SearchIndex>,
+                ) = unbounded();
+                *ctx.search_index_rx().borrow_mut() = Some(rx);
+
+                #[cfg(debug_assertions)]
+                mark_search_rebuild_spawn_for_debug();
+
+                let head_for_verify = current_head.clone();
+                thread::spawn(move || {
+                    let session_id_for_prewarm = session_id_for_bg.clone();
+                    log_ctx::with_session(session_id_for_bg, || {
+                        let mut verified = index;
+                        let _cache_lock = if is_worktree_bridge_for_search {
+                            None
+                        } else {
+                            CacheLock::acquire(&cache_dir).ok()
+                        };
+                        verified.verify_against_disk(head_for_verify);
+                        let symbol_files = search_index_symbol_files(&verified);
+                        let _ = tx.send(verified);
+                        spawn_symbol_cache_prewarm(
+                            root_for_prewarm,
+                            symbol_cache,
+                            symbol_storage,
+                            symbol_project_key,
+                            symbol_cache_generation,
+                            symbol_files,
+                            is_worktree_bridge_for_search,
+                            session_id_for_prewarm,
+                        );
+                    });
+                });
             }
             mut baseline => {
                 if let Some(index) = baseline.as_mut() {
