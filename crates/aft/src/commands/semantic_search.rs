@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::context::{AppContext, SemanticIndexStatus};
@@ -22,7 +23,7 @@ const LEXICAL_ONLY_SCORE_CEILING: f32 = 0.25;
 const LEXICAL_ENUMERATION_LIMIT: usize = 50;
 const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
 const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
-const DEGRADED_GREP_FILE_LIMIT: usize = 5_000;
+const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 
 #[derive(Debug, Clone)]
@@ -73,6 +74,14 @@ struct LexicalCollection {
     files: Vec<(PathBuf, f32)>,
     ready: bool,
     engine_capped: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DegradedGrepFallbackResult {
+    grep: GrepResult,
+    file_cap_reached: bool,
+    file_limit: usize,
+    candidate_files: usize,
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -758,12 +767,20 @@ fn semantic_unavailable_grep_fallback_response(
     project_root: &Path,
     top_k: usize,
 ) -> Response {
-    let result = match execute_degraded_grep_fallback(&params.query, project_root, top_k, &req.id) {
+    let fallback = match execute_degraded_grep_fallback(&params.query, project_root, top_k, &req.id)
+    {
         Ok(result) => result,
         Err(response) => return response,
     };
+    let result = &fallback.grep;
     if result.fully_degraded {
         warnings.push(degraded_warning(ctx));
+    }
+    if fallback.file_cap_reached {
+        warnings.push(format!(
+            "Degraded grep reached its {}-file scan cap; additional files were not scanned.",
+            fallback.file_limit
+        ));
     }
     warnings
         .push("Semantic search unavailable; returning lexical-only fallback results.".to_string());
@@ -773,7 +790,24 @@ fn semantic_unavailable_grep_fallback_response(
         .iter()
         .map(|grep_match| grep_match_to_json(grep_match, "literal"))
         .collect::<Vec<_>>();
-    let more_available = result.truncated || result.total_matches > result.matches.len();
+    let more_available = result.truncated
+        || result.total_matches > result.matches.len()
+        || fallback.file_cap_reached;
+    let mut extras = semantic_unavailable_extras(true);
+    if fallback.file_cap_reached {
+        extras.insert(
+            "degraded_grep_walk_truncated".to_string(),
+            serde_json::json!(true),
+        );
+        extras.insert(
+            "degraded_grep_file_limit".to_string(),
+            serde_json::json!(fallback.file_limit),
+        );
+        extras.insert(
+            "degraded_grep_candidate_files".to_string(),
+            serde_json::json!(fallback.candidate_files),
+        );
+    }
 
     search_response(
         req,
@@ -787,13 +821,13 @@ fn semantic_unavailable_grep_fallback_response(
             semantic_status,
             status: "ready",
             complete: false,
-            text: format_grep_lexical_unavailable_text(&detail, &result, project_root),
+            text: format_grep_lexical_unavailable_text(&detail, result, project_root),
             results: result_values,
             more_available,
             engine_capped: result.engine_capped,
             fully_degraded: result.fully_degraded,
             warnings,
-            extras: semantic_unavailable_extras(true),
+            extras,
         },
     )
 }
@@ -803,7 +837,7 @@ fn execute_degraded_grep_fallback(
     project_root: &Path,
     top_k: usize,
     request_id: &str,
-) -> Result<GrepResult, Response> {
+) -> Result<DegradedGrepFallbackResult, Response> {
     let compiled = match pattern_compile::compile(
         query,
         CompileOpts {
@@ -834,6 +868,7 @@ fn execute_degraded_grep_fallback(
 
     let max_results = top_k.clamp(1, DEGRADED_GREP_RESULT_LIMIT);
     let (files, file_cap_reached) = collect_degraded_grep_files(project_root);
+    let candidate_files = files.len();
     let mut matches = Vec::new();
     let mut total_matches = 0usize;
     let mut files_searched = 0usize;
@@ -841,15 +876,24 @@ fn execute_degraded_grep_fallback(
     let mut truncated = false;
     let mut engine_capped = file_cap_reached;
 
-    for file in files {
+    let mut readable_files = files
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            crate::search_index::read_searchable_text(file)
+                .map(|content| (index, file.clone(), content))
+        })
+        .collect::<Vec<_>>();
+    // Rayon collection order is not part of the response contract; restore the
+    // original walker order before applying the existing result-cap semantics.
+    readable_files.sort_by_key(|(index, _, _)| *index);
+
+    for (_, file, content) in readable_files {
         if truncated {
             engine_capped = true;
             break;
         }
 
-        let Some(content) = crate::search_index::read_searchable_text(&file) else {
-            continue;
-        };
         files_searched += 1;
 
         if search_degraded_grep_file(
@@ -870,16 +914,21 @@ fn execute_degraded_grep_fallback(
     }
     sort_grep_matches_by_mtime_desc(&mut matches, project_root);
 
-    Ok(GrepResult {
-        matches,
-        total_matches,
-        files_searched,
-        files_with_matches,
-        index_status: IndexStatus::Fallback,
-        truncated,
-        fully_degraded: true,
-        engine_capped,
-        walk_truncated: false,
+    Ok(DegradedGrepFallbackResult {
+        grep: GrepResult {
+            matches,
+            total_matches,
+            files_searched,
+            files_with_matches,
+            index_status: IndexStatus::Fallback,
+            truncated,
+            fully_degraded: true,
+            engine_capped,
+            walk_truncated: false,
+        },
+        file_cap_reached,
+        file_limit: DEGRADED_GREP_FILE_LIMIT,
+        candidate_files,
     })
 }
 
@@ -1087,7 +1136,7 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     let semantic_config = ctx.config().semantic.clone();
 
     if model_ref.is_none() {
-        *model_ref = Some(EmbeddingModel::from_config(&semantic_config)?);
+        *model_ref = Some(EmbeddingModel::from_config_for_query(&semantic_config)?);
     }
 
     let model = model_ref

@@ -52,8 +52,12 @@ const SEMANTIC_INDEX_VERSION_V5: u8 = 5;
 const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
-// Must stay below the bridge timeout (30s) to avoid bridge kills on slow backends.
+// Build/refresh embedding requests keep a larger budget because they run on
+// background workers and often batch many texts through a cold local backend.
 const DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS: u64 = 25_000;
+// Interactive query embedding runs inside semantic_search dispatch; keep it
+// short so slow/unreachable remote backends degrade to lexical quickly.
+const DEFAULT_QUERY_EMBEDDING_TIMEOUT_MS: u64 = 8_000;
 const DEFAULT_MAX_BATCH_SIZE: usize = 64;
 const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
 const FALLBACK_BACKEND: &str = "none";
@@ -488,14 +492,29 @@ where
     unreachable!("embedding request retries exhausted without returning")
 }
 
+fn configured_embedding_timeout_ms(config: &SemanticBackendConfig) -> u64 {
+    if config.timeout_ms == 0 {
+        DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS
+    } else {
+        config.timeout_ms
+    }
+}
+
 impl SemanticEmbeddingModel {
     pub fn from_config(config: &SemanticBackendConfig) -> Result<Self, String> {
-        let timeout_ms = if config.timeout_ms == 0 {
-            DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS
-        } else {
-            config.timeout_ms
-        };
+        Self::from_config_with_timeout_ms(config, configured_embedding_timeout_ms(config))
+    }
 
+    pub fn from_config_for_query(config: &SemanticBackendConfig) -> Result<Self, String> {
+        let timeout_ms =
+            configured_embedding_timeout_ms(config).min(DEFAULT_QUERY_EMBEDDING_TIMEOUT_MS);
+        Self::from_config_with_timeout_ms(config, timeout_ms)
+    }
+
+    fn from_config_with_timeout_ms(
+        config: &SemanticBackendConfig,
+        timeout_ms: u64,
+    ) -> Result<Self, String> {
         let max_batch_size = if config.max_batch_size == 0 {
             DEFAULT_MAX_BATCH_SIZE
         } else {
@@ -4910,6 +4929,48 @@ Connection: close
 
         assert!(message.starts_with("ONNX Runtime not found. Install via:"));
         assert!(message.contains("Original error:"));
+    }
+
+    #[test]
+    fn interactive_query_embedding_model_caps_remote_timeout() {
+        let mut config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-embedding".to_string(),
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            api_key_env: None,
+            timeout_ms: 0,
+            max_batch_size: 64,
+            max_files: 20_000,
+        };
+
+        let build_model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let query_model = SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
+        assert_eq!(
+            build_model.timeout_ms(),
+            DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS,
+            "background build keeps the longer default embedding timeout"
+        );
+        assert_eq!(
+            query_model.timeout_ms(),
+            DEFAULT_QUERY_EMBEDDING_TIMEOUT_MS,
+            "interactive query embedding is capped below the dispatch transport timeout"
+        );
+
+        config.timeout_ms = 60_000;
+        let query_model = SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
+        assert_eq!(
+            query_model.timeout_ms(),
+            DEFAULT_QUERY_EMBEDDING_TIMEOUT_MS,
+            "explicitly long backend timeouts are capped for interactive queries"
+        );
+
+        config.timeout_ms = 3_000;
+        let query_model = SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
+        assert_eq!(
+            query_model.timeout_ms(),
+            3_000,
+            "shorter explicit timeouts are respected for interactive queries"
+        );
     }
 
     #[test]

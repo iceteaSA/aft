@@ -296,6 +296,49 @@ fn natural_language_auto_falls_back_to_grep_when_semantic_disabled() {
 }
 
 #[test]
+fn degraded_grep_reports_file_cap_gap_when_scan_limit_reached() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let src_dir = project.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create source dir");
+    for index in 0..=1_000 {
+        std::fs::write(
+            src_dir.join(format!("module_{index}.rs")),
+            format!("pub fn unrelated_{index}() {{}}\n"),
+        )
+        .expect("write source file");
+    }
+
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request("how slow backend fallback works"),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "degraded grep fallback should succeed: {response:?}"
+    );
+    assert_eq!(response["complete"], false);
+    assert_eq!(response["fully_degraded"], true);
+    assert_eq!(response["engine_capped"], true);
+    assert_eq!(response["more_available"], true);
+    assert_eq!(response["result_count"], 0);
+    assert_eq!(response["degraded_grep_walk_truncated"], true);
+    assert_eq!(response["degraded_grep_file_limit"], 1_000);
+    assert_eq!(response["degraded_grep_candidate_files"], 1_000);
+
+    let warnings = response["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("1000-file scan cap"))),
+        "expected degraded grep file cap warning, got {warnings:?}"
+    );
+}
+
+#[test]
 fn natural_language_auto_falls_back_to_grep_while_semantic_builds() {
     let project = tempfile::tempdir().expect("create project dir");
     let source_file = project.path().join("src/lib.rs");
