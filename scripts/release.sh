@@ -296,7 +296,16 @@ cargo build --release -p agent-file-tools --quiet 2>&1 || { echo "Error: Release
 # Update versioned cache only — never write to the flat cache path because
 # other instances may be running a binary from there.
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/aft/bin"
-mkdir -p "$CACHE_DIR/$TAG" && cp target/release/aft "$CACHE_DIR/$TAG/aft" 2>/dev/null && echo "  Updated $CACHE_DIR/$TAG/aft"
+if mkdir -p "$CACHE_DIR/$TAG" && cp target/release/aft "$CACHE_DIR/$TAG/aft" 2>/dev/null; then
+  # macOS Sequoia SIGKILLs a freshly-built linker-signed-only binary on exec
+  # (Gatekeeper/library validation). cargo's output is only linker-signed, so
+  # ad-hoc re-sign it — mirroring dev-rebuild.sh — or the running session's
+  # next bridge spawn dies with "Binary killed by SIGKILL".
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    codesign --force --sign - "$CACHE_DIR/$TAG/aft" 2>/dev/null || true
+  fi
+  echo "  Updated $CACHE_DIR/$TAG/aft"
+fi
 
 echo "→ Creating tag $TAG..."
 git tag -a "$TAG" -m "Release $TAG"
