@@ -497,7 +497,7 @@ impl CallGraphStore {
                 drop(store);
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
-                    Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
+                    Self::cold_build_with_lease(callgraph_dir, project_root, &files, 100)?;
                 Ok(store)
             }
             OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(store),
@@ -551,7 +551,7 @@ impl CallGraphStore {
                 drop(store);
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
-                    Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
+                    Self::cold_build_with_lease(callgraph_dir, project_root, &files, 100)?;
                 Ok(Some(store))
             }
             OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(Some(store)),
@@ -562,13 +562,14 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
         files: &[PathBuf],
+        chunk_size: usize,
     ) -> Result<(Self, ColdBuildStats)> {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::project_cache_key(&project_root);
         let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
         let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
         let (stats, generation) =
-            Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files)?;
+            Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files, chunk_size)?;
         let store = Self::open_generation(&callgraph_dir, project_root, project_key, generation)?;
         Ok((store, stats))
     }
@@ -577,6 +578,7 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
         files: &[PathBuf],
+        chunk_size: usize,
     ) -> Result<(Self, Option<ColdBuildStats>)> {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::project_cache_key(&project_root);
@@ -606,6 +608,7 @@ impl CallGraphStore {
                         &project_root,
                         &project_key,
                         files,
+                        chunk_size,
                     )?;
                     let store = Self::open_generation(
                         &callgraph_dir,
@@ -621,7 +624,7 @@ impl CallGraphStore {
             }
         }
         let (stats, generation) =
-            Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files)?;
+            Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files, chunk_size)?;
         let store = Self::open_generation(&callgraph_dir, project_root, project_key, generation)?;
         Ok((store, Some(stats)))
     }
@@ -641,6 +644,7 @@ impl CallGraphStore {
         project_root: &Path,
         project_key: &str,
         files: &[PathBuf],
+        chunk_size: usize,
     ) -> Result<(ColdBuildStats, String)> {
         let generation = generation_file_name(project_key);
         let gen_path = callgraph_dir.join(&generation);
@@ -660,7 +664,7 @@ impl CallGraphStore {
                 false,
             )?
             .store;
-            let stats = temp_store.cold_build(files)?;
+            let stats = temp_store.cold_build(files, chunk_size)?;
             temp_store.prepare_for_atomic_swap()?;
             stats
         };
@@ -773,7 +777,7 @@ impl CallGraphStore {
         }
     }
 
-    pub fn cold_build(&self, files: &[PathBuf]) -> Result<ColdBuildStats> {
+    pub fn cold_build(&self, files: &[PathBuf], chunk_size: usize) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let bench = std::env::var("AFT_BENCH_COLD").is_ok();
         macro_rules! phase {
@@ -785,54 +789,175 @@ impl CallGraphStore {
             };
         }
         let files = normalize_file_list(&self.project_root, files)?;
-        let t = Instant::now();
-        let build = build_extracts_parallel(&self.project_root, &files);
-        phase!("extract_parallel", t);
-        let extracts = build.extracts;
-        let failures = build.failures;
-        let node_count = extracts.iter().map(|extract| extract.nodes.len()).sum();
 
-        let t = Instant::now();
-        let index = ProjectIndex::from_extracts(&self.project_root, &extracts);
-        phase!("build_index", t);
-        let t = Instant::now();
-        let mut resolved_refs = Vec::new();
-        for extract in &extracts {
-            for raw_ref in &extract.raw_refs {
-                resolved_refs.push(resolve_ref(raw_ref.clone(), &index)?);
+        if chunk_size == 0 {
+            let t = Instant::now();
+            let build = build_extracts_parallel(&self.project_root, &files);
+            phase!("extract_parallel", t);
+            let extracts = build.extracts;
+            let failures = build.failures;
+            let node_count = extracts.iter().map(|extract| extract.nodes.len()).sum();
+
+            let t = Instant::now();
+            let index = ProjectIndex::from_extracts(&self.project_root, &extracts);
+            phase!("build_index", t);
+            let t = Instant::now();
+            let mut resolved_refs = Vec::new();
+            for extract in &extracts {
+                for raw_ref in &extract.raw_refs {
+                    resolved_refs.push(resolve_ref(raw_ref.clone(), &index)?);
+                }
             }
-        }
-        phase!("resolve_refs", t);
-        let ref_count = resolved_refs.len();
-        let edge_count = resolved_refs
-            .iter()
-            .filter(|item| item.edge.is_some())
-            .count();
+            phase!("resolve_refs", t);
+            let ref_count = resolved_refs.len();
+            let edge_count = resolved_refs
+                .iter()
+                .filter(|item| item.edge.is_some())
+                .count();
 
+            let t = Instant::now();
+            let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+            let tx = conn.transaction()?;
+            clear_tables(&tx)?;
+            insert_meta(&tx)?;
+            drop_cold_build_secondary_indexes(&tx)?;
+            {
+                let workspace_root = self.project_root.display().to_string();
+                let mut inserts = ColdBuildInsertStatements::new(&tx)?;
+                for extract in &extracts {
+                    insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                }
+                for failure in &failures {
+                    insert_backend_state_prepared(
+                        &mut inserts.backend_state,
+                        &workspace_root,
+                        &failure.rel_path,
+                        failure
+                            .freshness
+                            .as_ref()
+                            .map(|freshness| &freshness.content_hash),
+                        "stale",
+                    )?;
+                }
+                for resolved in &resolved_refs {
+                    insert_resolved_ref_prepared(&mut inserts, resolved)?;
+                }
+            }
+            create_cold_build_secondary_indexes(&tx)?;
+            let supplemental_edge_count = insert_method_dispatch_edges(&tx, &self.project_root, None)?;
+            set_meta_ready(&tx, true)?;
+            tx.commit()?;
+            phase!("sqlite_insert", t);
+
+            let elapsed_ms = started.elapsed().as_millis();
+            crate::slog_info!(
+                "perf callgraph_store cold_build: files={} nodes={} refs={} edges={} ms={}",
+                extracts.len(),
+                node_count,
+                ref_count,
+                edge_count + supplemental_edge_count,
+                elapsed_ms
+            );
+            return Ok(ColdBuildStats {
+                files: extracts.len(),
+                nodes: node_count,
+                refs: ref_count,
+                edges: edge_count + supplemental_edge_count,
+                failed_files: failures
+                    .into_iter()
+                    .map(|failure| failure.rel_path)
+                    .collect(),
+                elapsed_ms,
+            });
+        }
+
+        // Chunked low-memory implementation
         let t = Instant::now();
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let tx = conn.transaction()?;
         clear_tables(&tx)?;
         insert_meta(&tx)?;
         drop_cold_build_secondary_indexes(&tx)?;
+        tx.commit()?;
+        drop(conn);
+
+        let mut all_raw_refs = Vec::new();
+        let mut failures = Vec::new();
+        let mut node_count = 0;
+        let mut files_parsed = 0;
+
+        let mut persistent_call_data = Vec::new();
+        let mut file_to_call_data_index = HashMap::new();
+        let mut files_index = HashMap::new();
+
+        let workspace_root = self.project_root.display().to_string();
+
+        for chunk in files.chunks(chunk_size) {
+            let build = build_extracts_parallel(&self.project_root, chunk);
+            failures.extend(build.failures.clone());
+
+            let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+            let tx = conn.transaction()?;
+            {
+                let mut inserts = ColdBuildInsertStatements::new(&tx)?;
+                for extract in build.extracts {
+                    files_parsed += 1;
+                    node_count += extract.nodes.len();
+                    insert_file_extract_prepared(&mut inserts, &workspace_root, &extract)?;
+
+                    let db_file_index = DbFileIndex::from_extract(&self.project_root, &extract);
+                    files_index.insert(extract.rel_path.clone(), db_file_index);
+
+                    persistent_call_data.push(extract.data);
+                    let idx = persistent_call_data.len() - 1;
+                    file_to_call_data_index.insert(extract.rel_path.clone(), idx);
+
+                    all_raw_refs.push((extract.rel_path, extract.raw_refs));
+                }
+                for failure in &build.failures {
+                    insert_backend_state_prepared(
+                        &mut inserts.backend_state,
+                        &workspace_root,
+                        &failure.rel_path,
+                        failure
+                            .freshness
+                            .as_ref()
+                            .map(|freshness| &freshness.content_hash),
+                        "stale",
+                    )?;
+                }
+            }
+            tx.commit()?;
+        }
+
+        let mut caller_data = HashMap::new();
+        for (rel_path, idx) in &file_to_call_data_index {
+            caller_data.insert(rel_path.clone(), &persistent_call_data[*idx]);
+        }
+        let index = ProjectIndex {
+            project_root: self.project_root.clone(),
+            files: files_index,
+            caller_data,
+            workspace_crate_prefixes: std::sync::OnceLock::new(),
+        };
+
+        let mut resolved_refs = Vec::new();
+        for (_, raw_refs) in all_raw_refs {
+            for raw_ref in raw_refs {
+                resolved_refs.push(resolve_ref(raw_ref, &index)?);
+            }
+        }
+
+        let ref_count = resolved_refs.len();
+        let edge_count = resolved_refs
+            .iter()
+            .filter(|item| item.edge.is_some())
+            .count();
+
+        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        let tx = conn.transaction()?;
         {
-            let workspace_root = self.project_root.display().to_string();
             let mut inserts = ColdBuildInsertStatements::new(&tx)?;
-            for extract in &extracts {
-                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
-            }
-            for failure in &failures {
-                insert_backend_state_prepared(
-                    &mut inserts.backend_state,
-                    &workspace_root,
-                    &failure.rel_path,
-                    failure
-                        .freshness
-                        .as_ref()
-                        .map(|freshness| &freshness.content_hash),
-                    "stale",
-                )?;
-            }
             for resolved in &resolved_refs {
                 insert_resolved_ref_prepared(&mut inserts, resolved)?;
             }
@@ -844,21 +969,16 @@ impl CallGraphStore {
         phase!("sqlite_insert", t);
 
         let elapsed_ms = started.elapsed().as_millis();
-        // Always-on perf line (the AFT_BENCH_COLD eprintln path is stderr-only and
-        // bleeds into the TUI, so it can't run in production). The persisted-store
-        // cold build is a full parallel parse of the project — log it so a
-        // background CPU burst from a store rebuild is attributable in the log.
         crate::slog_info!(
-            "perf callgraph_store cold_build: files={} nodes={} refs={} edges={} ms={}",
-            extracts.len(),
+            "perf callgraph_store cold_build (chunked): files={} nodes={} refs={} edges={} ms={}",
+            files_parsed,
             node_count,
             ref_count,
             edge_count + supplemental_edge_count,
             elapsed_ms
         );
-
         Ok(ColdBuildStats {
-            files: extracts.len(),
+            files: files_parsed,
             nodes: node_count,
             refs: ref_count,
             edges: edge_count + supplemental_edge_count,
@@ -1036,7 +1156,7 @@ impl CallGraphStore {
     }
 
     pub fn refresh_corpus(&self, current_files: &[PathBuf]) -> Result<ColdBuildStats> {
-        self.cold_build(current_files)
+        self.cold_build(current_files, 0)
     }
 
     pub fn mark_files_stale(&self, files: &[PathBuf]) -> Result<Vec<String>> {
@@ -6627,7 +6747,7 @@ export function leaf() {}
         )
         .expect("open store");
         store
-            .cold_build(std::slice::from_ref(&file))
+            .cold_build(std::slice::from_ref(&file), 0)
             .expect("cold build");
 
         let root = store
@@ -6781,7 +6901,7 @@ export function leaf() {}
             project_root.to_path_buf(),
         )
         .expect("open incremental store");
-        store.cold_build(&files).expect("initial cold build");
+        store.cold_build(&files, 0).expect("initial cold build");
 
         {
             let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
@@ -6836,7 +6956,7 @@ export function leaf() {}
         )
         .expect("open cold rebuild store");
         cold_store
-            .cold_build(&files)
+            .cold_build(&files, 0)
             .expect("comparison cold build");
 
         for table in [

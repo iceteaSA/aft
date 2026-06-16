@@ -365,7 +365,7 @@ mod tests {
 
         let store = CallGraphStore::open(root.join(".store"), root).expect("open store");
         store
-            .cold_build(std::slice::from_ref(&source))
+            .cold_build(std::slice::from_ref(&source), 0)
             .expect("cold build fixture");
         let snapshot = project_dead_code_snapshot(store.sqlite_path())
             .expect("fresh backend rows should project");
@@ -418,7 +418,7 @@ impl OtherType {
 
         let store = CallGraphStore::open(root.join(".store"), root.clone()).expect("open store");
         store
-            .cold_build(&[source.clone(), target_source.clone()])
+            .cold_build(&[source.clone(), target_source.clone()], 0)
             .expect("cold build type-match constructor fixture");
         let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
         let expected_target = format!(
@@ -481,7 +481,7 @@ fn local_target() {}
 
         let store = CallGraphStore::open(root.join(".store"), root.clone()).expect("open store");
         store
-            .cold_build(std::slice::from_ref(&source))
+            .cold_build(std::slice::from_ref(&source), 0)
             .expect("cold build provenance fixture");
         let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
 

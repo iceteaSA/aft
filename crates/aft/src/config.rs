@@ -140,6 +140,9 @@ pub struct Config {
     pub aft_search_registered: bool,
     /// Enable the persisted callgraph store substrate (default: true).
     pub callgraph_store: bool,
+    /// Number of files to parse in a single batch during callgraph store cold build (default: 100).
+    /// Set to 0 to disable chunking and parse all files at once.
+    pub callgraph_chunk_size: usize,
     /// Enable experimental bash command rewriting (default: false).
     pub experimental_bash_rewrite: bool,
     /// Enable experimental bash command compression (default: false).
@@ -228,6 +231,7 @@ impl Default for Config {
             semantic_search: false,
             aft_search_registered: false,
             callgraph_store: true,
+            callgraph_chunk_size: 100,
             experimental_bash_rewrite: false,
             experimental_bash_compress: false,
             experimental_bash_background: false,

@@ -1329,12 +1329,12 @@ impl AppContext {
             } else if force_rebuild {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
-                    CallGraphStore::cold_build_with_lease(callgraph_dir, project_root, &files)?;
+                    CallGraphStore::cold_build_with_lease(callgraph_dir, project_root, &files, self.config().callgraph_chunk_size)?;
                 Some(store)
             } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
-                    CallGraphStore::ensure_built_with_lease(callgraph_dir, project_root, &files)?;
+                    CallGraphStore::ensure_built_with_lease(callgraph_dir, project_root, &files, self.config().callgraph_chunk_size)?;
                 Some(store)
             } else {
                 Some(CallGraphStore::open(callgraph_dir, project_root)?)
@@ -1519,14 +1519,15 @@ impl AppContext {
         let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStore>();
         *self.callgraph_store_rx.borrow_mut() = Some(rx);
         let session_id = crate::log_ctx::current_session();
+        let chunk_size = self.config().callgraph_chunk_size;
         std::thread::spawn(move || {
             crate::log_ctx::with_session(session_id, || {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let built = if force_rebuild {
-                    CallGraphStore::cold_build_with_lease(callgraph_dir, project_root, &files)
+                    CallGraphStore::cold_build_with_lease(callgraph_dir, project_root, &files, chunk_size)
                         .map(|(store, _)| store)
                 } else {
-                    CallGraphStore::ensure_built_with_lease(callgraph_dir, project_root, &files)
+                    CallGraphStore::ensure_built_with_lease(callgraph_dir, project_root, &files, chunk_size)
                         .map(|(store, _)| store)
                 };
                 match built {

@@ -2484,7 +2484,7 @@ mod guard_tests {
         let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
         let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&files).expect("cold build store");
+        store.cold_build(&files, 0).expect("cold build store");
 
         let snapshot = build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true))
             .expect("ready store snapshot");
@@ -2865,7 +2865,7 @@ mod dead_code_projection_tests {
         )
         .expect("open incremental store");
         incremental_store
-            .cold_build(&files_before)
+            .cold_build(&files_before, 0)
             .expect("initial cold build");
 
         let changed = edit(&root);
@@ -2881,7 +2881,7 @@ mod dead_code_projection_tests {
         )
         .expect("open cold store");
         cold_store
-            .cold_build(&project_files(&root))
+            .cold_build(&project_files(&root), 0)
             .expect("cold rebuild");
         let cold =
             project_dead_code_snapshot(cold_store.sqlite_path()).expect("project cold snapshot");
@@ -2922,7 +2922,7 @@ mod dead_code_projection_tests {
         let _ = std::fs::remove_dir_all(&store_dir);
         let store = CallGraphStore::open(store_dir.clone(), root.clone()).expect("open store");
         let t = Instant::now();
-        let cold_stats = store.cold_build(&files).expect("store cold build");
+        let cold_stats = store.cold_build(&files, 0).expect("store cold build");
         let store_build_ms = t.elapsed().as_millis();
         let t = Instant::now();
         let projected = project_dead_code_snapshot(store.sqlite_path()).expect("projection");
@@ -2954,7 +2954,7 @@ mod dead_code_projection_tests {
         let store =
             CallGraphStore::open(root.join(store_name), root.to_path_buf()).expect("open store");
         store
-            .cold_build(&project_files(root))
+            .cold_build(&project_files(root), 0)
             .expect("store cold build");
         project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot")
     }

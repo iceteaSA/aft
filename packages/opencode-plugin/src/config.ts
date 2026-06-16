@@ -288,6 +288,8 @@ export const AftConfigSchema = z
     semantic_search: z.boolean().optional(),
     /** Enable the persisted callgraph store substrate. Default: true. */
     callgraph_store: z.boolean().optional(),
+    /** Number of files to parse in a single batch during callgraph store cold build. Default: 100. */
+    callgraph_chunk_size: z.number().optional(),
     /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
     inspect: InspectConfigSchema.optional(),
     /**
@@ -455,6 +457,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.search_index !== undefined) overrides.search_index = config.search_index;
   if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
   if (config.callgraph_store !== undefined) overrides.callgraph_store = config.callgraph_store;
+  if (config.callgraph_chunk_size !== undefined) overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
   // Bash / LSP / semantic / max_callgraph_files — all flow through dedicated
   // resolvers because they have their own merge / project-safety rules.

@@ -1749,6 +1749,22 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     }
+    if let Some(raw) = params.get("callgraph_chunk_size") {
+        let parsed = raw.as_u64();
+        match parsed {
+            Some(v) => next_config.callgraph_chunk_size = v as usize,
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "callgraph_chunk_size must be a non-negative integer; got {}",
+                        raw
+                    ),
+                );
+            }
+        }
+    }
     if let Some(raw) = params.get("max_background_bash_tasks") {
         let parsed = raw.as_u64().filter(|v| *v >= 1);
         match parsed.and_then(|v| usize::try_from(v).ok()) {
