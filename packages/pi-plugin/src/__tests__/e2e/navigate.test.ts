@@ -74,19 +74,17 @@ maybeDescribe("aft_callgraph (real bridge)", () => {
       toSymbol: "decorate",
       toFile: "sample.ts",
     });
+    // aft_callgraph returns flat text to the agent (structured data is carried
+    // in `details` for the themed renderer). Assert on the flat output.
     const text = harness.text(result);
-    const response = JSON.parse(text) as {
-      complete: boolean;
-      path: Array<{ file: string; line: number; symbol: string }>;
-    };
-
-    expect(response.complete).toBe(true);
-    expect(Array.isArray(response.path)).toBe(true);
-    expect(response.path.length).toBeGreaterThanOrEqual(2);
-    expect(response.path[0]).toMatchObject({ symbol: "funcC" });
-    expect(response.path[response.path.length - 1]).toMatchObject({ symbol: "decorate" });
-    expect(response.path.every((hop) => hop.file.endsWith("sample.ts"))).toBe(true);
-    expect(response.path.every((hop) => typeof hop.line === "number")).toBe(true);
+    const hopMatch = text.match(/(\d+) hops?/);
+    expect(hopMatch).not.toBeNull();
+    expect(Number(hopMatch?.[1])).toBeGreaterThanOrEqual(2);
+    expect(text).toContain("funcC");
+    expect(text).toContain("decorate");
+    // Path order: funcC (source) appears before decorate (target).
+    expect(text.indexOf("funcC")).toBeLessThan(text.indexOf("decorate"));
+    expect(text).toContain("sample.ts");
   });
 
   test("trace_to_symbol reports no_path_found for unreachable symbols", async () => {
@@ -97,16 +95,10 @@ maybeDescribe("aft_callgraph (real bridge)", () => {
       toSymbol: "normalize",
       toFile: "sample.ts",
     });
+    // Flat output for an unreachable pair: "No path (no_path_found)".
     const text = harness.text(result);
-    const response = JSON.parse(text) as {
-      complete: boolean;
-      path: null;
-      reason: string;
-    };
-
-    expect(response.complete).toBe(true);
-    expect(response.path).toBeNull();
-    expect(response.reason).toBe("no_path_found");
+    expect(text).toContain("No path");
+    expect(text).toContain("no_path_found");
   });
 
   test("trace_data requires expression", async () => {

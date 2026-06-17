@@ -49,13 +49,24 @@ function treeLine(depth: number, text: string): string {
   return `${"  ".repeat(depth)}${depth === 0 ? "" : "↳ "}${text}`;
 }
 
-function renderCallTreeNode(node: Record<string, unknown>, depth: number, lines: string[]): void {
+function renderCallTreeNode(
+  node: Record<string, unknown>,
+  depth: number,
+  lines: string[],
+  theme: CallgraphTheme,
+): void {
   const name = asString(node.name) ?? "(unknown)";
   const file = shortenPath(asString(node.file) ?? "(unknown file)");
   const line = asNumber(node.line);
-  lines.push(treeLine(depth, `${name} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}`));
+  // `resolved:false` means the callee could not be resolved to a definition —
+  // the file/line is the CALLSITE in the caller, not the callee's definition.
+  // Mark it so the agent doesn't read the callsite as the definition location.
+  // Only when explicitly false (resolved/legacy nodes omit the field).
+  const unresolved = node.resolved === false ? ` ${theme.fg("warning", "[unresolved]")}` : "";
+  const location = line !== undefined ? `[${file}:${line}]` : `[${file}]`;
+  lines.push(treeLine(depth, `${name} ${location}${unresolved}`));
   asRecords(node.children).forEach((child) => {
-    renderCallTreeNode(child, depth + 1, lines);
+    renderCallTreeNode(child, depth + 1, lines, theme);
   });
 }
 
@@ -122,7 +133,7 @@ export function formatCallgraphSections(
 
   if (op === "call_tree") {
     const lines: string[] = [];
-    renderCallTreeNode(record, 0, lines);
+    renderCallTreeNode(record, 0, lines, theme);
     const warning = depthWarning(record, theme);
     if (warning) lines.push(warning);
     return lines.length > 0 ? lines : [theme.fg("muted", "No call tree available.")];

@@ -21,6 +21,24 @@ describe("formatCallgraphSections", () => {
     expect(text).toContain("2 truncated");
   });
 
+  test("call_tree marks unresolved callees and leaves resolved ones unmarked", () => {
+    const text = formatCallgraphSections("call_tree", {
+      name: "entry",
+      file: "/repo/src/a.ts",
+      line: 1,
+      resolved: true,
+      children: [
+        { name: "realCallee", file: "/repo/src/b.ts", line: 10, resolved: true, children: [] },
+        { name: "missing", file: "/repo/src/a.ts", line: 3, resolved: false, children: [] },
+      ],
+    }).join("\n");
+    // Unresolved callee: file/line is the callsite, not a definition — must be flagged.
+    expect(text).toContain("missing [/repo/src/a.ts:3] [unresolved]");
+    // Resolved callee carries no marker.
+    expect(text).toContain("realCallee [/repo/src/b.ts:10]");
+    expect(text).not.toContain("realCallee [/repo/src/b.ts:10] [unresolved]");
+  });
+
   test("callers collapses repeated symbols and keeps true total in summary", () => {
     const sections = formatCallgraphSections("callers", {
       total_callers: 16,
