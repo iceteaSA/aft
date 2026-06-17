@@ -22,12 +22,15 @@ import {
   handlePushedPatternMatch,
 } from "./bg-notifications.js";
 import {
+  getConfigLoadErrors,
   loadAftConfig,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
   resolveProjectOverridesForConfigure,
 } from "./config.js";
 import {
+  drainPendingConfigParseWarnings,
+  enqueueConfigParseWarnings,
   enqueueConfigureWarningsForSession,
   flushConfigureWarningsOnIdle,
 } from "./configure-warnings.js";
@@ -255,6 +258,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   // Load config: ~/.config/opencode/aft.jsonc → <project>/.opencode/aft.jsonc
   const aftConfig = loadAftConfig(input.directory);
+  enqueueConfigParseWarnings(input.directory, getConfigLoadErrors());
   const autoUpdateAbort = new AbortController();
 
   // Build config overrides for the Rust binary (strip undefined values).
@@ -454,6 +458,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     projectConfigLoader: (projectRoot) => {
       try {
         const projectConfig = loadAftConfig(projectRoot);
+        enqueueConfigParseWarnings(projectRoot, getConfigLoadErrors());
         return resolveProjectOverridesForConfigure(projectConfig);
       } catch (err) {
         warn(
@@ -1004,6 +1009,22 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         sessionID,
         client: input.client,
       });
+      const configParseWarnings = drainPendingConfigParseWarnings(sessionDir);
+      if (configParseWarnings.length > 0) {
+        const bridge = pool.getActiveBridgeForRoot(sessionDir) ?? pool.getBridge(sessionDir);
+        enqueueConfigureWarningsForSession({
+          projectRoot: sessionDir,
+          sessionId: sessionID,
+          client: input.client,
+          bridge,
+          warnings: configParseWarnings,
+          fallbackClient: input.client,
+          storageDir: configOverrides.storage_dir as string,
+          pluginVersion: PLUGIN_VERSION,
+          serverUrl: input.serverUrl?.toString(),
+          delivery: aftConfig.configure_warnings_delivery ?? "toast",
+        });
+      }
       await flushConfigureWarningsOnIdle(sessionID);
     },
     "chat.message": async (messageInput: {

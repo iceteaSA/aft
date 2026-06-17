@@ -576,24 +576,27 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
     initialError = "AFT is starting up. Status will refresh automatically...";
   }
 
+  const dismissStatusDialog = () => {
+    api.ui.dialog.setSize("medium");
+    api.ui.dialog.clear();
+  };
+
   api.ui.dialog.setSize("large");
   api.ui.dialog.replace(
     () => (
-      <StatusDialog
-        api={api}
-        client={client}
-        directory={directory}
-        sessionID={sessionID}
-        initial={initial}
-        initialError={initialError}
-        onClose={() => {
-          api.ui.dialog.setSize("medium");
-        }}
-      />
+      <api.ui.Dialog size="large" onClose={dismissStatusDialog}>
+        <StatusDialog
+          api={api}
+          client={client}
+          directory={directory}
+          sessionID={sessionID}
+          initial={initial}
+          initialError={initialError}
+          onClose={dismissStatusDialog}
+        />
+      </api.ui.Dialog>
     ),
-    () => {
-      api.ui.dialog.setSize("medium");
-    },
+    dismissStatusDialog,
   );
 }
 

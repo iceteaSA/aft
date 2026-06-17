@@ -78,6 +78,12 @@ declare module "@opencode-ai/plugin/tui" {
     duration?: number;
   };
 
+  export type TuiDialogProps = {
+    size?: "medium" | "large" | "xlarge";
+    onClose: () => void;
+    children?: JSX.Element;
+  };
+
   export type TuiDialogStack = {
     replace: (render: () => JSX.Element, onClose?: () => void) => void;
     clear: () => void;
@@ -198,6 +204,7 @@ declare module "@opencode-ai/plugin/tui" {
         | { name: string; params?: Record<string, unknown> };
     };
     ui: {
+      Dialog: (props: TuiDialogProps) => JSX.Element;
       DialogAlert: (props: TuiDialogAlertProps) => JSX.Element;
       DialogConfirm: (props: TuiDialogConfirmProps) => JSX.Element;
       DialogPrompt: (props: TuiDialogPromptProps) => JSX.Element;

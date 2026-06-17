@@ -877,13 +877,37 @@ function detectConfigFile(basePath: string): {
   return { format: "none", path: jsonPath };
 }
 
+export type ConfigLoadError = { path: string; message: string };
+
+let configLoadErrors: ConfigLoadError[] = [];
+
+export function getConfigLoadErrors(): readonly ConfigLoadError[] {
+  return configLoadErrors;
+}
+
+export function __resetConfigLoadErrorsForTests(): void {
+  configLoadErrors = [];
+}
+
+export function formatConfigParseFailureMessage(configPath: string, errorMessage: string): string {
+  return (
+    `AFT config at ${configPath} failed to parse and was ignored (running on defaults): ${errorMessage}. ` +
+    "Fix the syntax or run `npx @cortexkit/aft doctor`."
+  );
+}
+
+function recordConfigParseFailure(configPath: string, errorMessage: string): void {
+  configLoadErrors.push({ path: configPath, message: errorMessage });
+  warn(formatConfigParseFailureMessage(configPath, errorMessage));
+}
+
 function loadConfigFromPath(configPath: string): AftConfig | null {
   try {
     if (!existsSync(configPath)) return null;
     const content = readFileSync(configPath, "utf-8");
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
     if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
-      warn(`Config validation error in ${configPath}: root must be an object`);
+      recordConfigParseFailure(configPath, "root must be an object");
       return null;
     }
     migrateRawConfig(rawConfig, configPath, { log, warn });
@@ -905,6 +929,7 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);
+    recordConfigParseFailure(configPath, errorMsg);
     return null;
   }
 }
@@ -1213,14 +1238,9 @@ function getGlobalPiDir(): string {
   return join(homedir(), ".pi", "agent");
 }
 
-/**
- * Load AFT config:
- *   1. User-level:    ~/.pi/agent/aft.jsonc (or .json)
- *   2. Project-level: <project>/.pi/aft.jsonc (or .json)
- *
- * Project config merges on top of user config.
- */
 export function loadAftConfig(projectDirectory: string): AftConfig {
+  configLoadErrors = [];
+
   const userBasePath = join(getGlobalPiDir(), "aft");
   migrateAftConfigFile(`${userBasePath}.jsonc`);
   migrateAftConfigFile(`${userBasePath}.json`);

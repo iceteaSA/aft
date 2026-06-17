@@ -967,6 +967,40 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig | n
 // Load config from a single file path
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Config parse failures (syntax errors — file exists but unparseable)
+// ---------------------------------------------------------------------------
+
+export type ConfigLoadError = { path: string; message: string };
+
+let configLoadErrors: ConfigLoadError[] = [];
+
+/** Errors from the most recent {@link loadAftConfig} call (parse failures only). */
+export function getConfigLoadErrors(): readonly ConfigLoadError[] {
+  return configLoadErrors;
+}
+
+/** @internal Test-only reset. */
+export function __resetConfigLoadErrorsForTests(): void {
+  configLoadErrors = [];
+}
+
+export function formatConfigParseFailureMessage(configPath: string, errorMessage: string): string {
+  return (
+    `AFT config at ${configPath} failed to parse and was ignored (running on defaults): ${errorMessage}. ` +
+    "Fix the syntax or run `npx @cortexkit/aft doctor`."
+  );
+}
+
+function recordConfigParseFailure(configPath: string, errorMessage: string): void {
+  configLoadErrors.push({ path: configPath, message: errorMessage });
+  warn(formatConfigParseFailureMessage(configPath, errorMessage));
+}
+
+// ---------------------------------------------------------------------------
+// Load config from a single file path
+// ---------------------------------------------------------------------------
+
 function loadConfigFromPath(configPath: string): AftConfig | null {
   try {
     if (!existsSync(configPath)) {
@@ -996,6 +1030,7 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);
+    recordConfigParseFailure(configPath, errorMsg);
     return null;
   }
 }
@@ -1330,17 +1365,9 @@ function getOpenCodeConfigDir(): string {
 // Public API: loadAftConfig
 // ---------------------------------------------------------------------------
 
-/**
- * Load AFT config using the same two-level pattern as oh-my-opencode:
- *
- * 1. User-level:    ~/.config/opencode/aft.jsonc (or .json)
- * 2. Project-level: <project>/.opencode/aft.jsonc (or .json)
- *
- * Project config merges on top of user config.
- * Both support JSONC (comments allowed).
- * Invalid sections are skipped, valid sections still load.
- */
 export function loadAftConfig(projectDirectory: string): AftConfig {
+  configLoadErrors = [];
+
   // User-level config
   const configDir = getOpenCodeConfigDir();
   const userBasePath = join(configDir, "aft");

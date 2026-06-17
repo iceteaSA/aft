@@ -52,6 +52,8 @@ import {
 import { registerStatusCommand } from "./commands/aft-status.js";
 import {
   type AftConfig,
+  formatConfigParseFailureMessage,
+  getConfigLoadErrors,
   loadAftConfig,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
@@ -210,7 +212,8 @@ function isConfigureWarning(value: unknown): value is ConfigureWarning {
   return (
     (warning.kind === "formatter_not_installed" ||
       warning.kind === "checker_not_installed" ||
-      warning.kind === "lsp_binary_missing") &&
+      warning.kind === "lsp_binary_missing" ||
+      warning.kind === "config_parse_failed") &&
     typeof warning.hint === "string"
   );
 }
@@ -223,6 +226,21 @@ function drainPendingEagerWarnings(projectRoot: string): ConfigureWarning[] {
   const pending = pendingEagerWarnings.get(projectRoot) ?? [];
   pendingEagerWarnings.delete(projectRoot);
   return pending;
+}
+
+function enqueueConfigParseWarnings(
+  projectRoot: string,
+  errors: ReturnType<typeof getConfigLoadErrors>,
+): void {
+  if (!projectRoot || errors.length === 0) return;
+  const pending = pendingEagerWarnings.get(projectRoot) ?? [];
+  for (const entry of errors) {
+    const hint = formatConfigParseFailureMessage(entry.path, entry.message);
+    if (!pending.some((item) => item.kind === "config_parse_failed" && item.hint === hint)) {
+      pending.push({ kind: "config_parse_failed", hint });
+    }
+  }
+  pendingEagerWarnings.set(projectRoot, pending);
 }
 
 function shouldPrepareOnnxRuntime(
@@ -412,6 +430,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   // Load config (user + project).
   const config = loadAftConfig(process.cwd());
+  enqueueConfigParseWarnings(process.cwd(), getConfigLoadErrors());
   const storageDir = resolveCortexKitStorageRoot();
 
   // ONNX runtime for semantic search (optional, best-effort).
@@ -819,12 +838,25 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       ) => unknown,
     ) => void
   )("turn_end", async (_event, extCtx) => {
+    const sessionID = resolveSessionId(extCtx);
     await handleTurnEndBgCompletions({
       ctx,
       directory: extCtx.cwd,
-      sessionID: resolveSessionId(extCtx),
+      sessionID,
       runtime: pi,
     });
+    const bridge = pool.getActiveBridgeForRoot(extCtx.cwd);
+    if (bridge && sessionID) {
+      void handleConfigureWarningsForSession({
+        projectRoot: extCtx.cwd,
+        sessionId: sessionID,
+        client: pi,
+        bridge,
+        warnings: [],
+        storageDir,
+        pluginVersion: PLUGIN_VERSION,
+      });
+    }
   });
 
   // User-message abort: when the user sends a message while the agent is
@@ -873,6 +905,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 }
 
 export const __test__ = {
+  enqueueConfigParseWarnings,
   bridgeDirectoryFromCallback,
   resolveToolSurface,
   handleConfigureWarningsForSession,

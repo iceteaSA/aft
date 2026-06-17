@@ -123,6 +123,47 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Cannot convert a symbol to a string");
   });
 
+  test("getConfigLoadErrors records parse failures and absent files do not", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.projectConfigPath, "i{ invalid");
+
+    const script = `
+      import { loadAftConfig, getConfigLoadErrors } from "./src/config.ts";
+      const config = loadAftConfig(process.env.PROJECT_DIR!);
+      console.log(JSON.stringify({ config, errors: getConfigLoadErrors() }));
+    `;
+    const bad = spawnSync(process.execPath, ["-e", script], {
+      cwd: packageRoot,
+      env: {
+        ...process.env,
+        AFT_LOG_STDERR: "1",
+        HOME: fixture.home,
+        PROJECT_DIR: fixture.projectDirectory,
+      },
+      encoding: "utf8",
+    });
+    expect(bad.status).toBe(0);
+    const badParsed = JSON.parse(bad.stdout.trim()) as {
+      errors: Array<{ path: string }>;
+    };
+    expect(badParsed.errors).toHaveLength(1);
+    expect(badParsed.errors[0].path).toBe(fixture.projectConfigPath);
+
+    const empty = createConfigFixture();
+    const ok = spawnSync(process.execPath, ["-e", script], {
+      cwd: packageRoot,
+      env: {
+        ...process.env,
+        AFT_LOG_STDERR: "1",
+        HOME: empty.home,
+        PROJECT_DIR: empty.projectDirectory,
+      },
+      encoding: "utf8",
+    });
+    expect(ok.status).toBe(0);
+    expect((JSON.parse(ok.stdout.trim()) as { errors: unknown[] }).errors).toEqual([]);
+  });
+
   test("loads user object-map lsp servers with entry defaults", () => {
     const fixture = createConfigFixture();
     writeFileSync(

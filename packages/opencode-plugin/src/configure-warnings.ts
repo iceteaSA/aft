@@ -21,11 +21,16 @@
  */
 
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
-import type { ConfigureWarningsDelivery } from "./config.js";
+import {
+  type ConfigLoadError,
+  type ConfigureWarningsDelivery,
+  formatConfigParseFailureMessage,
+} from "./config.js";
 import { warn } from "./logger.js";
 import { type ConfigureWarning, deliverConfigureWarnings } from "./notifications.js";
 
 const pendingEagerWarnings = new Map<string, ConfigureWarning[]>();
+const pendingConfigParseWarnings = new Map<string, ConfigureWarning[]>();
 
 type PendingSessionWarnings = {
   warnings: ConfigureWarning[];
@@ -46,9 +51,39 @@ function isConfigureWarning(value: unknown): value is ConfigureWarning {
   return (
     (warning.kind === "formatter_not_installed" ||
       warning.kind === "checker_not_installed" ||
-      warning.kind === "lsp_binary_missing") &&
+      warning.kind === "lsp_binary_missing" ||
+      warning.kind === "config_parse_failed") &&
     typeof warning.hint === "string"
   );
+}
+
+function configParseWarningsFromErrors(errors: readonly ConfigLoadError[]): ConfigureWarning[] {
+  return errors.map((entry) => ({
+    kind: "config_parse_failed" as const,
+    hint: formatConfigParseFailureMessage(entry.path, entry.message),
+  }));
+}
+
+/** Buffer config syntax failures until a session-bound configure warning flush (deduped by hint). */
+export function enqueueConfigParseWarnings(
+  projectRoot: string,
+  errors: readonly ConfigLoadError[],
+): void {
+  if (!projectRoot || errors.length === 0) return;
+  const incoming = configParseWarningsFromErrors(errors);
+  const existing = pendingConfigParseWarnings.get(projectRoot) ?? [];
+  for (const warning of incoming) {
+    if (!existing.some((item) => item.hint === warning.hint)) {
+      existing.push(warning);
+    }
+  }
+  pendingConfigParseWarnings.set(projectRoot, existing);
+}
+
+export function drainPendingConfigParseWarnings(projectRoot: string): ConfigureWarning[] {
+  const pending = pendingConfigParseWarnings.get(projectRoot) ?? [];
+  pendingConfigParseWarnings.delete(projectRoot);
+  return pending;
 }
 
 function coerceConfigureWarnings(warnings: unknown[]): ConfigureWarning[] {
@@ -64,6 +99,7 @@ export function drainPendingEagerWarnings(projectRoot: string): ConfigureWarning
 /** Test-only reset for queued configure warnings. */
 export function __resetConfigureWarningQueuesForTests(): void {
   pendingEagerWarnings.clear();
+  pendingConfigParseWarnings.clear();
   pendingBySession.clear();
 }
 
@@ -79,7 +115,10 @@ export function enqueueConfigureWarningsForSession(context: {
   serverUrl?: string;
   delivery?: ConfigureWarningsDelivery;
 }): void {
-  const validWarnings = coerceConfigureWarnings(context.warnings);
+  const validWarnings = [
+    ...drainPendingConfigParseWarnings(context.projectRoot),
+    ...coerceConfigureWarnings(context.warnings),
+  ];
 
   if (!context.sessionId) {
     if (validWarnings.length === 0) return;

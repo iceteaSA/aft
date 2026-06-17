@@ -6,6 +6,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  __resetConfigureWarningQueuesForTests,
+  enqueueConfigParseWarnings,
   enqueueConfigureWarningsForSession,
   flushConfigureWarningsOnIdle,
 } from "../configure-warnings.js";
@@ -67,6 +69,42 @@ describe("Lane G plugin orchestration regressions", () => {
       expect(messages[0]).toContain("Formatter is not installed");
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("config parse warnings enqueue and flush on session idle", async () => {
+    __resetConfigureWarningQueuesForTests();
+    const root = mkdtempSync(join(tmpdir(), "aft-config-parse-warnings-"));
+    const messages: string[] = [];
+    const client = {
+      session: {
+        prompt: (input: { body: { parts: Array<{ text: string }> } }) =>
+          messages.push(input.body.parts[0].text),
+      },
+    };
+    const configPath = join(root, "aft.jsonc");
+    try {
+      enqueueConfigParseWarnings("/repo-parse", [
+        { path: configPath, message: "Unexpected token i" },
+      ]);
+      enqueueConfigureWarningsForSession({
+        projectRoot: "/repo-parse",
+        sessionId: "session-parse",
+        client,
+        bridge,
+        warnings: [],
+        fallbackClient: client,
+        storageDir: root,
+        pluginVersion: "1.0.0",
+        delivery: "chat",
+      });
+      await flushConfigureWarningsOnIdle("session-parse");
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain("failed to parse and was ignored");
+      expect(messages[0]).toContain("npx @cortexkit/aft doctor");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      __resetConfigureWarningQueuesForTests();
     }
   });
 

@@ -384,7 +384,11 @@ export interface NotificationOptions {
 }
 
 export interface ConfigureWarning {
-  kind: "formatter_not_installed" | "checker_not_installed" | "lsp_binary_missing";
+  kind:
+    | "formatter_not_installed"
+    | "checker_not_installed"
+    | "lsp_binary_missing"
+    | "config_parse_failed";
   language?: string;
   server?: string;
   tool?: string;
@@ -653,6 +657,8 @@ function warningTitle(warning: ConfigureWarning): string {
       return "Checker is not installed";
     case "lsp_binary_missing":
       return "LSP binary is missing";
+    case "config_parse_failed":
+      return "Config failed to parse";
   }
 }
 

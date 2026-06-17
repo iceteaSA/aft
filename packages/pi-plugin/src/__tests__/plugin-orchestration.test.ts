@@ -60,6 +60,32 @@ describe("Pi Lane G plugin orchestration regressions", () => {
     }
   });
 
+  test("config parse warnings buffer and deliver on session-bound configure flush", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-pi-config-parse-"));
+    const messages: string[] = [];
+    const client = { ui: { notify: (message: string) => messages.push(message) } };
+    const configPath = join(root, "aft.jsonc");
+    try {
+      __test__.enqueueConfigParseWarnings("/repo-pi-parse", [
+        { path: configPath, message: "Unexpected token i" },
+      ]);
+      await __test__.handleConfigureWarningsForSession({
+        projectRoot: "/repo-pi-parse",
+        sessionId: "session-pi-parse",
+        client,
+        bridge,
+        warnings: [],
+        storageDir: root,
+        pluginVersion: "1.0.0",
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain("failed to parse and was ignored");
+      expect(messages[0]).toContain("npx @cortexkit/aft doctor");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("ONNX runtime is only prepared for fastembed semantic search", () => {
     expect(__test__.shouldPrepareOnnxRuntime({ semantic_search: true })).toBe(true);
     expect(

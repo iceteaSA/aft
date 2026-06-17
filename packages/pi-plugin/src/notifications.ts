@@ -3,13 +3,18 @@ import {
   markAnnouncementSeen,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
+import { formatConfigParseFailureMessage } from "./config.js";
 import { log, sessionLog } from "./logger.js";
 
 const WARNING_MARKER = "🔧 AFT: ⚠️";
 const FEATURE_MARKER = "🔧 AFT: ✨";
 
 export interface ConfigureWarning {
-  kind: "formatter_not_installed" | "checker_not_installed" | "lsp_binary_missing";
+  kind:
+    | "formatter_not_installed"
+    | "checker_not_installed"
+    | "lsp_binary_missing"
+    | "config_parse_failed";
   language?: string;
   server?: string;
   tool?: string;
@@ -136,6 +141,8 @@ function warningTitle(warning: ConfigureWarning): string {
       return "Checker is not installed";
     case "lsp_binary_missing":
       return "LSP binary is missing";
+    case "config_parse_failed":
+      return "Config failed to parse";
   }
 }
 
@@ -173,6 +180,19 @@ export async function deliverConfigureWarnings(
     if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) continue;
 
     await recordWarning(opts.bridge, key);
+  }
+}
+
+export function notifyConfigParseFailures(
+  client: unknown,
+  sessionId: string,
+  errors: readonly { path: string; message: string }[],
+): void {
+  for (const entry of errors) {
+    const text = `${WARNING_MARKER} ${formatConfigParseFailureMessage(entry.path, entry.message)}`;
+    if (!sendIgnoredMessage(client, sessionId, text)) {
+      sessionLog(sessionId, `[aft-pi] ${text}`);
+    }
   }
 }
 

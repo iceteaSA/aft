@@ -86,6 +86,54 @@ describe("loadAftConfig", () => {
       `[aft-plugin] Error loading config from ${fixture.projectConfigPath}:`,
     );
     expect(result.stderr).toContain("is not valid JSON");
+    expect(result.stderr).toContain("failed to parse and was ignored");
+    expect(result.stderr).toContain("npx @cortexkit/aft doctor");
+  });
+
+  test("getConfigLoadErrors records parse failures and absent files do not", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.projectConfigPath, "i{ not json");
+
+    const script = `
+      import { loadAftConfig, getConfigLoadErrors } from "./src/config.ts";
+      const config = loadAftConfig(process.env.PROJECT_DIR!);
+      console.log(JSON.stringify({ config, errors: getConfigLoadErrors() }));
+    `;
+    const missingOnly = spawnSync(process.execPath, ["-e", script], {
+      cwd: packageRoot,
+      env: {
+        ...process.env,
+        AFT_LOG_STDERR: "1",
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+        PROJECT_DIR: fixture.projectDirectory,
+      },
+      encoding: "utf8",
+    });
+    expect(missingOnly.status).toBe(0);
+    const missingParsed = JSON.parse(missingOnly.stdout.trim()) as {
+      errors: Array<{ path: string; message: string }>;
+    };
+    expect(missingParsed.errors).toHaveLength(1);
+    expect(missingParsed.errors[0].path).toBe(fixture.projectConfigPath);
+
+    const emptyFixture = createConfigFixture();
+    const emptyResult = spawnSync(process.execPath, ["-e", script], {
+      cwd: packageRoot,
+      env: {
+        ...process.env,
+        AFT_LOG_STDERR: "1",
+        HOME: join(emptyFixture.root, "home"),
+        XDG_CONFIG_HOME: emptyFixture.xdgConfigHome,
+        PROJECT_DIR: emptyFixture.projectDirectory,
+      },
+      encoding: "utf8",
+    });
+    expect(emptyResult.status).toBe(0);
+    const emptyParsed = JSON.parse(emptyResult.stdout.trim()) as {
+      errors: unknown[];
+    };
+    expect(emptyParsed.errors).toEqual([]);
   });
 
   test("loads a config with comments inside nested objects (issue #88)", () => {
