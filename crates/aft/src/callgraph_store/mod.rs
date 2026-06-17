@@ -898,8 +898,6 @@ impl CallGraphStore {
         clear_tables(&tx)?;
         insert_meta(&tx)?;
         drop_cold_build_secondary_indexes(&tx)?;
-        tx.commit()?;
-        drop(conn);
 
         let mut all_raw_refs = Vec::new();
         let mut failures = Vec::new();
@@ -912,14 +910,12 @@ impl CallGraphStore {
 
         let workspace_root = self.project_root.display().to_string();
 
-        for chunk in files.chunks(chunk_size) {
-            let build = build_extracts_parallel(&self.project_root, chunk);
-            failures.extend(build.failures.clone());
+        {
+            let mut inserts = ColdBuildInsertStatements::new(&tx)?;
+            for chunk in files.chunks(chunk_size) {
+                let build = build_extracts_parallel(&self.project_root, chunk);
+                failures.extend(build.failures.clone());
 
-            let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
-            let tx = conn.transaction()?;
-            {
-                let mut inserts = ColdBuildInsertStatements::new(&tx)?;
                 for extract in build.extracts {
                     files_parsed += 1;
                     node_count += extract.nodes.len();
@@ -947,7 +943,6 @@ impl CallGraphStore {
                     )?;
                 }
             }
-            tx.commit()?;
         }
 
         let mut caller_data = HashMap::new();
@@ -974,8 +969,6 @@ impl CallGraphStore {
             .filter(|item| item.edge.is_some())
             .count();
 
-        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        let tx = conn.transaction()?;
         {
             let mut inserts = ColdBuildInsertStatements::new(&tx)?;
             for resolved in &resolved_refs {
