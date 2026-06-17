@@ -1,3 +1,4 @@
+import { formatCallgraphSections } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
@@ -118,7 +119,7 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           }
           throw new Error(message);
         }
-        return JSON.stringify(response);
+        return formatCallgraphSections(args.op as string, response).join("\n");
       },
     },
   };

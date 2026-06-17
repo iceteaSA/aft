@@ -29,10 +29,14 @@ describe("aft_callgraph adapter", () => {
       filePath: "src/app.ts",
       symbol: "run",
       depth: 4,
-    })) as { content: Array<{ type: string; text: string }> };
+    })) as {
+      content: Array<{ type: string; text: string }>;
+      details?: Record<string, unknown>;
+    };
 
-    expect(result.content[0]?.text).toContain('"success": true');
-    expect(result.content[0]?.text).toContain('"total_affected": 0');
+    expect(result.content[0]?.text).toContain("affected call site");
+    expect(result.content[0]?.text).not.toContain('"success"');
+    expect(result.details).toMatchObject({ success: true, total_affected: 0 });
     expect(calls[0].command).toBe("impact");
     expect(calls[0].params).toEqual({
       op: "impact",
@@ -238,5 +242,37 @@ describe("aft_callgraph adapter", () => {
 
       expect(result.content[0]?.text).toContain(`callers: ${code} — ${code} happened`);
     }
+  });
+
+  test("returns flat text and structured details for themed render", async () => {
+    const { api, tools } = makeMockApi();
+    const payload = {
+      success: true,
+      total_callers: 2,
+      callers: [
+        {
+          file: "src/a.ts",
+          callers: [
+            { symbol: "fn", line: 10 },
+            { symbol: "fn", line: 20 },
+          ],
+        },
+      ],
+    };
+    const { bridge } = makeMockBridge(() => payload);
+    registerNavigateTool(api, makePluginContext(bridge));
+
+    const result = (await executeTool(tools.get("aft_callgraph")!, {
+      op: "callers",
+      filePath: "src/a.ts",
+      symbol: "target",
+    })) as {
+      content: Array<{ type: string; text: string }>;
+      details?: Record<string, unknown>;
+    };
+
+    expect(result.content[0]?.text).toContain("2 callers");
+    expect(result.content[0]?.text).toContain("↳ fn:10, 20");
+    expect(result.details).toEqual(payload);
   });
 });

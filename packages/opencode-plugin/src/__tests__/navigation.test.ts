@@ -79,7 +79,9 @@ describe("aft_callgraph OpenCode adapter", () => {
       makeToolContext(),
     );
 
-    expect(JSON.parse(raw)).toMatchObject({ success: true, command: "impact" });
+    expect(typeof raw).toBe("string");
+    expect(raw as string).toContain("affected call site");
+    expect(raw as string).not.toContain('"success"');
     expect(calls).toHaveLength(1);
     expect(calls[0]).toEqual({
       command: "impact",
