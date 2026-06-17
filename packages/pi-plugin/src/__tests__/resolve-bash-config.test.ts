@@ -64,7 +64,7 @@ describe("resolveBashConfig (Pi)", () => {
     expect(r).toMatchObject({ enabled: true, rewrite: true, compress: true, background: true });
   });
 
-  test("top-level bash: false wins over legacy experimental.bash.background: true", () => {
+  test("top-level bash: false wins over legacy background: true", () => {
     const r = resolveBashConfig(cfg({ bash: false, experimental: { bash: { background: true } } }));
     expect(r.enabled).toBe(false);
     expect(r.background).toBe(false);

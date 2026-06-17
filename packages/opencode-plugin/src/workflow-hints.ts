@@ -17,7 +17,7 @@ export interface WorkflowHintsOpts {
   hoistBuiltins: boolean;
   /** `experimental.semantic_search` — gates `aft_search` mention. */
   semanticEnabled: boolean;
-  /** `experimental.bash.background` — gates background-bash paragraph. */
+  /** `bash.background` — gates background-bash paragraph. */
   bashBackgroundEnabled: boolean;
   /** Resolved bash compression flag. */
   bashCompressionEnabled: boolean;
@@ -173,9 +173,8 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
  * Resolve workflow-hints opts from a loaded AftConfig and the active
  * disabled-tools set computed at registration time.
  *
- * Background-bash gating reads the resolved bash config so the new
- * graduated `bash: true` / `bash: { background: true }` shapes enable the
- * hint, not just the legacy `experimental.bash.background: true` path.
+ * Background-bash gating reads the resolved bash config so the graduated
+ * `bash.background` setting controls whether the hint appears.
  */
 export function buildHintsFromConfig(config: AftConfig, disabledTools: Set<string>): string | null {
   return buildWorkflowHints({

@@ -78,6 +78,7 @@ function resolveForegroundWaitMs(configured: number): number {
 // protocol round-trip; not a function of params.timeout. See council audit
 // `.alfonso/athena/council-aft-bash-timeout-audit-057818e1583d3883/`.
 const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
+const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 
 // Background task completion metadata shape (from Track D)
 interface BgCompletion {
@@ -96,7 +97,7 @@ interface BashSpawnContext {
 
 type BashSpawnHook = (ctx: BashSpawnContext) => BashSpawnContext | Promise<BashSpawnContext>;
 
-const BashParams = Type.Object({
+const BashBaseParams = {
   command: Type.String({
     description: "Shell command to execute. Supports pipes, redirections, and shell syntax.",
   }),
@@ -113,18 +114,27 @@ const BashParams = Type.Object({
         "Human-readable description shown in UI logs. Helps users understand what the command does without reading shell syntax.",
     }),
   ),
+};
+
+const BashBackgroundFlagParam = {
   background: Type.Optional(
     Type.Boolean({
       description:
         "Spawn command in background and return immediately with a task_id. Use bash_status to poll completion and bash_kill to terminate. Ideal for long-running tasks like builds or dev servers.",
     }),
   ),
+};
+
+const BashCompressionParam = {
   compressed: Type.Optional(
     Type.Boolean({
       description:
         "Compress output by removing ANSI codes, carriage returns, and excessive blank lines. Default: true. Set to false for raw terminal output including color codes.",
     }),
   ),
+};
+
+const BashPtyParams = {
   pty: Type.Optional(
     Type.Boolean({
       description:
@@ -133,7 +143,22 @@ const BashParams = Type.Object({
   ),
   ptyRows: optionalInt(1, 60),
   ptyCols: optionalInt(1, 140),
+};
+
+const BashParams = Type.Object({
+  ...BashBaseParams,
+  ...BashBackgroundFlagParam,
+  ...BashCompressionParam,
+  ...BashPtyParams,
 });
+const BashForegroundOnlyParams = Type.Object({
+  ...BashBaseParams,
+  ...BashCompressionParam,
+});
+
+function bashParamsForConfig(backgroundEnabled: boolean): typeof BashParams {
+  return (backgroundEnabled ? BashParams : BashForegroundOnlyParams) as typeof BashParams;
+}
 
 const BashTaskParams = Type.Object({
   task_id: Type.String({
@@ -300,7 +325,8 @@ export function registerBashTool(
   // else to the grep tool (same surface logic as the Rust grep footer). The
   // compression sentence only appears when compression is actually on —
   // advertising `compressed: false` when compression is disabled would
-  // describe a no-op.
+  // describe a no-op. Background/PTY/watch wording appears only when
+  // `bash.background` is enabled.
   const searchSteer = aftSearchRegistered
     ? "use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead"
     : "use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead";
@@ -308,48 +334,56 @@ export function registerBashTool(
   const compressionSentence = bashCfg.compress
     ? " Output is compressed by default; pass `compressed: false` for raw output."
     : "";
-  // `bash.background` gates explicit background/PTY spawning (Rust returns
-  // feature_disabled); foreground promotion happens regardless, so the
-  // no-background variant still explains promoted tasks.
   const tasksSentence = bashCfg.background
-    ? ' Pass `background: true` to run in the background and get a task_id for `bash_status`/`bash_kill`. Pass `pty: true` for interactive programs (REPLs, TUIs) and drive them with `bash_status({ output_mode: "screen" })` plus `bash_write`.'
-    : " Commands that outlive the foreground wait window are promoted to background tasks; inspect them with `bash_status({ task_id })` or terminate with `bash_kill`.";
+    ? ' Pass `background: true` to run in the background and get a task_id for `bash_status`/`bash_kill`. Pass `pty: true` for interactive programs (REPLs, TUIs) and drive them with `bash_status({ output_mode: "screen" })` plus `bash_write`. Use `bash_watch` to wait for output patterns or exit events.'
+    : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   pi.registerTool<typeof BashParams, BashDetails>({
     name: "bash",
     label: "bash",
     description: `Execute shell commands.${compressionSentence}${tasksSentence}
 
 DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}.`,
-    promptSnippet:
-      "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)",
+    promptSnippet: bashCfg.background
+      ? "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
+      : "Run shell commands (timeout in milliseconds; supports workdir and compressed output)",
     promptGuidelines: [
       `DO NOT use bash for code search or exploration — ${searchSteer}.`,
       "Set compressed: false when you need ANSI color codes in the output.",
     ],
-    parameters: BashParams,
+    parameters: bashParamsForConfig(bashCfg.background),
     async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const bashCfg = resolveBashConfig(ctx.config);
       const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
+      const backgroundDisabled = !bashCfg.background;
       // ptyRows/ptyCols are silently ignored when pty is false so agents
       // that defensively pass them on normal bash calls don't get stuck in
       // a retry loop. pty: true silently implies background: true (Rust
       // bash.rs handles the auto-promote); we mirror that here so the
-      // Pi-side spawn payload also reflects the auto-promotion.
+      // Pi-side spawn payload also reflects the auto-promotion. When background
+      // is disabled these params are omitted from the schema and defensively
+      // ignored if a stale caller sends them anyway.
       const timeout = coerceOptionalInt(params.timeout, "timeout", 1, Number.MAX_SAFE_INTEGER);
-      const ptyRows = coerceOptionalInt(params.ptyRows, "ptyRows", 1, 60);
-      const ptyCols = coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
-      const effectiveBackground = params.background === true || params.pty === true;
+      const ptyRows = backgroundDisabled
+        ? undefined
+        : coerceOptionalInt(params.ptyRows, "ptyRows", 1, 60);
+      const ptyCols = backgroundDisabled
+        ? undefined
+        : coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
+      const requestedPty = !backgroundDisabled && params.pty === true;
+      const effectiveBackground =
+        !backgroundDisabled && (params.background === true || requestedPty);
       // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
       // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
-      // FOREGROUND path a `timeout` below the foreground wait window is
-      // incoherent (the task would be killed before we promote it to
+      // FOREGROUND auto-promote path a `timeout` below the foreground wait
+      // window is incoherent (the task would be killed before we promote it to
       // background), so treat it as unset and let the bridge apply its
-      // 30-minute default — this is the #102 fix. Used for the bridge payload,
-      // the wait calc, and the promotion message so all three agree.
-      const effectiveTimeout = effectiveBackground
-        ? timeout
-        : resolveBashKillTimeout(timeout, foregroundWaitMs);
+      // 30-minute default — this is the #102 fix. When background is disabled
+      // there is no promotion window, so `timeout` remains the hard cap.
+      const effectiveTimeout =
+        effectiveBackground || backgroundDisabled
+          ? timeout
+          : resolveBashKillTimeout(timeout, foregroundWaitMs);
 
       // Build spawn context for potential hook modification
       let spawnContext: BashSpawnContext = {
@@ -386,7 +420,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           background: effectiveBackground,
           notify_on_completion: effectiveBackground,
           compressed: params.compressed,
-          pty: params.pty,
+          pty: requestedPty,
           pty_rows: ptyRows,
           pty_cols: ptyCols,
         },
@@ -426,23 +460,21 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           // Surface the strip note on the background path too, so the agent
           // knows their pipe was dropped when they read the task output later.
           return bashResult(
-            appendPipeStripNote(
-              formatBackgroundLaunch(taskId, params.pty === true),
-              pipeStrip.note,
-            ),
+            appendPipeStripNote(formatBackgroundLaunch(taskId, requestedPty), pipeStrip.note),
             { task_id: taskId },
           );
         }
 
-        // Wait-window decoupled from params.timeout. Always cap polling at
-        // foregroundWaitMs so agents get a fast promotion message
-        // for unexpectedly long commands. Honor a shorter explicit timeout
-        // when present — polling beyond the task's kill cap is pointless.
-        // effectiveTimeout already folded the sub-window guard (#102): it is
-        // either >= foregroundWaitMs or undefined, so this Math.min can no
-        // longer collapse the wait window below the configured value.
-        const waitTimeoutMs =
-          effectiveTimeout !== undefined
+        // Wait-window decoupled from params.timeout. With background enabled,
+        // cap polling at foregroundWaitMs so agents get a fast promotion
+        // message for unexpectedly long commands. With background disabled,
+        // keep polling inline until terminal status or the command's hard-kill
+        // timeout. effectiveTimeout already folded the sub-window guard (#102)
+        // for the promote path, so Math.min cannot collapse that window below
+        // the configured value.
+        const waitTimeoutMs = backgroundDisabled
+          ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
+          : effectiveTimeout !== undefined
             ? Math.min(effectiveTimeout, foregroundWaitMs)
             : foregroundWaitMs;
         const startedAt = Date.now();
@@ -472,6 +504,10 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
             );
           }
           if (Date.now() - startedAt >= waitTimeoutMs) {
+            if (backgroundDisabled) {
+              await sleep(FOREGROUND_POLL_INTERVAL_MS);
+              continue;
+            }
             const promoted = await callBashBridge(
               bridge,
               "bash_promote",
@@ -519,16 +555,15 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
     },
   });
 
-  // bash_status and bash_kill ride alongside `bash` regardless of which
-  // experimental flag enabled it: foreground bash auto-promotes long-running
-  // tasks to background after a short wait-window, so the agent always needs
-  // a way to inspect or kill promoted tasks. The `experimental.bash.background`
-  // flag only gates explicit `bash({ background: true })` spawning, not the
-  // promotion path.
-  pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
-  pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
-  pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
-  pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
+  // Background control tools are part of the background surface. When
+  // `bash.background` is disabled, `bash` still registers but runs foreground
+  // commands to completion inline, so these tools are intentionally absent.
+  if (bashCfg.background) {
+    pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
+    pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
+    pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
+    pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
+  }
 }
 
 function formatBackgroundLaunch(taskId: string, isPty: boolean): string {

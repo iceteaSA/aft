@@ -63,11 +63,9 @@ function resolveForegroundWaitMs(configured: number): number {
  *   is known.
  * - the compression sentence only appears when output compression is on —
  *   advertising `compressed: false` otherwise would describe a no-op.
- * - the background/PTY sentences only appear when `bash.background` is on —
- *   with it off, explicit `background: true`/`pty: true` is a guaranteed
- *   `feature_disabled` error from Rust. Foreground promotion still happens
- *   regardless (the flag gates explicit spawning only), so the no-background
- *   variant still explains promoted tasks and bash_status/bash_kill.
+ * - the background/PTY/watch sentences only appear when `bash.background` is on.
+ *   With it off, the foreground tool surface runs commands to completion
+ *   inline and treats `timeout` as the hard kill cap.
  *
  * Wording rules: this is read by AGENTS choosing a tool, not by users reading
  * docs. No internal vocabulary ("hoisted", "command rewriting", "unified bash
@@ -85,9 +83,9 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output."
     : "";
   const tasks = backgroundOn
-    ? ' Pass background: true to run in the background and get a taskId for bash_status/bash_kill. Pass pty: true for interactive programs (REPLs, TUIs) and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically).'
-    : " Commands that outlive the foreground wait window are promoted to background tasks; inspect them with bash_status({ taskId }) or terminate with bash_kill.";
-  return `Execute shell commands.${compression}${tasks} Use bash_watch to wait for output patterns or exit events.
+    ? ' Pass background: true to run in the background and get a taskId for bash_status/bash_kill. Pass pty: true for interactive programs (REPLs, TUIs) and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically). Use bash_watch to wait for output patterns or exit events.'
+    : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
+  return `Execute shell commands.${compression}${tasks}
 
 DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}.`;
 }
@@ -171,57 +169,67 @@ export function createBashTool(
   ctx: PluginContext,
   aftSearchRegisteredOverride?: boolean,
 ): ToolDefinition {
+  const initialBashCfg = resolveBashConfig(ctx.config);
+  const backgroundFlagArg = initialBashCfg.background
+    ? {
+        background: z
+          .boolean()
+          .optional()
+          .describe(
+            "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+          ),
+      }
+    : {};
+  const ptyArgs = initialBashCfg.background
+    ? {
+        pty: z
+          .boolean()
+          .optional()
+          .describe(
+            'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
+          ),
+        ptyRows: optionalInt(1, 60).describe(
+          "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+        ),
+        ptyCols: optionalInt(1, 140).describe(
+          "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+        ),
+      }
+    : {};
+  const args = {
+    command: z
+      .string()
+      .describe("Shell command to execute. Supports pipes, redirection, and normal shell syntax."),
+    timeout: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+      initialBashCfg.background
+        ? "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~8s (configurable via bash.foreground_wait_window_ms); otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes."
+        : "Hard kill cap in milliseconds (positive integer). When omitted, the foreground command can run up to 30 minutes and returns inline when it finishes.",
+    ),
+    workdir: z
+      .string()
+      .optional()
+      .describe(
+        "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+      ),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+      ),
+    ...backgroundFlagArg,
+    compressed: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+      ),
+    ...ptyArgs,
+  };
+
   return {
-    description: (() => {
-      const cfg = resolveBashConfig(ctx.config);
-      return bashToolDescription(false, cfg.compress, cfg.background);
-    })(),
-    args: {
-      command: z
-        .string()
-        .describe(
-          "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
-        ),
-      timeout: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-        "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~8s (configurable via bash.foreground_wait_window_ms); otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes.",
-      ),
-      workdir: z
-        .string()
-        .optional()
-        .describe(
-          "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
-        ),
-      description: z
-        .string()
-        .optional()
-        .describe(
-          "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
-        ),
-      background: z
-        .boolean()
-        .optional()
-        .describe(
-          "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
-        ),
-      compressed: z
-        .boolean()
-        .optional()
-        .describe(
-          "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
-        ),
-      pty: z
-        .boolean()
-        .optional()
-        .describe(
-          'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
-        ),
-      ptyRows: optionalInt(1, 60).describe(
-        "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
-      ),
-      ptyCols: optionalInt(1, 140).describe(
-        "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
-      ),
-    },
+    description: bashToolDescription(false, initialBashCfg.compress, initialBashCfg.background),
+    args: args as ToolDefinition["args"],
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);
       const ctxAftSearchRegistered =
@@ -246,10 +254,12 @@ export function createBashTool(
       // foreground poll window to the task's full hard-kill timeout — the
       // command still runs to completion, just inline.
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
-      const requestedPty = args.pty === true;
+      const backgroundDisabled = !bashCfg.background;
+      const requestedPty = !backgroundDisabled && args.pty === true;
       // pty:true silently implies background:true (Rust bash.rs handles the
-      // auto-promote). Agents don't need to set both flags.
-      const requestedBackground = args.background === true || requestedPty;
+      // auto-promote). Agents don't need to set both flags. When background is
+      // disabled, those args are omitted from the schema and defensively ignored.
+      const requestedBackground = !backgroundDisabled && (args.background === true || requestedPty);
       // ptyRows/ptyCols are silently ignored when pty is false so agents
       // that defensively pass them on normal bash calls don't get stuck in
       // a retry loop. pty: true silently implies background: true (Rust
@@ -261,19 +271,21 @@ export function createBashTool(
       }
       const allowSubagentBg = bashCfg.subagent_background;
       const subagentForcedForeground = isSubagent && !allowSubagentBg;
-      const effectiveBackground = subagentForcedForeground ? false : requestedBackground;
+      const blockToCompletion = subagentForcedForeground || backgroundDisabled;
+      const effectiveBackground = blockToCompletion ? false : requestedBackground;
 
       // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
       // small `timeout` is a legitimate kill cap (kill after N ms), so honor it
-      // verbatim. For the FOREGROUND path a `timeout` below the foreground wait
-      // window is incoherent (the task would be killed before we promote it to
-      // background), so treat it as unset and let the bridge apply its
-      // 30-minute default — this is the #102 fix. Used for the bridge payload,
-      // the wait calc, and the promotion message so all three agree.
+      // verbatim. For the FOREGROUND auto-promote path a `timeout` below the
+      // foreground wait window is incoherent (the task would be killed before we
+      // promote it to background), so treat it as unset and let the bridge apply
+      // its 30-minute default — this is the #102 fix. When background is
+      // disabled there is no promotion window, so `timeout` remains the hard cap.
       const rawTimeout = args.timeout as number | undefined;
-      const effectiveTimeout = effectiveBackground
-        ? rawTimeout
-        : resolveBashKillTimeout(rawTimeout, bashCfg.foreground_wait_window_ms);
+      const effectiveTimeout =
+        effectiveBackground || backgroundDisabled
+          ? rawTimeout
+          : resolveBashKillTimeout(rawTimeout, bashCfg.foreground_wait_window_ms);
       // Only log when the gate actually changes behavior (subagent path).
       // The common primary-session foreground case is the overwhelming
       // majority of calls and produces no useful log signal.
@@ -336,19 +348,18 @@ export function createBashTool(
         }
 
         // Wait-window is decoupled from `args.timeout`. For primary sessions
-        // we always cap the foreground polling window at
+        // with background enabled we always cap the foreground polling window at
         // foregroundWaitMs so agents get a fast "promoted" response
         // for unexpectedly long commands. If the agent passed a shorter
         // explicit `timeout`, honor that — there's no point polling longer
         // than the task can possibly survive.
         //
-        // For SUBAGENTS, we extend the poll window to the task's full
-        // hard-kill cap (`args.timeout` if provided, else the 30-minute
-        // default). Subagents cannot survive background promotion, so the
-        // bash call must stay inline until the task reaches a terminal
-        // status or its own hard-kill timer fires. The transport timeout
-        // is unaffected because each `bash_status` poll is a separate
-        // short bridge call.
+        // For SUBAGENTS and background-disabled sessions, we extend the poll
+        // window to the task's full hard-kill cap (`args.timeout` if provided,
+        // else the 30-minute default). Those modes must stay inline until the
+        // task reaches a terminal status or its own hard-kill timer fires. The
+        // transport timeout is unaffected because each `bash_status` poll is a
+        // separate short bridge call.
         //
         // Schema validation guarantees `args.timeout` is a positive
         // integer or undefined, so these expressions are well-defined.
@@ -357,7 +368,7 @@ export function createBashTool(
         // Math.min can no longer collapse the wait window below the configured
         // value.
         const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
-        const waitTimeoutMs = subagentForcedForeground
+        const waitTimeoutMs = blockToCompletion
           ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
           : effectiveTimeout !== undefined
             ? Math.min(effectiveTimeout, foregroundWaitMs)
@@ -380,7 +391,7 @@ export function createBashTool(
             return { output: rendered, title: uiTitle, metadata: metadataPayload };
           }
           if (Date.now() - startedAt >= waitTimeoutMs) {
-            if (subagentForcedForeground) {
+            if (blockToCompletion) {
               await sleep(FOREGROUND_POLL_INTERVAL_MS);
               continue;
             }

@@ -75,6 +75,7 @@ function createHarness(
   ) => Promise<BridgeResponse> | BridgeResponse,
   triggerImpl?: PluginContext["plugin"],
   aftSearchRegistered = false,
+  config: PluginContext["config"] = {} as PluginContext["config"],
 ) {
   const calls: SendCall[] = [];
   const bridge = {
@@ -92,7 +93,7 @@ function createHarness(
     pool,
     client: createMockClient(),
     plugin: triggerImpl,
-    config: {} as PluginContext["config"],
+    config,
     storageDir: "/tmp/aft-test",
   };
   return { calls, tool: createBashTool(ctx, aftSearchRegistered) };
@@ -144,6 +145,36 @@ describe("OpenCode bash adapter", () => {
       };
       expect(jsonSchema.description?.length).toBeGreaterThan(20);
     }
+  });
+
+  test("schema omits background and PTY args when bash.background is disabled", () => {
+    const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+      bash: { background: false },
+    } as PluginContext["config"]);
+
+    expect(Object.keys(bash.args)).toEqual([
+      "command",
+      "timeout",
+      "workdir",
+      "description",
+      "compressed",
+    ]);
+    expect(bash.args.background).toBeUndefined();
+    expect(bash.args.pty).toBeUndefined();
+    expect(bash.args.ptyRows).toBeUndefined();
+    expect(bash.args.ptyCols).toBeUndefined();
+    expect(bash.description).toContain("foreground to completion");
+    expect(bash.description).not.toContain("background: true");
+    expect(bash.description).not.toContain("bash_status");
+    expect(bash.description).not.toContain("bash_kill");
+    expect(bash.description).not.toContain("bash_watch");
+    expect(bash.description).not.toContain("pty: true");
+
+    const timeoutSchema = tool.schema.toJSONSchema(bash.args.timeout, { io: "input" }) as {
+      description?: string;
+    };
+    expect(timeoutSchema.description).toContain("returns inline");
+    expect(timeoutSchema.description).not.toContain("promoted");
   });
 
   test("pty dimensions are forwarded when pty:true and silently ignored when pty:false", async () => {
@@ -569,6 +600,48 @@ describe("OpenCode bash adapter", () => {
       expect(call.options?.keepBridgeOnTimeout).toBe(true);
       expect(call.options?.transportTimeoutMs).toBe(30_000);
     }
+  });
+
+  test("background disabled foreground task polls to completion without promotion", async () => {
+    let statusCalls = 0;
+    const { calls, tool: bash } = createHarness(
+      (command) => {
+        if (command === "bash") {
+          return { success: true, status: "running", task_id: "task-no-bg" };
+        }
+        if (command === "bash_status") {
+          statusCalls += 1;
+          if (statusCalls === 1) return { success: true, status: "running" };
+          return {
+            success: true,
+            status: "completed",
+            exit_code: 0,
+            duration_ms: 125,
+            output_preview: "finished without background",
+            output_truncated: false,
+          };
+        }
+        throw new Error(`unexpected bridge command: ${command}`);
+      },
+      undefined,
+      false,
+      { bash: { background: false } } as PluginContext["config"],
+    );
+
+    const output = bashText(
+      await bash.execute(
+        { command: "sleep 2", background: true, pty: true, timeout: 25 },
+        createMockSdkContext({ sessionID: "no-bg-session" }),
+      ),
+    );
+
+    expect(output).toBe("finished without background");
+    expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status", "bash_status"]);
+    expect(calls.find((call) => call.command === "bash_promote")).toBeUndefined();
+    expect(calls[0].params.background).toBe(false);
+    expect(calls[0].params.notify_on_completion).toBe(false);
+    expect(calls[0].params.pty).toBe(false);
+    expect(calls[0].params.timeout).toBe(25);
   });
 
   test("explicit background spawn enables completion notifications", async () => {
@@ -1422,12 +1495,16 @@ describe("bash tool description (agent-facing wording)", () => {
     const on = bashToolDescription(true, true, true);
     expect(on).toContain("background: true");
     expect(on).toContain("pty: true");
-    // Background off: never advertise a guaranteed feature_disabled error,
-    // but still explain auto-promoted tasks (promotion is not gated).
+    expect(on).toContain("bash_watch");
+    // Background off: foreground commands block to completion, so do not
+    // advertise promotion or any background-control tools.
     const off = bashToolDescription(true, true, false);
+    expect(off).toContain("foreground to completion");
     expect(off).not.toContain("background: true");
     expect(off).not.toContain("pty: true");
-    expect(off).toContain("promoted to background");
-    expect(off).toContain("bash_status");
+    expect(off).not.toContain("promoted");
+    expect(off).not.toContain("bash_status");
+    expect(off).not.toContain("bash_kill");
+    expect(off).not.toContain("bash_watch");
   });
 });

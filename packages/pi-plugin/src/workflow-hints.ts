@@ -144,10 +144,9 @@ export function buildHintsFromConfig(
   absentTools: Set<string>,
   hoistBuiltins: boolean,
 ): string | null {
-  // Background-bash gating reads the resolved bash config so the new
-  // graduated `bash: true` / `bash: { background: true }` shapes enable
-  // the hint, not just the legacy `experimental.bash.background: true`
-  // path. See `resolveBashConfig` in config.ts.
+  // Background-bash gating reads the resolved bash config so the graduated
+  // `bash.background` setting controls whether the hint appears. See
+  // `resolveBashConfig` in config.ts.
   return buildWorkflowHints({
     toolSurface: config.tool_surface ?? "recommended",
     hoistBuiltins,

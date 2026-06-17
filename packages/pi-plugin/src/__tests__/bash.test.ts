@@ -84,12 +84,15 @@ function makeTrackableMockBridge(response: Record<string, unknown> = {}): {
 }
 
 // Mock plugin context
-function makeMockContext(bridge: BinaryBridge): PluginContext {
+function makeMockContext(
+  bridge: BinaryBridge,
+  config: PluginContext["config"] = {} as PluginContext["config"],
+): PluginContext {
   return {
     pool: {
       getBridge: () => bridge,
     } as unknown as PluginContext["pool"],
-    config: {} as PluginContext["config"],
+    config,
     storageDir: "/tmp/test",
   };
 }
@@ -151,6 +154,38 @@ describe("bash tool adapter", () => {
     expect(bashTool!.description).toContain("compressed");
     expect(bashTool!.description).toContain("background");
     expect(bashTool!.description).toContain("task_id");
+  });
+
+  test("schema omits background and PTY params when bash.background is disabled", () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const mockBridge = makeMockBridge();
+    const ctx = makeMockContext(mockBridge, {
+      bash: { background: false },
+    } as PluginContext["config"]);
+
+    registerBashTool(api, ctx);
+
+    const bashTool = tools.get("bash");
+    expect(bashTool).toBeDefined();
+    const properties = (bashTool!.parameters as { properties?: Record<string, unknown> })
+      .properties;
+    expect(Object.keys(properties ?? {})).toEqual([
+      "command",
+      "timeout",
+      "workdir",
+      "description",
+      "compressed",
+    ]);
+    expect(properties?.background).toBeUndefined();
+    expect(properties?.pty).toBeUndefined();
+    expect(properties?.ptyRows).toBeUndefined();
+    expect(properties?.ptyCols).toBeUndefined();
+    expect(bashTool!.description).toContain("foreground to completion");
+    expect(bashTool!.description).not.toContain("bash_status");
+    expect(bashTool!.description).not.toContain("bash_kill");
+    expect(bashTool!.description).not.toContain("bash_watch");
+    expect(bashTool!.description).not.toContain("pty: true");
   });
 
   test("execute calls bridge with correct parameters", async () => {
@@ -432,6 +467,62 @@ describe("bash tool adapter", () => {
       expect(call[2].keepBridgeOnTimeout).toBe(true);
       expect(call[2].transportTimeoutMs).toBe(30_000);
     }
+  });
+
+  test("background disabled foreground command polls to completion without promotion", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const calls: unknown[] = [];
+    let statusCalls = 0;
+    const bridge = {
+      send: async (
+        command: string,
+        params: Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ) => {
+        calls.push([command, params, options]);
+        if (command === "bash") return { success: true, status: "running", task_id: "task-no-bg" };
+        if (command === "bash_status") {
+          statusCalls += 1;
+          if (statusCalls === 1) return { success: true, status: "running" };
+          return {
+            success: true,
+            status: "completed",
+            exit_code: 0,
+            duration_ms: 125,
+            output_preview: "finished without background",
+            output_truncated: false,
+          };
+        }
+        throw new Error(`unexpected bridge command: ${command}`);
+      },
+    } as unknown as BinaryBridge;
+    const ctx = makeMockContext(bridge, { bash: { background: false } } as PluginContext["config"]);
+
+    registerBashTool(api, ctx);
+
+    const result = (await tools
+      .get("bash")!
+      .execute(
+        "test-call",
+        { command: "sleep 2", background: true, pty: true, timeout: 25 },
+        undefined,
+        undefined,
+        { cwd: "/test" },
+      )) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toBe("finished without background");
+    expect(calls.map((call) => (call as [string])[0])).toEqual([
+      "bash",
+      "bash_status",
+      "bash_status",
+    ]);
+    expect(calls.find((call) => (call as [string])[0] === "bash_promote")).toBeUndefined();
+    const bashParams = (calls[0] as [string, Record<string, unknown>])[1];
+    expect(bashParams.background).toBe(false);
+    expect(bashParams.notify_on_completion).toBe(false);
+    expect(bashParams.pty).toBe(false);
+    expect(bashParams.timeout).toBe(25);
   });
 
   test("async bash_watch registration does not add synthetic outstanding task", async () => {
@@ -1015,72 +1106,77 @@ describe("bash tool adapter", () => {
 });
 
 /**
- * Verify that `bash_status` and `bash_kill` are always registered alongside
- * `bash` inside `registerBashTool`, regardless of which experimental.bash.*
- * flag enabled the outer gate.
- *
- * The outer gate (whether `registerBashTool` is called at all) lives in
- * Pi's `index.ts` and depends on any `experimental.bash.*` flag being set.
- * Once that gate passes, the bash subsystem registers all three tools as a
- * unit because foreground bash auto-promotes long-running tasks to
- * background after a short wait-window — the agent always needs a way to
- * inspect or kill a promoted task. Earlier versions gated status/kill on
- * `experimental.bash.background` specifically, which left the agent with a
- * promotion message referencing tools that didn't exist for users who only
- * opted into rewrite/compress. (See council audit
- * `.alfonso/athena/council-aft-bash-timeout-audit-057818e1583d3883/`.)
+ * Verify that the primary `bash` tool can be registered without exposing the
+ * background control surface. `registerBashTool` is called only after Pi's
+ * outer bash-enabled gate passes; inside it, `bash.background` controls
+ * `bash_status` / `bash_kill` / `bash_write` / `bash_watch` registration.
  */
-describe("registerBashTool registers bash + bash_status + bash_kill as a unit", () => {
-  function registerWithBashConfig(bash: Record<string, boolean> | undefined) {
+describe("registerBashTool gates background control tools", () => {
+  function registerWithConfig(config: PluginContext["config"]) {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const bridge = makeMockBridge();
     const ctx: PluginContext = {
       pool: { getBridge: () => bridge } as unknown as PluginContext["pool"],
-      config: { experimental: bash ? { bash } : undefined } as PluginContext["config"],
+      config,
       storageDir: "/tmp/test",
     };
     registerBashTool(api, ctx);
     return tools;
   }
 
-  test("no experimental.bash config → all three tools registered (caller already gated)", () => {
-    // registerBashTool is called by the caller — caller does the outer gate.
-    // The function itself unconditionally registers all three.
-    const tools = registerWithBashConfig(undefined);
+  function expectBackgroundControls(tools: Map<string, MockToolDef>, present: boolean): void {
+    for (const name of ["bash_status", "bash_watch", "bash_write", "bash_kill"]) {
+      if (present) {
+        expect(tools.get(name)).toBeDefined();
+      } else {
+        expect(tools.get(name)).toBeUndefined();
+      }
+    }
+  }
+
+  test("default resolved config → full bash surface registered", () => {
+    const tools = registerWithConfig({} as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expect(tools.get("bash_status")).toBeDefined();
-    expect(tools.get("bash_kill")).toBeDefined();
+    expectBackgroundControls(tools, true);
   });
 
-  test("experimental.bash.rewrite=true alone → bash_status and bash_kill still registered", () => {
-    // Foreground bash can still auto-promote even without the background
-    // flag, so status/kill must be available for the promoted task.
-    const tools = registerWithBashConfig({ rewrite: true });
+  test("bash.background=false → bash registered without background controls", () => {
+    const tools = registerWithConfig({ bash: { background: false } } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expect(tools.get("bash_status")).toBeDefined();
-    expect(tools.get("bash_kill")).toBeDefined();
+    expectBackgroundControls(tools, false);
   });
 
-  test("experimental.bash.compress=true alone → bash_status and bash_kill still registered", () => {
-    const tools = registerWithBashConfig({ compress: true });
+  test("legacy rewrite=true only → bash registered without background controls", () => {
+    const tools = registerWithConfig({
+      experimental: { bash: { rewrite: true } },
+    } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expect(tools.get("bash_status")).toBeDefined();
-    expect(tools.get("bash_kill")).toBeDefined();
+    expectBackgroundControls(tools, false);
   });
 
-  test("experimental.bash.background=true → all three tools registered", () => {
-    const tools = registerWithBashConfig({ background: true });
+  test("legacy compress=true only → bash registered without background controls", () => {
+    const tools = registerWithConfig({
+      experimental: { bash: { compress: true } },
+    } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expect(tools.get("bash_status")).toBeDefined();
-    expect(tools.get("bash_kill")).toBeDefined();
+    expectBackgroundControls(tools, false);
   });
 
-  test("all three flags true → all three tools registered", () => {
-    const tools = registerWithBashConfig({ rewrite: true, compress: true, background: true });
+  test("legacy background=true → full bash surface registered", () => {
+    const tools = registerWithConfig({
+      experimental: { bash: { background: true } },
+    } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expect(tools.get("bash_status")).toBeDefined();
-    expect(tools.get("bash_kill")).toBeDefined();
+    expectBackgroundControls(tools, true);
+  });
+
+  test("all legacy flags true → full bash surface registered", () => {
+    const tools = registerWithConfig({
+      experimental: { bash: { rewrite: true, compress: true, background: true } },
+    } as PluginContext["config"]);
+    expect(tools.get("bash")).toBeDefined();
+    expectBackgroundControls(tools, true);
   });
 
   test("bash_status and bash_kill execute with task_id request shape", async () => {
@@ -1166,16 +1262,20 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(on).toContain("compressed: false");
     expect(on).toContain("background: true");
     expect(on).toContain("pty: true");
+    expect(on).toContain("bash_watch");
 
-    // Both features off: never advertise a guaranteed feature_disabled error,
-    // but still explain auto-promoted tasks (promotion is not gated).
+    // Both features off: foreground commands block to completion, so do not
+    // advertise promotion or any background-control tools.
     const off = registeredDescription(true, {
       bash: { compress: false, background: false },
     }).description;
+    expect(off).toContain("foreground to completion");
     expect(off).not.toContain("compressed: false");
     expect(off).not.toContain("background: true");
     expect(off).not.toContain("pty: true");
-    expect(off).toContain("promoted to background");
-    expect(off).toContain("bash_status");
+    expect(off).not.toContain("promoted");
+    expect(off).not.toContain("bash_status");
+    expect(off).not.toContain("bash_kill");
+    expect(off).not.toContain("bash_watch");
   });
 });

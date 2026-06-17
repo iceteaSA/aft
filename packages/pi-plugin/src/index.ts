@@ -719,12 +719,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   // Hoisted tool overrides (replace Pi's built-in bash/read/write/edit/grep with AFT versions).
   // Bash hoisting is gated by the single resolved bash config — see
-  // `resolveBashConfig` in config.ts for the precedence rules (top-level
-  // `bash` wins over legacy `experimental.bash.*`, surface defaults fill
-  // in when neither is set). When `surface.hoistBash` is false (e.g.
-  // `tool_surface: "minimal"`), AFT bash never registers regardless of
-  // resolved config. registerBashTool handles per-flag gating internally
-  // for bash_status / bash_kill.
+  // `resolveBashConfig` in config.ts for the precedence rules. When
+  // `surface.hoistBash` is false (e.g. `tool_surface: "minimal"`), AFT bash
+  // never registers regardless of resolved config. registerBashTool registers
+  // `bash` whenever enabled and gates the background control tools on
+  // `bash.background`.
   if (surface.hoistBash && resolveBashConfig(config).enabled) {
     registerBashTool(pi, ctx, surface.semantic);
   }

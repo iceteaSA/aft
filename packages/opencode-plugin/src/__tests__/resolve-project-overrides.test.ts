@@ -8,7 +8,7 @@
  * v0.27.1 motivation: in OpenCode Desktop / `opencode serve` mode, one
  * plugin instance serves many projects. Without per-project overrides, every
  * bridge inherits whatever project config was visible at plugin init time.
- * The user reported this with `experimental.bash.background: false` in
+ * The user reported this with `bash.background: false` in
  * project A being ignored because plugin init loaded a different project.
  *
  * The function's contract (see config.ts doc-comment):

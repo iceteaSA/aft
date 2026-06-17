@@ -254,7 +254,7 @@ describe("buildHintsFromConfig", () => {
     expect(buildHintsFromConfig(off, new Set())).not.toContain("**Long-running commands**");
   });
 
-  test("legacy experimental.bash.background=true still enables bg-bash hint", () => {
+  test("legacy background=true still enables bg-bash hint", () => {
     const on: AftConfig = {
       tool_surface: "recommended",
       experimental: { bash: { background: true } },

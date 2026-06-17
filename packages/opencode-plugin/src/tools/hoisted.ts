@@ -1807,18 +1807,11 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
  * Returns hoisted tools keyed by opencode's built-in names.
  * Overrides: read, write, edit, apply_patch (always when hoisting is on).
  *
- * Bash hoisting is opt-in: `bash`, `bash_status`, `bash_write`, and `bash_kill` are
- * registered together when at least one `experimental.bash.*` flag is
- * enabled (rewrite, compress, or background). When all flags are off,
- * opencode's native bash stays in place — users without bash experimentals
- * get zero AFT code in their bash path.
- *
- * `bash_status` and `bash_kill` ride alongside `bash` regardless of which
- * experimental flag enabled it: foreground bash auto-promotes long-running
- * tasks to background after a short wait-window (v0.20+), so the agent
- * always needs a way to inspect or kill those promoted tasks. The
- * `experimental.bash.background` flag only gates explicit
- * `bash({ background: true })` spawning, not promotion.
+ * Bash hoisting follows the resolved `bash` config. When bash is enabled, the
+ * primary `bash` tool is registered. Background control tools (`bash_status`,
+ * `bash_write`, `bash_watch`, and `bash_kill`) are registered only when
+ * `bash.background` resolves true. With `bash.background: false`, foreground
+ * bash runs to completion inline and no background surface is exposed.
  */
 export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const tools: Record<string, ToolDefinition> = {
@@ -1831,18 +1824,18 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
   };
 
   // Bash hoisting is gated by the single resolved bash config — see
-  // `resolveBashConfig` in config.ts for the precedence rules (top-level
-  // `bash` wins over legacy `experimental.bash.*`, surface defaults fill in
-  // when neither is set). When enabled, `bash_status` and `bash_kill`
-  // register alongside `bash` so the agent can always inspect and kill
-  // auto-promoted background tasks regardless of which sub-feature was
-  // actually requested.
-  if (resolveBashConfig(ctx.config).enabled) {
+  // `resolveBashConfig` in config.ts for the precedence rules. `bash` itself
+  // registers whenever bash is enabled; the background control tools register
+  // only when `bash.background` is enabled.
+  const bashCfg = resolveBashConfig(ctx.config);
+  if (bashCfg.enabled) {
     tools.bash = createBashTool(ctx);
-    tools.bash_status = createBashStatusTool(ctx);
-    tools.bash_write = createBashWriteTool(ctx);
-    tools.bash_watch = createBashWatchTool(ctx);
-    tools.bash_kill = createBashKillTool(ctx);
+    if (bashCfg.background) {
+      tools.bash_status = createBashStatusTool(ctx);
+      tools.bash_write = createBashWriteTool(ctx);
+      tools.bash_watch = createBashWatchTool(ctx);
+      tools.bash_kill = createBashKillTool(ctx);
+    }
   }
 
   return tools;
@@ -1941,15 +1934,18 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
   };
 
   // Hoist-off mode: same gating as hoisted mode but with the aft_ prefix on
-  // the primary bash tool so it doesn't override OpenCode's native bash.
-  // The sibling status/kill tools keep their unprefixed names because they
-  // refer to AFT-spawned task IDs that the native bash doesn't know about.
-  if (resolveBashConfig(ctx.config).enabled) {
+  // the primary bash tool so it doesn't override OpenCode's native bash. The
+  // background control tools keep their unprefixed names because they refer to
+  // AFT-spawned task IDs that the native bash doesn't know about.
+  const bashCfg = resolveBashConfig(ctx.config);
+  if (bashCfg.enabled) {
     tools.aft_bash = createBashTool(ctx);
-    tools.bash_status = createBashStatusTool(ctx);
-    tools.bash_write = createBashWriteTool(ctx);
-    tools.bash_watch = createBashWatchTool(ctx);
-    tools.bash_kill = createBashKillTool(ctx);
+    if (bashCfg.background) {
+      tools.bash_status = createBashStatusTool(ctx);
+      tools.bash_write = createBashWriteTool(ctx);
+      tools.bash_watch = createBashWatchTool(ctx);
+      tools.bash_kill = createBashKillTool(ctx);
+    }
   }
 
   return tools;
