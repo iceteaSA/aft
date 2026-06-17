@@ -20,7 +20,7 @@ import { callBashBridge, optionalInt, projectRootFor } from "./_shared.js";
 const z = tool.schema;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
-const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
+const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 export type BashWaitPattern =
@@ -38,7 +38,7 @@ type OutputCursor = { output: number; stderr: number; combined: number };
 export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
   return {
     description:
-      "Watch a background bash task. Two modes. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use this to be pinged when a specific line appears or the task exits, without freezing your turn. Sync (default) blocks until a pattern matches/the task exits/timeout, and is ONLY for short bounded waits (seconds, e.g. a dev server printing a readiness line). Do NOT sync-wait for a long task (build/test/install): blocking locks the user out until it ends — instead end your turn and let the automatic completion reminder arrive, or use async mode.",
+      "Watch a background bash task. Sync (default) blocks until a pattern matches, the task exits, or timeout — use it when the result is the next thing you need, even for long builds/tests/installs (pass timeoutMs up to 30 min for those). The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
     args: {
       taskId: z.string().describe("Background task ID returned by bash({ background: true })."),
       pattern: z
@@ -54,7 +54,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           "When true, register an async watch and return immediately. Defaults to false (sync wait).",
         ),
       timeoutMs: optionalInt(1, MAX_BASH_STATUS_WAIT_TIMEOUT_MS).describe(
-        "Sync-only timeout in milliseconds. Default 30000, max 300000.",
+        "Sync-only timeout in milliseconds. Default 30000, max 1800000 (30 min).",
       ),
       once: z
         .boolean()

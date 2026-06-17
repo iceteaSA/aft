@@ -105,18 +105,13 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   }
 
   if (hasBgBash) {
-    // Positive-first framing (user feedback: "the admonishment to not poll
-    // focuses on what NOT to do, rather than what TO do" — models acknowledged
-    // the rule, then polled anyway). Give the waiting urge three sanctioned
-    // outlets and give bash_status a legitimate role, so it isn't forbidden
-    // fruit the model reaches for the moment it feels blocked.
     sections.push(
       [
-        `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns a \`task_id\` immediately. Then do ONE of these:`,
-        "1. Keep working on something independent of the result.",
-        "2. End your turn — a completion reminder with the result arrives automatically.",
-        `3. Need to react to a specific output line early? Register \`bash_watch({ task_id, pattern, background: true })\`, then end your turn — it pings you the moment the pattern appears.`,
-        `\`bash_status({ task_id })\` is for inspecting output AFTER the reminder arrives, or one quick look at a live task — never call it repeatedly to wait: the reminder already delivers the result, and each poll wastes a turn. Sync \`bash_watch\` (without \`background: true\`) blocks your turn and locks the user out — reserve it for waits of a few seconds (a dev server printing its ready line), never for builds or test suites.`,
+        `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns a \`task_id\` immediately.`,
+        "1. Nothing else useful to do (a build/test/validation whose result is the next thing you need) → sync `bash_watch` to block until it exits (pass a longer timeout_ms for long commands; the user can interrupt).",
+        "2. Useful parallel work available → end your turn; the completion reminder delivers the result. (Or spawn a subagent for the side work.)",
+        "3. Want to react to a specific early output line → async `bash_watch` (background:true + pattern).",
+        "Never loop `bash_status` to wait — it's a one-shot inspector, not a wait primitive.",
       ].join("\n"),
     );
     sections.push(

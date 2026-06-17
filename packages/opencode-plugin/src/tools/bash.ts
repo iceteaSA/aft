@@ -83,7 +83,7 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output."
     : "";
   const tasks = backgroundOn
-    ? ' Pass background: true to run in the background and get a taskId for bash_status/bash_kill. Pass pty: true for interactive programs (REPLs, TUIs) and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically). Use bash_watch to wait for output patterns or exit events.'
+    ? ' Pass background: true to run in the background and get a taskId for bash_status/bash_watch/bash_kill. Pass pty: true for interactive programs (REPLs, TUIs) and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically). Use bash_watch to wait for exit or output patterns (sync blocks, async notifies). Do not loop bash_status to wait.'
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   return `Execute shell commands.${compression}${tasks}
 
@@ -459,7 +459,7 @@ export function createBashTool(
 export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
   return {
     description:
-      "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. Use bash_watch to block on or register for pattern matches and exit events.",
+      "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
     args: {
       taskId: z
         .string()

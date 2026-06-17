@@ -44,15 +44,12 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("does not surface compile/type errors automatically");
     expect(out).toContain("**Long-running commands**");
     expect(out).toContain("`bash({ background: true })`");
-    // Positive-first waiting protocol (Discord feedback: "what NOT to do"
-    // framing made models acknowledge the rule then poll anyway). The three
-    // sanctioned outlets lead; bash_status gets a legitimate role.
-    expect(out).toContain("Then do ONE of these:");
-    expect(out).toContain("Keep working on something independent");
-    expect(out).toContain("completion reminder with the result arrives automatically");
-    expect(out).toContain("bash_watch({ taskId, pattern, background: true })");
-    expect(out).toContain("never call it repeatedly to wait");
-    expect(out).toContain("locks the user out");
+    expect(out).toContain("Nothing else useful to do");
+    expect(out).toContain("sync `bash_watch`");
+    expect(out).toContain("the user can interrupt");
+    expect(out).toContain("completion reminder delivers the result");
+    expect(out).toContain("async `bash_watch`");
+    expect(out).toContain("Never loop `bash_status`");
   });
 
   test("omits long-running bash hint when background bash is off (foreground auto-promotes)", () => {

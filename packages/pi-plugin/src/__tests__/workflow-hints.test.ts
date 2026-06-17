@@ -39,16 +39,13 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain("before you run tests or commit");
     expect(out).toContain("does not surface compile/type errors automatically");
     expect(out).toContain("**Long-running commands**");
-    // Positive-first waiting protocol (parity with OpenCode — see the Discord
-    // feedback rationale there): sanctioned outlets lead, bash_status gets a
-    // legitimate role, and Pi keeps snake_case param names.
-    expect(out).toContain("Then do ONE of these:");
-    expect(out).toContain("Keep working on something independent");
-    expect(out).toContain("completion reminder with the result arrives automatically");
-    expect(out).toContain("bash_watch({ task_id, pattern, background: true })");
-    expect(out).toContain("never call it repeatedly to wait");
-    expect(out).toContain("locks the user out");
-    expect(out).toContain("`bash_status({ task_id })`");
+    expect(out).toContain("Nothing else useful to do");
+    expect(out).toContain("sync `bash_watch`");
+    expect(out).toContain("timeout_ms");
+    expect(out).toContain("the user can interrupt");
+    expect(out).toContain("completion reminder delivers the result");
+    expect(out).toContain("async `bash_watch`");
+    expect(out).toContain("Never loop `bash_status`");
     expect(out).not.toContain("taskId");
   });
 

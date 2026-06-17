@@ -1491,6 +1491,60 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(bashToolDescription(true, false, true)).not.toContain("compressed");
   });
 
+  test("background on steers waiting to bash_watch and forbids bash_status polling loops", () => {
+    const on = bashToolDescription(true, true, true);
+    expect(on).toContain("bash_status/bash_watch/bash_kill");
+    expect(on).toContain("sync blocks, async notifies");
+    expect(on).toContain("Do not loop bash_status to wait");
+  });
+
+  test("bash_watch description endorses long sync waits and user interrupt", () => {
+    const ctx: PluginContext = {
+      pool: {
+        getBridge: () => ({ send: async () => ({ success: true }) }),
+      } as unknown as BridgePool,
+      client: createMockClient(),
+      config: {} as PluginContext["config"],
+      storageDir: "/tmp/aft-test",
+    };
+    const desc = createBashWatchTool(ctx).description;
+    expect(desc).toContain("even for long builds/tests/installs");
+    expect(desc).toContain("interrupt");
+    expect(desc).toContain("Never loop bash_status");
+  });
+
+  test("bash_status description forbids polling loops", () => {
+    const ctx: PluginContext = {
+      pool: {
+        getBridge: () => ({ send: async () => ({ success: true }) }),
+      } as unknown as BridgePool,
+      client: createMockClient(),
+      config: {} as PluginContext["config"],
+      storageDir: "/tmp/aft-test",
+    };
+    const desc = createBashStatusTool(ctx).description;
+    expect(desc).toContain("never loop");
+    expect(desc).toContain("To wait, use bash_watch");
+  });
+
+  test("bash_watch timeoutMs arg documents 30 min max", () => {
+    const ctx: PluginContext = {
+      pool: {
+        getBridge: () => ({ send: async () => ({ success: true }) }),
+      } as unknown as BridgePool,
+      client: createMockClient(),
+      config: {} as PluginContext["config"],
+      storageDir: "/tmp/aft-test",
+    };
+    const watch = createBashWatchTool(ctx);
+    const wrapped = tool.schema.object(watch.args);
+    const jsonSchema = tool.schema.toJSONSchema(wrapped, { io: "input" }) as {
+      properties?: { timeoutMs?: { maximum?: number; description?: string } };
+    };
+    expect(jsonSchema.properties?.timeoutMs?.maximum).toBe(1_800_000);
+    expect(jsonSchema.properties?.timeoutMs?.description).toContain("1800000 (30 min)");
+  });
+
   test("background/PTY sentences track bash.background config", () => {
     const on = bashToolDescription(true, true, true);
     expect(on).toContain("background: true");

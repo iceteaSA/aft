@@ -57,7 +57,7 @@ import {
 const FOREGROUND_POLL_INTERVAL_MS = 100;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
-const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
+const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 // Test-only override for the foreground wait window. Production resolves the
@@ -120,7 +120,7 @@ const BashBackgroundFlagParam = {
   background: Type.Optional(
     Type.Boolean({
       description:
-        "Spawn command in background and return immediately with a task_id. Use bash_status to poll completion and bash_kill to terminate. Ideal for long-running tasks like builds or dev servers.",
+        "Spawn command in background and return immediately with a task_id. Use bash_watch to wait for completion or output patterns; bash_status for a one-shot snapshot only. Use bash_kill to terminate. Ideal for long-running tasks like builds or dev servers.",
     }),
   ),
 };
@@ -335,7 +335,7 @@ export function registerBashTool(
     ? " Output is compressed by default; pass `compressed: false` for raw output."
     : "";
   const tasksSentence = bashCfg.background
-    ? ' Pass `background: true` to run in the background and get a task_id for `bash_status`/`bash_kill`. Pass `pty: true` for interactive programs (REPLs, TUIs) and drive them with `bash_status({ output_mode: "screen" })` plus `bash_write`. Use `bash_watch` to wait for output patterns or exit events.'
+    ? ' Pass `background: true` to run in the background and get a task_id for `bash_status`/`bash_watch`/`bash_kill`. Pass `pty: true` for interactive programs (REPLs, TUIs) and drive them with `bash_status({ output_mode: "screen" })` plus `bash_write`. Use `bash_watch` to wait for exit or output patterns (sync blocks, async notifies). Do not loop `bash_status` to wait.'
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   pi.registerTool<typeof BashParams, BashDetails>({
     name: "bash",
@@ -614,7 +614,7 @@ export function createBashStatusTool(ctx: PluginContext) {
     name: "bash_status",
     label: "bash_status",
     description:
-      "Read-only snapshot of a background bash task. Returns immediately. Never waits. Use bash_watch to block on or register for pattern matches and exit events.",
+      "Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
     promptSnippet: "Inspect a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(
@@ -643,7 +643,7 @@ export function createBashWatchTool(ctx: PluginContext) {
     name: "bash_watch",
     label: "bash_watch",
     description:
-      "Watch a background bash task. Two modes. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use this to be pinged when a specific line appears or the task exits, without freezing your turn. Sync (default) blocks until a pattern matches/the task exits/timeout, and is ONLY for short bounded waits (seconds, e.g. a dev server printing a readiness line). Do NOT sync-wait for a long task (build/test/install): blocking locks the user out until it ends — instead end your turn and let the automatic completion reminder arrive, or use async mode.",
+      "Watch a background bash task. Sync (default) blocks until a pattern matches, the task exits, or timeout — use it when the result is the next thing you need, even for long builds/tests/installs (pass timeout_ms up to 30 min for those). The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
     promptSnippet: "Wait for or watch a background bash task",
     parameters: BashWatchParams,
     async execute(

@@ -19,6 +19,8 @@ import { __resetBgNotificationStateForTests, sessionBgStates } from "../bg-notif
 import {
   __parseWaitPatternForTests,
   __trimWaitScanBufferForTests,
+  createBashStatusTool,
+  createBashWatchTool,
   registerBashTool,
 } from "../tools/bash.js";
 import type { PluginContext } from "../types.js";
@@ -1254,6 +1256,41 @@ describe("bash tool description (agent-facing wording)", () => {
       expect(description.toLowerCase()).not.toContain("rust bash handler");
       expect(description.toLowerCase()).not.toContain("rewrit");
     }
+  });
+
+  test("background on steers waiting to bash_watch and forbids bash_status polling loops", () => {
+    const on = registeredDescription(true).description;
+    expect(on).toContain("bash_status`/`bash_watch`/`bash_kill");
+    expect(on).toContain("sync blocks, async notifies");
+    expect(on).toContain("Do not loop `bash_status` to wait");
+  });
+
+  test("bash_watch and bash_status agent-facing descriptions", () => {
+    const ctx = makeMockContext({} as BinaryBridge);
+    const watch = createBashWatchTool(ctx);
+    expect(watch.description).toContain("even for long builds/tests/installs");
+    expect(watch.description).toContain("interrupt");
+    expect(watch.description).toContain("Never loop bash_status");
+    const status = createBashStatusTool(ctx);
+    expect(status.description).toContain("never loop");
+    expect(status.description).toContain("To wait, use bash_watch");
+  });
+
+  test("bash background param steers to bash_watch not poll", () => {
+    let backgroundDesc = "";
+    const api = {
+      registerTool: (def: {
+        name: string;
+        parameters?: { properties?: Record<string, unknown> };
+      }) => {
+        if (def.name !== "bash") return;
+        const bg = def.parameters?.properties?.background as { description?: string } | undefined;
+        backgroundDesc = bg?.description ?? "";
+      },
+    } as unknown as ExtensionAPI;
+    registerBashTool(api, makeMockContext({} as BinaryBridge), false);
+    expect(backgroundDesc).toContain("bash_watch");
+    expect(backgroundDesc).not.toContain("poll completion");
   });
 
   test("compression and background sentences track the resolved bash config", () => {
