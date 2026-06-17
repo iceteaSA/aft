@@ -288,7 +288,7 @@ export const AftConfigSchema = z
     semantic_search: z.boolean().optional(),
     /** Enable the persisted callgraph store substrate. Default: true. */
     callgraph_store: z.boolean().optional(),
-    /** Number of files to parse in a single batch during callgraph store cold build. Default: 100. */
+    /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
     callgraph_chunk_size: z.number().optional(),
     /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
     inspect: InspectConfigSchema.optional(),
@@ -1211,6 +1211,8 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "callgraph_store",
+  "callgraph_chunk_size",
   "inspect",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:

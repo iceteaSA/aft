@@ -1328,13 +1328,21 @@ impl AppContext {
                 CallGraphStore::open_readonly(callgraph_dir, project_root)?
             } else if force_rebuild {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                let (store, _stats) =
-                    CallGraphStore::cold_build_with_lease_chunked(callgraph_dir, project_root, &files, self.config().callgraph_chunk_size)?;
+                let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+                    callgraph_dir,
+                    project_root,
+                    &files,
+                    self.config().callgraph_chunk_size,
+                )?;
                 Some(store)
             } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                let (store, _stats) =
-                    CallGraphStore::ensure_built_with_lease_chunked(callgraph_dir, project_root, &files, self.config().callgraph_chunk_size)?;
+                let (store, _stats) = CallGraphStore::ensure_built_with_lease_chunked(
+                    callgraph_dir,
+                    project_root,
+                    &files,
+                    self.config().callgraph_chunk_size,
+                )?;
                 Some(store)
             } else {
                 Some(CallGraphStore::open(callgraph_dir, project_root)?)
@@ -1524,11 +1532,21 @@ impl AppContext {
             crate::log_ctx::with_session(session_id, || {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let built = if force_rebuild {
-                    CallGraphStore::cold_build_with_lease_chunked(callgraph_dir, project_root, &files, chunk_size)
-                        .map(|(store, _)| store)
+                    CallGraphStore::cold_build_with_lease_chunked(
+                        callgraph_dir,
+                        project_root,
+                        &files,
+                        chunk_size,
+                    )
+                    .map(|(store, _)| store)
                 } else {
-                    CallGraphStore::ensure_built_with_lease_chunked(callgraph_dir, project_root, &files, chunk_size)
-                        .map(|(store, _)| store)
+                    CallGraphStore::ensure_built_with_lease_chunked(
+                        callgraph_dir,
+                        project_root,
+                        &files,
+                        chunk_size,
+                    )
+                    .map(|(store, _)| store)
                 };
                 match built {
                     Ok(store) => {

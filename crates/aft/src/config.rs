@@ -141,6 +141,7 @@ pub struct Config {
     /// Enable the persisted callgraph store substrate (default: true).
     pub callgraph_store: bool,
     /// Number of files to parse in a single batch during callgraph store cold build (default: 100).
+    /// Lower values reduce peak memory during cold build.
     /// Set to 0 to disable chunking and parse all files at once.
     pub callgraph_chunk_size: usize,
     /// Enable experimental bash command rewriting (default: false).

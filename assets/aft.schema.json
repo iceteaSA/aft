@@ -112,6 +112,16 @@
       "default": false,
       "description": "Enable semantic search via aft_search. Backend defaults to local fastembed; configurable via the `semantic` field."
     },
+    "callgraph_store": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable the persisted callgraph store substrate. Default: true."
+    },
+    "callgraph_chunk_size": {
+      "type": "number",
+      "default": 100,
+      "description": "Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build; set to 0 to parse all files at once."
+    },
     "inspect": {
       "type": "object",
       "properties": {

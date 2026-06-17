@@ -576,8 +576,13 @@ impl CallGraphStore {
         let project_key = crate::search_index::project_cache_key(&project_root);
         let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
         let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
-        let (stats, generation) =
-            Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files, chunk_size)?;
+        let (stats, generation) = Self::cold_build_publish_locked(
+            &callgraph_dir,
+            &project_root,
+            &project_key,
+            files,
+            chunk_size,
+        )?;
         let store = Self::open_generation(&callgraph_dir, project_root, project_key, generation)?;
         Ok((store, stats))
     }
@@ -639,8 +644,13 @@ impl CallGraphStore {
                 }
             }
         }
-        let (stats, generation) =
-            Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files, chunk_size)?;
+        let (stats, generation) = Self::cold_build_publish_locked(
+            &callgraph_dir,
+            &project_root,
+            &project_key,
+            files,
+            chunk_size,
+        )?;
         let store = Self::open_generation(&callgraph_dir, project_root, project_key, generation)?;
         Ok((store, Some(stats)))
     }
@@ -797,7 +807,11 @@ impl CallGraphStore {
         self.cold_build_chunked(files, 0)
     }
 
-    pub fn cold_build_chunked(&self, files: &[PathBuf], chunk_size: usize) -> Result<ColdBuildStats> {
+    pub fn cold_build_chunked(
+        &self,
+        files: &[PathBuf],
+        chunk_size: usize,
+    ) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let bench = std::env::var("AFT_BENCH_COLD").is_ok();
         macro_rules! phase {
@@ -864,7 +878,8 @@ impl CallGraphStore {
                 }
             }
             create_cold_build_secondary_indexes(&tx)?;
-            let supplemental_edge_count = insert_method_dispatch_edges(&tx, &self.project_root, None)?;
+            let supplemental_edge_count =
+                insert_method_dispatch_edges(&tx, &self.project_root, None)?;
             set_meta_ready(&tx, true)?;
             tx.commit()?;
             phase!("sqlite_insert", t);
@@ -891,7 +906,8 @@ impl CallGraphStore {
             });
         }
 
-        // Chunked low-memory implementation
+        // Chunked implementation: parse and resolve in batches to reduce peak
+        // memory during cold build without changing the persisted graph.
         let t = Instant::now();
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let tx = conn.transaction()?;
@@ -949,12 +965,8 @@ impl CallGraphStore {
         for (rel_path, idx) in &file_to_call_data_index {
             caller_data.insert(rel_path.clone(), &persistent_call_data[*idx]);
         }
-        let index = ProjectIndex {
-            project_root: self.project_root.clone(),
-            files: files_index,
-            caller_data,
-            workspace_crate_prefixes: std::sync::OnceLock::new(),
-        };
+        let indexed_caller_files = files_index.keys().cloned().collect::<BTreeSet<_>>();
+        let index = ProjectIndex::from_parts(&self.project_root, files_index, caller_data);
 
         let mut resolved_refs = Vec::new();
         for (_, raw_refs) in all_raw_refs {
@@ -976,7 +988,12 @@ impl CallGraphStore {
             }
         }
         create_cold_build_secondary_indexes(&tx)?;
-        let supplemental_edge_count = insert_method_dispatch_edges(&tx, &self.project_root, None)?;
+        let supplemental_edge_count = insert_method_dispatch_edges_chunked(
+            &tx,
+            &self.project_root,
+            &indexed_caller_files,
+            chunk_size,
+        )?;
         set_meta_ready(&tx, true)?;
         tx.commit()?;
         phase!("sqlite_insert", t);
@@ -3796,6 +3813,19 @@ fn resolve_local_target(
 }
 
 impl<'a> ProjectIndex<'a> {
+    fn from_parts(
+        project_root: &Path,
+        files: HashMap<String, DbFileIndex>,
+        caller_data: HashMap<String, &'a FileCallData>,
+    ) -> Self {
+        Self {
+            project_root: project_root.to_path_buf(),
+            files,
+            caller_data,
+            workspace_crate_prefixes: std::sync::OnceLock::new(),
+        }
+    }
+
     fn from_extracts(project_root: &Path, extracts: &'a [FileExtract]) -> Self {
         let mut files = HashMap::new();
         let mut caller_data = HashMap::new();
@@ -3804,12 +3834,7 @@ impl<'a> ProjectIndex<'a> {
             caller_data.insert(extract.rel_path.clone(), &extract.data);
             files.insert(extract.rel_path.clone(), index);
         }
-        Self {
-            project_root: project_root.to_path_buf(),
-            files,
-            caller_data,
-            workspace_crate_prefixes: std::sync::OnceLock::new(),
-        }
+        Self::from_parts(project_root, files, caller_data)
     }
 
     fn from_db_and_callers(
@@ -3826,12 +3851,7 @@ impl<'a> ProjectIndex<'a> {
             );
             caller_data.insert(rel_path.clone(), &extract.data);
         }
-        Ok(Self {
-            project_root: project_root.to_path_buf(),
-            files,
-            caller_data,
-            workspace_crate_prefixes: std::sync::OnceLock::new(),
-        })
+        Ok(Self::from_parts(project_root, files, caller_data))
     }
 
     fn lang_for(&self, rel_path: &str) -> Option<LangId> {
@@ -4439,6 +4459,34 @@ fn insert_method_dispatch_edges(
         };
         insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_NAME_MATCH)?;
         inserted += 1;
+    }
+    Ok(inserted)
+}
+
+fn insert_method_dispatch_edges_chunked(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    caller_files: &BTreeSet<String>,
+    chunk_size: usize,
+) -> Result<usize> {
+    if caller_files.is_empty() {
+        return Ok(0);
+    }
+    if chunk_size == 0 || caller_files.len() <= chunk_size {
+        return insert_method_dispatch_edges(tx, project_root, Some(caller_files));
+    }
+
+    let mut inserted = 0usize;
+    let mut batch = BTreeSet::new();
+    for caller_file in caller_files {
+        batch.insert(caller_file.clone());
+        if batch.len() == chunk_size {
+            inserted += insert_method_dispatch_edges(tx, project_root, Some(&batch))?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        inserted += insert_method_dispatch_edges(tx, project_root, Some(&batch))?;
     }
     Ok(inserted)
 }
@@ -6902,6 +6950,106 @@ export function leaf() {}
     }
 
     #[test]
+    fn cold_build_chunked_matches_unchunked_logical_rows() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = fs::canonicalize(dir.path()).expect("canonical temp root");
+        write_chunked_equivalence_fixture(&project_root);
+        let files = callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+        assert!(
+            files.len() > 6,
+            "fixture should be large enough to split into multiple chunks"
+        );
+
+        let unchunked = CallGraphStore::open(
+            project_root.join(".store-unchunked"),
+            project_root.to_path_buf(),
+        )
+        .expect("open unchunked store");
+        let unchunked_stats = unchunked
+            .cold_build_chunked(&files, 0)
+            .expect("unchunked cold build");
+
+        let chunked = CallGraphStore::open(
+            project_root.join(".store-chunked"),
+            project_root.to_path_buf(),
+        )
+        .expect("open chunked store");
+        let chunked_stats = chunked
+            .cold_build_chunked(&files, 3)
+            .expect("chunked cold build");
+
+        assert_cold_build_stats_match_except_elapsed(&unchunked_stats, &chunked_stats);
+        assert_eq!(
+            unchunked.edge_snapshot().expect("unchunked edge snapshot"),
+            chunked.edge_snapshot().expect("chunked edge snapshot"),
+            "public edge snapshots must match"
+        );
+
+        let dispatch_edges = {
+            let conn = chunked.conn.lock().expect("callgraph store mutex poisoned");
+            conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE provenance IN ('name_match', 'type_match')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count dispatch edges")
+        };
+        assert!(
+            dispatch_edges > 0,
+            "fixture must exercise method-dispatch edge insertion"
+        );
+
+        for table in [
+            "edges",
+            "refs",
+            "nodes",
+            "file_dependencies",
+            "dispatch_hints",
+        ] {
+            assert_eq!(
+                graph_table_rows(&unchunked, table),
+                graph_table_rows(&chunked, table),
+                "chunked cold build must match unchunked rows for {table}"
+            );
+        }
+        assert_eq!(
+            graph_table_rows_without(&unchunked, "files", &["indexed_at"]),
+            graph_table_rows_without(&chunked, "files", &["indexed_at"]),
+            "files rows must match apart from indexed_at"
+        );
+        assert_eq!(
+            graph_table_rows_without(&unchunked, "backend_file_state", &["updated_at"]),
+            graph_table_rows_without(&chunked, "backend_file_state", &["updated_at"]),
+            "backend freshness rows must match apart from updated_at"
+        );
+
+        let published_dir = project_root.join(".store-published");
+        let (_published, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+            published_dir.clone(),
+            project_root.to_path_buf(),
+            &files,
+            0,
+        )
+        .expect("published unchunked cold build");
+        assert!(
+            !CallGraphStore::needs_cold_build(&published_dir, &project_root)
+                .expect("needs_cold_build after publish"),
+            "published store should be ready"
+        );
+        let (_opened, rebuild_stats) = CallGraphStore::ensure_built_with_lease_chunked(
+            published_dir,
+            project_root.to_path_buf(),
+            &files,
+            3,
+        )
+        .expect("ensure with a different chunk size");
+        assert!(
+            rebuild_stats.is_none(),
+            "changing callgraph_chunk_size must not affect store identity or force a rebuild"
+        );
+    }
+
+    #[test]
     fn incremental_barrel_refresh_matches_per_ref_lookup_and_cold_rebuild() {
         let dir = tempdir().expect("temp dir");
         let project_root = dir.path();
@@ -7137,6 +7285,80 @@ export function leaf() {}
         }
     }
 
+    fn write_chunked_equivalence_fixture(project_root: &Path) {
+        let ts_dir = project_root.join("ts");
+        fs::create_dir_all(&ts_dir).expect("create ts dir");
+        fs::write(
+            ts_dir.join("leaf.ts"),
+            "export function leaf(value: number) {\n  return value + 1;\n}\n",
+        )
+        .expect("write ts leaf");
+        fs::write(
+            ts_dir.join("mid.ts"),
+            "import { leaf } from './leaf';\n\nexport function mid(value: number) {\n  return leaf(value);\n}\n",
+        )
+        .expect("write ts mid");
+        fs::write(
+            ts_dir.join("entry.ts"),
+            "import { mid } from './mid';\nimport { Worker } from './worker';\n\nexport function entry(worker: Worker) {\n  return mid(worker.run());\n}\n",
+        )
+        .expect("write ts entry");
+        fs::write(
+            ts_dir.join("worker.ts"),
+            "export class Worker {\n  run() {\n    return 41;\n  }\n}\n",
+        )
+        .expect("write ts worker");
+        for idx in 0..4 {
+            fs::write(
+                ts_dir.join(format!("extra_{idx}.ts")),
+                format!(
+                    "import {{ entry }} from './entry';\nimport {{ Worker }} from './worker';\n\nexport function extra{idx}() {{\n  return entry(new Worker());\n}}\n"
+                ),
+            )
+            .expect("write ts extra");
+        }
+
+        let rust_dir = project_root.join("src");
+        let commands_dir = rust_dir.join("commands");
+        fs::create_dir_all(&commands_dir).expect("create rust commands dir");
+        fs::write(
+            rust_dir.join("context.rs"),
+            r#"pub struct AppContext;
+
+impl AppContext {
+    pub fn callgraph_store_for_ops(&self) -> usize {
+        1
+    }
+}
+"#,
+        )
+        .expect("write rust context");
+        fs::write(
+            rust_dir.join("lib.rs"),
+            "pub mod context;\npub mod commands;\n",
+        )
+        .expect("write rust lib");
+        fs::write(
+            commands_dir.join("mod.rs"),
+            "pub mod callers;\npub mod impact;\npub mod trace_to;\n",
+        )
+        .expect("write rust commands mod");
+        for name in ["callers", "impact", "trace_to"] {
+            fs::write(
+                commands_dir.join(format!("{name}.rs")),
+                format!(
+                    r#"use crate::context::AppContext;
+
+pub fn handle_{name}(ctx: &AppContext) -> usize {{
+    ctx.callgraph_store_for_ops()
+}}
+"#
+                ),
+            )
+            .expect("write rust command");
+        }
+    }
+
     fn write_barrel_refresh_fixture(project_root: &Path, barrel_source: &str) -> Vec<PathBuf> {
         let src_dir = project_root.join("src");
         fs::create_dir_all(&src_dir).expect("create src dir");
@@ -7172,14 +7394,35 @@ export function leaf() {}
         table_rows(&conn, table)
     }
 
+    fn graph_table_rows_without(
+        store: &CallGraphStore,
+        table: &str,
+        excluded_columns: &[&str],
+    ) -> Vec<String> {
+        let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+        table_rows_without(&conn, table, excluded_columns)
+    }
+
     fn table_rows(conn: &Connection, table: &str) -> Vec<String> {
+        table_rows_without(conn, table, &[])
+    }
+
+    fn table_rows_without(
+        conn: &Connection,
+        table: &str,
+        excluded_columns: &[&str],
+    ) -> Vec<String> {
+        let excluded_columns = excluded_columns.iter().copied().collect::<BTreeSet<_>>();
         let columns: Vec<String> = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .expect("prepare table_info")
             .query_map([], |row| row.get::<_, String>(1))
             .expect("query table_info")
-            .collect::<std::result::Result<_, _>>()
-            .expect("collect columns");
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .expect("collect columns")
+            .into_iter()
+            .filter(|column| !excluded_columns.contains(column.as_str()))
+            .collect();
         let sql = format!(
             "SELECT {} FROM {table} ORDER BY {}",
             columns.join(", "),
@@ -7191,6 +7434,25 @@ export function leaf() {}
             .expect("query table rows")
             .collect::<std::result::Result<_, _>>()
             .expect("collect table rows")
+    }
+
+    fn assert_cold_build_stats_match_except_elapsed(
+        expected: &ColdBuildStats,
+        actual: &ColdBuildStats,
+    ) {
+        assert_eq!(actual.files, expected.files, "file counts must match");
+        assert_eq!(actual.nodes, expected.nodes, "node counts must match");
+        assert_eq!(actual.refs, expected.refs, "ref counts must match");
+        assert_eq!(actual.edges, expected.edges, "edge counts must match");
+        assert_eq!(
+            actual.failed_files.iter().cloned().collect::<BTreeSet<_>>(),
+            expected
+                .failed_files
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            "failed file sets must match"
+        );
     }
 
     fn backend_state_rows(conn: &Connection) -> Vec<String> {

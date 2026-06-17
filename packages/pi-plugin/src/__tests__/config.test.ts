@@ -5,7 +5,11 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AftConfigSchema, resolveBridgePoolTransportOptions } from "../config.js";
+import {
+  AftConfigSchema,
+  resolveBridgePoolTransportOptions,
+  resolveProjectOverridesForConfigure,
+} from "../config.js";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const tempRoots = new Set<string>();
@@ -61,6 +65,28 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("project config can override callgraph store chunking knobs", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ callgraph_store: true, callgraph_chunk_size: 100 }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ callgraph_store: false, callgraph_chunk_size: 3 }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.callgraph_store).toBe(false);
+    expect(config.callgraph_chunk_size).toBe(3);
+    expect(result.stderr).not.toContain("Ignoring callgraph_store");
+    expect(result.stderr).not.toContain("Ignoring callgraph_chunk_size");
+  });
+
   test("loads a config with comments inside nested objects (issue #88)", () => {
     const fixture = createConfigFixture();
     // comment-json attaches Symbol(before:<key>) properties for the comments.
@@ -783,5 +809,19 @@ describe("loadAftConfig", () => {
     expect(config.bridge).toBeUndefined();
     expect(config.format_on_edit).toBe(true);
     expect(result.stderr).toContain("Partial config loaded");
+  });
+});
+
+describe("resolveProjectOverridesForConfigure", () => {
+  test("forwards callgraph store chunking knobs to Rust configure", () => {
+    expect(
+      resolveProjectOverridesForConfigure({
+        callgraph_store: false,
+        callgraph_chunk_size: 3,
+      }),
+    ).toMatchObject({
+      callgraph_store: false,
+      callgraph_chunk_size: 3,
+    });
   });
 });

@@ -15,6 +15,7 @@
  *   - INCLUDES every field that can legitimately differ per project:
  *     format_on_edit, formatter_timeout_secs, validate_on_edit, formatter,
  *     checker, restrict_to_project_root, search_index, semantic_search,
+ *     callgraph_store, callgraph_chunk_size,
  *     experimental.bash.*, experimental.lsp_ty, lsp (project-safe subset),
  *     semantic (project-safe subset), max_callgraph_files.
  *   - EXCLUDES tool-registration fields that lock at plugin init:
@@ -55,6 +56,8 @@ describe("resolveProjectOverridesForConfigure", () => {
       restrict_to_project_root: true,
       search_index: true,
       semantic_search: true,
+      callgraph_store: false,
+      callgraph_chunk_size: 3,
       experimental: {
         bash: { rewrite: true, compress: true, background: false },
         lsp_ty: true,
@@ -72,6 +75,8 @@ describe("resolveProjectOverridesForConfigure", () => {
       restrict_to_project_root: true,
       search_index: true,
       semantic_search: true,
+      callgraph_store: false,
+      callgraph_chunk_size: 3,
       experimental_bash_rewrite: true,
       experimental_bash_compress: true,
       experimental_bash_background: false,

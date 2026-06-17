@@ -55,8 +55,7 @@ import {
   loadAftConfig,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
-  resolveExperimentalConfigForConfigure,
-  resolveLspConfigForConfigure,
+  resolveProjectOverridesForConfigure,
 } from "./config.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
@@ -452,24 +451,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // can opt in by setting `restrict_to_project_root: true` in their aft.jsonc
   // (USER config only; project config cannot weaken this — see trust
   // boundary in config.ts).
-  const configOverrides: Record<string, unknown> = {};
-  if (config.format_on_edit !== undefined) configOverrides.format_on_edit = config.format_on_edit;
-  if (config.formatter_timeout_secs !== undefined)
-    configOverrides.formatter_timeout_secs = config.formatter_timeout_secs;
-  if (config.validate_on_edit !== undefined)
-    configOverrides.validate_on_edit = config.validate_on_edit;
-  if (config.formatter !== undefined) configOverrides.formatter = config.formatter;
-  if (config.checker !== undefined) configOverrides.checker = config.checker;
-  configOverrides.restrict_to_project_root = config.restrict_to_project_root ?? false;
-  if (config.search_index !== undefined) configOverrides.search_index = config.search_index;
-  if (config.semantic_search !== undefined)
-    configOverrides.semantic_search = config.semantic_search;
-  Object.assign(configOverrides, resolveExperimentalConfigForConfigure(config));
-  Object.assign(configOverrides, resolveLspConfigForConfigure(config));
-  if (config.semantic !== undefined) configOverrides.semantic = config.semantic;
-  if (config.inspect !== undefined) configOverrides.inspect = config.inspect;
-  if (config.max_callgraph_files !== undefined)
-    configOverrides.max_callgraph_files = config.max_callgraph_files;
+  const configOverrides = resolveProjectOverridesForConfigure(config);
   // url_fetch_allow_private: USER ONLY. Forwarded only when set (Rust default false).
   if (config.url_fetch_allow_private !== undefined)
     configOverrides.url_fetch_allow_private = config.url_fetch_allow_private;

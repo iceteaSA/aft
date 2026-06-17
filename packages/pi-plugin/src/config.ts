@@ -169,6 +169,9 @@ export interface AftConfig {
   restrict_to_project_root?: boolean;
   search_index?: boolean;
   semantic_search?: boolean;
+  callgraph_store?: boolean;
+  /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
+  callgraph_chunk_size?: number;
   /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
   inspect?: InspectConfig;
   /**
@@ -492,6 +495,8 @@ export const AftConfigSchema = z
     restrict_to_project_root: z.boolean().optional(),
     search_index: z.boolean().optional(),
     semantic_search: z.boolean().optional(),
+    callgraph_store: z.boolean().optional(),
+    callgraph_chunk_size: z.number().optional(),
     inspect: InspectConfigSchema.optional(),
     /**
      * Bash tool family (hoist + rewrite + compress + background execution).
@@ -566,6 +571,42 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
   if (disabled.size > 0) {
     overrides.disabled_lsp = [...disabled];
   }
+
+  return overrides;
+}
+
+/**
+ * Build the configure overrides that can legitimately differ per project.
+ *
+ * Pi runs one project per plugin process today, but keeping this shape in
+ * parity with OpenCode's `resolveProjectOverridesForConfigure` prevents drift
+ * in the Rust configure payload and keeps project-safe config forwarding in one
+ * place.
+ */
+export function resolveProjectOverridesForConfigure(config: AftConfig): Record<string, unknown> {
+  const overrides: Record<string, unknown> = {};
+
+  if (config.format_on_edit !== undefined) overrides.format_on_edit = config.format_on_edit;
+  if (config.formatter_timeout_secs !== undefined)
+    overrides.formatter_timeout_secs = config.formatter_timeout_secs;
+  if (config.validate_on_edit !== undefined) overrides.validate_on_edit = config.validate_on_edit;
+  if (config.formatter !== undefined) overrides.formatter = config.formatter;
+  if (config.checker !== undefined) overrides.checker = config.checker;
+
+  overrides.restrict_to_project_root = config.restrict_to_project_root ?? false;
+
+  if (config.search_index !== undefined) overrides.search_index = config.search_index;
+  if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
+  if (config.callgraph_store !== undefined) overrides.callgraph_store = config.callgraph_store;
+  if (config.callgraph_chunk_size !== undefined)
+    overrides.callgraph_chunk_size = config.callgraph_chunk_size;
+
+  Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
+  Object.assign(overrides, resolveLspConfigForConfigure(config));
+  if (config.semantic !== undefined) overrides.semantic = config.semantic;
+  if (config.inspect !== undefined) overrides.inspect = config.inspect;
+  if (config.max_callgraph_files !== undefined)
+    overrides.max_callgraph_files = config.max_callgraph_files;
 
   return overrides;
 }
@@ -1071,6 +1112,8 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "callgraph_store",
+  "callgraph_chunk_size",
   "inspect",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
