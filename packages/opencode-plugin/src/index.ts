@@ -32,7 +32,7 @@ import {
   flushConfigureWarningsOnIdle,
 } from "./configure-warnings.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
-import { bridgeLogger, debug, error, log, warn } from "./logger.js";
+import { bridgeLogger, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
 import {
   abortInFlightGithubInstalls,
@@ -50,7 +50,6 @@ import {
 } from "./notifications.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
-import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
 import {
@@ -530,12 +529,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           ctx,
           directory: sessionDir,
           sessionID: completion.session_id,
-          // `client` is the in-process fallback used when the probe at
-          // plugin init found the live HTTP listener unreachable. See
-          // shared/live-server-client.ts and bg-notifications.ts for the
-          // wake transport selection (anomalyco/opencode#28202).
           client: input.client,
-          serverUrl: input.serverUrl?.toString(),
         },
         completion,
       );
@@ -547,10 +541,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           ctx,
           directory: sessionDir,
           sessionID: reminder.session_id,
-          // See onBashCompleted above for the live-server vs. in-process
-          // wake transport selection.
           client: input.client,
-          serverUrl: input.serverUrl?.toString(),
         },
         reminder,
       );
@@ -563,7 +554,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           directory: sessionDir,
           sessionID: frame.session_id,
           client: input.client,
-          serverUrl: input.serverUrl?.toString(),
         },
         frame,
       );
@@ -579,40 +569,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     storageDir: configOverrides.storage_dir as string,
   };
 
-  // Wake transport probe: decide ONCE per plugin process whether
-  // bg-notifications should POST wakes through a `createOpencodeClient`
-  // aimed at `input.serverUrl` (the workaround for
-  // anomalyco/opencode#28202 — no duplicate runs) or through the
-  // in-process `input.client.session.promptAsync` (the upstream bug
-  // path, but always available). Probe runs in the background so plugin
-  // init never blocks on the HTTP timeout; the wake path reads the
-  // resolved decision through `useLiveServerWake()` at the moment a
-  // wake fires, so background probes that finish AFTER init still take
-  // effect on the next reminder. Default until the probe resolves:
-  // `false` (in-process fallback) — that's the safer direction because
-  // `input.client.session.promptAsync` is always present, while the
-  // live-server transport needs an actual listener to be reachable.
-  void probeServerReachable(input.serverUrl?.toString())
-    .then((reachable) => {
-      setLiveServerWakeAvailable(reachable);
-      if (reachable) {
-        log(
-          "Live OpenCode HTTP listener reachable; bg-notifications wake path = live-server (anomalyco/opencode#28202 workaround active).",
-        );
-      } else {
-        // Normal OpenCode TUI flow: the optional live HTTP listener is absent,
-        // so bg-notifications uses the reliable in-process wake path. Keep the
-        // duplicate-runner workaround nudge in DEBUG instead of surfacing it as
-        // a user-actionable warning.
-        debug(
-          "Live OpenCode HTTP listener unreachable; bg-notifications wake path = in-process-fallback. Wakes will still arrive but the upstream duplicate-runner bug (anomalyco/opencode#28202) is not worked around. Launch with `opencode --port 0` in TUI mode to activate the workaround.",
-        );
-      }
-    })
-    .catch(() => {
-      // Probe failures stay on the safe default (in-process fallback).
-      setLiveServerWakeAvailable(false);
-    });
   // Settle the ONNX runtime download promise (started above) and patch the
   // resolved path into the pool's configure overrides. Bridges spawned AFTER
   // this resolves will pass `_ort_dylib_dir` through configure and pick up
@@ -1047,7 +1003,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         directory: sessionDir,
         sessionID,
         client: input.client,
-        serverUrl: input.serverUrl?.toString(),
       });
       await flushConfigureWarningsOnIdle(sessionID);
     },

@@ -1,11 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { sessionDebug, sessionLog, sessionWarn } from "./logger.js";
+import { sessionLog, sessionWarn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
-import {
-  getLiveServerClient,
-  setLiveServerWakeAvailable,
-  useLiveServerWake,
-} from "./shared/live-server-client.js";
 import type { PluginContext } from "./types.js";
 
 /**
@@ -122,30 +117,15 @@ interface DrainContext {
   directory: string;
   sessionID: string;
   /**
-   * Plugin-provided OpenCode SDK client (`input.client`). The wake path
-   * uses this as a fallback when `useLiveServerWake()` is false — i.e.
-   * the live HTTP listener was unreachable when probed at plugin init,
-   * so `getLiveServerClient(...)` cannot be built. Falling back here
-   * accepts the upstream `promptAsync` runner-split bug
-   * (anomalyco/opencode#28202; duplicate "stop" messages) in exchange
-   * for wakes still arriving at all in plain-TUI sessions.
+   * Plugin-provided OpenCode SDK client (`input.client`). Wake prompts are
+   * sent through this canonical in-process client; OpenCode fixed the
+   * runner-state split that previously required a live HTTP listener workaround.
    *
    * Typed `unknown` because the real `@opencode-ai/sdk` `OpencodeClient`
-   * has a narrower, generated `promptAsync` signature than the loose
-   * structural `OpenCodeClient` shape used by the live-server factory
-   * and test stubs. The wake closure asserts to `OpenCodeClient` after
-   * deciding which transport to use.
+   * has a generated `promptAsync` signature. The wake closure asserts to the
+   * loose structural `OpenCodeClient` shape after checking it.
    */
   client?: unknown;
-  /**
-   * Live OpenCode HTTP listener URL (from `input.serverUrl`). When the
-   * listener was reachable at startup, the wake path builds a separate
-   * `createOpencodeClient` from this URL so requests hit the same Effect
-   * memoMap as the live UI — works around the runner-split bug
-   * (anomalyco/opencode#28202). When the listener was unreachable, the
-   * wake path falls back to `client` above; this URL is unused.
-   */
-  serverUrl?: string;
 }
 
 interface OpenCodeClient {
@@ -503,9 +483,7 @@ async function triggerWakeIfPending(
             directory: drainContext.directory,
             attempt: state.wakeRetryAttempts + 1,
           });
-          throw new Error(
-            "no wake transport available: live-server unreachable and input.client absent",
-          );
+          throw new Error("in-process wake client unavailable: input.client absent");
         }
         // Cast the unknown `input.client` (real SDK shape with a generated
         // narrower promptAsync signature) to the loose structural shape
@@ -514,12 +492,9 @@ async function triggerWakeIfPending(
         return drainContext.client as OpenCodeClient;
       };
 
-      const sendPrompt = async (
-        client: OpenCodeClient,
-        clientPath: "live-server" | "in-process-fallback",
-      ): Promise<string> => {
+      const sendPrompt = async (client: OpenCodeClient): Promise<string> => {
         if (typeof client.session?.promptAsync !== "function") {
-          throw new Error(`wake client.session.promptAsync is unavailable (path=${clientPath})`);
+          throw new Error("wake client.session.promptAsync is unavailable");
         }
         // Pass the previous turn's prompt context (agent + model + variant)
         // explicitly. OpenCode's `createUserMessage` resolves variant
@@ -574,13 +549,6 @@ async function triggerWakeIfPending(
           directory: drainContext.directory,
           reminder_sha256: hashReminder(reminder),
           reminder_chars: reminder.length,
-          // `live-server` = wake POSTed through `createOpencodeClient` aimed
-          // at `input.serverUrl` (anomalyco/opencode#28202 workaround, no
-          // duplicate runs). `in-process-fallback` = wake POSTed through
-          // `input.client.session.promptAsync` because the live listener
-          // wasn't reachable at startup or failed mid-session; this accepts
-          // the upstream bug so wakes still arrive instead of hard-stopping.
-          wake_client_path: clientPath,
           prompt_context: promptContext
             ? {
                 agent: promptContext.agent,
@@ -605,16 +573,13 @@ async function triggerWakeIfPending(
           });
         } catch (err) {
           // Trace #5 of 7: promptAsync rejected. Counted toward
-          // MAX_WAKE_SEND_ATTEMPTS by the catch in scheduleWake unless a
-          // live-server failure can be delivered by the in-process fallback
-          // below. Re-throw so the retry/fallback path runs.
-          const logPromptError = clientPath === "live-server" ? sessionDebug : sessionWarn;
-          logPromptError(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
+          // MAX_WAKE_SEND_ATTEMPTS by the catch in scheduleWake. Re-throw so
+          // the retry-with-backoff path runs.
+          sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
             event: "bash_completion_wake_prompt_async_error",
             delivery_id: deliveryID,
             attempt: state.wakeRetryAttempts + 1,
             task_ids: taskIDs,
-            wake_client_path: clientPath,
             error: err instanceof Error ? err.message : String(err),
           });
           throw err;
@@ -631,58 +596,12 @@ async function triggerWakeIfPending(
           delivery_id: deliveryID,
           attempt: state.wakeRetryAttempts + 1,
           task_ids: taskIDs,
-          wake_client_path: clientPath,
         });
         return deliveryID;
       };
 
-      // Wake transport selection is keyed by serverUrl. A reachable live
-      // server gets the anomalyco/opencode#28202 workaround; otherwise we
-      // fall back to the plugin-provided in-process client. If the live
-      // server fails after an earlier successful probe, demote that cached
-      // serverUrl decision and retry this same delivery through the
-      // in-process client before spending the scheduler retry budget.
-      if (useLiveServerWake(drainContext.serverUrl) && drainContext.serverUrl) {
-        try {
-          const liveClient = getLiveServerClient(
-            drainContext.serverUrl,
-            drainContext.directory,
-          ) as OpenCodeClient;
-          const deliveryID = await sendPrompt(liveClient, "live-server");
-          await ackCompletions(drainContext, deliveredCompletions, deliveryID);
-          return;
-        } catch (err) {
-          setLiveServerWakeAvailable(drainContext.serverUrl, false);
-          // Falling back from live-server to the in-process client is the
-          // expected safe path when the optional duplicate-runner workaround is
-          // unavailable. Keep it DEBUG; the scheduler emits WARN only if no
-          // transport ultimately delivers the wake.
-          sessionDebug(
-            drainContext.sessionID,
-            `${LOG_PREFIX} live-server wake failed; falling back`,
-            {
-              event: "bash_completion_wake_live_server_fallback",
-              task_ids: taskIDs,
-              directory: drainContext.directory,
-              server_url: drainContext.serverUrl,
-              attempt: state.wakeRetryAttempts + 1,
-              error: err instanceof Error ? err.message : String(err),
-            },
-          );
-          const fallbackClient = getInProcessClient();
-          const deliveryID = await sendPrompt(fallbackClient, "in-process-fallback");
-          // This delivery succeeded by switching transports; do not carry
-          // over retry attempts spent on the now-demoted live-server path.
-          state.retryDelayMs = null;
-          state.wakeRetryAttempts = 0;
-          state.wakeHardStopped = false;
-          await ackCompletions(drainContext, deliveredCompletions, deliveryID);
-          return;
-        }
-      }
-
-      const fallbackClient = getInProcessClient();
-      const deliveryID = await sendPrompt(fallbackClient, "in-process-fallback");
+      const client = getInProcessClient();
+      const deliveryID = await sendPrompt(client);
       await ackCompletions(drainContext, deliveredCompletions, deliveryID);
     },
     (err, hardStopped) => {

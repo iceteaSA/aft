@@ -45,8 +45,8 @@
     "@cortexkit/aft-win32-x64": "0.39.2"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.15.11",
-    "@opencode-ai/sdk": "^1.15.11",
+    "@opencode-ai/plugin": "^1.17.7",
+    "@opencode-ai/sdk": "^1.17.7",
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
   },
@@ -65,6 +65,6 @@
     "tui"
   ],
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.15.5"
+    "@opencode-ai/plugin": ">=1.17.0"
   }
 }
