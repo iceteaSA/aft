@@ -7,6 +7,7 @@ import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
 import { astTools } from "../tools/ast.js";
+import { createBashTool } from "../tools/bash.js";
 import { hoistedTools } from "../tools/hoisted.js";
 import { importTools } from "../tools/imports.js";
 import {
@@ -24,6 +25,12 @@ type AskCall = {
   patterns?: string[];
   always?: string[];
   metadata?: Record<string, unknown>;
+};
+
+type PermissionAskFrame = {
+  kind: "external_directory" | "bash";
+  patterns: string[];
+  always: string[];
 };
 
 const windowsTest = process.platform === "win32" ? test : test.skip;
@@ -64,6 +71,18 @@ function createHarness(
   };
   const pool = { getBridge: () => bridge } as unknown as BridgePool;
   return { calls, tools: toolFactory(createPluginContext(pool)) };
+}
+
+function createBashPermissionHarness(asks: PermissionAskFrame[]) {
+  return createHarness(
+    (ctx) => ({ bash: createBashTool(ctx) }),
+    (_command, params) => {
+      if (!("permissions_granted" in params)) {
+        return { success: false, code: "permission_required", asks };
+      }
+      return { success: true, output: "ok\n", exit_code: 0 };
+    },
+  );
 }
 
 function createSdkContext(directory: string, ask: ToolContext["ask"]): ToolContext {
@@ -108,6 +127,103 @@ function parsePermissionDenied(raw: string): Record<string, unknown> {
 }
 
 describe("permission audit regressions", () => {
+  test("bash permission loop groups multi-bash pipeline asks into one prompt", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createBashPermissionHarness([
+      { kind: "bash", patterns: ["cat a"], always: ["cat *"] },
+      { kind: "bash", patterns: ["grep b", "grep b"], always: ["grep *"] },
+      { kind: "bash", patterns: ["wc -l"], always: ["wc *"] },
+    ]);
+
+    await tools.bash.execute(
+      { command: "cat a | grep b | wc -l" },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expect(askCalls).toEqual([
+      {
+        permission: "bash",
+        patterns: ["cat a", "grep b", "wc -l"],
+        always: ["cat *", "grep *", "wc *"],
+        metadata: {},
+      },
+    ]);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.params.permissions_granted).toEqual(["cat *", "grep *", "wc *"]);
+  });
+
+  test("bash permission loop keeps external_directory asks separate from grouped bash asks", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createBashPermissionHarness([
+      { kind: "bash", patterns: ["cat a"], always: ["cat *"] },
+      { kind: "external_directory", patterns: ["/tmp/aft-one/*"], always: [] },
+      { kind: "bash", patterns: ["grep b"], always: ["grep *"] },
+      {
+        kind: "external_directory",
+        patterns: ["/tmp/aft-two/*"],
+        always: ["/tmp/aft-two/*"],
+      },
+    ]);
+
+    await tools.bash.execute(
+      { command: "cat a | grep b > /tmp/aft-one/out && touch /tmp/aft-two/done" },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expect(askCalls).toEqual([
+      {
+        permission: "bash",
+        patterns: ["cat a", "grep b"],
+        always: ["cat *", "grep *"],
+        metadata: {},
+      },
+      {
+        permission: "external_directory",
+        patterns: ["/tmp/aft-one/*"],
+        always: [],
+        metadata: {},
+      },
+      {
+        permission: "external_directory",
+        patterns: ["/tmp/aft-two/*"],
+        always: ["/tmp/aft-two/*"],
+        metadata: {},
+      },
+    ]);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.params.permissions_granted).toEqual([
+      "cat *",
+      "/tmp/aft-one/*",
+      "grep *",
+      "/tmp/aft-two/*",
+    ]);
+  });
+
+  test("bash permission retry preserves original always-or-pattern grants", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createBashPermissionHarness([
+      { kind: "bash", patterns: ["custom-run --flag"], always: [] },
+      { kind: "bash", patterns: ["git status"], always: ["git status *"] },
+      { kind: "external_directory", patterns: ["/tmp/aft-empty-always/*"], always: [] },
+    ]);
+
+    await tools.bash.execute(
+      { command: "custom-run --flag | git status > /tmp/aft-empty-always/out" },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expect(askCalls.map((call) => call.permission)).toEqual(["bash", "external_directory"]);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.params.permissions_granted).toEqual([
+      "custom-run --flag",
+      "git status *",
+      "/tmp/aft-empty-always/*",
+    ]);
+  });
+
   test("aft_import rejects empty module sentinels before bridge dispatch", async () => {
     const { project } = await makeProjectAndExternalDirs();
     const { calls, tools } = createHarness(importTools);

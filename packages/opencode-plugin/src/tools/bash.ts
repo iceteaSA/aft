@@ -100,6 +100,37 @@ interface PermissionAsk {
 
 type BridgeCaller = typeof callBashBridge;
 
+function pushUnique(target: string[], values: string[]): void {
+  for (const value of values) {
+    if (!target.includes(value)) target.push(value);
+  }
+}
+
+function groupBashPermissionAsks(asks: PermissionAsk[]): PermissionAsk[] {
+  const grouped: PermissionAsk[] = [];
+  let bashAsk: PermissionAsk | undefined;
+
+  for (const ask of asks) {
+    if (ask.kind === "bash") {
+      if (!bashAsk) {
+        bashAsk = { kind: "bash", patterns: [], always: [] };
+        grouped.push(bashAsk);
+      }
+      pushUnique(bashAsk.patterns, ask.patterns);
+      pushUnique(bashAsk.always, ask.always);
+      continue;
+    }
+
+    grouped.push(ask);
+  }
+
+  return grouped;
+}
+
+function permissionsGrantedForRetry(asks: PermissionAsk[]): string[] {
+  return asks.flatMap((ask) => (ask.always.length > 0 ? ask.always : ask.patterns));
+}
+
 async function withPermissionLoop(
   ctx: PluginContext,
   runtime: ToolContext,
@@ -111,8 +142,7 @@ async function withPermissionLoop(
   if (first.success !== false || first.code !== "permission_required") return first;
 
   const asks = Array.isArray(first.asks) ? (first.asks as PermissionAsk[]) : [];
-  const permissionsGranted: string[] = [];
-  for (const ask of asks) {
+  for (const ask of groupBashPermissionAsks(asks)) {
     const permission = ask.kind === "external_directory" ? "external_directory" : "bash";
     await runAsk(
       runtime.ask({
@@ -122,14 +152,13 @@ async function withPermissionLoop(
         metadata: {},
       }),
     );
-    permissionsGranted.push(...(ask.always.length > 0 ? ask.always : ask.patterns));
   }
 
   const second = await bridgeCall(
     ctx,
     runtime,
     "bash",
-    { ...params, permissions_granted: permissionsGranted },
+    { ...params, permissions_granted: permissionsGrantedForRetry(asks) },
     options,
   );
   if (second.success === false && second.code === "permission_required") {

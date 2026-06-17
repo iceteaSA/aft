@@ -398,7 +398,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   //   2. Deny path         → bash deny propagates as a thrown Error.
   //   3. Body execution    → the ask body actually runs (no silent drop).
   //   4. permissions_granted → ask is bypassed entirely (Rust short-circuits).
-  //   5. Multiple asks     → all asks are awaited before bash runs.
+  //   5. Multiple asks     → bash asks are grouped and awaited before bash runs.
   // ─────────────────────────────────────────────────────────────────────────
 
   test("Promise-returning ask resolves cleanly and bash runs (allow path)", async () => {
@@ -469,16 +469,17 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(response.code).not.toBe("permission_required");
   });
 
-  test("multiple permission asks are all consulted before bash runs", async () => {
+  test("multiple bash permission asks are grouped before bash runs", async () => {
     const { h, bash } = await pluginHarness();
 
-    // `find . | xargs grep foo` produces TWO bash asks (find, grep). Both
-    // must be awaited before the second bridge call runs the command. If
-    // runAsk silently dropped any of them, the bash deny would bypass for
-    // whichever subcommand the loop forgot to await.
+    // `find . | xargs grep foo` produces multiple Rust bash asks. OpenCode's
+    // adapter should collapse them into ONE host prompt that still carries all
+    // scanned patterns before the second bridge call runs the command.
     let askCount = 0;
-    const ask = mock(async (_input: unknown) => {
+    let askInput: { permission?: string; patterns?: string[]; always?: string[] } | undefined;
+    const ask = mock(async (input: unknown) => {
       askCount += 1;
+      askInput = input as { permission?: string; patterns?: string[]; always?: string[] };
     });
 
     await callPluginBash(
@@ -488,8 +489,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       { ask: ask as unknown as ToolContext["ask"] },
     );
 
-    expect(askCount).toBeGreaterThanOrEqual(2);
-    expect(ask.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(askCount).toBe(1);
+    expect(ask.mock.calls.length).toBe(1);
+    expect(askInput?.permission).toBe("bash");
+    expect(askInput?.patterns?.length ?? 0).toBeGreaterThanOrEqual(2);
+    expect(askInput?.always?.length ?? 0).toBeGreaterThanOrEqual(2);
   });
 
   test("Rust scan fail-closed wildcard ask propagates through the plugin layer", async () => {
