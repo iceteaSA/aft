@@ -210,6 +210,31 @@ class BridgeReplacedDuringVersionCheck extends Error {
   }
 }
 
+/**
+ * Thrown when a request times out at the transport layer but the bridge is
+ * being kept warm (passive/bash-family calls with `keepBridgeOnTimeout`). The
+ * timeout means the bridge was *busy*, not hung — the request can be retried.
+ * Carries a machine-readable `code` so pollers (e.g. the bash_watch poll loop)
+ * can distinguish "bridge busy, retry" from a genuine command failure without
+ * string-matching the message.
+ */
+export class BridgeTransportTimeoutError extends Error {
+  readonly code = "transport_timeout" as const;
+  constructor(
+    public readonly command: string,
+    public readonly timeoutMs: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BridgeTransportTimeoutError";
+  }
+}
+
+/** Type guard for a transport-timeout rejection (bridge busy, retryable). */
+export function isBridgeTransportTimeout(err: unknown): err is BridgeTransportTimeoutError {
+  return err instanceof Error && (err as { code?: unknown }).code === "transport_timeout";
+}
+
 export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
@@ -706,7 +731,9 @@ export class BinaryBridge {
               this.warnVia(timeoutMsg);
             }
             entry.reject(
-              new Error(
+              new BridgeTransportTimeoutError(
+                command,
+                effectiveTimeoutMs,
                 `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
               ),
             );

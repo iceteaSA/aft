@@ -5,7 +5,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setActiveLogger } from "../active-logger.js";
-import { BinaryBridge } from "../bridge.js";
+import { BinaryBridge, isBridgeTransportTimeout } from "../bridge.js";
 import type { Logger, LogMeta } from "../logger.js";
 import { BridgePool } from "../pool.js";
 
@@ -495,6 +495,63 @@ process.stdin.on("data", (chunk) => {
       expect(sibling).toBe("sibling");
       expect(bridge.isAlive()).toBe(true);
       expect(testBridge.configured).toBe(true);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("keepBridgeOnTimeout rejection is a typed transport-timeout error", async () => {
+    // The bash_watch poll loop must distinguish "bridge busy, retry" from a
+    // genuine command failure WITHOUT string-matching the message. A keep-warm
+    // timeout rejects with BridgeTransportTimeoutError (code transport_timeout);
+    // a non-timeout error does not.
+    const script = writeExecutable(
+      "typed-timeout.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+function writeFrame(frame) {
+  process.stdout.write(JSON.stringify(frame) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      writeFrame({ id: req.id, success: true, warnings: [] });
+    } else if (req.command === "boom") {
+      writeFrame({ id: req.id, success: false, code: "explode", message: "kaboom" });
+    }
+    // "slow" gets no response → transport timeout.
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 1_000, maxRestarts: 0 });
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+
+      // Keep-warm transport timeout → typed, code transport_timeout.
+      const timeoutErr = await bridge
+        .send("slow", {}, { timeoutMs: 20, keepBridgeOnTimeout: true })
+        .then(
+          () => undefined,
+          (err) => err,
+        );
+      expect(isBridgeTransportTimeout(timeoutErr)).toBe(true);
+      expect((timeoutErr as { code?: string }).code).toBe("transport_timeout");
+      expect(bridge.isAlive()).toBe(true);
+
+      // A genuine command-failure response is NOT a transport timeout — the
+      // poll loop must let this propagate, not retry it away.
+      const boom = await bridge.send("boom", {}, { keepBridgeOnTimeout: true }).then(
+        (response) => response,
+        (err) => err,
+      );
+      expect(isBridgeTransportTimeout(boom)).toBe(false);
     } finally {
       await bridge.shutdown();
     }

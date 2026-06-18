@@ -1,5 +1,10 @@
 import * as fs from "node:fs/promises";
-import { type BridgeRequestOptions, isTerminalStatus, sleep } from "@cortexkit/aft-bridge";
+import {
+  type BridgeRequestOptions,
+  isBridgeTransportTimeout,
+  isTerminalStatus,
+  sleep,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import {
@@ -27,11 +32,20 @@ export type BashWaitPattern =
   | { kind: "substring"; value: string }
   | { kind: "regex"; source: string };
 export type BashStatusWaited = {
-  reason: "matched" | "exited" | "timeout" | "user_message";
+  reason: "matched" | "exited" | "timeout" | "user_message" | "unavailable";
   elapsed_ms: number;
   match?: string;
   match_offset?: number;
 };
+
+/**
+ * Minimal snapshot used when a watch ends without ever reading task status
+ * (the bridge stayed busy past our deadline). Keeps formatWatchResultText from
+ * dereferencing an absent snapshot.
+ */
+function unavailableSnapshot(): Record<string, unknown> {
+  return { status: "unknown" };
+}
 type BashStatusWithWait = Record<string, unknown> & { waited?: BashStatusWaited };
 type OutputCursor = { output: number; stderr: number; combined: number };
 
@@ -217,6 +231,8 @@ function formatWatchResultText(
       text += `\nWaited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")} at offset ${waited.match_offset ?? 0}.`;
     } else if (waited.reason === "timeout") {
       text += `\nWaited ${waited.elapsed_ms}ms; timeout reached without match.`;
+    } else if (waited.reason === "unavailable") {
+      text += `\nWaited ${waited.elapsed_ms}ms; the bridge stayed busy and status couldn't be read. The task may still be running — check with bash_status({ taskId }).`;
     } else {
       const stat = String(data.status ?? "unknown");
       const e = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
@@ -271,9 +287,35 @@ export async function waitForBashStatus(
   clearSyncWatchAbort(runtime.sessionID);
   markTaskWaiting(runtime.sessionID, taskId);
   let sawTerminal = false;
+  let lastData: Record<string, unknown> | undefined;
   try {
     while (true) {
-      const data = await bashStatusSnapshot(ctx, runtime, taskId, outputMode, bridgeOptions);
+      let data: Record<string, unknown>;
+      try {
+        data = await bashStatusSnapshot(ctx, runtime, taskId, outputMode, bridgeOptions);
+      } catch (err) {
+        // A single poll's transport timeout means the bridge is *busy*, not
+        // that the task failed — the bridge is kept warm (keepBridgeOnTimeout).
+        // Don't abort the whole watch (which surfaces a red "Failed" to the
+        // user every poll); honor abort/deadline and otherwise retry. A
+        // genuine non-timeout error still propagates.
+        if (!isBridgeTransportTimeout(err)) throw err;
+        if (isSyncWatchAborted(runtime.sessionID)) {
+          return withWaited(lastData ?? unavailableSnapshot(), {
+            reason: "user_message",
+            elapsed_ms: Date.now() - startedAt,
+          });
+        }
+        if (Date.now() >= deadline) {
+          return withWaited(lastData ?? unavailableSnapshot(), {
+            reason: "unavailable",
+            elapsed_ms: Date.now() - startedAt,
+          });
+        }
+        await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+        continue;
+      }
+      lastData = data;
       const terminal = isTerminalStatus(data.status);
       if (waitFor) {
         const scan = await readNewTaskOutput(runtime, taskId, data, spillCursor);

@@ -33,7 +33,13 @@ export type {
   StatusSnapshot,
 } from "./bridge.js";
 // --- transport ---
-export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";
+export {
+  BinaryBridge,
+  BridgeTransportTimeoutError,
+  compareSemver,
+  isBridgeTransportTimeout,
+  tagStderrLine,
+} from "./bridge.js";
 // --- aft_callgraph flat formatter (shared by both plugin hosts) ---
 export type { CallgraphTheme } from "./callgraph-format.js";
 export { formatCallgraphSections, PLAIN_CALLGRAPH_THEME } from "./callgraph-format.js";

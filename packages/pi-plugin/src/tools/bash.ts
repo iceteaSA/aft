@@ -5,6 +5,7 @@ import {
   type BridgeRequestOptions,
   formatForegroundResult,
   formatSeconds,
+  isBridgeTransportTimeout,
   isTerminalStatus,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
@@ -231,10 +232,19 @@ interface BashDetails {
 }
 
 interface BashStatusWaited {
-  reason: "matched" | "exited" | "timeout" | "user_message";
+  reason: "matched" | "exited" | "timeout" | "user_message" | "unavailable";
   elapsed_ms: number;
   match?: string;
   match_offset?: number;
+}
+
+/**
+ * Minimal snapshot used when a watch ends without ever reading task status
+ * (the bridge stayed busy past our deadline). Keeps the formatter from
+ * dereferencing an absent snapshot.
+ */
+function unavailableSnapshot(): Record<string, unknown> {
+  return { status: "unknown" };
 }
 
 interface BashStatusDetails {
@@ -937,9 +947,35 @@ async function waitForBashStatus(
   clearSyncWatchAbort(sessionId);
   if (waitForExit) markTaskWaiting(sessionId, taskId);
   let sawTerminal = false;
+  let lastData: Record<string, unknown> | undefined;
   try {
     while (true) {
-      const data = await bashStatusSnapshot(bridge, extCtx, taskId, outputMode, bridgeOptions);
+      let data: Record<string, unknown>;
+      try {
+        data = await bashStatusSnapshot(bridge, extCtx, taskId, outputMode, bridgeOptions);
+      } catch (err) {
+        // A single poll's transport timeout means the bridge is *busy*, not
+        // that the task failed — the bridge is kept warm (keepBridgeOnTimeout).
+        // Don't abort the whole watch (which surfaces a red failure every
+        // poll); honor abort/deadline and otherwise retry. A genuine
+        // non-timeout error still propagates.
+        if (!isBridgeTransportTimeout(err)) throw err;
+        if (isSyncWatchAborted(sessionId)) {
+          return withWaited(lastData ?? unavailableSnapshot(), {
+            reason: "user_message",
+            elapsed_ms: Date.now() - startedAt,
+          });
+        }
+        if (Date.now() >= deadline) {
+          return withWaited(lastData ?? unavailableSnapshot(), {
+            reason: "unavailable",
+            elapsed_ms: Date.now() - startedAt,
+          });
+        }
+        await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+        continue;
+      }
+      lastData = data;
       const terminal = isTerminalStatus(data.status);
 
       if (waitFor) {
@@ -1204,6 +1240,9 @@ function formatWaitSummary(waited: BashStatusWaited, details: BashStatusDetails)
   }
   if (waited.reason === "timeout") {
     return `Waited ${waited.elapsed_ms}ms; timeout reached without match.`;
+  }
+  if (waited.reason === "unavailable") {
+    return `Waited ${waited.elapsed_ms}ms; the bridge stayed busy and status couldn't be read. The task may still be running — check with bash_status({ taskId }).`;
   }
   const exit = typeof details.exit_code === "number" ? `, exit ${details.exit_code}` : "";
   return `Waited ${waited.elapsed_ms}ms; task exited (${details.status}${exit}).`;
