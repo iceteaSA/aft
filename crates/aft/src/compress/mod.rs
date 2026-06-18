@@ -23,9 +23,12 @@ pub mod bun;
 pub mod caps;
 pub mod cargo;
 pub mod eslint;
+pub mod find;
 pub mod generic;
 pub mod git;
 pub mod go;
+pub mod listing_fold;
+pub mod ls;
 pub mod mypy;
 pub mod next;
 pub mod npm;
@@ -46,9 +49,11 @@ use bun::BunCompressor;
 use caps::DropClass;
 use cargo::CargoCompressor;
 use eslint::EslintCompressor;
+use find::FindCompressor;
 use generic::{strip_ansi, GenericCompressor};
 use git::GitCompressor;
 use go::{GoCompressor, GolangciLintCompressor};
+use ls::LsCompressor;
 use mypy::MypyCompressor;
 use next::NextCompressor;
 use npm::NpmCompressor;
@@ -304,7 +309,7 @@ pub fn compress_with_registry_exit_code(
     let normalized = normalize_command_for_dispatch(command);
     let dispatch_cmd = normalized.as_deref().unwrap_or(command);
 
-    let compressors: [&dyn Compressor; 17] = [
+    let compressors: [&dyn Compressor; 19] = [
         &GitCompressor,
         &CargoCompressor,
         &TscCompressor,
@@ -322,6 +327,8 @@ pub fn compress_with_registry_exit_code(
         &GolangciLintCompressor,
         &PlaywrightCompressor,
         &NextCompressor,
+        &LsCompressor,
+        &FindCompressor,
     ];
 
     // Tier 1a: Specific command compressors win first.

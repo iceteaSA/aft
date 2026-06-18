@@ -13,11 +13,9 @@
 /// of the same name wholesale.
 pub const ALL: &[(&str, &str)] = &[
     ("make", include_str!("builtin_filters/make.toml")),
-    ("ls", include_str!("builtin_filters/ls.toml")),
     ("tree", include_str!("builtin_filters/tree.toml")),
     ("df", include_str!("builtin_filters/df.toml")),
     ("du", include_str!("builtin_filters/du.toml")),
-    ("find", include_str!("builtin_filters/find.toml")),
     ("wc", include_str!("builtin_filters/wc.toml")),
     ("gradle", include_str!("builtin_filters/gradle.toml")),
     (

@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use aft::compress::builtin_filters::ALL;
+use aft::compress::find::build_lebench_find_fixture;
+use aft::compress::ls::build_lebench_ls_la_fixture;
 use aft::compress::toml_filter::{apply_filter, build_registry, parse_filter, FilterSource};
 
 fn fixture_dir(name: &str) -> PathBuf {
@@ -63,8 +65,18 @@ fn du_filter() {
 }
 
 #[test]
-fn find_filter() {
-    run_fixture("find");
+fn find_compressor_folds_and_preserves_needle() {
+    let input = build_lebench_find_fixture();
+    let compressed = compress_builtin("find src -name '*.ts'", &input);
+    assert!(compressed.contains("module_100_NEEDLE_FILE_marker.ts"));
+    assert!(compressed.contains("module_*.ts"));
+    assert!(compressed.lines().count() < input.lines().count() / 2);
+}
+
+#[test]
+fn find_compressor_empty_shortcircuits() {
+    let compressed = compress_builtin("find . -name missing", "");
+    assert_eq!(compressed, "find: no matches");
 }
 
 #[test]
@@ -88,8 +100,17 @@ fn kubectl_filter() {
 }
 
 #[test]
-fn ls_filter() {
-    run_fixture("ls");
+fn ls_compressor_folds_and_preserves_needle() {
+    let input = build_lebench_ls_la_fixture();
+    let compressed = compress_builtin("ls -la src/generated/client", &input);
+    assert!(compressed.contains("module_100_NEEDLE_FILE_marker.ts"));
+    assert!(compressed.contains("module_*.ts"));
+    assert!(compressed.lines().count() < 50);
+}
+
+#[test]
+fn builtin_filter_count_is_twenty_without_ls_and_find() {
+    assert_eq!(ALL.len(), 20);
 }
 
 #[test]
