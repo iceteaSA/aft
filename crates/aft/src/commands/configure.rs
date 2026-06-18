@@ -24,7 +24,7 @@ use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    build_path_filters, current_git_head, project_cache_key, resolve_cache_dir,
+    artifact_cache_key, build_path_filters, current_git_head, resolve_cache_dir,
     walk_project_files_bounded_matching, CacheLock, SearchIndex,
 };
 use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
@@ -1901,7 +1901,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.clear_tsconfig_membership_cache();
     ctx.backup()
         .borrow()
-        .set_db_project_key(crate::search_index::project_cache_key(
+        .set_db_project_key(crate::path_identity::project_scope_key(
             &canonical_cache_root,
         ));
     if let Some(storage_dir) = next_config.storage_dir.clone() {
@@ -2038,7 +2038,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let root_for_prewarm = canonical_cache_root.clone();
         let symbol_cache = ctx.symbol_cache();
         let symbol_storage = storage_dir.clone();
-        let symbol_project_key = project_cache_key(&canonical_cache_root);
+        let symbol_project_key = artifact_cache_key(&canonical_cache_root);
         let is_worktree_bridge_for_search = is_worktree_bridge;
         let session_id_for_bg = log_ctx::current_session();
 
@@ -2191,7 +2191,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
         let root_clone = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
-        let semantic_project_key = crate::search_index::project_cache_key(&canonical_cache_root);
+        let semantic_project_key = crate::search_index::artifact_cache_key(&canonical_cache_root);
         let semantic_config = semantic_config.clone();
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;

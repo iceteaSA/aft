@@ -478,7 +478,7 @@ impl CallGraphStore {
 
     pub fn open(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&callgraph_dir)?;
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
         // path so a brand-new store still gets a writable DB + schema.
@@ -505,7 +505,7 @@ impl CallGraphStore {
     }
 
     pub fn open_readonly(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Option<Self>> {
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
             return Ok(None);
@@ -533,7 +533,7 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
             return Ok(None);
@@ -573,7 +573,7 @@ impl CallGraphStore {
         chunk_size: usize,
     ) -> Result<(Self, ColdBuildStats)> {
         std::fs::create_dir_all(&callgraph_dir)?;
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
         let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
         let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
         let (stats, generation) = Self::cold_build_publish_locked(
@@ -602,7 +602,7 @@ impl CallGraphStore {
         chunk_size: usize,
     ) -> Result<(Self, Option<ColdBuildStats>)> {
         std::fs::create_dir_all(&callgraph_dir)?;
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
         let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
         let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
         // Another process may have published a ready generation while we waited
@@ -722,7 +722,7 @@ impl CallGraphStore {
     }
 
     pub fn needs_cold_build(callgraph_dir: &Path, project_root: &Path) -> Result<bool> {
-        let project_key = crate::search_index::project_cache_key(project_root);
+        let project_key = crate::search_index::artifact_cache_key(project_root);
         // A cold build is needed unless a ready generation (or ready legacy DB)
         // is currently published.
         Ok(resolve_ready_target(callgraph_dir, &project_key).is_none())

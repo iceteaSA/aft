@@ -1422,7 +1422,7 @@ impl BgTaskRegistry {
             Ok(conn) => conn,
             Err(_) => return Some(Err("db mutex poisoned".to_string())),
         };
-        let project_key = crate::search_index::project_cache_key(project_root);
+        let project_key = crate::path_identity::project_scope_key(project_root);
         Some(
             crate::db::bash_tasks::find_bash_task_for_project(
                 &conn,
@@ -2417,7 +2417,7 @@ impl BgTaskRegistry {
             .project_root
             .as_deref()
             .unwrap_or(&metadata.workdir);
-        let project_key = crate::search_index::project_cache_key(project_root);
+        let project_key = crate::path_identity::project_scope_key(project_root);
         let row = crate::db::compression_events::CompressionEventRow {
             harness: &harness,
             session_id: Some(&metadata.session_id),

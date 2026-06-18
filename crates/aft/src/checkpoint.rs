@@ -108,7 +108,7 @@ pub struct CheckpointStore {
 impl CheckpointStore {
     pub fn new() -> Self {
         let project_root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::path_identity::project_scope_key(&project_root);
         let lock_path = crate::bash_background::storage_dir(None)
             .join("checkpoints")
             .join(project_key)

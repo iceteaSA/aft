@@ -337,7 +337,7 @@ pub struct InspectCache {
 impl InspectCache {
     pub fn open(inspect_dir: PathBuf, project_root: PathBuf) -> Result<Self, InspectCacheError> {
         std::fs::create_dir_all(&inspect_dir)?;
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let conn = Connection::open(&sqlite_path)?;
         configure_connection(&conn)?;
@@ -354,7 +354,7 @@ impl InspectCache {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>, InspectCacheError> {
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         if !sqlite_path.is_file() {
             return Ok(None);

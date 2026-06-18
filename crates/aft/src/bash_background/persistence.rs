@@ -162,7 +162,7 @@ impl PersistedTask {
             harness: harness.to_string(),
             session_id: self.session_id.clone(),
             task_id: self.task_id.clone(),
-            project_key: crate::search_index::project_cache_key(project_root),
+            project_key: crate::path_identity::project_scope_key(project_root),
             command: self.command.clone(),
             cwd: self.workdir.display().to_string(),
             status: status_name(&self.status).to_string(),

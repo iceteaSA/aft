@@ -355,7 +355,7 @@ impl InspectManager {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Arc<InspectCache>, String> {
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let identity = InspectCacheIdentity {
             sqlite_path,
@@ -2380,8 +2380,8 @@ mod guard_tests {
         )
         .expect("write clone manifest edit");
         assert_eq!(
-            crate::search_index::project_cache_key(&source),
-            crate::search_index::project_cache_key(&clone),
+            crate::search_index::artifact_cache_key(&source),
+            crate::search_index::artifact_cache_key(&clone),
             "clones with the same root commit should share the sqlite project key"
         );
 

@@ -152,7 +152,7 @@ impl AppContext {
         let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
         let disk_info = match (&config.storage_dir, &config.project_root) {
             (Some(dir), Some(root)) => {
-                let key = crate::search_index::project_cache_key(root);
+                let key = crate::search_index::artifact_cache_key(root);
                 let trigram_size = dir_size(&dir.join("index").join(&key));
                 let semantic_size = dir_size(&dir.join("semantic").join(&key));
                 serde_json::json!({
@@ -265,7 +265,7 @@ impl AppContext {
         };
 
         let harness = self.harness().as_str();
-        let project_key = crate::search_index::project_cache_key(&project_root);
+        let project_key = crate::path_identity::project_scope_key(&project_root);
         if let Ok(project_agg) =
             crate::db::compression_events::aggregate_for_project(&conn, harness, &project_key)
         {

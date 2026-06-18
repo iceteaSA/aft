@@ -1690,11 +1690,11 @@ pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Pat
     if let Some(override_dir) = std::env::var_os("AFT_CACHE_DIR") {
         return PathBuf::from(override_dir)
             .join("index")
-            .join(project_cache_key(project_root));
+            .join(artifact_cache_key(project_root));
     }
     // Use configured storage dir (from plugin, XDG-compliant)
     if let Some(dir) = storage_dir {
-        return dir.join("index").join(project_cache_key(project_root));
+        return dir.join("index").join(artifact_cache_key(project_root));
     }
     // Fallback to ~/.cache/aft/ (legacy, for standalone binary usage).
     // On Windows `HOME` is typically unset, so try `USERPROFILE` next.
@@ -1707,7 +1707,7 @@ pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Pat
     home.join(".cache")
         .join("aft")
         .join("index")
-        .join(project_cache_key(project_root))
+        .join(artifact_cache_key(project_root))
 }
 
 pub(crate) fn build_path_filters(
@@ -2025,7 +2025,18 @@ pub(crate) fn current_git_head(root: &Path) -> Option<String> {
     run_git(root, &["rev-parse", "HEAD"])
 }
 
-pub fn project_cache_key(project_root: &Path) -> String {
+/// On-disk ARTIFACT cache key (search, semantic, symbol, callgraph, inspect).
+///
+/// For git repos this is the repository ROOT COMMIT — so a linked worktree
+/// shares the main checkout's index (opened read-only), the deliberate
+/// worktree-sharing mechanism. For non-git it is the canonical filesystem path.
+///
+/// This is the per-REPOSITORY identity. It is intentionally DISTINCT from
+/// [`crate::path_identity::project_scope_key`] (the per-CHECKOUT identity used
+/// for bash/compression/backup/checkpoint scoping). Its value is unchanged from
+/// the historical `project_cache_key`, so existing on-disk caches are NOT
+/// invalidated by the P0 identity split.
+pub fn artifact_cache_key(project_root: &Path) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -3022,7 +3033,7 @@ mod tests {
     }
 
     #[test]
-    fn project_cache_key_includes_checkout_path() {
+    fn artifact_cache_key_shared_across_clones_of_same_repo() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let source = dir.path().join("source");
         fs::create_dir_all(&source).expect("create source repo dir");
@@ -3064,8 +3075,8 @@ mod tests {
             .expect("git clone")
             .success());
 
-        let source_key = project_cache_key(&source);
-        let clone_key = project_cache_key(&clone);
+        let source_key = artifact_cache_key(&source);
+        let clone_key = artifact_cache_key(&clone);
 
         assert_eq!(source_key.len(), 16);
         assert_eq!(clone_key.len(), 16);
