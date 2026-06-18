@@ -406,6 +406,17 @@ fn zoom_one_symbol(
     };
     let matches = match ctx.provider().resolve_symbol(path, lookup_name) {
         Ok(m) => m,
+        Err(crate::error::AftError::SymbolNotFound { name, .. }) => {
+            let mut msg = format!("symbol '{}' not found", name);
+            if let Ok(all_symbols) = ctx.provider().list_symbols(path) {
+                let available: Vec<String> = all_symbols.into_iter().map(|s| s.name).collect();
+                let suggestions = suggest_close_symbols(&name, &available, 5);
+                if !suggestions.is_empty() {
+                    msg.push_str(&format!(", did you mean: [{}]", suggestions.join(", ")));
+                }
+            }
+            return Response::error(&req.id, "symbol_not_found", msg);
+        }
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
         }
@@ -456,11 +467,15 @@ fn zoom_one_symbol(
     }
 
     if matches.is_empty() {
-        return Response::error(
-            &req.id,
-            "symbol_not_found",
-            format!("symbol '{}' not found", symbol_name),
-        );
+        let mut msg = format!("symbol '{}' not found", symbol_name);
+        if let Ok(all_symbols) = ctx.provider().list_symbols(path) {
+            let available: Vec<String> = all_symbols.into_iter().map(|s| s.name).collect();
+            let suggestions = suggest_close_symbols(symbol_name, &available, 5);
+            if !suggestions.is_empty() {
+                msg.push_str(&format!(", did you mean: [{}]", suggestions.join(", ")));
+            }
+        }
+        return Response::error(&req.id, "symbol_not_found", msg);
     }
 
     let target = &matches[0].symbol;
@@ -620,6 +635,82 @@ fn zoom_one_symbol(
             format!("zoom: failed to serialize response: {err}"),
         ),
     }
+}
+
+fn levenshtein_distance(s1: &str, s2: &str) -> usize {
+    let s1_chars: Vec<char> = s1.chars().collect();
+    let s2_chars: Vec<char> = s2.chars().collect();
+    let len1 = s1_chars.len();
+    let len2 = s2_chars.len();
+
+    let mut dp = vec![vec![0; len2 + 1]; len1 + 1];
+
+    for i in 0..=len1 {
+        dp[i][0] = i;
+    }
+    for j in 0..=len2 {
+        dp[0][j] = j;
+    }
+
+    for i in 1..=len1 {
+        for j in 1..=len2 {
+            if s1_chars[i - 1] == s2_chars[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1];
+            } else {
+                dp[i][j] =
+                    1 + std::cmp::min(dp[i - 1][j], std::cmp::min(dp[i][j - 1], dp[i - 1][j - 1]));
+            }
+        }
+    }
+
+    dp[len1][len2]
+}
+
+fn suggest_close_symbols(query: &str, available: &[String], k: usize) -> Vec<String> {
+    let mut unique: Vec<&String> = available.iter().collect();
+    unique.sort();
+    unique.dedup();
+
+    let query_lower = query.to_lowercase();
+    let query_len = query_lower.chars().count();
+    let max_dist = std::cmp::max(2, query_len / 3);
+
+    let mut scored: Vec<(bool, usize, &String)> = unique
+        .into_iter()
+        .map(|name| {
+            let name_lower = name.to_lowercase();
+            let is_substring =
+                name_lower.contains(&query_lower) || query_lower.contains(&name_lower);
+            let is_wildcard = if let (Some(first_idx), Some(last_idx)) =
+                (query_lower.find('_'), query_lower.rfind('_'))
+            {
+                let prefix = &query_lower[..=first_idx];
+                let suffix = &query_lower[last_idx..];
+                name_lower.starts_with(prefix) && name_lower.ends_with(suffix)
+            } else {
+                false
+            };
+            let is_match = is_substring || is_wildcard;
+            let dist = levenshtein_distance(&query_lower, &name_lower);
+            (is_match, dist, name)
+        })
+        .filter(|&(is_match, dist, _)| is_match || dist <= max_dist)
+        .collect();
+
+    scored.sort_by(|a, b| {
+        let a_match = a.0;
+        let b_match = b.0;
+        (!a_match)
+            .cmp(&(!b_match))
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
+
+    scored
+        .into_iter()
+        .take(k)
+        .map(|(_, _, name)| name.clone())
+        .collect()
 }
 
 fn normalize_heading_query(input: &str) -> &str {
@@ -1170,6 +1261,36 @@ function helper(value: number): number {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], false);
         assert_eq!(json["code"], "invalid_request");
+    }
+
+    #[test]
+    fn test_suggest_close_symbols_unit() {
+        let available = vec![
+            "handle_grep_search".to_string(),
+            "handle_semantic_search".to_string(),
+            "handle_semantic_or_hybrid_search".to_string(),
+            "compute_total".to_string(),
+            "search".to_string(),
+            "handle_search".to_string(),
+        ];
+
+        let suggestions = suggest_close_symbols("handle_search", &available, 5);
+        assert!(suggestions.contains(&"handle_grep_search".to_string()));
+        assert!(suggestions.contains(&"handle_semantic_search".to_string()));
+        assert!(suggestions.contains(&"handle_semantic_or_hybrid_search".to_string()));
+        assert!(suggestions.contains(&"search".to_string()));
+        assert!(!suggestions.contains(&"compute_total".to_string()));
+
+        let suggestions_caps = suggest_close_symbols("HANDLE_SEARCH", &available, 5);
+        assert_eq!(suggestions, suggestions_caps);
+
+        let available2 = vec![
+            "total".to_string(),
+            "compute_total".to_string(),
+            "unrelated".to_string(),
+        ];
+        let suggestions2 = suggest_close_symbols("totol", &available2, 5);
+        assert_eq!(suggestions2, vec!["total".to_string()]);
     }
 
     // --- Helpers ---

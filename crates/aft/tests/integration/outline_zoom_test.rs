@@ -625,3 +625,74 @@ fn zoom_html_heading_with_spaces_not_split() {
 
     assert!(aft.shutdown().success());
 }
+
+#[test]
+fn zoom_symbol_not_found_with_close_matches() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "search.ts",
+        r#"function handle_grep_search() {}
+function handle_semantic_search() {}
+function handle_semantic_or_hybrid_search() {}
+function compute_total() {}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-close-matches",
+            "command": "zoom",
+            "file": file,
+            "symbol": "handle_search",
+        }),
+    );
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "symbol_not_found");
+    let msg = resp["message"].as_str().unwrap();
+    assert!(msg.contains("symbol 'handle_search' not found"));
+    assert!(msg.contains("did you mean:"));
+    assert!(msg.contains("handle_grep_search"));
+    assert!(msg.contains("handle_semantic_search"));
+    assert!(msg.contains("handle_semantic_or_hybrid_search"));
+    assert!(!msg.contains("compute_total"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_symbol_not_found_without_close_matches() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "search.ts",
+        r#"function compute_total() {}
+function unrelated_symbol() {}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-no-close-matches",
+            "command": "zoom",
+            "file": file,
+            "symbol": "handle_search",
+        }),
+    );
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "symbol_not_found");
+    let msg = resp["message"].as_str().unwrap();
+    assert_eq!(msg, "symbol 'handle_search' not found");
+
+    assert!(aft.shutdown().success());
+}
