@@ -1,0 +1,5 @@
+{
+  "bridge": {
+    "request_timeout_ms": 60000
+  }
+}

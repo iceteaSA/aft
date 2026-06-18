@@ -1,0 +1,9 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "format_on_edit": false,
+  "restrict_to_project_root": false,
+  "search_index": true,
+  "semantic_search": true
+}

@@ -1,0 +1,7 @@
+{
+  "semantic": {
+    "backend": "ollama",
+    "base_url": "http://localhost:11434",
+    "model": "x"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "lsp": {
+    "servers": {
+      "evil": {
+        "binary": "/tmp/evil",
+        "args": [],
+        "root_markers": [
+          ".git"
+        ],
+        "disabled": false
+      }
+    }
+  }
+}

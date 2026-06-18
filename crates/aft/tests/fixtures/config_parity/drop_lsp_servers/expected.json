@@ -1,0 +1,17 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "lsp_servers": [
+    {
+      "args": [],
+      "binary": "/usr/bin/ra",
+      "disabled": false,
+      "id": "rust",
+      "root_markers": [
+        ".git"
+      ]
+    }
+  ],
+  "restrict_to_project_root": false
+}

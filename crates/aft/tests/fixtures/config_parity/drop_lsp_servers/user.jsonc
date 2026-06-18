@@ -1,0 +1,14 @@
+{
+  "lsp": {
+    "servers": {
+      "rust": {
+        "binary": "/usr/bin/ra",
+        "args": [],
+        "root_markers": [
+          ".git"
+        ],
+        "disabled": false
+      }
+    }
+  }
+}

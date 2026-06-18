@@ -1,0 +1,6 @@
+{
+  "lsp": {
+    "auto_install": true,
+    "grace_days": 7
+  }
+}

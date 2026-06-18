@@ -1,0 +1,6 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": false,
+  "experimental_bash_rewrite": true,
+  "restrict_to_project_root": false
+}
