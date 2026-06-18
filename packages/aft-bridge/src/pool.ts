@@ -1,8 +1,8 @@
-import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { error, getActiveLogger, log } from "./active-logger.js";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
 import type { Logger, LogMeta } from "./logger.js";
+import { canonicalizeProjectRoot } from "./project-identity.js";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // evict idle bridges after 30 minutes
 const DEFAULT_MAX_POOL_SIZE = 8;
@@ -37,16 +37,16 @@ export class HomeProjectRootError extends Error {
   }
 }
 
-/** Canonicalize the user's home directory for stable comparison with bridge keys. */
+/**
+ * Canonicalize the user's home directory for stable comparison with bridge
+ * keys. Uses the SAME canonicalizer as `normalizeKey` so a `$HOME` spelled with
+ * a symlink/trailing-slash/Windows-drive-case still matches a bridge key.
+ */
 function canonicalHomeDir(): string | null {
   try {
     const home = homedir();
     if (!home) return null;
-    try {
-      return realpathSync(home);
-    } catch {
-      return home.replace(/[/\\]+$/, "");
-    }
+    return canonicalizeProjectRoot(home);
   } catch {
     return null;
   }
@@ -387,12 +387,13 @@ export class BridgePool {
   }
 }
 
-/** Canonicalize bridge keys so symlinked paths and trailing separators collapse to one key. */
+/**
+ * Canonicalize bridge keys so symlinked paths, trailing separators, and Windows
+ * verbatim/drive-case spellings collapse to one key. Delegates to the single
+ * shared canonicalizer (`canonicalizeProjectRoot`) so bridge routing, RPC
+ * port-file scoping, and the sidebar status gate all derive identity the same
+ * way — the divergence between them was the sidebar/stale-port bug.
+ */
 function normalizeKey(projectRoot: string): string {
-  const stripped = projectRoot.replace(/[/\\]+$/, "");
-  try {
-    return realpathSync(stripped);
-  } catch {
-    return stripped;
-  }
+  return canonicalizeProjectRoot(projectRoot);
 }

@@ -7,9 +7,9 @@
 // session.updated/message.updated events with a small debounce, same as
 // magic-context, so the panel stays current without polling.
 
+import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
 import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
-
 import { AftRpcClient } from "../shared/rpc-client";
 import {
   type AftStatusSnapshot,
@@ -317,16 +317,22 @@ export function isSnapshotForContext(
   directory: string,
   servedDirectory: string | undefined,
 ): boolean {
-  const stripSlash = (p: string) => p.replace(/\/+$/, "");
+  // Canonicalize both sides through the SAME canonicalizer the bridge routes
+  // by, so a symlinked / `/var`-vs-`/private/var` / trailing-slash spelling of
+  // the sidebar directory still matches Rust's canonical_root. A raw stripSlash
+  // compare (the old behavior) rejected legitimate snapshots whenever the TUI
+  // directory and Rust's root were different spellings of the same location,
+  // leaving the sidebar blank on aliased roots.
+  const canon = (p: string) => canonicalizeProjectRoot(p);
   const roots = [snapshot.project_root, snapshot.canonical_root].filter(
     (r): r is string => typeof r === "string" && r.length > 0,
   );
   if (roots.length === 0) return true; // placeholder / synthetic
-  const dir = stripSlash(directory);
-  if (roots.some((r) => stripSlash(r) === dir)) return true;
+  const dir = canon(directory);
+  if (roots.some((r) => canon(r) === dir)) return true;
   if (typeof servedDirectory === "string" && servedDirectory.length > 0) {
-    const served = stripSlash(servedDirectory);
-    return roots.some((r) => stripSlash(r) === served);
+    const served = canon(servedDirectory);
+    return roots.some((r) => canon(r) === served);
   }
   return false;
 }

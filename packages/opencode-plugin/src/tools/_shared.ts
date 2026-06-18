@@ -16,11 +16,10 @@
  * and still pass `session_id` explicitly.
  */
 
-import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
-import { timeoutForCommand } from "@cortexkit/aft-bridge";
+import { canonicalizeProjectRoot, timeoutForCommand } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import {
@@ -99,12 +98,11 @@ export interface ToolRuntime {
  * session-stored directory before we use it for routing.
  */
 function canonicalizeDirectory(dir: string): string {
-  const trimmed = dir.replace(/[/\\]+$/, "");
-  try {
-    return fs.realpathSync(trimmed);
-  } catch {
-    return path.resolve(trimmed);
-  }
+  // Single shared canonicalizer: realpath + Windows verbatim/drive-case
+  // normalization, matching the bridge pool's routing key and the RPC port
+  // scope. Keeping a separate local realpath here (the old behavior) risked the
+  // routing/permission key diverging from the bridge key on Windows.
+  return canonicalizeProjectRoot(dir);
 }
 
 /**

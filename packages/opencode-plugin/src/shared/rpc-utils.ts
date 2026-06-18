@@ -1,15 +1,20 @@
-import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { projectRootKeyHash } from "@cortexkit/aft-bridge";
 
 /**
- * Compute a stable hash for a project directory.
- * Used to scope RPC port files per-project so multiple
- * OpenCode Desktop instances don't overwrite each other.
+ * Compute a stable hash for a project directory, used to scope RPC port files
+ * per-project so multiple OpenCode Desktop instances don't overwrite each
+ * other.
+ *
+ * Delegates to the shared `projectRootKeyHash`, which CANONICALIZES (realpath +
+ * Windows normalization) before hashing — the same identity the bridge pool
+ * routes by. Previously this hashed the RAW directory string, so a symlinked or
+ * raw-spelled launch dir scoped its port file to a different directory than the
+ * bridge routed to, leaving the sidebar unable to discover the live server
+ * (stale-port / wrong-project class).
  */
 export function projectHash(directory: string): string {
-  // Normalize: strip trailing slashes
-  const normalized = directory.replace(/\/+$/, "");
-  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+  return projectRootKeyHash(directory);
 }
 
 /**
