@@ -419,10 +419,35 @@ pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
         }
     }
 
-    ResolveResult {
-        config: resolve_flat_config(&merged),
-        dropped,
+    let mut config = Config::default();
+    apply_resolved_config(&merged, &mut config);
+    ResolveResult { config, dropped }
+}
+
+/// Resolve raw config tiers and OVERLAY the core-domain fields onto an existing
+/// `base` config (preserving its process-state fields: storage_dir, harness,
+/// lsp_paths_extra, bash_permissions, …). This is the configure-path entry: the
+/// caller seeds `base` with process-state, then applies the tier-derived core
+/// config on top. Returns the project-tier trust-boundary drops for warning
+/// surfacing.
+pub fn resolve_config_onto(tiers: &[ConfigTier], base: &mut Config) -> Vec<DroppedKey> {
+    let mut merged = RawAftConfig::default();
+    let mut dropped = Vec::new();
+
+    for tier in tiers {
+        let Some(raw) = parse_tier(tier) else {
+            continue;
+        };
+        if tier.tier == "user" {
+            merge_trusted_config(&mut merged, raw);
+        } else {
+            record_project_drops(&raw, &tier.tier, &mut dropped);
+            merge_project_config(&mut merged, raw);
+        }
     }
+
+    apply_resolved_config(&merged, base);
+    dropped
 }
 
 fn parse_tier(tier: &ConfigTier) -> Option<RawAftConfig> {
@@ -876,9 +901,12 @@ fn push_drop(dropped: &mut Vec<DroppedKey>, key: &str, tier: &str, reason: &str)
     });
 }
 
-fn resolve_flat_config(raw: &RawAftConfig) -> Config {
-    let mut config = Config::default();
-
+/// Overlay the resolved core-domain fields from `raw` onto `config`. Scalar
+/// fields are only written when present in the merged tiers (preserving the
+/// caller's base for absent keys); semantic/inspect/lsp are core-domain and are
+/// fully resolved from the tiers. Process-state fields on `config` are never
+/// touched (they are not part of `RawAftConfig`).
+fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     if let Some(value) = raw.format_on_edit {
         config.format_on_edit = value;
     }
@@ -927,10 +955,8 @@ fn resolve_flat_config(raw: &RawAftConfig) -> Config {
 
     config.semantic = resolve_semantic_config(raw.semantic.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
-    resolve_lsp_config(raw, &mut config);
-    resolve_bash_fields(raw, &mut config);
-
-    config
+    resolve_lsp_config(raw, config);
+    resolve_bash_fields(raw, config);
 }
 
 fn resolve_semantic_config(raw: Option<&RawSemantic>) -> SemanticBackendConfig {

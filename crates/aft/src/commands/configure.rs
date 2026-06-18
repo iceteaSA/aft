@@ -1493,6 +1493,32 @@ fn mark_search_rebuild_spawn_for_debug() {
     let _ = fs::write(path, b"spawned");
 }
 
+/// Parse the optional `config: [{tier, source, doc}]` raw-tier array from
+/// configure params. Returns `None` when absent (legacy flat-param plugins) or
+/// empty, so the resolver only runs when tiers are actually supplied. Tiers with
+/// a missing/invalid `tier` or `doc` are skipped (the `source` is optional
+/// metadata). The `tier` label is trusted as stamped by the plugin (by config
+/// source path) — never re-derived from `doc` content.
+fn parse_config_tiers(
+    params: &serde_json::Value,
+) -> Option<Vec<crate::config_resolve::ConfigTier>> {
+    let arr = params.get("config")?.as_array()?;
+    let tiers: Vec<crate::config_resolve::ConfigTier> = arr
+        .iter()
+        .filter_map(|entry| {
+            let tier = entry.get("tier")?.as_str()?.to_string();
+            let doc = entry.get("doc")?.as_str()?.to_string();
+            let source = entry
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(crate::config_resolve::ConfigTier { tier, source, doc })
+        })
+        .collect();
+    (!tiers.is_empty()).then_some(tiers)
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -1559,6 +1585,18 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut next_config = previous_config.clone();
     next_config.project_root = Some(root_path.clone());
     next_config.harness = Some(harness);
+
+    // P1 config relocation: when the plugin sends raw config tiers
+    // (`config: [{tier, source, doc}]`), AFT-core resolves the merge +
+    // trust-boundary itself (crate::config_resolve). The resolved core fields are
+    // overlaid onto next_config FIRST, so any explicit flat params below still win
+    // during the transition window (receiver-before-sender: this handler accepts
+    // tiers before the plugin starts sending them). Project-tier trust-boundary
+    // drops are surfaced in the response for the existing warning path.
+    let mut config_dropped_keys: Vec<crate::config_resolve::DroppedKey> = Vec::new();
+    if let Some(tiers) = parse_config_tiers(params) {
+        config_dropped_keys = crate::config_resolve::resolve_config_onto(&tiers, &mut next_config);
+    }
 
     // Parse and validate every configure field into a temporary config first.
     // AppContext is mutated only after this phase succeeds, so an invalid late
@@ -2648,6 +2686,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "warnings": [],
             "warnings_pending": warnings_pending,
             "search_index_cache_reused": search_index_cache_reused,
+            "config_dropped_keys": config_dropped_keys
+                .iter()
+                .map(|d| json!({ "key": d.key, "tier": d.tier, "reason": d.reason }))
+                .collect::<Vec<_>>(),
         }),
     );
     ctx.status_emitter().signal(ctx.build_status_snapshot());
@@ -2704,6 +2746,41 @@ mod tests {
             session_id: None,
             params,
         }
+    }
+
+    #[test]
+    fn configure_resolves_config_tiers_and_surfaces_dropped_keys() {
+        // P1 receiver half: configure accepts raw config tiers, resolves them in
+        // core (merge + trust boundary), and surfaces project-tier drops.
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "config": [
+                { "tier": "user", "source": "/u/aft.jsonc",
+                  "doc": "{ \"restrict_to_project_root\": true, \"search_index\": true }" },
+                { "tier": "project", "source": "/p/.opencode/aft.jsonc",
+                  "doc": "{ \"restrict_to_project_root\": false, \"semantic\": { \"api_key_env\": \"EVIL\" } }" }
+            ]
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+
+        // Core-resolved field applied: user search_index=true survived.
+        assert_eq!(ctx.config().search_index, true);
+        // Trust boundary: project tried restrict=false over user restrict=true →
+        // user value wins.
+        assert_eq!(ctx.config().restrict_to_project_root, true);
+        // Project semantic.api_key_env never reached Config.
+        assert!(ctx.config().semantic.api_key_env.is_none());
+
+        // Drops surfaced for the warning path.
+        let dropped = response.data["config_dropped_keys"].as_array().unwrap();
+        let keys: Vec<&str> = dropped.iter().filter_map(|d| d["key"].as_str()).collect();
+        assert!(keys.contains(&"restrict_to_project_root"), "keys: {keys:?}");
+        assert!(keys.contains(&"semantic.api_key_env"), "keys: {keys:?}");
     }
 
     #[test]
