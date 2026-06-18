@@ -130,8 +130,8 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     expect(data.formatted).toBe(formatted);
     if (reason) expect(data.format_skipped_reason).toBe(reason);
     else expect(data.format_skipped_reason).toBeUndefined();
-    if (formatted) expect(output).toContain("Auto-formatted.");
-    else expect(output).not.toContain("Auto-formatted.");
+    if (formatted) expect(output).toMatch(/Auto-formatted/);
+    else expect(output).not.toMatch(/Auto-formatted/);
   }
 
   test("edit oldString/newString triggers formatter", async () => {

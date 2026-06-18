@@ -309,6 +309,91 @@ pub fn auto_backup(
     Ok(Some(backup_id))
 }
 
+/// Post-format excerpt of the region(s) the formatter reflowed, so the agent
+/// can re-anchor its next edit on the real on-disk text instead of the text it
+/// submitted. `None` on WriteResult when the formatter did not change the
+/// applied edit (self-suppressing).
+pub struct ReformattedExcerpt {
+    /// Post-format text of the changed region(s), with ~2 lines of context,
+    /// capped. Empty when `extensive` is true.
+    pub text: String,
+    /// True when the reflow exceeded the cap (whole-file reformat etc.) — too
+    /// large to inline; the agent should re-read the file before re-anchoring.
+    pub extensive: bool,
+}
+
+const REFORMATTED_EXCERPT_MAX_LINES: usize = 60;
+const REFORMATTED_EXCERPT_MAX_BYTES: usize = 4096;
+
+/// Compute a bounded post-format excerpt when `pre_format` (agent-applied edit)
+/// differs from `post_format` (on-disk after formatting).
+pub fn compute_reformatted_excerpt(
+    pre_format: &str,
+    post_format: &str,
+) -> Option<ReformattedExcerpt> {
+    if pre_format == post_format {
+        return None;
+    }
+
+    use similar::DiffTag;
+
+    let diff = similar::TextDiff::from_lines(pre_format, post_format);
+    let post_lines: Vec<&str> = post_format.lines().collect();
+    let mut collected: Vec<String> = Vec::new();
+    let mut last_post_idx: Option<usize> = None;
+
+    for group in diff.grouped_ops(2) {
+        let mut group_start: Option<usize> = None;
+        let mut group_end: Option<usize> = None;
+
+        for op in group {
+            let tag = op.tag();
+            if tag == DiffTag::Delete {
+                continue;
+            }
+            let new_range = op.new_range();
+            if new_range.is_empty() {
+                continue;
+            }
+            let start = new_range.start;
+            let end = new_range.end.saturating_sub(1);
+            group_start = Some(group_start.map_or(start, |s| s.min(start)));
+            group_end = Some(group_end.map_or(end, |e| e.max(end)));
+        }
+
+        let (Some(start), Some(end)) = (group_start, group_end) else {
+            continue;
+        };
+
+        if let Some(prev) = last_post_idx {
+            if start > prev + 1 {
+                collected.push("…".to_string());
+            }
+        }
+
+        for idx in start..=end {
+            if idx < post_lines.len() {
+                collected.push(post_lines[idx].to_string());
+            }
+        }
+        last_post_idx = Some(end);
+    }
+
+    let line_count = collected.len();
+    let byte_count: usize = collected.iter().map(|l| l.len() + 1).sum();
+    if line_count > REFORMATTED_EXCERPT_MAX_LINES || byte_count > REFORMATTED_EXCERPT_MAX_BYTES {
+        return Some(ReformattedExcerpt {
+            text: String::new(),
+            extensive: true,
+        });
+    }
+
+    Some(ReformattedExcerpt {
+        text: collected.join("\n"),
+        extensive: false,
+    })
+}
+
 /// Result of the write → format → validate pipeline.
 ///
 /// Returned by `write_format_validate` to give callers a single struct
@@ -343,6 +428,8 @@ pub struct WriteResult {
     /// reports diagnostics from servers that proved freshness against the
     /// post-edit document version.
     pub lsp_outcome: Option<crate::lsp::manager::PostEditWaitOutcome>,
+    /// Post-format excerpt when the formatter reflowed the applied edit.
+    pub reformatted_excerpt: Option<ReformattedExcerpt>,
 }
 
 /// Render structured validation errors as a compact `line N: message` list for
@@ -410,6 +497,17 @@ impl WriteResult {
                 .iter()
                 .map(|key| key.kind.id_str().to_string())
                 .collect::<Vec<_>>());
+        }
+    }
+
+    /// Append post-format reflow excerpt when the formatter changed the applied edit.
+    pub fn append_reformatted_excerpt_to(&self, result: &mut serde_json::Value) {
+        if let Some(excerpt) = &self.reformatted_excerpt {
+            if excerpt.extensive {
+                result["reformatted"] = serde_json::json!({ "extensive": true });
+            } else {
+                result["reformatted"] = serde_json::json!({ "text": excerpt.text });
+            }
         }
     }
 }
@@ -487,6 +585,14 @@ pub fn write_format_validate(
         (Vec::new(), None)
     };
 
+    let reformatted_excerpt = if rolled_back {
+        None
+    } else {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|final_on_disk| compute_reformatted_excerpt(content, &final_on_disk))
+    };
+
     Ok(WriteResult {
         syntax_valid,
         formatted,
@@ -496,6 +602,7 @@ pub fn write_format_validate(
         validate_skipped_reason,
         rolled_back,
         lsp_outcome: None,
+        reformatted_excerpt,
     })
 }
 
@@ -604,5 +711,30 @@ mod tests {
         let source = "old content";
         let result = replace_byte_range(source, 0, source.len(), "new content").unwrap();
         assert_eq!(result, "new content");
+    }
+
+    #[test]
+    fn compute_reformatted_excerpt_self_suppresses_when_unchanged() {
+        let s = "fn main() {\n    let x = 1;\n}\n";
+        assert!(compute_reformatted_excerpt(s, s).is_none());
+    }
+
+    #[test]
+    fn compute_reformatted_excerpt_includes_post_format_text() {
+        let before = "fn  main( ){  let   x=1;  }";
+        let after = "fn main() {\n    let x = 1;\n}\n";
+        let excerpt = compute_reformatted_excerpt(before, after).expect("should diff");
+        assert!(!excerpt.extensive);
+        assert!(excerpt.text.contains("fn main()"));
+        assert!(excerpt.text.contains("let x = 1"));
+    }
+
+    #[test]
+    fn compute_reformatted_excerpt_extensive_when_over_line_cap() {
+        let before: String = (0..80).map(|i| format!("line{i} ugly\n")).collect();
+        let after: String = (0..80).map(|i| format!("line{i} neat\n")).collect();
+        let excerpt = compute_reformatted_excerpt(&before, &after).expect("should diff");
+        assert!(excerpt.extensive);
+        assert!(excerpt.text.is_empty());
     }
 }

@@ -540,6 +540,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     write_result.append_lsp_diagnostics_to(&mut result);
+    write_result.append_reformatted_excerpt_to(&mut result);
     Response::success(&req.id, result)
 }
 

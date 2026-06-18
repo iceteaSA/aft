@@ -351,8 +351,13 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             // false until/unless append gains the same rollback flow.
             rolled_back: false,
             lsp_outcome,
+            reformatted_excerpt: edit::compute_reformatted_excerpt(
+                &format!("{before_content}{append_content}"),
+                &final_content,
+            ),
         };
         write_result.append_lsp_diagnostics_to(&mut result);
+        write_result.append_reformatted_excerpt_to(&mut result);
     }
 
     Response::success(&req.id, result)
@@ -1202,6 +1207,7 @@ fn handle_single_file_edit_match(
     }
 
     write_result.append_lsp_diagnostics_to(&mut result);
+    write_result.append_reformatted_excerpt_to(&mut result);
 
     // Compute final on-disk content once for both `no_op` detection and the
     // optional diff metadata. We always emit `no_op: true` when the file

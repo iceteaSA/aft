@@ -195,7 +195,7 @@ maybeDescribe("e2e Pi format_on_edit parity", () => {
     // Parity (v0.35.2): Pi's agent-facing text now shares formatEditSummary
     // with OpenCode, so a formatted write surfaces " Auto-formatted." in both
     // harnesses (previously only OpenCode's write said it; Pi was silent).
-    expect(h.text(result)).toContain("Auto-formatted.");
+    expect(h.text(result)).toMatch(/Auto-formatted/);
   });
 
   test("Pi hoisted edit triggers formatter", async () => {

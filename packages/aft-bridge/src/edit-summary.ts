@@ -33,6 +33,8 @@ export interface EditSummaryInput {
   rolled_back?: boolean;
   /** Whether the file was auto-formatted after the write. */
   formatted?: boolean;
+  /** Post-format reflow excerpt from Rust when the formatter changed the applied edit. */
+  reformatted?: { text?: string; extensive?: boolean };
   /** Diff counts. before/after content is intentionally ignored here. */
   diff?: { additions?: number; deletions?: number };
 }
@@ -79,7 +81,7 @@ export function formatEditSummary(data: EditSummaryInput): string {
   // Append/write create path.
   if (data.created === true) {
     let s = `Created file (${counts}).`;
-    if (data.formatted) s += " Auto-formatted.";
+    if (data.formatted) s += formatAutoFormattedSuffix(data);
     return s;
   }
 
@@ -92,6 +94,17 @@ export function formatEditSummary(data: EditSummaryInput): string {
   }
 
   let s = `Edited (${detail}).`;
-  if (data.formatted) s += " Auto-formatted.";
+  if (data.formatted) s += formatAutoFormattedSuffix(data);
   return s;
+}
+
+function formatAutoFormattedSuffix(data: EditSummaryInput): string {
+  const reflowText = data.reformatted?.text;
+  if (typeof reflowText === "string" && reflowText.length > 0) {
+    return `\nAuto-formatted — the formatter reflowed your edit. On disk now:\n${reflowText}`;
+  }
+  if (data.reformatted?.extensive === true) {
+    return " Auto-formatted — extensive reflow; re-read the file before your next anchored edit.";
+  }
+  return " Auto-formatted.";
 }

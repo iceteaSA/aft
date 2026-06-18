@@ -45,6 +45,31 @@ describe("formatEditSummary", () => {
     ).toBe("Created file (+2/-0). Auto-formatted.");
   });
 
+  test("surfaces reformatted.text with reflow message", () => {
+    const s = formatEditSummary({
+      replacements: 1,
+      formatted: true,
+      diff: { additions: 2, deletions: 1 },
+      reformatted: { text: "fn main() {\n    let x = 1;\n}" },
+    });
+    expect(s).toContain("reflowed your edit");
+    expect(s).toContain("fn main()");
+    expect(s).not.toMatch(/\. Auto-formatted\.$/);
+  });
+
+  test("surfaces reformatted.extensive with re-read hint", () => {
+    expect(
+      formatEditSummary({
+        replacements: 1,
+        formatted: true,
+        diff: { additions: 1, deletions: 1 },
+        reformatted: { extensive: true },
+      }),
+    ).toBe(
+      "Edited (+1/-1). Auto-formatted — extensive reflow; re-read the file before your next anchored edit.",
+    );
+  });
+
   test("transaction reports file count, singular/plural", () => {
     expect(formatEditSummary({ files_modified: 1 })).toBe("Applied edits to 1 file.");
     expect(formatEditSummary({ files_modified: 2 })).toBe("Applied edits to 2 files.");

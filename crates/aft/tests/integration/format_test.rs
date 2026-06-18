@@ -137,6 +137,99 @@ fn format_integration_applied_rustfmt() {
         on_disk
     );
 
+    let reflow_text = resp["reformatted"]["text"]
+        .as_str()
+        .expect("rustfmt reflow should surface reformatted.text");
+    assert!(
+        reflow_text.contains("fn main()"),
+        "excerpt should show post-format text, got: {reflow_text}"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// edit_match with a mis-wrapped replacement → reformatted.text in response.
+#[test]
+fn format_integration_edit_match_reformatted_excerpt_on_reflow() {
+    if !is_on_path("rustfmt") {
+        eprintln!("SKIP: rustfmt not on PATH");
+        return;
+    }
+
+    let dir = format_test_dir("edit_match_reflow");
+    fs::write(dir.join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let target = dir.join("format_edit_match_reflow.rs");
+    fs::write(
+        &target,
+        "fn main() {\n    helper();\n}\n\nfn helper() {\n    println!(\"ok\");\n}\n",
+    )
+    .unwrap();
+
+    let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    aft.configure(&dir);
+
+    let req = serde_json::json!({
+        "id": "fmt-edit-match",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "fn helper() {\n    println!(\"ok\");\n}",
+        "replacement": "fn helper() {  println!(  \"ok\"  );  }",
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "edit_match should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["formatted"], true);
+    let reflow_text = resp["reformatted"]["text"]
+        .as_str()
+        .expect("replacement reflow should surface reformatted.text");
+    assert!(
+        reflow_text.contains("println!"),
+        "excerpt should contain formatted helper body, got: {reflow_text}"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// Well-formatted write → reformatted field absent (self-suppress).
+#[test]
+fn format_integration_write_self_suppresses_reformatted_when_no_reflow() {
+    if !is_on_path("rustfmt") {
+        eprintln!("SKIP: rustfmt not on PATH");
+        return;
+    }
+
+    let dir = format_test_dir("write_self_suppress");
+    fs::write(dir.join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let target = dir.join("format_self_suppress.rs");
+    let _ = fs::remove_file(&target);
+
+    let neat = "fn main() {\n    let x = 1;\n}\n";
+
+    let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    aft.configure(&dir);
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-self","command":"write","file":{},"content":{}}}"#,
+        crate::helpers::json_string(&target.display()),
+        crate::helpers::json_string(&neat)
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    assert!(
+        resp.get("reformatted").is_none() || resp["reformatted"].is_null(),
+        "already-formatted content should not emit reformatted: {:?}",
+        resp
+    );
+
     let _ = fs::remove_file(&target);
     let status = aft.shutdown();
     assert!(status.success());

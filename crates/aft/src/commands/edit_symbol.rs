@@ -381,6 +381,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     write_result.append_lsp_diagnostics_to(&mut result);
+    write_result.append_reformatted_excerpt_to(&mut result);
 
     // Read final content once for both no_op detection and diff info.
     // Honest reporting: when the symbol replacement produced byte-identical

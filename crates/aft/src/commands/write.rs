@@ -177,6 +177,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     write_result.append_lsp_diagnostics_to(&mut result);
+    write_result.append_reformatted_excerpt_to(&mut result);
 
     // Read final on-disk content once for no_op detection + diff metadata.
     // Honest reporting: when the file existed AND the post-write content is
