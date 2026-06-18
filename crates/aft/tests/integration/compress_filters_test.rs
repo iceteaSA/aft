@@ -5,7 +5,10 @@ use aft::compress::builtin_filters::ALL;
 use aft::compress::find::build_lebench_find_fixture;
 use aft::compress::ls::build_lebench_ls_la_fixture;
 use aft::compress::toml_filter::{apply_filter, build_registry, parse_filter, FilterSource};
-use aft::compress::tree::build_lebench_tree_fixture;
+use aft::compress::tree::{
+    build_lebench_tree_c_locale_ascii_fixture, build_lebench_tree_fixture,
+    build_lebench_tree_utf8_nbsp_fixture,
+};
 
 fn fixture_dir(name: &str) -> PathBuf {
     crate::helpers::cargo_manifest_dir()
@@ -119,14 +122,48 @@ fn terraform_filter() {
     run_fixture("terraform");
 }
 
+fn assert_tree_compressor_folds_and_preserves_needle(format_name: &str, input: String) {
+    let compressed = compress_builtin("tree -a src", &input);
+    assert!(
+        compressed.contains("module_100_NEEDLE_FILE_marker.ts"),
+        "{format_name}: needle should survive: {compressed}"
+    );
+    assert!(
+        compressed.contains("module_*.ts"),
+        "{format_name}: homogeneous run should fold: {compressed}"
+    );
+    assert!(
+        compressed.contains("2 directories, 202 files"),
+        "{format_name}: trailer should survive: {compressed}"
+    );
+    assert!(
+        compressed.lines().count() < input.lines().count() / 2,
+        "{format_name}: expected dramatic compression"
+    );
+}
+
 #[test]
 fn tree_compressor_folds_and_preserves_needle() {
-    let input = build_lebench_tree_fixture();
-    let compressed = compress_builtin("tree -a src", &input);
-    assert!(compressed.contains("module_100_NEEDLE_FILE_marker.ts"));
-    assert!(compressed.contains("module_*.ts"));
-    assert!(compressed.contains("2 directories, 202 files"));
-    assert!(compressed.lines().count() < input.lines().count() / 2);
+    assert_tree_compressor_folds_and_preserves_needle(
+        "utf8-box ascii-space indent",
+        build_lebench_tree_fixture(),
+    );
+}
+
+#[test]
+fn tree_compressor_folds_utf8_nbsp_indented_tree() {
+    assert_tree_compressor_folds_and_preserves_needle(
+        "utf8-box nbsp indent",
+        build_lebench_tree_utf8_nbsp_fixture(),
+    );
+}
+
+#[test]
+fn tree_compressor_folds_c_locale_ascii_tree() {
+    assert_tree_compressor_folds_and_preserves_needle(
+        "c-locale ascii",
+        build_lebench_tree_c_locale_ascii_fixture(),
+    );
 }
 
 #[test]

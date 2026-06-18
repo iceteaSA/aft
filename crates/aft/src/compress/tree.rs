@@ -192,41 +192,86 @@ fn count_word(text: &str, singular: &str, plural: &str) -> bool {
 }
 
 fn parse_tree_entry(line: &str) -> Option<ParsedTreeEntry<'_>> {
-    let mut rest = line;
+    let mut consumed = 0usize;
     let mut ancestor_units = 0usize;
 
-    loop {
-        if let Some(after) = rest.strip_prefix("│   ") {
-            ancestor_units += 1;
-            rest = after;
-            continue;
-        }
-        if let Some(after) = rest.strip_prefix("    ") {
-            ancestor_units += 1;
-            rest = after;
-            continue;
-        }
-        break;
+    while let Some(next) = consume_tree_indent_unit(line, consumed) {
+        ancestor_units += 1;
+        consumed = next;
     }
 
-    if let Some(label) = rest.strip_prefix("├── ") {
-        return Some(ParsedTreeEntry {
-            depth: ancestor_units + 1,
-            label,
-        });
+    let label_start = consume_tree_connector(line, consumed)?;
+    Some(ParsedTreeEntry {
+        depth: ancestor_units + 1,
+        label: &line[label_start..],
+    })
+}
+
+fn consume_tree_indent_unit(line: &str, start: usize) -> Option<usize> {
+    let (first, _) = next_char(line, start)?;
+    if is_tree_vertical_char(first) {
+        let mut index = start + first.len_utf8();
+        for _ in 0..3 {
+            index = consume_tree_space_char(line, index)?;
+        }
+        Some(index)
+    } else if is_tree_space_char(first) {
+        let mut index = start;
+        for _ in 0..4 {
+            index = consume_tree_space_char(line, index)?;
+        }
+        Some(index)
+    } else {
+        None
     }
-    if let Some(label) = rest.strip_prefix("└── ") {
-        return Some(ParsedTreeEntry {
-            depth: ancestor_units + 1,
-            label,
-        });
+}
+
+fn consume_tree_connector(line: &str, start: usize) -> Option<usize> {
+    let (branch, mut index) = next_char(line, start)?;
+    if !is_tree_connector_char(branch) {
+        return None;
     }
-    None
+
+    for _ in 0..2 {
+        let (horizontal, next) = next_char(line, index)?;
+        if !is_tree_horizontal_char(horizontal) {
+            return None;
+        }
+        index = next;
+    }
+
+    consume_tree_space_char(line, index)
+}
+
+fn consume_tree_space_char(line: &str, start: usize) -> Option<usize> {
+    let (ch, next) = next_char(line, start)?;
+    is_tree_space_char(ch).then_some(next)
+}
+
+fn next_char(line: &str, start: usize) -> Option<(char, usize)> {
+    let ch = line.get(start..)?.chars().next()?;
+    Some((ch, start + ch.len_utf8()))
+}
+
+fn is_tree_space_char(ch: char) -> bool {
+    matches!(ch, ' ' | '\u{00a0}')
+}
+
+fn is_tree_vertical_char(ch: char) -> bool {
+    matches!(ch, '│' | '|')
+}
+
+fn is_tree_connector_char(ch: char) -> bool {
+    matches!(ch, '├' | '└' | '|' | '`')
+}
+
+fn is_tree_horizontal_char(ch: char) -> bool {
+    matches!(ch, '─' | '-')
 }
 
 fn looks_like_malformed_tree_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with('│') || trimmed.starts_with('├') || trimmed.starts_with('└')
+    let trimmed = line.trim_start_matches(|ch: char| ch.is_whitespace() || is_tree_space_char(ch));
+    trimmed.starts_with(|ch: char| is_tree_vertical_char(ch) || matches!(ch, '├' | '└' | '`'))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -347,23 +392,87 @@ fn join_tree_path(parent_path: &str, label: &str) -> String {
     }
 }
 
-pub fn build_lebench_tree_fixture() -> String {
+#[derive(Clone, Copy)]
+enum TreeFixtureFormat {
+    Utf8BoxAsciiIndent,
+    Utf8BoxNbspIndent,
+    CLocaleAscii,
+}
+
+impl TreeFixtureFormat {
+    fn continuing_indent(self) -> &'static str {
+        match self {
+            Self::Utf8BoxAsciiIndent => "\u{2502}   ",
+            Self::Utf8BoxNbspIndent => "\u{2502}\u{00a0}\u{00a0} ",
+            Self::CLocaleAscii => "|   ",
+        }
+    }
+
+    fn blank_indent(self) -> &'static str {
+        "    "
+    }
+
+    fn branch_connector(self) -> &'static str {
+        match self {
+            Self::Utf8BoxAsciiIndent | Self::Utf8BoxNbspIndent => "\u{251c}\u{2500}\u{2500} ",
+            Self::CLocaleAscii => "|-- ",
+        }
+    }
+
+    fn last_connector(self) -> &'static str {
+        match self {
+            Self::Utf8BoxAsciiIndent | Self::Utf8BoxNbspIndent => "\u{2514}\u{2500}\u{2500} ",
+            Self::CLocaleAscii => "`-- ",
+        }
+    }
+}
+
+fn build_lebench_tree_fixture_with_format(format: TreeFixtureFormat) -> String {
     let mut lines = Vec::with_capacity(207);
     lines.push("src".to_string());
-    lines.push("├── generated".to_string());
-    lines.push("│   └── client".to_string());
+    lines.push(format!("{}generated", format.branch_connector()));
+    lines.push(format!(
+        "{}{}client",
+        format.continuing_indent(),
+        format.last_connector()
+    ));
+    let nested_prefix = format!("{}{}", format.continuing_indent(), format.blank_indent());
     for i in 0..=100u32 {
-        lines.push(format!("│       ├── module_{i:03}.ts"));
+        lines.push(format!(
+            "{nested_prefix}{}module_{i:03}.ts",
+            format.branch_connector()
+        ));
     }
-    lines.push("│       ├── module_100_NEEDLE_FILE_marker.ts".to_string());
+    lines.push(format!(
+        "{nested_prefix}{}module_100_NEEDLE_FILE_marker.ts",
+        format.branch_connector()
+    ));
     for i in 101..=198u32 {
-        lines.push(format!("│       ├── module_{i:03}.ts"));
+        lines.push(format!(
+            "{nested_prefix}{}module_{i:03}.ts",
+            format.branch_connector()
+        ));
     }
-    lines.push("│       └── module_199.ts".to_string());
-    lines.push("└── main.ts".to_string());
+    lines.push(format!(
+        "{nested_prefix}{}module_199.ts",
+        format.last_connector()
+    ));
+    lines.push(format!("{}main.ts", format.last_connector()));
     lines.push(String::new());
     lines.push("2 directories, 202 files".to_string());
     lines.join("\n")
+}
+
+pub fn build_lebench_tree_fixture() -> String {
+    build_lebench_tree_fixture_with_format(TreeFixtureFormat::Utf8BoxAsciiIndent)
+}
+
+pub fn build_lebench_tree_utf8_nbsp_fixture() -> String {
+    build_lebench_tree_fixture_with_format(TreeFixtureFormat::Utf8BoxNbspIndent)
+}
+
+pub fn build_lebench_tree_c_locale_ascii_fixture() -> String {
+    build_lebench_tree_fixture_with_format(TreeFixtureFormat::CLocaleAscii)
 }
 
 #[cfg(test)]
@@ -371,6 +480,27 @@ mod tests {
     use super::*;
 
     const NEEDLE: &str = "module_100_NEEDLE_FILE_marker.ts";
+
+    fn assert_tree_fixture_folds(input: &str) -> String {
+        let line_count = input.lines().count();
+        let out = compress_tree_listing(input).expect("tree parses");
+
+        assert!(out.contains(NEEDLE), "needle must survive; got:\n{out}");
+        assert!(
+            out.contains("module_*.ts —"),
+            "homogeneous module run should fold: {out}"
+        );
+        assert!(
+            out.contains("2 directories, 202 files"),
+            "tree summary trailer should be preserved: {out}"
+        );
+        assert!(
+            out.lines().count() < line_count / 2,
+            "should compress dramatically: {line_count} -> {} lines",
+            out.lines().count()
+        );
+        out
+    }
 
     #[test]
     fn matches_tree_invocations() {
@@ -384,38 +514,50 @@ mod tests {
     #[test]
     fn lebench_tree_folds_sibling_run_and_preserves_needle_and_trailer() {
         let input = build_lebench_tree_fixture();
-        let line_count = input.lines().count();
+        let out = assert_tree_fixture_folds(&input);
 
-        let out = compress_tree_listing(&input).expect("tree parses");
-
-        assert!(out.contains(NEEDLE), "needle must survive; got:\n{out}");
-        assert!(
-            out.contains("module_*.ts —"),
-            "homogeneous module run should fold: {out}"
-        );
         assert!(
             out.contains("│       ├── module_100_NEEDLE_FILE_marker.ts"),
             "needle should keep its sibling-tree prefix: {out}"
         );
+    }
+
+    #[test]
+    fn lebench_utf8_nbsp_tree_folds_sibling_run_and_preserves_needle_and_trailer() {
+        let input = build_lebench_tree_utf8_nbsp_fixture();
         assert!(
-            out.contains("2 directories, 202 files"),
-            "tree summary trailer should be preserved: {out}"
+            input.contains("\u{2502}\u{00a0}\u{00a0}     \u{251c}\u{2500}\u{2500} module_000.ts")
         );
+
+        let out = assert_tree_fixture_folds(&input);
+
         assert!(
-            out.lines().count() < line_count / 2,
-            "should compress dramatically: {line_count} -> {} lines",
-            out.lines().count()
+            out.contains("│       ├── module_100_NEEDLE_FILE_marker.ts"),
+            "needle should keep its sibling-tree prefix after normalization: {out}"
         );
     }
 
     #[test]
-    fn tree_compression_is_deterministic() {
-        let input = build_lebench_tree_fixture();
-        let first = compress_tree_listing(&input).expect("tree parses");
-        let second = compress_tree_listing(&input).expect("tree parses");
-        let recompressed = compress_tree_listing(&first).expect("compressed tree parses");
-        assert_eq!(first, second);
-        assert_eq!(first, recompressed);
+    fn lebench_c_locale_ascii_tree_folds_sibling_run_and_preserves_needle_and_trailer() {
+        let input = build_lebench_tree_c_locale_ascii_fixture();
+        assert!(input.contains("|       |-- module_000.ts"));
+
+        assert_tree_fixture_folds(&input);
+    }
+
+    #[test]
+    fn tree_compression_is_deterministic_across_fixture_formats() {
+        for input in [
+            build_lebench_tree_fixture(),
+            build_lebench_tree_utf8_nbsp_fixture(),
+            build_lebench_tree_c_locale_ascii_fixture(),
+        ] {
+            let first = compress_tree_listing(&input).expect("tree parses");
+            let second = compress_tree_listing(&input).expect("tree parses");
+            let recompressed = compress_tree_listing(&first).expect("compressed tree parses");
+            assert_eq!(first, second);
+            assert_eq!(first, recompressed);
+        }
     }
 
     #[test]
@@ -441,6 +583,34 @@ mod tests {
         assert!(out.contains("    ├── component_*.rs — 8 files"), "{out}");
         assert!(out.contains("    └── keep.rs"), "{out}");
         assert!(out.contains("2 directories, 20 files"), "{out}");
+    }
+
+    #[test]
+    fn mixed_ascii_and_nbsp_indent_space_chars_still_parse() {
+        let lines = [
+            ".".to_string(),
+            "├── src".to_string(),
+            format!("\u{2502} \u{00a0} ├── module_{:03}.rs", 0),
+            format!("\u{2502}\u{00a0}  ├── module_{:03}.rs", 1),
+            format!("\u{2502}  \u{00a0}├── module_{:03}.rs", 2),
+            format!("\u{2502}\u{00a0}\u{00a0} ├── module_{:03}.rs", 3),
+            format!("\u{2502} \u{00a0} ├── module_{:03}.rs", 4),
+            format!("\u{2502}\u{00a0}  ├── module_{:03}.rs", 5),
+            format!("\u{2502}  \u{00a0}├── module_{:03}.rs", 6),
+            format!("\u{2502}\u{00a0}\u{00a0} ├── module_{:03}.rs", 7),
+            "\u{2502} \u{00a0} \u{2514}\u{2500}\u{2500} keep.rs".to_string(),
+            "└── tail.rs".to_string(),
+            String::new(),
+            "1 directory, 10 files".to_string(),
+        ]
+        .join("\n");
+
+        let out = compress_tree_listing(&lines).expect("tree parses");
+
+        assert!(out.contains("│   ├── module_*.rs — 8 files"), "{out}");
+        assert!(out.contains("│   └── keep.rs"), "{out}");
+        assert!(out.contains("└── tail.rs"), "{out}");
+        assert!(out.contains("1 directory, 10 files"), "{out}");
     }
 
     #[test]
