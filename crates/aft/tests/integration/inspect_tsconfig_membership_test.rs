@@ -182,6 +182,93 @@ fn inspect_diagnostics_scoped_surfaces_included_ts_file() {
     assert_eq!(details[0]["message"], "test pull diagnostic");
 }
 
+/// A bare count ("1 error") is not actionable — diagnostics detail must surface
+/// WITHOUT an explicit `sections` request (the always-on diagnostics-detail
+/// behavior). Other categories stay sections-gated; diagnostics is the
+/// exception because it replaced the removed `lsp_diagnostics` tool.
+#[test]
+fn inspect_diagnostics_detail_surfaces_without_sections_param() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "packages/pkg/tsconfig.json",
+        r#"{
+          "include": ["src/**/*.ts"],
+          "exclude": ["src/**/*.test.ts"]
+        }"#,
+    );
+    write_file(&root, "packages/pkg/src/foo.ts", "export const foo = 1;\n");
+    let ctx = configured_context(&root);
+    configure_fake_typescript_lsp(&ctx);
+
+    // Scope provided, but NO `sections` — the exact call shape that previously
+    // returned a count with no message.
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-no-sections",
+            "command": "inspect",
+            "scope": "packages/pkg/src/foo.ts",
+            "topK": 20,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 1);
+    let details = diagnostics_details(&response);
+    assert_eq!(
+        details.len(),
+        1,
+        "diagnostics detail must surface without a sections request: {response:#}"
+    );
+    assert_eq!(details[0]["file"], "packages/pkg/src/foo.ts");
+    assert_eq!(details[0]["message"], "test pull diagnostic");
+}
+
+/// Self-suppression: when there are no diagnostics, the always-on path must NOT
+/// inject an empty `details.diagnostics` — the clean payload stays detail-free
+/// so a green inspect costs no extra tokens. Uses a tsconfig-EXCLUDED file
+/// (the server never pulls it → zero diagnostics) to reach the no-items state
+/// without a fake-server knob.
+#[test]
+fn inspect_diagnostics_zero_items_has_no_details_without_sections() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "packages/pkg/tsconfig.json",
+        r#"{
+          "include": ["src/**/*.ts"],
+          "exclude": ["src/**/*.test.ts"]
+        }"#,
+    );
+    write_file(
+        &root,
+        "packages/pkg/src/foo.test.ts",
+        "import { test } from 'bun:test';\ntest('works', () => import.meta.dir);\n",
+    );
+    let ctx = configured_context(&root);
+    configure_fake_typescript_lsp(&ctx);
+
+    // Excluded file, NO `sections` — zero diagnostics, so the always-on path
+    // must not inject an empty diagnostics detail array.
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-zero-no-sections",
+            "command": "inspect",
+            "scope": "packages/pkg/src/foo.test.ts",
+            "topK": 20,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert!(
+        response["details"].get("diagnostics").is_none(),
+        "zero-diagnostics scope must not inject empty diagnostics detail: {response:#}"
+    );
+}
+
 #[test]
 fn inspect_diagnostics_warm_filters_excluded_file_and_keeps_included_file() {
     let (_temp_dir, root) = fixture_project();

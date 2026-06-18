@@ -437,6 +437,19 @@ fn build_inspect_payload(
                 category.as_str().to_string(),
                 details_for(*category, payload, top_k),
             );
+        } else if *category == InspectCategory::Diagnostics {
+            // Diagnostics detail is always actionable — a bare count ("1 error")
+            // can't be fixed without the message + location, and this category
+            // is the replacement for the removed `lsp_diagnostics` tool. So
+            // include its drill-down even without an explicit `sections` request.
+            // Self-suppressing: only inserted when there's something to show, so
+            // the clean (E0/W0) payload stays identical to before (no `details`).
+            // Other Tier-2 categories stay `sections`-gated (their detail can be
+            // hundreds of rows and a count is a meaningful at-a-glance signal).
+            let detail = details_for(*category, payload, top_k);
+            if detail.as_array().is_some_and(|items| !items.is_empty()) {
+                details.insert(category.as_str().to_string(), detail);
+            }
         }
     }
 

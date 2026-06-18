@@ -402,7 +402,14 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
         // partial/pending honesty logic) and appended after the body, matching
         // the OpenCode `appendRenderedDiagnostics` flow. The status bar is added
         // by the global tool_result hook.
-        const diagnostics = diagnosticsSummaryPart(asRecord(response.summary));
+        // Diagnostics summary line + (when present) the detail rows. Rust now
+        // always includes diagnostics detail in `details` (a bare count isn't
+        // actionable), so render it for the agent here — matching OpenCode's
+        // appendRenderedDiagnostics. The detail section self-suppresses when
+        // there are no diagnostics, so the clean case stays summary-only.
+        const diagnosticsSummary = diagnosticsSummaryPart(asRecord(response.summary));
+        const diagnosticsDetail = diagnosticsDetailSection(asRecord(response.details));
+        const diagnostics = [diagnosticsSummary, diagnosticsDetail].filter(Boolean).join("\n");
         const text = diagnostics ? (body ? `${body}\n\n${diagnostics}` : diagnostics) : body;
         return textResult(text, response);
       }
