@@ -517,7 +517,12 @@ fn semantic_index_state(ctx: &AppContext) -> SubsystemState {
     if !ctx.config().semantic_search {
         return SubsystemState::Disabled;
     }
-    match ctx.semantic_index_status().borrow().clone() {
+    match ctx
+        .semantic_index_status()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
         SemanticIndexStatus::Disabled => SubsystemState::Disabled,
         SemanticIndexStatus::Ready { .. } => SubsystemState::Ready,
         SemanticIndexStatus::Failed(error) => SubsystemState::Failed(error),
@@ -689,21 +694,34 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 entries_done,
                 entries_total,
             } => {
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                    stage,
-                    files,
-                    entries_done,
-                    entries_total,
-                };
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Building {
+                        stage,
+                        files,
+                        entries_done,
+                        entries_total,
+                    };
             }
             SemanticIndexEvent::Ready(index) => {
-                *ctx.semantic_index().borrow_mut() = Some(index);
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+                *ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::ready();
                 keep_receiver = false;
             }
             SemanticIndexEvent::Failed(error) => {
-                *ctx.semantic_index().borrow_mut() = None;
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
+                *ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Failed(error);
                 keep_receiver = false;
             }
         }

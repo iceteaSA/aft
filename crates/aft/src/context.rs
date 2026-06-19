@@ -627,9 +627,9 @@ pub struct AppContext {
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
     tier2_refresh_scheduler: RefCell<Tier2RefreshScheduler>,
-    semantic_index: RefCell<Option<SemanticIndex>>,
+    semantic_index: RwLock<Option<SemanticIndex>>,
     semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
-    semantic_index_status: RefCell<SemanticIndexStatus>,
+    semantic_index_status: RwLock<SemanticIndexStatus>,
     pending_semantic_index_paths: RefCell<BTreeSet<PathBuf>>,
     pending_semantic_corpus_refresh: RefCell<bool>,
     semantic_refresh_tx: RefCell<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>,
@@ -779,9 +779,9 @@ impl AppContext {
             symbol_cache,
             inspect_manager: Arc::new(InspectManager::new()),
             tier2_refresh_scheduler: RefCell::new(Tier2RefreshScheduler::new()),
-            semantic_index: RefCell::new(None),
+            semantic_index: RwLock::new(None),
             semantic_index_rx: RefCell::new(None),
-            semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
+            semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
             pending_semantic_index_paths: RefCell::new(BTreeSet::new()),
             pending_semantic_corpus_refresh: RefCell::new(false),
             semantic_refresh_tx: RefCell::new(None),
@@ -1969,7 +1969,7 @@ impl AppContext {
     }
 
     /// Access the semantic search index.
-    pub fn semantic_index(&self) -> &RefCell<Option<SemanticIndex>> {
+    pub fn semantic_index(&self) -> &RwLock<Option<SemanticIndex>> {
         &self.semantic_index
     }
 
@@ -1980,7 +1980,7 @@ impl AppContext {
         &self.semantic_index_rx
     }
 
-    pub fn semantic_index_status(&self) -> &RefCell<SemanticIndexStatus> {
+    pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
         &self.semantic_index_status
     }
 

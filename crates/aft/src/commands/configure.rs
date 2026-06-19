@@ -1591,7 +1591,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let symbol_cache_generation = ctx.reset_symbol_cache();
-    *ctx.semantic_index().borrow_mut() = None;
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     *ctx.semantic_index_rx().borrow_mut() = None;
     *ctx.callgraph_store()
         .write()
@@ -1599,7 +1601,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if previous_project_root.as_ref() == Some(&root_path) {
         ctx.mark_callgraph_store_force_rebuild();
     }
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
     ctx.clear_semantic_refresh_worker();
     *ctx.semantic_embedding_model().borrow_mut() = None;
     ctx.clear_pending_index_updates();
@@ -1765,7 +1769,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         } else {
             "initial"
         };
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
             stage: semantic_initial_stage.to_string(),
             files: None,
             entries_done: None,

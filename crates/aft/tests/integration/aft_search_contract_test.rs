@@ -271,7 +271,9 @@ fn natural_language_auto_falls_back_to_grep_when_semantic_disabled() {
     )
     .expect("write source file");
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
         &request("how retry logic works"),
@@ -313,7 +315,9 @@ fn degraded_grep_reports_file_cap_gap_when_scan_limit_reached() {
     }
 
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
         &request("how slow backend fallback works"),
@@ -354,7 +358,9 @@ fn natural_language_auto_falls_back_to_grep_while_semantic_builds() {
     )
     .expect("write source file");
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
         stage: "embedding".to_string(),
         files: Some(1),
         entries_done: Some(0),
@@ -405,7 +411,9 @@ fn hybrid_disabled_semantic_uses_lexical_only_fallback() {
     let (project, source_file, source) = project_with_needle();
     let ctx = test_context(project.path());
     install_lexical_index(&ctx, &source_file, source);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
 
@@ -417,7 +425,9 @@ fn hybrid_failed_semantic_uses_lexical_only_fallback() {
     let (project, source_file, source) = project_with_needle();
     let ctx = test_context(project.path());
     install_lexical_index(&ctx, &source_file, source);
-    *ctx.semantic_index_status().borrow_mut() =
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
         SemanticIndexStatus::Failed("ONNX Runtime unavailable".to_string());
 
     let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
@@ -429,7 +439,9 @@ fn hybrid_failed_semantic_uses_lexical_only_fallback() {
 fn auto_mode_falls_back_to_grep_when_trigram_unavailable_and_semantic_disabled() {
     let (project, _source_file, _source) = project_with_needle();
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
 
@@ -441,8 +453,13 @@ fn embed_query_failure_falls_back_to_grep_when_hint_not_explicit_semantic() {
     let (project, _source_file, _source) = project_with_needle();
     let (base_url, handle) = start_mock_embedding_error_server();
     let ctx = openai_context(project.path(), base_url);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-    *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(SemanticIndex::new(project.path().to_path_buf(), 3));
 
     let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
 
@@ -454,7 +471,9 @@ fn embed_query_failure_falls_back_to_grep_when_hint_not_explicit_semantic() {
 fn explicit_hint_semantic_still_fails_cleanly_when_no_fallback_available() {
     let (project, _source_file, _source) = project_with_needle();
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
         &request_with("needle_symbol", Some("semantic")),
@@ -470,7 +489,9 @@ fn explicit_semantic_hint_fails_when_semantic_is_unavailable() {
     let (project, source_file, source) = project_with_needle();
     let ctx = test_context(project.path());
     install_lexical_index(&ctx, &source_file, source);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
         &request_with("needle_symbol", Some("semantic")),
@@ -485,7 +506,9 @@ fn explicit_semantic_hint_fails_when_semantic_is_unavailable() {
 fn regex_grep_success_reports_ready_status_not_semantic_backend_status() {
     let (project, _source_file, _source) = project_with_needle();
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
         &request_with("^pub fn exported", Some("regex")),
@@ -506,7 +529,9 @@ fn regex_grep_success_reports_ready_status_not_semantic_backend_status() {
 fn grep_results_report_regex_or_literal_source() {
     let (project, _source_file, _source) = project_with_needle();
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     for (query, hint, expected_source) in [
         ("^pub fn exported", "regex", "regex"),
@@ -555,8 +580,12 @@ fn hybrid_semantic_results_report_semantic_source_and_boost_metadata() {
     let (base_url, handle) = start_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index(&ctx, &source_file, source);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-    *ctx.semantic_index().borrow_mut() = Some(semantic_index);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
 
     let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
 
@@ -593,7 +622,9 @@ fn lexical_only_fallback_reports_more_available_when_capped_or_over_top_k() {
     let (project, entries) = project_with_repeated_needle_files(6);
     let ctx = test_context(project.path());
     install_lexical_index_entries(&ctx, &entries);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
         &request_with_top_k("needle_symbol", None, 5),
@@ -612,7 +643,9 @@ fn lexical_only_fallback_reports_more_available_when_capped_or_over_top_k() {
     let (project, entries) = project_with_repeated_needle_files(210);
     let ctx = test_context(project.path());
     install_lexical_index_entries(&ctx, &entries);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
         stage: "embedding".to_string(),
         files: Some(210),
         entries_done: Some(0),
@@ -640,8 +673,13 @@ fn hybrid_ready_reports_more_available_when_lexical_engine_capped() {
     let (base_url, handle) = start_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index_entries(&ctx, &entries);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-    *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(SemanticIndex::new(project.path().to_path_buf(), 3));
 
     let response = response_value(handle_semantic_search(
         &request_with_top_k("needle_symbol", None, 100),
@@ -677,8 +715,12 @@ fn semantic_ready_reports_more_available_when_semantic_lane_overflows() {
     );
     let (base_url, handle) = start_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-    *ctx.semantic_index().borrow_mut() = Some(semantic_index);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
 
     let response = response_value(handle_semantic_search(
         &request_with_top_k("needle_symbol", Some("semantic"), 100),
@@ -713,8 +755,12 @@ fn hybrid_ready_reports_no_more_available_when_under_top_k_without_caps() {
     let (base_url, handle) = start_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index(&ctx, &source_file, source);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-    *ctx.semantic_index().borrow_mut() = Some(semantic_index);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
 
     let response = response_value(handle_semantic_search(
         &request_with_top_k("needle_symbol", None, 5),
@@ -746,7 +792,9 @@ fn auto_bare_quantifier_queries_route_to_regex_grep() {
     std::fs::write(&source_file, "foo foobar color colour fooooooobar\n")
         .expect("write source file");
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     for query in ["foo*", "foo+", "colou?r", "foo*bar"] {
         let response = response_value(handle_semantic_search(&request(query), &ctx));
@@ -769,7 +817,9 @@ fn auto_short_identifier_tokens_use_literal_scan() {
         .expect("create source dir");
     std::fs::write(&source_file, "let id = 1;\nlet ab = id;\n").expect("write source file");
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     for query in ["id", "ab"] {
         let response = response_value(handle_semantic_search(&request(query), &ctx));
@@ -798,8 +848,13 @@ fn hybrid_ready_semantic_reports_complete_success() {
     let (base_url, handle) = start_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index(&ctx, &source_file, source);
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-    *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(SemanticIndex::new(project.path().to_path_buf(), 3));
 
     let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
 
@@ -822,7 +877,9 @@ fn hybrid_ready_semantic_reports_complete_success() {
 fn literal_query_strips_surrounding_paired_quotes() {
     let (project, _source_file, _) = project_with_needle();
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     for (query, label) in [
         ("\"needle_symbol\"", "double-quoted"),
@@ -864,7 +921,9 @@ fn literal_query_preserves_unmatched_quotes() {
         .expect("create source dir");
     std::fs::write(&source_file, "let s = \"'needle\";\n").expect("write source file");
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
         &request_with("\"'needle", Some("literal")),
@@ -904,7 +963,9 @@ fn quote_strip_only_removes_one_pair() {
     let (project, source_file, _) = project_with_needle();
     std::fs::write(&source_file, "let s = \"needle\";\n").expect("write source file");
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
         &request_with("\"\"needle\"\"", Some("literal")),

@@ -115,7 +115,11 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let top_k = params.top_k.clamp(1, MAX_TOP_K);
     let project_root = grep_executor::project_root(ctx);
     let shape = query_shape::classify(&params.query);
-    let semantic_status_snapshot = ctx.semantic_index_status().borrow().clone();
+    let semantic_status_snapshot = ctx
+        .semantic_index_status()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let semantic_status = semantic_status_label(&semantic_status_snapshot);
     let mut warnings = Vec::new();
 
@@ -580,7 +584,10 @@ fn handle_semantic_or_hybrid_search(
     let semantic_limit = semantic_candidate_limit(top_k);
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
     let mut semantic_results = {
-        let semantic_index = ctx.semantic_index().borrow();
+        let semantic_index = ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         semantic_index
             .as_ref()
             .map(|index| index.search(&query_vector, semantic_fetch_limit))
@@ -1158,7 +1165,10 @@ fn record_degraded_grep_match(
 }
 
 fn semantic_index_loaded(ctx: &AppContext) -> bool {
-    ctx.semantic_index().borrow().is_some()
+    ctx.semantic_index()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
 }
 
 fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> LexicalCollection {
@@ -1228,13 +1238,24 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     let query_vector = model
         .embed_query_cached(query)
         .map_err(|error| format!("failed to embed query: {error}"))?;
+    drop(model_ref);
 
-    if let Some(index) = ctx.semantic_index().borrow().as_ref() {
-        if index.len() > 0 && index.dimension() != query_vector.len() {
+    let index_dimension = {
+        let semantic_index = ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        semantic_index
+            .as_ref()
+            .filter(|index| index.len() > 0)
+            .map(|index| index.dimension())
+    };
+    if let Some(index_dimension) = index_dimension {
+        if index_dimension != query_vector.len() {
             return Err(format!(
                 "semantic embedding dimension mismatch: query backend returned {}, index expects {}. Rebuild the semantic index for the active backend/model.",
                 query_vector.len(),
-                index.dimension()
+                index_dimension
             ));
         }
     }
@@ -1985,7 +2006,9 @@ mod tests {
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
             stage: "embedding".to_string(),
             files: Some(1),
             entries_done: Some(0),
@@ -2034,7 +2057,9 @@ mod tests {
             .expect("create source dir");
         std::fs::write(&source_file, "pub fn exported() {}\n").expect("write source file");
         let ctx = test_context(project.path());
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint(".*exported", 5, "regex"),
@@ -2217,8 +2242,12 @@ mod tests {
                 ..Config::default()
             },
         );
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-        *ctx.semantic_index().borrow_mut() =
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(SemanticIndex::new(project.path().to_path_buf(), 384));
 
         let response = response_value(handle_semantic_search(

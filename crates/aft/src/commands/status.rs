@@ -75,9 +75,16 @@ impl AppContext {
 
         // Semantic index status
         let semantic_index_info = {
-            let status = self.semantic_index_status().borrow().clone();
+            let status = self
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let refreshing_count = status.refreshing_count();
-            let index = self.semantic_index().borrow();
+            let index = self
+                .semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match index.as_ref() {
                 Some(idx) => {
                     let status_label = match status {

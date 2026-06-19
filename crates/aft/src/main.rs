@@ -691,7 +691,12 @@ fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> 
         drain_search_index_events(ctx);
         drain_semantic_index_events(ctx);
 
-        match ctx.semantic_index_status().borrow().clone() {
+        match ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
             SemanticIndexStatus::Ready { .. }
             | SemanticIndexStatus::Disabled
             | SemanticIndexStatus::Failed(_) => return None,
@@ -834,8 +839,12 @@ fn replay_search_index_pending_updates(
 }
 
 fn semantic_corpus_refresh_in_progress(ctx: &AppContext) -> bool {
+    let status = ctx
+        .semantic_index_status()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     matches!(
-        &*ctx.semantic_index_status().borrow(),
+        &*status,
         SemanticIndexStatus::Building { stage, .. } if stage == "refreshing_corpus"
     )
 }
@@ -1186,20 +1195,26 @@ fn refresh_project_corpus(ctx: &AppContext, reason: &str, invalidate_ignore_path
 
     if config.semantic_search {
         if let Some(sender) = ctx.semantic_refresh_sender() {
-            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                stage: "refreshing_corpus".to_string(),
-                files: None,
-                entries_done: None,
-                entries_total: None,
-            };
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SemanticIndexStatus::Building {
+                    stage: "refreshing_corpus".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                };
             match sender.send(SemanticRefreshRequest::Corpus) {
                 Ok(()) => {
                     status_changed = true;
                 }
                 Err(error) => {
-                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
-                        format!("semantic corpus refresh worker unavailable: {error}"),
-                    );
+                    *ctx.semantic_index_status()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        SemanticIndexStatus::Failed(format!(
+                            "semantic corpus refresh worker unavailable: {error}"
+                        ));
                     status_changed = true;
                 }
             }
@@ -1481,22 +1496,31 @@ fn drain_watcher_events(ctx: &AppContext) {
             }
         }
 
-        let mut semantic_index_ref = ctx.semantic_index().borrow_mut();
-        if let Some(index) = semantic_index_ref.as_mut() {
+        let stale_paths = {
+            let mut semantic_index_ref = ctx
+                .semantic_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut stale_paths = Vec::new();
-            for path in &semantic_source_paths {
-                index.invalidate_file(path);
-                stale_paths.push(path.clone());
-            }
-            if !stale_paths.is_empty() {
-                let mut status = ctx.semantic_index_status().borrow_mut();
-                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                    for path in &stale_paths {
-                        status.add_refreshing_file(path.clone());
-                    }
-                    semantic_refresh_paths = stale_paths;
-                    status_changed = true;
+            if let Some(index) = semantic_index_ref.as_mut() {
+                for path in &semantic_source_paths {
+                    index.invalidate_file(path);
+                    stale_paths.push(path.clone());
                 }
+            }
+            stale_paths
+        };
+        if !stale_paths.is_empty() {
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                for path in &stale_paths {
+                    status.add_refreshing_file(path.clone());
+                }
+                semantic_refresh_paths = stale_paths;
+                status_changed = true;
             }
         }
     }
@@ -1534,7 +1558,10 @@ fn drain_watcher_events(ctx: &AppContext) {
                 "semantic refresh worker unavailable; dropping {} refreshing file(s)",
                 semantic_refresh_paths.len()
             );
-            let mut status = ctx.semantic_index_status().borrow_mut();
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for path in &semantic_refresh_paths {
                 status.cancel_refreshing_file(path);
             }
@@ -1710,12 +1737,15 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 entries_done,
                 entries_total,
             } => {
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                    stage,
-                    files,
-                    entries_done,
-                    entries_total,
-                };
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Building {
+                        stage,
+                        files,
+                        entries_done,
+                        entries_total,
+                    };
                 // Push progress to the sidebar. Without this, a long rebuild
                 // (e.g. a slow local embedding backend re-indexing after a prior
                 // failure) leaves the sidebar showing the stale prior state —
@@ -1734,17 +1764,27 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                     }
                 }
                 replay_corpus_refresh = ctx.take_pending_semantic_corpus_refresh();
-                *ctx.semantic_index().borrow_mut() = Some(index);
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+                *ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::ready();
                 keep_receiver = false;
                 status_changed = true;
             }
             SemanticIndexEvent::Failed(error) => {
                 let _ = ctx.take_pending_semantic_index_paths();
                 let _ = ctx.take_pending_semantic_corpus_refresh();
-                *ctx.semantic_index().borrow_mut() = None;
+                *ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 ctx.clear_semantic_refresh_worker();
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Failed(error);
                 keep_receiver = false;
                 status_changed = true;
             }
@@ -1754,9 +1794,13 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     if disconnected && keep_receiver {
         let _ = ctx.take_pending_semantic_index_paths();
         let _ = ctx.take_pending_semantic_corpus_refresh();
-        *ctx.semantic_index().borrow_mut() = None;
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         ctx.clear_semantic_refresh_worker();
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Failed(
             "semantic index build worker disconnected before reporting completion".to_string(),
         );
         keep_receiver = false;
@@ -1769,25 +1813,34 @@ fn drain_semantic_index_events(ctx: &AppContext) {
 
     if replay_corpus_refresh {
         if ctx.canonical_cache_root_opt().is_some() {
-            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                stage: "refreshing_corpus".to_string(),
-                files: None,
-                entries_done: None,
-                entries_total: None,
-            };
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SemanticIndexStatus::Building {
+                    stage: "refreshing_corpus".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                };
             let sent = ctx
                 .semantic_refresh_sender()
                 .is_some_and(|sender| sender.send(SemanticRefreshRequest::Corpus).is_ok());
             if !sent {
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
-                    "semantic corpus refresh worker unavailable".to_string(),
-                );
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Failed(
+                        "semantic corpus refresh worker unavailable".to_string(),
+                    );
             }
             status_changed = true;
         }
     } else if !replay_refresh_paths.is_empty() {
         {
-            let mut status = ctx.semantic_index_status().borrow_mut();
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                 for path in &replay_refresh_paths {
                     status.add_refreshing_file(path.clone());
@@ -1807,7 +1860,10 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 "semantic refresh worker unavailable; dropping {} replayed file(s)",
                 replay_refresh_paths.len()
             );
-            let mut status = ctx.semantic_index_status().borrow_mut();
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for path in &replay_refresh_paths {
                 status.cancel_refreshing_file(path);
             }
@@ -1853,7 +1909,10 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
     for event in events {
         match event {
             SemanticRefreshEvent::Started { paths } => {
-                let mut status = ctx.semantic_index_status().borrow_mut();
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                     for path in paths {
                         status.start_refreshing_file(path);
@@ -1862,12 +1921,15 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 }
             }
             SemanticRefreshEvent::CorpusStarted { files } => {
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                    stage: "refreshing_corpus".to_string(),
-                    files: Some(files),
-                    entries_done: None,
-                    entries_total: None,
-                };
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Building {
+                        stage: "refreshing_corpus".to_string(),
+                        files: Some(files),
+                        entries_done: None,
+                        entries_total: None,
+                    };
                 status_changed = true;
             }
             SemanticRefreshEvent::Completed {
@@ -1875,11 +1937,19 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 updated_metadata,
                 completed_paths,
             } => {
-                if let Some(index) = ctx.semantic_index().borrow_mut().as_mut() {
+                if let Some(index) = ctx
+                    .semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
                     index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
                 }
                 mark_semantic_refresh_success(ctx, &completed_paths);
-                let mut status = ctx.semantic_index_status().borrow_mut();
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                     for path in &completed_paths {
                         status.complete_refreshing_file(path);
@@ -1914,8 +1984,13 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                         replay_refresh_paths.push(path);
                     }
                 }
-                *ctx.semantic_index().borrow_mut() = Some(index);
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+                *ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::ready();
                 status_changed = true;
             }
             SemanticRefreshEvent::Failed { paths, error } => {
@@ -1934,7 +2009,10 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                     aft::slog_warn!("semantic refresh failed: {}", error);
                     reset_semantic_refresh_transient_failure_count(ctx);
                     clear_semantic_refresh_retry_attempts(ctx, &paths);
-                    let mut status = ctx.semantic_index_status().borrow_mut();
+                    let mut status = ctx
+                        .semantic_index_status()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                         for path in &paths {
                             status.complete_refreshing_file(path);
@@ -1954,25 +2032,39 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 // real failure.
                 if aft::semantic_index::embedding_failure_is_transient(&error) {
                     let clean = aft::semantic_index::strip_transient_embedding_marker(&error);
-                    let has_index = ctx.semantic_index().borrow().is_some();
+                    let has_index = ctx
+                        .semantic_index()
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some();
                     if has_index {
                         aft::slog_warn!(
                             "semantic corpus refresh hit a transient backend error ({}); keeping the existing index",
                             clean,
                         );
-                        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+                        *ctx.semantic_index_status()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            SemanticIndexStatus::ready();
                     } else {
                         // No index to fall back on — surface the clean message.
                         aft::slog_warn!("semantic corpus refresh failed: {}", clean);
-                        *ctx.semantic_index_status().borrow_mut() =
+                        *ctx.semantic_index_status()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             SemanticIndexStatus::Failed(clean);
                     }
                     status_changed = true;
                 } else {
                     aft::slog_warn!("semantic corpus refresh failed: {}", error);
                     let _ = ctx.take_pending_semantic_index_paths();
-                    *ctx.semantic_index().borrow_mut() = None;
-                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
+                    *ctx.semantic_index()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    *ctx.semantic_index_status()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        SemanticIndexStatus::Failed(error);
                     status_changed = true;
                 }
             }
@@ -1982,14 +2074,20 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
     if disconnected {
         ctx.clear_semantic_refresh_worker();
         let refreshing_paths = {
-            let status = ctx.semantic_index_status().borrow();
+            let status = ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match &*status {
                 SemanticIndexStatus::Ready { refreshing, .. } => refreshing.clone(),
                 _ => Vec::new(),
             }
         };
         if !refreshing_paths.is_empty() {
-            let mut status = ctx.semantic_index_status().borrow_mut();
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for path in &refreshing_paths {
                 status.cancel_refreshing_file(path);
             }
@@ -2001,7 +2099,10 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
 
     if !replay_refresh_paths.is_empty() {
         {
-            let mut status = ctx.semantic_index_status().borrow_mut();
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                 for path in &replay_refresh_paths {
                     status.add_refreshing_file(path.clone());
@@ -2021,7 +2122,10 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 "semantic refresh worker unavailable; dropping {} replayed corpus file(s)",
                 replay_refresh_paths.len()
             );
-            let mut status = ctx.semantic_index_status().borrow_mut();
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for path in &replay_refresh_paths {
                 status.cancel_refreshing_file(path);
             }
@@ -2702,7 +2806,9 @@ mod watcher_filter_tests {
         let ctx = make_ctx_with_root(&root);
         let (tx, rx) = crossbeam_channel::unbounded::<SemanticIndexEvent>();
         *ctx.semantic_index_rx().borrow_mut() = Some(rx);
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
             stage: "embedding".into(),
             files: Some(1),
             entries_done: Some(0),
@@ -2714,7 +2820,9 @@ mod watcher_filter_tests {
 
         assert!(ctx.semantic_index_rx().borrow().is_none());
         assert!(matches!(
-            &*ctx.semantic_index_status().borrow(),
+            &*ctx.semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             SemanticIndexStatus::Failed(message)
                 if message.contains("disconnected before reporting completion")
         ));
@@ -2728,7 +2836,9 @@ mod watcher_filter_tests {
         std::fs::write(&file, "fn main() {}\n").unwrap();
 
         let ctx = make_ctx_with_root(&root);
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
         let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
         event_tx
             .send(SemanticRefreshEvent::Started {
@@ -2740,7 +2850,13 @@ mod watcher_filter_tests {
         drain_semantic_refresh_events(&ctx);
 
         assert!(ctx.semantic_refresh_event_rx().borrow().is_none());
-        assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 0);
+        assert_eq!(
+            ctx.semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refreshing_count(),
+            0
+        );
     }
 
     #[test]
@@ -2845,8 +2961,13 @@ mod watcher_filter_tests {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(search_index);
 
-        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.clone(), 3));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
         let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
 
         let watcher_tx = install_watcher_rx(&ctx);
@@ -2962,8 +3083,13 @@ mod watcher_filter_tests {
         std::fs::write(&file, "<script setup>const n = 1;</script>").unwrap();
 
         let ctx = make_ctx_with_root(&root);
-        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.clone(), 3));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
         let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx.send(watcher_paths_event(file.clone())).unwrap();
@@ -2996,8 +3122,12 @@ mod watcher_filter_tests {
         );
         ctx.set_canonical_cache_root(root.clone());
         ctx.rebuild_gitignore();
-        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root, 3));
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SemanticIndex::new(root, 3));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
         let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx.send(watcher_paths_event(file.clone())).unwrap();
@@ -3038,7 +3168,9 @@ mod watcher_filter_tests {
             let mut status = SemanticIndexStatus::ready();
             status.add_refreshing_file(file.clone());
             status.start_refreshing_file(file.clone());
-            *ctx.semantic_index_status().borrow_mut() = status;
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
 
             event_tx
                 .send(SemanticRefreshEvent::Failed {
@@ -3059,7 +3191,13 @@ mod watcher_filter_tests {
                 SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file.clone()]),
                 SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
             }
-            assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 1);
+            assert_eq!(
+                ctx.semantic_index_status()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .refreshing_count(),
+                1
+            );
         });
     }
 
@@ -3254,8 +3392,13 @@ mod watcher_filter_tests {
         std::fs::write(&file, "<template />").unwrap();
 
         let ctx = make_ctx_with_root(&root);
-        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.clone(), 3));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
             stage: "refreshing_corpus".into(),
             files: Some(1),
             entries_done: None,
@@ -3278,7 +3421,10 @@ mod watcher_filter_tests {
         let pending = ctx.take_pending_semantic_index_paths();
         assert_eq!(pending, vec![file]);
         assert!(matches!(
-            &*ctx.semantic_index_status().borrow(),
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             SemanticIndexStatus::Ready { .. }
         ));
     }
