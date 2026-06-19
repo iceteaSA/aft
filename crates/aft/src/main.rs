@@ -6,6 +6,7 @@ use aft::context::{
     SemanticRefreshRequest,
 };
 use aft::log_ctx;
+use aft::lsp::child_registry::LspChildRegistry;
 use aft::lsp::client::LspEvent;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::runtime_registry::RuntimeRegistry;
@@ -72,15 +73,12 @@ fn main() {
     let app = App::default_shared();
     let ctx = AppContext::from_app(Arc::clone(&app), Config::default());
     let registry = RuntimeRegistry::standalone(app, ctx);
-    // P3-02: signal/shutdown is a process service; N>1 must aggregate
-    // all runtime registries (or move to one shared registry). Standalone
-    // routes through the selected single runtime for now.
+    // P3-02 slice 2: signal handling aggregates all per-actor
+    // background registries; drain/dispatch multi-root routing remains later.
     {
-        let runtime = registry.current();
-        install_signal_handler(
-            runtime.bash_background().clone(),
-            runtime.lsp_child_registry(),
-        );
+        let bg_registries = signal_bg_registries(&registry);
+        let lsp_children = registry.app().lsp_child_registry();
+        install_signal_handler(bg_registries, lsp_children);
     }
 
     // Install bash output-compression closure on the BgTaskRegistry. The
@@ -256,11 +254,15 @@ fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
     }
 }
 
+fn signal_bg_registries(registry: &RuntimeRegistry) -> Vec<BgTaskRegistry> {
+    registry
+        .iter()
+        .map(|runtime| runtime.bash_background().clone())
+        .collect()
+}
+
 #[cfg(unix)]
-fn install_signal_handler(
-    bg_registry: BgTaskRegistry,
-    lsp_children: aft::lsp::child_registry::LspChildRegistry,
-) {
+fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspChildRegistry) {
     let signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
@@ -277,7 +279,9 @@ fn install_signal_handler(
             // Plugin restarts can SIGTERM the bridge while background bash jobs
             // are still running. Detach first so child handles are not killed by
             // Rust drop glue and can be rehydrated from disk.
-            bg_registry.detach();
+            for registry in &bg_registries {
+                registry.detach();
+            }
             // Kill LSP children synchronously before exit. Without this, LSP
             // child processes (typescript-language-server, biome lsp-proxy,
             // etc.) get orphaned to PID 1 because process::exit bypasses the
@@ -295,10 +299,8 @@ fn install_signal_handler(
 }
 
 #[cfg(not(unix))]
-static WINDOWS_SIGNAL_REGISTRIES: std::sync::OnceLock<(
-    BgTaskRegistry,
-    aft::lsp::child_registry::LspChildRegistry,
-)> = std::sync::OnceLock::new();
+static WINDOWS_SIGNAL_REGISTRIES: std::sync::OnceLock<(Vec<BgTaskRegistry>, LspChildRegistry)> =
+    std::sync::OnceLock::new();
 
 #[cfg(windows)]
 unsafe extern "system" fn windows_console_handler(ctrl_type: u32) -> i32 {
@@ -316,8 +318,10 @@ unsafe extern "system" fn windows_console_handler(ctrl_type: u32) -> i32 {
             | CTRL_LOGOFF_EVENT
             | CTRL_SHUTDOWN_EVENT
     ) {
-        if let Some((bg_registry, lsp_children)) = WINDOWS_SIGNAL_REGISTRIES.get() {
-            bg_registry.detach();
+        if let Some((bg_registries, lsp_children)) = WINDOWS_SIGNAL_REGISTRIES.get() {
+            for registry in bg_registries {
+                registry.detach();
+            }
             let killed = lsp_children.kill_all();
             if killed > 0 {
                 aft::slog_info!(
@@ -341,13 +345,10 @@ unsafe extern "system" {
 }
 
 #[cfg(not(unix))]
-fn install_signal_handler(
-    bg_registry: BgTaskRegistry,
-    lsp_children: aft::lsp::child_registry::LspChildRegistry,
-) {
+fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspChildRegistry) {
     #[cfg(windows)]
     {
-        let _ = WINDOWS_SIGNAL_REGISTRIES.set((bg_registry, lsp_children));
+        let _ = WINDOWS_SIGNAL_REGISTRIES.set((bg_registries, lsp_children));
         // SAFETY: registers a process-global console-control callback. The
         // callback only uses cloneable registries stored in OnceLock.
         let ok = unsafe { SetConsoleCtrlHandler(Some(windows_console_handler), 1) };
@@ -358,7 +359,7 @@ fn install_signal_handler(
 
     #[cfg(not(windows))]
     {
-        let _ = (bg_registry, lsp_children);
+        let _ = (bg_registries, lsp_children);
     }
 }
 
@@ -2031,6 +2032,21 @@ fn drain_lsp_events(ctx: &AppContext) {
     }
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
+}
+
+#[cfg(test)]
+mod signal_handler_tests {
+    use super::{signal_bg_registries, App, AppContext, Config, RuntimeRegistry};
+    use std::sync::Arc;
+
+    #[test]
+    fn signal_bg_registry_collection_includes_standalone_actor() {
+        let app = App::default_shared();
+        let ctx = AppContext::from_app(Arc::clone(&app), Config::default());
+        let registry = RuntimeRegistry::standalone(app, ctx);
+
+        assert_eq!(signal_bg_registries(&registry).len(), 1);
     }
 }
 
