@@ -1,6 +1,6 @@
-import { readConfigTiers } from "@cortexkit/aft-bridge";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { readConfigTiers } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import type { AftRequest, sendAftRequest } from "../lib/aft-bridge.js";

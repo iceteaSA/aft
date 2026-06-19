@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
-import { PASSIVE_COMMAND_TIMEOUT_MS, isPassiveCommand } from "./command-timeouts.js";
-import type { LogMeta, Logger } from "./logger.js";
+import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
+import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
-import { type StatusBarCounts, parseStatusBarCounts } from "./status-bar.js";
+import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
