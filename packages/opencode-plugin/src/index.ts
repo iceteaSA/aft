@@ -13,6 +13,7 @@ import {
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
 import type { Plugin } from "@opencode-ai/plugin";
+
 import {
   appendInTurnBgCompletions,
   extractSessionID,
@@ -22,11 +23,11 @@ import {
   handlePushedPatternMatch,
 } from "./bg-notifications.js";
 import {
+  buildConfigTierConfigureParams,
   getConfigLoadErrors,
   loadAftConfig,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
-  resolveProjectOverridesForConfigure,
 } from "./config.js";
 import {
   drainPendingConfigParseWarnings,
@@ -218,42 +219,37 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   enqueueConfigParseWarnings(input.directory, getConfigLoadErrors());
   const autoUpdateAbort = new AbortController();
 
-  // Build config overrides for the Rust binary (strip undefined values).
+  // Build configure params for the Rust binary.
   //
   // **Two layers**:
   //   1. `configOverrides` (this block) — GLOBAL per-process state shared by
   //      every bridge: storage_dir, _ort_dylib_dir (patched later), harness,
-  //      bash_permissions, lsp_paths_extra (LSP install cache).
-  //   2. `projectConfigLoader` (wired below) — PER-BRIDGE, loaded from each
-  //      project's own `.opencode/aft.jsonc` at bridge-spawn time. Contains
-  //      everything that can legitimately differ per project: experimental.bash.*,
-  //      format_on_edit, formatter, checker, restrict_to_project_root,
-  //      search_index, semantic_search, semantic, lsp (per-project safe
-  //      subset), max_callgraph_files.
+  //      bash_permissions, lsp_paths_extra (LSP install cache), plus raw config
+  //      tiers for the init-time project so the first bridge configures without
+  //      an extra loader call.
+  //   2. `projectConfigLoader` (wired below) — PER-BRIDGE raw config tiers,
+  //      loaded from each project's own `.opencode/aft.jsonc` at bridge-spawn
+  //      time. Rust owns merge + trust-boundary stripping for the core domain.
   //
   // The pool merges them with per-project values winning. Without this split,
   // OpenCode Desktop / `opencode serve` (one plugin instance, many projects)
   // would burn the wrong project's config into every bridge — the project
   // visible at plugin init time would override everything.
   //
-  // Seed the global layer with the init-time config so the FIRST bridge in
-  // the init-time project still gets its config without an extra loader call.
-  // Subsequent project switches re-resolve via the loader.
-  const configOverrides: Record<string, unknown> = {
-    ...resolveProjectOverridesForConfigure(aftConfig),
+  // Core-domain config now flows only through `config: [{ tier, source, doc }]`.
+  // Do not add resolved aft.jsonc fields (format_on_edit, semantic, lsp, etc.)
+  // to this flat map; flat params below are plugin-computed process state.
+  const storageDir = resolveCortexKitStorageRoot();
+  const configOverrides: Record<string, unknown> = buildConfigTierConfigureParams(input.directory, {
     bash_permissions: true,
-  };
-  // url_fetch_allow_private is user-config only (project config is stripped in loadAftConfig).
-  if (aftConfig.url_fetch_allow_private !== undefined) {
-    configOverrides.url_fetch_allow_private = aftConfig.url_fetch_allow_private;
-  }
+    storage_dir: storageDir,
+  });
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 
   // v0.27 stores runtime state under the shared CortexKit root. Migration from
   // the legacy OpenCode plugin root completed synchronously before any storage
   // consumer (ONNX, RPC server, bridge configure) can touch this path.
-  configOverrides.storage_dir = resolveCortexKitStorageRoot();
 
   // Auto-resolve ONNX Runtime for semantic search.
   //
@@ -414,12 +410,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // that project's bridge. See PoolOptions.projectConfigLoader doc.
     projectConfigLoader: (projectRoot) => {
       try {
-        const projectConfig = loadAftConfig(projectRoot);
-        enqueueConfigParseWarnings(projectRoot, getConfigLoadErrors());
-        return resolveProjectOverridesForConfigure(projectConfig);
+        return buildConfigTierConfigureParams(projectRoot);
       } catch (err) {
         warn(
-          `loadAftConfig(${projectRoot}) failed; falling back to plugin-init config: ${
+          `readConfigTiers(${projectRoot}) failed; falling back to plugin-init config: ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
@@ -464,7 +458,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       versionUpgradePromises.set(minVersion, upgradePromise);
       return upgradePromise;
     },
-    onConfigureWarnings: ({ projectRoot, sessionId, client, warnings }) => {
+    onConfigureWarnings: ({ projectRoot, sessionId, client, warnings, configDroppedKeys }) => {
       const bridge = pool.getActiveBridgeForRoot(projectRoot);
       if (!bridge) return;
       const projectConfig = loadAftConfig(projectRoot);
@@ -474,6 +468,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         client,
         bridge,
         warnings,
+        configDroppedKeys,
         fallbackClient: input.client,
         storageDir: configOverrides.storage_dir as string,
         pluginVersion: PLUGIN_VERSION,
@@ -687,7 +682,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   });
   // Feature announcement — TUI plugin calls this on startup to show a dialog.
   // Uses ANNOUNCEMENT_VERSION (not PLUGIN_VERSION) so patch releases don't re-fire.
-  const storageDir = configOverrides.storage_dir as string;
 
   rpcServer.handle("get-announcement", async () => {
     if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {

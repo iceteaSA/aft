@@ -20,7 +20,8 @@
  * from this file directly.
  */
 
-import type { BinaryBridge } from "@cortexkit/aft-bridge";
+import { type BinaryBridge, formatDroppedKeyWarnings } from "@cortexkit/aft-bridge";
+
 import {
   type ConfigLoadError,
   type ConfigureWarningsDelivery,
@@ -52,7 +53,8 @@ function isConfigureWarning(value: unknown): value is ConfigureWarning {
     (warning.kind === "formatter_not_installed" ||
       warning.kind === "checker_not_installed" ||
       warning.kind === "lsp_binary_missing" ||
-      warning.kind === "config_parse_failed") &&
+      warning.kind === "config_parse_failed" ||
+      warning.kind === "config_key_dropped") &&
     typeof warning.hint === "string"
   );
 }
@@ -90,6 +92,26 @@ function coerceConfigureWarnings(warnings: unknown[]): ConfigureWarning[] {
   return warnings.filter(isConfigureWarning);
 }
 
+type DroppedConfigKey = { key: string; tier: string; reason: string };
+
+function isDroppedConfigKey(value: unknown): value is DroppedConfigKey {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const dropped = value as Record<string, unknown>;
+  return (
+    typeof dropped.key === "string" &&
+    typeof dropped.tier === "string" &&
+    typeof dropped.reason === "string"
+  );
+}
+
+function coerceDroppedKeyWarnings(droppedKeys: unknown): ConfigureWarning[] {
+  if (!Array.isArray(droppedKeys)) return [];
+  return formatDroppedKeyWarnings(droppedKeys.filter(isDroppedConfigKey)).map((hint) => ({
+    kind: "config_key_dropped" as const,
+    hint,
+  }));
+}
+
 export function drainPendingEagerWarnings(projectRoot: string): ConfigureWarning[] {
   const pending = pendingEagerWarnings.get(projectRoot) ?? [];
   pendingEagerWarnings.delete(projectRoot);
@@ -109,6 +131,7 @@ export function enqueueConfigureWarningsForSession(context: {
   client?: unknown;
   bridge: Pick<BinaryBridge, "send">;
   warnings: unknown[];
+  configDroppedKeys?: unknown;
   fallbackClient: unknown;
   storageDir: string;
   pluginVersion: string;
@@ -118,6 +141,7 @@ export function enqueueConfigureWarningsForSession(context: {
   const validWarnings = [
     ...drainPendingConfigParseWarnings(context.projectRoot),
     ...coerceConfigureWarnings(context.warnings),
+    ...coerceDroppedKeyWarnings(context.configDroppedKeys),
   ];
 
   if (!context.sessionId) {
@@ -181,6 +205,7 @@ export async function handleConfigureWarningsForSession(context: {
   client?: unknown;
   bridge: Pick<BinaryBridge, "send">;
   warnings: unknown[];
+  configDroppedKeys?: unknown;
   fallbackClient: unknown;
   storageDir: string;
   pluginVersion: string;

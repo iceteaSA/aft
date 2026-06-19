@@ -36,6 +36,7 @@ import {
   ensureOnnxRuntime,
   ensureStorageMigrated,
   findBinary,
+  formatDroppedKeyWarnings,
   getManualInstallHint,
   isHomeDirectoryRoot,
   resolveCortexKitStorageRoot,
@@ -52,12 +53,12 @@ import {
 import { registerStatusCommand } from "./commands/aft-status.js";
 import {
   type AftConfig,
+  buildConfigTierConfigureParams,
   formatConfigParseFailureMessage,
   getConfigLoadErrors,
   loadAftConfig,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
-  resolveProjectOverridesForConfigure,
 } from "./config.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
@@ -213,13 +214,34 @@ function isConfigureWarning(value: unknown): value is ConfigureWarning {
     (warning.kind === "formatter_not_installed" ||
       warning.kind === "checker_not_installed" ||
       warning.kind === "lsp_binary_missing" ||
-      warning.kind === "config_parse_failed") &&
+      warning.kind === "config_parse_failed" ||
+      warning.kind === "config_key_dropped") &&
     typeof warning.hint === "string"
   );
 }
 
 function coerceConfigureWarnings(warnings: unknown[]): ConfigureWarning[] {
   return warnings.filter(isConfigureWarning);
+}
+
+type DroppedConfigKey = { key: string; tier: string; reason: string };
+
+function isDroppedConfigKey(value: unknown): value is DroppedConfigKey {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const dropped = value as Record<string, unknown>;
+  return (
+    typeof dropped.key === "string" &&
+    typeof dropped.tier === "string" &&
+    typeof dropped.reason === "string"
+  );
+}
+
+function coerceDroppedKeyWarnings(droppedKeys: unknown): ConfigureWarning[] {
+  if (!Array.isArray(droppedKeys)) return [];
+  return formatDroppedKeyWarnings(droppedKeys.filter(isDroppedConfigKey)).map((hint) => ({
+    kind: "config_key_dropped" as const,
+    hint,
+  }));
 }
 
 function drainPendingEagerWarnings(projectRoot: string): ConfigureWarning[] {
@@ -268,10 +290,14 @@ async function handleConfigureWarningsForSession(context: {
   client?: unknown;
   bridge: Pick<import("@cortexkit/aft-bridge").BinaryBridge, "send">;
   warnings: unknown[];
+  configDroppedKeys?: unknown;
   storageDir: string;
   pluginVersion: string;
 }): Promise<void> {
-  const validWarnings = coerceConfigureWarnings(context.warnings);
+  const validWarnings = [
+    ...coerceConfigureWarnings(context.warnings),
+    ...coerceDroppedKeyWarnings(context.configDroppedKeys),
+  ];
 
   if (!context.sessionId) {
     if (validWarnings.length === 0) return;
@@ -453,28 +479,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     });
   }
 
-  // Build configure-time overrides forwarded to every bridge on spawn.
-  //
-  // STRICT ALLOWLIST (audit v0.17 #18): we explicitly pick fields from
-  // `config` instead of spreading. The previous `...config` spread leaked
-  // every top-level field — including `restrict_to_project_root` and
-  // `url_fetch_allow_private` — through the project-config trust boundary,
-  // because at this point `config` is the merged user+project view and
-  // mergeConfigs alone is not enough.
-  //
-  // Default `restrict_to_project_root: false` for parity with Pi's built-in
-  // tools, which do NOT enforce a project-root boundary at all (Pi's
-  // `resolveToCwd` resolves absolute paths through unchanged). AFT previously
-  // defaulted to `true`, hard-rejecting out-of-root paths that Pi's own
-  // tools would have happily processed. Users who want strict containment
-  // can opt in by setting `restrict_to_project_root: true` in their aft.jsonc
-  // (USER config only; project config cannot weaken this — see trust
-  // boundary in config.ts).
-  const configOverrides = resolveProjectOverridesForConfigure(config);
-  // url_fetch_allow_private: USER ONLY. Forwarded only when set (Rust default false).
-  if (config.url_fetch_allow_private !== undefined)
-    configOverrides.url_fetch_allow_private = config.url_fetch_allow_private;
-  configOverrides.storage_dir = storageDir;
+  // Build configure-time params forwarded to every bridge on spawn.
+  // Core-domain config flows only through raw tiers; Rust owns merge +
+  // trust-boundary stripping. Flat params below are plugin-computed process
+  // state and must not be derived from aft.jsonc.
+  const configOverrides = buildConfigTierConfigureParams(process.cwd(), {
+    storage_dir: storageDir,
+  });
   // _ort_dylib_dir is patched in asynchronously below once ensureOnnxRuntime
   // settles. Bridges spawned before that resolution don't get ORT and
   // semantic search returns "still building" until they restart.
@@ -571,7 +582,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     errorPrefix: "[aft-pi]",
     minVersion: PLUGIN_VERSION,
     onVersionMismatch: createVersionMismatchHandler(() => pool),
-    onConfigureWarnings: ({ projectRoot, sessionId, client, warnings }) => {
+    onConfigureWarnings: ({ projectRoot, sessionId, client, warnings, configDroppedKeys }) => {
       const bridge = pool.getActiveBridgeForRoot(projectRoot);
       if (!bridge) return;
       const pendingWarnings = sessionId ? drainPendingEagerWarnings(projectRoot) : [];
@@ -584,6 +595,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           client,
           bridge,
           warnings: [...pendingWarnings, ...warnings],
+          configDroppedKeys,
           storageDir,
           pluginVersion: PLUGIN_VERSION,
         });

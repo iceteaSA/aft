@@ -28,6 +28,7 @@ export type {
   BashLongRunningPayload,
   BridgeOptions,
   BridgeRequestOptions,
+  ConfigureDroppedKey,
   ConfigureWarning,
   ConfigureWarningsContext,
   StatusSnapshot,

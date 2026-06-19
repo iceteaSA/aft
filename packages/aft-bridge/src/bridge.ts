@@ -188,12 +188,37 @@ export interface ConfigureWarning {
   [key: string]: unknown;
 }
 
+/** Project/user trust-boundary key dropped by Rust config resolution. */
+export interface ConfigureDroppedKey {
+  key: string;
+  tier: string;
+  reason: string;
+}
+
 /** Context passed to {@link BridgeOptions.onConfigureWarnings} after the first successful configure. */
 export interface ConfigureWarningsContext {
   projectRoot: string;
   sessionId?: string | null;
   client?: unknown;
   warnings: ConfigureWarning[];
+  configDroppedKeys?: ConfigureDroppedKey[];
+}
+
+function coerceConfigureDroppedKeys(value: unknown): ConfigureDroppedKey[] {
+  if (!Array.isArray(value)) return [];
+  const dropped: ConfigureDroppedKey[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    if (
+      typeof record.key === "string" &&
+      typeof record.tier === "string" &&
+      typeof record.reason === "string"
+    ) {
+      dropped.push({ key: record.key, tier: record.tier, reason: record.reason });
+    }
+  }
+  return dropped;
 }
 
 export type VersionMismatchCallbackResult = string | null | undefined;
@@ -823,19 +848,27 @@ export class BinaryBridge {
     params: Record<string, unknown>,
     options: SendOptions | undefined,
   ): Promise<void> {
-    if (!this.onConfigureWarnings || !Array.isArray(configResult.warnings)) return;
-    if (configResult.warnings.length === 0) return;
+    if (!this.onConfigureWarnings) return;
+    const warnings = Array.isArray(configResult.warnings)
+      ? (configResult.warnings as ConfigureWarning[])
+      : [];
+    const configDroppedKeys = coerceConfigureDroppedKeys(configResult.config_dropped_keys);
+    if (warnings.length === 0 && configDroppedKeys.length === 0) return;
 
     const sessionId = typeof params.session_id === "string" ? params.session_id : undefined;
+    const context: ConfigureWarningsContext = {
+      projectRoot: this.cwd,
+      sessionId,
+      client:
+        options?.configureWarningClient ??
+        (sessionId ? this.configureWarningClients.get(sessionId) : undefined),
+      warnings,
+    };
+    if (configDroppedKeys.length > 0) {
+      context.configDroppedKeys = configDroppedKeys;
+    }
     try {
-      await this.onConfigureWarnings({
-        projectRoot: this.cwd,
-        sessionId,
-        client:
-          options?.configureWarningClient ??
-          (sessionId ? this.configureWarningClients.get(sessionId) : undefined),
-        warnings: configResult.warnings,
-      });
+      await this.onConfigureWarnings(context);
     } catch (err) {
       this.warnVia(
         `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,

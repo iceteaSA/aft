@@ -388,7 +388,8 @@ export interface ConfigureWarning {
     | "formatter_not_installed"
     | "checker_not_installed"
     | "lsp_binary_missing"
-    | "config_parse_failed";
+    | "config_parse_failed"
+    | "config_key_dropped";
   language?: string;
   server?: string;
   tool?: string;
@@ -659,10 +660,14 @@ function warningTitle(warning: ConfigureWarning): string {
       return "LSP binary is missing";
     case "config_parse_failed":
       return "Config failed to parse";
+    case "config_key_dropped":
+      return "Config key ignored";
   }
 }
 
 function formatConfigureWarningLine(warning: ConfigureWarning): string {
+  if (warning.kind === "config_key_dropped") return `• ${warning.hint}`;
+
   const details: string[] = [];
   if (warning.language) details.push(`language: ${warning.language}`);
   if (warning.server) details.push(`server: ${warning.server}`);
@@ -676,6 +681,7 @@ function formatConfigureWarningLine(warning: ConfigureWarning): string {
 }
 
 function formatConfigureWarningChat(warning: ConfigureWarning): string {
+  if (warning.kind === "config_key_dropped") return `${WARNING_MARKER} ${warning.hint}`;
   return `${WARNING_MARKER} ${formatConfigureWarningLine(warning).replace(/^• /, "")}`;
 }
 

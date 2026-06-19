@@ -1,9 +1,10 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { stripJsoncSymbols } from "@cortexkit/aft-bridge";
+import { type ConfigTier, readConfigTiers, stripJsoncSymbols } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { z } from "zod";
+
 import { error, log, warn } from "./logger.js";
 
 // ---------------------------------------------------------------------------
@@ -1238,9 +1239,12 @@ function getGlobalPiDir(): string {
   return join(homedir(), ".pi", "agent");
 }
 
-export function loadAftConfig(projectDirectory: string): AftConfig {
-  configLoadErrors = [];
+export interface ResolvedAftConfigPaths {
+  userConfigPath: string;
+  projectConfigPath: string;
+}
 
+export function resolveAftConfigPaths(projectDirectory: string): ResolvedAftConfigPaths {
   const userBasePath = join(getGlobalPiDir(), "aft");
   migrateAftConfigFile(`${userBasePath}.jsonc`);
   migrateAftConfigFile(`${userBasePath}.json`);
@@ -1254,6 +1258,24 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   const projectDetected = detectConfigFile(projectBasePath);
   const projectConfigPath =
     projectDetected.format !== "none" ? projectDetected.path : `${projectBasePath}.json`;
+
+  return { userConfigPath, projectConfigPath };
+}
+
+export function buildConfigTierConfigureParams(
+  projectDirectory: string,
+  processState: Record<string, unknown> = {},
+): Record<string, unknown> & { config: ConfigTier[] } {
+  return {
+    ...processState,
+    config: readConfigTiers(resolveAftConfigPaths(projectDirectory)),
+  };
+}
+
+export function loadAftConfig(projectDirectory: string): AftConfig {
+  configLoadErrors = [];
+
+  const { userConfigPath, projectConfigPath } = resolveAftConfigPaths(projectDirectory);
 
   let config: AftConfig = loadConfigFromPath(userConfigPath) ?? {};
 
