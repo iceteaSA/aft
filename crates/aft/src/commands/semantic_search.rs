@@ -120,6 +120,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut warnings = Vec::new();
 
     let lexical_ready = search_index_ready(ctx);
+    let regex_explicit = params.hint == SearchHint::Regex;
     let mode = choose_mode(
         params.hint,
         &params.query,
@@ -136,6 +137,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             top_k,
             &shape,
             mode,
+            regex_explicit,
             semantic_status,
             warnings,
             &project_root,
@@ -238,39 +240,90 @@ fn handle_grep_search(
     top_k: usize,
     shape: &QueryShape,
     mode: SearchMode,
+    regex_explicit: bool,
     semantic_status: &'static str,
     mut warnings: Vec<String>,
     project_root: &Path,
 ) -> Response {
-    let literal = mode == SearchMode::Literal;
-    let compiled = match pattern_compile::compile(
-        query,
-        CompileOpts {
-            literal,
-            ..CompileOpts::default()
-        },
-    ) {
-        CompileResult::Ok(compiled) => compiled,
-        CompileResult::InvalidPattern { message, .. } => {
-            return Response::error_with_data(
+    let auto_regex = mode == SearchMode::Regex && !regex_explicit;
+    let mut effective_mode = mode;
+    let compile_literal_fallback = || -> Result<_, Response> {
+        match pattern_compile::compile(
+            query,
+            CompileOpts {
+                literal: true,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(compiled) => Ok(compiled),
+            CompileResult::InvalidPattern { message, .. } => Err(Response::error_with_data(
                 &req.id,
                 "invalid_pattern",
                 message,
                 serde_json::json!({"pattern": query}),
-            );
-        }
-        CompileResult::UnsupportedSyntax { feature, .. } => {
-            return Response::error_with_data(
+            )),
+            CompileResult::UnsupportedSyntax { feature, .. } => Err(Response::error_with_data(
                 &req.id,
                 "unsupported_pattern",
                 format!(
                     "Pattern uses regex syntax not supported by AFT's engine: {feature}. Use hint:'literal' or rewrite without {feature}."
                 ),
                 serde_json::json!({"pattern": query, "feature": feature}),
-            );
+            )),
         }
     };
 
+    let compiled = match pattern_compile::compile(
+        query,
+        CompileOpts {
+            literal: mode == SearchMode::Literal,
+            ..CompileOpts::default()
+        },
+    ) {
+        CompileResult::Ok(compiled) => compiled,
+        CompileResult::InvalidPattern { message, .. } => {
+            if auto_regex {
+                warnings.push(auto_regex_literal_fallback_warning(
+                    short_regex_compile_reason(&message),
+                ));
+                effective_mode = SearchMode::Literal;
+                match compile_literal_fallback() {
+                    Ok(compiled) => compiled,
+                    Err(response) => return response,
+                }
+            } else {
+                return Response::error_with_data(
+                    &req.id,
+                    "invalid_pattern",
+                    message,
+                    serde_json::json!({"pattern": query}),
+                );
+            }
+        }
+        CompileResult::UnsupportedSyntax { feature, .. } => {
+            if auto_regex {
+                warnings.push(auto_regex_literal_fallback_warning(format!(
+                    "{feature} is not supported"
+                )));
+                effective_mode = SearchMode::Literal;
+                match compile_literal_fallback() {
+                    Ok(compiled) => compiled,
+                    Err(response) => return response,
+                }
+            } else {
+                return Response::error_with_data(
+                    &req.id,
+                    "unsupported_pattern",
+                    format!(
+                        "Pattern uses regex syntax not supported by AFT's engine: {feature}. Use hint:'literal' or rewrite without {feature}."
+                    ),
+                    serde_json::json!({"pattern": query, "feature": feature}),
+                );
+            }
+        }
+    };
+
+    let literal = effective_mode == SearchMode::Literal;
     let scope = match grep_executor::resolve_grep_scope(ctx, None, top_k, &req.id) {
         Ok(scope) => scope,
         Err(response) => return response,
@@ -291,7 +344,7 @@ fn handle_grep_search(
         .iter()
         .map(|grep_match| grep_match_to_json(grep_match, result_source))
         .collect::<Vec<_>>();
-    let interpreted_as = interpreted_as_label(mode);
+    let interpreted_as = interpreted_as_label(effective_mode);
     let text = format_grep_search_text(&result, project_root, interpreted_as);
     search_response(
         req,
@@ -310,6 +363,29 @@ fn handle_grep_search(
             warnings,
             extras: serde_json::Map::new(),
         },
+    )
+}
+
+fn short_regex_compile_reason(message: &str) -> Cow<'_, str> {
+    let trimmed = message.trim();
+    let reason = trimmed
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.chars().all(|ch| ch == '^'))
+        .unwrap_or(trimmed);
+    Cow::Borrowed(
+        reason
+            .strip_prefix("error: ")
+            .or_else(|| reason.strip_prefix("invalid regex: "))
+            .unwrap_or(reason),
+    )
+}
+
+fn auto_regex_literal_fallback_warning(reason: impl AsRef<str>) -> String {
+    format!(
+        "Query looked like a regex but failed to compile ({}); searched literally instead. Pass hint:\"regex\" to force regex.",
+        reason.as_ref()
     )
 }
 
@@ -1961,6 +2037,88 @@ mod tests {
         assert_eq!(response["query_kind"], "Regex");
         assert_eq!(response["semantic_status"], "disabled");
         assert_eq!(response["results"][0]["kind"], "GrepLine");
+    }
+
+    #[test]
+    fn auto_regexlike_uncompilable_query_falls_back_to_literal() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        // The fallback recompiles as an escaped literal, so the exact needle
+        // must be present for this test to produce a match.
+        std::fs::write(
+            &source_file,
+            "// assert_ne!(.*route_channel\nassert_ne!(route_channel, 0);\n",
+        )
+        .expect("write source file");
+        let ctx = test_context(project.path());
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request_with_hint("assert_ne!(.*route_channel", 5, "auto"),
+            &ctx,
+        ));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["interpreted_as"], "literal");
+        let results = response["results"].as_array().expect("results array");
+        assert!(
+            !results.is_empty(),
+            "expected literal fallback result, got {results:?}"
+        );
+        assert_eq!(response["results"][0]["source"], "literal");
+        assert_eq!(
+            response["results"][0]["match_text"],
+            "assert_ne!(.*route_channel"
+        );
+        let warnings = response["warnings"].as_array().expect("warnings array");
+        let fallback_warning = warnings
+            .iter()
+            .filter_map(|warning| warning.as_str())
+            .find(|warning| warning.contains("searched literally instead"))
+            .expect("fallback warning");
+        assert!(fallback_warning.contains("unclosed group"));
+        assert!(fallback_warning.contains("Pass hint:\"regex\" to force regex."));
+    }
+
+    #[test]
+    fn explicit_regex_uncompilable_query_still_errors() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = test_context(project.path());
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request_with_hint("assert_ne!(.*route_channel", 5, "regex"),
+            &ctx,
+        ));
+
+        assert_eq!(response["success"], false);
+        assert_eq!(response["code"], "invalid_pattern");
+    }
+
+    #[test]
+    fn valid_auto_regex_query_stays_regex_without_fallback_warning() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source_file, "let route_alpha_channel = 1;\n").expect("write source file");
+        let ctx = test_context(project.path());
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request_with_hint("route_.*channel", 5, "auto"),
+            &ctx,
+        ));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["interpreted_as"], "regex");
+        assert_eq!(response["results"][0]["source"], "regex");
+        let warnings = response["warnings"].as_array().expect("warnings array");
+        assert!(!warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .expect("warning")
+                .contains("searched literally instead")
+        }));
     }
 
     #[test]
