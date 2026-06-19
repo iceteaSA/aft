@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -27,10 +27,16 @@ fn configure(aft: &mut AftProcess, root: &Path) {
 }
 
 fn configure_with_index(aft: &mut AftProcess, root: &Path) {
-    let resp = aft.send(&format!(
-        r#"{{"id":"cfg-index","command":"configure","harness":"opencode","project_root":{},"search_index":true}}"#,
-        crate::helpers::json_string(&root.display())
-    ));
+    let resp = send(
+        aft,
+        json!({
+            "id": "cfg-index",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(serde_json::json!({ "search_index": true }))
+        }),
+    );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 }
 
@@ -787,8 +793,10 @@ fn semantic_degraded_grep_fallback_respects_aftignore() {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.path(),
-            "semantic_search": false,
-            "search_index": false,
+            "config": user_config(serde_json::json!({
+                "semantic_search": false,
+                "search_index": false
+            })),
         }),
     );
     assert_eq!(
@@ -861,13 +869,18 @@ fn inspect_scoped_diagnostics_respects_aftignore() {
             "harness": "opencode",
             "project_root": project.path(),
             "lsp_paths_extra": [fake_bin_dir],
-            "lsp_servers": [{
-                "id": "fake",
-                "extensions": ["fake"],
-                "binary": fake_binary_name,
-                "args": [],
-                "root_markers": ["fake.toml"]
-            }]
+            "config": user_config(serde_json::json!({
+                "lsp": {
+                    "servers": {
+                        "fake": {
+                            "extensions": ["fake"],
+                            "binary": fake_binary_name,
+                            "args": [],
+                            "root_markers": ["fake.toml"]
+                        }
+                    }
+                }
+            }))
         }),
     );
     assert_eq!(

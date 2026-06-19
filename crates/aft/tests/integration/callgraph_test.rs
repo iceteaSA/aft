@@ -3,7 +3,7 @@
 //! Exercises multi-file call graph traversal through the binary protocol
 //! using the fixtures in `tests/fixtures/callgraph/`.
 
-use crate::helpers::{fixture_path, AftProcess};
+use crate::helpers::{fixture_path, user_config, AftProcess};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
@@ -2339,10 +2339,16 @@ fn callgraph_configure_reports_source_file_count_exceeds_max() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "1",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(serde_json::json!({ "max_callgraph_files": 1 }))
+        })
+        .to_string(),
+    );
 
     assert_eq!(
         resp["success"], true,
@@ -2366,10 +2372,16 @@ fn callgraph_callers_ignores_legacy_project_size_cap() {
     let root = fixtures.display().to_string();
 
     // Configure with cap=1 so the 9-file fixture trips the guard.
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "1",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(serde_json::json!({ "max_callgraph_files": 1 }))
+        })
+        .to_string(),
+    );
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
@@ -2396,10 +2408,16 @@ fn callgraph_trace_to_ignores_legacy_project_size_cap() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "1",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(serde_json::json!({ "max_callgraph_files": 1 }))
+        })
+        .to_string(),
+    );
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
@@ -2423,10 +2441,16 @@ fn callgraph_impact_ignores_legacy_project_size_cap() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "1",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(serde_json::json!({ "max_callgraph_files": 1 }))
+        })
+        .to_string(),
+    );
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
@@ -2453,10 +2477,16 @@ fn callgraph_trace_data_ignores_legacy_project_size_cap() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "1",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(serde_json::json!({ "max_callgraph_files": 1 }))
+        })
+        .to_string(),
+    );
     assert_eq!(resp["success"], true);
 
     let resp = aft.send(&format!(
@@ -2472,121 +2502,6 @@ fn callgraph_trace_data_ignores_legacy_project_size_cap() {
     assert!(resp["hops"].as_array().is_some());
 
     aft.shutdown();
-}
-
-/// `configure` rejects `max_callgraph_files: 0` instead of silently clamping.
-/// Regression test for Oracle v0.15.1 review blocker: sub-1 values must surface
-/// as `invalid_request` so user typos are visible.
-#[test]
-fn callgraph_configure_rejects_zero_max_callgraph_files() {
-    let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":0}}"#,
-        crate::helpers::json_string(&root)
-    ));
-
-    assert_eq!(resp["success"], false, "configure should reject 0");
-    assert_eq!(resp["code"], "invalid_request");
-    let msg = resp["message"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("max_callgraph_files"),
-        "error message should mention max_callgraph_files: {}",
-        msg
-    );
-
-    aft.shutdown();
-}
-
-/// `configure` rejects negative `max_callgraph_files` (via JSON number → `as_u64` returning None).
-#[test]
-fn callgraph_configure_rejects_negative_max_callgraph_files() {
-    let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":-5}}"#,
-        crate::helpers::json_string(&root)
-    ));
-
-    assert_eq!(resp["success"], false, "configure should reject -5");
-    assert_eq!(resp["code"], "invalid_request");
-
-    aft.shutdown();
-}
-
-/// `configure` accepts any positive `max_callgraph_files` and reflects it back.
-/// Paired negative-cases above to prove the validator is not rejecting valid input.
-#[test]
-fn callgraph_configure_accepts_positive_max_callgraph_files() {
-    let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":42}}"#,
-        crate::helpers::json_string(&root)
-    ));
-
-    assert_eq!(resp["success"], true);
-    assert_eq!(resp["max_callgraph_files"], 42);
-
-    aft.shutdown();
-}
-
-/// `configure` rejects non-integer `max_callgraph_files` payloads with a clear
-/// `invalid_request` surface rather than silently clamping. `serde_json::Value::as_u64`
-/// returns `None` for floats, strings, booleans, nulls, and compound types,
-/// which are all funneled through the same rejection path.
-///
-/// Covers the follow-up gap Oracle flagged on v0.15.1: the predicate's truth
-/// table is correct by source inspection, but explicit regression tests only
-/// existed for integer cases (0, negative, positive). Added v0.15.2.
-#[test]
-fn callgraph_configure_rejects_non_integer_max_callgraph_files_payloads() {
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
-
-    // Each payload is a JSON fragment that will be inlined into the configure
-    // request. All should be rejected.
-    let rejected_payloads = [
-        ("float", "1.5"),
-        ("string", "\"twenty\""),
-        ("numeric_string", "\"20000\""),
-        ("bool_true", "true"),
-        ("bool_false", "false"),
-        ("null", "null"),
-        ("array", "[]"),
-        ("object", "{}"),
-    ];
-
-    for (label, payload) in rejected_payloads {
-        let mut aft = AftProcess::spawn();
-        let resp = aft.send(&format!(
-            r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":{}}}"#,
-            crate::helpers::json_string(&root),
-            payload
-        ));
-
-        assert_eq!(
-            resp["success"], false,
-            "configure should reject {label} payload ({payload})"
-        );
-        assert_eq!(
-            resp["code"], "invalid_request",
-            "configure should return invalid_request for {label} payload ({payload})"
-        );
-        let msg = resp["message"].as_str().unwrap_or("");
-        assert!(
-            msg.contains("max_callgraph_files"),
-            "error message should mention max_callgraph_files for {label}: {msg}"
-        );
-
-        aft.shutdown();
-    }
 }
 
 // ---------------------------------------------------------------------------

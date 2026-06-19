@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde_json::json;
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn configure(aft: &mut AftProcess, root: &Path) {
     let resp = aft.configure(root);
@@ -17,7 +17,7 @@ fn configure_restricted(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "restrict_to_project_root": true,
+            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
         }))
         .unwrap(),
     );

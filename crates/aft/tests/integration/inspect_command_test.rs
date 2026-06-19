@@ -75,9 +75,11 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "search_index": false,
-        "semantic_search": false,
-        "callgraph_store": callgraph_store,
+        "config": crate::helpers::user_config(serde_json::json!({
+            "search_index": false,
+            "semantic_search": false,
+            "callgraph_store": callgraph_store
+        })),
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
@@ -2393,8 +2395,10 @@ fn inspect_command_diagnostics_inapplicable_root_marker_reports_no_server_not_pe
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "search_index": false,
-        "semantic_search": false,
+        "config": crate::helpers::user_config(serde_json::json!({
+            "search_index": false,
+            "semantic_search": false
+        })),
     }));
     let configure_response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");

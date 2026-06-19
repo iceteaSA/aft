@@ -14,7 +14,7 @@ use aft::search_index::SearchIndex;
 use aft::semantic_index::SemanticIndex;
 use serde_json::{json, Value};
 
-use crate::helpers::AftProcess;
+use crate::helpers::{user_config, AftProcess};
 
 struct MockEmbeddingServer {
     base_url: String,
@@ -204,16 +204,18 @@ fn configure_semantic_openai(
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "search_index": false,
-            "semantic_search": true,
             "storage_dir": storage_dir.display().to_string(),
-            "semantic": {
-                "backend": "openai_compatible",
-                "model": "test-embedding",
-                "base_url": base_url,
-                "timeout_ms": 30_000,
-                "max_batch_size": 64,
-            },
+            "config": user_config(serde_json::json!({
+                "search_index": false,
+                "semantic_search": true,
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "test-embedding",
+                    "base_url": base_url,
+                    "timeout_ms": 30_000,
+                    "max_batch_size": 64
+                }
+            })),
         }),
     )
 }

@@ -6,7 +6,9 @@
 use std::fs;
 use std::process::Command;
 
-use super::helpers::AftProcess;
+use serde_json::json;
+
+use super::helpers::{user_config, AftProcess};
 
 // ============================================================================
 // Helpers
@@ -601,10 +603,19 @@ fn validate_on_edit_full_from_config_runs_checker() {
     install_tsc_stub(&dir, "validate_config_full.ts");
 
     let mut aft = AftProcess::spawn();
-    let cfg = aft.send(&format!(
-        r#"{{"id":"cfg-val-full","command":"configure","harness":"opencode","project_root":{},"validate_on_edit":"full","checker":{{"typescript":"tsc"}}}}"#,
-        crate::helpers::json_string(&dir.display())
-    ));
+    let cfg = aft.send(
+        &json!({
+            "id": "cfg-val-full",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir,
+            "config": user_config(serde_json::json!({
+                "validate_on_edit": "full",
+                "checker": { "typescript": "tsc" }
+            }))
+        })
+        .to_string(),
+    );
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
@@ -637,10 +648,15 @@ fn validate_on_edit_off_from_config_skips_checker() {
     install_tsc_stub(&dir, "validate_config_off.ts");
 
     let mut aft = AftProcess::spawn();
-    let cfg = aft.send(&format!(
-        r#"{{"id":"cfg-val-off","command":"configure","harness":"opencode","project_root":{},"validate_on_edit":"off"}}"#,
-        crate::helpers::json_string(&dir.display())
-    ));
+    let cfg = aft.send(
+        &json!({
+            "id": "cfg-val-off",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir,
+        })
+        .to_string(),
+    );
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(

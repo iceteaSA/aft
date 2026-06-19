@@ -3,6 +3,7 @@ use std::fs;
 use serde_json::json;
 use tempfile::tempdir;
 
+use super::helpers::user_config;
 use super::test_helpers::AftProcess;
 
 fn configure(aft: &mut AftProcess, project: &std::path::Path, storage: &std::path::Path) {
@@ -13,9 +14,11 @@ fn configure(aft: &mut AftProcess, project: &std::path::Path, storage: &std::pat
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "experimental_bash_compress": true,
-            "search_index": false,
-            "semantic_search": false
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "compress": true } },
+                "search_index": false,
+                "semantic_search": false
+            }))
         })
         .to_string(),
     );

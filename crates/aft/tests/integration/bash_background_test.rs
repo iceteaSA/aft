@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 #[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
@@ -43,7 +43,9 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
             "harness": "opencode",
             "project_root": dir.path(),
             "storage_dir": storage_dir,
-            "experimental_bash_background": true,
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "background": true } }
+            })),
         })
         .to_string(),
     );
@@ -900,7 +902,9 @@ fn replay_does_not_return_acknowledged_completion_after_restart() {
             "harness": "opencode",
             "project_root": dir.path(),
             "storage_dir": dir.path().join("aft-storage"),
-            "experimental_bash_background": true,
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "background": true } }
+            })),
         })
         .to_string(),
     );

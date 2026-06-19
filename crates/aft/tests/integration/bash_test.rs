@@ -1,4 +1,4 @@
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 #[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
@@ -98,7 +98,9 @@ fn bash_rejects_invalid_pty_dimensions() {
             "harness": "opencode",
             "project_root": dir.path(),
             "storage_dir": dir.path().join("storage"),
-            "experimental_bash_background": true,
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "background": true } }
+            })),
         })
         .to_string(),
     );

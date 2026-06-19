@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::helpers::AftProcess;
+use crate::helpers::{user_config, AftProcess};
 
 fn configure_with_search_index(aft: &mut AftProcess, root: &Path) {
     let configure = aft.send(
@@ -14,7 +14,7 @@ fn configure_with_search_index(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "search_index": true,
+            "config": user_config(serde_json::json!({ "search_index": true })),
         })
         .to_string(),
     );
@@ -124,9 +124,11 @@ fn dispatch_stays_responsive_under_ignored_event_flood() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false,
+            "config": user_config(serde_json::json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            })),
         })
         .to_string(),
     );

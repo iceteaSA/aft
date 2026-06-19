@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {
     aft.send(&serde_json::to_string(&request).expect("serialize request"))
@@ -25,8 +25,10 @@ fn configure_search_index(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "search_index": true,
-            "semantic_search": false,
+            "config": user_config(serde_json::json!({
+                "search_index": true,
+                "semantic_search": false
+            })),
         }),
     );
     assert_eq!(
@@ -427,16 +429,18 @@ fn configure_semantic_openai(
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "search_index": false,
-            "semantic_search": true,
             "storage_dir": storage_dir.display().to_string(),
-            "semantic": {
-                "backend": "openai_compatible",
-                "model": "test-embedding",
-                "base_url": base_url,
-                "timeout_ms": 30_000,
-                "max_batch_size": 64,
-            },
+            "config": user_config(serde_json::json!({
+                "search_index": false,
+                "semantic_search": true,
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "test-embedding",
+                    "base_url": base_url,
+                    "timeout_ms": 30_000,
+                    "max_batch_size": 64
+                }
+            })),
         }),
     );
     assert_eq!(

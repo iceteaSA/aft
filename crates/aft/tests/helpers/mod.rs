@@ -828,6 +828,20 @@ pub fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Build a user-tier config entry for configure requests.
+pub fn user_config_tier(doc: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "tier": "user",
+        "source": "/tmp/aft-test-user-aft.jsonc",
+        "doc": doc.to_string(),
+    })
+}
+
+/// Build a one-entry `config` tier array for configure requests.
+pub fn user_config(doc: serde_json::Value) -> serde_json::Value {
+    serde_json::json!([user_config_tier(doc)])
+}
+
 // ---------------------------------------------------------------------------
 // Shared warn-level log capture for integration tests
 //

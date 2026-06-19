@@ -3,7 +3,7 @@
 //! Tests exercise the full round-trip through the binary's JSON protocol:
 //! snapshot → checkpoint → modify → restore → verify file contents.
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 use std::fs;
 
 /// Helper: create a temp directory with a unique name for this test.
@@ -287,7 +287,7 @@ fn symlink_file_delete_is_rejected_with_project_restriction() {
         "command": "configure",
             "harness": "opencode",
         "project_root": dir.display().to_string(),
-        "restrict_to_project_root": true,
+        "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
     });
     let cfg = aft.send(&serde_json::to_string(&configure).unwrap());
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");

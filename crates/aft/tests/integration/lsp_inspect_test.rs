@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde_json::json;
 use tempfile::tempdir;
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
@@ -128,13 +128,18 @@ fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
             "harness": "opencode",
             "project_root": root,
             "lsp_paths_extra": [fake_bin_dir],
-            "lsp_servers": [{
-                "id": "fake",
-                "extensions": ["fake"],
-                "binary": fake_binary_name,
-                "args": [],
-                "root_markers": ["fake.toml"]
-            }]
+            "config": user_config(serde_json::json!({
+                "lsp": {
+                    "servers": {
+                        "fake": {
+                            "extensions": ["fake"],
+                            "binary": fake_binary_name,
+                            "args": [],
+                            "root_markers": ["fake.toml"]
+                        }
+                    }
+                }
+            }))
         })
         .to_string(),
     );

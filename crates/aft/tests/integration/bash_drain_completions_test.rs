@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -12,7 +12,9 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "experimental_bash_background": true,
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "background": true } }
+            })),
         })
         .to_string(),
     );

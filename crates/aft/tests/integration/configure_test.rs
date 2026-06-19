@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
@@ -19,8 +19,10 @@ fn configure_with_search_index_and_storage(aft: &mut AftProcess, root: &Path, st
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "search_index": true,
-            "semantic_search": false,
+            "config": user_config(serde_json::json!({
+                "search_index": true,
+                "semantic_search": false
+            })),
         })
         .to_string(),
     );
@@ -85,75 +87,35 @@ fn warning_with_kind<'a>(
 }
 
 #[test]
-fn configure_accepts_boolean_validate_on_edit() {
+fn configure_accepts_tier_validate_on_edit() {
     let dir = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();
 
     let configure = aft.send(
         &json!({
-            "id": "cfg-validate-bool",
+            "id": "cfg-validate-tier",
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "validate_on_edit": true,
+            "config": user_config(serde_json::json!({ "validate_on_edit": "syntax" })),
         })
         .to_string(),
     );
     assert_eq!(
         configure["success"], true,
-        "configure should accept boolean validate_on_edit: {configure:?}"
+        "configure should accept tier validate_on_edit: {configure:?}"
     );
     assert!(
         configure["warnings"].as_array().is_some(),
         "configure responses should always include warnings: {configure:?}"
     );
 
-    let status = aft.send(r#"{"id":"status-validate-bool","command":"status"}"#);
+    let status = aft.send(r#"{"id":"status-validate-tier","command":"status"}"#);
     assert_eq!(status["success"], true, "status should succeed: {status:?}");
     assert_eq!(status["features"]["validate_on_edit"], "syntax");
 
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
-}
-
-#[test]
-fn configure_rejects_nonpositive_semantic_max_files() {
-    for (id, max_files) in [
-        ("cfg-semantic-max-files-zero", json!(0)),
-        ("cfg-semantic-max-files-negative", json!(-1)),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let mut aft = AftProcess::spawn();
-
-        let configure = aft.send(
-            &json!({
-                "id": id,
-                "command": "configure",
-                "harness": "opencode",
-                "project_root": dir.path(),
-                "semantic": {
-                    "max_files": max_files,
-                },
-            })
-            .to_string(),
-        );
-
-        assert_eq!(
-            configure["success"], false,
-            "configure should fail: {configure:?}"
-        );
-        assert_eq!(configure["code"], "invalid_request");
-        assert!(
-            configure["message"]
-                .as_str()
-                .unwrap()
-                .contains("semantic.max_files must be a positive integer"),
-            "unexpected error message: {configure:?}"
-        );
-
-        let shutdown = aft.shutdown();
-        assert!(shutdown.success());
-    }
 }
 
 #[test]
@@ -239,7 +201,7 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "validate_on_edit": "syntax"
+            "config": user_config(serde_json::json!({ "validate_on_edit": "syntax" }))
         })
         .to_string(),
     );
@@ -281,8 +243,7 @@ fn configure_skips_formatter_warnings_when_format_on_edit_disabled() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "format_on_edit": false,
-            "validate_on_edit": "off"
+            "config": user_config(serde_json::json!({ "format_on_edit": false }))
         })
         .to_string(),
     );
@@ -319,9 +280,11 @@ fn configure_warns_for_missing_explicit_tsgo_checker() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "checker": {
-                "typescript": "tsgo"
-            }
+            "config": user_config(serde_json::json!({
+                "checker": {
+                    "typescript": "tsgo"
+                }
+            }))
         })
         .to_string(),
     );
@@ -390,13 +353,18 @@ fn configure_warns_for_missing_builtin_and_custom_lsp_binaries() {
             "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": ["bash-language-server"],
-            "lsp_servers": [{
-                "id": "tinymist",
-                "extensions": ["typ"],
-                "binary": "tinymist",
-                "args": [],
-                "root_markers": ["typst.toml"]
-            }]
+            "config": user_config(serde_json::json!({
+                "lsp": {
+                    "servers": {
+                        "tinymist": {
+                            "extensions": ["typ"],
+                            "binary": "tinymist",
+                            "args": [],
+                            "root_markers": ["typst.toml"]
+                        }
+                    }
+                }
+            }))
         })
         .to_string(),
     );
@@ -516,13 +484,18 @@ fn configure_warns_for_custom_lsp_regardless_of_auto_install_set() {
             "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": [],
-            "lsp_servers": [{
-                "id": "custom-thing",
-                "extensions": ["thing"],
-                "binary": "nonexistent-binary",
-                "args": [],
-                "root_markers": [".git"]
-            }]
+            "config": user_config(serde_json::json!({
+                "lsp": {
+                    "servers": {
+                        "custom-thing": {
+                            "extensions": ["thing"],
+                            "binary": "nonexistent-binary",
+                            "args": [],
+                            "root_markers": [".git"]
+                        }
+                    }
+                }
+            }))
         })
         .to_string(),
     );
@@ -690,22 +663,27 @@ fn configure_accepts_custom_lsp_servers() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "experimental_lsp_ty": true,
-            "lsp_servers": [{
-                "id": "tinymist",
-                "extensions": ["typ"],
-                "binary": "tinymist",
-                "args": [],
-                "root_markers": [".git", "typst.toml"],
-                "env": {
-                    "TINYMIST_FONT_PATHS": "/tmp/fonts"
-                },
-                "initialization_options": {
-                    "exportPdf": "never"
-                },
-                "disabled": false
-            }],
-            "disabled_lsp": ["Pyright"]
+            "config": user_config(serde_json::json!({
+                "experimental": { "lsp_ty": true },
+                "lsp": {
+                    "disabled": ["Pyright"],
+                    "servers": {
+                        "tinymist": {
+                            "extensions": ["typ"],
+                            "binary": "tinymist",
+                            "args": [],
+                            "root_markers": [".git", "typst.toml"],
+                            "env": {
+                                "TINYMIST_FONT_PATHS": "/tmp/fonts"
+                            },
+                            "initialization_options": {
+                                "exportPdf": "never"
+                            },
+                            "disabled": false
+                        }
+                    }
+                }
+            }))
         })
         .to_string(),
     );
@@ -714,73 +692,6 @@ fn configure_accepts_custom_lsp_servers() {
         configure["success"], true,
         "configure should accept custom lsp server config: {configure:?}"
     );
-
-    let shutdown = aft.shutdown();
-    assert!(shutdown.success());
-}
-
-#[test]
-fn configure_rejects_lsp_server_env_with_non_string_values() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut aft = AftProcess::spawn();
-
-    let configure = aft.send(
-        &json!({
-            "id": "cfg-lsp-bad-env",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": dir.path(),
-            "lsp_servers": [{
-                "id": "tinymist",
-                "extensions": ["typ"],
-                "binary": "tinymist",
-                "env": {
-                    "TINYMIST_FONT_PATHS": 42
-                }
-            }]
-        })
-        .to_string(),
-    );
-
-    assert_eq!(configure["success"], false);
-    assert_eq!(configure["code"], "invalid_request");
-    assert!(configure["message"]
-        .as_str()
-        .unwrap()
-        .contains("env.TINYMIST_FONT_PATHS must be a string"));
-
-    let shutdown = aft.shutdown();
-    assert!(shutdown.success());
-}
-
-#[test]
-fn configure_rejects_malformed_lsp_servers() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut aft = AftProcess::spawn();
-
-    // A present-but-blank binary is a typo, not an intentional inherit
-    // (which is expressed by omitting the field), so it is still rejected.
-    let configure = aft.send(
-        &json!({
-            "id": "cfg-lsp-bad",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": dir.path(),
-            "lsp_servers": [{
-                "id": "tinymist",
-                "extensions": [".typ"],
-                "binary": "   "
-            }]
-        })
-        .to_string(),
-    );
-
-    assert_eq!(configure["success"], false);
-    assert_eq!(configure["code"], "invalid_request");
-    assert!(configure["message"]
-        .as_str()
-        .unwrap()
-        .contains("binary must not be empty"));
 
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
@@ -800,10 +711,15 @@ fn configure_accepts_partial_builtin_lsp_override() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "lsp_servers": [{
-                "id": "rust",
-                "args": ["--extra-flag"]
-            }]
+            "config": user_config(serde_json::json!({
+                "lsp": {
+                    "servers": {
+                        "rust": {
+                            "args": ["--extra-flag"]
+                        }
+                    }
+                }
+            }))
         })
         .to_string(),
     );

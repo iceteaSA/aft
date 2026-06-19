@@ -30,7 +30,7 @@ mod aft {
 use aft::search_index::artifact_cache_key;
 use serde_json::{json, Value};
 
-use crate::helpers::AftProcess;
+use crate::helpers::{user_config, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -63,8 +63,8 @@ fn configure_semantic(
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "semantic_search": enabled,
             "storage_dir": storage_dir.display().to_string(),
+            "config": user_config(serde_json::json!({ "semantic_search": enabled })),
         }),
     )
 }
@@ -82,15 +82,17 @@ fn configure_semantic_openai(
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "semantic_search": true,
             "storage_dir": storage_dir.display().to_string(),
-            "semantic": {
-                "backend": "openai_compatible",
-                "model": "test-embedding",
-                "base_url": base_url,
-                "timeout_ms": 5_000,
-                "max_batch_size": 64,
-            },
+            "config": user_config(serde_json::json!({
+                "semantic_search": true,
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "test-embedding",
+                    "base_url": base_url,
+                    "timeout_ms": 5_000,
+                    "max_batch_size": 64
+                }
+            })),
         }),
     )
 }
@@ -573,15 +575,17 @@ fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
             json!({
                 "id": "cfg-ollama",
                 "command": "configure",
-            "harness": "opencode",
+                "harness": "opencode",
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
-                "semantic_search": true,
-                "semantic": {
-                    "backend": "ollama",
-                    "model": "nomic-embed-text",
-                    "base_url": base_url,
-                },
+                "config": user_config(serde_json::json!({
+                    "semantic_search": true,
+                    "semantic": {
+                        "backend": "ollama",
+                        "model": "nomic-embed-text",
+                        "base_url": base_url
+                    }
+                })),
             }),
         );
         assert_eq!(
@@ -592,11 +596,10 @@ fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
     }
 }
 
-/// Non-loopback private IPs (LAN/intranet ranges) must still be rejected at
-/// configure time. SSRF guard remains meaningful for homelab/corporate
-/// network targets even though the user is the trust boundary.
+/// User-tier semantic endpoints are trusted user config, so self-hosted
+/// private-network embedding backends are accepted through the tier resolver.
 #[test]
-fn configure_rejects_non_loopback_private_base_url() {
+fn configure_accepts_user_private_base_url() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() {}\n")]);
     let storage = tempfile::tempdir().expect("create storage dir");
 
@@ -611,21 +614,23 @@ fn configure_rejects_non_loopback_private_base_url() {
             json!({
                 "id": "cfg-private",
                 "command": "configure",
-            "harness": "opencode",
+                "harness": "opencode",
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
-                "semantic_search": true,
-                "semantic": {
-                    "backend": "openai_compatible",
-                    "model": "text-embedding-3-small",
-                    "base_url": base_url,
-                    "api_key_env": "FAKE_KEY",
-                },
+                "config": user_config(serde_json::json!({
+                    "semantic_search": true,
+                    "semantic": {
+                        "backend": "openai_compatible",
+                        "model": "text-embedding-3-small",
+                        "base_url": base_url,
+                        "api_key_env": "FAKE_KEY"
+                    }
+                })),
             }),
         );
         assert_eq!(
-            response["success"], false,
-            "configure should reject non-loopback private base_url {base_url}, got: {response:?}"
+            response["success"], true,
+            "configure should accept user private base_url {base_url}, got: {response:?}"
         );
         let _ = aft.shutdown();
     }

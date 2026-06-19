@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use aft::edit::replace_byte_range;
 
-use super::helpers::{fixture_path, AftProcess};
+use super::helpers::{fixture_path, user_config, AftProcess};
 
 fn fake_server_path() -> PathBuf {
     option_env!("CARGO_BIN_EXE_fake-lsp-server")
@@ -1493,8 +1493,10 @@ fn edit_match_glob_reports_formatter_excluded_path_per_file_and_summary() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "format_on_edit": true,
-            "formatter": { "typescript": "biome" }
+            "config": user_config(serde_json::json!({
+                "format_on_edit": true,
+                "formatter": { "typescript": "biome" }
+            }))
         })
         .to_string(),
     );
@@ -1544,7 +1546,7 @@ fn edit_match_glob_reports_format_on_edit_false_for_each_file() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "format_on_edit": false
+            "config": user_config(serde_json::json!({ "format_on_edit": false }))
         })
         .to_string(),
     );
@@ -1611,8 +1613,10 @@ exit 0
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "format_on_edit": true,
-            "formatter": { "typescript": "biome", "python": "biome" }
+            "config": user_config(serde_json::json!({
+                "format_on_edit": true,
+                "formatter": { "typescript": "biome", "python": "biome" }
+            }))
         })
         .to_string(),
     );

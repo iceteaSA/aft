@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 use crate::callgraph::CallGraph;
-use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
+use crate::config::SemanticBackendConfig;
 use crate::context::{
     AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
     SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
@@ -36,8 +36,6 @@ static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 const MAX_SEARCH_INDEX_FILES: usize = 20_000;
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
-const MAX_SEMANTIC_TIMEOUT_MS: u64 = 120_000;
-const MAX_SEMANTIC_BATCH_SIZE: usize = 1_024;
 
 fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
@@ -502,240 +500,6 @@ fn semantic_fingerprint_config_changed(
         || previous.base_url != next.base_url
 }
 
-fn parse_inspect_config(
-    value: &serde_json::Value,
-    current: &crate::config::InspectConfig,
-) -> Result<crate::config::InspectConfig, String> {
-    let Some(obj) = value.as_object() else {
-        return Err("configure: inspect must be an object".to_string());
-    };
-
-    let mut inspect = current.clone();
-
-    if let Some(raw) = obj.get("enabled") {
-        let Some(value) = raw.as_bool() else {
-            return Err("configure: inspect.enabled must be a boolean".to_string());
-        };
-        inspect.enabled = value;
-    }
-
-    Ok(inspect)
-}
-
-fn parse_semantic_config(
-    value: &serde_json::Value,
-    current: &SemanticBackendConfig,
-) -> Result<SemanticBackendConfig, String> {
-    let Some(obj) = value.as_object() else {
-        return Err("configure: semantic must be an object".to_string());
-    };
-
-    let mut semantic = current.clone();
-
-    if let Some(raw) = obj.get("backend") {
-        let name = raw
-            .as_str()
-            .ok_or_else(|| "configure: semantic.backend must be a string".to_string())?
-            .trim();
-        semantic.backend = SemanticBackend::from_name(name)
-            .ok_or_else(|| format!("configure: unsupported semantic.backend '{name}'"))?;
-    }
-    if let Some(raw) = obj.get("model") {
-        semantic.model = raw
-            .as_str()
-            .ok_or_else(|| "configure: semantic.model must be a string".to_string())?
-            .trim()
-            .to_string();
-    }
-    if let Some(raw) = obj.get("base_url") {
-        let base_url = raw
-            .as_str()
-            .ok_or_else(|| "configure: semantic.base_url must be a string".to_string())?
-            .trim()
-            .to_string();
-        semantic.base_url = if base_url.is_empty() {
-            None
-        } else {
-            // Reject private/loopback IPs at configure time to prevent SSRF.
-            crate::semantic_index::validate_base_url_no_ssrf(&base_url)?;
-            Some(base_url)
-        };
-    }
-    if let Some(raw) = obj.get("api_key_env") {
-        let api_key_env = raw
-            .as_str()
-            .ok_or_else(|| "configure: semantic.api_key_env must be a string".to_string())?
-            .trim()
-            .to_string();
-        semantic.api_key_env = if api_key_env.is_empty() {
-            None
-        } else {
-            Some(api_key_env)
-        };
-    }
-    if let Some(raw) = obj.get("timeout_ms") {
-        let timeout_ms = raw.as_u64().ok_or_else(|| {
-            "configure: semantic.timeout_ms must be an unsigned integer".to_string()
-        })?;
-        semantic.timeout_ms = timeout_ms.min(MAX_SEMANTIC_TIMEOUT_MS);
-    }
-    if let Some(raw) = obj.get("max_batch_size") {
-        let max_batch_size = raw.as_u64().ok_or_else(|| {
-            "configure: semantic.max_batch_size must be an unsigned integer".to_string()
-        })?;
-        semantic.max_batch_size = usize::try_from(max_batch_size)
-            .map_err(|_| "configure: semantic.max_batch_size is too large".to_string())?
-            .min(MAX_SEMANTIC_BATCH_SIZE);
-    }
-    if let Some(raw) = obj.get("max_files") {
-        let max_files = raw.as_u64().filter(|value| *value >= 1).ok_or_else(|| {
-            format!(
-                "configure: semantic.max_files must be a positive integer (>= 1); got {}",
-                raw
-            )
-        })?;
-        semantic.max_files = usize::try_from(max_files)
-            .map_err(|_| "configure: semantic.max_files is too large".to_string())?;
-    }
-
-    Ok(semantic)
-}
-
-fn parse_lsp_servers(value: &Value) -> Result<Vec<UserServerDef>, String> {
-    let Some(entries) = value.as_array() else {
-        return Err("configure: lsp_servers must be an array".to_string());
-    };
-
-    entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| parse_lsp_server(entry, index))
-        .collect()
-}
-
-fn parse_lsp_server(value: &Value, index: usize) -> Result<UserServerDef, String> {
-    let Some(obj) = value.as_object() else {
-        return Err(format!("configure: lsp_servers[{index}] must be an object"));
-    };
-
-    let id = required_string(obj.get("id"), index, "id")?;
-    // extensions/binary are optional: when a user overrides a *built-in* server
-    // (e.g. `rust`) to tweak one field, the built-in's extensions/binary are
-    // inherited downstream in `resolved_servers`. Requiring them here silently
-    // dropped the entire `lsp` section on a partial override (issue from #84).
-    let extensions = optional_extension_array(obj.get("extensions"), index)?;
-    let binary = optional_lsp_binary(obj.get("binary"), index)?;
-    let args = optional_string_array(obj.get("args"), index, "args")?;
-    let root_markers = optional_string_array(obj.get("root_markers"), index, "root_markers")?;
-    let env = parse_lsp_server_env(obj.get("env"), index)?;
-    let initialization_options = obj.get("initialization_options").cloned();
-    let disabled = obj
-        .get("disabled")
-        .map(|value| {
-            value.as_bool().ok_or_else(|| {
-                format!("configure: lsp_servers[{index}].disabled must be a boolean")
-            })
-        })
-        .transpose()?
-        .unwrap_or(false);
-
-    Ok(UserServerDef {
-        id,
-        extensions,
-        binary,
-        args,
-        root_markers,
-        env,
-        initialization_options,
-        disabled,
-    })
-}
-
-fn parse_lsp_server_env(
-    value: Option<&Value>,
-    index: usize,
-) -> Result<HashMap<String, String>, String> {
-    let Some(value) = value else {
-        return Ok(HashMap::new());
-    };
-    let Some(obj) = value.as_object() else {
-        return Err(format!(
-            "configure: lsp_servers[{index}].env must be an object"
-        ));
-    };
-
-    let mut env = HashMap::with_capacity(obj.len());
-    for (key, value) in obj {
-        let Some(value) = value.as_str() else {
-            return Err(format!(
-                "configure: lsp_servers[{index}].env.{key} must be a string"
-            ));
-        };
-        env.insert(key.clone(), value.to_string());
-    }
-    Ok(env)
-}
-
-fn required_string(value: Option<&Value>, index: usize, field: &str) -> Result<String, String> {
-    let raw = value
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("configure: lsp_servers[{index}].{field} must be a string"))?
-        .trim();
-    if raw.is_empty() {
-        return Err(format!(
-            "configure: lsp_servers[{index}].{field} must not be empty"
-        ));
-    }
-    Ok(raw.to_string())
-}
-
-/// Parse the `extensions` array for an LSP server override. An absent value is
-/// an empty list (no validation error) so a partial override of a built-in
-/// server can omit `extensions` and inherit the built-in's set downstream.
-fn optional_extension_array(value: Option<&Value>, index: usize) -> Result<Vec<String>, String> {
-    let values = optional_string_array(value, index, "extensions")?;
-    Ok(values
-        .into_iter()
-        .map(|value| value.trim_start_matches('.').to_string())
-        .collect())
-}
-
-/// Like `required_string` for `binary` but treats an absent value as empty
-/// (inherited from the built-in downstream). A present-but-blank value is still
-/// rejected so typos like `"binary": ""` surface instead of silently inheriting.
-fn optional_lsp_binary(value: Option<&Value>, index: usize) -> Result<String, String> {
-    match value {
-        None => Ok(String::new()),
-        Some(value) => required_string(Some(value), index, "binary"),
-    }
-}
-
-fn optional_string_array(
-    value: Option<&Value>,
-    index: usize,
-    field: &str,
-) -> Result<Vec<String>, String> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let Some(entries) = value.as_array() else {
-        return Err(format!(
-            "configure: lsp_servers[{index}].{field} must be an array of strings"
-        ));
-    };
-
-    let mut values = Vec::with_capacity(entries.len());
-    for (entry_index, entry) in entries.iter().enumerate() {
-        let Some(raw) = entry.as_str() else {
-            return Err(format!(
-                "configure: lsp_servers[{index}].{field}[{entry_index}] must be a string"
-            ));
-        };
-        values.push(raw.trim().to_string());
-    }
-    Ok(values)
-}
-
 /// Parse the `lsp_paths_extra` config param: an array of absolute directory
 /// paths the plugin wants AFT to search when resolving LSP binaries (used
 /// for the auto-install cache, e.g.
@@ -799,23 +563,6 @@ fn parse_lsp_paths_extra(value: &Value) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(paths)
-}
-
-fn parse_disabled_lsp(value: &Value) -> Result<std::collections::HashSet<String>, String> {
-    let Some(entries) = value.as_array() else {
-        return Err("configure: disabled_lsp must be an array of strings".to_string());
-    };
-
-    entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            entry
-                .as_str()
-                .map(|value| value.to_ascii_lowercase())
-                .ok_or_else(|| format!("configure: disabled_lsp[{index}] must be a string"))
-        })
-        .collect()
 }
 
 fn parse_string_set(
@@ -1207,47 +954,6 @@ fn detect_missing_tools_for_languages(
     warnings
 }
 
-fn parse_validate_on_edit(raw: &Value) -> Result<String, String> {
-    if let Some(value) = raw.as_bool() {
-        return Ok(if value { "syntax" } else { "off" }.to_string());
-    }
-
-    let Some(value) = raw.as_str() else {
-        return Err(
-            "configure: validate_on_edit must be a boolean or one of 'off', 'syntax', 'full'"
-                .to_string(),
-        );
-    };
-
-    match value {
-        "off" | "syntax" | "full" => Ok(value.to_string()),
-        "true" | "false" => Err(
-            "configure: validate_on_edit string booleans are not accepted; use a JSON boolean or one of 'off', 'syntax', 'full'"
-                .to_string(),
-        ),
-        other => Err(format!(
-            "configure: validate_on_edit must be one of 'off', 'syntax', 'full'; got '{other}'"
-        )),
-    }
-}
-
-fn parse_string_map(value: &Value, field: &str) -> Result<HashMap<String, String>, String> {
-    let Some(object) = value.as_object() else {
-        return Err(format!(
-            "configure: {field} must be an object of string values"
-        ));
-    };
-
-    let mut parsed = HashMap::with_capacity(object.len());
-    for (key, raw_value) in object {
-        let Some(value) = raw_value.as_str() else {
-            return Err(format!("configure: {field}.{key} must be a string"));
-        };
-        parsed.insert(key.clone(), value.to_string());
-    }
-    Ok(parsed)
-}
-
 fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config) -> Vec<Value> {
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
@@ -1494,8 +1200,8 @@ fn mark_search_rebuild_spawn_for_debug() {
 }
 
 /// Parse the optional `config: [{tier, source, doc}]` raw-tier array from
-/// configure params. Returns `None` when absent (legacy flat-param plugins) or
-/// empty, so the resolver only runs when tiers are actually supplied. Tiers with
+/// configure params. Returns `None` when absent or empty, so the resolver only
+/// runs when tiers are actually supplied. Tiers with
 /// a missing/invalid `tier` or `doc` are skipped (the `source` is optional
 /// metadata). The `tier` label is trusted as stamped by the plugin (by config
 /// source path) — never re-derived from `doc` content.
@@ -1586,126 +1292,29 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     next_config.project_root = Some(root_path.clone());
     next_config.harness = Some(harness);
 
-    // P1 config relocation: when the plugin sends raw config tiers
-    // (`config: [{tier, source, doc}]`), AFT-core resolves the merge +
-    // trust-boundary itself (crate::config_resolve). The resolved core fields are
-    // overlaid onto next_config FIRST, so any explicit flat params below still win
-    // during the transition window (receiver-before-sender: this handler accepts
-    // tiers before the plugin starts sending them). Project-tier trust-boundary
-    // drops are surfaced in the response for the existing warning path.
+    // P1 config relocation: plugins send raw config tiers
+    // (`config: [{tier, source, doc}]`), and AFT-core resolves the merge +
+    // trust-boundary itself (crate::config_resolve). Core AftConfig fields are
+    // applied here before process-state fields below; the legacy Group-B flat
+    // params are intentionally not read so they cannot bypass tier trust.
+    // Project-tier trust-boundary drops are surfaced for the warning path.
     let mut config_dropped_keys: Vec<crate::config_resolve::DroppedKey> = Vec::new();
     if let Some(tiers) = parse_config_tiers(params) {
         config_dropped_keys = crate::config_resolve::resolve_config_onto(&tiers, &mut next_config);
     }
 
-    // Parse and validate every configure field into a temporary config first.
+    // Parse and validate process-state configure fields into a temporary config first.
     // AppContext is mutated only after this phase succeeds, so an invalid late
-    // field cannot leave the bridge half-configured.
-    if let Some(v) = params.get("format_on_edit").and_then(|v| v.as_bool()) {
-        next_config.format_on_edit = v;
-    }
-    if let Some(raw) = params.get("validate_on_edit") {
-        let value = match parse_validate_on_edit(raw) {
-            Ok(value) => value,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
-        next_config.validate_on_edit = Some(value);
-    }
-    if let Some(v) = params.get("formatter") {
-        next_config.formatter = match parse_string_map(v, "formatter") {
-            Ok(formatter) => formatter,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
-    }
-    if let Some(v) = params
-        .get("restrict_to_project_root")
-        .and_then(|v| v.as_bool())
-    {
-        next_config.restrict_to_project_root = v;
-    }
-    if let Some(raw) = params.get("formatter_timeout_secs") {
-        let Some(v) = raw.as_u64() else {
-            return Response::error(
-                &req.id,
-                "invalid_request",
-                format!(
-                    "configure: formatter_timeout_secs must be in 1..=600, got {}",
-                    raw
-                ),
-            );
-        };
-        if v == 0 || v > 600 {
-            return Response::error(
-                &req.id,
-                "invalid_request",
-                format!(
-                    "configure: formatter_timeout_secs must be in 1..=600, got {}",
-                    v
-                ),
-            );
-        }
-        next_config.formatter_timeout_secs = v as u32;
-    }
-    if let Some(v) = params.get("checker") {
-        next_config.checker = match parse_string_map(v, "checker") {
-            Ok(checker) => checker,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
-    }
-
-    if let Some(v) = params.get("search_index").and_then(|v| v.as_bool()) {
-        next_config.search_index = v;
-    }
-    if let Some(v) = params.get("semantic_search").and_then(|v| v.as_bool()) {
-        next_config.semantic_search = v;
-    }
+    // field cannot leave the bridge half-configured. Core AftConfig fields are
+    // resolved exclusively from `config: [{tier, source, doc}]` above.
     if let Some(v) = params
         .get("aft_search_registered")
         .and_then(|v| v.as_bool())
     {
         next_config.aft_search_registered = v;
     }
-    if let Some(v) = params
-        .get(crate::callgraph_store::CALLGRAPH_STORE_FLAG)
-        .and_then(|v| v.as_bool())
-    {
-        next_config.callgraph_store = v;
-    }
-    if let Some(v) = params
-        .get("experimental_bash_rewrite")
-        .and_then(|v| v.as_bool())
-    {
-        next_config.experimental_bash_rewrite = v;
-    }
-    if let Some(v) = params
-        .get("experimental_bash_compress")
-        .and_then(|v| v.as_bool())
-    {
-        next_config.experimental_bash_compress = v;
-    }
-    if let Some(v) = params
-        .get("experimental_bash_background")
-        .and_then(|v| v.as_bool())
-    {
-        next_config.experimental_bash_background = v;
-    }
-    if let Some(v) = params.get("experimental_lsp_ty").and_then(|v| v.as_bool()) {
-        next_config.experimental_lsp_ty = v;
-    }
-    if let Some(v) = params.get("lsp_servers") {
-        next_config.lsp_servers = match parse_lsp_servers(v) {
-            Ok(servers) => servers,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
-    }
     if let Some(v) = params.get("bash_permissions").and_then(|v| v.as_bool()) {
         next_config.bash_permissions = v;
-    }
-    if let Some(v) = params.get("disabled_lsp") {
-        next_config.disabled_lsp = match parse_disabled_lsp(v) {
-            Ok(disabled_lsp) => disabled_lsp,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
     }
     if let Some(v) = params.get("lsp_paths_extra") {
         next_config.lsp_paths_extra = match parse_lsp_paths_extra(v) {
@@ -1745,64 +1354,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
     }
-    if let Some(raw) = params.get("url_fetch_allow_private") {
-        let Some(value) = raw.as_bool() else {
-            return Response::error(
-                &req.id,
-                "invalid_request",
-                "configure: url_fetch_allow_private must be a boolean",
-            );
-        };
-        next_config.url_fetch_allow_private = value;
-    }
-    if let Some(v) = params.get("semantic") {
-        next_config.semantic = match parse_semantic_config(v, &next_config.semantic) {
-            Ok(config) => config,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
-    }
-    if let Some(v) = params.get("inspect") {
-        next_config.inspect = match parse_inspect_config(v, &next_config.inspect) {
-            Ok(config) => config,
-            Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
-    }
-    if let Some(raw) = params.get("max_callgraph_files") {
-        // Reject invalid values explicitly so user typos surface instead of
-        // being silently swallowed (Oracle v0.15.1 review blocker).
-        // Accepts: positive integers (u64).
-        // Rejects: 0, negatives, non-integers, non-numbers.
-        let parsed = raw.as_u64().filter(|v| *v >= 1);
-        match parsed {
-            Some(v) => next_config.max_callgraph_files = v as usize,
-            None => {
-                return Response::error(
-                    &req.id,
-                    "invalid_request",
-                    format!(
-                        "max_callgraph_files must be a positive integer (>= 1); got {}",
-                        raw
-                    ),
-                );
-            }
-        }
-    }
-    if let Some(raw) = params.get("callgraph_chunk_size") {
-        let parsed = raw.as_u64();
-        match parsed {
-            Some(v) => next_config.callgraph_chunk_size = v as usize,
-            None => {
-                return Response::error(
-                    &req.id,
-                    "invalid_request",
-                    format!(
-                        "callgraph_chunk_size must be a non-negative integer; got {}",
-                        raw
-                    ),
-                );
-            }
-        }
-    }
     if let Some(raw) = params.get("max_background_bash_tasks") {
         let parsed = raw.as_u64().filter(|v| *v >= 1);
         match parsed.and_then(|v| usize::try_from(v).ok()) {
@@ -1813,28 +1364,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     "invalid_request",
                     format!(
                         "max_background_bash_tasks must be a positive integer (>= 1); got {}",
-                        raw
-                    ),
-                );
-            }
-        }
-    }
-    if let Some(v) = params
-        .get("bash_long_running_reminder_enabled")
-        .and_then(|v| v.as_bool())
-    {
-        next_config.bash_long_running_reminder_enabled = v;
-    }
-    if let Some(raw) = params.get("bash_long_running_reminder_interval_ms") {
-        let parsed = raw.as_u64().filter(|v| *v >= 1);
-        match parsed {
-            Some(v) => next_config.bash_long_running_reminder_interval_ms = v,
-            None => {
-                return Response::error(
-                    &req.id,
-                    "invalid_request",
-                    format!(
-                        "bash_long_running_reminder_interval_ms must be a positive integer (>= 1); got {}",
                         raw
                     ),
                 );
@@ -2707,7 +2236,7 @@ mod tests {
 
     use super::{
         external_ignore_watch_paths, install_project_watcher_with, parse_lsp_paths_extra,
-        parse_semantic_config, semantic_build_retry_backoff, validate_storage_dir,
+        semantic_build_retry_backoff, validate_storage_dir,
     };
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -2746,6 +2275,14 @@ mod tests {
             session_id: None,
             params,
         }
+    }
+
+    fn user_tier(doc: serde_json::Value) -> serde_json::Value {
+        json!({
+            "tier": "user",
+            "source": "/u/aft.jsonc",
+            "doc": doc.to_string(),
+        })
     }
 
     #[test]
@@ -2855,21 +2392,6 @@ mod tests {
             std::fs::canonicalize(temp.path()).unwrap()
         );
         assert_eq!(ctx.cache_role(), "main");
-    }
-
-    #[test]
-    fn parse_semantic_config_clamps_expensive_limits() {
-        let parsed = super::parse_semantic_config(
-            &json!({
-                "timeout_ms": 999_999_999_u64,
-                "max_batch_size": 999_999_999_u64,
-            }),
-            &SemanticBackendConfig::default(),
-        )
-        .expect("parse semantic config");
-
-        assert_eq!(parsed.timeout_ms, super::MAX_SEMANTIC_TIMEOUT_MS);
-        assert_eq!(parsed.max_batch_size, super::MAX_SEMANTIC_BATCH_SIZE);
     }
 
     #[test]
@@ -3146,52 +2668,6 @@ mod tests {
         );
         // User config preserved.
         assert!(ctx.config().search_index);
-    }
-
-    #[test]
-    fn parse_lsp_server_preserves_dotted_root_markers() {
-        let value = json!([
-            {
-                "id": "oxlint-cli",
-                "extensions": [".ts", "tsx"],
-                "binary": "oxlint",
-                "args": ["--lsp", ".keep-dotted-arg"],
-                "root_markers": [".oxlintrc.json", ".oxlintrc"]
-            }
-        ]);
-
-        let servers = super::parse_lsp_servers(&value).expect("parse lsp servers");
-
-        assert_eq!(servers[0].extensions, vec!["ts", "tsx"]);
-        assert_eq!(servers[0].args, vec!["--lsp", ".keep-dotted-arg"]);
-        assert_eq!(servers[0].root_markers, vec![".oxlintrc.json", ".oxlintrc"]);
-    }
-
-    // A partial override of a built-in server (only `args`/`binary`) must parse
-    // successfully with empty extensions/binary inherited downstream — requiring
-    // them used to drop the entire `lsp` config section silently.
-    #[test]
-    fn parse_lsp_server_allows_partial_builtin_override() {
-        let value = json!([
-            {
-                "id": "rust",
-                "args": ["--extra-flag"]
-            }
-        ]);
-
-        let servers = super::parse_lsp_servers(&value).expect("partial override should parse");
-        assert_eq!(servers[0].id, "rust");
-        assert!(servers[0].extensions.is_empty());
-        assert!(servers[0].binary.is_empty());
-        assert_eq!(servers[0].args, vec!["--extra-flag"]);
-    }
-
-    // A present-but-blank binary is still rejected — that's a typo, not an
-    // intentional inherit (which is expressed by omitting the field entirely).
-    #[test]
-    fn parse_lsp_server_rejects_blank_binary() {
-        let value = json!([{ "id": "rust", "binary": "  " }]);
-        assert!(super::parse_lsp_servers(&value).is_err());
     }
 
     #[cfg(unix)]
@@ -3493,7 +2969,7 @@ mod tests {
         let first_req = configure_request_with_params(json!({
             "project_root": first.path(),
             "harness": "opencode",
-            "max_callgraph_files": 1000
+            "config": [user_tier(json!({ "max_callgraph_files": 1000 }))]
         }));
         let first_response = super::handle_configure(&first_req, &ctx);
         assert!(first_response.success);
@@ -3502,7 +2978,7 @@ mod tests {
         let invalid_req = configure_request_with_params(json!({
             "project_root": second.path(),
             "harness": "pi",
-            "formatter_timeout_secs": 0
+            "max_background_bash_tasks": 0
         }));
         let invalid_response = super::handle_configure(&invalid_req, &ctx);
 
@@ -3523,16 +2999,20 @@ mod tests {
         let first_req = configure_request_with_params(json!({
             "project_root": root.path(),
             "harness": "opencode",
-            "formatter": { "typescript": "biome", "python": "ruff" },
-            "checker": { "typescript": "tsc" }
+            "config": [user_tier(json!({
+                "formatter": { "typescript": "biome", "python": "ruff" },
+                "checker": { "typescript": "tsc" }
+            }))]
         }));
         assert!(super::handle_configure(&first_req, &ctx).success);
 
         let second_req = configure_request_with_params(json!({
             "project_root": root.path(),
             "harness": "opencode",
-            "formatter": { "rust": "rustfmt" },
-            "checker": { "go": "go" }
+            "config": [user_tier(json!({
+                "formatter": { "rust": "rustfmt" },
+                "checker": { "go": "go" }
+            }))]
         }));
         assert!(super::handle_configure(&second_req, &ctx).success);
 
@@ -3548,13 +3028,13 @@ mod tests {
     }
 
     #[test]
-    fn configure_rejects_validate_on_edit_string_booleans_without_mutation() {
+    fn configure_rejects_invalid_process_state_without_mutation() {
         let root = tempfile::tempdir().unwrap();
         let ctx = test_context();
         let req = configure_request_with_params(json!({
             "project_root": root.path(),
             "harness": "opencode",
-            "validate_on_edit": "true"
+            "max_background_bash_tasks": 0
         }));
 
         let response = super::handle_configure(&req, &ctx);
@@ -3572,7 +3052,7 @@ mod tests {
         let invalid_req = configure_request_with_params(json!({
             "project_root": root.path(),
             "harness": "opencode",
-            "max_callgraph_files": 0
+            "max_background_bash_tasks": 0
         }));
         assert!(!super::handle_configure(&invalid_req, &ctx).success);
         assert_eq!(ctx.configure_generation(), 0);
@@ -3585,32 +3065,5 @@ mod tests {
     #[test]
     fn semantic_max_files_defaults_to_20k() {
         assert_eq!(SemanticBackendConfig::default().max_files, 20_000);
-    }
-
-    #[test]
-    fn parse_semantic_config_reads_max_files() {
-        let cfg = parse_semantic_config(
-            &json!({ "max_files": 50_000 }),
-            &SemanticBackendConfig::default(),
-        )
-        .expect("valid max_files");
-        assert_eq!(cfg.max_files, 50_000);
-    }
-
-    #[test]
-    fn parse_semantic_config_max_files_omitted_keeps_existing() {
-        let existing = SemanticBackendConfig {
-            max_files: 7_500,
-            ..SemanticBackendConfig::default()
-        };
-        let cfg = parse_semantic_config(&json!({ "model": "x" }), &existing).expect("valid config");
-        assert_eq!(cfg.max_files, 7_500);
-    }
-
-    #[test]
-    fn parse_semantic_config_rejects_non_integer_max_files() {
-        let base = SemanticBackendConfig::default();
-        assert!(parse_semantic_config(&json!({ "max_files": "lots" }), &base).is_err());
-        assert!(parse_semantic_config(&json!({ "max_files": 1.5 }), &base).is_err());
     }
 }

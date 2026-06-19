@@ -1,6 +1,6 @@
 //! Integration tests for `trace_to_symbol`.
 
-use crate::helpers::AftProcess;
+use crate::helpers::{user_config, AftProcess};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -26,7 +26,7 @@ fn configure_project_with_cap(aft: &mut AftProcess, root: &Path, max_callgraph_f
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-            "max_callgraph_files": max_callgraph_files,
+            "config": user_config(serde_json::json!({ "max_callgraph_files": max_callgraph_files })),
         })
         .to_string(),
     );

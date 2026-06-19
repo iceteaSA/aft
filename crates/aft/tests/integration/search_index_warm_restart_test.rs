@@ -12,7 +12,7 @@ use aft::cache_freshness::{
 use aft::search_index::SearchIndex;
 use serde_json::{json, Value};
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -38,8 +38,10 @@ fn configure_search_index(aft: &mut AftProcess, root: &Path, id: &str) -> Value 
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-            "search_index": true,
-            "semantic_search": false,
+            "config": user_config(serde_json::json!({
+                "search_index": true,
+                "semantic_search": false
+            })),
         }),
     )
 }

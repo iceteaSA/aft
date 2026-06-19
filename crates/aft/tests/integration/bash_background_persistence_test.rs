@@ -13,7 +13,7 @@ use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 const SESSION: &str = "persist-session";
 
@@ -32,7 +32,9 @@ fn configure_background(aft: &mut AftProcess, project: &Path, storage: &Path, se
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "experimental_bash_background": true,
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "background": true } }
+            })),
             "max_background_bash_tasks": 32,
         })
         .to_string(),
@@ -48,7 +50,9 @@ fn configure_background_without_storage(aft: &mut AftProcess, project: &Path, se
             "command": "configure",
             "harness": "opencode",
             "project_root": project,
-            "experimental_bash_background": true,
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "background": true } }
+            })),
             "max_background_bash_tasks": 32,
         })
         .to_string(),

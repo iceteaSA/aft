@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn assert_error_code(resp: &serde_json::Value, code: &str) {
     assert_eq!(
@@ -107,7 +107,7 @@ fn write_rejects_paths_outside_the_configured_project_root() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "restrict_to_project_root": true,
+            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
         }))
         .unwrap(),
     );
@@ -280,7 +280,7 @@ fn delete_file_rejects_paths_outside_the_configured_project_root() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "restrict_to_project_root": true,
+            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
         }))
         .unwrap(),
     );

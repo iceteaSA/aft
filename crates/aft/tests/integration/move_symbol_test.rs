@@ -4,7 +4,8 @@
 //! to test the full move pipeline: symbol extraction, destination insertion,
 //! consumer import rewiring, checkpoint creation/restore, and error paths.
 
-use crate::helpers::{fixture_path, AftProcess};
+use crate::helpers::{fixture_path, user_config, AftProcess};
+use serde_json::json;
 
 /// Copy the `tests/fixtures/move_symbol/` directory into a temp dir,
 /// including the `features/` subdirectory.  Returns `(TempDir, root_path)`.
@@ -1119,10 +1120,16 @@ fn move_symbol_project_too_large() {
 
     // Configure with an artificially low cap so the 7+ file fixture trips the
     // guard. This asserts the guard fires BEFORE the move writes anything.
-    let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(serde_json::json!({ "max_callgraph_files": 1 }))
+        })
+        .to_string(),
+    );
     assert_eq!(resp["success"], true);
 
     let source = format!("{}/service.ts", root);
