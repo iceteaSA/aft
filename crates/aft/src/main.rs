@@ -81,33 +81,11 @@ fn main() {
         install_signal_handler(bg_registries, lsp_children);
     }
 
-    // Install bash output-compression closure on the BgTaskRegistry. The
-    // closure captures the shared filter-registry handle and the shared
-    // compress-flag (atomic) so the watchdog thread can compress without
-    // touching the rest of AppContext. The flag is updated from `configure`
-    // when `experimental.bash.compress` changes; the filter registry is
-    // updated when `reset_filter_registry` is called.
-    {
-        let runtime = registry.current();
-        let filter_registry_handle = runtime.shared_filter_registry();
-        let compress_flag = runtime.bash_compress_flag();
-        runtime.bash_background().set_compressor_with_exit_code(
-            move |command: &str, output: String, exit_code: Option<i32>| {
-                if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return aft::compress::CompressionResult::new(output);
-                }
-                let registry_guard = match filter_registry_handle.read() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                aft::compress::compress_with_registry_exit_code(
-                    command,
-                    &output,
-                    exit_code,
-                    &registry_guard,
-                )
-            },
-        );
+    // Install bash output-compression closures per actor so each background
+    // registry captures its own filter registry and compress flag.
+    // Future P5 actor creation at attach must call this for each new actor.
+    for runtime in registry.iter() {
+        install_bash_compressor(runtime);
     }
 
     // P3-02: stdout/progress is a process service — N>1 must keep one
@@ -259,6 +237,34 @@ fn signal_bg_registries(registry: &RuntimeRegistry) -> Vec<BgTaskRegistry> {
         .iter()
         .map(|runtime| runtime.bash_background().clone())
         .collect()
+}
+
+fn install_bash_compressor(runtime: &AppContext) {
+    // Install bash output-compression closure on the BgTaskRegistry. The
+    // closure captures the shared filter-registry handle and the shared
+    // compress-flag (atomic) so the watchdog thread can compress without
+    // touching the rest of AppContext. The flag is updated from `configure`
+    // when `experimental.bash.compress` changes; the filter registry is
+    // updated when `reset_filter_registry` is called.
+    let filter_registry_handle = runtime.shared_filter_registry();
+    let compress_flag = runtime.bash_compress_flag();
+    runtime.bash_background().set_compressor_with_exit_code(
+        move |command: &str, output: String, exit_code: Option<i32>| {
+            if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return aft::compress::CompressionResult::new(output);
+            }
+            let registry_guard = match filter_registry_handle.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            aft::compress::compress_with_registry_exit_code(
+                command,
+                &output,
+                exit_code,
+                &registry_guard,
+            )
+        },
+    );
 }
 
 #[cfg(unix)]

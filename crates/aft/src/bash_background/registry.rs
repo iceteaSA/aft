@@ -1275,7 +1275,11 @@ impl BgTaskRegistry {
         let mut task = self.task_for_session(task_id, session_id);
         if task.is_none() {
             if let Some(storage_dir) = storage_dir {
-                let _ = self.replay_session(storage_dir, session_id);
+                let _ = if let Some(project_root) = project_root {
+                    self.replay_session_for_project(storage_dir, session_id, project_root)
+                } else {
+                    self.replay_session(storage_dir, session_id)
+                };
                 task = self.task_for_session(task_id, session_id);
             }
         }
@@ -4014,6 +4018,58 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    fn write_running_project_task(storage: &Path, project: &Path, session: &str, task_id: &str) {
+        let paths = task_paths(storage, session, task_id);
+        let mut metadata = PersistedTask::starting(
+            task_id.to_string(),
+            session.to_string(),
+            "sleep 60".to_string(),
+            project.to_path_buf(),
+            Some(project.to_path_buf()),
+            Some(30_000),
+            true,
+            true,
+        );
+        metadata.status = BgTaskStatus::Running;
+        write_task(&paths.json, &metadata).unwrap();
+        fs::write(&paths.stdout, "still running\n").unwrap();
+        fs::write(&paths.stderr, "").unwrap();
+    }
+
+    #[test]
+    fn status_replay_filters_same_session_by_project_root() {
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "shared-session";
+        let task_id = "bash-project-a";
+        write_running_project_task(storage.path(), project_a.path(), session, task_id);
+
+        let actor_b = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        assert!(actor_b
+            .status(
+                task_id,
+                session,
+                Some(project_b.path()),
+                Some(storage.path()),
+                1024,
+            )
+            .is_none());
+        assert!(actor_b.task_for_session(task_id, session).is_none());
+
+        let actor_a = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let snapshot = actor_a
+            .status(
+                task_id,
+                session,
+                Some(project_a.path()),
+                Some(storage.path()),
+                1024,
+            )
+            .expect("owning project should replay its task");
+        assert_eq!(snapshot.info.status, BgTaskStatus::Running);
     }
 
     #[cfg(unix)]
