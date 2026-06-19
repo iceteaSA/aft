@@ -16,6 +16,12 @@ use crate::config::{Config, InspectConfig, SemanticBackend, SemanticBackendConfi
 const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 8_000;
 const FOREGROUND_WAIT_WINDOW_MIN_MS: u64 = 5_000;
 
+// Semantic budget clamps — restored from the deleted configure-time
+// parse_semantic_config so the tier-resolved Config matches the historical
+// clamping (zero-behavior-change relocation, not a new policy).
+const MAX_SEMANTIC_TIMEOUT_MS: u64 = 120_000;
+const MAX_SEMANTIC_BATCH_SIZE: usize = 1_024;
+
 const USER_ONLY_REASON: &str =
     "security: this setting only honors user-level config and project values are ignored";
 const SEMANTIC_SECRET_REASON: &str =
@@ -978,10 +984,10 @@ fn resolve_semantic_config(raw: Option<&RawSemantic>) -> SemanticBackendConfig {
         semantic.api_key_env = Some(value.clone());
     }
     if let Some(value) = raw.timeout_ms {
-        semantic.timeout_ms = value;
+        semantic.timeout_ms = value.min(MAX_SEMANTIC_TIMEOUT_MS);
     }
     if let Some(value) = raw.max_batch_size {
-        semantic.max_batch_size = value;
+        semantic.max_batch_size = value.min(MAX_SEMANTIC_BATCH_SIZE);
     }
     if let Some(value) = raw.max_files {
         semantic.max_files = value;

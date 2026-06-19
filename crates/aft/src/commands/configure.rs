@@ -1303,6 +1303,16 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         config_dropped_keys = crate::config_resolve::resolve_config_onto(&tiers, &mut next_config);
     }
 
+    // SSRF guard restored from the deleted parse_semantic_config: a tier-resolved
+    // semantic.base_url (user-tier only — project base_url is trust-dropped by the
+    // resolver) must pass the no-SSRF check at configure time, matching historical
+    // behavior. Empty/absent base_url is already normalized to None by the resolver.
+    if let Some(base_url) = next_config.semantic.base_url.as_deref() {
+        if let Err(error) = crate::semantic_index::validate_base_url_no_ssrf(base_url) {
+            return Response::error(&req.id, "invalid_request", error);
+        }
+    }
+
     // Parse and validate process-state configure fields into a temporary config first.
     // AppContext is mutated only after this phase succeeds, so an invalid late
     // field cannot leave the bridge half-configured. Core AftConfig fields are
