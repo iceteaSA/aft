@@ -85,6 +85,7 @@ pub mod path_identity;
 pub mod pattern_compile;
 pub mod protocol;
 pub mod query_shape;
+pub mod runtime_registry;
 pub mod search_index;
 pub mod semantic_index;
 pub mod symbol_cache_disk;

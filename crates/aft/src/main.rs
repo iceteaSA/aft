@@ -9,6 +9,7 @@ use aft::log_ctx;
 use aft::lsp::client::LspEvent;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
+use aft::runtime_registry::RuntimeRegistry;
 use aft::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
@@ -70,7 +71,17 @@ fn main() {
     aft::slog_info!("started, pid {}", std::process::id());
 
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-    install_signal_handler(ctx.bash_background().clone(), ctx.lsp_child_registry());
+    let registry = RuntimeRegistry::standalone(ctx);
+    // P3-02: signal/shutdown is a process service; N>1 must aggregate
+    // all runtime registries (or move to one shared registry). Standalone
+    // routes through the selected single runtime for now.
+    {
+        let runtime = registry.current();
+        install_signal_handler(
+            runtime.bash_background().clone(),
+            runtime.lsp_child_registry(),
+        );
+    }
 
     // Install bash output-compression closure on the BgTaskRegistry. The
     // closure captures the shared filter-registry handle and the shared
@@ -79,9 +90,10 @@ fn main() {
     // when `experimental.bash.compress` changes; the filter registry is
     // updated when `reset_filter_registry` is called.
     {
-        let filter_registry_handle = ctx.shared_filter_registry();
-        let compress_flag = ctx.bash_compress_flag();
-        ctx.bash_background().set_compressor_with_exit_code(
+        let runtime = registry.current();
+        let filter_registry_handle = runtime.shared_filter_registry();
+        let compress_flag = runtime.bash_compress_flag();
+        runtime.bash_background().set_compressor_with_exit_code(
             move |command: &str, output: String, exit_code: Option<i32>| {
                 if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     return aft::compress::CompressionResult::new(output);
@@ -100,17 +112,21 @@ fn main() {
         );
     }
 
-    let stdout_writer = ctx.stdout_writer();
+    // P3-02: stdout/progress is a process service — N>1 must keep one
+    // shared sink so response and push frames do not interleave/corrupt.
+    let stdout_writer = registry.current().stdout_writer();
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_from_push = Arc::clone(&shutdown_requested);
-    ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame: PushFrame| {
-        let Ok(mut writer) = stdout_writer.lock() else {
-            aft::slog_error!("stdout push frame lock poisoned; shutting down bridge");
-            shutdown_from_push.store(true, Ordering::SeqCst);
-            return;
-        };
-        write_push_frame_or_request_shutdown(&mut *writer, &frame, &shutdown_from_push);
-    }))));
+    registry
+        .current()
+        .set_progress_sender(Some(Arc::new(Box::new(move |frame: PushFrame| {
+            let Ok(mut writer) = stdout_writer.lock() else {
+                aft::slog_error!("stdout push frame lock poisoned; shutting down bridge");
+                shutdown_from_push.store(true, Ordering::SeqCst);
+                return;
+            };
+            write_push_frame_or_request_shutdown(&mut *writer, &frame, &shutdown_from_push);
+        }))));
 
     // Stdin is read by a dedicated thread that forwards lines through a
     // channel. The main thread does recv_timeout so it wakes periodically
@@ -142,14 +158,7 @@ fn main() {
                 // Periodic drain so push frames flow even without requests.
                 // Cheap on the idle path: each drain just checks try_recv
                 // on a channel and bails if empty.
-                drain_configure_warning_events(&ctx);
-                drain_search_index_events(&ctx);
-                drain_callgraph_store_events(&ctx);
-                drain_semantic_index_events(&ctx);
-                drain_semantic_refresh_events(&ctx);
-                drain_inspect_events(&ctx);
-                drain_watcher_events(&ctx);
-                drain_lsp_events(&ctx);
+                drain_runtime_events(&registry);
                 if shutdown_requested.load(Ordering::SeqCst) {
                     break;
                 }
@@ -177,25 +186,22 @@ fn main() {
                 // Drain search index FIRST so watcher events apply to the latest index.
                 // If reversed, watcher updates applied to the old index would be lost
                 // when the background-built index replaces it.
-                drain_configure_warning_events(&ctx);
-                drain_search_index_events(&ctx);
-                drain_callgraph_store_events(&ctx);
-                drain_semantic_index_events(&ctx);
-                drain_semantic_refresh_events(&ctx);
-                drain_inspect_events(&ctx);
-                drain_watcher_events(&ctx);
-                drain_lsp_events(&ctx);
+                drain_runtime_events(&registry);
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
                 let session_id_for_log = req.session_id.clone();
+                // P3-02/P3-03 seam: request-root identity is absent in
+                // standalone; the selected single runtime is the root today.
+                // P3-03 adds an explicit root selector here instead of path inference.
+                let runtime = registry.current();
                 let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
-                    log_ctx::with_session(session_id_for_log, || dispatch(req, &ctx))
+                    log_ctx::with_session(session_id_for_log, || dispatch(req, runtime))
                 }));
                 match dispatch_result {
                     Ok(mut response) => {
-                        attach_bg_completions(&mut response, &ctx, &session_id, &command);
-                        attach_status_bar(&mut response, &ctx, &command);
+                        attach_bg_completions(&mut response, runtime, &session_id, &command);
+                        attach_status_bar(&mut response, runtime, &command);
                         response
                     }
                     Err(payload) => {
@@ -214,19 +220,40 @@ fn main() {
             }
         };
 
-        if let Err(e) = write_response(&ctx, &response) {
+        if let Err(e) = write_response(registry.current(), &response) {
             aft::slog_error!("stdout write error: {}", e);
             break;
         }
-        drain_configure_warning_events(&ctx);
+        drain_configure_warning_events_for_registry(&registry);
         if shutdown_after_response || shutdown_requested.load(Ordering::SeqCst) {
             break;
         }
     }
 
-    ctx.lsp().shutdown_all();
-    ctx.bash_background().detach();
+    for runtime in registry.iter() {
+        runtime.lsp().shutdown_all();
+        runtime.bash_background().detach();
+    }
     aft::slog_info!("stdin closed, shutting down");
+}
+
+fn drain_runtime_events(registry: &RuntimeRegistry) {
+    for runtime in registry.iter() {
+        drain_configure_warning_events(runtime);
+        drain_search_index_events(runtime);
+        drain_callgraph_store_events(runtime);
+        drain_semantic_index_events(runtime);
+        drain_semantic_refresh_events(runtime);
+        drain_inspect_events(runtime);
+        drain_watcher_events(runtime);
+        drain_lsp_events(runtime);
+    }
+}
+
+fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
+    for runtime in registry.iter() {
+        drain_configure_warning_events(runtime);
+    }
 }
 
 #[cfg(unix)]
