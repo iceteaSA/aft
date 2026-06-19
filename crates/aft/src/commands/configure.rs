@@ -1303,15 +1303,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         config_dropped_keys = crate::config_resolve::resolve_config_onto(&tiers, &mut next_config);
     }
 
-    // SSRF guard restored from the deleted parse_semantic_config: a tier-resolved
-    // semantic.base_url (user-tier only — project base_url is trust-dropped by the
-    // resolver) must pass the no-SSRF check at configure time, matching historical
-    // behavior. Empty/absent base_url is already normalized to None by the resolver.
-    if let Some(base_url) = next_config.semantic.base_url.as_deref() {
-        if let Err(error) = crate::semantic_index::validate_base_url_no_ssrf(base_url) {
-            return Response::error(&req.id, "invalid_request", error);
-        }
-    }
+    // NO configure-time SSRF guard on semantic.base_url — deliberate (config
+    // relocation posture). The original guard existed to stop UNTRUSTED *project*
+    // config from pointing the embedding backend at an internal IP (SSRF). The tier
+    // resolver now drops project-tier `semantic.base_url` outright (SEMANTIC_SECRET_REASON),
+    // so the only base_url that can reach `next_config` is USER-tier — the same trust
+    // level as the binary itself. A user pointing AFT at their own self-hosted
+    // embedding server on the LAN/WAN (homelab Ollama/LMStudio at 192.168.x / 10.x, or
+    // a remote box) is legitimate and must be allowed; the SSRF threat model (attacker-
+    // controlled URL) does not apply to user-trusted config. The `validate_base_url_no_ssrf`
+    // primitive remains for any future less-trusted source. See semantic_test::
+    // configure_accepts_user_private_base_url.
 
     // Parse and validate process-state configure fields into a temporary config first.
     // AppContext is mutated only after this phase succeeds, so an invalid late
