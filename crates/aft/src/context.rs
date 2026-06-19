@@ -2,8 +2,8 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lsp_types::FileChangeType;
@@ -129,25 +129,21 @@ use crate::semantic_index::{EmbeddingEntry, SemanticIndex};
 // `SemanticIndexStatus::Ready` exposes a unique `refreshing` path list. Keep
 // per-path queue accounting separately so repeated edits to the same file do not
 // let an older refresh completion remove the path while newer work is pending.
+#[derive(Debug, Default, Clone)]
+#[doc(hidden)]
+pub struct SemanticRefreshAccounting {
+    #[doc(hidden)]
+    pub pending: usize,
+    #[doc(hidden)]
+    pub in_flight: usize,
+}
+
 #[derive(Debug, Default)]
-struct SemanticRefreshAccounting {
-    pending: usize,
-    in_flight: usize,
-}
-
-static SEMANTIC_REFRESH_ACCOUNTING: OnceLock<Mutex<BTreeMap<PathBuf, SemanticRefreshAccounting>>> =
-    OnceLock::new();
-
-fn semantic_refresh_accounting() -> &'static Mutex<BTreeMap<PathBuf, SemanticRefreshAccounting>> {
-    SEMANTIC_REFRESH_ACCOUNTING.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn clear_semantic_refresh_accounting() {
-    if let Some(accounting) = SEMANTIC_REFRESH_ACCOUNTING.get() {
-        if let Ok(mut accounting) = accounting.lock() {
-            accounting.clear();
-        }
-    }
+struct SemanticRefreshCircuit {
+    consecutive_transient_failures: AtomicUsize,
+    open: AtomicBool,
+    probe_in_flight: AtomicBool,
+    probe_ready: AtomicBool,
 }
 
 fn ensure_refreshing_path(refreshing: &mut Vec<PathBuf>, path: PathBuf) {
@@ -175,38 +171,47 @@ pub enum SemanticIndexStatus {
         /// Files currently being re-embedded after recent edits. The index is
         /// still queryable; results for these files may be temporarily missing.
         refreshing: Vec<PathBuf>,
+        /// Per-root queue accounting for repeated refreshes of the same path.
+        /// Kept on the status value so two AppContexts in one process cannot
+        /// share refresh-completion state.
+        #[doc(hidden)]
+        accounting: BTreeMap<PathBuf, SemanticRefreshAccounting>,
     },
     Failed(String),
 }
 
 impl SemanticIndexStatus {
     pub fn ready() -> Self {
-        clear_semantic_refresh_accounting();
         Self::Ready {
             refreshing: Vec::new(),
+            accounting: BTreeMap::new(),
         }
     }
 
     pub fn add_refreshing_file(&mut self, path: PathBuf) {
-        if let Self::Ready { refreshing } = self {
-            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
-                let state = accounting.entry(path.clone()).or_default();
-                state.pending = state.pending.saturating_add(1);
-            }
+        if let Self::Ready {
+            refreshing,
+            accounting,
+        } = self
+        {
+            let state = accounting.entry(path.clone()).or_default();
+            state.pending = state.pending.saturating_add(1);
             ensure_refreshing_path(refreshing, path);
         }
     }
 
     pub fn start_refreshing_file(&mut self, path: PathBuf) {
-        if let Self::Ready { refreshing } = self {
-            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
-                let state = accounting.entry(path.clone()).or_default();
-                if state.pending == 0 {
-                    state.pending = 1;
-                }
-                if state.in_flight == 0 {
-                    state.in_flight = state.pending;
-                }
+        if let Self::Ready {
+            refreshing,
+            accounting,
+        } = self
+        {
+            let state = accounting.entry(path.clone()).or_default();
+            if state.pending == 0 {
+                state.pending = 1;
+            }
+            if state.in_flight == 0 {
+                state.in_flight = state.pending;
             }
             ensure_refreshing_path(refreshing, path);
         }
@@ -225,31 +230,31 @@ impl SemanticIndexStatus {
     }
 
     fn finish_refreshing_file(&mut self, path: &Path, complete_in_flight: bool) {
-        if let Self::Ready { refreshing } = self {
+        if let Self::Ready {
+            refreshing,
+            accounting,
+        } = self
+        {
             let mut keep_refreshing = false;
-            let mut accounting_checked = false;
-            if let Ok(mut accounting) = semantic_refresh_accounting().lock() {
-                accounting_checked = true;
-                if let Some(state) = accounting.get_mut(path) {
-                    let finished = if complete_in_flight {
-                        state.in_flight.max(1)
-                    } else {
-                        1
-                    };
-                    state.pending = state.pending.saturating_sub(finished);
-                    if complete_in_flight {
-                        state.in_flight = 0;
-                    } else {
-                        state.in_flight = state.in_flight.min(state.pending);
-                    }
-                    keep_refreshing = state.pending > 0;
-                    if !keep_refreshing {
-                        accounting.remove(path);
-                    }
+            if let Some(state) = accounting.get_mut(path) {
+                let finished = if complete_in_flight {
+                    state.in_flight.max(1)
+                } else {
+                    1
+                };
+                state.pending = state.pending.saturating_sub(finished);
+                if complete_in_flight {
+                    state.in_flight = 0;
+                } else {
+                    state.in_flight = state.in_flight.min(state.pending);
+                }
+                keep_refreshing = state.pending > 0;
+                if !keep_refreshing {
+                    accounting.remove(path);
                 }
             }
 
-            if !accounting_checked || !keep_refreshing {
+            if !keep_refreshing {
                 remove_refreshing_path(refreshing, path);
             }
         }
@@ -257,7 +262,7 @@ impl SemanticIndexStatus {
 
     pub fn refreshing_count(&self) -> usize {
         match self {
-            Self::Ready { refreshing } => refreshing.len(),
+            Self::Ready { refreshing, .. } => refreshing.len(),
             _ => 0,
         }
     }
@@ -527,6 +532,8 @@ pub struct AppContext {
     semantic_refresh_tx: RefCell<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>,
     semantic_refresh_event_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>>,
     semantic_refresh_worker: RefCell<Option<SemanticRefreshWorkerSlot>>,
+    semantic_refresh_retry_attempts: RefCell<BTreeMap<PathBuf, usize>>,
+    semantic_refresh_circuit: Arc<SemanticRefreshCircuit>,
     semantic_embedding_model: RefCell<Option<crate::semantic_index::EmbeddingModel>>,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
@@ -546,6 +553,10 @@ pub struct AppContext {
     configure_warnings_tx: mpsc::Sender<(u64, ConfigureWarningsFrame)>,
     configure_warnings_rx: mpsc::Receiver<(u64, ConfigureWarningsFrame)>,
     status_emitter: StatusEmitter,
+    /// Last status-bar payload attached to a tool response for this project root.
+    /// Deduping here (not in a process-global static) lets daemon roots emit the
+    /// same counts independently.
+    status_bar_last_emitted: RefCell<Option<StatusBarCounts>>,
     bash_background: BgTaskRegistry,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
@@ -669,6 +680,8 @@ impl AppContext {
             semantic_refresh_tx: RefCell::new(None),
             semantic_refresh_event_rx: RefCell::new(None),
             semantic_refresh_worker: RefCell::new(None),
+            semantic_refresh_retry_attempts: RefCell::new(BTreeMap::new()),
+            semantic_refresh_circuit: Arc::new(SemanticRefreshCircuit::default()),
             semantic_embedding_model: RefCell::new(None),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
@@ -682,6 +695,7 @@ impl AppContext {
             configure_warnings_tx,
             configure_warnings_rx,
             status_emitter,
+            status_bar_last_emitted: RefCell::new(None),
             bash_background: BgTaskRegistry::new(progress_sender),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
@@ -722,6 +736,15 @@ impl AppContext {
             todos: tier2.todos.unwrap_or(0),
             tier2_stale: tier2.stale,
         })
+    }
+
+    pub fn should_emit_status_bar(&self, counts: &StatusBarCounts) -> bool {
+        let mut last = self.status_bar_last_emitted.borrow_mut();
+        if last.as_ref() == Some(counts) {
+            return false;
+        }
+        *last = Some(counts.clone());
+        true
     }
 
     /// Error/warning counts for the agent status bar, filtered to match
@@ -1843,6 +1866,128 @@ impl AppContext {
         &self,
     ) -> &RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>> {
         &self.semantic_refresh_event_rx
+    }
+
+    pub fn with_semantic_refresh_retry_attempts_mut<R>(
+        &self,
+        f: impl FnOnce(&mut BTreeMap<PathBuf, usize>) -> R,
+    ) -> R {
+        let mut attempts = self.semantic_refresh_retry_attempts.borrow_mut();
+        f(&mut attempts)
+    }
+
+    pub fn clear_semantic_refresh_retry_attempts(&self, paths: &[PathBuf]) {
+        let mut attempts = self.semantic_refresh_retry_attempts.borrow_mut();
+        for path in paths {
+            attempts.remove(path);
+        }
+    }
+
+    pub fn clear_all_semantic_refresh_retry_attempts(&self) {
+        self.semantic_refresh_retry_attempts.borrow_mut().clear();
+    }
+
+    pub fn semantic_refresh_circuit_is_open(&self) -> bool {
+        self.semantic_refresh_circuit.open.load(Ordering::SeqCst)
+    }
+
+    pub fn record_semantic_refresh_transient_failure(&self, trip_threshold: usize) -> bool {
+        let failures = self
+            .semantic_refresh_circuit
+            .consecutive_transient_failures
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        if failures >= trip_threshold
+            && !self
+                .semantic_refresh_circuit
+                .open
+                .swap(true, Ordering::SeqCst)
+        {
+            crate::slog_warn!(
+                "embedding backend appears down; suspending active retries, will resume on next change or successful probe"
+            );
+        }
+        self.semantic_refresh_circuit_is_open()
+    }
+
+    pub fn reset_semantic_refresh_transient_failure_count(&self) {
+        self.semantic_refresh_circuit
+            .consecutive_transient_failures
+            .store(0, Ordering::SeqCst);
+    }
+
+    pub fn reset_semantic_refresh_circuit_after_success(&self) {
+        self.reset_semantic_refresh_transient_failure_count();
+        self.semantic_refresh_circuit
+            .probe_ready
+            .store(false, Ordering::SeqCst);
+        if self
+            .semantic_refresh_circuit
+            .open
+            .swap(false, Ordering::SeqCst)
+        {
+            crate::slog_info!("embedding backend recovered; resuming normal refresh retries");
+        }
+    }
+
+    pub fn semantic_refresh_transient_failure_count(&self) -> usize {
+        self.semantic_refresh_circuit
+            .consecutive_transient_failures
+            .load(Ordering::SeqCst)
+    }
+
+    pub fn semantic_refresh_probe_is_scheduled(&self) -> bool {
+        self.semantic_refresh_circuit
+            .probe_in_flight
+            .load(Ordering::SeqCst)
+            || self
+                .semantic_refresh_circuit
+                .probe_ready
+                .load(Ordering::SeqCst)
+    }
+
+    pub fn take_semantic_refresh_probe_ready(&self) -> bool {
+        self.semantic_refresh_circuit
+            .probe_ready
+            .swap(false, Ordering::SeqCst)
+    }
+
+    pub fn ensure_semantic_refresh_probe_scheduled(&self, delay: Duration) {
+        if self
+            .semantic_refresh_circuit
+            .probe_ready
+            .load(Ordering::SeqCst)
+        {
+            return;
+        }
+        if self
+            .semantic_refresh_circuit
+            .probe_in_flight
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        if self
+            .semantic_refresh_circuit
+            .probe_ready
+            .load(Ordering::SeqCst)
+        {
+            self.semantic_refresh_circuit
+                .probe_in_flight
+                .store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let delay = delay;
+        let circuit = Arc::clone(&self.semantic_refresh_circuit);
+        let session_id = crate::log_ctx::current_session();
+        std::thread::spawn(move || {
+            crate::log_ctx::with_session(session_id, || {
+                std::thread::sleep(delay);
+                circuit.probe_ready.store(true, Ordering::SeqCst);
+                circuit.probe_in_flight.store(false, Ordering::SeqCst);
+            });
+        });
     }
 
     /// Access the cached semantic embedding model.

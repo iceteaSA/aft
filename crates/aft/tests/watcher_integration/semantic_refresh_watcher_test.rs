@@ -438,7 +438,7 @@ fn refreshing_status_keeps_repeated_same_file_invalidations_until_last_completio
     status.add_refreshing_file(file.clone());
 
     assert_eq!(status.refreshing_count(), 1);
-    let SemanticIndexStatus::Ready { refreshing } = &status else {
+    let SemanticIndexStatus::Ready { refreshing, .. } = &status else {
         panic!("semantic status should stay ready");
     };
     assert_eq!(refreshing.as_slice(), std::slice::from_ref(&file));
@@ -450,7 +450,7 @@ fn refreshing_status_keeps_repeated_same_file_invalidations_until_last_completio
         1,
         "first refresh completion must not clear a queued refresh for the same file"
     );
-    let SemanticIndexStatus::Ready { refreshing } = &status else {
+    let SemanticIndexStatus::Ready { refreshing, .. } = &status else {
         panic!("semantic status should stay ready");
     };
     assert_eq!(refreshing.as_slice(), std::slice::from_ref(&file));
@@ -459,7 +459,7 @@ fn refreshing_status_keeps_repeated_same_file_invalidations_until_last_completio
     status.complete_refreshing_file(&file);
 
     assert_eq!(status.refreshing_count(), 0);
-    let SemanticIndexStatus::Ready { refreshing } = &status else {
+    let SemanticIndexStatus::Ready { refreshing, .. } = &status else {
         panic!("semantic status should stay ready");
     };
     assert!(refreshing.is_empty());

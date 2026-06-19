@@ -115,7 +115,7 @@ impl AppContext {
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
-                    SemanticIndexStatus::Ready { refreshing } => serde_json::json!({
+                    SemanticIndexStatus::Ready { refreshing, .. } => serde_json::json!({
                         "status": "ready",
                         "state": "ready",
                         "refreshing_count": refreshing.len(),

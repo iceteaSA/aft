@@ -3,18 +3,18 @@ use aft::bash_background::BgTaskRegistry;
 use aft::config::Config;
 use aft::context::{
     AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-    SemanticRefreshRequest, StatusBarCounts,
+    SemanticRefreshRequest,
 };
 use aft::log_ctx;
 use aft::lsp::client::LspEvent;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -478,18 +478,6 @@ fn attach_bg_completions(
 /// responses never reach the agent, and bash-lifecycle commands fire rapidly).
 /// `errors`/`warnings` are read live from the LSP store here; Tier-2/todos are
 /// last-known. Omitted entirely until the Tier-2 cache is populated once.
-fn status_bar_last_emitted() -> &'static Mutex<Option<StatusBarCounts>> {
-    static LAST_EMITTED_STATUS_BAR: OnceLock<Mutex<Option<StatusBarCounts>>> = OnceLock::new();
-    LAST_EMITTED_STATUS_BAR.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(test)]
-fn reset_status_bar_emission_for_test() {
-    if let Ok(mut last) = status_bar_last_emitted().lock() {
-        *last = None;
-    }
-}
-
 fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
     if matches!(
         command,
@@ -511,17 +499,8 @@ fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
     let Some(counts) = ctx.status_bar_counts() else {
         return;
     };
-    match status_bar_last_emitted().lock() {
-        Ok(mut last) => {
-            if last.as_ref() == Some(&counts) {
-                return;
-            }
-            *last = Some(counts.clone());
-        }
-        Err(_) => {
-            // If the fingerprint lock is poisoned, prefer the previous behavior
-            // (emit) over accidentally suppressing a changed status bar.
-        }
+    if !ctx.should_emit_status_bar(&counts) {
+        return;
     }
     let value = serde_json::json!({
         "errors": counts.errors,
@@ -834,16 +813,6 @@ fn watcher_path_is_semantic_source(path: &std::path::Path) -> bool {
 const MAX_RETRY_ATTEMPTS: usize = 6;
 const BREAKER_TRIP_THRESHOLD: usize = 3;
 
-static SEMANTIC_REFRESH_CONSECUTIVE_TRANSIENT_FAILURES: AtomicUsize = AtomicUsize::new(0);
-static SEMANTIC_REFRESH_CIRCUIT_OPEN: AtomicBool = AtomicBool::new(false);
-static SEMANTIC_REFRESH_PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static SEMANTIC_REFRESH_PROBE_READY: AtomicBool = AtomicBool::new(false);
-
-fn semantic_refresh_retry_attempts() -> &'static Mutex<BTreeMap<std::path::PathBuf, usize>> {
-    static ATTEMPTS: OnceLock<Mutex<BTreeMap<std::path::PathBuf, usize>>> = OnceLock::new();
-    ATTEMPTS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
 /// Backoff for live semantic refresh retries after a transient embedding backend
 /// failure. Mirrors the cold-build retry cadence (15s -> 30s -> 60s capped) so
 /// a down backend cannot spin the watcher/refresh loop hot while still
@@ -869,29 +838,26 @@ struct SemanticRefreshRetryPlan {
     delay: Option<Duration>,
 }
 
-fn next_semantic_refresh_retry_plan(paths: Vec<std::path::PathBuf>) -> SemanticRefreshRetryPlan {
+fn next_semantic_refresh_retry_plan(
+    ctx: &AppContext,
+    paths: Vec<std::path::PathBuf>,
+) -> SemanticRefreshRetryPlan {
     let mut retry_paths = Vec::new();
     let mut capped_paths = Vec::new();
     let mut max_attempt = 0usize;
 
-    let Ok(mut attempts) = semantic_refresh_retry_attempts().lock() else {
-        return SemanticRefreshRetryPlan {
-            retry_paths: paths,
-            capped_paths,
-            delay: Some(semantic_refresh_retry_backoff(0)),
-        };
-    };
-
-    for path in paths {
-        let attempt = attempts.get(&path).copied().unwrap_or(0);
-        if attempt >= MAX_RETRY_ATTEMPTS {
-            capped_paths.push(path);
-            continue;
+    ctx.with_semantic_refresh_retry_attempts_mut(|attempts| {
+        for path in paths {
+            let attempt = attempts.get(&path).copied().unwrap_or(0);
+            if attempt >= MAX_RETRY_ATTEMPTS {
+                capped_paths.push(path);
+                continue;
+            }
+            max_attempt = max_attempt.max(attempt);
+            attempts.insert(path.clone(), attempt.saturating_add(1));
+            retry_paths.push(path);
         }
-        max_attempt = max_attempt.max(attempt);
-        attempts.insert(path.clone(), attempt.saturating_add(1));
-        retry_paths.push(path);
-    }
+    });
 
     let delay = if retry_paths.is_empty() {
         None
@@ -906,18 +872,12 @@ fn next_semantic_refresh_retry_plan(paths: Vec<std::path::PathBuf>) -> SemanticR
     }
 }
 
-fn clear_semantic_refresh_retry_attempts(paths: &[std::path::PathBuf]) {
-    if let Ok(mut attempts) = semantic_refresh_retry_attempts().lock() {
-        for path in paths {
-            attempts.remove(path);
-        }
-    }
+fn clear_semantic_refresh_retry_attempts(ctx: &AppContext, paths: &[std::path::PathBuf]) {
+    ctx.clear_semantic_refresh_retry_attempts(paths);
 }
 
-fn clear_all_semantic_refresh_retry_attempts() {
-    if let Ok(mut attempts) = semantic_refresh_retry_attempts().lock() {
-        attempts.clear();
-    }
+fn clear_all_semantic_refresh_retry_attempts(ctx: &AppContext) {
+    ctx.clear_all_semantic_refresh_retry_attempts();
 }
 
 fn clear_completed_pending_semantic_index_paths(
@@ -943,95 +903,52 @@ fn semantic_refresh_probe_delay() -> Duration {
     semantic_refresh_retry_backoff(usize::MAX)
 }
 
-fn semantic_refresh_circuit_is_open() -> bool {
-    SEMANTIC_REFRESH_CIRCUIT_OPEN.load(Ordering::SeqCst)
+fn semantic_refresh_circuit_is_open(ctx: &AppContext) -> bool {
+    ctx.semantic_refresh_circuit_is_open()
 }
 
-fn record_semantic_refresh_transient_failure() -> bool {
-    let failures = SEMANTIC_REFRESH_CONSECUTIVE_TRANSIENT_FAILURES
-        .fetch_add(1, Ordering::SeqCst)
-        .saturating_add(1);
-    if failures >= BREAKER_TRIP_THRESHOLD
-        && !SEMANTIC_REFRESH_CIRCUIT_OPEN.swap(true, Ordering::SeqCst)
-    {
-        aft::slog_warn!(
-            "embedding backend appears down; suspending active retries, will resume on next change or successful probe"
-        );
-    }
-    semantic_refresh_circuit_is_open()
+fn record_semantic_refresh_transient_failure(ctx: &AppContext) -> bool {
+    ctx.record_semantic_refresh_transient_failure(BREAKER_TRIP_THRESHOLD)
 }
 
-fn reset_semantic_refresh_transient_failure_count() {
-    SEMANTIC_REFRESH_CONSECUTIVE_TRANSIENT_FAILURES.store(0, Ordering::SeqCst);
+fn reset_semantic_refresh_transient_failure_count(ctx: &AppContext) {
+    ctx.reset_semantic_refresh_transient_failure_count();
 }
 
-fn reset_semantic_refresh_circuit_after_success() {
-    reset_semantic_refresh_transient_failure_count();
-    SEMANTIC_REFRESH_PROBE_READY.store(false, Ordering::SeqCst);
-    if SEMANTIC_REFRESH_CIRCUIT_OPEN.swap(false, Ordering::SeqCst) {
-        aft::slog_info!("embedding backend recovered; resuming normal refresh retries");
-    }
+fn reset_semantic_refresh_circuit_after_success(ctx: &AppContext) {
+    ctx.reset_semantic_refresh_circuit_after_success();
 }
 
 fn mark_semantic_refresh_success(ctx: &AppContext, completed_paths: &[std::path::PathBuf]) {
-    clear_semantic_refresh_retry_attempts(completed_paths);
+    clear_semantic_refresh_retry_attempts(ctx, completed_paths);
     clear_completed_pending_semantic_index_paths(ctx, completed_paths);
-    reset_semantic_refresh_circuit_after_success();
+    reset_semantic_refresh_circuit_after_success(ctx);
 }
 
-fn mark_semantic_corpus_refresh_success() {
-    clear_all_semantic_refresh_retry_attempts();
-    reset_semantic_refresh_circuit_after_success();
-}
-
-#[cfg(test)]
-fn reset_semantic_refresh_retry_state_for_test() {
-    clear_all_semantic_refresh_retry_attempts();
-    SEMANTIC_REFRESH_CONSECUTIVE_TRANSIENT_FAILURES.store(0, Ordering::SeqCst);
-    SEMANTIC_REFRESH_CIRCUIT_OPEN.store(false, Ordering::SeqCst);
-    SEMANTIC_REFRESH_PROBE_IN_FLIGHT.store(false, Ordering::SeqCst);
-    SEMANTIC_REFRESH_PROBE_READY.store(false, Ordering::SeqCst);
+fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
+    clear_all_semantic_refresh_retry_attempts(ctx);
+    reset_semantic_refresh_circuit_after_success(ctx);
 }
 
 #[cfg(test)]
-fn semantic_refresh_transient_failure_count_for_test() -> usize {
-    SEMANTIC_REFRESH_CONSECUTIVE_TRANSIENT_FAILURES.load(Ordering::SeqCst)
+fn semantic_refresh_transient_failure_count_for_test(ctx: &AppContext) -> usize {
+    ctx.semantic_refresh_transient_failure_count()
 }
 
 #[cfg(test)]
-fn semantic_refresh_probe_is_scheduled_for_test() -> bool {
-    SEMANTIC_REFRESH_PROBE_IN_FLIGHT.load(Ordering::SeqCst)
-        || SEMANTIC_REFRESH_PROBE_READY.load(Ordering::SeqCst)
+fn semantic_refresh_probe_is_scheduled_for_test(ctx: &AppContext) -> bool {
+    ctx.semantic_refresh_probe_is_scheduled()
 }
 
-fn ensure_semantic_refresh_probe_scheduled() {
-    if SEMANTIC_REFRESH_PROBE_READY.load(Ordering::SeqCst) {
-        return;
-    }
-    if SEMANTIC_REFRESH_PROBE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    if SEMANTIC_REFRESH_PROBE_READY.load(Ordering::SeqCst) {
-        SEMANTIC_REFRESH_PROBE_IN_FLIGHT.store(false, Ordering::SeqCst);
-        return;
-    }
-
-    let delay = semantic_refresh_probe_delay();
-    let session_id = log_ctx::current_session();
-    thread::spawn(move || {
-        log_ctx::with_session(session_id, || {
-            thread::sleep(delay);
-            SEMANTIC_REFRESH_PROBE_READY.store(true, Ordering::SeqCst);
-            SEMANTIC_REFRESH_PROBE_IN_FLIGHT.store(false, Ordering::SeqCst);
-        });
-    });
+fn ensure_semantic_refresh_probe_scheduled(ctx: &AppContext) {
+    ctx.ensure_semantic_refresh_probe_scheduled(semantic_refresh_probe_delay());
 }
 
 fn maybe_fire_semantic_refresh_probe(ctx: &AppContext) {
-    if !SEMANTIC_REFRESH_PROBE_READY.swap(false, Ordering::SeqCst) {
+    if !ctx.take_semantic_refresh_probe_ready() {
         return;
     }
-    if !semantic_refresh_circuit_is_open() {
+    if !semantic_refresh_circuit_is_open(ctx) {
         return;
     }
 
@@ -1068,7 +985,7 @@ fn schedule_semantic_refresh_retry(
         retry_paths,
         capped_paths,
         delay,
-    } = next_semantic_refresh_retry_plan(paths);
+    } = next_semantic_refresh_retry_plan(ctx, paths);
 
     if !capped_paths.is_empty() {
         aft::slog_warn!(
@@ -1730,7 +1647,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 status_changed = true;
             }
             SemanticIndexEvent::Ready(mut index) => {
-                mark_semantic_corpus_refresh_success();
+                mark_semantic_corpus_refresh_success(ctx);
                 let pending_paths = ctx.take_pending_semantic_index_paths();
                 for path in pending_paths {
                     if watcher_path_is_semantic_source(&path) {
@@ -1899,7 +1816,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 deleted,
                 total_processed,
             } => {
-                mark_semantic_corpus_refresh_success();
+                mark_semantic_corpus_refresh_success(ctx);
                 if changed > 0 || added > 0 || deleted > 0 {
                     aft::slog_info!(
                         "semantic corpus refresh completed: {} changed, {} new, {} deleted, {} total processed",
@@ -1925,9 +1842,9 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
             }
             SemanticRefreshEvent::Failed { paths, error } => {
                 if aft::semantic_index::embedding_failure_is_transient(&error) {
-                    if record_semantic_refresh_transient_failure() {
+                    if record_semantic_refresh_transient_failure(ctx) {
                         ctx.add_pending_semantic_index_paths(paths);
-                        ensure_semantic_refresh_probe_scheduled();
+                        ensure_semantic_refresh_probe_scheduled(ctx);
                     } else if !schedule_semantic_refresh_retry(ctx, paths.clone(), &error) {
                         aft::slog_warn!(
                             "semantic refresh worker unavailable; preserving {} transiently failed file(s) for retry",
@@ -1937,8 +1854,8 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                     }
                 } else {
                     aft::slog_warn!("semantic refresh failed: {}", error);
-                    reset_semantic_refresh_transient_failure_count();
-                    clear_semantic_refresh_retry_attempts(&paths);
+                    reset_semantic_refresh_transient_failure_count(ctx);
+                    clear_semantic_refresh_retry_attempts(ctx, &paths);
                     let mut status = ctx.semantic_index_status().borrow_mut();
                     if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                         for path in &paths {
@@ -1989,7 +1906,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
         let refreshing_paths = {
             let status = ctx.semantic_index_status().borrow();
             match &*status {
-                SemanticIndexStatus::Ready { refreshing } => refreshing.clone(),
+                SemanticIndexStatus::Ready { refreshing, .. } => refreshing.clone(),
                 _ => Vec::new(),
             }
         };
@@ -2095,9 +2012,8 @@ mod watcher_filter_tests {
     use super::{
         attach_status_bar, dispatch_panic_response, drain_configure_warning_events,
         drain_semantic_index_events, drain_semantic_refresh_events, drain_watcher_events,
-        reset_semantic_refresh_retry_state_for_test, reset_status_bar_emission_for_test,
-        schedule_semantic_refresh_retry, semantic_refresh_circuit_is_open,
-        semantic_refresh_probe_is_scheduled_for_test,
+        record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
+        semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
         write_push_frame_or_request_shutdown, BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
         WATCHER_BATCH_INLINE_CAP,
@@ -2129,11 +2045,8 @@ mod watcher_filter_tests {
     /// thread does `spawn -> sleep(backoff) -> send`, so under CI load the
     /// spawn-plus-wakeup latency can briefly exceed a tight budget. The wait
     /// returns the instant the value arrives, so this is zero-cost on the happy
-    /// path. This is only headroom for thread scheduling; the actual cross-test
-    /// flake (the request never arriving at all) was a process-global
-    /// breaker-state race, fixed by serializing breaker tests via
-    /// `semantic_breaker_test_lock`. Negative waits (asserting absence) must
-    /// stay short and are NOT this const.
+    /// path. Negative waits (asserting absence) must stay short and are NOT
+    /// this const.
     const RECV_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     fn make_ctx_with_root(root: &std::path::Path) -> AppContext {
@@ -2270,46 +2183,19 @@ mod watcher_filter_tests {
         }
     }
 
-    /// Shared serialization lock for every test that touches the process-global
-    /// semantic-refresh breaker state (`SEMANTIC_REFRESH_CIRCUIT_OPEN` /
-    /// `PROBE_READY` / `PROBE_IN_FLIGHT` / `CONSECUTIVE_TRANSIENT_FAILURES`).
-    ///
-    /// The breaker is intentionally one-per-process in production (a single
-    /// embedding backend per process), so the globals are correct there. But
-    /// the test harness runs these tests in parallel against that shared state,
-    /// and they corrupt each other: e.g. a concurrent breaker test that leaves
-    /// `PROBE_READY + CIRCUIT_OPEN` true makes another test's
-    /// `drain_semantic_refresh_events -> maybe_fire_semantic_refresh_probe`
-    /// spuriously fire and consume that test's per-ctx pending paths. EVERY
-    /// breaker-touching test MUST hold this lock (via `with_semantic_retry_backoff_ms`
-    /// or `with_semantic_breaker_isolation`) so only one runs at a time.
+    /// Shared serialization lock for tests that override the process-global
+    /// semantic retry-backoff environment variable. The semantic breaker itself
+    /// is per-AppContext; only the test seam remains process-global.
     fn semantic_breaker_test_lock() -> &'static std::sync::Mutex<()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    /// Reset the breaker globals and run `f` serialized against every other
-    /// breaker-touching test. For tests that touch the breaker but do not need
-    /// the retry-backoff override.
-    fn with_semantic_breaker_isolation<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = semantic_breaker_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        reset_semantic_refresh_retry_state_for_test();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        reset_semantic_refresh_retry_state_for_test();
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-
     fn with_semantic_retry_backoff_ms<R>(ms: u64, f: impl FnOnce() -> R) -> R {
         let _guard = semantic_breaker_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        reset_semantic_refresh_retry_state_for_test();
         let previous = std::env::var_os("AFT_SEMANTIC_RETRY_BACKOFF_MS");
         unsafe {
             std::env::set_var("AFT_SEMANTIC_RETRY_BACKOFF_MS", ms.to_string());
@@ -2321,7 +2207,6 @@ mod watcher_filter_tests {
                 None => std::env::remove_var("AFT_SEMANTIC_RETRY_BACKOFF_MS"),
             }
         }
-        reset_semantic_refresh_retry_state_for_test();
         match result {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
@@ -2566,7 +2451,6 @@ mod watcher_filter_tests {
 
     #[test]
     fn status_bar_attach_skips_unchanged_fingerprint() {
-        reset_status_bar_emission_for_test();
         let tmp = TempDir::new().unwrap();
         let ctx = make_ctx_with_root(tmp.path());
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
@@ -2737,29 +2621,25 @@ mod watcher_filter_tests {
 
     #[test]
     fn semantic_refresh_disconnect_after_started_cancels_refreshing_paths() {
-        // Drains refresh events (-> maybe_fire probe touches global breaker), so
-        // serialize against the other breaker tests.
-        with_semantic_breaker_isolation(|| {
-            let tmp = TempDir::new().unwrap();
-            let root = std::fs::canonicalize(tmp.path()).unwrap();
-            let file = root.join("lib.rs");
-            std::fs::write(&file, "fn main() {}\n").unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
 
-            let ctx = make_ctx_with_root(&root);
-            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-            let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
-            event_tx
-                .send(SemanticRefreshEvent::Started {
-                    paths: vec![file.clone()],
-                })
-                .unwrap();
-            drop(event_tx);
+        let ctx = make_ctx_with_root(&root);
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+        event_tx
+            .send(SemanticRefreshEvent::Started {
+                paths: vec![file.clone()],
+            })
+            .unwrap();
+        drop(event_tx);
 
-            drain_semantic_refresh_events(&ctx);
+        drain_semantic_refresh_events(&ctx);
 
-            assert!(ctx.semantic_refresh_event_rx().borrow().is_none());
-            assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 0);
-        });
+        assert!(ctx.semantic_refresh_event_rx().borrow().is_none());
+        assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 0);
     }
 
     #[test]
@@ -3087,8 +2967,8 @@ mod watcher_filter_tests {
             }
             drain_semantic_refresh_events(&ctx);
 
-            assert!(semantic_refresh_circuit_is_open());
-            assert!(semantic_refresh_probe_is_scheduled_for_test());
+            assert!(semantic_refresh_circuit_is_open(&ctx));
+            assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
 
             for file in files.iter().skip(BREAKER_TRIP_THRESHOLD) {
                 event_tx
@@ -3100,7 +2980,7 @@ mod watcher_filter_tests {
             }
             drain_semantic_refresh_events(&ctx);
 
-            assert!(semantic_refresh_probe_is_scheduled_for_test());
+            assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
             let expected_probe_paths = files[(BREAKER_TRIP_THRESHOLD - 1)..].to_vec();
             let pending = ctx.take_pending_semantic_index_paths();
             assert_eq!(pending, expected_probe_paths);
@@ -3121,6 +3001,27 @@ mod watcher_filter_tests {
                 .recv_timeout(std::time::Duration::from_millis(50))
                 .is_err());
         });
+    }
+
+    #[test]
+    fn semantic_refresh_circuit_breaker_is_per_app_context() {
+        let root_a = TempDir::new().unwrap();
+        let root_b = TempDir::new().unwrap();
+        let ctx_a = make_ctx_with_root(root_a.path());
+        let ctx_b = make_ctx_with_root(root_b.path());
+
+        for _ in 0..BREAKER_TRIP_THRESHOLD {
+            record_semantic_refresh_transient_failure(&ctx_a);
+        }
+
+        assert!(semantic_refresh_circuit_is_open(&ctx_a));
+        assert_eq!(
+            semantic_refresh_transient_failure_count_for_test(&ctx_a),
+            BREAKER_TRIP_THRESHOLD
+        );
+        assert!(!semantic_refresh_circuit_is_open(&ctx_b));
+        assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx_b), 0);
+        assert!(!semantic_refresh_probe_is_scheduled_for_test(&ctx_b));
     }
 
     #[test]
@@ -3147,7 +3048,7 @@ mod watcher_filter_tests {
                     .unwrap();
             }
             drain_semantic_refresh_events(&ctx);
-            assert!(semantic_refresh_circuit_is_open());
+            assert!(semantic_refresh_circuit_is_open(&ctx));
 
             // The pre-breaker failures each schedule a retry on an independent
             // thread with the same backoff, so their arrival order at the channel
@@ -3173,8 +3074,8 @@ mod watcher_filter_tests {
                 .unwrap();
             drain_semantic_refresh_events(&ctx);
 
-            assert!(!semantic_refresh_circuit_is_open());
-            assert_eq!(semantic_refresh_transient_failure_count_for_test(), 0);
+            assert!(!semantic_refresh_circuit_is_open(&ctx));
+            assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx), 0);
 
             let fresh_file = files[BREAKER_TRIP_THRESHOLD].clone();
             event_tx
@@ -3185,8 +3086,8 @@ mod watcher_filter_tests {
                 .unwrap();
             drain_semantic_refresh_events(&ctx);
 
-            assert!(!semantic_refresh_circuit_is_open());
-            assert_eq!(semantic_refresh_transient_failure_count_for_test(), 1);
+            assert!(!semantic_refresh_circuit_is_open(&ctx));
+            assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx), 1);
             assert_eq!(recv_files_request(&request_rx), vec![fresh_file]);
         });
     }
@@ -3226,45 +3127,39 @@ mod watcher_filter_tests {
 
     #[test]
     fn transient_corpus_failure_preserves_pending_semantic_paths() {
-        // Touches the process-global breaker via drain -> maybe_fire probe, so
-        // it must serialize against the other breaker tests (otherwise a
-        // concurrent test's leaked PROBE_READY+CIRCUIT_OPEN makes our drain
-        // spuriously fire the probe and consume our pending paths).
-        with_semantic_breaker_isolation(|| {
-            let tmp = TempDir::new().unwrap();
-            let root = std::fs::canonicalize(tmp.path()).unwrap();
-            let file = root.join("pending.vue");
-            std::fs::write(&file, "<template />").unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("pending.vue");
+        std::fs::write(&file, "<template />").unwrap();
 
-            let ctx = make_ctx_with_root(&root);
-            *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
-            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                stage: "refreshing_corpus".into(),
-                files: Some(1),
-                entries_done: None,
-                entries_total: None,
-            };
-            ctx.add_pending_semantic_index_paths(vec![file.clone()]);
-            let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+        let ctx = make_ctx_with_root(&root);
+        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+            stage: "refreshing_corpus".into(),
+            files: Some(1),
+            entries_done: None,
+            entries_total: None,
+        };
+        ctx.add_pending_semantic_index_paths(vec![file.clone()]);
+        let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
 
-            event_tx
-                .send(SemanticRefreshEvent::CorpusFailed {
-                    error: format!(
-                        "{}backend unavailable",
-                        aft::semantic_index::TRANSIENT_EMBEDDING_MARKER
-                    ),
-                })
-                .unwrap();
+        event_tx
+            .send(SemanticRefreshEvent::CorpusFailed {
+                error: format!(
+                    "{}backend unavailable",
+                    aft::semantic_index::TRANSIENT_EMBEDDING_MARKER
+                ),
+            })
+            .unwrap();
 
-            drain_semantic_refresh_events(&ctx);
+        drain_semantic_refresh_events(&ctx);
 
-            let pending = ctx.take_pending_semantic_index_paths();
-            assert_eq!(pending, vec![file]);
-            assert!(matches!(
-                &*ctx.semantic_index_status().borrow(),
-                SemanticIndexStatus::Ready { .. }
-            ));
-        });
+        let pending = ctx.take_pending_semantic_index_paths();
+        assert_eq!(pending, vec![file]);
+        assert!(matches!(
+            &*ctx.semantic_index_status().borrow(),
+            SemanticIndexStatus::Ready { .. }
+        ));
     }
 
     #[test]

@@ -448,7 +448,7 @@ fn handle_semantic_or_hybrid_search(
                 },
             );
         }
-        SemanticIndexStatus::Ready { refreshing } => {
+        SemanticIndexStatus::Ready { refreshing, .. } => {
             if !refreshing.is_empty() {
                 warnings.push(format!(
                     "{} file(s) refreshing; results for those files may be temporarily missing",
