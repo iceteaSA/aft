@@ -403,6 +403,108 @@ fn html_url_is_converted_to_markdown_before_cache_and_zoom_heading_is_clean() {
     assert!(aft.shutdown().success());
 }
 
+const RUSTDOC_HTML: &str = r##"<!doctype html>
+<html>
+<head><title>stdio</title><script>window.__rustdoc = {};</script></head>
+<body>
+<main>
+<h1>Function <span class="fn">stdio</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1>
+<p>Creates a stdio transport.</p>
+<h2 class="location"><a href="#">stdio</a></h2>
+<h2><a class="doc-anchor" href="#stdio-transport">§</a>StdIO Transport</h2>
+<p>Transport details.</p>
+</main>
+</body>
+</html>
+"##;
+
+#[test]
+fn html_url_rustdoc_headings_are_clean_without_chrome() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(2, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            RUSTDOC_HTML.as_bytes(),
+        );
+    });
+    let url = server.url("/rmcp/latest/rmcp/transport/io/fn.stdio.html");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+
+    let outline = aft.send(
+        &json!({
+            "id": "rustdoc-outline",
+            "command": "outline",
+            "file": &url,
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        outline["success"], true,
+        "rustdoc HTML outline should succeed: {outline:?}"
+    );
+    let text = outline["text"].as_str().expect("outline text");
+    assert!(
+        text.contains("# Function stdio"),
+        "outline should contain clean h1: {text}"
+    );
+    assert!(
+        !text.contains("Copy item path"),
+        "outline must not include copy-path button text: {text}"
+    );
+    assert!(
+        text.contains("## stdio"),
+        "outline should contain clean self-link h2: {text}"
+    );
+    assert!(
+        !text.contains("[stdio](#)"),
+        "outline must not expose self-link as markdown link: {text}"
+    );
+    assert!(
+        text.contains("## StdIO Transport"),
+        "outline should contain section title: {text}"
+    );
+    assert!(
+        !text.contains('§'),
+        "outline must not include section permalink: {text}"
+    );
+    assert!(
+        !text.contains("](#stdio-transport)"),
+        "outline must not include doc-anchor markdown link: {text}"
+    );
+
+    let zoom = aft.send(
+        &json!({
+            "id": "rustdoc-zoom",
+            "command": "zoom",
+            "file": &url,
+            "symbol": "StdIO Transport",
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        zoom["success"], true,
+        "zoom by clean rustdoc heading should succeed: {zoom:?}"
+    );
+    let content = zoom["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("## StdIO Transport"),
+        "zoom should resolve section heading: {content}"
+    );
+    assert!(
+        content.contains("Transport details."),
+        "zoom should include section body: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn markdown_url_cache_content_is_unchanged() {
     let storage = TempDir::new().unwrap();

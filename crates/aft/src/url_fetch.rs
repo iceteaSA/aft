@@ -691,13 +691,19 @@ fn convert_html_body_to_markdown(body: &[u8], url: &str) -> Result<Vec<u8>, UrlF
 fn html_to_markdown_converter() -> HtmlToMarkdown {
     HtmlToMarkdown::builder()
         .skip_tags(vec![
-            "head", "script", "style", "nav", "footer", "aside", "noscript",
+            "head", "script", "style", "nav", "footer", "aside", "noscript", "button",
         ])
         .add_handler(
             vec!["a"],
             |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
-                if is_permalink_anchor(&element) {
+                if is_permalink_anchor(&element)
+                    || handlers.walk_children(element.node).content.trim() == "§"
+                {
                     None
+                } else if element_attr_value(&element, "href")
+                    .is_some_and(|href| href.trim() == "#")
+                {
+                    Some(handlers.walk_children(element.node).content.into())
                 } else {
                     handlers.fallback(element)
                 }
@@ -730,6 +736,7 @@ fn html_to_markdown_converter() -> HtmlToMarkdown {
 
 fn is_permalink_anchor(element: &Element<'_>) -> bool {
     element_has_class_token(element, "hash-link")
+        || element_has_class_token(element, "doc-anchor")
         || element_attr_value(element, "aria-label")
             .is_some_and(|value| value.to_ascii_lowercase().starts_with("direct link to"))
 }
@@ -983,5 +990,38 @@ mod tests {
     fn unsupported_pdf_still_errors_via_resolve() {
         let url = Url::parse("https://example.com/doc.pdf").unwrap();
         assert!(resolve_fetch_extension(&url, "application/pdf").is_none());
+    }
+
+    #[test]
+    fn is_permalink_anchor_doc_anchor_class_drops_anchor() {
+        let md = html_to_markdown_converter()
+            .convert("<a class=\"doc-anchor\" href=\"#stdio-transport\">x</a>")
+            .unwrap();
+        assert_eq!(
+            md.trim(),
+            "",
+            "doc-anchor permalink should be dropped: {md:?}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_rustdoc_heading_cleanup() {
+        let html = "<main><h1>Function <span class=\"fn\">stdio</span>&nbsp;<button id=\"copy-path\">Copy item path</button></h1><h2 class=\"location\"><a href=\"#\">stdio</a></h2><h2><a class=\"doc-anchor\" href=\"#stdio-transport\">§</a>StdIO Transport</h2></main>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert!(md.contains("# Function stdio"), "{md:?}");
+        assert!(!md.contains("Copy item path"), "{md:?}");
+        assert!(md.contains("## stdio"), "{md:?}");
+        assert!(!md.contains("[stdio](#)"), "{md:?}");
+        assert!(md.contains("## StdIO Transport"), "{md:?}");
+        assert!(!md.contains('§'), "{md:?}");
+        assert!(!md.contains("](#stdio-transport)"), "{md:?}");
+    }
+
+    #[test]
+    fn html_to_markdown_docusaurus_hash_link_still_dropped() {
+        let html = "<h2>The Retain Pipeline<a class=\"hash-link\" href=\"#x\" aria-label=\"Direct link to The Retain Pipeline\">\u{200b}</a></h2>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert!(md.contains("## The Retain Pipeline"), "{md:?}");
+        assert!(!md.contains('\u{200b}'), "{md:?}");
     }
 }
