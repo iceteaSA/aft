@@ -544,8 +544,14 @@ function Invoke-AftBgBashScenario {
             command = "configure"
             harness = "opencode"
             project_root = $ProjectDir
-            experimental_bash_background = $true
-        } | ConvertTo-Json -Compress
+            config = @(
+                @{
+                    tier   = "user"
+                    source = "<inline>"
+                    doc    = '{"bash":{"background":true}}'
+                }
+            )
+        } | ConvertTo-Json -Compress -Depth 6
         $proc.StandardInput.WriteLine($configure)
         $proc.StandardInput.Flush()
         $cfgResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-configure" -TimeoutSec 30
@@ -641,8 +647,14 @@ function Invoke-AftNdjsonScenario {
             command = "configure"
             harness = "opencode"
             project_root = $ProjectDir
-            experimental_bash_background = $true
-        } | ConvertTo-Json -Compress
+            config = @(
+                @{
+                    tier   = "user"
+                    source = "<inline>"
+                    doc    = '{"bash":{"background":true}}'
+                }
+            )
+        } | ConvertTo-Json -Compress -Depth 6
         $proc.StandardInput.WriteLine($configure)
         $proc.StandardInput.Flush()
         $cfgResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-configure" -TimeoutSec 30

@@ -76,7 +76,7 @@ pub fn spawn(
         return Response::error(
             request_id,
             "feature_disabled",
-            "background bash is disabled; set `experimental.bash.background: true` in aft.jsonc",
+            "background bash is disabled; set `bash: { background: true }` (or `bash: true`) in aft.jsonc",
         );
     }
 
