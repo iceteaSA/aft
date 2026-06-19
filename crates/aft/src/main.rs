@@ -2,12 +2,11 @@ mod cli;
 use aft::bash_background::BgTaskRegistry;
 use aft::config::Config;
 use aft::context::{
-    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
+    App, AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
     SemanticRefreshRequest,
 };
 use aft::log_ctx;
 use aft::lsp::client::LspEvent;
-use aft::parser::TreeSitterProvider;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::runtime_registry::RuntimeRegistry;
 use aft::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
@@ -70,8 +69,9 @@ fn main() {
 
     aft::slog_info!("started, pid {}", std::process::id());
 
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-    let registry = RuntimeRegistry::standalone(ctx);
+    let app = App::default_shared();
+    let ctx = AppContext::from_app(Arc::clone(&app), Config::default());
+    let registry = RuntimeRegistry::standalone(app, ctx);
     // P3-02: signal/shutdown is a process service; N>1 must aggregate
     // all runtime registries (or move to one shared registry). Standalone
     // routes through the selected single runtime for now.

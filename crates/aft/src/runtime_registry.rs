@@ -1,14 +1,21 @@
-use crate::context::AppContext;
+use std::sync::Arc;
+
+use crate::context::{App, AppContext};
 
 pub type ProjectRuntime = AppContext;
 
 pub struct RuntimeRegistry {
+    app: Arc<App>,
     single: ProjectRuntime,
 }
 
 impl RuntimeRegistry {
-    pub fn standalone(rt: ProjectRuntime) -> Self {
-        Self { single: rt }
+    pub fn standalone(app: Arc<App>, rt: ProjectRuntime) -> Self {
+        Self { app, single: rt }
+    }
+
+    pub fn app(&self) -> Arc<App> {
+        Arc::clone(&self.app)
     }
 
     pub fn current(&self) -> &ProjectRuntime {
@@ -32,7 +39,10 @@ mod tests {
     #[test]
     fn standalone_current_and_iter_return_single_runtime() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        let mut registry = RuntimeRegistry::standalone(ctx);
+        let app = ctx.app();
+        let mut registry = RuntimeRegistry::standalone(Arc::clone(&app), ctx);
+        assert!(Arc::ptr_eq(&app, &registry.app()));
+        assert!(Arc::ptr_eq(&app, &registry.current().app()));
 
         let current_ptr = registry.current() as *const ProjectRuntime;
         let iter_ptrs = registry

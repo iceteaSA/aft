@@ -24,7 +24,7 @@ use crate::inspect::{
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
-use crate::parser::{SharedSymbolCache, SymbolCache};
+use crate::parser::{SharedSymbolCache, SymbolCache, TreeSitterProvider};
 use crate::protocol::{
     ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
 };
@@ -486,6 +486,107 @@ fn iterative_follow_chain(
     Ok(())
 }
 
+pub type LanguageProviderFactory = fn() -> Box<dyn LanguageProvider>;
+
+pub fn default_language_provider_factory() -> Box<dyn LanguageProvider> {
+    Box::new(TreeSitterProvider::new())
+}
+
+/// Process-global services shared by all project actors in this AFT process.
+///
+/// `App` owns only true process services. Per-root caches and the live
+/// language provider instance stay in [`AppContext`].
+pub struct App {
+    db: RefCell<Option<Arc<Mutex<Connection>>>>,
+    lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
+    stdout_writer: SharedStdoutWriter,
+    progress_sender: SharedProgressSender,
+    provider_factory: LanguageProviderFactory,
+}
+
+impl App {
+    pub fn new(provider_factory: LanguageProviderFactory) -> Self {
+        Self {
+            db: RefCell::new(None),
+            lsp_child_registry: crate::lsp::child_registry::LspChildRegistry::new(),
+            stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
+            progress_sender: Arc::new(Mutex::new(None)),
+            provider_factory,
+        }
+    }
+
+    /// Create the shared process `App` handle required by the actor split.
+    ///
+    /// `App` intentionally contains single-threaded `RefCell` state but is held
+    /// behind `Arc` so registry/actor ownership can be split without changing
+    /// the public runtime shape in this N=1 slice. Do not send this handle to
+    /// background threads; clone explicit handles instead.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn shared(provider_factory: LanguageProviderFactory) -> Arc<Self> {
+        Arc::new(Self::new(provider_factory))
+    }
+
+    pub fn default_shared() -> Arc<Self> {
+        Self::shared(default_language_provider_factory)
+    }
+
+    pub fn create_provider(&self) -> Box<dyn LanguageProvider> {
+        (self.provider_factory)()
+    }
+
+    pub fn lsp_child_registry(&self) -> crate::lsp::child_registry::LspChildRegistry {
+        self.lsp_child_registry.clone()
+    }
+
+    pub fn stdout_writer(&self) -> SharedStdoutWriter {
+        Arc::clone(&self.stdout_writer)
+    }
+
+    fn progress_sender(&self) -> SharedProgressSender {
+        Arc::clone(&self.progress_sender)
+    }
+
+    pub fn set_progress_sender(&self, sender: Option<ProgressSender>) {
+        if let Ok(mut progress_sender) = self.progress_sender.lock() {
+            *progress_sender = sender;
+        }
+    }
+
+    pub fn emit_progress(&self, frame: ProgressFrame) {
+        let Ok(progress_sender) = self.progress_sender.lock().map(|sender| sender.clone()) else {
+            return;
+        };
+        if let Some(sender) = progress_sender.as_ref() {
+            sender(PushFrame::Progress(frame));
+        }
+    }
+
+    pub fn progress_sender_handle(&self) -> Option<ProgressSender> {
+        self.progress_sender
+            .lock()
+            .ok()
+            .and_then(|sender| sender.clone())
+    }
+
+    pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
+        *self.db.borrow_mut() = Some(conn);
+    }
+
+    pub fn clear_db(&self) {
+        *self.db.borrow_mut() = None;
+    }
+
+    pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
+        self.db.borrow().clone()
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new(default_language_provider_factory)
+    }
+}
+
 /// Shared application context threaded through all command handlers.
 ///
 /// Holds the language provider, backup/checkpoint stores, configuration,
@@ -496,10 +597,10 @@ fn iterative_follow_chain(
 /// (one request at a time on the stdin read loop) so runtime borrow checking
 /// is safe and never contended.
 pub struct AppContext {
+    app: Arc<App>,
     provider: Box<dyn LanguageProvider>,
     backup: RefCell<BackupStore>,
     checkpoint: RefCell<CheckpointStore>,
-    db: RefCell<Option<Arc<Mutex<Connection>>>>,
     config: RefCell<Config>,
     pub harness: RefCell<Option<Harness>>,
     canonical_cache_root: RefCell<Option<PathBuf>>,
@@ -539,12 +640,6 @@ pub struct AppContext {
     watcher_rx: RefCell<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_thread: RefCell<Option<WatcherThreadHandle>>,
     lsp_manager: RefCell<LspManager>,
-    /// Shared registry of LSP child PIDs. Cloned and passed to the signal
-    /// handler so it can SIGKILL all children before aft exits, preventing
-    /// orphaned LSP processes when bridge.shutdown() SIGTERMs aft.
-    lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
-    stdout_writer: SharedStdoutWriter,
-    progress_sender: SharedProgressSender,
     configure_generation: AtomicU64,
     /// Last-seen value of `InspectManager::reuse_completion_count()`, so the
     /// per-request inspect drain can detect watcher-driven Tier-2 scans that
@@ -634,27 +729,37 @@ fn callgraph_build_wait_window() -> Duration {
 
 impl AppContext {
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
+        Self::with_app_and_provider(App::default_shared(), provider, config)
+    }
+
+    pub fn from_app(app: Arc<App>, config: Config) -> Self {
+        let provider = app.create_provider();
+        Self::with_app_and_provider(app, provider, config)
+    }
+
+    pub fn with_app_and_provider(
+        app: Arc<App>,
+        provider: Box<dyn LanguageProvider>,
+        config: Config,
+    ) -> Self {
         let bash_compress_enabled = config.experimental_bash_compress;
-        let progress_sender = Arc::new(Mutex::new(None));
-        let stdout_writer = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
         let (configure_warnings_tx, configure_warnings_rx) = mpsc::channel();
-        let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
+        let status_emitter = StatusEmitter::new(app.progress_sender());
         let symbol_cache = provider
             .as_any()
-            .downcast_ref::<crate::parser::TreeSitterProvider>()
+            .downcast_ref::<TreeSitterProvider>()
             .map(|provider| provider.symbol_cache())
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(SymbolCache::new())));
-        let lsp_child_registry = crate::lsp::child_registry::LspChildRegistry::new();
         let mut lsp_manager = LspManager::new();
-        lsp_manager.set_child_registry(lsp_child_registry.clone());
+        lsp_manager.set_child_registry(app.lsp_child_registry());
         // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
         // so the documented `lsp.diagnostic_cache_size` knob takes effect.
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         AppContext {
+            app: Arc::clone(&app),
             provider,
             backup: RefCell::new(BackupStore::new()),
             checkpoint: RefCell::new(CheckpointStore::new()),
-            db: RefCell::new(None),
             config: RefCell::new(config),
             harness: RefCell::new(None),
             canonical_cache_root: RefCell::new(None),
@@ -687,16 +792,13 @@ impl AppContext {
             watcher_rx: RefCell::new(None),
             watcher_thread: RefCell::new(None),
             lsp_manager: RefCell::new(lsp_manager),
-            lsp_child_registry,
-            stdout_writer,
-            progress_sender: Arc::clone(&progress_sender),
             configure_generation: AtomicU64::new(0),
             last_seen_reuse_completions: AtomicU64::new(0),
             configure_warnings_tx,
             configure_warnings_rx,
             status_emitter,
             status_bar_last_emitted: RefCell::new(None),
-            bash_background: BgTaskRegistry::new(progress_sender),
+            bash_background: BgTaskRegistry::new(app.progress_sender()),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
             )),
@@ -1075,29 +1177,26 @@ impl AppContext {
         }
     }
 
+    pub fn app(&self) -> Arc<App> {
+        Arc::clone(&self.app)
+    }
+
     /// Clone the LSP child registry handle. Used by main.rs to give the
     /// signal handler thread a way to SIGKILL LSP children on shutdown.
     pub fn lsp_child_registry(&self) -> crate::lsp::child_registry::LspChildRegistry {
-        self.lsp_child_registry.clone()
+        self.app.lsp_child_registry()
     }
 
     pub fn stdout_writer(&self) -> SharedStdoutWriter {
-        Arc::clone(&self.stdout_writer)
+        self.app.stdout_writer()
     }
 
     pub fn set_progress_sender(&self, sender: Option<ProgressSender>) {
-        if let Ok(mut progress_sender) = self.progress_sender.lock() {
-            *progress_sender = sender;
-        }
+        self.app.set_progress_sender(sender);
     }
 
     pub fn emit_progress(&self, frame: ProgressFrame) {
-        let Ok(progress_sender) = self.progress_sender.lock().map(|sender| sender.clone()) else {
-            return;
-        };
-        if let Some(sender) = progress_sender.as_ref() {
-            sender(PushFrame::Progress(frame));
-        }
+        self.app.emit_progress(frame);
     }
 
     pub fn status_emitter(&self) -> &StatusEmitter {
@@ -1112,10 +1211,7 @@ impl AppContext {
     /// configure has already returned, so configure latency stays sub-100 ms
     /// even on huge directories.
     pub fn progress_sender_handle(&self) -> Option<ProgressSender> {
-        self.progress_sender
-            .lock()
-            .ok()
-            .and_then(|sender| sender.clone())
+        self.app.progress_sender_handle()
     }
 
     pub fn advance_configure_generation(&self) -> u64 {
@@ -1164,15 +1260,15 @@ impl AppContext {
     }
 
     pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
-        *self.db.borrow_mut() = Some(conn);
+        self.app.set_db(conn);
     }
 
     pub fn clear_db(&self) {
-        *self.db.borrow_mut() = None;
+        self.app.clear_db();
     }
 
     pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
-        self.db.borrow().clone()
+        self.app.db()
     }
 
     /// Access the configuration (shared borrow).
