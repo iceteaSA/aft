@@ -73,10 +73,9 @@ fn dispatch_category(job: InspectJob) -> InspectResult {
         InspectCategory::UnusedExports => scanners::unused_exports::run_unused_exports_scan(&job),
         InspectCategory::Duplicates => scanners::duplicates::run_duplicates_scan(&job),
         InspectCategory::Diagnostics => {
-            // Diagnostics are backed by the AppContext LSP manager (RefCell, not
-            // Send/Sync), so they run on the main thread via
-            // `run_diagnostics_category` in `handle_inspect` — never through this
-            // rayon worker pool. Reaching this arm means a caller routed
+            // Diagnostics are backed by the AppContext LSP manager and run via
+            // the serial LSP/status lane in `handle_inspect` — never through
+            // this rayon worker pool. Reaching this arm means a caller routed
             // Diagnostics into the worker path incorrectly; surface that as a
             // routing bug instead of a misleading "pending" status.
             let started = Instant::now();

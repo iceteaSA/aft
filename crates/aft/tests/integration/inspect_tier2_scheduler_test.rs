@@ -63,7 +63,7 @@ fn configured_context(root: &Path) -> AppContext {
 
 fn drain_callgraph_store_for_test(ctx: &AppContext) {
     let (latest, disconnected) = {
-        let rx_ref = ctx.callgraph_store_rx().borrow();
+        let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
@@ -86,9 +86,9 @@ fn drain_callgraph_store_for_test(ctx: &AppContext) {
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(store));
-        *ctx.callgraph_store_rx().borrow_mut() = None;
+        *ctx.callgraph_store_rx().lock() = None;
     } else if disconnected {
-        *ctx.callgraph_store_rx().borrow_mut() = None;
+        *ctx.callgraph_store_rx().lock() = None;
     }
 }
 

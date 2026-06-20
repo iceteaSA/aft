@@ -7,7 +7,7 @@ use std::path::Path;
 /// Params: `file` (string, optional) — path to a single file to undo.
 /// Returns: `{ path, backup_id }` on success, or `no_undo_history` error.
 pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut backup = ctx.backup().borrow_mut();
+    let mut backup = ctx.backup().lock();
 
     let Some(file) = req.params.get("file").and_then(|v| v.as_str()) else {
         return match backup.restore_last_operation(req.session()) {
@@ -56,7 +56,7 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
 /// otherwise previews the most recent operation in the session.
 /// Returns: `{ paths, count }` on success, or `no_undo_history` error.
 pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
-    let backup = ctx.backup().borrow();
+    let backup = ctx.backup().lock();
 
     let preview = req
         .params

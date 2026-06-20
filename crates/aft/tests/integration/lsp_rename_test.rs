@@ -177,7 +177,7 @@ fn test_rename_rollback_on_failure() {
 
     let history = ctx
         .backup()
-        .borrow()
+        .lock()
         .history(aft::protocol::DEFAULT_SESSION_ID, &main_rs);
     assert!(
         history.is_empty(),

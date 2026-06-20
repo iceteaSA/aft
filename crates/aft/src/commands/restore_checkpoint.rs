@@ -26,7 +26,7 @@ fn handle_restore_checkpoint_impl(
         }
     };
 
-    let checkpoint_store = ctx.checkpoint().borrow();
+    let checkpoint_store = ctx.checkpoint().lock();
     let file_paths = checkpoint_store
         .file_paths(req.session(), name)
         .map_err(|e| Response::error(&req.id, e.code(), e.to_string()))?;

@@ -39,9 +39,9 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut tier2_refresh_needed = false;
     for category in InspectCategory::active() {
         let outcome = if *category == InspectCategory::Diagnostics {
-            // Diagnostics are backed by the AppContext LSP manager (RefCell, not
-            // Send/Sync), so they must be computed on this main dispatch thread.
-            // Do not send them through InspectManager's rayon worker path.
+            // Diagnostics are backed by the AppContext LSP manager and must stay
+            // on the serial LSP/status lane. Do not send them through
+            // InspectManager's rayon worker path.
             run_diagnostics_category(ctx, &snapshot, &scope, scope_was_provided)
         } else if category.is_tier2() {
             // Tier 2 (dead_code, unused_exports, duplicates) are NEVER scanned

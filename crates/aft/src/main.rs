@@ -774,7 +774,7 @@ fn handle_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(resp) => return resp,
     };
     let path = path.as_path();
-    let mut backup = ctx.backup().borrow_mut();
+    let mut backup = ctx.backup().lock();
 
     match backup.snapshot(req.session(), path, "manual snapshot") {
         Ok(id) => Response::success(&req.id, serde_json::json!({ "backup_id": id })),
@@ -1179,7 +1179,7 @@ fn refresh_project_corpus(ctx: &AppContext, reason: &str, invalidate_ignore_path
     let mut status_changed = false;
 
     if invalidate_ignore_paths {
-        if let Some(graph) = ctx.callgraph().borrow_mut().as_mut() {
+        if let Some(graph) = ctx.callgraph().lock().as_mut() {
             graph.invalidate_file(&root.join(".gitignore"));
             graph.invalidate_file(&root.join(".aftignore"));
         }
@@ -1214,7 +1214,7 @@ fn refresh_project_corpus(ctx: &AppContext, reason: &str, invalidate_ignore_path
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.is_some()
         };
-        if callgraph_store_resident || ctx.callgraph_store_rx().borrow().is_some() {
+        if callgraph_store_resident || ctx.callgraph_store_rx().lock().is_some() {
             *ctx.callgraph_store()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -1258,7 +1258,7 @@ fn refresh_project_corpus(ctx: &AppContext, reason: &str, invalidate_ignore_path
                     status_changed = true;
                 }
             }
-        } else if ctx.semantic_index_rx().borrow().is_some() {
+        } else if ctx.semantic_index_rx().lock().is_some() {
             ctx.mark_pending_semantic_corpus_refresh();
         }
     }
@@ -1280,8 +1280,8 @@ fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
     ctx.clear_tsconfig_membership_cache();
     let mut status_changed = true;
 
-    if ctx.callgraph().borrow().is_some() {
-        *ctx.callgraph().borrow_mut() = Some(aft::callgraph::CallGraph::new(root));
+    if ctx.callgraph().lock().is_some() {
+        *ctx.callgraph().lock() = Some(aft::callgraph::CallGraph::new(root));
     }
 
     status_changed |= refresh_project_corpus(ctx, "watcher overflow", false);
@@ -1317,7 +1317,7 @@ fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::
         // changed paths so they're replayed once the freshly-built store lands
         // (otherwise mid-build edits would be silently lost). If no build is
         // running, there's nothing to refresh.
-        if ctx.callgraph_store_rx().borrow().is_some() {
+        if ctx.callgraph_store_rx().lock().is_some() {
             ctx.add_pending_callgraph_store_paths(source_paths);
         }
         return;
@@ -1350,7 +1350,7 @@ fn drain_watcher_events(ctx: &AppContext) {
     let mut root_deleted = false;
 
     {
-        let rx_ref = ctx.watcher_rx().borrow();
+        let rx_ref = ctx.watcher_rx().lock();
         let rx = match rx_ref.as_ref() {
             Some(rx) => rx,
             None => {
@@ -1490,7 +1490,7 @@ fn drain_watcher_events(ctx: &AppContext) {
         .filter(|path| watcher_path_is_semantic_source(path))
         .cloned()
         .collect::<Vec<_>>();
-    let semantic_build_in_progress = ctx.semantic_index_rx().borrow().is_some();
+    let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
     if !oversized_inline_batch
         && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
@@ -1506,7 +1506,7 @@ fn drain_watcher_events(ctx: &AppContext) {
     }
 
     // Phase 2: invalidate each changed file in the call graph
-    let mut graph_ref = ctx.callgraph().borrow_mut();
+    let mut graph_ref = ctx.callgraph().lock();
     if let Some(graph) = graph_ref.as_mut() {
         for path in &changed {
             if watcher_path_is_source(path) {
@@ -1677,7 +1677,7 @@ fn drain_search_index_events(ctx: &AppContext) {
 /// receiver is cleared so a later op can retry the cold build.
 fn drain_callgraph_store_events(ctx: &AppContext) {
     let (latest, disconnected) = {
-        let rx_ref = ctx.callgraph_store_rx().borrow();
+        let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
@@ -1725,7 +1725,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
     }
 
     if disconnected || installed {
-        *ctx.callgraph_store_rx().borrow_mut() = None;
+        *ctx.callgraph_store_rx().lock() = None;
         if disconnected && !installed {
             // Build failed: discard pending paths (no store to apply them to);
             // a later op restarts the build and re-walks the project.
@@ -1741,7 +1741,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
 
 fn drain_semantic_index_events(ctx: &AppContext) {
     let (events, disconnected) = {
-        let rx_ref = ctx.semantic_index_rx().borrow();
+        let rx_ref = ctx.semantic_index_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
@@ -1848,7 +1848,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     }
 
     if !keep_receiver {
-        *ctx.semantic_index_rx().borrow_mut() = None;
+        *ctx.semantic_index_rx().lock() = None;
     }
 
     if replay_corpus_refresh {
@@ -1918,7 +1918,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
 
 fn drain_semantic_refresh_events(ctx: &AppContext) {
     let (events, disconnected) = {
-        let rx_ref = ctx.semantic_refresh_event_rx().borrow();
+        let rx_ref = ctx.semantic_refresh_event_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
@@ -2298,7 +2298,7 @@ mod watcher_filter_tests {
 
     fn install_watcher_rx(ctx: &AppContext) -> crossbeam_channel::Sender<WatcherDispatchEvent> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        *ctx.watcher_rx().borrow_mut() = Some(rx);
+        *ctx.watcher_rx().lock() = Some(rx);
         tx
     }
 
@@ -2845,7 +2845,7 @@ mod watcher_filter_tests {
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let ctx = make_ctx_with_root(&root);
         let (tx, rx) = crossbeam_channel::unbounded::<SemanticIndexEvent>();
-        *ctx.semantic_index_rx().borrow_mut() = Some(rx);
+        *ctx.semantic_index_rx().lock() = Some(rx);
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
@@ -2858,7 +2858,7 @@ mod watcher_filter_tests {
 
         drain_semantic_index_events(&ctx);
 
-        assert!(ctx.semantic_index_rx().borrow().is_none());
+        assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(matches!(
             &*ctx.semantic_index_status()
                 .read()
@@ -2889,7 +2889,7 @@ mod watcher_filter_tests {
 
         drain_semantic_refresh_events(&ctx);
 
-        assert!(ctx.semantic_refresh_event_rx().borrow().is_none());
+        assert!(ctx.semantic_refresh_event_rx().lock().is_none());
         assert_eq!(
             ctx.semantic_index_status()
                 .read()
@@ -2954,7 +2954,7 @@ mod watcher_filter_tests {
         // ...and the drain itself did NOT spawn a build (no inline cold_build on
         // the dispatch thread); the rebuild happens lazily on the next op.
         assert!(
-            ctx.callgraph_store_rx().borrow().is_none(),
+            ctx.callgraph_store_rx().lock().is_none(),
             "drain must not start a synchronous/inline callgraph build"
         );
         // The next callgraph op will see the force flag and background-build.
@@ -3026,7 +3026,7 @@ mod watcher_filter_tests {
             "oversized watcher batch must drop the resident store instead of refreshing inline"
         );
         assert!(
-            ctx.callgraph_store_rx().borrow().is_none(),
+            ctx.callgraph_store_rx().lock().is_none(),
             "drain must not start a callgraph cold build on the dispatch thread"
         );
         assert!(
@@ -3071,7 +3071,7 @@ mod watcher_filter_tests {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let ctx = make_ctx_with_root(&root);
-        *ctx.callgraph().borrow_mut() = Some(aft::callgraph::CallGraph::new(root.clone()));
+        *ctx.callgraph().lock() = Some(aft::callgraph::CallGraph::new(root.clone()));
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx
             .send(WatcherDispatchEvent::Error(
@@ -3081,7 +3081,7 @@ mod watcher_filter_tests {
 
         drain_watcher_events(&ctx);
 
-        assert!(ctx.watcher_rx().borrow().is_none());
+        assert!(ctx.watcher_rx().lock().is_none());
         assert!(ctx
             .degraded_reasons()
             .contains(&"watcher_unavailable".to_string()));
@@ -3091,10 +3091,7 @@ mod watcher_filter_tests {
             status["degraded_reasons"],
             serde_json::json!(["watcher_unavailable"])
         );
-        assert!(
-            ctx.callgraph().borrow().is_some(),
-            "callgraph remains usable"
-        );
+        assert!(ctx.callgraph().lock().is_some(), "callgraph remains usable");
     }
 
     #[test]
@@ -3109,7 +3106,7 @@ mod watcher_filter_tests {
 
         drain_watcher_events(&ctx);
 
-        assert!(ctx.watcher_rx().borrow().is_none());
+        assert!(ctx.watcher_rx().lock().is_none());
         assert!(ctx
             .degraded_reasons()
             .contains(&"project_root_deleted".to_string()));

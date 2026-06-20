@@ -54,10 +54,10 @@ struct DiagnosticsCollection {
 
 /// Main-thread implementation for the `diagnostics` inspect category.
 ///
-/// The LSP manager is owned by `AppContext` behind a `RefCell`, so this category
-/// must never be dispatched through the rayon inspect worker pool. `handle_inspect`
-/// calls this directly, alongside the Tier-1 reads, while Tier-2 categories keep
-/// using the cache/worker path.
+/// The LSP manager is owned by `AppContext` and is part of the serial LSP/status
+/// lane, so this category must never be dispatched through the rayon inspect
+/// worker pool. `handle_inspect` calls this directly, alongside the Tier-1 reads,
+/// while Tier-2 categories keep using the cache/worker path.
 pub(crate) fn run_diagnostics_category(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,

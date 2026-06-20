@@ -221,7 +221,7 @@ fn rewrite_append_uses_original_session_for_backups() {
         config.storage_dir = Some(storage.path().to_path_buf());
     });
     ctx.backup()
-        .borrow_mut()
+        .lock()
         .set_storage_dir(storage.path().to_path_buf(), 168);
     let session_id = "bash-rewrite-session";
 

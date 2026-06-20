@@ -578,7 +578,7 @@ fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
 /// without the status-emitter signal (warmup has no sidebar consumer).
 fn drain_callgraph_store_events(ctx: &AppContext) {
     let (latest, disconnected) = {
-        let rx_ref = ctx.callgraph_store_rx().borrow();
+        let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
@@ -613,7 +613,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
     }
 
     if disconnected || installed {
-        *ctx.callgraph_store_rx().borrow_mut() = None;
+        *ctx.callgraph_store_rx().lock() = None;
         if disconnected && !installed {
             let _ = ctx.take_pending_callgraph_store_paths();
         }
@@ -635,7 +635,7 @@ fn callgraph_store_state(
     {
         return SubsystemState::Ready;
     }
-    if ctx.callgraph_store_rx().borrow().is_some() {
+    if ctx.callgraph_store_rx().lock().is_some() {
         return SubsystemState::Pending("building".to_string());
     }
     // No store, no in-flight build: the cold build finished without producing a
@@ -669,7 +669,7 @@ fn drain_search_index_events(ctx: &AppContext) {
 
 fn drain_semantic_index_events(ctx: &AppContext) {
     let events = {
-        let rx_ref = ctx.semantic_index_rx().borrow();
+        let rx_ref = ctx.semantic_index_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
@@ -728,7 +728,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     }
 
     if !keep_receiver {
-        *ctx.semantic_index_rx().borrow_mut() = None;
+        *ctx.semantic_index_rx().lock() = None;
     }
 }
 

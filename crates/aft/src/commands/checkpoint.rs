@@ -44,7 +44,7 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
         .unwrap_or_default();
 
     let file_list = if files.is_empty() {
-        let backup = ctx.backup().borrow();
+        let backup = ctx.backup().lock();
         backup.tracked_files(req.session())
     } else {
         files
@@ -52,8 +52,8 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
 
     let validated_files = validate_checkpoint_files(&req.id, ctx, file_list)?;
 
-    let backup = ctx.backup().borrow();
-    let mut checkpoint_store = ctx.checkpoint().borrow_mut();
+    let backup = ctx.backup().lock();
+    let mut checkpoint_store = ctx.checkpoint().lock();
 
     match checkpoint_store.create(req.session(), name, validated_files, &backup) {
         Ok(info) => {
@@ -112,7 +112,7 @@ pub fn handle_checkpoint_paths(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let checkpoint_store = ctx.checkpoint().borrow();
+    let checkpoint_store = ctx.checkpoint().lock();
     match checkpoint_store.absolute_file_paths(req.session(), name) {
         Ok(paths) => Response::success(
             &req.id,

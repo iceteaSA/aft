@@ -195,9 +195,9 @@ impl AppContext {
         // Per-session undo/checkpoint counts (issue #14 — one shared bridge serves
         // many sessions; surface both the global footprint and the current
         // session's own slice so `/aft-status` can split them in the UI).
-        let checkpoint_total = self.checkpoint().borrow().total_count();
-        let session_checkpoints = self.checkpoint().borrow().list(session_id).len();
-        let session_tracked_files = self.backup().borrow().tracked_files(session_id).len();
+        let checkpoint_total = self.checkpoint().lock().total_count();
+        let session_checkpoints = self.checkpoint().lock().list(session_id).len();
+        let session_tracked_files = self.backup().lock().tracked_files(session_id).len();
         let compression = self.compression_stats_for_session(session_id);
 
         // Degraded-mode reasons recorded by `handle_configure` when the

@@ -1,4 +1,3 @@
-use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
@@ -497,7 +496,7 @@ pub fn default_language_provider_factory() -> Box<dyn LanguageProvider> {
 /// `App` owns only true process services. Per-root caches and the live
 /// language provider instance stay in [`AppContext`].
 pub struct App {
-    db: RefCell<Option<Arc<Mutex<Connection>>>>,
+    db: parking_lot::Mutex<Option<Arc<Mutex<Connection>>>>,
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
     progress_sender: SharedProgressSender,
@@ -507,7 +506,7 @@ pub struct App {
 impl App {
     pub fn new(provider_factory: LanguageProviderFactory) -> Self {
         Self {
-            db: RefCell::new(None),
+            db: parking_lot::Mutex::new(None),
             lsp_child_registry: crate::lsp::child_registry::LspChildRegistry::new(),
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
             progress_sender: Arc::new(Mutex::new(None)),
@@ -516,12 +515,6 @@ impl App {
     }
 
     /// Create the shared process `App` handle required by the actor split.
-    ///
-    /// `App` intentionally contains single-threaded `RefCell` state but is held
-    /// behind `Arc` so registry/actor ownership can be split without changing
-    /// the public runtime shape in this N=1 slice. Do not send this handle to
-    /// background threads; clone explicit handles instead.
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn shared(provider_factory: LanguageProviderFactory) -> Arc<Self> {
         Arc::new(Self::new(provider_factory))
     }
@@ -569,15 +562,15 @@ impl App {
     }
 
     pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
-        *self.db.borrow_mut() = Some(conn);
+        *self.db.lock() = Some(conn);
     }
 
     pub fn clear_db(&self) {
-        *self.db.borrow_mut() = None;
+        *self.db.lock() = None;
     }
 
     pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
-        self.db.borrow().clone()
+        self.db.lock().clone()
     }
 }
 
@@ -587,27 +580,36 @@ impl Default for App {
     }
 }
 
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>() {}
+
+    assert_send_sync::<App>();
+    assert_send::<crate::lsp::manager::LspManager>();
+    assert_send::<crate::semantic_index::EmbeddingModel>();
+};
+
 /// Shared application context threaded through all command handlers.
 ///
 /// Holds the language provider, backup/checkpoint stores, configuration,
 /// and call graph engine. Constructed once at startup and passed by
 /// reference to `dispatch`.
 ///
-/// Most stores use `RefCell` for interior mutability — the binary is single-threaded
-/// (one request at a time on the stdin read loop) so runtime borrow checking
-/// is safe and never contended. `config` is a thread-safe owned snapshot so
-/// future read-side dispatch can hold configuration across other work without
-/// holding a lock guard.
+/// Write-rarely stores use `parking_lot::Mutex` for interior mutability so the
+/// context substrate can become thread-safe without changing the current N=1
+/// dispatch behavior. `config` is a thread-safe owned snapshot so future
+/// read-side dispatch can hold configuration across other work without holding
+/// a lock guard.
 pub struct AppContext {
     app: Arc<App>,
     provider: Box<dyn LanguageProvider>,
-    backup: RefCell<BackupStore>,
-    checkpoint: RefCell<CheckpointStore>,
+    backup: parking_lot::Mutex<BackupStore>,
+    checkpoint: parking_lot::Mutex<CheckpointStore>,
     config: RwLock<Arc<Config>>,
-    pub harness: RefCell<Option<Harness>>,
-    canonical_cache_root: RefCell<Option<PathBuf>>,
-    is_worktree_bridge: RefCell<bool>,
-    git_common_dir: RefCell<Option<PathBuf>>,
+    pub harness: parking_lot::Mutex<Option<Harness>>,
+    canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
+    is_worktree_bridge: parking_lot::Mutex<bool>,
+    git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
     /// Reasons (if any) why heavy AFT subsystems were auto-disabled for the
     /// current project root. Populated by `handle_configure` based on the
     /// canonical project root and synchronous file count. Each reason is a
@@ -615,40 +617,42 @@ pub struct AppContext {
     /// `"search_too_many_files:N"`, etc.) so the plugin can render distinct
     /// degraded-mode UI states without re-deriving the reason locally.
     /// Empty when the project is healthy / full-featured.
-    degraded_reasons: RefCell<Vec<String>>,
-    callgraph: RefCell<Option<CallGraph>>,
+    degraded_reasons: parking_lot::Mutex<Vec<String>>,
+    callgraph: parking_lot::Mutex<Option<CallGraph>>,
     callgraph_store: RwLock<Option<Arc<CallGraphStore>>>,
-    callgraph_store_force_rebuild: RefCell<bool>,
-    callgraph_store_rx: RefCell<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
-    pending_callgraph_store_paths: RefCell<BTreeSet<PathBuf>>,
+    callgraph_store_force_rebuild: parking_lot::Mutex<bool>,
+    callgraph_store_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
+    pending_callgraph_store_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     search_index: RwLock<Option<SearchIndex>>,
     search_index_rx: RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>>,
-    pending_search_index_paths: RefCell<BTreeSet<PathBuf>>,
+    pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
-    tier2_refresh_scheduler: RefCell<Tier2RefreshScheduler>,
+    tier2_refresh_scheduler: parking_lot::Mutex<Tier2RefreshScheduler>,
     semantic_index: RwLock<Option<SemanticIndex>>,
-    semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
+    semantic_index_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RwLock<SemanticIndexStatus>,
-    pending_semantic_index_paths: RefCell<BTreeSet<PathBuf>>,
-    pending_semantic_corpus_refresh: RefCell<bool>,
-    semantic_refresh_tx: RefCell<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>,
-    semantic_refresh_event_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>>,
-    semantic_refresh_worker: RefCell<Option<SemanticRefreshWorkerSlot>>,
-    semantic_refresh_retry_attempts: RefCell<BTreeMap<PathBuf, usize>>,
+    pending_semantic_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
+    pending_semantic_corpus_refresh: parking_lot::Mutex<bool>,
+    semantic_refresh_tx:
+        parking_lot::Mutex<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>,
+    semantic_refresh_event_rx:
+        parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>>,
+    semantic_refresh_worker: parking_lot::Mutex<Option<SemanticRefreshWorkerSlot>>,
+    semantic_refresh_retry_attempts: parking_lot::Mutex<BTreeMap<PathBuf, usize>>,
     semantic_refresh_circuit: Arc<SemanticRefreshCircuit>,
-    semantic_embedding_model: RefCell<Option<crate::semantic_index::EmbeddingModel>>,
-    watcher: RefCell<Option<RecommendedWatcher>>,
-    watcher_rx: RefCell<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
-    watcher_thread: RefCell<Option<WatcherThreadHandle>>,
-    lsp_manager: RefCell<LspManager>,
+    semantic_embedding_model: parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>,
+    watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
+    watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
+    watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
+    lsp_manager: parking_lot::Mutex<LspManager>,
     configure_generation: AtomicU64,
     /// Last-seen value of `InspectManager::reuse_completion_count()`, so the
     /// per-request inspect drain can detect watcher-driven Tier-2 scans that
     /// finished since the previous tick and refresh the status bar (#3).
     last_seen_reuse_completions: AtomicU64,
-    configure_warnings_tx: mpsc::Sender<(u64, ConfigureWarningsFrame)>,
-    configure_warnings_rx: mpsc::Receiver<(u64, ConfigureWarningsFrame)>,
+    configure_warnings_tx: crossbeam_channel::Sender<(u64, ConfigureWarningsFrame)>,
+    configure_warnings_rx: crossbeam_channel::Receiver<(u64, ConfigureWarningsFrame)>,
     status_emitter: StatusEmitter,
     /// Last status-bar payload attached to a tool response for this project root.
     /// Deduping here (not in a process-global static) lets daemon roots emit the
@@ -688,7 +692,8 @@ pub struct AppContext {
     /// this memoizes per tsconfig dir. Invalidated wholesale on any
     /// tsconfig-like watcher event and on `configure`. Owned here (not in
     /// `DiagnosticsStore`, which stays raw policy-free) per the v0.35 council.
-    tsconfig_membership: RefCell<crate::lsp::tsconfig_membership::TsconfigMembershipCache>,
+    tsconfig_membership:
+        parking_lot::Mutex<crate::lsp::tsconfig_membership::TsconfigMembershipCache>,
 }
 
 impl Drop for AppContext {
@@ -745,7 +750,7 @@ impl AppContext {
         config: Config,
     ) -> Self {
         let bash_compress_enabled = config.experimental_bash_compress;
-        let (configure_warnings_tx, configure_warnings_rx) = mpsc::channel();
+        let (configure_warnings_tx, configure_warnings_rx) = crossbeam_channel::unbounded();
         let status_emitter = StatusEmitter::new(app.progress_sender());
         let symbol_cache = provider
             .as_any()
@@ -760,40 +765,40 @@ impl AppContext {
         AppContext {
             app: Arc::clone(&app),
             provider,
-            backup: RefCell::new(BackupStore::new()),
-            checkpoint: RefCell::new(CheckpointStore::new()),
+            backup: parking_lot::Mutex::new(BackupStore::new()),
+            checkpoint: parking_lot::Mutex::new(CheckpointStore::new()),
             config: RwLock::new(Arc::new(config)),
-            harness: RefCell::new(None),
-            canonical_cache_root: RefCell::new(None),
-            is_worktree_bridge: RefCell::new(false),
-            git_common_dir: RefCell::new(None),
-            degraded_reasons: RefCell::new(Vec::new()),
-            callgraph: RefCell::new(None),
+            harness: parking_lot::Mutex::new(None),
+            canonical_cache_root: parking_lot::Mutex::new(None),
+            is_worktree_bridge: parking_lot::Mutex::new(false),
+            git_common_dir: parking_lot::Mutex::new(None),
+            degraded_reasons: parking_lot::Mutex::new(Vec::new()),
+            callgraph: parking_lot::Mutex::new(None),
             callgraph_store: RwLock::new(None),
-            callgraph_store_force_rebuild: RefCell::new(false),
-            callgraph_store_rx: RefCell::new(None),
-            pending_callgraph_store_paths: RefCell::new(BTreeSet::new()),
+            callgraph_store_force_rebuild: parking_lot::Mutex::new(false),
+            callgraph_store_rx: parking_lot::Mutex::new(None),
+            pending_callgraph_store_paths: parking_lot::Mutex::new(BTreeSet::new()),
             search_index: RwLock::new(None),
             search_index_rx: RwLock::new(None),
-            pending_search_index_paths: RefCell::new(BTreeSet::new()),
+            pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
             inspect_manager: Arc::new(InspectManager::new()),
-            tier2_refresh_scheduler: RefCell::new(Tier2RefreshScheduler::new()),
+            tier2_refresh_scheduler: parking_lot::Mutex::new(Tier2RefreshScheduler::new()),
             semantic_index: RwLock::new(None),
-            semantic_index_rx: RefCell::new(None),
+            semantic_index_rx: parking_lot::Mutex::new(None),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
-            pending_semantic_index_paths: RefCell::new(BTreeSet::new()),
-            pending_semantic_corpus_refresh: RefCell::new(false),
-            semantic_refresh_tx: RefCell::new(None),
-            semantic_refresh_event_rx: RefCell::new(None),
-            semantic_refresh_worker: RefCell::new(None),
-            semantic_refresh_retry_attempts: RefCell::new(BTreeMap::new()),
+            pending_semantic_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
+            pending_semantic_corpus_refresh: parking_lot::Mutex::new(false),
+            semantic_refresh_tx: parking_lot::Mutex::new(None),
+            semantic_refresh_event_rx: parking_lot::Mutex::new(None),
+            semantic_refresh_worker: parking_lot::Mutex::new(None),
+            semantic_refresh_retry_attempts: parking_lot::Mutex::new(BTreeMap::new()),
             semantic_refresh_circuit: Arc::new(SemanticRefreshCircuit::default()),
-            semantic_embedding_model: RefCell::new(None),
-            watcher: RefCell::new(None),
-            watcher_rx: RefCell::new(None),
-            watcher_thread: RefCell::new(None),
-            lsp_manager: RefCell::new(lsp_manager),
+            semantic_embedding_model: parking_lot::Mutex::new(None),
+            watcher: parking_lot::Mutex::new(None),
+            watcher_rx: parking_lot::Mutex::new(None),
+            watcher_thread: parking_lot::Mutex::new(None),
+            lsp_manager: parking_lot::Mutex::new(lsp_manager),
             configure_generation: AtomicU64::new(0),
             last_seen_reuse_completions: AtomicU64::new(0),
             configure_warnings_tx,
@@ -809,7 +814,7 @@ impl AppContext {
             gitignore: Arc::new(std::sync::RwLock::new(None)),
             gitignore_generation: Arc::new(AtomicU64::new(0)),
             status_bar_tier2: RwLock::new(StatusBarTier2::default()),
-            tsconfig_membership: RefCell::new(
+            tsconfig_membership: parking_lot::Mutex::new(
                 crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
             ),
         }
@@ -877,21 +882,20 @@ impl AppContext {
         let Some(root) = self.canonical_cache_root_opt() else {
             // Pre-configure: no project root to scope against. Raw count is the
             // best available signal (and the bar is gated on Tier-2 anyway).
-            return self.lsp_manager.borrow().warm_error_warning_counts();
+            return self.lsp_manager.lock().warm_error_warning_counts();
         };
-        let mut membership = self.tsconfig_membership.borrow_mut();
-        self.lsp_manager
-            .borrow()
-            .filtered_error_warning_counts(|file| {
-                file.starts_with(&root) && !membership.should_skip_diagnostics(file)
-            })
+        let lsp = self.lsp_manager.lock();
+        let mut membership = self.tsconfig_membership.lock();
+        lsp.filtered_error_warning_counts(|file| {
+            file.starts_with(&root) && !membership.should_skip_diagnostics(file)
+        })
     }
 
     /// Invalidate the status-bar tsconfig-membership cache. Called from the
     /// watcher seam when a tsconfig-like file changes and from `configure`
     /// when the project root changes, so the next bar count re-reads from disk.
     pub fn clear_tsconfig_membership_cache(&self) {
-        self.tsconfig_membership.borrow_mut().clear();
+        self.tsconfig_membership.lock().clear();
     }
 
     /// Mark the status-bar Tier-2 counts stale (rendered with `~`) without
@@ -1065,7 +1069,7 @@ impl AppContext {
         // under `<worktree>/.git/info/exclude` (where `.git` is only a file).
         let info_exclude = self
             .git_common_dir
-            .borrow()
+            .lock()
             .clone()
             .unwrap_or_else(|| Path::new(&root).join(".git"))
             .join("info")
@@ -1251,7 +1255,9 @@ impl AppContext {
         self.configure_generation.load(Ordering::SeqCst)
     }
 
-    pub fn configure_warnings_sender(&self) -> mpsc::Sender<(u64, ConfigureWarningsFrame)> {
+    pub fn configure_warnings_sender(
+        &self,
+    ) -> crossbeam_channel::Sender<(u64, ConfigureWarningsFrame)> {
         self.configure_warnings_tx.clone()
     }
 
@@ -1277,12 +1283,12 @@ impl AppContext {
     }
 
     /// Access the backup store.
-    pub fn backup(&self) -> &RefCell<BackupStore> {
+    pub fn backup(&self) -> &parking_lot::Mutex<BackupStore> {
         &self.backup
     }
 
     /// Access the checkpoint store.
-    pub fn checkpoint(&self) -> &RefCell<CheckpointStore> {
+    pub fn checkpoint(&self) -> &parking_lot::Mutex<CheckpointStore> {
         &self.checkpoint
     }
 
@@ -1324,12 +1330,12 @@ impl AppContext {
     }
 
     pub fn set_harness(&self, harness: Harness) {
-        *self.harness.borrow_mut() = Some(harness);
+        *self.harness.lock() = Some(harness);
         self.bash_background.set_harness(harness);
     }
 
     pub fn harness_opt(&self) -> Option<Harness> {
-        *self.harness.borrow()
+        *self.harness.lock()
     }
 
     pub fn harness(&self) -> Harness {
@@ -1373,43 +1379,43 @@ impl AppContext {
 
     pub fn set_canonical_cache_root(&self, root: PathBuf) {
         debug_assert!(root.is_absolute());
-        *self.canonical_cache_root.borrow_mut() = Some(root);
+        *self.canonical_cache_root.lock() = Some(root);
     }
 
     pub fn canonical_cache_root(&self) -> PathBuf {
         self.canonical_cache_root
-            .borrow()
+            .lock()
             .clone()
             .expect("canonical_cache_root accessed before handle_configure")
     }
 
     pub fn canonical_cache_root_opt(&self) -> Option<PathBuf> {
-        self.canonical_cache_root.borrow().clone()
+        self.canonical_cache_root.lock().clone()
     }
 
     pub fn set_cache_role(&self, is_worktree_bridge: bool, git_common_dir: Option<PathBuf>) {
-        *self.is_worktree_bridge.borrow_mut() = is_worktree_bridge;
-        *self.git_common_dir.borrow_mut() = git_common_dir;
+        *self.is_worktree_bridge.lock() = is_worktree_bridge;
+        *self.git_common_dir.lock() = git_common_dir;
     }
 
     pub fn is_worktree_bridge(&self) -> bool {
-        *self.is_worktree_bridge.borrow()
+        *self.is_worktree_bridge.lock()
     }
 
     pub fn git_common_dir(&self) -> Option<PathBuf> {
-        self.git_common_dir.borrow().clone()
+        self.git_common_dir.lock().clone()
     }
 
     /// Replace the current degraded-mode reasons. Empty vec = full-featured
     /// mode (no degradation). Called by `handle_configure` after deciding
     /// which subsystems to disable for this project root.
     pub fn set_degraded_reasons(&self, reasons: Vec<String>) {
-        *self.degraded_reasons.borrow_mut() = reasons;
+        *self.degraded_reasons.lock() = reasons;
     }
 
     pub fn add_degraded_reason(&self, reason: impl Into<String>) -> bool {
         let reason = reason.into();
-        let mut reasons = self.degraded_reasons.borrow_mut();
+        let mut reasons = self.degraded_reasons.lock();
         if reasons.iter().any(|existing| existing == &reason) {
             return false;
         }
@@ -1421,16 +1427,16 @@ impl AppContext {
     /// (insertion order from `set_degraded_reasons`) so UI rendering and
     /// snapshot diffs are deterministic.
     pub fn degraded_reasons(&self) -> Vec<String> {
-        self.degraded_reasons.borrow().clone()
+        self.degraded_reasons.lock().clone()
     }
 
     /// True iff at least one degraded reason is recorded.
     pub fn is_degraded(&self) -> bool {
-        !self.degraded_reasons.borrow().is_empty()
+        !self.degraded_reasons.lock().is_empty()
     }
 
     pub fn cache_role(&self) -> &'static str {
-        if self.canonical_cache_root.borrow().is_none() {
+        if self.canonical_cache_root.lock().is_none() {
             "not_initialized"
         } else if self.is_worktree_bridge() {
             "worktree"
@@ -1440,7 +1446,7 @@ impl AppContext {
     }
 
     /// Access the call graph engine.
-    pub fn callgraph(&self) -> &RefCell<Option<CallGraph>> {
+    pub fn callgraph(&self) -> &parking_lot::Mutex<Option<CallGraph>> {
         &self.callgraph
     }
 
@@ -1450,13 +1456,14 @@ impl AppContext {
     }
 
     pub fn mark_callgraph_store_force_rebuild(&self) {
-        *self.callgraph_store_force_rebuild.borrow_mut() = true;
+        *self.callgraph_store_force_rebuild.lock() = true;
     }
 
     fn take_callgraph_store_force_rebuild(&self) -> bool {
-        let force = *self.callgraph_store_force_rebuild.borrow();
-        *self.callgraph_store_force_rebuild.borrow_mut() = false;
-        force
+        let mut force = self.callgraph_store_force_rebuild.lock();
+        let was_forced = *force;
+        *force = false;
+        was_forced
     }
 
     pub fn callgraph_store_dir(&self) -> PathBuf {
@@ -1563,7 +1570,7 @@ impl AppContext {
     pub fn revalidate_callgraph_store_generation(&self) {
         // Never disturb the store while a background build's result is pending
         // install (the rx-install path replaces it wholesale).
-        if self.callgraph_store_rx.borrow().is_some() {
+        if self.callgraph_store_rx.lock().is_some() {
             return;
         }
         let superseded = {
@@ -1598,7 +1605,7 @@ impl AppContext {
         }
 
         // A background build is already running; don't start a second one.
-        if self.callgraph_store_rx.borrow().is_some() {
+        if self.callgraph_store_rx.lock().is_some() {
             return CallgraphStoreAccess::Building;
         }
 
@@ -1626,7 +1633,7 @@ impl AppContext {
             }
         }
 
-        let force_rebuild = *self.callgraph_store_force_rebuild.borrow();
+        let force_rebuild = *self.callgraph_store_force_rebuild.lock();
         // Warm path: a fresh on-disk DB exists -> open synchronously (cheap, no
         // "building" delay). Only a genuine cold build goes to the background.
         if !force_rebuild {
@@ -1662,7 +1669,7 @@ impl AppContext {
         let wait = callgraph_build_wait_window();
         if !wait.is_zero() {
             let received = {
-                let rx_ref = self.callgraph_store_rx.borrow();
+                let rx_ref = self.callgraph_store_rx.lock();
                 let Some(rx) = rx_ref.as_ref() else {
                     return CallgraphStoreAccess::Building;
                 };
@@ -1691,14 +1698,14 @@ impl AppContext {
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         *guard = Some(Arc::clone(&store));
                     }
-                    *self.callgraph_store_rx.borrow_mut() = None;
+                    *self.callgraph_store_rx.lock() = None;
                     return CallgraphStoreAccess::Ready(store);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     // Build failed before sending; clear the receiver so a later
                     // op restarts the build instead of waiting on a dead channel.
-                    *self.callgraph_store_rx.borrow_mut() = None;
+                    *self.callgraph_store_rx.lock() = None;
                 }
             }
         }
@@ -1721,7 +1728,7 @@ impl AppContext {
             self.take_callgraph_store_force_rebuild();
         }
         let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStore>();
-        *self.callgraph_store_rx.borrow_mut() = Some(rx);
+        *self.callgraph_store_rx.lock() = Some(rx);
         let session_id = crate::log_ctx::current_session();
         let chunk_size = self.config().callgraph_chunk_size;
         std::thread::spawn(move || {
@@ -1762,7 +1769,7 @@ impl AppContext {
     /// main loop once the cold build completes).
     pub fn callgraph_store_rx(
         &self,
-    ) -> &RefCell<Option<crossbeam_channel::Receiver<CallGraphStore>>> {
+    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>> {
         &self.callgraph_store_rx
     }
 
@@ -1772,14 +1779,12 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
-        self.pending_callgraph_store_paths
-            .borrow_mut()
-            .extend(paths);
+        self.pending_callgraph_store_paths.lock().extend(paths);
     }
 
     /// Take and clear the paths that changed during a background cold build.
     pub fn take_pending_callgraph_store_paths(&self) -> Vec<PathBuf> {
-        std::mem::take(&mut *self.pending_callgraph_store_paths.borrow_mut())
+        std::mem::take(&mut *self.pending_callgraph_store_paths.lock())
             .into_iter()
             .collect()
     }
@@ -1798,11 +1803,11 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
-        self.pending_search_index_paths.borrow_mut().extend(paths);
+        self.pending_search_index_paths.lock().extend(paths);
     }
 
     pub fn take_pending_search_index_paths(&self) -> Vec<PathBuf> {
-        std::mem::take(&mut *self.pending_search_index_paths.borrow_mut())
+        std::mem::take(&mut *self.pending_search_index_paths.lock())
             .into_iter()
             .collect()
     }
@@ -1811,28 +1816,28 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
-        self.pending_semantic_index_paths.borrow_mut().extend(paths);
+        self.pending_semantic_index_paths.lock().extend(paths);
     }
 
     pub fn take_pending_semantic_index_paths(&self) -> Vec<PathBuf> {
-        std::mem::take(&mut *self.pending_semantic_index_paths.borrow_mut())
+        std::mem::take(&mut *self.pending_semantic_index_paths.lock())
             .into_iter()
             .collect()
     }
 
     pub fn mark_pending_semantic_corpus_refresh(&self) {
-        *self.pending_semantic_corpus_refresh.borrow_mut() = true;
+        *self.pending_semantic_corpus_refresh.lock() = true;
     }
 
     pub fn take_pending_semantic_corpus_refresh(&self) -> bool {
-        std::mem::take(&mut *self.pending_semantic_corpus_refresh.borrow_mut())
+        std::mem::take(&mut *self.pending_semantic_corpus_refresh.lock())
     }
 
     pub fn clear_pending_index_updates(&self) {
-        self.pending_search_index_paths.borrow_mut().clear();
-        self.pending_callgraph_store_paths.borrow_mut().clear();
-        self.pending_semantic_index_paths.borrow_mut().clear();
-        *self.pending_semantic_corpus_refresh.borrow_mut() = false;
+        self.pending_search_index_paths.lock().clear();
+        self.pending_callgraph_store_paths.lock().clear();
+        self.pending_semantic_index_paths.lock().clear();
+        *self.pending_semantic_corpus_refresh.lock() = false;
     }
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
@@ -1858,13 +1863,13 @@ impl AppContext {
     #[doc(hidden)]
     pub fn reset_tier2_refresh_scheduler_at(&self, now: Instant) {
         self.tier2_refresh_scheduler
-            .borrow_mut()
+            .lock()
             .reset_after_configure(now);
     }
 
     pub fn request_tier2_refresh_pull(&self) -> bool {
         self.tier2_refresh_scheduler
-            .borrow_mut()
+            .lock()
             .request_pull(!self.is_worktree_bridge())
     }
 
@@ -1884,12 +1889,10 @@ impl AppContext {
         let manager = self.inspect_manager();
         let can_write = !self.is_worktree_bridge();
         let in_flight = manager.tier2_any_in_flight();
-        let decision = self.tier2_refresh_scheduler.borrow_mut().tick(
-            now,
-            changed_path_count,
-            can_write,
-            in_flight,
-        );
+        let decision =
+            self.tier2_refresh_scheduler
+                .lock()
+                .tick(now, changed_path_count, can_write, in_flight);
 
         if let Some(reason) = decision {
             self.start_tier2_refresh(reason, manager);
@@ -1905,27 +1908,27 @@ impl AppContext {
     #[doc(hidden)]
     pub fn note_tier2_refresh_started_at(&self, now: Instant) {
         self.tier2_refresh_scheduler
-            .borrow_mut()
+            .lock()
             .note_external_scan_started(now);
     }
 
     pub fn tier2_trigger_reason(&self) -> Option<&'static str> {
         self.tier2_refresh_scheduler
-            .borrow()
+            .lock()
             .last_trigger_reason()
             .map(Tier2TriggerReason::as_str)
     }
 
     #[doc(hidden)]
     pub fn tier2_pull_demand_pending(&self) -> bool {
-        self.tier2_refresh_scheduler.borrow().pull_demand_pending()
+        self.tier2_refresh_scheduler.lock().pull_demand_pending()
     }
 
     fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
         if self.is_worktree_bridge()
             || self
                 .degraded_reasons
-                .borrow()
+                .lock()
                 .iter()
                 .any(|r| r == "home_root")
             || !self.config().inspect.enabled
@@ -1999,7 +2002,7 @@ impl AppContext {
     /// Access the semantic-index build receiver.
     pub fn semantic_index_rx(
         &self,
-    ) -> &RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>> {
+    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>> {
         &self.semantic_index_rx
     }
 
@@ -2014,15 +2017,15 @@ impl AppContext {
         worker_slot: SemanticRefreshWorkerSlot,
     ) {
         self.clear_semantic_refresh_worker();
-        *self.semantic_refresh_tx.borrow_mut() = Some(sender);
-        *self.semantic_refresh_event_rx.borrow_mut() = Some(event_rx);
-        *self.semantic_refresh_worker.borrow_mut() = Some(worker_slot);
+        *self.semantic_refresh_tx.lock() = Some(sender);
+        *self.semantic_refresh_event_rx.lock() = Some(event_rx);
+        *self.semantic_refresh_worker.lock() = Some(worker_slot);
     }
 
     pub fn clear_semantic_refresh_worker(&self) {
-        *self.semantic_refresh_tx.borrow_mut() = None;
-        *self.semantic_refresh_event_rx.borrow_mut() = None;
-        if let Some(worker_slot) = self.semantic_refresh_worker.borrow_mut().take() {
+        *self.semantic_refresh_tx.lock() = None;
+        *self.semantic_refresh_event_rx.lock() = None;
+        if let Some(worker_slot) = self.semantic_refresh_worker.lock().take() {
             if let Ok(mut handle) = worker_slot.lock() {
                 drop(handle.take());
             }
@@ -2032,12 +2035,12 @@ impl AppContext {
     pub fn semantic_refresh_sender(
         &self,
     ) -> Option<crossbeam_channel::Sender<SemanticRefreshRequest>> {
-        self.semantic_refresh_tx.borrow().clone()
+        self.semantic_refresh_tx.lock().clone()
     }
 
     pub fn semantic_refresh_event_rx(
         &self,
-    ) -> &RefCell<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>> {
+    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>> {
         &self.semantic_refresh_event_rx
     }
 
@@ -2045,19 +2048,19 @@ impl AppContext {
         &self,
         f: impl FnOnce(&mut BTreeMap<PathBuf, usize>) -> R,
     ) -> R {
-        let mut attempts = self.semantic_refresh_retry_attempts.borrow_mut();
+        let mut attempts = self.semantic_refresh_retry_attempts.lock();
         f(&mut attempts)
     }
 
     pub fn clear_semantic_refresh_retry_attempts(&self, paths: &[PathBuf]) {
-        let mut attempts = self.semantic_refresh_retry_attempts.borrow_mut();
+        let mut attempts = self.semantic_refresh_retry_attempts.lock();
         for path in paths {
             attempts.remove(path);
         }
     }
 
     pub fn clear_all_semantic_refresh_retry_attempts(&self) {
-        self.semantic_refresh_retry_attempts.borrow_mut().clear();
+        self.semantic_refresh_retry_attempts.lock().clear();
     }
 
     pub fn semantic_refresh_circuit_is_open(&self) -> bool {
@@ -2165,19 +2168,19 @@ impl AppContext {
     /// Access the cached semantic embedding model.
     pub fn semantic_embedding_model(
         &self,
-    ) -> &RefCell<Option<crate::semantic_index::EmbeddingModel>> {
+    ) -> &parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>> {
         &self.semantic_embedding_model
     }
 
     /// Access the file watcher handle (kept alive to continue watching).
-    pub fn watcher(&self) -> &RefCell<Option<RecommendedWatcher>> {
+    pub fn watcher(&self) -> &parking_lot::Mutex<Option<RecommendedWatcher>> {
         &self.watcher
     }
 
     /// Access the pre-filtered watcher event receiver.
     pub fn watcher_rx(
         &self,
-    ) -> &RefCell<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>> {
+    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>> {
         &self.watcher_rx
     }
 
@@ -2188,30 +2191,30 @@ impl AppContext {
         rx: crossbeam_channel::Receiver<WatcherDispatchEvent>,
         runtime: WatcherThreadHandle,
     ) {
-        *self.watcher_rx.borrow_mut() = Some(rx);
-        *self.watcher_thread.borrow_mut() = Some(runtime);
+        *self.watcher_rx.lock() = Some(rx);
+        *self.watcher_thread.lock() = Some(runtime);
     }
 
     /// Stop the watcher filter thread (if any) and clear the dispatch receiver.
     /// Used on reconfigure, watcher failure, root deletion, and test teardown.
     pub fn stop_watcher_runtime(&self) {
-        if let Some(runtime) = self.watcher_thread.borrow_mut().take() {
+        if let Some(runtime) = self.watcher_thread.lock().take() {
             runtime.shutdown_and_join();
         }
-        *self.watcher_rx.borrow_mut() = None;
-        *self.watcher.borrow_mut() = None;
+        *self.watcher_rx.lock() = None;
+        *self.watcher.lock() = None;
     }
 
     /// Access the LSP manager.
-    pub fn lsp(&self) -> RefMut<'_, LspManager> {
-        self.lsp_manager.borrow_mut()
+    pub fn lsp(&self) -> parking_lot::MutexGuard<'_, LspManager> {
+        self.lsp_manager.lock()
     }
 
     /// Notify LSP servers that a file was written.
     /// Call this after write_format_validate in command handlers.
     pub fn lsp_notify_file_changed(&self, file_path: &Path, content: &str) {
-        if let Ok(mut lsp) = self.lsp_manager.try_borrow_mut() {
-            let config = self.config();
+        let config = self.config();
+        if let Some(mut lsp) = self.lsp_manager.try_lock() {
             if let Err(e) = lsp.notify_file_changed(file_path, content, &config) {
                 crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
             }
@@ -2224,7 +2227,7 @@ impl AppContext {
     /// Returns true if any entry was removed. Best-effort: a contended borrow is
     /// skipped silently (the watcher drain retries on subsequent events).
     pub fn lsp_clear_diagnostics_for_file(&self, file_path: &Path) -> bool {
-        if let Ok(mut lsp) = self.lsp_manager.try_borrow_mut() {
+        if let Some(mut lsp) = self.lsp_manager.try_lock() {
             lsp.clear_diagnostics_for_file(file_path)
         } else {
             false
@@ -2247,7 +2250,8 @@ impl AppContext {
         content: &str,
         timeout: std::time::Duration,
     ) -> crate::lsp::manager::PostEditWaitOutcome {
-        let Ok(mut lsp) = self.lsp_manager.try_borrow_mut() else {
+        let config = self.config();
+        let Some(mut lsp) = self.lsp_manager.try_lock() else {
             return crate::lsp::manager::PostEditWaitOutcome::default();
         };
 
@@ -2261,7 +2265,6 @@ impl AppContext {
         let pre_snapshot = lsp.snapshot_pre_edit_state(file_path);
 
         // Send didChange/didOpen and capture per-server target version.
-        let config = self.config();
         let expected_versions = match lsp.notify_file_changed_versioned(file_path, content, &config)
         {
             Ok(v) => v,
@@ -2392,8 +2395,8 @@ impl AppContext {
             return;
         }
 
-        if let Ok(mut lsp) = self.lsp_manager.try_borrow_mut() {
-            let config = self.config();
+        let config = self.config();
+        if let Some(mut lsp) = self.lsp_manager.try_lock() {
             if let Err(e) = lsp.notify_files_watched_changed(config_paths, &config) {
                 crate::slog_warn!("watched-file sync error: {}", e);
             }
@@ -2573,7 +2576,7 @@ impl AppContext {
     /// Count active LSP server instances.
     pub fn lsp_server_count(&self) -> usize {
         self.lsp_manager
-            .try_borrow()
+            .try_lock()
             .map(|lsp| lsp.server_count())
             .unwrap_or(0)
     }

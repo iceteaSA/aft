@@ -1225,7 +1225,7 @@ fn search_index_ready(ctx: &AppContext) -> bool {
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
-    let mut model_ref = ctx.semantic_embedding_model().borrow_mut();
+    let mut model_ref = ctx.semantic_embedding_model().lock();
     let semantic_config = ctx.config().semantic.clone();
 
     if model_ref.is_none() {

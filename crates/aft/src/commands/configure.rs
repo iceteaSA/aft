@@ -1471,7 +1471,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Commit phase: no validation returns after this point.
     ctx.set_config(next_config.clone());
     ctx.set_harness(harness);
-    ctx.backup().borrow().set_db_harness(harness);
+    ctx.backup().lock().set_db_harness(harness);
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     ctx.reset_tier2_refresh_scheduler();
@@ -1479,7 +1479,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // status-bar membership cache so the next bar count re-resolves from disk.
     ctx.clear_tsconfig_membership_cache();
     ctx.backup()
-        .borrow()
+        .lock()
         .set_db_project_key(crate::path_identity::project_scope_key(
             &canonical_cache_root,
         ));
@@ -1497,7 +1497,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 err
             );
         }
-        ctx.backup().borrow_mut().set_storage_dir_for_harness(
+        ctx.backup().lock().set_storage_dir_for_harness(
             storage_dir,
             harness,
             next_config.checkpoint_ttl_hours,
@@ -1524,12 +1524,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(conn) => {
             let shared = Arc::new(Mutex::new(conn));
             ctx.set_db(shared.clone());
-            ctx.backup().borrow().set_db_pool(shared.clone());
+            ctx.backup().lock().set_db_pool(shared.clone());
             ctx.bash_background().set_db_pool(shared);
         }
         Err(err) => {
             ctx.clear_db();
-            ctx.backup().borrow().clear_db_pool();
+            ctx.backup().lock().clear_db_pool();
             ctx.bash_background().clear_db_pool();
             slog_warn!(
                 "failed to open aft.db at {}: {} — running with JSON-only persistence",
@@ -1564,7 +1564,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some();
-    let semantic_build_in_progress = ctx.semantic_index_rx().borrow().is_some();
+    let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     // Note: We intentionally only WARN on rapid reconfigure (rather than tracking
     // JoinHandles to cancel old threads) because:
     //   1. Old thread results are dropped when ctx.search_index_rx() is reset
@@ -1594,7 +1594,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     *ctx.semantic_index()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    *ctx.semantic_index_rx().borrow_mut() = None;
+    *ctx.semantic_index_rx().lock() = None;
     *ctx.callgraph_store()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -1605,7 +1605,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
     ctx.clear_semantic_refresh_worker();
-    *ctx.semantic_embedding_model().borrow_mut() = None;
+    *ctx.semantic_embedding_model().lock() = None;
     ctx.clear_pending_index_updates();
 
     // Snapshot accumulated degraded reasons on the context so status /
@@ -1781,7 +1781,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             crossbeam_channel::Sender<SemanticIndexEvent>,
             crossbeam_channel::Receiver<SemanticIndexEvent>,
         ) = unbounded();
-        *ctx.semantic_index_rx().borrow_mut() = Some(rx);
+        *ctx.semantic_index_rx().lock() = Some(rx);
 
         let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
         let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
@@ -2129,7 +2129,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Initialize call graph with the project root
     let graph = CallGraph::new(root_path.clone());
-    *ctx.callgraph().borrow_mut() = Some(graph);
+    *ctx.callgraph().lock() = Some(graph);
 
     if next_config.callgraph_store && !home_match {
         match ctx.callgraph_store_for_ops() {
@@ -2861,8 +2861,8 @@ mod tests {
             started.elapsed() < Duration::from_millis(100),
             "watcher installation should not wait for slow attach"
         );
-        assert!(ctx.watcher_rx().borrow().is_some());
-        assert!(ctx.watcher().borrow().is_none());
+        assert!(ctx.watcher_rx().lock().is_some());
+        assert!(ctx.watcher().lock().is_none());
 
         attach_started.wait();
         ctx.stop_watcher_runtime();
@@ -2885,7 +2885,7 @@ mod tests {
 
         let event = ctx
             .watcher_rx()
-            .borrow()
+            .lock()
             .as_ref()
             .expect("watcher receiver installed")
             .recv_timeout(Duration::from_secs(2))

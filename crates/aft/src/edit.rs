@@ -303,7 +303,7 @@ pub fn auto_backup(
         return Ok(None);
     }
     let backup_id = {
-        let mut store = ctx.backup().borrow_mut();
+        let mut store = ctx.backup().lock();
         store.snapshot_with_op(session, path, description, op_id)?
     }; // borrow dropped here
     Ok(Some(backup_id))

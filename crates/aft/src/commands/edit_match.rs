@@ -205,7 +205,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
         }
     } else {
-        match ctx.backup().borrow_mut().snapshot_op_tombstone(
+        match ctx.backup().lock().snapshot_op_tombstone(
             req.session(),
             op_id,
             path.as_path(),
@@ -234,7 +234,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         Err(error) => {
             if !existed {
                 ctx.backup()
-                    .borrow_mut()
+                    .lock()
                     .discard_operation_entries(req.session(), op_id);
             }
             return Response::error(
@@ -248,7 +248,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     if let Err(error) = file_handle.write_all(append_content.as_bytes()) {
         if !existed {
             ctx.backup()
-                .borrow_mut()
+                .lock()
                 .discard_operation_entries(req.session(), op_id);
         }
         return Response::error(
@@ -531,9 +531,9 @@ fn handle_glob_edit_match(
             .map(|edit| edit.path.clone())
             .collect::<Vec<_>>();
         let checkpoint_result = {
-            let backup = ctx.backup().borrow();
+            let backup = ctx.backup().lock();
             ctx.checkpoint()
-                .borrow_mut()
+                .lock()
                 .create(req.session(), &name, files, &backup)
         };
         if let Err(e) = checkpoint_result {
@@ -580,7 +580,7 @@ fn handle_glob_edit_match(
             }
             if rollback_ok {
                 ctx.backup()
-                    .borrow_mut()
+                    .lock()
                     .discard_operation_entries(req.session(), op_id);
             }
             return Response::error(
@@ -623,7 +623,7 @@ fn handle_glob_edit_match(
                         .collect::<Vec<_>>();
                     if restore_glob_checkpoint(ctx, req.session(), name, &paths).is_ok() {
                         ctx.backup()
-                            .borrow_mut()
+                            .lock()
                             .discard_operation_entries(req.session(), op_id);
                     }
                     delete_glob_checkpoint(ctx, req.session(), name);
@@ -683,7 +683,7 @@ fn handle_glob_edit_match(
         };
         if rollback.as_ref().map_or(true, |result| result.is_ok()) {
             ctx.backup()
-                .borrow_mut()
+                .lock()
                 .discard_operation_entries(req.session(), op_id);
         }
         return match rollback {
@@ -849,7 +849,7 @@ fn restore_glob_checkpoint(
     }
     match ctx
         .checkpoint()
-        .borrow()
+        .lock()
         .restore_validated(session, name, paths)
     {
         Ok(_) => Ok(()),
@@ -897,22 +897,22 @@ mod tests {
         fs::write(&a, "const a = TARGET;\n").unwrap();
 
         let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let backup = ctx.backup().lock();
         let checkpoint_name = ctx
             .checkpoint()
-            .borrow_mut()
+            .lock()
             .create(
                 "default",
                 "__edit_match_glob_missing_path__",
                 vec![a.clone()],
-                &ctx.backup().borrow(),
+                &backup,
             )
             .unwrap()
             .name;
+        drop(backup);
 
         let result = restore_glob_checkpoint(&ctx, "default", &checkpoint_name, &[a, b]);
-        ctx.checkpoint()
-            .borrow_mut()
-            .delete("default", &checkpoint_name);
+        ctx.checkpoint().lock().delete("default", &checkpoint_name);
 
         // SAFETY: only one test in this module mutates this env var.
         unsafe {
@@ -924,7 +924,7 @@ mod tests {
 }
 
 fn delete_glob_checkpoint(ctx: &AppContext, session: &str, name: &str) {
-    ctx.checkpoint().borrow_mut().delete(session, name);
+    ctx.checkpoint().lock().delete(session, name);
 }
 
 fn validate_glob_edit_path(
@@ -1171,7 +1171,7 @@ fn handle_single_file_edit_match(
 
     if write_result.rolled_back {
         ctx.backup()
-            .borrow_mut()
+            .lock()
             .discard_operation_entries(req.session(), op_id);
     }
 

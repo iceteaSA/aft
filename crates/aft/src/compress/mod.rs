@@ -494,7 +494,7 @@ fn contains_nonzero_failure_word(line: &str, word: &str) -> bool {
 /// 2. User filters at `<storage_dir>/<harness>/filters/*.toml`.
 /// 3. Builtin filters compiled into the binary via [`builtin_filters`].
 pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
-    let harness = ctx.harness.borrow().unwrap_or(Harness::Opencode);
+    let harness = ctx.harness.lock().unwrap_or(Harness::Opencode);
     let config = ctx.config();
     let storage_dir = config.storage_dir.clone();
     let project_root = config.project_root.clone();

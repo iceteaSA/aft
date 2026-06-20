@@ -150,7 +150,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Call graph guard (D089) ---
-    let mut cg_ref = ctx.callgraph().borrow_mut();
+    let mut cg_ref = ctx.callgraph().lock();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
         None => {
@@ -429,8 +429,8 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             all_files.push(path.clone());
         }
 
-        let backup_store = ctx.backup().borrow();
-        let mut cp_store = ctx.checkpoint().borrow_mut();
+        let backup_store = ctx.backup().lock();
+        let mut cp_store = ctx.checkpoint().lock();
         if let Err(e) = cp_store.create(req.session(), &checkpoint_name, all_files, &backup_store) {
             return Response::error(&req.id, e.code(), e.to_string());
         }
@@ -449,7 +449,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         files_to_backup.sort();
         files_to_backup.dedup();
 
-        let mut backup_store = ctx.backup().borrow_mut();
+        let mut backup_store = ctx.backup().lock();
         for path in files_to_backup {
             match backup_store.snapshot_with_op(
                 req.session(),
@@ -489,7 +489,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(wr) if wr.rolled_back => {
             if restore_checkpoint(ctx, req.session(), &checkpoint_name) {
                 ctx.backup()
-                    .borrow_mut()
+                    .lock()
                     .discard_operation_entries(req.session(), &op_id);
             }
             return move_error(
@@ -515,7 +515,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(e) => {
             if restore_checkpoint(ctx, req.session(), &checkpoint_name) {
                 ctx.backup()
-                    .borrow_mut()
+                    .lock()
                     .discard_operation_entries(req.session(), &op_id);
             }
             return move_error(
@@ -544,7 +544,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             cleanup_new_files(&files_to_delete);
             if restored {
                 ctx.backup()
-                    .borrow_mut()
+                    .lock()
                     .discard_operation_entries(req.session(), &op_id);
             }
             return move_error(
@@ -580,7 +580,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             cleanup_new_files(&files_to_delete);
             if restored {
                 ctx.backup()
-                    .borrow_mut()
+                    .lock()
                     .discard_operation_entries(req.session(), &op_id);
             }
             return move_error(
@@ -605,7 +605,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 cleanup_new_files(&new_files);
                 if restored {
                     ctx.backup()
-                        .borrow_mut()
+                        .lock()
                         .discard_operation_entries(req.session(), &op_id);
                 }
                 return move_error(
@@ -634,7 +634,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 cleanup_new_files(&new_files);
                 if restored {
                     ctx.backup()
-                        .borrow_mut()
+                        .lock()
                         .discard_operation_entries(req.session(), &op_id);
                 }
                 return move_error(
@@ -2021,7 +2021,7 @@ fn extract_alias(raw_text: &str, symbol_name: &str) -> Option<String> {
 
 /// Restore a checkpoint by name, scoped to the caller's session.
 fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) -> bool {
-    let cp_store = ctx.checkpoint().borrow();
+    let cp_store = ctx.checkpoint().lock();
     if let Err(e) = cp_store.restore(session, name) {
         log::debug!(
             "move_symbol rollback: failed to restore checkpoint '{}': {}",

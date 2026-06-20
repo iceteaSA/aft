@@ -88,7 +88,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     } else {
-        match ctx.backup().borrow_mut().snapshot_op_tombstone(
+        match ctx.backup().lock().snapshot_op_tombstone(
             req.session(),
             &op_id,
             path.as_path(),
@@ -106,7 +106,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     if !existed {
                         ctx.backup()
-                            .borrow_mut()
+                            .lock()
                             .discard_operation_entries(req.session(), &op_id);
                     }
                     return Response::error(
@@ -126,7 +126,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(e) => {
                 if !existed {
                     ctx.backup()
-                        .borrow_mut()
+                        .lock()
                         .discard_operation_entries(req.session(), &op_id);
                 }
                 return Response::error(&req.id, e.code(), e.to_string());
@@ -135,7 +135,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if write_result.rolled_back {
         ctx.backup()
-            .borrow_mut()
+            .lock()
             .discard_operation_entries(req.session(), &op_id);
     }
 

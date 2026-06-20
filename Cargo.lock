@@ -55,6 +55,7 @@ dependencies = [
  "oxc_semantic",
  "oxc_span",
  "oxc_str",
+ "parking_lot",
  "portable-pty",
  "rayon",
  "regex",

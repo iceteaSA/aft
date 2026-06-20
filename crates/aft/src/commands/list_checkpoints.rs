@@ -6,7 +6,7 @@ use crate::protocol::{RawRequest, Response};
 /// No params required.
 /// Returns: `{ checkpoints: [{ name, file_count, created_at }, ...] }`.
 pub fn handle_list_checkpoints(req: &RawRequest, ctx: &AppContext) -> Response {
-    let checkpoint_store = ctx.checkpoint().borrow();
+    let checkpoint_store = ctx.checkpoint().lock();
     let list = checkpoint_store.list(req.session());
 
     let checkpoints: Vec<serde_json::Value> = list

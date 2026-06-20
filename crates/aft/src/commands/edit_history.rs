@@ -32,7 +32,7 @@ pub fn handle_edit_history(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     drop(config);
 
-    let backup = ctx.backup().borrow();
+    let backup = ctx.backup().lock();
     let history = backup.history(req.session(), &resolved);
 
     let entries: Vec<serde_json::Value> = history

@@ -307,7 +307,7 @@ fn snapshot_affected_files(
     ctx: &AppContext,
     op_id: &str,
 ) -> Result<Vec<PathBuf>, LspError> {
-    let mut backup = ctx.backup().borrow_mut();
+    let mut backup = ctx.backup().lock();
     let mut snapshotted = Vec::with_capacity(file_changes.len());
 
     for path in file_changes.keys() {
@@ -440,7 +440,7 @@ fn utf16_column_to_byte(line: &str, character: u32) -> usize {
 
 fn rollback_rename(ctx: &AppContext, session: &str, snapshotted: &[PathBuf]) {
     for path in snapshotted.iter().rev() {
-        let restored = ctx.backup().borrow_mut().restore_latest(session, path);
+        let restored = ctx.backup().lock().restore_latest(session, path);
         if let Ok((entry, _)) = restored {
             ctx.lsp_notify_file_changed(path, &entry.content);
         }

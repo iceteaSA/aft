@@ -318,7 +318,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                 continue;
             }
 
-            let backup_id = match ctx.backup().borrow_mut().snapshot_with_op(
+            let backup_id = match ctx.backup().lock().snapshot_with_op(
                 req.session(),
                 validated_path.as_path(),
                 "ast_replace",
@@ -334,7 +334,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if !invalid_rewrites.is_empty() {
         ctx.backup()
-            .borrow_mut()
+            .lock()
             .discard_operation_entries(req.session(), &op_id);
         invalid_rewrites.sort();
         return Response::error_with_data(
@@ -355,7 +355,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                 .open(validated_path.as_path())
             {
                 ctx.backup()
-                    .borrow_mut()
+                    .lock()
                     .discard_operation_entries(req.session(), &op_id);
                 return Response::error_with_data(
                     &req.id,
@@ -398,7 +398,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                     let rollback_ok = rollback_error.is_none();
                     if rollback_ok {
                         ctx.backup()
-                            .borrow_mut()
+                            .lock()
                             .discard_operation_entries(req.session(), &op_id);
                     }
                     return Response::error_with_data(

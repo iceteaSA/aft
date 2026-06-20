@@ -31,7 +31,7 @@ pub fn handle_list_filters(req: &RawRequest, ctx: &AppContext) -> Response {
         .as_ref()
         .map(|dir| crate::compress::trust::list_trusted(dir))
         .unwrap_or_default();
-    let harness = ctx.harness.borrow().unwrap_or(Harness::Opencode);
+    let harness = ctx.harness.lock().unwrap_or(Harness::Opencode);
     let user_dir = storage_dir.as_ref().map(|dir| {
         crate::compress::repair_legacy_user_filter_dir(dir, harness);
         crate::compress::user_filter_dir(dir, harness)

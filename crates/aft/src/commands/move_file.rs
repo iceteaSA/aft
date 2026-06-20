@@ -112,14 +112,14 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    if let Err(e) = ctx.backup().borrow_mut().snapshot_op_tombstone(
+    if let Err(e) = ctx.backup().lock().snapshot_op_tombstone(
         req.session(),
         &op_id,
         &dst_path,
         "move_file: destination created during move",
     ) {
         ctx.backup()
-            .borrow_mut()
+            .lock()
             .discard_operation_entries(req.session(), &op_id);
         return Response::error(&req.id, e.code(), e.to_string());
     }
@@ -129,7 +129,7 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         if !parent.exists() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 ctx.backup()
-                    .borrow_mut()
+                    .lock()
                     .discard_operation_entries(req.session(), &op_id);
                 return Response::error(
                     &req.id,
@@ -149,7 +149,7 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         MoveOutcome::Failed(message) => {
             ctx.backup()
-                .borrow_mut()
+                .lock()
                 .discard_operation_entries(req.session(), &op_id);
             return Response::error(
                 &req.id,
