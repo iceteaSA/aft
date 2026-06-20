@@ -19,6 +19,26 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Parse `--subc <connection-file>` / `--subc=<path>` from argv. Returns `None`
+/// when absent (standalone mode). The presence of the flag is the subc-mode
+/// gate; the value is the daemon's published connection-file path.
+fn parse_subc_arg(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--subc" {
+            return args.next().map(std::path::PathBuf::from);
+        }
+        if let Some(raw) = arg.to_str().and_then(|a| a.strip_prefix("--subc=")) {
+            if !raw.is_empty() {
+                return Some(std::path::PathBuf::from(raw));
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     // Handle --version flag before anything else
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -64,6 +84,22 @@ fn main() {
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(error.exit_code());
+            }
+        }
+    }
+
+    // subc daemon attach (P5a): `aft --subc <connection-file>` swaps the
+    // standalone NDJSON-over-stdin transport for the subc loopback-TCP client.
+    // Presence of --subc => subc mode; absence => standalone (the dormancy gate).
+    // Fail-loud on connect/auth failure — never silently downgrade to standalone
+    // (split-brain index state). tokio runs ONLY inside run_subc_mode.
+    if let Some(connection_file) = parse_subc_arg(std::env::args_os().skip(1)) {
+        aft::slog_info!("subc mode, pid {}", std::process::id());
+        match aft::subc::run_subc_mode(&connection_file) {
+            Ok(()) => return,
+            Err(error) => {
+                aft::slog_error!("subc attach failed: {error}");
+                std::process::exit(1);
             }
         }
     }
