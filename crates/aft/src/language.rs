@@ -6,7 +6,7 @@ pub use crate::symbols::{Range, Symbol, SymbolMatch};
 /// Trait for language-specific symbol resolution.
 ///
 /// S02 implements this with tree-sitter parsing via `TreeSitterProvider`.
-pub trait LanguageProvider {
+pub trait LanguageProvider: Send + Sync {
     /// Resolve a symbol by name within a file. Returns all matches.
     fn resolve_symbol(&self, file: &Path, name: &str) -> Result<Vec<SymbolMatch>, AftError>;
 

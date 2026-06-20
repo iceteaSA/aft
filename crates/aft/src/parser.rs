@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
@@ -6331,7 +6330,7 @@ fn dedup_symbols(symbols: &mut Vec<Symbol>) {
 /// Provider that uses tree-sitter for real symbol extraction.
 /// Implements the `LanguageProvider` trait from `language.rs`.
 pub struct TreeSitterProvider {
-    parser: RefCell<FileParser>,
+    symbol_cache: SharedSymbolCache,
 }
 
 #[derive(Debug, Clone)]
@@ -6341,32 +6340,32 @@ struct ReExportTarget {
 }
 
 impl TreeSitterProvider {
-    /// Create a new `TreeSitterProvider` backed by a fresh `FileParser`.
+    /// Create a new `TreeSitterProvider` backed by a fresh shared symbol cache.
     pub fn new() -> Self {
         Self::with_symbol_cache(Arc::new(RwLock::new(SymbolCache::new())))
     }
 
     /// Create a new `TreeSitterProvider` backed by a shared symbol cache.
     pub fn with_symbol_cache(symbol_cache: SharedSymbolCache) -> Self {
-        Self {
-            parser: RefCell::new(FileParser::with_symbol_cache(symbol_cache)),
-        }
+        Self { symbol_cache }
     }
 
     /// Return shared symbol cache entries for status reporting.
     pub fn symbol_cache_len(&self) -> usize {
-        let parser = self.parser.borrow();
-        parser.symbol_cache_len()
+        self.symbol_cache
+            .read()
+            .map(|cache| cache.len())
+            .unwrap_or(0)
     }
 
     /// Shared symbol cache backing this provider.
     pub fn symbol_cache(&self) -> SharedSymbolCache {
-        let parser = self.parser.borrow();
-        parser.symbol_cache()
+        Arc::clone(&self.symbol_cache)
     }
 
     fn resolve_symbol_inner(
         &self,
+        parser: &mut FileParser,
         file: &Path,
         name: &str,
         depth: usize,
@@ -6381,26 +6380,30 @@ impl TreeSitterProvider {
             return Ok(Vec::new());
         }
 
-        let symbols = self.parser.borrow_mut().extract_symbols(file)?;
+        let symbols = parser.extract_symbols(file)?;
         let local_matches = symbol_matches_in_file(file, &symbols, name);
         if !local_matches.is_empty() {
             return Ok(local_matches);
         }
 
         if name == "default" {
-            let default_matches = self.resolve_local_default_export(file, &symbols)?;
+            let default_matches = self.resolve_local_default_export(parser, file, &symbols)?;
             if !default_matches.is_empty() {
                 return Ok(default_matches);
             }
         }
 
-        let reexport_targets = self.collect_reexport_targets(file, name)?;
+        let reexport_targets = self.collect_reexport_targets(parser, file, name)?;
         let mut matches = Vec::new();
         let mut seen = HashSet::new();
         for target in reexport_targets {
-            for resolved in
-                self.resolve_symbol_inner(&target.file, &target.symbol_name, depth + 1, visited)?
-            {
+            for resolved in self.resolve_symbol_inner(
+                parser,
+                &target.file,
+                &target.symbol_name,
+                depth + 1,
+                visited,
+            )? {
                 let key = format!(
                     "{}:{}:{}:{}:{}:{}",
                     resolved.file,
@@ -6421,10 +6424,11 @@ impl TreeSitterProvider {
 
     fn collect_reexport_targets(
         &self,
+        parser: &mut FileParser,
         file: &Path,
         requested_name: &str,
     ) -> Result<Vec<ReExportTarget>, AftError> {
-        let (source, tree, lang) = self.read_parsed_file(file)?;
+        let (source, tree, lang) = self.read_parsed_file(parser, file)?;
         if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
             return Ok(Vec::new());
         }
@@ -6499,10 +6503,11 @@ impl TreeSitterProvider {
 
     fn resolve_local_default_export(
         &self,
+        parser: &mut FileParser,
         file: &Path,
         symbols: &[Symbol],
     ) -> Result<Vec<SymbolMatch>, AftError> {
-        let (source, tree, lang) = self.read_parsed_file(file)?;
+        let (source, tree, lang) = self.read_parsed_file(parser, file)?;
         if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
             return Ok(Vec::new());
         }
@@ -6548,7 +6553,11 @@ impl TreeSitterProvider {
         Ok(matches)
     }
 
-    fn read_parsed_file(&self, file: &Path) -> Result<(String, Tree, LangId), AftError> {
+    fn read_parsed_file(
+        &self,
+        parser: &mut FileParser,
+        file: &Path,
+    ) -> Result<(String, Tree, LangId), AftError> {
         let current_mtime = std::fs::metadata(file)
             .and_then(|m| m.modified())
             .map_err(|e| AftError::FileNotFound {
@@ -6559,13 +6568,9 @@ impl TreeSitterProvider {
         })?;
         let size = source.len() as u64;
         let content_hash = content_hash_for_source(&source);
-        let (tree, lang) = {
-            let mut parser = self.parser.borrow_mut();
-            let (tree, lang) =
-                parser.parse_with_source(file, &source, current_mtime, size, content_hash)?;
-            (tree.clone(), lang)
-        };
-        Ok((source, tree, lang))
+        let (tree, lang) =
+            parser.parse_with_source(file, &source, current_mtime, size, content_hash)?;
+        Ok((source, tree.clone(), lang))
     }
 }
 
@@ -6793,7 +6798,8 @@ fn lexical_declaration_name(source: &str, node: &Node) -> Option<String> {
 
 impl crate::language::LanguageProvider for TreeSitterProvider {
     fn resolve_symbol(&self, file: &Path, name: &str) -> Result<Vec<SymbolMatch>, AftError> {
-        let matches = self.resolve_symbol_inner(file, name, 0, &mut HashSet::new())?;
+        let mut parser = FileParser::with_symbol_cache(self.symbol_cache());
+        let matches = self.resolve_symbol_inner(&mut parser, file, name, 0, &mut HashSet::new())?;
 
         if matches.is_empty() {
             Err(AftError::SymbolNotFound {
@@ -6806,7 +6812,8 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
     }
 
     fn list_symbols(&self, file: &Path) -> Result<Vec<Symbol>, AftError> {
-        self.parser.borrow_mut().extract_symbols(file)
+        let mut parser = FileParser::with_symbol_cache(self.symbol_cache());
+        parser.extract_symbols(file)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -585,6 +585,7 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
 
     assert_send_sync::<App>();
+    assert_send_sync::<AppContext>();
     assert_send::<crate::lsp::manager::LspManager>();
     assert_send::<crate::semantic_index::EmbeddingModel>();
 };
