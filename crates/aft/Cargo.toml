@@ -111,7 +111,8 @@ htmd = "0.5.4"
 # codec (Frame + read_frame/write_frame) lands via subc-protocol/subc-transport
 # bumps when the Hello-onward control loop is wired. tokio runs ONLY at the
 # --subc transport edge; AFT's command core stays synchronous.
-subc-transport = "0.1.0"
+subc-protocol = "0.3.0"
+subc-transport = "0.2.0"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
 
 [target.'cfg(unix)'.dependencies]
