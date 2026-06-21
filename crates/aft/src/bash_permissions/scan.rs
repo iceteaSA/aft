@@ -21,7 +21,7 @@ pub fn scan(command: &str, ctx: &AppContext) -> Vec<PermissionAsk> {
     #[cfg(windows)]
     {
         let _ = (command, ctx);
-        return Vec::new();
+        Vec::new()
     }
 
     #[cfg(not(windows))]

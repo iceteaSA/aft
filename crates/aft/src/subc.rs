@@ -11,7 +11,7 @@
 //! edge never dispatches against `AppContext` inline; per-actor executor lanes
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -22,10 +22,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::context::{App, AppContext};
+use crate::context::{App, AppContext, ProgressSender};
 use crate::executor::{Executor, Lane};
 use crate::path_identity::ProjectRootId;
-use crate::protocol::{RawRequest, Response};
+use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
 use crate::runtime_drain;
 
 use subc_protocol::manifest::{
@@ -80,6 +80,165 @@ impl RootMeta {
 
 fn route_key(channel: u16) -> RouteChannel {
     RouteChannel::from(channel)
+}
+
+fn remove_root_channel(
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root: &ProjectRootId,
+    channel: RouteChannel,
+) {
+    let remove_root = if let Some(channels) = root_channels.get_mut(root) {
+        channels.remove(&channel);
+        channels.is_empty()
+    } else {
+        false
+    };
+    if remove_root {
+        root_channels.remove(root);
+    }
+}
+
+fn remove_route_channel(
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    channel: RouteChannel,
+) -> Option<RouteIdentity> {
+    let removed = routes.remove(&channel);
+    if let Some(identity) = &removed {
+        remove_root_channel(root_channels, &identity.root, channel);
+    }
+    removed
+}
+
+fn insert_route_channel(
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    channel: RouteChannel,
+    identity: RouteIdentity,
+) {
+    if let Some(previous) = routes.insert(channel, identity.clone()) {
+        remove_root_channel(root_channels, &previous.root, channel);
+    }
+    root_channels
+        .entry(identity.root.clone())
+        .or_default()
+        .insert(channel);
+}
+
+fn progress_sender_for_root(
+    push_tx: mpsc::Sender<(ProjectRootId, PushFrame)>,
+    root_id: ProjectRootId,
+) -> ProgressSender {
+    Arc::new(Box::new(move |frame: PushFrame| {
+        // Emitters can run on executor workers, maintenance jobs, watcher drains,
+        // semantic refresh workers, or bg-bash watchdog threads. Never block any
+        // of them on subc routing/backpressure; the loop coalesces lossy bursts.
+        let _ = push_tx.try_send((root_id.clone(), frame));
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LossyProgressKind {
+    Stdout,
+    Stderr,
+}
+
+impl From<&ProgressKind> for LossyProgressKind {
+    fn from(kind: &ProgressKind) -> Self {
+        match kind {
+            ProgressKind::Stdout => Self::Stdout,
+            ProgressKind::Stderr => Self::Stderr,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LossyPushKey {
+    Progress {
+        request_id: String,
+        kind: LossyProgressKind,
+    },
+    StatusChanged,
+    BashLongRunning {
+        task_id: String,
+    },
+}
+
+fn lossy_push_key(frame: &PushFrame) -> Option<LossyPushKey> {
+    match frame {
+        PushFrame::Progress(progress) => Some(LossyPushKey::Progress {
+            request_id: progress.request_id.clone(),
+            kind: LossyProgressKind::from(&progress.kind),
+        }),
+        PushFrame::StatusChanged(_) => Some(LossyPushKey::StatusChanged),
+        PushFrame::BashLongRunning(long_running) => Some(LossyPushKey::BashLongRunning {
+            task_id: long_running.task_id.clone(),
+        }),
+        PushFrame::BashCompleted(_)
+        | PushFrame::BashPatternMatch(_)
+        | PushFrame::ConfigureWarnings(_) => None,
+    }
+}
+
+fn coalesce_push_batch(batch: Vec<(ProjectRootId, PushFrame)>) -> Vec<(ProjectRootId, PushFrame)> {
+    let mut slots: Vec<Option<(ProjectRootId, PushFrame)>> = Vec::with_capacity(batch.len());
+    let mut latest_lossy: HashMap<(ProjectRootId, LossyPushKey), usize> = HashMap::new();
+
+    for (root, frame) in batch {
+        if let Some(lossy_key) = lossy_push_key(&frame) {
+            let map_key = (root.clone(), lossy_key);
+            if let Some(previous_index) = latest_lossy.insert(map_key, slots.len()) {
+                slots[previous_index] = None;
+            }
+        }
+        slots.push(Some((root, frame)));
+    }
+
+    slots.into_iter().flatten().collect()
+}
+
+fn fan_out_push_frame(
+    writer_tx: &mpsc::Sender<Frame>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root: &ProjectRootId,
+    frame: &PushFrame,
+) -> usize {
+    let Some(channels) = root_channels.get(root) else {
+        return 0;
+    };
+    let body = match serde_json::to_vec(frame) {
+        Ok(body) => body,
+        Err(error) => {
+            log::warn!("subc attach: failed to serialize PushFrame for fan-out: {error}");
+            return 0;
+        }
+    };
+
+    let mut sent = 0;
+    for &channel in channels {
+        let Ok(route_channel) = u16::try_from(channel) else {
+            log::warn!("subc attach: invalid route channel {channel} for Push fan-out");
+            continue;
+        };
+        let push_frame = match Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Push,
+            control_flags(),
+            route_channel,
+            0,
+            body.clone(),
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                log::warn!("subc attach: failed to build Push frame: {error}");
+                continue;
+            }
+        };
+        if writer_tx.try_send(push_frame).is_ok() {
+            sent += 1;
+        }
+    }
+    sent
 }
 
 /// Sync command dispatch, passed in from `main` (the binary owns the command
@@ -217,7 +376,9 @@ where
     let shutdown = Arc::new(Notify::new());
     let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<(ProjectRootId, Response)>(256);
+    let (push_tx, mut push_rx) = mpsc::channel::<(ProjectRootId, PushFrame)>(1024);
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
+    let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
@@ -259,7 +420,7 @@ where
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel);
-                        if let Some(identity) = routes.remove(&channel) {
+                        if let Some(identity) = remove_route_channel(&mut routes, &mut root_channels, channel) {
                             if let Some(meta) = live_roots.get_mut(&identity.root) {
                                 let idle_for = meta.last_touched.elapsed();
                                 meta.touch();
@@ -291,7 +452,9 @@ where
                             &shared_app,
                             &executor,
                             &mut routes,
+                            &mut root_channels,
                             &mut live_roots,
+                            &push_tx,
                             &shutdown,
                             dispatch,
                         )
@@ -317,6 +480,19 @@ where
                     }
                     // Cancel/Push/etc. are ignored until Phase 3 cancellation.
                     _ => {}
+                }
+            }
+            Some((root_id, frame)) = push_rx.recv() => {
+                // Drain the currently queued burst in one loop turn so lossy
+                // status/progress classes coalesce before reaching subc's shared
+                // egress queue.
+                let mut batch = vec![(root_id, frame)];
+                while let Ok(item) = push_rx.try_recv() {
+                    batch.push(item);
+                }
+
+                for (root, frame) in coalesce_push_batch(batch) {
+                    let _ = fan_out_push_frame(&writer_tx, &root_channels, &root, &frame);
                 }
             }
             Some((root_id, response)) = maintenance_rx.recv() => {
@@ -427,7 +603,9 @@ async fn handle_control_request(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    push_tx: &mpsc::Sender<(ProjectRootId, PushFrame)>,
     shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
@@ -494,6 +672,10 @@ async fn handle_control_request(
                     Config::default(),
                 ));
                 install_bash_compressor(&actor_ctx);
+                actor_ctx.set_progress_sender(Some(progress_sender_for_root(
+                    push_tx.clone(),
+                    bind_root_id.clone(),
+                )));
                 let inserted =
                     executor.register_actor(bind_root_id.clone(), Arc::clone(&actor_ctx));
                 drop(actor_ctx);
@@ -572,7 +754,9 @@ async fn handle_control_request(
                 }
             }
 
-            routes.insert(
+            insert_route_channel(
+                routes,
+                root_channels,
                 route_key(route_channel),
                 RouteIdentity {
                     root: bind_root_id.clone(),
@@ -1005,6 +1189,222 @@ fn build_manifest() -> ModuleManifest {
 
 fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::{
+        BashCompletedFrame, BashLongRunningFrame, ProgressFrame, StatusChangedFrame,
+    };
+    use serde_json::json;
+
+    fn test_root(name: &str) -> (tempfile::TempDir, ProjectRootId) {
+        let dir = tempfile::Builder::new()
+            .prefix(name)
+            .tempdir()
+            .expect("temp root");
+        let root = ProjectRootId::from_path(dir.path()).expect("project root id");
+        (dir, root)
+    }
+
+    fn status_frame(seq: u64) -> PushFrame {
+        PushFrame::StatusChanged(StatusChangedFrame {
+            frame_type: "status_changed",
+            session_id: None,
+            snapshot: json!({ "seq": seq }),
+        })
+    }
+
+    fn completion_frame(task_id: &str) -> PushFrame {
+        PushFrame::BashCompleted(BashCompletedFrame {
+            frame_type: "bash_completed",
+            task_id: task_id.to_string(),
+            session_id: "session-1".to_string(),
+            status: BgTaskStatus::Completed,
+            exit_code: Some(0),
+            command: format!("echo {task_id}"),
+            output_preview: String::new(),
+            output_truncated: false,
+            original_tokens: None,
+            compressed_tokens: None,
+            tokens_skipped: false,
+        })
+    }
+
+    fn long_running_frame(task_id: &str, elapsed_ms: u64) -> PushFrame {
+        PushFrame::BashLongRunning(BashLongRunningFrame {
+            frame_type: "bash_long_running",
+            task_id: task_id.to_string(),
+            session_id: "session-1".to_string(),
+            command: format!("sleep {elapsed_ms}"),
+            elapsed_ms,
+        })
+    }
+
+    fn progress_frame(request_id: &str, kind: ProgressKind, chunk: &str) -> PushFrame {
+        PushFrame::Progress(ProgressFrame::new(request_id, kind, chunk))
+    }
+
+    fn status_seq(frame: &PushFrame) -> Option<u64> {
+        match frame {
+            PushFrame::StatusChanged(status) => status.snapshot.get("seq").and_then(|v| v.as_u64()),
+            _ => None,
+        }
+    }
+
+    fn completion_task(frame: &PushFrame) -> Option<&str> {
+        match frame {
+            PushFrame::BashCompleted(completion) => Some(completion.task_id.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn coalesce_push_batch_collapses_lossy_and_preserves_reliable_fifo() {
+        let (_root_dir, root) = test_root("subc-coalesce-root");
+        let (_other_dir, other_root) = test_root("subc-coalesce-other");
+
+        let output = coalesce_push_batch(vec![
+            (root.clone(), status_frame(1)),
+            (root.clone(), completion_frame("task-1")),
+            (root.clone(), status_frame(2)),
+            (root.clone(), completion_frame("task-2")),
+            (root.clone(), long_running_frame("long-task", 100)),
+            (root.clone(), long_running_frame("long-task", 200)),
+            (other_root.clone(), status_frame(9)),
+        ]);
+
+        let completion_tasks: Vec<_> = output
+            .iter()
+            .filter_map(|(_, frame)| completion_task(frame))
+            .collect();
+        assert_eq!(completion_tasks, vec!["task-1", "task-2"]);
+
+        let root_statuses: Vec<_> = output
+            .iter()
+            .filter(|(output_root, _)| output_root == &root)
+            .filter_map(|(_, frame)| status_seq(frame))
+            .collect();
+        assert_eq!(root_statuses, vec![2]);
+
+        let other_statuses: Vec<_> = output
+            .iter()
+            .filter(|(output_root, _)| output_root == &other_root)
+            .filter_map(|(_, frame)| status_seq(frame))
+            .collect();
+        assert_eq!(other_statuses, vec![9]);
+
+        let long_running_elapsed: Vec<_> = output
+            .iter()
+            .filter_map(|(_, frame)| match frame {
+                PushFrame::BashLongRunning(long_running) => Some(long_running.elapsed_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(long_running_elapsed, vec![200]);
+    }
+
+    #[test]
+    fn coalesce_push_batch_keeps_progress_stream_keys_separate() {
+        let (_root_dir, root) = test_root("subc-progress-coalesce-root");
+
+        let output = coalesce_push_batch(vec![
+            (
+                root.clone(),
+                progress_frame("request-1", ProgressKind::Stdout, "old stdout"),
+            ),
+            (
+                root.clone(),
+                progress_frame("request-1", ProgressKind::Stderr, "stderr"),
+            ),
+            (
+                root.clone(),
+                progress_frame("request-2", ProgressKind::Stdout, "other stdout"),
+            ),
+            (
+                root.clone(),
+                progress_frame("request-1", ProgressKind::Stdout, "new stdout"),
+            ),
+        ]);
+
+        let progress: Vec<_> = output
+            .iter()
+            .filter_map(|(_, frame)| match frame {
+                PushFrame::Progress(progress) => Some((
+                    progress.request_id.as_str(),
+                    match progress.kind {
+                        ProgressKind::Stdout => "stdout",
+                        ProgressKind::Stderr => "stderr",
+                    },
+                    progress.chunk.as_str(),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            progress,
+            vec![
+                ("request-1", "stderr", "stderr"),
+                ("request-2", "stdout", "other stdout"),
+                ("request-1", "stdout", "new stdout"),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_sender_drops_when_push_funnel_is_full_without_blocking() {
+        let (_root_dir, root) = test_root("subc-push-full-root");
+        let (push_tx, mut push_rx) = mpsc::channel::<(ProjectRootId, PushFrame)>(1);
+        let sender = progress_sender_for_root(push_tx, root.clone());
+
+        let started = Instant::now();
+        sender(status_frame(1));
+        sender(status_frame(2));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "saturated push sender must return immediately"
+        );
+
+        let (received_root, received_frame) = push_rx.try_recv().expect("first frame queued");
+        assert_eq!(received_root, root);
+        assert_eq!(status_seq(&received_frame), Some(1));
+        assert!(
+            push_rx.try_recv().is_err(),
+            "second frame should be dropped"
+        );
+    }
+
+    #[test]
+    fn fan_out_push_frame_drops_when_writer_is_full_without_blocking() {
+        let (_root_dir, root) = test_root("subc-writer-full-root");
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        writer_tx
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .expect("prefill writer queue");
+
+        let mut root_channels = HashMap::new();
+        root_channels.insert(root.clone(), HashSet::from([route_key(7)]));
+
+        let started = Instant::now();
+        let sent = fan_out_push_frame(&writer_tx, &root_channels, &root, &status_frame(1));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "saturated writer fan-out must return immediately"
+        );
+        assert_eq!(sent, 0);
+
+        let queued = writer_rx
+            .try_recv()
+            .expect("prefilled frame remains queued");
+        assert_eq!(queued.header.ty, FrameType::Ping);
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "push should be dropped on full writer"
+        );
+    }
 }
 
 #[derive(Debug)]

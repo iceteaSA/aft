@@ -11,7 +11,7 @@ use aft::executor::{Executor, ExecutorConfig, Lane};
 use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
 use aft::path_identity::ProjectRootId;
-use aft::protocol::{RawRequest, Response};
+use aft::protocol::{PushFrame, RawRequest, Response, StatusChangedFrame};
 use aft::subc::run_subc_mode;
 use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
@@ -33,6 +33,7 @@ struct FakeDaemonInput {
     root1: std::path::PathBuf,
     root2: std::path::PathBuf,
     failed_root: std::path::PathBuf,
+    push_burst_root: std::path::PathBuf,
     callgraph_root: std::path::PathBuf,
     callgraph_file: std::path::PathBuf,
     state: Arc<BridgeState>,
@@ -317,19 +318,71 @@ fn ctx_project_root(ctx: &AppContext) -> String {
         .unwrap_or_else(|| "<unset>".to_string())
 }
 
+fn emit_test_status(ctx: &AppContext, marker: &str, seq: u64) {
+    if let Some(sender) = ctx.progress_sender_handle() {
+        sender(PushFrame::StatusChanged(StatusChangedFrame {
+            frame_type: "status_changed",
+            session_id: Some("session-1".to_string()),
+            snapshot: json!({
+                "marker": marker,
+                "seq": seq,
+                "project_root": ctx_project_root(ctx),
+            }),
+        }));
+    }
+}
+
+fn emit_test_status_burst(ctx: &AppContext, marker: &str, count: u64) {
+    for seq in 0..count {
+        emit_test_status(ctx, marker, seq);
+    }
+}
+
+fn configure_status_burst_spec(req: &RawRequest) -> Option<(String, u64)> {
+    let tiers = req.params.get("config")?.as_array()?;
+    for tier in tiers {
+        let Some(doc) = tier.get("doc").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<Value>(doc) else {
+            continue;
+        };
+        let Some(spec) = doc.get("subc_test_configure_status_burst") else {
+            continue;
+        };
+        let marker = spec
+            .get("marker")
+            .and_then(Value::as_str)
+            .unwrap_or("configure-status-burst")
+            .to_string();
+        let count = spec.get("count").and_then(Value::as_u64).unwrap_or(1);
+        return Some((marker, count));
+    }
+    None
+}
+
+fn emit_configure_status_burst_if_requested(req: &RawRequest, ctx: &AppContext) {
+    if let Some((marker, count)) = configure_status_burst_spec(req) {
+        emit_test_status_burst(ctx, &marker, count);
+    }
+}
+
 fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = Arc::clone(BRIDGE_STATE.get().expect("bridge state installed"));
     match req.command.as_str() {
         "configure" => {
             state.configure(&req, ctx);
             if req.id == "subc-bind-5" {
+                emit_configure_status_burst_if_requested(&req, ctx);
                 return Response::error(
                     &req.id,
                     "config_divergence",
                     "intentional test configure failure",
                 );
             }
-            configure_bridge_context(&req, ctx)
+            let response = configure_bridge_context(&req, ctx);
+            emit_configure_status_burst_if_requested(&req, ctx);
+            response
         }
         "read" => match req.params.get("case").and_then(Value::as_str) {
             Some("overlap") => state.overlap_read(req.id),
@@ -356,6 +409,29 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
         "semantic_search" => state.heavy(req.id),
+        "subc_test_emit_status" => {
+            let marker = req
+                .params
+                .get("marker")
+                .and_then(Value::as_str)
+                .unwrap_or("tool-status");
+            let seq = req.params.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            emit_test_status(ctx, marker, seq);
+            Response::success(
+                req.id,
+                json!({ "emitted": true, "marker": marker, "seq": seq }),
+            )
+        }
+        "subc_test_emit_status_burst" => {
+            let marker = req
+                .params
+                .get("marker")
+                .and_then(Value::as_str)
+                .unwrap_or("tool-status-burst");
+            let count = req.params.get("count").and_then(Value::as_u64).unwrap_or(1);
+            emit_test_status_burst(ctx, marker, count);
+            Response::success(req.id, json!({ "emitted": count, "marker": marker }))
+        }
         "enable_callgraph_store_for_test" => {
             ctx.update_config(|config| config.callgraph_store = true);
             Response::success(req.id, json!({ "callgraph_store": true }))
@@ -377,6 +453,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     let root1 = tempfile::tempdir().expect("root1 tempdir");
     let root2 = tempfile::tempdir().expect("root2 tempdir");
     let failed_root = tempfile::tempdir().expect("failed root tempdir");
+    let push_burst_root = tempfile::tempdir().expect("push burst root tempdir");
     let callgraph_root = tempfile::tempdir().expect("callgraph root tempdir");
     let callgraph_src = callgraph_root.path().join("src");
     std::fs::create_dir_all(&callgraph_src).expect("callgraph src dir");
@@ -414,6 +491,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     let root1_path = root1.path().to_path_buf();
     let root2_path = root2.path().to_path_buf();
     let failed_root_path = failed_root.path().to_path_buf();
+    let push_burst_root_path = push_burst_root.path().to_path_buf();
     let callgraph_root_path = callgraph_root.path().to_path_buf();
     let callgraph_file_path = callgraph_file.clone();
     let daemon = thread::spawn(move || {
@@ -432,6 +510,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
                     root1: root1_path,
                     root2: root2_path,
                     failed_root: failed_root_path,
+                    push_burst_root: push_burst_root_path,
                     callgraph_root: callgraph_root_path,
                     callgraph_file: callgraph_file_path,
                     state: daemon_state,
@@ -500,6 +579,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     drop(root1);
     drop(root2);
     drop(failed_root);
+    drop(push_burst_root);
     drop(callgraph_root);
     drop(storage);
 }
@@ -512,6 +592,7 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         root1,
         root2,
         failed_root,
+        push_burst_root,
         callgraph_root,
         callgraph_file,
         state,
@@ -527,7 +608,7 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     .await
     .expect("authenticate aft client");
 
-    let hello = read_frame_timeout(&mut stream, "ModuleHello").await;
+    let hello = read_any_frame_timeout(&mut stream, "ModuleHello").await;
     assert_eq!(hello.header.ty, FrameType::Hello);
     let hello_body: ModuleHelloBody = serde_json::from_slice(&hello.body).expect("hello body");
     let _: ModuleManifest = hello_body.manifest;
@@ -551,6 +632,46 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
 
     send_route_bind(&mut stream, 1, 10, &root1).await;
     expect_route_bind_ack(&mut stream, 10).await;
+
+    // L3 PUSH fan-out: a root-1 actor emit is serialized as a server-initiated
+    // Push frame on route 1 with corr=0.
+    send_tool_call(
+        &mut stream,
+        1,
+        70,
+        "subc_test_emit_status",
+        json!({ "marker": "root1-fanout", "seq": 1 }),
+    )
+    .await;
+    let fanout_pushes =
+        expect_status_pushes_for_tool(&mut stream, 70, "root1-fanout", HashSet::from([1])).await;
+    assert_eq!(push_seq(&fanout_pushes[0]), Some(1));
+
+    // L3 coalescing integration: configure emits a burst while run_module_loop is
+    // awaiting the Mutating configure job, so the queued burst drains in one pass.
+    send_route_bind_with_doc(
+        &mut stream,
+        6,
+        16,
+        &push_burst_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_configure_status_burst": {
+                "marker": "configure-burst",
+                "count": 16,
+            },
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 16).await;
+    let configure_burst_pushes =
+        expect_status_pushes(&mut stream, "configure-burst", HashSet::from([6])).await;
+    assert_eq!(configure_burst_pushes.len(), 1);
+    assert_eq!(push_seq(&configure_burst_pushes[0]), Some(15));
+    assert_no_status_push_for_marker(&mut stream, "configure-burst", Duration::from_millis(150))
+        .await;
 
     // L2 response finalizer: a normal route-channel read gets status_bar once
     // the actor has real Tier-2 counts, matching standalone response shape.
@@ -702,6 +823,21 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     assert_eq!(route2_read.header.corr, 401);
     assert_tool_project_root(&route2_read, &root2);
 
+    // L3 PUSH isolation: root-1 emits do not leak to root-2's bound channel.
+    send_tool_call(
+        &mut stream,
+        1,
+        402,
+        "subc_test_emit_status",
+        json!({ "marker": "root1-isolation", "seq": 2 }),
+    )
+    .await;
+    let isolation_pushes =
+        expect_status_pushes_for_tool(&mut stream, 402, "root1-isolation", HashSet::from([1]))
+            .await;
+    assert_eq!(isolation_pushes.len(), 1);
+    assert_eq!(push_seq(&isolation_pushes[0]), Some(2));
+
     // 4. Same root: route 4 binds to root 1 while route 1 reads are in flight.
     // It must reuse the existing actor, so configure cannot start until those
     // reads leave the shared per-root epoch.
@@ -730,10 +866,49 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     assert_eq!(route4_read.header.corr, 420);
     assert_tool_project_root(&route4_read, &root1);
 
+    // L3 PUSH multi-channel fan-out: root 1 is bound on routes 1 and 4.
+    send_tool_call(
+        &mut stream,
+        1,
+        421,
+        "subc_test_emit_status",
+        json!({ "marker": "root1-multichannel", "seq": 4 }),
+    )
+    .await;
+    let multichannel_pushes = expect_status_pushes_for_tool(
+        &mut stream,
+        421,
+        "root1-multichannel",
+        HashSet::from([1, 4]),
+    )
+    .await;
+    assert_eq!(multichannel_pushes.len(), 2);
+    assert!(multichannel_pushes
+        .iter()
+        .all(|push| push_seq(push) == Some(4)));
+
     // 5. B3: a new-root configure failure must not install a route and must be
-    // removed from the executor before the connection exits.
-    send_route_bind(&mut stream, 5, 50, &failed_root).await;
+    // removed from the executor before the connection exits. Any Push emitted by
+    // that actor before the failed bind is dropped because no channel is bound.
+    send_route_bind_with_doc(
+        &mut stream,
+        5,
+        50,
+        &failed_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_configure_status_burst": {
+                "marker": "failed-no-channel",
+                "count": 4,
+            },
+        }),
+    )
+    .await;
     expect_route_bind_error(&mut stream, 50, "config_divergence").await;
+    assert_no_status_push_for_marker(&mut stream, "failed-no-channel", Duration::from_millis(150))
+        .await;
     send_tool_call(&mut stream, 5, 550, "read", json!({ "case": "fast" })).await;
     expect_error_frame(&mut stream, 5, 550, "route_not_bound").await;
 
@@ -807,6 +982,27 @@ async fn send_route_bind(
     corr: u64,
     root: &std::path::Path,
 ) {
+    send_route_bind_with_doc(
+        stream,
+        route_channel,
+        corr,
+        root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+}
+
+async fn send_route_bind_with_doc(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    root: &std::path::Path,
+    doc: Value,
+) {
     let request = ModuleControlRequest::RouteBind {
         route_channel,
         target: RouteTarget::ToolProvider {
@@ -817,11 +1013,7 @@ async fn send_route_bind(
             harness: "opencode".to_string(),
             session: format!("session-{route_channel}"),
         },
-        config: vec![user_config_tier(json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
-        }))],
+        config: vec![user_config_tier(doc)],
     };
     send_frame(
         stream,
@@ -863,12 +1055,29 @@ async fn send_frame(stream: &mut tokio::net::TcpStream, frame: Frame) {
     write_frame(stream, &frame).await.expect("write frame");
 }
 
-async fn read_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str) -> Frame {
+async fn read_any_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str) -> Frame {
     tokio::time::timeout(Duration::from_secs(3), read_frame(stream))
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
         .expect("read frame")
         .unwrap_or_else(|| panic!("EOF waiting for {label}"))
+}
+
+async fn read_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str) -> Frame {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let now = Instant::now();
+        assert!(now < deadline, "timed out waiting for {label}");
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for {label}"));
+        if frame.header.ty != FrameType::Push {
+            return frame;
+        }
+    }
 }
 
 async fn expect_route_bind_ack(stream: &mut tokio::net::TcpStream, corr: u64) {
@@ -896,6 +1105,131 @@ async fn expect_error_frame(
     assert_eq!(frame.header.corr, corr);
     let body: Value = serde_json::from_slice(&frame.body).expect("error body");
     assert_eq!(body.get("code").and_then(Value::as_str), Some(code));
+}
+
+fn push_marker(body: &Value) -> Option<&str> {
+    body.get("snapshot")
+        .and_then(|snapshot| snapshot.get("marker"))
+        .and_then(Value::as_str)
+}
+
+fn push_seq(body: &Value) -> Option<u64> {
+    body.get("snapshot")
+        .and_then(|snapshot| snapshot.get("seq"))
+        .and_then(Value::as_u64)
+}
+
+async fn expect_status_pushes_for_tool(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    marker: &str,
+    expected_channels: HashSet<u16>,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut response_seen = false;
+    let mut pushes = Vec::new();
+    let mut channels = HashSet::new();
+
+    while !response_seen || channels != expected_channels {
+        let now = Instant::now();
+        assert!(now < deadline, "timed out waiting for push marker {marker}");
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for push marker {marker}"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for push marker {marker}"));
+        match frame.header.ty {
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if push_marker(&body) == Some(marker) {
+                    channels.insert(frame.header.channel);
+                    pushes.push(body);
+                }
+            }
+            FrameType::Response if frame.header.corr == corr => {
+                let response = tool_response_json(&frame);
+                assert!(
+                    response["success"].as_bool().unwrap_or(false),
+                    "emit tool response should succeed: {response:?}"
+                );
+                response_seen = true;
+            }
+            other => panic!("unexpected frame while waiting for push marker {marker}: {other:?}"),
+        }
+    }
+
+    assert_eq!(channels, expected_channels);
+    pushes
+}
+
+async fn expect_status_pushes(
+    stream: &mut tokio::net::TcpStream,
+    marker: &str,
+    expected_channels: HashSet<u16>,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut pushes = Vec::new();
+    let mut channels = HashSet::new();
+
+    while channels != expected_channels {
+        let now = Instant::now();
+        assert!(now < deadline, "timed out waiting for push marker {marker}");
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for push marker {marker}"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for push marker {marker}"));
+        if frame.header.ty != FrameType::Push {
+            panic!(
+                "unexpected non-Push frame while waiting for marker {marker}: {:?}",
+                frame.header.ty
+            );
+        }
+        assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+        let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+        if push_marker(&body) == Some(marker) {
+            channels.insert(frame.header.channel);
+            pushes.push(body);
+        }
+    }
+
+    assert_eq!(channels, expected_channels);
+    pushes
+}
+
+async fn assert_no_status_push_for_marker(
+    stream: &mut tokio::net::TcpStream,
+    marker: &str,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match tokio::time::timeout(remaining, read_frame(stream)).await {
+            Err(_) => return,
+            Ok(Ok(Some(frame))) => {
+                if frame.header.ty == FrameType::Push {
+                    let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                    assert_ne!(
+                        push_marker(&body),
+                        Some(marker),
+                        "unexpected push marker {marker}: {body:?}"
+                    );
+                }
+            }
+            Ok(Ok(None)) => panic!("EOF while checking absence of push marker {marker}"),
+            Ok(Err(error)) => {
+                panic!("error while checking absence of push marker {marker}: {error}")
+            }
+        }
+    }
 }
 
 fn assert_tool_project_root(frame: &Frame, root: &std::path::Path) {
