@@ -4,6 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aft::bash_background::BgTaskStatus;
 use aft::callgraph::CallGraph;
 use aft::config::Config;
 use aft::context::AppContext;
@@ -11,7 +12,9 @@ use aft::executor::{Executor, ExecutorConfig, Lane};
 use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
 use aft::path_identity::ProjectRootId;
-use aft::protocol::{PushFrame, RawRequest, Response, StatusChangedFrame};
+use aft::protocol::{
+    BashCompletedFrame, BashLongRunningFrame, PushFrame, RawRequest, Response, StatusChangedFrame,
+};
 use aft::subc::run_subc_mode;
 use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
@@ -64,6 +67,8 @@ struct BridgeInner {
     epoch_started: usize,
     epoch_current: usize,
     epoch_release: bool,
+    deferred_push_started: usize,
+    deferred_push_release: bool,
     configure_events: Vec<ConfigureEvent>,
 }
 
@@ -109,6 +114,42 @@ impl BridgeState {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.epoch_release = true;
         self.cv.notify_all();
+    }
+
+    fn begin_deferred_push_wave(&self) -> usize {
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        guard.deferred_push_release = false;
+        guard.deferred_push_started
+    }
+
+    fn release_deferred_pushes(&self) {
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        guard.deferred_push_release = true;
+        self.cv.notify_all();
+    }
+
+    fn wait_for_deferred_push_release(&self) {
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        guard.deferred_push_started += 1;
+        self.cv.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !guard.deferred_push_release {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "timed out waiting for deferred push release"
+            );
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, result) = self
+                .cv
+                .wait_timeout(guard, remaining)
+                .expect("bridge state condvar");
+            guard = next;
+            assert!(
+                !result.timed_out() || guard.deferred_push_release,
+                "timed out waiting for deferred push release"
+            );
+        }
     }
 
     fn assert_overlap(&self) {
@@ -322,7 +363,7 @@ fn emit_test_status(ctx: &AppContext, marker: &str, seq: u64) {
     if let Some(sender) = ctx.progress_sender_handle() {
         sender(PushFrame::StatusChanged(StatusChangedFrame {
             frame_type: "status_changed",
-            session_id: Some("session-1".to_string()),
+            session_id: None,
             snapshot: json!({
                 "marker": marker,
                 "seq": seq,
@@ -336,6 +377,52 @@ fn emit_test_status_burst(ctx: &AppContext, marker: &str, count: u64) {
     for seq in 0..count {
         emit_test_status(ctx, marker, seq);
     }
+}
+
+fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
+    PushFrame::BashCompleted(BashCompletedFrame {
+        frame_type: "bash_completed",
+        task_id: task_id.to_string(),
+        session_id: session_id.to_string(),
+        status: BgTaskStatus::Completed,
+        exit_code: Some(0),
+        command: format!("echo {task_id}"),
+        output_preview: String::new(),
+        output_truncated: false,
+        original_tokens: None,
+        compressed_tokens: None,
+        tokens_skipped: false,
+    })
+}
+
+fn bash_long_running_push(task_id: &str, session_id: &str) -> PushFrame {
+    PushFrame::BashLongRunning(BashLongRunningFrame {
+        frame_type: "bash_long_running",
+        task_id: task_id.to_string(),
+        session_id: session_id.to_string(),
+        command: format!("sleep {task_id}"),
+        elapsed_ms: 1_000,
+    })
+}
+
+fn emit_push_frame(ctx: &AppContext, frame: PushFrame) -> bool {
+    if let Some(sender) = ctx.progress_sender_handle() {
+        sender(frame);
+        true
+    } else {
+        false
+    }
+}
+
+fn defer_push_frame(state: Arc<BridgeState>, ctx: &AppContext, frame: PushFrame) -> bool {
+    let Some(sender) = ctx.progress_sender_handle() else {
+        return false;
+    };
+    thread::spawn(move || {
+        state.wait_for_deferred_push_release();
+        sender(frame);
+    });
+    true
 }
 
 fn configure_status_burst_spec(req: &RawRequest) -> Option<(String, u64)> {
@@ -435,6 +522,71 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             let count = req.params.get("count").and_then(Value::as_u64).unwrap_or(1);
             emit_test_status_burst(ctx, marker, count);
             Response::success(req.id, json!({ "emitted": count, "marker": marker }))
+        }
+        "subc_test_emit_bash_completed" => {
+            let task_id = req
+                .params
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or("subc-test-completed")
+                .to_string();
+            let session_id = req
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| req.session())
+                .to_string();
+            let emitted = emit_push_frame(ctx, bash_completed_push(&task_id, &session_id));
+            Response::success(
+                req.id,
+                json!({ "emitted": emitted, "task_id": task_id, "session_id": session_id }),
+            )
+        }
+        "subc_test_defer_bash_completed" => {
+            let task_id = req
+                .params
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or("subc-test-deferred-completed")
+                .to_string();
+            let session_id = req
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| req.session())
+                .to_string();
+            let emitted = defer_push_frame(
+                Arc::clone(&state),
+                ctx,
+                bash_completed_push(&task_id, &session_id),
+            );
+            Response::success(
+                req.id,
+                json!({ "deferred": emitted, "task_id": task_id, "session_id": session_id }),
+            )
+        }
+        "subc_test_defer_bash_long_running" => {
+            let task_id = req
+                .params
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or("subc-test-deferred-long-running")
+                .to_string();
+            let session_id = req
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| req.session())
+                .to_string();
+            let emitted = defer_push_frame(
+                Arc::clone(&state),
+                ctx,
+                bash_long_running_push(&task_id, &session_id),
+            );
+            Response::success(
+                req.id,
+                json!({ "deferred": emitted, "task_id": task_id, "session_id": session_id }),
+            )
         }
         "enable_callgraph_store_for_test" => {
             ctx.update_config(|config| config.callgraph_store = true);
@@ -963,6 +1115,95 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         .iter()
         .all(|push| push_seq(push) == Some(4)));
 
+    // 4d-2b session-scoped Push isolation: a bash completion for session-1
+    // must go only to route 1, not sibling route 4 (session-4) on the same root.
+    send_tool_call(
+        &mut stream,
+        1,
+        430,
+        "subc_test_emit_bash_completed",
+        json!({ "task_id": "session-scoped-isolation" }),
+    )
+    .await;
+    let session_pushes = expect_bash_completed_pushes_for_tool(
+        &mut stream,
+        430,
+        "session-scoped-isolation",
+        HashSet::from([1]),
+    )
+    .await;
+    assert_eq!(session_pushes.len(), 1);
+    assert_no_bash_push_for_task(
+        &mut stream,
+        "session-scoped-isolation",
+        Duration::from_millis(150),
+    )
+    .await;
+
+    // 4d-2b reliable buffer + replay: release route 1, emit a reliable
+    // session-1 frame while only sibling session-4 remains, then re-bind the
+    // same logical session on route 7 and receive the buffered completion there.
+    let reliable_task = "detached-reliable-replay";
+    let deferred_base = state.begin_deferred_push_wave();
+    send_tool_call(
+        &mut stream,
+        1,
+        431,
+        "subc_test_defer_bash_completed",
+        json!({ "task_id": reliable_task, "session_id": "session-1" }),
+    )
+    .await;
+    let deferred_response = read_frame_timeout(&mut stream, "defer reliable response").await;
+    assert_eq!(deferred_response.header.corr, 431);
+    state.wait_until("reliable deferred push waiter", |inner| {
+        inner.deferred_push_started == deferred_base + 1
+    });
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Goodbye, control_flags(), 1, 4310, Vec::new())
+            .expect("route 1 goodbye"),
+    )
+    .await;
+    send_tool_call(&mut stream, 1, 4311, "read", json!({ "case": "fast" })).await;
+    expect_error_frame(&mut stream, 1, 4311, "route_not_bound").await;
+    state.release_deferred_pushes();
+    assert_no_bash_push_for_task(&mut stream, reliable_task, Duration::from_millis(300)).await;
+    send_route_bind_with_session(&mut stream, 7, 47, &root1, "session-1").await;
+    let replayed =
+        expect_route_bind_ack_and_bash_completed_push(&mut stream, 47, reliable_task, 7).await;
+    assert_eq!(push_task_id(&replayed), Some(reliable_task));
+
+    // 4d-2b lossy no-channel drop: a detached BashLongRunning frame for the
+    // same session is dropped, not buffered/replayed on the next bind.
+    let lossy_task = "detached-lossy-drop";
+    let deferred_lossy_base = state.begin_deferred_push_wave();
+    send_tool_call(
+        &mut stream,
+        7,
+        432,
+        "subc_test_defer_bash_long_running",
+        json!({ "task_id": lossy_task, "session_id": "session-1" }),
+    )
+    .await;
+    let lossy_deferred_response = read_frame_timeout(&mut stream, "defer lossy response").await;
+    assert_eq!(lossy_deferred_response.header.corr, 432);
+    state.wait_until("lossy deferred push waiter", |inner| {
+        inner.deferred_push_started == deferred_lossy_base + 1
+    });
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Goodbye, control_flags(), 7, 4320, Vec::new())
+            .expect("route 7 goodbye"),
+    )
+    .await;
+    send_tool_call(&mut stream, 7, 4321, "read", json!({ "case": "fast" })).await;
+    expect_error_frame(&mut stream, 7, 4321, "route_not_bound").await;
+    state.release_deferred_pushes();
+    assert_no_bash_push_for_task(&mut stream, lossy_task, Duration::from_millis(300)).await;
+    send_route_bind_with_session(&mut stream, 8, 48, &root1, "session-1").await;
+    expect_route_bind_ack_without_task_push(&mut stream, 48, lossy_task).await;
+    assert_no_bash_push_for_task(&mut stream, lossy_task, Duration::from_millis(150)).await;
+
     // 5. B3: a new-root configure failure must not install a route and must be
     // removed from the executor before the connection exits. Any Push emitted by
     // that actor before the failed bind is dropped because no channel is bound.
@@ -1079,6 +1320,47 @@ async fn send_route_bind_with_doc(
     root: &std::path::Path,
     doc: Value,
 ) {
+    send_route_bind_with_session_and_doc(
+        stream,
+        route_channel,
+        corr,
+        root,
+        &format!("session-{route_channel}"),
+        doc,
+    )
+    .await;
+}
+
+async fn send_route_bind_with_session(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    root: &std::path::Path,
+    session: &str,
+) {
+    send_route_bind_with_session_and_doc(
+        stream,
+        route_channel,
+        corr,
+        root,
+        session,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+}
+
+async fn send_route_bind_with_session_and_doc(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    root: &std::path::Path,
+    session: &str,
+    doc: Value,
+) {
     let request = ModuleControlRequest::RouteBind {
         route_channel,
         target: RouteTarget::ToolProvider {
@@ -1087,7 +1369,7 @@ async fn send_route_bind_with_doc(
         identity: BindIdentity {
             project_root: root.to_path_buf(),
             harness: "opencode".to_string(),
-            session: format!("session-{route_channel}"),
+            session: session.to_string(),
         },
         config: vec![user_config_tier(doc)],
     };
@@ -1193,6 +1475,177 @@ fn push_seq(body: &Value) -> Option<u64> {
     body.get("snapshot")
         .and_then(|snapshot| snapshot.get("seq"))
         .and_then(Value::as_u64)
+}
+
+fn push_task_id(body: &Value) -> Option<&str> {
+    body.get("task_id").and_then(Value::as_str)
+}
+
+fn push_type(body: &Value) -> Option<&str> {
+    body.get("type").and_then(Value::as_str)
+}
+
+async fn expect_bash_completed_pushes_for_tool(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    task_id: &str,
+    expected_channels: HashSet<u16>,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut response_seen = false;
+    let mut pushes = Vec::new();
+    let mut channels = HashSet::new();
+
+    while !response_seen || channels != expected_channels {
+        let now = Instant::now();
+        assert!(now < deadline, "timed out waiting for bash push {task_id}");
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for bash push {task_id}"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for bash push {task_id}"));
+        match frame.header.ty {
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if push_type(&body) == Some("bash_completed")
+                    && push_task_id(&body) == Some(task_id)
+                {
+                    assert!(
+                        expected_channels.contains(&frame.header.channel),
+                        "bash push {task_id} leaked to unexpected channel {}",
+                        frame.header.channel
+                    );
+                    channels.insert(frame.header.channel);
+                    pushes.push(body);
+                }
+            }
+            FrameType::Response if frame.header.corr == corr => {
+                let response = tool_response_json(&frame);
+                assert!(
+                    response["success"].as_bool().unwrap_or(false),
+                    "emit tool response should succeed: {response:?}"
+                );
+                response_seen = true;
+            }
+            other => panic!("unexpected frame while waiting for bash push {task_id}: {other:?}"),
+        }
+    }
+
+    assert_eq!(channels, expected_channels);
+    pushes
+}
+
+async fn assert_no_bash_push_for_task(
+    stream: &mut tokio::net::TcpStream,
+    task_id: &str,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match tokio::time::timeout(remaining, read_frame(stream)).await {
+            Err(_) => return,
+            Ok(Ok(Some(frame))) => {
+                if frame.header.ty == FrameType::Push {
+                    let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                    assert_ne!(
+                        push_task_id(&body),
+                        Some(task_id),
+                        "unexpected push for task {task_id} on channel {}: {body:?}",
+                        frame.header.channel
+                    );
+                }
+            }
+            Ok(Ok(None)) => panic!("EOF while checking absence of bash push {task_id}"),
+            Ok(Err(error)) => {
+                panic!("error while checking absence of bash push {task_id}: {error}")
+            }
+        }
+    }
+}
+
+async fn expect_route_bind_ack_and_bash_completed_push(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    task_id: &str,
+    expected_channel: u16,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut ack_seen = false;
+    let mut push_seen = None;
+
+    while !ack_seen || push_seen.is_none() {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for RouteBindAck {corr} and replay {task_id}"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for RouteBindAck {corr} and replay {task_id}")
+            })
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for RouteBindAck {corr} and replay {task_id}"));
+        match frame.header.ty {
+            FrameType::Response if frame.header.corr == corr => {
+                assert_eq!(frame.header.channel, 0);
+                ack_seen = true;
+            }
+            FrameType::Push => {
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if push_type(&body) == Some("bash_completed") && push_task_id(&body) == Some(task_id) {
+                    assert_eq!(frame.header.channel, expected_channel);
+                    push_seen = Some(body);
+                }
+            }
+            other => panic!(
+                "unexpected frame while waiting for RouteBindAck {corr} and replay {task_id}: {other:?}"
+            ),
+        }
+    }
+
+    push_seen.expect("push seen")
+}
+
+async fn expect_route_bind_ack_without_task_push(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    task_id: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let now = Instant::now();
+        assert!(now < deadline, "timed out waiting for RouteBindAck {corr}");
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for RouteBindAck {corr}"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for RouteBindAck {corr}"));
+        match frame.header.ty {
+            FrameType::Response if frame.header.corr == corr => {
+                assert_eq!(frame.header.channel, 0);
+                return;
+            }
+            FrameType::Push => {
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                assert_ne!(
+                    push_task_id(&body),
+                    Some(task_id),
+                    "lossy task {task_id} should not replay on RouteBind: {body:?}"
+                );
+            }
+            other => panic!("unexpected frame while waiting for RouteBindAck {corr}: {other:?}"),
+        }
+    }
 }
 
 async fn expect_status_pushes_for_tool(

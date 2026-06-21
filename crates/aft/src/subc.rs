@@ -11,7 +11,7 @@
 //! edge never dispatches against `AppContext` inline; per-actor executor lanes
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -50,6 +50,10 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 /// Correlation id for the initial ModuleHello (channel 0).
 const HELLO_CORR: u64 = 1;
 
+/// Per-session in-memory replay cap for must-deliver Push frames. This covers
+/// detach/re-attach while AFT stays alive; cross-restart replay is phased later.
+const PUSH_BUFFER_MAX_PER_KEY: usize = 256;
+
 type RouteChannel = u32;
 
 #[derive(Debug)]
@@ -63,6 +67,23 @@ struct RouteIdentity {
     root: ProjectRootId,
     harness: String,
     session: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReplayKey {
+    root: ProjectRootId,
+    harness: String,
+    session: String,
+}
+
+impl ReplayKey {
+    fn from_identity(identity: &RouteIdentity) -> Self {
+        Self {
+            root: identity.root.clone(),
+            harness: identity.harness.clone(),
+            session: identity.session.clone(),
+        }
+    }
 }
 
 impl RootMeta {
@@ -123,6 +144,52 @@ fn insert_route_channel(
         .entry(identity.root.clone())
         .or_default()
         .insert(channel);
+}
+
+fn remember_session_identity(
+    session_identity: &mut HashMap<(ProjectRootId, String), String>,
+    identity: &RouteIdentity,
+) {
+    // Retained after route Goodbye so reliable session-scoped frames emitted while
+    // the session is detached can still be keyed by the full (root,harness,session)
+    // replay triple. Phase 4c eviction will later prune stale identities/buffers.
+    session_identity.insert(
+        (identity.root.clone(), identity.session.clone()),
+        identity.harness.clone(),
+    );
+}
+
+fn replay_key_for_session(
+    session_identity: &HashMap<(ProjectRootId, String), String>,
+    root: &ProjectRootId,
+    session: &str,
+) -> Option<ReplayKey> {
+    let harness = session_identity.get(&(root.clone(), session.to_string()))?;
+    Some(ReplayKey {
+        root: root.clone(),
+        harness: harness.clone(),
+        session: session.to_string(),
+    })
+}
+
+fn frame_session(frame: &PushFrame) -> Option<&str> {
+    match frame {
+        PushFrame::BashCompleted(completed) => Some(completed.session_id.as_str()),
+        PushFrame::BashLongRunning(long_running) => Some(long_running.session_id.as_str()),
+        PushFrame::BashPatternMatch(pattern_match) => Some(pattern_match.session_id.as_str()),
+        PushFrame::ConfigureWarnings(warnings) => warnings.session_id.as_deref(),
+        PushFrame::StatusChanged(status) => status.session_id.as_deref(),
+        PushFrame::Progress(_) => None,
+    }
+}
+
+fn frame_is_reliable(frame: &PushFrame) -> bool {
+    matches!(
+        frame,
+        PushFrame::BashCompleted(_)
+            | PushFrame::BashPatternMatch(_)
+            | PushFrame::ConfigureWarnings(_)
+    )
 }
 
 fn progress_sender_for_root(
@@ -197,48 +264,129 @@ fn coalesce_push_batch(batch: Vec<(ProjectRootId, PushFrame)>) -> Vec<(ProjectRo
     slots.into_iter().flatten().collect()
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FanOutResult {
+    /// Channels matching the frame's project/session scope. Buffer decisions use
+    /// this rather than sent_frames so a full writer does not turn a live channel
+    /// into an artificial detach/replay event.
+    matched_channels: usize,
+    /// Frames accepted by the writer queue. Full writer queues drop Push frames
+    /// best-effort and never block executor/drain emitters.
+    sent_frames: usize,
+}
+
+fn try_send_push_body(writer_tx: &mpsc::Sender<Frame>, channel: RouteChannel, body: &[u8]) -> bool {
+    let Ok(route_channel) = u16::try_from(channel) else {
+        log::warn!("subc attach: invalid route channel {channel} for Push fan-out");
+        return false;
+    };
+    let push_frame = match Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Push,
+        control_flags(),
+        route_channel,
+        0,
+        body.to_vec(),
+    ) {
+        Ok(frame) => frame,
+        Err(error) => {
+            log::warn!("subc attach: failed to build Push frame: {error}");
+            return false;
+        }
+    };
+    writer_tx.try_send(push_frame).is_ok()
+}
+
+fn try_send_push_frame(
+    writer_tx: &mpsc::Sender<Frame>,
+    channel: RouteChannel,
+    frame: &PushFrame,
+) -> bool {
+    let body = match serde_json::to_vec(frame) {
+        Ok(body) => body,
+        Err(error) => {
+            log::warn!("subc attach: failed to serialize PushFrame: {error}");
+            return false;
+        }
+    };
+    try_send_push_body(writer_tx, channel, &body)
+}
+
+fn buffer_push_frame(
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    key: ReplayKey,
+    frame: PushFrame,
+) {
+    let queue = push_buffer.entry(key).or_default();
+    if queue.len() >= PUSH_BUFFER_MAX_PER_KEY {
+        queue.pop_front();
+    }
+    queue.push_back(frame);
+}
+
+fn replay_buffered_push_frames(
+    writer_tx: &mpsc::Sender<Frame>,
+    channel: RouteChannel,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    key: &ReplayKey,
+) -> usize {
+    let Some(frames) = push_buffer.remove(key) else {
+        return 0;
+    };
+    let replayed = frames.len();
+    for frame in frames {
+        let _ = try_send_push_frame(writer_tx, channel, &frame);
+    }
+    replayed
+}
+
 fn fan_out_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     root: &ProjectRootId,
     frame: &PushFrame,
-) -> usize {
+) -> FanOutResult {
     let Some(channels) = root_channels.get(root) else {
-        return 0;
+        return FanOutResult::default();
     };
+
+    let session = frame_session(frame);
+    let matching_channels: Vec<RouteChannel> = channels
+        .iter()
+        .copied()
+        .filter(|channel| match session {
+            Some(session) => routes
+                .get(channel)
+                .is_some_and(|identity| identity.session == session),
+            None => true,
+        })
+        .collect();
+    let matched_channels = matching_channels.len();
+    if matched_channels == 0 {
+        return FanOutResult::default();
+    }
+
     let body = match serde_json::to_vec(frame) {
         Ok(body) => body,
         Err(error) => {
             log::warn!("subc attach: failed to serialize PushFrame for fan-out: {error}");
-            return 0;
+            return FanOutResult {
+                matched_channels,
+                sent_frames: 0,
+            };
         }
     };
 
-    let mut sent = 0;
-    for &channel in channels {
-        let Ok(route_channel) = u16::try_from(channel) else {
-            log::warn!("subc attach: invalid route channel {channel} for Push fan-out");
-            continue;
-        };
-        let push_frame = match Frame::build_with_version(
-            PROTOCOL_VERSION,
-            FrameType::Push,
-            control_flags(),
-            route_channel,
-            0,
-            body.clone(),
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                log::warn!("subc attach: failed to build Push frame: {error}");
-                continue;
-            }
-        };
-        if writer_tx.try_send(push_frame).is_ok() {
-            sent += 1;
-        }
+    let sent_frames = matching_channels
+        .into_iter()
+        .filter(|&channel| try_send_push_body(writer_tx, channel, &body))
+        .count();
+
+    FanOutResult {
+        matched_channels,
+        sent_frames,
     }
-    sent
 }
 
 /// Sync command dispatch, passed in from `main` (the binary owns the command
@@ -379,6 +527,8 @@ where
     let (push_tx, mut push_rx) = mpsc::channel::<(ProjectRootId, PushFrame)>(1024);
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
+    let mut session_identity: HashMap<(ProjectRootId, String), String> = HashMap::new();
+    let mut push_buffer: HashMap<ReplayKey, VecDeque<PushFrame>> = HashMap::new();
     let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
@@ -453,6 +603,8 @@ where
                             &executor,
                             &mut routes,
                             &mut root_channels,
+                            &mut session_identity,
+                            &mut push_buffer,
                             &mut live_roots,
                             &push_tx,
                             &shutdown,
@@ -492,7 +644,24 @@ where
                 }
 
                 for (root, frame) in coalesce_push_batch(batch) {
-                    let _ = fan_out_push_frame(&writer_tx, &root_channels, &root, &frame);
+                    let fan_out =
+                        fan_out_push_frame(&writer_tx, &routes, &root_channels, &root, &frame);
+                    if fan_out.matched_channels == 0 && frame_is_reliable(&frame) {
+                        if let Some(session) = frame_session(&frame) {
+                            if let Some(key) =
+                                replay_key_for_session(&session_identity, &root, session)
+                            {
+                                buffer_push_frame(&mut push_buffer, key, frame);
+                            } else {
+                                log::warn!(
+                                    "subc attach: dropping reliable Push for root {} session {} \
+                                     because no retained harness identity is known",
+                                    root.as_path().display(),
+                                    session
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Some((root_id, response)) = maintenance_rx.recv() => {
@@ -604,6 +773,8 @@ async fn handle_control_request(
     executor: &Arc<Executor>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &mut HashMap<(ProjectRootId, String), String>,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     push_tx: &mpsc::Sender<(ProjectRootId, PushFrame)>,
     shutdown: &Arc<Notify>,
@@ -754,15 +925,18 @@ async fn handle_control_request(
                 }
             }
 
+            let route_identity = RouteIdentity {
+                root: bind_root_id.clone(),
+                harness: identity.harness,
+                session: identity.session,
+            };
+            remember_session_identity(session_identity, &route_identity);
+            let replay_key = ReplayKey::from_identity(&route_identity);
             insert_route_channel(
                 routes,
                 root_channels,
                 route_key(route_channel),
-                RouteIdentity {
-                    root: bind_root_id.clone(),
-                    harness: identity.harness,
-                    session: identity.session,
-                },
+                route_identity,
             );
             if let Some(meta) = live_roots.get_mut(&bind_root_id) {
                 meta.touch();
@@ -780,6 +954,18 @@ async fn handle_control_request(
             )
             .map_err(SubcError::FrameBuild)?;
             send_frame(tx, response).await?;
+            let replayed =
+                replay_buffered_push_frames(tx, route_key(route_channel), push_buffer, &replay_key);
+            if replayed > 0 {
+                log::debug!(
+                    "subc attach: replayed {} buffered Push frame(s) to route {} root {} harness {} session {}",
+                    replayed,
+                    route_channel,
+                    replay_key.root.as_path().display(),
+                    replay_key.harness,
+                    replay_key.session
+                );
+            }
             log::info!(
                 "subc attach: route {} bound to root {}",
                 route_channel,
@@ -1198,7 +1384,8 @@ mod tests {
     use super::*;
     use crate::bash_background::BgTaskStatus;
     use crate::protocol::{
-        BashCompletedFrame, BashLongRunningFrame, ProgressFrame, StatusChangedFrame,
+        BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, ConfigureWarningsFrame,
+        ProgressFrame, StatusChangedFrame,
     };
     use serde_json::json;
 
@@ -1212,18 +1399,26 @@ mod tests {
     }
 
     fn status_frame(seq: u64) -> PushFrame {
+        status_frame_with_session(seq, None)
+    }
+
+    fn status_frame_with_session(seq: u64, session_id: Option<&str>) -> PushFrame {
         PushFrame::StatusChanged(StatusChangedFrame {
             frame_type: "status_changed",
-            session_id: None,
+            session_id: session_id.map(str::to_string),
             snapshot: json!({ "seq": seq }),
         })
     }
 
     fn completion_frame(task_id: &str) -> PushFrame {
+        completion_frame_with_session(task_id, "session-1")
+    }
+
+    fn completion_frame_with_session(task_id: &str, session_id: &str) -> PushFrame {
         PushFrame::BashCompleted(BashCompletedFrame {
             frame_type: "bash_completed",
             task_id: task_id.to_string(),
-            session_id: "session-1".to_string(),
+            session_id: session_id.to_string(),
             status: BgTaskStatus::Completed,
             exit_code: Some(0),
             command: format!("echo {task_id}"),
@@ -1236,13 +1431,55 @@ mod tests {
     }
 
     fn long_running_frame(task_id: &str, elapsed_ms: u64) -> PushFrame {
+        long_running_frame_with_session(task_id, "session-1", elapsed_ms)
+    }
+
+    fn long_running_frame_with_session(
+        task_id: &str,
+        session_id: &str,
+        elapsed_ms: u64,
+    ) -> PushFrame {
         PushFrame::BashLongRunning(BashLongRunningFrame {
             frame_type: "bash_long_running",
             task_id: task_id.to_string(),
-            session_id: "session-1".to_string(),
+            session_id: session_id.to_string(),
             command: format!("sleep {elapsed_ms}"),
             elapsed_ms,
         })
+    }
+
+    fn pattern_match_frame(session_id: &str) -> PushFrame {
+        PushFrame::BashPatternMatch(BashPatternMatchFrame {
+            frame_type: "bash_pattern_match",
+            task_id: "task-pattern".to_string(),
+            session_id: session_id.to_string(),
+            watch_id: "watch-1".to_string(),
+            match_text: "needle".to_string(),
+            match_offset: 7,
+            context: "haystack needle".to_string(),
+            once: true,
+            reason: "pattern_match",
+        })
+    }
+
+    fn configure_warnings_frame(session_id: Option<&str>) -> PushFrame {
+        PushFrame::ConfigureWarnings(ConfigureWarningsFrame {
+            frame_type: "configure_warnings",
+            session_id: session_id.map(str::to_string),
+            project_root: "/tmp/subc-test".to_string(),
+            source_file_count: 0,
+            source_file_count_exceeds_max: false,
+            max_callgraph_files: 0,
+            warnings: Vec::new(),
+        })
+    }
+
+    fn route_identity(root: &ProjectRootId, session_id: &str) -> RouteIdentity {
+        RouteIdentity {
+            root: root.clone(),
+            harness: "opencode".to_string(),
+            session: session_id.to_string(),
+        }
     }
 
     fn progress_frame(request_id: &str, kind: ProgressKind, chunk: &str) -> PushFrame {
@@ -1261,6 +1498,161 @@ mod tests {
             PushFrame::BashCompleted(completion) => Some(completion.task_id.as_str()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn frame_classification_matches_push_delivery_contract() {
+        let completion = completion_frame_with_session("done", "session-a");
+        assert_eq!(frame_session(&completion), Some("session-a"));
+        assert!(frame_is_reliable(&completion));
+
+        let long_running = long_running_frame_with_session("long", "session-b", 42);
+        assert_eq!(frame_session(&long_running), Some("session-b"));
+        assert!(!frame_is_reliable(&long_running));
+
+        let pattern_match = pattern_match_frame("session-c");
+        assert_eq!(frame_session(&pattern_match), Some("session-c"));
+        assert!(frame_is_reliable(&pattern_match));
+
+        let tagged_warnings = configure_warnings_frame(Some("session-d"));
+        assert_eq!(frame_session(&tagged_warnings), Some("session-d"));
+        assert!(frame_is_reliable(&tagged_warnings));
+
+        let untagged_warnings = configure_warnings_frame(None);
+        assert_eq!(frame_session(&untagged_warnings), None);
+        assert!(frame_is_reliable(&untagged_warnings));
+
+        let tagged_status = status_frame_with_session(1, Some("session-e"));
+        assert_eq!(frame_session(&tagged_status), Some("session-e"));
+        assert!(!frame_is_reliable(&tagged_status));
+
+        let project_status = status_frame(2);
+        assert_eq!(frame_session(&project_status), None);
+        assert!(!frame_is_reliable(&project_status));
+
+        let progress = progress_frame("request-1", ProgressKind::Stdout, "chunk");
+        assert_eq!(frame_session(&progress), None);
+        assert!(!frame_is_reliable(&progress));
+    }
+
+    #[test]
+    fn fan_out_push_frame_routes_session_scoped_and_project_scoped_frames() {
+        let (_root_dir, root) = test_root("subc-session-routing-root");
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let mut routes = HashMap::new();
+        routes.insert(route_key(1), route_identity(&root, "session-1"));
+        routes.insert(route_key(2), route_identity(&root, "session-2"));
+        let mut root_channels = HashMap::new();
+        root_channels.insert(root.clone(), HashSet::from([route_key(1), route_key(2)]));
+
+        let session_result = fan_out_push_frame(
+            &writer_tx,
+            &routes,
+            &root_channels,
+            &root,
+            &completion_frame_with_session("session-only", "session-1"),
+        );
+        assert_eq!(
+            session_result,
+            FanOutResult {
+                matched_channels: 1,
+                sent_frames: 1,
+            }
+        );
+        let session_push = writer_rx.try_recv().expect("session push queued");
+        assert_eq!(session_push.header.ty, FrameType::Push);
+        assert_eq!(session_push.header.channel, 1);
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "session-scoped frame must not broadcast to sibling sessions"
+        );
+
+        let project_result =
+            fan_out_push_frame(&writer_tx, &routes, &root_channels, &root, &status_frame(9));
+        assert_eq!(
+            project_result,
+            FanOutResult {
+                matched_channels: 2,
+                sent_frames: 2,
+            }
+        );
+        let project_channels: HashSet<_> = [
+            writer_rx
+                .try_recv()
+                .expect("first project push")
+                .header
+                .channel,
+            writer_rx
+                .try_recv()
+                .expect("second project push")
+                .header
+                .channel,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(project_channels, HashSet::from([1, 2]));
+        assert!(writer_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn push_buffer_drops_oldest_per_replay_key() {
+        let (_root_dir, root) = test_root("subc-buffer-bound-root");
+        let key = ReplayKey {
+            root,
+            harness: "opencode".to_string(),
+            session: "session-1".to_string(),
+        };
+        let mut push_buffer = HashMap::new();
+        let total = PUSH_BUFFER_MAX_PER_KEY + 3;
+
+        for index in 0..total {
+            buffer_push_frame(
+                &mut push_buffer,
+                key.clone(),
+                completion_frame(&format!("task-{index}")),
+            );
+        }
+
+        let buffered = push_buffer.get(&key).expect("buffer entry");
+        assert_eq!(buffered.len(), PUSH_BUFFER_MAX_PER_KEY);
+        let tasks: Vec<String> = buffered
+            .iter()
+            .filter_map(completion_task)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(tasks.first().map(String::as_str), Some("task-3"));
+        assert_eq!(
+            tasks.last().map(String::as_str),
+            Some(format!("task-{}", total - 1).as_str())
+        );
+    }
+
+    #[test]
+    fn replay_buffered_push_frames_drains_to_bound_channel() {
+        let (_root_dir, root) = test_root("subc-buffer-replay-root");
+        let key = ReplayKey {
+            root,
+            harness: "opencode".to_string(),
+            session: "session-1".to_string(),
+        };
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(4);
+        let mut push_buffer = HashMap::new();
+        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
+        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-b"));
+
+        let replayed =
+            replay_buffered_push_frames(&writer_tx, route_key(3), &mut push_buffer, &key);
+
+        assert_eq!(replayed, 2);
+        assert!(!push_buffer.contains_key(&key));
+        for expected_task in ["task-a", "task-b"] {
+            let frame = writer_rx.try_recv().expect("replayed push");
+            assert_eq!(frame.header.ty, FrameType::Push);
+            assert_eq!(frame.header.channel, 3);
+            let body: serde_json::Value = serde_json::from_slice(&frame.body).expect("push body");
+            assert_eq!(body["task_id"].as_str(), Some(expected_task));
+        }
+        assert!(writer_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1390,13 +1782,21 @@ mod tests {
         let mut root_channels = HashMap::new();
         root_channels.insert(root.clone(), HashSet::from([route_key(7)]));
 
+        let routes = HashMap::new();
         let started = Instant::now();
-        let sent = fan_out_push_frame(&writer_tx, &root_channels, &root, &status_frame(1));
+        let result =
+            fan_out_push_frame(&writer_tx, &routes, &root_channels, &root, &status_frame(1));
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "saturated writer fan-out must return immediately"
         );
-        assert_eq!(sent, 0);
+        assert_eq!(
+            result,
+            FanOutResult {
+                matched_channels: 1,
+                sent_frames: 0,
+            }
+        );
 
         let queued = writer_rx
             .try_recv()
