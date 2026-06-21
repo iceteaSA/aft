@@ -871,6 +871,8 @@ async fn handle_tool_call(
     let mut map = call.arguments.as_object().cloned().unwrap_or_default();
     map.insert("id".to_string(), json!(request_id.clone()));
     map.insert("command".to_string(), json!(command));
+    // Transport session from RouteBind identity; authoritative over any stray arg.
+    map.insert("session_id".to_string(), json!(identity.session.clone()));
 
     let raw_req = match serde_json::from_value::<RawRequest>(Value::Object(map)) {
         Ok(req) => req,

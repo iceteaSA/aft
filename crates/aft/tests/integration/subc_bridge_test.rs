@@ -409,6 +409,10 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
         "semantic_search" => state.heavy(req.id),
+        "subc_test_echo_session" => {
+            let session = req.session().to_string();
+            Response::success(req.id, json!({ "transport_session": session }))
+        }
         "subc_test_emit_status" => {
             let marker = req
                 .params
@@ -633,6 +637,17 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     send_route_bind(&mut stream, 1, 10, &root1).await;
     expect_route_bind_ack(&mut stream, 10).await;
 
+    // Phase 4d-2a: subc tool calls carry RouteBind session on the RawRequest.
+    send_tool_call(&mut stream, 1, 11, "subc_test_echo_session", json!({})).await;
+    let echo_s1 = read_frame_timeout(&mut stream, "echo session route 1").await;
+    assert_eq!(echo_s1.header.corr, 11);
+    let echo_s1_body = tool_response_json(&echo_s1);
+    assert_eq!(
+        echo_s1_body["transport_session"].as_str(),
+        Some("session-1"),
+        "route 1 bind identity session: {echo_s1_body:?}"
+    );
+
     // L3 PUSH fan-out: a root-1 actor emit is serialized as a server-initiated
     // Push frame on route 1 with corr=0.
     send_tool_call(
@@ -700,7 +715,6 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         81,
         "bash",
         json!({
-            "session_id": "session-1",
             "params": {
                 "command": "echo subc-bg-completion",
                 "background": true,
@@ -720,7 +734,7 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         .as_str()
         .expect("bash start task_id")
         .to_string();
-    wait_for_bash_completion(&mut stream, 1, 82, &task_id).await;
+    wait_for_bash_completion(&mut stream, 1, 82, "session-1", &task_id).await;
 
     send_tool_call(&mut stream, 1, 120, "read", json!({ "case": "fast" })).await;
     let first_after_completion = read_frame_timeout(&mut stream, "first completion read").await;
@@ -865,6 +879,68 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     assert_eq!(route4_read.header.channel, 4);
     assert_eq!(route4_read.header.corr, 420);
     assert_tool_project_root(&route4_read, &root1);
+
+    // Phase 4d-2a: second session on same root — transport session + bg isolation.
+    send_tool_call(&mut stream, 4, 422, "subc_test_echo_session", json!({})).await;
+    let echo_s4 = read_frame_timeout(&mut stream, "echo session route 4").await;
+    assert_eq!(echo_s4.header.corr, 422);
+    assert_eq!(
+        tool_response_json(&echo_s4)["transport_session"].as_str(),
+        Some("session-4"),
+    );
+
+    send_tool_call(
+        &mut stream,
+        4,
+        423,
+        "bash",
+        json!({
+            "params": {
+                "command": "echo subc-session-4-bg",
+                "background": true,
+                "timeout": 5000,
+            },
+        }),
+    )
+    .await;
+    let bash_s4_started = read_frame_timeout(&mut stream, "session-4 bash start").await;
+    assert_eq!(bash_s4_started.header.corr, 423);
+    let bash_s4_started_response = tool_response_json(&bash_s4_started);
+    assert!(
+        bash_s4_started_response["success"]
+            .as_bool()
+            .unwrap_or(false),
+        "session-4 background bash should start: {bash_s4_started_response:?}"
+    );
+    let task_id_s4 = bash_s4_started_response["task_id"]
+        .as_str()
+        .expect("session-4 bash task_id")
+        .to_string();
+    wait_for_bash_completion(&mut stream, 4, 424, "session-4", &task_id_s4).await;
+
+    send_tool_call(&mut stream, 4, 425, "read", json!({ "case": "fast" })).await;
+    let s4_after_completion = read_frame_timeout(&mut stream, "session-4 completion read").await;
+    assert_eq!(s4_after_completion.header.corr, 425);
+    assert_bg_completion_matching(
+        &tool_response_json(&s4_after_completion),
+        &task_id_s4,
+        "subc-session-4-bg",
+    );
+
+    send_tool_call(&mut stream, 1, 426, "read", json!({ "case": "fast" })).await;
+    let s1_after_s4_bg = read_frame_timeout(&mut stream, "session-1 after session-4 bg").await;
+    assert_eq!(s1_after_s4_bg.header.corr, 426);
+    let s1_after_s4_body = tool_response_json(&s1_after_s4_bg);
+    if let Some(completions) = s1_after_s4_body["bg_completions"].as_array() {
+        assert!(
+            !completions.iter().any(|c| {
+                c.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|cmd| cmd.contains("subc-session-4-bg"))
+            }),
+            "session-1 must not see session-4 bg completion: {s1_after_s4_body:?}"
+        );
+    }
 
     // L3 PUSH multi-channel fan-out: root 1 is bound on routes 1 and 4.
     send_tool_call(
@@ -1271,6 +1347,7 @@ async fn wait_for_bash_completion(
     stream: &mut tokio::net::TcpStream,
     channel: u16,
     first_corr: u64,
+    _session_id: &str,
     task_id: &str,
 ) -> Value {
     for attempt in 0..30 {
@@ -1281,7 +1358,7 @@ async fn wait_for_bash_completion(
             channel,
             corr,
             "bash_status",
-            json!({ "session_id": "session-1", "params": { "task_id": task_id } }),
+            json!({ "params": { "task_id": task_id } }),
         )
         .await;
         let frame = read_frame_timeout(stream, "bash status response").await;
@@ -1312,6 +1389,10 @@ fn assert_no_finalizer_fields(response: &Value) {
 }
 
 fn assert_bg_completion(response: &Value, task_id: &str) {
+    assert_bg_completion_matching(response, task_id, "subc-bg-completion");
+}
+
+fn assert_bg_completion_matching(response: &Value, task_id: &str, command_contains: &str) {
     let completions = response["bg_completions"]
         .as_array()
         .unwrap_or_else(|| panic!("expected bg_completions on response: {response:?}"));
@@ -1322,9 +1403,9 @@ fn assert_bg_completion(response: &Value, task_id: &str) {
                 && completion
                     .get("command")
                     .and_then(Value::as_str)
-                    .is_some_and(|command| command.contains("subc-bg-completion"))
+                    .is_some_and(|command| command.contains(command_contains))
         }),
-        "expected completion for task {task_id}, got {completions:?}"
+        "expected completion for task {task_id} (command ~ {command_contains}), got {completions:?}"
     );
 }
 
