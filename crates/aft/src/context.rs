@@ -499,7 +499,6 @@ pub struct App {
     db: parking_lot::Mutex<Option<Arc<Mutex<Connection>>>>,
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
-    progress_sender: SharedProgressSender,
     provider_factory: LanguageProviderFactory,
 }
 
@@ -509,7 +508,6 @@ impl App {
             db: parking_lot::Mutex::new(None),
             lsp_child_registry: crate::lsp::child_registry::LspChildRegistry::new(),
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
-            progress_sender: Arc::new(Mutex::new(None)),
             provider_factory,
         }
     }
@@ -533,32 +531,6 @@ impl App {
 
     pub fn stdout_writer(&self) -> SharedStdoutWriter {
         Arc::clone(&self.stdout_writer)
-    }
-
-    fn progress_sender(&self) -> SharedProgressSender {
-        Arc::clone(&self.progress_sender)
-    }
-
-    pub fn set_progress_sender(&self, sender: Option<ProgressSender>) {
-        if let Ok(mut progress_sender) = self.progress_sender.lock() {
-            *progress_sender = sender;
-        }
-    }
-
-    pub fn emit_progress(&self, frame: ProgressFrame) {
-        let Ok(progress_sender) = self.progress_sender.lock().map(|sender| sender.clone()) else {
-            return;
-        };
-        if let Some(sender) = progress_sender.as_ref() {
-            sender(PushFrame::Progress(frame));
-        }
-    }
-
-    pub fn progress_sender_handle(&self) -> Option<ProgressSender> {
-        self.progress_sender
-            .lock()
-            .ok()
-            .and_then(|sender| sender.clone())
     }
 
     pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
@@ -654,6 +626,9 @@ pub struct AppContext {
     last_seen_reuse_completions: AtomicU64,
     configure_warnings_tx: crossbeam_channel::Sender<(u64, ConfigureWarningsFrame)>,
     configure_warnings_rx: crossbeam_channel::Receiver<(u64, ConfigureWarningsFrame)>,
+    /// Per-context push sender slot. Status and background-bash emitters share
+    /// this Arc so a sender installed after construction is observed at emit time.
+    progress_sender: SharedProgressSender,
     status_emitter: StatusEmitter,
     /// Last status-bar payload attached to a tool response for this project root.
     /// Deduping here (not in a process-global static) lets daemon roots emit the
@@ -764,7 +739,8 @@ impl AppContext {
     ) -> Self {
         let bash_compress_enabled = config.experimental_bash_compress;
         let (configure_warnings_tx, configure_warnings_rx) = crossbeam_channel::unbounded();
-        let status_emitter = StatusEmitter::new(app.progress_sender());
+        let progress_sender: SharedProgressSender = Arc::new(Mutex::new(None));
+        let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
         let symbol_cache = provider
             .as_any()
             .downcast_ref::<TreeSitterProvider>()
@@ -816,9 +792,10 @@ impl AppContext {
             last_seen_reuse_completions: AtomicU64::new(0),
             configure_warnings_tx,
             configure_warnings_rx,
+            progress_sender: Arc::clone(&progress_sender),
             status_emitter,
             status_bar_last_emitted: RwLock::new(None),
-            bash_background: BgTaskRegistry::new(app.progress_sender()),
+            bash_background: BgTaskRegistry::new(Arc::clone(&progress_sender)),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
             )),
@@ -1236,11 +1213,18 @@ impl AppContext {
     }
 
     pub fn set_progress_sender(&self, sender: Option<ProgressSender>) {
-        self.app.set_progress_sender(sender);
+        if let Ok(mut progress_sender) = self.progress_sender.lock() {
+            *progress_sender = sender;
+        }
     }
 
     pub fn emit_progress(&self, frame: ProgressFrame) {
-        self.app.emit_progress(frame);
+        let Ok(progress_sender) = self.progress_sender.lock().map(|sender| sender.clone()) else {
+            return;
+        };
+        if let Some(sender) = progress_sender.as_ref() {
+            sender(PushFrame::Progress(frame));
+        }
     }
 
     pub fn status_emitter(&self) -> &StatusEmitter {
@@ -1255,7 +1239,10 @@ impl AppContext {
     /// configure has already returned, so configure latency stays sub-100 ms
     /// even on huge directories.
     pub fn progress_sender_handle(&self) -> Option<ProgressSender> {
-        self.app.progress_sender_handle()
+        self.progress_sender
+            .lock()
+            .ok()
+            .and_then(|sender| sender.clone())
     }
 
     pub fn advance_configure_generation(&self) -> u64 {
@@ -2792,6 +2779,53 @@ mod status_emitter_tests {
         let (ctx, rx) = ctx_with_frame_rx();
         drop(ctx);
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn progress_sender_slot_is_per_context_for_shared_app() {
+        let app = App::default_shared();
+        let ctx_a = AppContext::from_app(Arc::clone(&app), Config::default());
+        let ctx_b = AppContext::from_app(app, Config::default());
+        let (tx_a, rx_a) = mpsc::channel();
+        let (tx_b, rx_b) = mpsc::channel();
+
+        ctx_a.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            let _ = tx_a.send(frame);
+        }))));
+        ctx_b.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            let _ = tx_b.send(frame);
+        }))));
+
+        ctx_a.emit_progress(ProgressFrame {
+            frame_type: "progress",
+            request_id: "ctx-a".to_string(),
+            kind: crate::protocol::ProgressKind::Stdout,
+            chunk: "a".to_string(),
+        });
+        ctx_b.emit_progress(ProgressFrame {
+            frame_type: "progress",
+            request_id: "ctx-b".to_string(),
+            kind: crate::protocol::ProgressKind::Stdout,
+            chunk: "b".to_string(),
+        });
+
+        match rx_a
+            .recv_timeout(Duration::from_millis(50))
+            .expect("ctx A progress frame")
+        {
+            PushFrame::Progress(frame) => assert_eq!(frame.request_id, "ctx-a"),
+            other => panic!("unexpected frame for ctx A: {other:?}"),
+        }
+        assert!(rx_a.try_recv().is_err());
+
+        match rx_b
+            .recv_timeout(Duration::from_millis(50))
+            .expect("ctx B progress frame")
+        {
+            PushFrame::Progress(frame) => assert_eq!(frame.request_id, "ctx-b"),
+            other => panic!("unexpected frame for ctx B: {other:?}"),
+        }
+        assert!(rx_b.try_recv().is_err());
     }
 }
 
