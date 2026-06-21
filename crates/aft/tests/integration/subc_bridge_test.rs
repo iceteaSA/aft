@@ -289,6 +289,7 @@ fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
         config.callgraph_store = false;
         config.search_index = false;
         config.semantic_search = false;
+        config.experimental_bash_background = true;
     });
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(canonical_root);
@@ -336,6 +337,15 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 req.id,
                 json!({ "case": "fast", "project_root": ctx_project_root(ctx) }),
             ),
+            Some("status_bar") => {
+                let dead_code = req
+                    .params
+                    .get("dead_code")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(11) as usize;
+                ctx.update_status_bar_tier2(Some(dead_code), Some(12), Some(13), Some(14), false);
+                Response::success(req.id, json!({ "case": "status_bar" }))
+            }
             Some("epoch") => state.epoch_read(req.id),
             other => Response::error(
                 req.id,
@@ -343,6 +353,8 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 format!("unexpected read case: {other:?}"),
             ),
         },
+        "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash_status" => aft::commands::bash_status::handle(&req, ctx),
         "semantic_search" => state.heavy(req.id),
         "enable_callgraph_store_for_test" => {
             ctx.update_config(|config| config.callgraph_store = true);
@@ -539,6 +551,89 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
 
     send_route_bind(&mut stream, 1, 10, &root1).await;
     expect_route_bind_ack(&mut stream, 10).await;
+
+    // L2 response finalizer: a normal route-channel read gets status_bar once
+    // the actor has real Tier-2 counts, matching standalone response shape.
+    send_tool_call(
+        &mut stream,
+        1,
+        80,
+        "read",
+        json!({ "case": "status_bar", "dead_code": 21 }),
+    )
+    .await;
+    let status_bar_read = read_frame_timeout(&mut stream, "status-bar read response").await;
+    assert_eq!(status_bar_read.header.corr, 80);
+    let status_bar_response = tool_response_json(&status_bar_read);
+    assert_eq!(status_bar_response["status_bar"]["dead_code"], 21);
+    assert_eq!(status_bar_response["status_bar"]["unused_exports"], 12);
+    assert_eq!(status_bar_response["status_bar"]["duplicates"], 13);
+    assert_eq!(status_bar_response["status_bar"]["todos"], 14);
+
+    // A completed bg-bash task for the bound route's BindIdentity.session is
+    // attached to subsequent non-skip responses. The bash_status poll itself is
+    // a skip-list command, so it must not carry status_bar/bg_completions.
+    send_tool_call(
+        &mut stream,
+        1,
+        81,
+        "bash",
+        json!({
+            "session_id": "session-1",
+            "params": {
+                "command": "echo subc-bg-completion",
+                "background": true,
+                "timeout": 5000,
+            },
+        }),
+    )
+    .await;
+    let bash_started = read_frame_timeout(&mut stream, "bash start response").await;
+    assert_eq!(bash_started.header.corr, 81);
+    let bash_started_response = tool_response_json(&bash_started);
+    assert!(
+        bash_started_response["success"].as_bool().unwrap_or(false),
+        "background bash should start: {bash_started_response:?}"
+    );
+    let task_id = bash_started_response["task_id"]
+        .as_str()
+        .expect("bash start task_id")
+        .to_string();
+    wait_for_bash_completion(&mut stream, 1, 82, &task_id).await;
+
+    send_tool_call(&mut stream, 1, 120, "read", json!({ "case": "fast" })).await;
+    let first_after_completion = read_frame_timeout(&mut stream, "first completion read").await;
+    assert_eq!(first_after_completion.header.corr, 120);
+    let first_after_completion_response = tool_response_json(&first_after_completion);
+    assert_bg_completion(&first_after_completion_response, &task_id);
+
+    send_tool_call(&mut stream, 1, 121, "read", json!({ "case": "fast" })).await;
+    let second_after_completion = read_frame_timeout(&mut stream, "second completion read").await;
+    assert_eq!(second_after_completion.header.corr, 121);
+    let second_after_completion_response = tool_response_json(&second_after_completion);
+    assert_bg_completion(&second_after_completion_response, &task_id);
+
+    // Two same-actor PureRead jobs finish/finalize concurrently. Both should
+    // clone the pending bg completion safely; the status_bar dedup lock is also
+    // exercised because counts were populated above.
+    let finalizer_epoch_base = state.begin_epoch_wave();
+    for corr in 122..124 {
+        send_tool_call(&mut stream, 1, corr, "read", json!({ "case": "epoch" })).await;
+    }
+    state.wait_until("finalizer epoch reads started", |inner| {
+        inner.epoch_started == finalizer_epoch_base + 2
+    });
+    state.release_epoch_reads();
+    let mut finalizer_corrs = HashSet::new();
+    for _ in 0..2 {
+        let frame = read_frame_timeout(&mut stream, "concurrent finalizer response").await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        finalizer_corrs.insert(frame.header.corr);
+        let response = tool_response_json(&frame);
+        assert!(response["success"].as_bool().unwrap_or(false));
+        assert_bg_completion(&response, &task_id);
+    }
+    assert_eq!(finalizer_corrs, HashSet::from([122, 123]));
 
     // 1. Overlap: three PureRead calls on one route must all reach dispatch
     // before any is released.
@@ -836,6 +931,71 @@ fn tool_response_json(frame: &Frame) -> Value {
         .as_str()
         .expect("tool result text");
     serde_json::from_str(text).expect("embedded AFT response JSON")
+}
+
+async fn wait_for_bash_completion(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    first_corr: u64,
+    task_id: &str,
+) -> Value {
+    for attempt in 0..30 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let corr = first_corr + attempt;
+        send_tool_call(
+            stream,
+            channel,
+            corr,
+            "bash_status",
+            json!({ "session_id": "session-1", "params": { "task_id": task_id } }),
+        )
+        .await;
+        let frame = read_frame_timeout(stream, "bash status response").await;
+        assert_eq!(frame.header.corr, corr);
+        let response = tool_response_json(&frame);
+        assert_no_finalizer_fields(&response);
+        if response["success"].as_bool() == Some(true)
+            && response
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(is_terminal_status)
+        {
+            return response;
+        }
+    }
+    panic!("background bash task did not complete: {task_id}");
+}
+
+fn assert_no_finalizer_fields(response: &Value) {
+    assert!(
+        response.get("status_bar").is_none(),
+        "skip-list response should not carry status_bar: {response:?}"
+    );
+    assert!(
+        response.get("bg_completions").is_none(),
+        "skip-list response should not carry bg_completions: {response:?}"
+    );
+}
+
+fn assert_bg_completion(response: &Value, task_id: &str) {
+    let completions = response["bg_completions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected bg_completions on response: {response:?}"));
+    assert!(
+        completions.iter().any(|completion| {
+            completion.get("task_id").and_then(Value::as_str) == Some(task_id)
+                && completion.get("status").and_then(Value::as_str) == Some("completed")
+                && completion
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| command.contains("subc-bg-completion"))
+        }),
+        "expected completion for task {task_id}, got {completions:?}"
+    );
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "killed" | "timed_out")
 }
 
 async fn poll_callers_until_ready(

@@ -58,6 +58,13 @@ struct RootMeta {
     last_touched: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct RouteIdentity {
+    root: ProjectRootId,
+    harness: String,
+    session: String,
+}
+
 impl RootMeta {
     fn new(now: Instant) -> Self {
         Self {
@@ -210,7 +217,7 @@ where
     let shutdown = Arc::new(Notify::new());
     let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<(ProjectRootId, Response)>(256);
-    let mut routes: HashMap<RouteChannel, ProjectRootId> = HashMap::new();
+    let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
@@ -252,21 +259,25 @@ where
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel);
-                        if let Some(root_id) = routes.remove(&channel) {
-                            if let Some(meta) = live_roots.get_mut(&root_id) {
+                        if let Some(identity) = routes.remove(&channel) {
+                            if let Some(meta) = live_roots.get_mut(&identity.root) {
                                 let idle_for = meta.last_touched.elapsed();
                                 meta.touch();
                                 log::debug!(
-                                    "subc attach: route {} torn down for root {} (last touched {:?} ago)",
+                                    "subc attach: route {} torn down for root {} harness {} session {} (last touched {:?} ago)",
                                     frame.header.channel,
-                                    root_id.as_path().display(),
+                                    identity.root.as_path().display(),
+                                    identity.harness,
+                                    identity.session,
                                     idle_for
                                 );
                             } else {
                                 log::debug!(
-                                    "subc attach: route {} torn down for root {}",
+                                    "subc attach: route {} torn down for root {} harness {} session {}",
                                     frame.header.channel,
-                                    root_id.as_path().display()
+                                    identity.root.as_path().display(),
+                                    identity.harness,
+                                    identity.session
                                 );
                             }
                         } else {
@@ -415,7 +426,7 @@ async fn handle_control_request(
     frame: &Frame,
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
-    routes: &mut HashMap<RouteChannel, ProjectRootId>,
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
@@ -561,7 +572,14 @@ async fn handle_control_request(
                 }
             }
 
-            routes.insert(route_key(route_channel), bind_root_id.clone());
+            routes.insert(
+                route_key(route_channel),
+                RouteIdentity {
+                    root: bind_root_id.clone(),
+                    harness: identity.harness,
+                    session: identity.session,
+                },
+            );
             if let Some(meta) = live_roots.get_mut(&bind_root_id) {
                 meta.touch();
             }
@@ -637,13 +655,13 @@ async fn send_route_bind_error(
 async fn handle_tool_call(
     tx: &mpsc::Sender<Frame>,
     frame: &Frame,
-    routes: &HashMap<RouteChannel, ProjectRootId>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
-    let Some(root_id) = routes.get(&route_key(frame.header.channel)).cloned() else {
+    let Some(identity) = routes.get(&route_key(frame.header.channel)).cloned() else {
         let error = build_error_frame(
             frame.header.ver,
             frame.header.channel,
@@ -654,7 +672,7 @@ async fn handle_tool_call(
         )?;
         return send_frame(tx, error).await;
     };
-    if let Some(meta) = live_roots.get_mut(&root_id) {
+    if let Some(meta) = live_roots.get_mut(&identity.root) {
         meta.touch();
     }
 
@@ -664,6 +682,8 @@ async fn handle_tool_call(
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let command = call.name;
     let lane = command_lane(&command);
+    let command_for_finalize = command.clone();
+    let session_for_finalize = identity.session.clone();
     let mut map = call.arguments.as_object().cloned().unwrap_or_default();
     map.insert("id".to_string(), json!(request_id.clone()));
     map.insert("command".to_string(), json!(command));
@@ -688,10 +708,20 @@ async fn handle_tool_call(
     };
 
     let rx = executor.submit_async(
-        root_id,
+        identity.root,
         lane,
         request_id.clone(),
-        Box::new(move |ctx| dispatch(raw_req, ctx)),
+        Box::new(move |ctx| {
+            let mut response = dispatch(raw_req, ctx);
+            crate::response_finalize::attach_bg_completions(
+                &mut response,
+                ctx,
+                &session_for_finalize,
+                &command_for_finalize,
+            );
+            crate::response_finalize::attach_status_bar(&mut response, ctx, &command_for_finalize);
+            response
+        }),
     );
     let completion_tx = tx.clone();
     let completion_shutdown = Arc::clone(shutdown);
