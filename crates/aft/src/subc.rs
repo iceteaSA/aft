@@ -1143,15 +1143,11 @@ fn submit_maintenance_drain(
         Lane::Mutating,
         request_id.clone(),
         Box::new(move |ctx| {
-            // Standalone order is configure → search → callgraph → semantic-index
-            // → semantic-refresh → inspect → watcher → lsp. Semantic refresh is
-            // extracted in a later slice, so this interim subc tick keeps its
-            // placeholder in the standalone-relative position.
             runtime_drain::drain_configure_warning_events(ctx);
             runtime_drain::drain_search_index_events(ctx);
             runtime_drain::drain_callgraph_store_events(ctx);
             runtime_drain::drain_semantic_index_events(ctx);
-            // drain_semantic_refresh_events(ctx); // NOT YET — 4b-2c slice.
+            runtime_drain::drain_semantic_refresh_events(ctx);
             runtime_drain::drain_inspect_events(ctx);
             runtime_drain::drain_watcher_events(ctx);
             runtime_drain::drain_lsp_events(ctx);

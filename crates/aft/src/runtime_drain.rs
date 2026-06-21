@@ -1,5 +1,8 @@
 use crate as aft;
-use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshRequest};
+use crate::context::{
+    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
+    SemanticRefreshRequest,
+};
 use crate::log_ctx;
 use crate::lsp::client::LspEvent;
 use crate::protocol::PushFrame;
@@ -438,6 +441,468 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
             status_changed = true;
         }
     }
+
+    if status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
+}
+
+pub const MAX_RETRY_ATTEMPTS: usize = 6;
+pub const BREAKER_TRIP_THRESHOLD: usize = 3;
+
+/// Backoff for live semantic refresh retries after a transient embedding backend
+/// failure. Mirrors the cold-build retry cadence (15s -> 30s -> 60s capped) so
+/// a down backend cannot spin the watcher/refresh loop hot while still
+/// self-healing once the backend returns.
+fn semantic_refresh_retry_backoff(attempt: usize) -> Duration {
+    // Test seam, intentionally matching the build-level retry override.
+    if let Ok(raw) = std::env::var("AFT_SEMANTIC_RETRY_BACKOFF_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    const SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
+    let secs = SCHEDULE_SECS
+        .get(attempt)
+        .copied()
+        .unwrap_or(*SCHEDULE_SECS.last().unwrap());
+    Duration::from_secs(secs)
+}
+
+struct SemanticRefreshRetryPlan {
+    retry_paths: Vec<std::path::PathBuf>,
+    capped_paths: Vec<std::path::PathBuf>,
+    delay: Option<Duration>,
+}
+
+fn next_semantic_refresh_retry_plan(
+    ctx: &AppContext,
+    paths: Vec<std::path::PathBuf>,
+) -> SemanticRefreshRetryPlan {
+    let mut retry_paths = Vec::new();
+    let mut capped_paths = Vec::new();
+    let mut max_attempt = 0usize;
+
+    ctx.with_semantic_refresh_retry_attempts_mut(|attempts| {
+        for path in paths {
+            let attempt = attempts.get(&path).copied().unwrap_or(0);
+            if attempt >= MAX_RETRY_ATTEMPTS {
+                capped_paths.push(path);
+                continue;
+            }
+            max_attempt = max_attempt.max(attempt);
+            attempts.insert(path.clone(), attempt.saturating_add(1));
+            retry_paths.push(path);
+        }
+    });
+
+    let delay = if retry_paths.is_empty() {
+        None
+    } else {
+        Some(semantic_refresh_retry_backoff(max_attempt))
+    };
+
+    SemanticRefreshRetryPlan {
+        retry_paths,
+        capped_paths,
+        delay,
+    }
+}
+
+fn clear_semantic_refresh_retry_attempts(ctx: &AppContext, paths: &[std::path::PathBuf]) {
+    ctx.clear_semantic_refresh_retry_attempts(paths);
+}
+
+fn clear_completed_pending_semantic_index_paths(
+    ctx: &AppContext,
+    completed_paths: &[std::path::PathBuf],
+) {
+    if completed_paths.is_empty() {
+        return;
+    }
+
+    let completed = completed_paths.iter().cloned().collect::<HashSet<_>>();
+    let remaining = ctx
+        .take_pending_semantic_index_paths()
+        .into_iter()
+        .filter(|path| !completed.contains(path))
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        ctx.add_pending_semantic_index_paths(remaining);
+    }
+}
+
+fn semantic_refresh_probe_delay() -> Duration {
+    semantic_refresh_retry_backoff(usize::MAX)
+}
+
+pub fn semantic_refresh_circuit_is_open(ctx: &AppContext) -> bool {
+    ctx.semantic_refresh_circuit_is_open()
+}
+
+pub fn record_semantic_refresh_transient_failure(ctx: &AppContext) -> bool {
+    ctx.record_semantic_refresh_transient_failure(BREAKER_TRIP_THRESHOLD)
+}
+
+fn reset_semantic_refresh_transient_failure_count(ctx: &AppContext) {
+    ctx.reset_semantic_refresh_transient_failure_count();
+}
+
+fn reset_semantic_refresh_circuit_after_success(ctx: &AppContext) {
+    ctx.reset_semantic_refresh_circuit_after_success();
+}
+
+fn mark_semantic_refresh_success(ctx: &AppContext, completed_paths: &[std::path::PathBuf]) {
+    clear_semantic_refresh_retry_attempts(ctx, completed_paths);
+    clear_completed_pending_semantic_index_paths(ctx, completed_paths);
+    reset_semantic_refresh_circuit_after_success(ctx);
+}
+
+#[doc(hidden)]
+pub fn semantic_refresh_transient_failure_count_for_test(ctx: &AppContext) -> usize {
+    ctx.semantic_refresh_transient_failure_count()
+}
+
+#[doc(hidden)]
+pub fn semantic_refresh_probe_is_scheduled_for_test(ctx: &AppContext) -> bool {
+    ctx.semantic_refresh_probe_is_scheduled()
+}
+
+fn ensure_semantic_refresh_probe_scheduled(ctx: &AppContext) {
+    ctx.ensure_semantic_refresh_probe_scheduled(semantic_refresh_probe_delay());
+}
+
+fn maybe_fire_semantic_refresh_probe(ctx: &AppContext) {
+    if !ctx.take_semantic_refresh_probe_ready() {
+        return;
+    }
+    if !semantic_refresh_circuit_is_open(ctx) {
+        return;
+    }
+
+    let pending_paths = ctx.take_pending_semantic_index_paths();
+    if pending_paths.is_empty() {
+        return;
+    }
+
+    let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+        sender
+            .send(SemanticRefreshRequest::Files {
+                paths: pending_paths.clone(),
+            })
+            .is_ok()
+    });
+    if !sent {
+        ctx.add_pending_semantic_index_paths(pending_paths);
+    }
+}
+
+pub fn schedule_semantic_refresh_retry(
+    ctx: &AppContext,
+    paths: Vec<std::path::PathBuf>,
+    error: &str,
+) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let Some(sender) = ctx.semantic_refresh_sender() else {
+        return false;
+    };
+
+    let SemanticRefreshRetryPlan {
+        retry_paths,
+        capped_paths,
+        delay,
+    } = next_semantic_refresh_retry_plan(ctx, paths);
+
+    if !capped_paths.is_empty() {
+        aft::slog_warn!(
+            "semantic refresh retry limit reached for {} file(s); preserving for next watcher/configure refresh",
+            capped_paths.len(),
+        );
+        ctx.add_pending_semantic_index_paths(capped_paths);
+    }
+
+    let Some(delay) = delay else {
+        return true;
+    };
+
+    let clean = aft::semantic_index::strip_transient_embedding_marker(error);
+    aft::slog_warn!(
+        "semantic refresh hit a transient backend error ({}); retrying {} file(s) in {}ms",
+        clean,
+        retry_paths.len(),
+        delay.as_millis(),
+    );
+
+    let session_id = log_ctx::current_session();
+    thread::spawn(move || {
+        log_ctx::with_session(session_id, || {
+            thread::sleep(delay);
+            let _ = sender.send(SemanticRefreshRequest::Files { paths: retry_paths });
+        });
+    });
+    true
+}
+
+pub fn drain_semantic_refresh_events(ctx: &AppContext) {
+    let (events, disconnected) = {
+        let rx_ref = ctx.semantic_refresh_event_rx().lock();
+        let Some(rx) = rx_ref.as_ref() else {
+            return;
+        };
+
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        (events, disconnected)
+    };
+
+    if events.is_empty() && !disconnected {
+        maybe_fire_semantic_refresh_probe(ctx);
+        return;
+    }
+
+    let had_events = !events.is_empty();
+    let mut status_changed = false;
+    let mut replay_refresh_paths = Vec::new();
+    for event in events {
+        match event {
+            SemanticRefreshEvent::Started { paths } => {
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in paths {
+                        status.start_refreshing_file(path);
+                    }
+                    status_changed = true;
+                }
+            }
+            SemanticRefreshEvent::CorpusStarted { files } => {
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Building {
+                        stage: "refreshing_corpus".to_string(),
+                        files: Some(files),
+                        entries_done: None,
+                        entries_total: None,
+                    };
+                status_changed = true;
+            }
+            SemanticRefreshEvent::Completed {
+                added_entries,
+                updated_metadata,
+                completed_paths,
+            } => {
+                if let Some(index) = ctx
+                    .semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
+                }
+                mark_semantic_refresh_success(ctx, &completed_paths);
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in &completed_paths {
+                        status.complete_refreshing_file(path);
+                    }
+                    status_changed = true;
+                }
+            }
+            SemanticRefreshEvent::CorpusCompleted {
+                mut index,
+                changed,
+                added,
+                deleted,
+                total_processed,
+            } => {
+                aft::runtime_drain::mark_semantic_corpus_refresh_success(ctx);
+                if changed > 0 || added > 0 || deleted > 0 {
+                    aft::slog_info!(
+                        "semantic corpus refresh completed: {} changed, {} new, {} deleted, {} total processed",
+                        changed,
+                        added,
+                        deleted,
+                        total_processed
+                    );
+                }
+                let pending_paths = ctx.take_pending_semantic_index_paths();
+                for path in pending_paths {
+                    if !aft::runtime_drain::watcher_path_is_semantic_source(&path) {
+                        continue;
+                    }
+                    index.invalidate_file(&path);
+                    if !aft::runtime_drain::watcher_path_is_ignored_by_current_matcher(ctx, &path) {
+                        replay_refresh_paths.push(path);
+                    }
+                }
+                *ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::ready();
+                status_changed = true;
+            }
+            SemanticRefreshEvent::Failed { paths, error } => {
+                if aft::semantic_index::embedding_failure_is_transient(&error) {
+                    if record_semantic_refresh_transient_failure(ctx) {
+                        ctx.add_pending_semantic_index_paths(paths);
+                        ensure_semantic_refresh_probe_scheduled(ctx);
+                    } else if !schedule_semantic_refresh_retry(ctx, paths.clone(), &error) {
+                        aft::slog_warn!(
+                            "semantic refresh worker unavailable; preserving {} transiently failed file(s) for retry",
+                            paths.len(),
+                        );
+                        ctx.add_pending_semantic_index_paths(paths);
+                    }
+                } else {
+                    aft::slog_warn!("semantic refresh failed: {}", error);
+                    reset_semantic_refresh_transient_failure_count(ctx);
+                    clear_semantic_refresh_retry_attempts(ctx, &paths);
+                    let mut status = ctx
+                        .semantic_index_status()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                        for path in &paths {
+                            status.complete_refreshing_file(path);
+                        }
+                        status_changed = true;
+                    }
+                }
+            }
+            SemanticRefreshEvent::CorpusFailed { error } => {
+                // A transient backend blip during a corpus refresh must NOT
+                // destroy the working index — the prior index is still valid and
+                // serving. Keep it Ready and let the next watcher/ignore change
+                // re-trigger the refresh, rather than nuking everything to
+                // `Failed` over a connection hiccup (the same park-forever trap
+                // the initial build now rides out). Permanent errors (dimension
+                // mismatch, too-many-files) still drop the index and surface the
+                // real failure.
+                if aft::semantic_index::embedding_failure_is_transient(&error) {
+                    let clean = aft::semantic_index::strip_transient_embedding_marker(&error);
+                    let has_index = ctx
+                        .semantic_index()
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some();
+                    if has_index {
+                        aft::slog_warn!(
+                            "semantic corpus refresh hit a transient backend error ({}); keeping the existing index",
+                            clean,
+                        );
+                        *ctx.semantic_index_status()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            SemanticIndexStatus::ready();
+                    } else {
+                        // No index to fall back on — surface the clean message.
+                        aft::slog_warn!("semantic corpus refresh failed: {}", clean);
+                        *ctx.semantic_index_status()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            SemanticIndexStatus::Failed(clean);
+                    }
+                    status_changed = true;
+                } else {
+                    aft::slog_warn!("semantic corpus refresh failed: {}", error);
+                    let _ = ctx.take_pending_semantic_index_paths();
+                    *ctx.semantic_index()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    *ctx.semantic_index_status()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        SemanticIndexStatus::Failed(error);
+                    status_changed = true;
+                }
+            }
+        }
+    }
+
+    if disconnected {
+        ctx.clear_semantic_refresh_worker();
+        let refreshing_paths = {
+            let status = ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*status {
+                SemanticIndexStatus::Ready { refreshing, .. } => refreshing.clone(),
+                _ => Vec::new(),
+            }
+        };
+        if !refreshing_paths.is_empty() {
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for path in &refreshing_paths {
+                status.cancel_refreshing_file(path);
+            }
+        }
+        if !refreshing_paths.is_empty() || had_events {
+            status_changed = true;
+        }
+    }
+
+    if !replay_refresh_paths.is_empty() {
+        {
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                for path in &replay_refresh_paths {
+                    status.add_refreshing_file(path.clone());
+                }
+                status_changed = true;
+            }
+        }
+        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+            sender
+                .send(SemanticRefreshRequest::Files {
+                    paths: replay_refresh_paths.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            aft::slog_warn!(
+                "semantic refresh worker unavailable; dropping {} replayed corpus file(s)",
+                replay_refresh_paths.len()
+            );
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for path in &replay_refresh_paths {
+                status.cancel_refreshing_file(path);
+            }
+            status_changed = true;
+        }
+    }
+
+    maybe_fire_semantic_refresh_probe(ctx);
 
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
