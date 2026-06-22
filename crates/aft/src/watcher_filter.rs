@@ -117,6 +117,28 @@ pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
     })
 }
 
+/// High-churn ignored directories that can be dropped from the raw event stream
+/// before paying for a `realpath` canonicalization.
+///
+/// A build writes hundreds of thousands of files under `target/` (or
+/// `node_modules/` for JS installs); FSEvents delivers every one to AFT, and
+/// canonicalizing each just to drop it later in the filter pegs the
+/// single-threaded watcher loop. This is a pure path-component scan (no syscall),
+/// so the flood is rejected almost for free.
+///
+/// This deliberately omits `.git`: `.git/info/exclude` changes the corpus ignore
+/// set, and dropping `.git` here would hide them from the ignore-relevance check
+/// in the full filter. `.git` churn is small next to `target/`, so it stays on
+/// the canonicalizing path.
+fn watcher_path_is_high_churn_infra(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(c, Component::Normal(name) if matches!(
+            name.to_str().unwrap_or(""),
+            ".opencode" | ".alfonso" | ".gsd" | "node_modules" | "target"
+        ))
+    })
+}
+
 fn watcher_path_is_ignore_file(path: &Path) -> bool {
     path.file_name()
         .map(|n| n == ".gitignore" || n == ".aftignore")
@@ -380,6 +402,21 @@ impl WatcherFilterThread {
 
     fn push_raw_paths(&mut self, paths: Vec<PathBuf>) -> bool {
         for path in paths {
+            // Drop high-churn ignored dirs (target/, node_modules/, agent infra)
+            // on the RAW path before canonicalizing. `canonicalize_watcher_path`
+            // is a realpath syscall; a build floods FSEvents with hundreds of
+            // thousands of target/ paths, and paying a syscall per path only to
+            // discard them later pegged this single watcher thread. The full
+            // filter still drops these (watcher_path_is_infra_skip), so this is a
+            // pure perf short-circuit with no behavior change.
+            if watcher_path_is_high_churn_infra(&path) {
+                continue;
+            }
+            // Canonicalize at intake so the set keys (and downstream consumers)
+            // see normalized paths — this is what collapses macOS /var ->
+            // /private/var aliasing and matches the callgraph/semantic/search
+            // cache keys. Same-file repeats within the window still dedup here;
+            // the high-churn flood is already dropped above, before this syscall.
             self.raw_paths.insert(canonicalize_watcher_path(path));
         }
         if !self.raw_paths.is_empty() && self.flush_deadline.is_none() {
@@ -517,6 +554,32 @@ mod tests {
             AccessKind::Open(AccessMode::Read)
         )));
         assert!(!watcher_event_invalidates(&EventKind::Other));
+    }
+
+    #[test]
+    fn high_churn_infra_skip_drops_build_dirs_but_keeps_git_and_source() {
+        // target/ and node_modules/ are dropped on the raw path before the
+        // realpath syscall — this is the build-flood short-circuit.
+        assert!(watcher_path_is_high_churn_infra(Path::new(
+            "/proj/target/debug/deps/foo.o"
+        )));
+        assert!(watcher_path_is_high_churn_infra(Path::new(
+            "/proj/node_modules/.bin/x"
+        )));
+        assert!(watcher_path_is_high_churn_infra(Path::new(
+            "/proj/.alfonso/notes/x"
+        )));
+        // .git is deliberately NOT high-churn-skipped: .git/info/exclude must
+        // still reach the ignore-relevance check.
+        assert!(!watcher_path_is_high_churn_infra(Path::new(
+            "/proj/.git/info/exclude"
+        )));
+        // Source files always pass through to canonicalization + filtering.
+        assert!(!watcher_path_is_high_churn_infra(Path::new(
+            "/proj/src/main.rs"
+        )));
+        // The full filter still drops .git (and everything high-churn does).
+        assert!(watcher_path_is_infra_skip(Path::new("/proj/.git/index")));
     }
 
     #[test]
