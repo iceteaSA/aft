@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::context::{App, AppContext, ProgressSender};
 use crate::executor::{Executor, Lane};
+use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
 use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
 use crate::runtime_drain;
@@ -408,7 +409,8 @@ pub fn run_subc_mode(
         .build()
         .map_err(SubcError::Runtime)?;
 
-    runtime.block_on(async move {
+    let executor_for_loop = Arc::clone(&executor);
+    let loop_result = runtime.block_on(async move {
         let shared_app = ctx.app();
         drop(ctx);
         let stream = connect_and_authenticate(connection_file_path).await?;
@@ -417,8 +419,22 @@ pub fn run_subc_mode(
             connection_file_path.display()
         );
         let (read_half, write_half) = tokio::io::split(stream);
-        run_module_loop(read_half, write_half, shared_app, executor, dispatch).await
-    })
+        run_module_loop(
+            read_half,
+            write_half,
+            shared_app,
+            executor_for_loop,
+            dispatch,
+        )
+        .await
+    });
+
+    for actor_ctx in executor.actor_contexts() {
+        actor_ctx.lsp().shutdown_all();
+        actor_ctx.bash_background().detach();
+    }
+
+    loop_result
 }
 
 /// Read the connection file → resolve the first endpoint → TCP connect → HMAC
@@ -805,6 +821,7 @@ async fn handle_control_request(
             // Reconcile RootConfig: build a configure request from the bind
             // identity + forwarded config tiers and run it through the executor.
             let request_id = format!("subc-bind-{route_channel}");
+            let configure_session = identity.session.clone();
             let config_tiers: Vec<Value> = config
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
@@ -814,6 +831,7 @@ async fn handle_control_request(
                 "command": "configure",
                 "project_root": identity.project_root,
                 "harness": identity.harness,
+                "session_id": configure_session.clone(),
                 "config": config_tiers,
             });
             let configure_req = match serde_json::from_value::<RawRequest>(configure_json) {
@@ -864,7 +882,11 @@ async fn handle_control_request(
                 bind_root_id.clone(),
                 Lane::Mutating,
                 configure_request_id.clone(),
-                Box::new(move |ctx| dispatch(configure_req, ctx)),
+                Box::new(move |ctx| {
+                    log_ctx::with_session(Some(configure_session.clone()), || {
+                        dispatch(configure_req, ctx)
+                    })
+                }),
             );
             let configure_response =
                 await_executor_response(configure_rx, configure_request_id.clone()).await;
@@ -1084,15 +1106,21 @@ async fn handle_tool_call(
         lane,
         request_id.clone(),
         Box::new(move |ctx| {
-            let mut response = dispatch(raw_req, ctx);
-            crate::response_finalize::attach_bg_completions(
-                &mut response,
-                ctx,
-                &session_for_finalize,
-                &command_for_finalize,
-            );
-            crate::response_finalize::attach_status_bar(&mut response, ctx, &command_for_finalize);
-            response
+            log_ctx::with_session(Some(session_for_finalize.clone()), || {
+                let mut response = dispatch(raw_req, ctx);
+                crate::response_finalize::attach_bg_completions(
+                    &mut response,
+                    ctx,
+                    &session_for_finalize,
+                    &command_for_finalize,
+                );
+                crate::response_finalize::attach_status_bar(
+                    &mut response,
+                    ctx,
+                    &command_for_finalize,
+                );
+                response
+            })
         }),
     );
     let completion_tx = tx.clone();

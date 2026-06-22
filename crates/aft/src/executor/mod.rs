@@ -218,6 +218,19 @@ impl Executor {
         self.wake_scheduler();
     }
 
+    /// Snapshot the registered actor contexts.
+    ///
+    /// The returned [`Arc`]s keep contexts alive after the scheduler lock is
+    /// released, so callers can run teardown without holding executor state.
+    pub fn actor_contexts(&self) -> Vec<Arc<AppContext>> {
+        let state = self.inner.state.lock();
+        state
+            .actors
+            .values()
+            .map(|actor_state| Arc::clone(&actor_state.ctx))
+            .collect()
+    }
+
     pub fn submit(
         &self,
         root_id: ProjectRootId,

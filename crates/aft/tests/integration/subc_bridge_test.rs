@@ -506,7 +506,8 @@ fn enqueue_configure_warning_if_requested(req: &RawRequest, ctx: &AppContext) {
         .as_ref()
         .map(|root| root.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let frame = ConfigureWarningsFrame::new(
+    let frame = ConfigureWarningsFrame::new_with_session_id(
+        aft::log_ctx::current_session(),
         project_root,
         1,
         false,
@@ -974,6 +975,7 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         HashSet::from([1]),
         &root1,
         "route-1-maintenance-warning",
+        "session-1",
     )
     .await;
     assert_eq!(configure_warning_pushes.len(), 1);
@@ -1252,6 +1254,48 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     assert_eq!(route4_read.header.channel, 4);
     assert_eq!(route4_read.header.corr, 420);
     assert_tool_project_root(&route4_read, &root1);
+
+    // P5b Slice A #2: configure warnings for one session on a shared root
+    // must carry that session id and not leak to sibling sessions.
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        49,
+        &root1,
+        "session-1",
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_configure_warning": {
+                "message": "session-1-reconfigure-warning",
+            },
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 49).await;
+    let session_configure_warning_pushes = expect_configure_warning_pushes(
+        &mut stream,
+        HashSet::from([1]),
+        &root1,
+        "session-1-reconfigure-warning",
+        "session-1",
+    )
+    .await;
+    assert_eq!(session_configure_warning_pushes.len(), 1);
+    assert_eq!(
+        session_configure_warning_pushes[0]
+            .get("session_id")
+            .and_then(Value::as_str),
+        Some("session-1")
+    );
+    assert_no_configure_warning_for_message(
+        &mut stream,
+        &root1,
+        "session-1-reconfigure-warning",
+        Duration::from_millis(150),
+    )
+    .await;
 
     // Phase 4d-2a: second session on same root — transport session + bg isolation.
     send_tool_call(&mut stream, 4, 422, "subc_test_echo_session", json!({})).await;
@@ -1719,6 +1763,7 @@ async fn expect_configure_warning_pushes(
     expected_channels: HashSet<u16>,
     expected_root: &std::path::Path,
     expected_message: &str,
+    expected_session: &str,
 ) -> Vec<Value> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let expected_root = expected_root.to_string_lossy().into_owned();
@@ -1749,6 +1794,11 @@ async fn expect_configure_warning_pushes(
             && body.get("project_root").and_then(Value::as_str) == Some(expected_root.as_str())
             && configure_warning_message_from_push(&body) == Some(expected_message)
         {
+            assert_eq!(
+                body.get("session_id").and_then(Value::as_str),
+                Some(expected_session),
+                "configure_warnings push should carry initiating session id"
+            );
             assert!(
                 expected_channels.contains(&frame.header.channel),
                 "configure_warnings push leaked to unexpected channel {}",
@@ -1761,6 +1811,44 @@ async fn expect_configure_warning_pushes(
 
     assert_eq!(channels, expected_channels);
     pushes
+}
+
+async fn assert_no_configure_warning_for_message(
+    stream: &mut tokio::net::TcpStream,
+    expected_root: &std::path::Path,
+    expected_message: &str,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    let expected_root = expected_root.to_string_lossy().into_owned();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match tokio::time::timeout(remaining, read_frame(stream)).await {
+            Err(_) => return,
+            Ok(Ok(Some(frame))) => {
+                if frame.header.ty == FrameType::Push {
+                    let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                    let matches_warning = push_type(&body) == Some("configure_warnings")
+                        && body.get("project_root").and_then(Value::as_str)
+                            == Some(expected_root.as_str())
+                        && configure_warning_message_from_push(&body) == Some(expected_message);
+                    assert!(
+                        !matches_warning,
+                        "configure_warnings push leaked to channel {}: {body:?}",
+                        frame.header.channel
+                    );
+                }
+            }
+            Ok(Ok(None)) => panic!("EOF while checking absence of configure_warnings push"),
+            Ok(Err(error)) => {
+                panic!("error while checking absence of configure_warnings push: {error}")
+            }
+        }
+    }
 }
 
 async fn expect_bash_completed_pushes_for_tool(

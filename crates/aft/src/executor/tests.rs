@@ -60,6 +60,25 @@ fn observe_max(max_seen: &AtomicUsize, value: usize) {
 }
 
 #[test]
+fn actor_contexts_returns_registered_contexts() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_dir_a, root_a) = test_root("contexts-a");
+    let (_dir_b, root_b) = test_root("contexts-b");
+    let ctx_a = test_ctx();
+    let ctx_b = test_ctx();
+
+    assert!(!Arc::ptr_eq(&ctx_a, &ctx_b));
+    assert!(executor.register_actor(root_a, Arc::clone(&ctx_a)));
+    assert!(executor.register_actor(root_b, Arc::clone(&ctx_b)));
+
+    let contexts = executor.actor_contexts();
+
+    assert_eq!(contexts.len(), 2);
+    assert!(contexts.iter().any(|ctx| Arc::ptr_eq(ctx, &ctx_a)));
+    assert!(contexts.iter().any(|ctx| Arc::ptr_eq(ctx, &ctx_b)));
+}
+
+#[test]
 fn cross_actor_isolation() {
     let executor = test_executor(4, 2, 3, 2);
     let (_dir_a, root_a) = test_root("isolation-a");
