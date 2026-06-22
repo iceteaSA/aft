@@ -6939,7 +6939,22 @@ export function leaf() {}
             "refs",
             "edges",
         ] {
-            assert_eq!(table_rows(&reference, table), table_rows(&optimized, table),);
+            // `files.indexed_at` is a wall-clock insert timestamp (unix_seconds_now);
+            // the reference and optimized builds run sequentially and can straddle a
+            // one-second tick under load, so it is legitimately allowed to differ.
+            // This mirrors the existing exclusions of `backend_file_state.updated_at`
+            // and the chunked-vs-unchunked sibling test. The check is for structural
+            // row equivalence of the optimized bulk insert, not wall-clock equality.
+            let excluded: &[&str] = if table == "files" {
+                &["indexed_at"]
+            } else {
+                &[]
+            };
+            assert_eq!(
+                table_rows_without(&reference, table, excluded),
+                table_rows_without(&optimized, table, excluded),
+                "table `{table}` rows must match apart from wall-clock columns"
+            );
         }
         assert_eq!(
             backend_state_rows(&reference),
