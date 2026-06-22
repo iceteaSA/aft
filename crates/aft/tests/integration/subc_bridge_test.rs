@@ -1294,7 +1294,7 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
     tokio::time::sleep(Duration::from_millis(150)).await;
     send_tool_call(&mut stream, 10, 1111, "glob", json!({ "case": "fast" })).await;
-    expect_error_frame(&mut stream, 10, 1111, "route_not_bound").await;
+    expect_error_frame_skipping_optional_ack(&mut stream, 10, 1111, "route_not_bound", 110).await;
 
     // Bind a single-channel root for the configure-emitted push scenarios below.
     // The follow-up RouteBinds exercise already-live reconfigure behavior while
@@ -2075,13 +2075,35 @@ async fn expect_route_bind_error(stream: &mut tokio::net::TcpStream, corr: u64, 
     expect_error_frame(stream, 0, corr, code).await;
 }
 
-async fn expect_error_frame(
+/// Like `expect_error_frame`, but tolerates one benign late `RouteBindAck` for a
+/// bind whose `Goodbye` raced its configure completion. When a `Goodbye` arrives
+/// while a slow bind's configure is in flight, the transport `select!` may pick
+/// the completion before the `Goodbye`: it then emits an ack on channel 0 for the
+/// abandoned corr and immediately tears the route down. Either ordering leaves the
+/// route unbound, so the only durable assertion is the subsequent
+/// `route_not_bound` error — the optional ack is correlated to a corr the gateway
+/// already abandoned and ignored. At most one such ack may appear.
+async fn expect_error_frame_skipping_optional_ack(
     stream: &mut tokio::net::TcpStream,
     channel: u16,
     corr: u64,
     code: &str,
+    optional_ack_corr: u64,
 ) {
-    let frame = read_frame_timeout(stream, "Error frame").await;
+    let frame = read_frame_timeout(stream, "Error frame (maybe after late ack)").await;
+    let frame = if frame.header.ty == FrameType::Response
+        && frame.header.channel == 0
+        && frame.header.corr == optional_ack_corr
+    {
+        // Benign late ack for the cancelled bind — skip it and read the real error.
+        read_frame_timeout(stream, "Error frame after late ack").await
+    } else {
+        frame
+    };
+    assert_error_frame(&frame, channel, corr, code);
+}
+
+fn assert_error_frame(frame: &Frame, channel: u16, corr: u64, code: &str) {
     if frame.header.ty != FrameType::Error
         || frame.header.channel != channel
         || frame.header.corr != corr
@@ -2096,6 +2118,16 @@ async fn expect_error_frame(
     }
     let body: Value = serde_json::from_slice(&frame.body).expect("error body");
     assert_eq!(body.get("code").and_then(Value::as_str), Some(code));
+}
+
+async fn expect_error_frame(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    code: &str,
+) {
+    let frame = read_frame_timeout(stream, "Error frame").await;
+    assert_error_frame(&frame, channel, corr, code);
 }
 
 fn push_marker(body: &Value) -> Option<&str> {

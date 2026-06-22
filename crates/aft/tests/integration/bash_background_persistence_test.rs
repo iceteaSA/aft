@@ -1408,7 +1408,23 @@ fn watchdog_marks_rehydrated_detached_task_failed_when_pid_dies_without_marker()
                 "process exited without exit marker"
             );
             assert_eq!(snapshot.exit_code, None);
-            let completions = registry.drain_completions_for_session(Some(SESSION));
+            // The watchdog marks the task terminal under the state lock but
+            // enqueues the completion afterwards (the enqueue does heavy I/O
+            // off-lock), so a status poll can observe Failed a beat before the
+            // completion is drainable. Settle: accumulate drains until it arrives.
+            let mut completions = Vec::new();
+            let settle_deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                completions.extend(registry.drain_completions_for_session(Some(SESSION)));
+                if !completions.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < settle_deadline,
+                    "watchdog marked task Failed but never enqueued its completion"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
             assert_eq!(completions.len(), 1);
             assert_eq!(completions[0].status, BgTaskStatus::Failed);
             break;

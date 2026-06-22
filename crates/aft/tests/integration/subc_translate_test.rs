@@ -9,6 +9,13 @@ fn root() -> PathBuf {
     PathBuf::from("/tmp/subc-parity-root")
 }
 
+/// Expected resolved path for a project-root-relative arg, built with the same
+/// `Path::join` the translator uses so the separator matches the host OS
+/// (forward slash on Unix, backslash on Windows).
+fn expected_resolved(rel: &str) -> String {
+    root().join(rel).to_string_lossy().into_owned()
+}
+
 fn assert_edit_error(args: Value, fragment: &str) {
     let err = subc_translate("edit", &args, &root()).unwrap_err();
     assert_eq!(err.code, "invalid_request");
@@ -37,7 +44,7 @@ fn read_offset_limit_normalizes_to_start_end_line() {
     assert_eq!(t.command, "read");
     assert_eq!(
         t.args.get("file").and_then(Value::as_str).unwrap(),
-        "/tmp/subc-parity-root/a.rs"
+        expected_resolved("a.rs")
     );
     assert_eq!(t.args.get("start_line").and_then(Value::as_u64), Some(10));
     assert_eq!(t.args.get("end_line").and_then(Value::as_u64), Some(14));
@@ -187,7 +194,7 @@ fn grep_path_resolves_relative() {
     .unwrap();
     assert_eq!(
         t.args.get("path").and_then(Value::as_str).unwrap(),
-        "/tmp/subc-parity-root/src"
+        expected_resolved("src")
     );
 }
 
