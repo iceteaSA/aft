@@ -179,8 +179,8 @@ impl BgBuffer {
                 }
             }
             // PTY completions intentionally skip token accounting. The combined
-            // stream can include terminal control sequences that Phase 2 renders
-            // via xterm-headless instead of the text compressor.
+            // stream can include terminal control sequences that the plugin
+            // renders via xterm-headless instead of the text compressor.
             Self::Pty { .. } => TokenCountInput::Skipped,
         }
     }

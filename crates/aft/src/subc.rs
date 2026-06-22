@@ -1,4 +1,4 @@
-//! subc daemon attach — transport edge (P5a).
+//! subc daemon attach — transport edge.
 //!
 //! When AFT is launched as `aft --subc <connection-file>`, it does NOT run the
 //! standalone NDJSON-over-stdin loop. Instead it connects to a running subc
@@ -7,7 +7,7 @@
 //! ModuleHello → HelloAck (register as a tool provider), then a channel-0
 //! control loop (Ping/Pong, RouteBind) plus route-channel tool calls.
 //!
-//! Concurrency: subc routes tool calls through the P5b executor. The tokio
+//! Concurrency: subc routes tool calls through the executor. The tokio
 //! edge never dispatches against `AppContext` inline; per-actor executor lanes
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
@@ -215,7 +215,8 @@ fn remember_session_identity(
 ) {
     // Retained after route Goodbye so reliable session-scoped frames emitted while
     // the session is detached can still be keyed by the full (root,harness,session)
-    // replay triple. Phase 4c eviction will later prune stale identities/buffers.
+    // replay triple. The idle-TTL actor reaper is responsible for pruning stale
+    // identities/buffers once an actor is evicted.
     session_identity.insert(
         (identity.root.clone(), identity.session.clone()),
         identity.harness.clone(),
@@ -1026,7 +1027,9 @@ where
                             break Err(error);
                         }
                     }
-                    // Cancel/Push/etc. are ignored until Phase 3 cancellation.
+                    // Cancel/Push/etc. are not yet handled: in-flight tool-call
+                    // cancellation is not implemented, so these frame types are
+                    // ignored rather than acted on.
                     _ => {}
                 }
             }
@@ -1893,8 +1896,8 @@ fn command_lane(command: &str) -> Lane {
         | "git_conflicts"
         | "ast_search" => Lane::PureRead,
 
-        // Lazy reads mutate parser/terminal/url caches on a miss, but Phase 2b
-        // classifies them onto the reader pool; install races are handled at the
+        // Lazy reads mutate parser/terminal/url caches on a miss, but are still
+        // classified onto the reader pool; install races are handled at the
         // individual cache sites.
         "bash_status" | "outline" | "zoom" => Lane::PureRead,
 

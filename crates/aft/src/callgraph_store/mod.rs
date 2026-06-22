@@ -1,7 +1,9 @@
 //! Persistent call/reference graph sidecar.
 //!
-//! Phase 1 intentionally keeps this substrate self-contained: callers can build
-//! and query the sidecar directly, but no runtime command reads from it yet.
+//! This SQLite-backed substrate stores raw symbols, references, and resolved
+//! edges, and backs the live call-graph commands (callers, call-tree, impact,
+//! trace) as well as dead-code reachability. It is self-contained: it can be
+//! built and queried directly without going through the in-memory call graph.
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData};
@@ -124,9 +126,9 @@ impl From<crate::fs_lock::AcquireError> for CallGraphStoreError {
 
 pub type Result<T> = std::result::Result<T, CallGraphStoreError>;
 
-/// Runtime gate name for Phase-1 callers. The substrate is compiled and tested,
-/// but production commands should only open it through `open_if_enabled` until
-/// Phase 2 migrates consumers.
+/// Config flag name gating whether the store is opened (default on). Production
+/// commands open it through `open_if_enabled` so the substrate can be disabled
+/// without code changes.
 pub const CALLGRAPH_STORE_FLAG: &str = "callgraph_store";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

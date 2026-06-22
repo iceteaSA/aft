@@ -1375,7 +1375,7 @@ pub fn drain_watcher_events(ctx: &AppContext) {
         }
     }
 
-    // Phase 2: invalidate each changed file in the call graph
+    // Invalidate each changed file in the call graph.
     let mut graph_ref = ctx.callgraph().lock();
     if let Some(graph) = graph_ref.as_mut() {
         for path in &changed {

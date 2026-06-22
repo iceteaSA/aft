@@ -830,7 +830,7 @@ fn collect_dispatched_method_names(contributions: &[DeadCodeContribution]) -> BT
 fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
     // A type-like export is live if it is referenced in type position ANYWHERE
     // in the project — not only from call-reachable files. Filtering by
-    // call-reachability (the original Phase 2 design) under-approximates
+    // call-reachability under-approximates
     // liveness: the cross-file call graph is incomplete (constructor/method
     // edges, workspace-package boundaries), so genuinely-used types referenced
     // from files the call graph fails to mark reachable were flagged dead.

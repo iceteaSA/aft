@@ -1,4 +1,4 @@
-//! Bash permission scanner for hoisted bash. Phase 0 stub; Phase 1 Track C fills in.
+//! Bash permission scanner for hoisted bash.
 //!
 //! Ports OpenCode's tree-sitter-based permission scan that walks the parsed
 //! command tree to identify sub-commands that touch external directories or

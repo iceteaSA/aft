@@ -103,7 +103,7 @@ impl ExecutorConfig {
     }
 }
 
-/// Synchronous completion handle used by the Phase 2a executor tests and the
+/// Synchronous completion handle used by the executor tests and the
 /// future standalone bridge.
 pub struct CompletionHandle {
     rx: Receiver<Response>,
@@ -182,8 +182,8 @@ impl Executor {
 
     /// Register an actor if one is not already present.
     ///
-    /// Existing actors keep their current context and scheduler state; Phase 4
-    /// subc routing reuses them and reconfigures through the Mutating lane
+    /// Existing actors keep their current context and scheduler state; subc
+    /// routing reuses them and reconfigures through the Mutating lane
     /// rather than replacing the per-root [`AppContext`]. Returns `true` when a
     /// new actor was inserted.
     pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<AppContext>) -> bool {
@@ -203,7 +203,7 @@ impl Executor {
 
     /// Remove an actor from scheduler state.
     ///
-    /// This is intentionally minimal: Phase 4a uses it only for a just-created
+    /// This is intentionally minimal: subc uses it only for a just-created
     /// RouteBind actor whose configure failed before any route was installed, so
     /// there is no in-flight work to quiesce. The removed [`AppContext`] is
     /// dropped after releasing the scheduler lock so watcher/LSP teardown never

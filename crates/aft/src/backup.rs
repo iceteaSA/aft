@@ -3086,9 +3086,10 @@ mod tests {
     }
 
     // Uses Unix-specific PermissionsExt::set_mode to make a target file
-    // read-only and force the Phase 1 write to fail. The atomicity logic
-    // it exercises is platform-independent — Windows has different
-    // mechanisms for forcing write failures, covered separately.
+    // read-only and force the staging-phase write of the two-phase-commit
+    // restore to fail. The atomicity logic it exercises is platform-independent
+    // — Windows has different mechanisms for forcing write failures, covered
+    // separately.
     #[cfg(unix)]
     #[test]
     fn restore_last_operation_is_atomic_when_a_write_fails() {

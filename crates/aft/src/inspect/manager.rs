@@ -1221,8 +1221,8 @@ fn validate_tier2_read_category(category: InspectCategory) -> Result<(), JobOutc
 
 /// Phase-level wall-time attribution for one Tier-2 reuse=miss pass.
 ///
-/// Exists to self-attribute pathological scans (note #263 class: a 100ms
-/// unused_exports pass once took 677s under release-gate machine load) without
+/// Exists to self-attribute pathological scans (e.g. a normally-100ms
+/// unused_exports pass once took 677s under heavy machine load) without
 /// needing a lucky live `sample`. Logged as ONE info line per pass, only when
 /// real work happened (freshness/scan/snapshot/rollup/db), so quiet reuse passes stay silent.
 #[derive(Default)]

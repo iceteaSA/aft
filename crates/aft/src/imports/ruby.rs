@@ -12,7 +12,7 @@ const RUBY_QUOTE_DOUBLE: &str = "quote:double";
 
 pub(crate) fn classify_group_ruby(_module_path: &str) -> ImportGroup {
     // Ruby has no conventional stdlib/external/internal declaration grouping for
-    // require-like calls, so keep Phase 1 grouping neutral and stable.
+    // require-like calls, so keep grouping neutral and stable.
     ImportGroup::External
 }
 

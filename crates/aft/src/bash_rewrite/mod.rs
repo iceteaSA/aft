@@ -1,4 +1,4 @@
-//! Bash command rewriter for hoisted bash. Phase 0 stub; Phase 1 Track B fills in.
+//! Bash command rewriter for hoisted bash.
 //!
 //! When the agent calls `bash("grep -n foo src/")`, the rewriter detects this
 //! pattern, dispatches internally to AFT's `grep` command, and returns the

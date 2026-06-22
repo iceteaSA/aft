@@ -384,7 +384,7 @@ impl ImportSyntax for GoSyntax {
 }
 
 /// Solidity import engine. Supports named / namespace / whole-file-alias /
-/// side-effect forms (Phase 1: first new language onto the registry).
+/// side-effect forms.
 struct SoliditySyntax;
 impl ImportSyntax for SoliditySyntax {
     fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
@@ -3370,7 +3370,7 @@ import { c } from 'charlie';
         assert_eq!(line, "import errs \"github.com/pkg/errors\"");
     }
 
-    // --- Solidity (Phase 1: first new language on the ImportSyntax registry) ---
+    // --- Solidity ---
 
     fn parse_solidity(source: &str) -> (Tree, ImportBlock) {
         let grammar = grammar_for(LangId::Solidity);

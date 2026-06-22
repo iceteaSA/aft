@@ -11,9 +11,9 @@ pub type StatusPayload = serde_json::Value;
 /// its final `Response`. Each progress frame is NDJSON on stdout with the same
 /// `request_id` as the original request and a `kind` of `stdout` or `stderr`.
 /// The final response remains the existing `{ id, success, ... }` envelope so
-/// older callers can ignore streaming frames. Bash permission prompts use the
-/// recognized `permission_required` error code; Phase 1 Track C will attach the
-/// full permission ask payload and retry loop.
+/// older callers can ignore streaming frames. Bash permission prompts surface
+/// through the `permission_required` error code, which carries the permission
+/// ask payload the plugin uses to prompt and retry.
 pub const ERROR_PERMISSION_REQUIRED: &str = "permission_required";
 
 #[derive(Debug, Clone, Serialize)]

@@ -82,7 +82,7 @@ fn main() {
         }
     }
 
-    // subc daemon attach (P5a): `aft --subc <connection-file>` swaps the
+    // subc daemon attach: `aft --subc <connection-file>` swaps the
     // standalone NDJSON-over-stdin transport for the subc loopback-TCP client.
     // Presence of --subc => subc mode; absence => standalone (the dormancy gate).
     // Fail-loud on connect/auth failure — never silently downgrade to standalone

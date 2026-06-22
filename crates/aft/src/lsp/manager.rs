@@ -458,9 +458,9 @@ impl LspManager {
             // pull-diagnostic / hover query, otherwise the LSP server
             // returns results computed from stale in-memory content.
             //
-            // This is the regression fix Oracle flagged in finding #6:
-            // "ensure_file_open skips already-open files without checking
-            // if disk content changed."
+            // Without this, ensure_file_open would skip an already-open file
+            // without checking whether its disk content changed, leaving the
+            // server's in-memory copy stale.
             let drifted = self
                 .documents
                 .get(key)

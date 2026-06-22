@@ -11,7 +11,7 @@ const PERL_FLAT_MARKER_PREFIX: &str = "perl:";
 
 pub(crate) fn classify_group_perl(_module_path: &str) -> ImportGroup {
     // Perl pragmas/modules do not have a source-level stdlib/external/internal
-    // grouping convention, so keep Phase 1 grouping neutral and stable.
+    // grouping convention, so keep grouping neutral and stable.
     ImportGroup::External
 }
 

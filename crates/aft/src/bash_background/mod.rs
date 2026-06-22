@@ -1,4 +1,6 @@
-//! Background bash task management. Phase 0 stub; Phase 1 Track D fills in.
+//! Background bash task management: spawning detached tasks, the watchdog that
+//! reaps them, output buffering/compression, and on-disk persistence so tasks
+//! survive a bridge restart.
 
 pub mod buffer;
 pub mod output;
