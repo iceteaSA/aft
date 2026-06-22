@@ -1546,9 +1546,13 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     tokio::time::sleep(Duration::from_millis(150)).await;
     state.assert_configure_not_started("subc-bind-4");
     state.release_epoch_reads();
-    let same_root_corrs = collect_response_corrs(&mut stream, 2).await;
+    // The same-root configure for route 4 starts only after these reads drain,
+    // so RouteBindAck(44) (channel 0) and the read responses (channel 1) are
+    // emitted concurrently and can reach the stream in any order. Demux by
+    // channel rather than assuming the reads land before the ack.
+    let same_root_corrs =
+        collect_tool_responses_and_route_bind_ack(&mut stream, &[410, 411], 44).await;
     assert_eq!(same_root_corrs, HashSet::from([410, 411]));
-    expect_route_bind_ack(&mut stream, 44).await;
     assert_eq!(
         state.wait_for_configure("subc-bind-4").epoch_reads_at_start,
         0,
@@ -2741,6 +2745,48 @@ async fn collect_response_corrs(stream: &mut tokio::net::TcpStream, count: usize
         corrs.insert(frame.header.corr);
     }
     corrs
+}
+
+/// Read `tool_corrs.len() + 1` Response frames and demux them by channel:
+/// tool responses arrive on their route channel (>= 1) and carry a
+/// content/text body, while a RouteBindAck arrives on the control channel (0)
+/// and has none. When a same-root configure only starts after in-flight reads
+/// drain, the ack and those read responses are emitted concurrently and can
+/// reach the shared stream in any order, so a positional reader that assumes
+/// "tool responses first, ack last" can mis-read the ack as a tool response.
+/// A real gateway routes frames by channel/corr; this helper does the same so
+/// the assertion is order-independent. Returns the set of tool-response corrs.
+async fn collect_tool_responses_and_route_bind_ack(
+    stream: &mut tokio::net::TcpStream,
+    tool_corrs: &[u64],
+    ack_corr: u64,
+) -> HashSet<u64> {
+    let mut tool_seen = HashSet::new();
+    let mut ack_seen = false;
+    for _ in 0..tool_corrs.len() + 1 {
+        let frame = read_frame_timeout(stream, "tool response or route-bind ack").await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        if frame.header.channel == 0 {
+            assert_eq!(
+                frame.header.corr, ack_corr,
+                "unexpected channel-0 control frame corr"
+            );
+            let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).expect("ack body");
+            assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+            assert!(!ack_seen, "duplicate route-bind ack {ack_corr}");
+            ack_seen = true;
+        } else {
+            assert!(
+                tool_response_json(&frame)["success"]
+                    .as_bool()
+                    .unwrap_or(false),
+                "expected successful tool response"
+            );
+            tool_seen.insert(frame.header.corr);
+        }
+    }
+    assert!(ack_seen, "route-bind ack {ack_corr} not received");
+    tool_seen
 }
 
 fn tool_response_json(frame: &Frame) -> Value {
