@@ -950,8 +950,15 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
             .expect("fake daemon runtime");
         runtime.block_on(async move {
             let listener = TcpListener::from_std(std_listener).expect("tokio listener");
+            // Whole-driver hang guard, not a behavioral assertion. The driver runs
+            // dozens of tool-call round-trips (plus bounded settle polls) across many
+            // scenarios; a heavily loaded Windows CI runner executes this integration
+            // binary several times slower than locally, so the budget must be generous
+            // enough to never false-fire on contention while still bounding a genuine
+            // hang. Keep it well above the real driver runtime (a couple seconds
+            // locally, low tens of seconds on a loaded runner).
             tokio::time::timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(120),
                 drive_fake_daemon(FakeDaemonInput {
                     listener,
                     key,
