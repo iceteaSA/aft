@@ -45,7 +45,7 @@ impl JsonLogger {
         if let serde_json::Value::Object(ref mut map) = value {
             map.insert("ts".to_string(), serde_json::json!(iso_timestamp_now()));
             map.entry("harness".to_string())
-                .or_insert_with(|| serde_json::json!(self.harness.as_str()));
+                .or_insert_with(|| serde_json::json!(self.harness.storage_segment()));
         }
         if let Some(file) = self.file.as_mut() {
             let result = serde_json::to_writer(&mut *file, &value)

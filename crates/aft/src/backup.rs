@@ -251,7 +251,7 @@ impl BackupStore {
 
     pub fn set_db_harness(&self, harness: crate::harness::Harness) {
         if let Ok(mut slot) = self.db_harness.write() {
-            *slot = Some(harness.as_str().to_string());
+            *slot = Some(harness.storage_segment());
         }
     }
 
@@ -276,7 +276,7 @@ impl BackupStore {
         harness: crate::harness::Harness,
         ttl_hours: u32,
     ) {
-        self.set_storage_dir_inner(dir, Some(harness.as_str().to_string()), ttl_hours);
+        self.set_storage_dir_inner(dir, Some(harness.storage_segment()), ttl_hours);
     }
 
     fn set_storage_dir_inner(&mut self, dir: PathBuf, harness: Option<String>, ttl_hours: u32) {

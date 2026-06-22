@@ -245,7 +245,7 @@ impl BgTaskRegistry {
 
     pub fn set_harness(&self, harness: Harness) {
         if let Ok(mut slot) = self.inner.db_harness.write() {
-            *slot = Some(harness.as_str().to_string());
+            *slot = Some(harness.storage_segment());
         }
     }
 

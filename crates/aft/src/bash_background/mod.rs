@@ -92,7 +92,8 @@ pub fn spawn(
         let root = storage_dir(config.storage_dir.as_deref());
         config
             .harness
-            .map(|harness| root.join(harness.as_str()))
+            .as_ref()
+            .map(|harness| root.join(harness.storage_segment()))
             .unwrap_or(root)
     };
     let max_running = ctx.config().max_background_bash_tasks;
@@ -179,7 +180,9 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
         return;
     }
 
-    let harness_tasks = storage_root.join(harness.as_str()).join("bash-tasks");
+    let harness_tasks = storage_root
+        .join(harness.storage_segment())
+        .join("bash-tasks");
     if dir_has_entries(&harness_tasks) {
         return;
     }

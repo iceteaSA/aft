@@ -26,21 +26,24 @@ pub fn handle_db_get_state(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some(harness) = ctx.harness_opt() else {
         return not_configured(&req.id, "db_get_state");
     };
-    let harness_name = harness.as_str();
+    let harness_name = harness.storage_segment();
     match ctx.db() {
         Some(db) => match db.lock() {
-            Ok(conn) => match crate::db::state::get_harness_state(&conn, harness_name, &params.key)
-            {
-                Ok(Some(value)) => return Response::success(&req.id, json!({ "value": value })),
-                Ok(None) => {}
-                Err(error) => {
-                    return Response::error(
-                        &req.id,
-                        "db_error",
-                        format!("db_get_state failed: {error}"),
-                    );
+            Ok(conn) => {
+                match crate::db::state::get_harness_state(&conn, &harness_name, &params.key) {
+                    Ok(Some(value)) => {
+                        return Response::success(&req.id, json!({ "value": value }))
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Response::error(
+                            &req.id,
+                            "db_error",
+                            format!("db_get_state failed: {error}"),
+                        );
+                    }
                 }
-            },
+            }
             Err(error) => {
                 return Response::error(
                     &req.id,
@@ -78,12 +81,12 @@ pub fn handle_db_set_state(req: &RawRequest, ctx: &AppContext) -> Response {
         return write_legacy_harness_state(&req.id, ctx, harness, &params.key, &value);
     };
 
-    let harness_name = harness.as_str();
+    let harness_name = harness.storage_segment();
     match db.lock() {
         Ok(conn) => {
             if let Err(error) = crate::db::state::set_harness_state(
                 &conn,
-                harness_name,
+                &harness_name,
                 &params.key,
                 &value,
                 unix_millis(),
@@ -278,7 +281,7 @@ fn parse_params(req: &RawRequest, command: &str) -> Result<StateParams, Response
 }
 
 fn legacy_harness_path(ctx: &AppContext, harness: Harness, key: &str) -> Option<PathBuf> {
-    let dir = ctx.storage_dir().join(harness.as_str());
+    let dir = ctx.storage_dir().join(harness.storage_segment());
     match key {
         "last_announced_version" => Some(repair_root_scoped_harness_file(
             ctx,

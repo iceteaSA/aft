@@ -1330,12 +1330,12 @@ impl AppContext {
     }
 
     pub fn set_harness(&self, harness: Harness) {
+        self.bash_background.set_harness(harness.clone());
         *self.harness.lock() = Some(harness);
-        self.bash_background.set_harness(harness);
     }
 
     pub fn harness_opt(&self) -> Option<Harness> {
-        *self.harness.lock()
+        self.harness.lock().clone()
     }
 
     pub fn harness(&self) -> Harness {
@@ -1348,7 +1348,7 @@ impl AppContext {
     }
 
     pub fn harness_dir(&self) -> PathBuf {
-        self.storage_dir().join(self.harness().as_str())
+        self.storage_dir().join(self.harness().storage_segment())
     }
 
     pub fn inspect_dir(&self) -> PathBuf {
@@ -1468,7 +1468,10 @@ impl AppContext {
 
     pub fn callgraph_store_dir(&self) -> PathBuf {
         match self.harness_opt() {
-            Some(harness) => self.storage_dir().join(harness.as_str()).join("callgraph"),
+            Some(harness) => self
+                .storage_dir()
+                .join(harness.storage_segment())
+                .join("callgraph"),
             None => self.storage_dir().join("callgraph"),
         }
     }

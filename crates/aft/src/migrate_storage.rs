@@ -95,14 +95,15 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
     };
 
     let target_root_error = fs::create_dir_all(&args.to).err();
-    let mut log = JsonLogger::open(&args.log, args.harness);
+    let log_harness = args.harness.clone();
+    let mut log = JsonLogger::open(&args.log, log_harness);
     let started = SystemTime::now();
     log.write(serde_json::json!({
         "step": "start",
         "level": "info",
         "from": args.from,
         "to": args.to,
-        "harness": args.harness.as_str(),
+        "harness": args.harness.storage_segment(),
     }));
 
     if let Some(error) = target_root_error {
@@ -128,7 +129,7 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
         return ExitStatus::MigrationFailed;
     }
 
-    let target_harness = args.to.join(args.harness.as_str());
+    let target_harness = args.to.join(args.harness.storage_segment());
     let target_marker = target_marker_path(&args);
     let source_marker = source_marker_path(&args);
 
@@ -306,7 +307,7 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
 }
 
 fn write_status(target_root: &Path, harness: Harness, source_root: Option<&Path>) {
-    let marker_path = target_marker_path_from(target_root, harness);
+    let marker_path = target_marker_path_from(target_root, &harness);
     let source_marker_path = source_root.map(|root| root.join(SOURCE_MARKER));
     let source_marker_present = source_marker_path
         .as_ref()
@@ -314,7 +315,7 @@ fn write_status(target_root: &Path, harness: Harness, source_root: Option<&Path>
     let mut value = match fs::read(&marker_path) {
         Ok(bytes) => match serde_json::from_slice::<Marker>(&bytes) {
             Ok(marker) => serde_json::json!({
-                "harness": harness.as_str(),
+                "harness": harness.storage_segment(),
                 "target_root": target_root.display().to_string(),
                 "migrated": true,
                 "marker_path": marker_path.display().to_string(),
@@ -323,19 +324,19 @@ fn write_status(target_root: &Path, harness: Harness, source_root: Option<&Path>
                 "aft_version": marker.aft_version,
             }),
             Err(_) => serde_json::json!({
-                "harness": harness.as_str(),
+                "harness": harness.storage_segment(),
                 "target_root": target_root.display().to_string(),
                 "migrated": true,
                 "marker_path": marker_path.display().to_string(),
             }),
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({
-            "harness": harness.as_str(),
+            "harness": harness.storage_segment(),
             "target_root": target_root.display().to_string(),
             "migrated": false,
         }),
         Err(_) => serde_json::json!({
-            "harness": harness.as_str(),
+            "harness": harness.storage_segment(),
             "target_root": target_root.display().to_string(),
             "migrated": false,
         }),
@@ -357,7 +358,7 @@ fn write_status(target_root: &Path, harness: Harness, source_root: Option<&Path>
 pub fn cleanup_staging_dirs(target_root: &Path, harness: Harness) -> io::Result<usize> {
     let mut parents = BTreeSet::new();
     for &item in migration_items() {
-        parents.insert(staging_parent_from_root(target_root, harness, item));
+        parents.insert(staging_parent_from_root(target_root, &harness, item));
     }
 
     let mut removed = 0;
@@ -384,7 +385,7 @@ pub fn cleanup_staging_dirs(target_root: &Path, harness: Harness) -> io::Result<
     Ok(removed)
 }
 
-fn staging_parent_from_root(target_root: &Path, harness: Harness, item: MigrationItem) -> PathBuf {
+fn staging_parent_from_root(target_root: &Path, harness: &Harness, item: MigrationItem) -> PathBuf {
     let final_path = target_path_from_root(target_root, harness, item);
     if item.merge == MergeKind::ChildUnion {
         final_path
@@ -694,12 +695,12 @@ fn read_json_string_array(path: &Path) -> io::Result<Vec<String>> {
 }
 
 fn target_path(args: &MigrationArgs, item: MigrationItem) -> PathBuf {
-    target_path_from_root(&args.to, args.harness, item)
+    target_path_from_root(&args.to, &args.harness, item)
 }
 
-fn target_path_from_root(target_root: &Path, harness: Harness, item: MigrationItem) -> PathBuf {
+fn target_path_from_root(target_root: &Path, harness: &Harness, item: MigrationItem) -> PathBuf {
     match item.target {
-        TargetKind::Harness => target_root.join(harness.as_str()).join(item.name),
+        TargetKind::Harness => target_root.join(harness.storage_segment()).join(item.name),
         TargetKind::Root => target_root.join(item.name),
     }
 }
@@ -813,7 +814,7 @@ fn marker(args: &MigrationArgs) -> Marker {
         timestamp: iso_timestamp_now(),
         source_path: args.from.display().to_string(),
         target_path: args.to.display().to_string(),
-        harness: args.harness.as_str().to_string(),
+        harness: args.harness.storage_segment().to_string(),
         aft_version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
@@ -823,7 +824,7 @@ fn write_source_marker(args: &MigrationArgs) -> io::Result<()> {
 }
 
 fn write_target_marker(args: &MigrationArgs) -> io::Result<()> {
-    fs::create_dir_all(args.to.join(args.harness.as_str()))?;
+    fs::create_dir_all(args.to.join(args.harness.storage_segment()))?;
     atomic_write_json(&target_marker_path(args), &marker(args))
 }
 
@@ -832,11 +833,13 @@ fn source_marker_path(args: &MigrationArgs) -> PathBuf {
 }
 
 fn target_marker_path(args: &MigrationArgs) -> PathBuf {
-    target_marker_path_from(&args.to, args.harness)
+    target_marker_path_from(&args.to, &args.harness)
 }
 
-fn target_marker_path_from(target_root: &Path, harness: Harness) -> PathBuf {
-    target_root.join(harness.as_str()).join(TARGET_MARKER)
+fn target_marker_path_from(target_root: &Path, harness: &Harness) -> PathBuf {
+    target_root
+        .join(harness.storage_segment())
+        .join(TARGET_MARKER)
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {

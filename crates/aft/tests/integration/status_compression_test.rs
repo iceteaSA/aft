@@ -41,8 +41,9 @@ fn insert_event(
     compressed_tokens: u32,
 ) {
     let project_key = project_scope_key(project_root);
+    let harness_seg = harness.storage_segment();
     let row = CompressionEventRow {
-        harness: harness.as_str(),
+        harness: &harness_seg,
         session_id: Some(session_id),
         project_key: &project_key,
         tool: "bash",

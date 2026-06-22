@@ -274,16 +274,16 @@ impl AppContext {
             return compression;
         };
 
-        let harness = self.harness().as_str();
+        let harness = self.harness().storage_segment();
         let project_key = crate::path_identity::project_scope_key(&project_root);
         if let Ok(project_agg) =
-            crate::db::compression_events::aggregate_for_project(&conn, harness, &project_key)
+            crate::db::compression_events::aggregate_for_project(&conn, &harness, &project_key)
         {
             compression.project = project_agg.into();
         }
         if let Ok(session_agg) = crate::db::compression_events::aggregate_for_session(
             &conn,
-            harness,
+            &harness,
             &project_key,
             session_id,
         ) {

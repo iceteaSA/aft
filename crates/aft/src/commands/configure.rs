@@ -1243,7 +1243,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 return Response::error(
                     &req.id,
                     "invalid_request",
-                    "configure payload invalid field 'harness'; expected 'opencode' or 'pi'",
+                    "configure payload invalid field 'harness'; expected 'opencode', 'pi', 'runner', or 'mcp:<client>'",
                 );
             }
         },
@@ -1251,7 +1251,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "configure payload missing required field 'harness'; expected 'opencode' or 'pi'",
+                "configure payload missing required field 'harness'; expected 'opencode', 'pi', 'runner', or 'mcp:<client>'",
             );
         }
     };
@@ -1290,7 +1290,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let previous_project_root = previous_config.project_root.clone();
     let mut next_config = previous_config.as_ref().clone();
     next_config.project_root = Some(root_path.clone());
-    next_config.harness = Some(harness);
+    next_config.harness = Some(harness.clone());
 
     // P1 config relocation: plugins send raw config tiers
     // (`config: [{tier, source, doc}]`), and AFT-core resolves the merge +
@@ -1470,8 +1470,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Commit phase: no validation returns after this point.
     ctx.set_config(next_config.clone());
-    ctx.set_harness(harness);
-    ctx.backup().lock().set_db_harness(harness);
+    ctx.set_harness(harness.clone());
+    ctx.backup().lock().set_db_harness(harness.clone());
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     ctx.reset_tier2_refresh_scheduler();
@@ -1499,7 +1499,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         ctx.backup().lock().set_storage_dir_for_harness(
             storage_dir,
-            harness,
+            harness.clone(),
             next_config.checkpoint_ttl_hours,
         );
     }
@@ -1538,7 +1538,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     }
-    match crate::migrate_storage::cleanup_staging_dirs(&storage_root, harness) {
+    match crate::migrate_storage::cleanup_staging_dirs(&storage_root, harness.clone()) {
         Ok(0) => {}
         Ok(n) => slog_info!(
             "swept {} staging directory orphans from prior migrations",
@@ -2149,7 +2149,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-    crate::bash_background::repair_legacy_root_tasks(&bg_storage_root, harness);
+    crate::bash_background::repair_legacy_root_tasks(&bg_storage_root, harness.clone());
+
     let bg_storage_dir = ctx.harness_dir();
     if let Err(error) =
         ctx.bash_background()
@@ -2368,7 +2369,7 @@ mod tests {
         assert_eq!(response.data["code"], "invalid_request");
         assert_eq!(
             response.data["message"],
-            "configure payload missing required field 'harness'; expected 'opencode' or 'pi'"
+            "configure payload missing required field 'harness'; expected 'opencode', 'pi', 'runner', or 'mcp:<client>'"
         );
     }
 

@@ -494,14 +494,14 @@ fn contains_nonzero_failure_word(line: &str, word: &str) -> bool {
 /// 2. User filters at `<storage_dir>/<harness>/filters/*.toml`.
 /// 3. Builtin filters compiled into the binary via [`builtin_filters`].
 pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
-    let harness = ctx.harness.lock().unwrap_or(Harness::Opencode);
+    let harness = ctx.harness.lock().clone().unwrap_or(Harness::Opencode);
     let config = ctx.config();
     let storage_dir = config.storage_dir.clone();
     let project_root = config.project_root.clone();
     drop(config);
 
     let user_dir = storage_dir.as_ref().map(|dir| {
-        repair_legacy_user_filter_dir(dir, harness);
+        repair_legacy_user_filter_dir(dir, harness.clone());
         user_filter_dir(dir, harness)
     });
     let project_dir = match (project_root.as_ref(), storage_dir.as_ref()) {
@@ -810,7 +810,7 @@ fn looks_like_duration(token: &str) -> bool {
 /// Resolve the harness-scoped user-filter directory for an arbitrary storage_dir.
 /// Used by `aft doctor filters` to inspect filters without needing a live AppContext.
 pub fn user_filter_dir(storage_dir: &Path, harness: Harness) -> PathBuf {
-    storage_dir.join(harness.as_str()).join("filters")
+    storage_dir.join(harness.storage_segment()).join("filters")
 }
 
 fn legacy_user_filter_dir(storage_dir: &Path) -> PathBuf {
