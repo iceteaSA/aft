@@ -191,7 +191,7 @@ async function resolveTargetVersion(
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ version: string | null; pinned: boolean; probe: VersionPickResult | null }> {
   // 1. User pin.
-  // Audit-2 v0.17 #2: validate npm pins with the same regex GitHub pins use.
+  // Validate npm pins with the same regex GitHub pins use.
   // Bun/npm version specifiers also accept `file:`, `npm:`, `git+https:` schemes
   // that could redirect the install to an attacker-controlled source if the user
   // config is compromised. Even though spawn() with argv array prevents shell
@@ -204,7 +204,7 @@ async function resolveTargetVersion(
 
   // 2. Cached check still fresh.
   //
-  // Audit-3 v0.17 #2: validate cached.latest_eligible before consuming.
+  // Validate cached.latest_eligible before consuming.
   // Disk corruption or future bug could put unsafe value here. Treat
   // unsafe cache as miss so the next branch forces a fresh probe.
   const cached = readVersionCheck(spec.npm);
@@ -392,9 +392,9 @@ async function ensureServerInstalled(
       return { started: false, reason: blocked };
     }
 
-    // Audit v0.17 #4: skip-if-installed compares installed version vs target.
+    // Skip-if-installed compares installed version vs target.
     //
-    // Audit-2 v0.17 #1: when the same version is already installed AND we
+    // When the same version is already installed AND we
     // recorded a sha256 last time, verify the binary still hashes to the
     // same value. A mismatch is a TOFU violation — refuse the install.
     if (isInstalled(spec.npm, spec.binary)) {
@@ -438,7 +438,7 @@ async function ensureServerInstalled(
     if (!ok) {
       return { started: true, reason: "install failed (see plugin log)" };
     }
-    // Audit v0.17 #4 + Audit-2 v0.17 #1: record version AND sha256.
+    // Record version AND sha256.
     const installedHash = await hashInstalledBinary(spec).catch((err: unknown) => {
       warn(`[lsp] could not hash newly-installed ${spec.npm} binary: ${err}`);
       return null;
@@ -472,7 +472,7 @@ function cachedPackageDir(npmPackage: string): string {
 /**
  * Compute the SHA-256 of the installed npm binary.
  *
- * Audit-2 v0.17 #1: TOFU verification for npm-distributed LSP servers.
+ * TOFU verification for npm-distributed LSP servers.
  * Streams the binary file directly because npm doesn't have a single
  * archive (bun extracts node_modules across many files).
  */

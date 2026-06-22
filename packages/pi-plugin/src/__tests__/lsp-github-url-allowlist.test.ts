@@ -1,4 +1,4 @@
-/** Audit-3 v0.17 #5: same allowlist test as OpenCode plugin. */
+/** Same allowlist test as the OpenCode plugin. */
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";

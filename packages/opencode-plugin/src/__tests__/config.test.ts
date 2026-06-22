@@ -248,7 +248,7 @@ describe("loadAftConfig", () => {
     });
   });
 
-  // Audit v0.17 #17: project config CANNOT set `restrict_to_project_root`,
+  // Project config CANNOT set `restrict_to_project_root`,
   // `url_fetch_allow_private`, or `max_callgraph_files`. These are user-only
   // because a hostile repo opening in OpenCode could otherwise weaken the
   // file/network/resource boundary protecting the user's machine.
@@ -1049,7 +1049,7 @@ describe("loadAftConfig", () => {
 
     const config = JSON.parse(result.stdout);
     expect(Object.keys(config.lsp.servers).sort()).toEqual(["tinymist"]);
-    // Audit v0.17 #5: project lsp.disabled is stripped — only user-level disabled survives.
+    // Project lsp.disabled is stripped — only user-level disabled survives.
     expect(config.lsp.disabled).toEqual(["pyright"]);
     expect(config.lsp.python).toBe("ty");
     expect(result.stderr).toContain(
@@ -1146,7 +1146,7 @@ describe("loadAftConfig", () => {
       fixture.projectConfigPath,
       JSON.stringify({
         lsp: {
-          // Audit-2 v0.17 #10: grace_days schema is .positive() now; use 1 to
+          // grace_days schema is .positive() now; use 1 to
           // exercise strip behavior with a valid (but security-relevant) value.
           grace_days: 1,
         },
@@ -1165,7 +1165,7 @@ describe("loadAftConfig", () => {
     );
   });
 
-  // Audit v0.17 #5: project lsp.disabled is now stripped (user-only). A hostile
+  // Project lsp.disabled is now stripped (user-only). A hostile
   // repo cannot silently disable LSP servers the user relies on, suppressing
   // diagnostics for its own malicious code.
   test("strips project lsp.disabled", () => {
@@ -1241,7 +1241,7 @@ describe("loadAftConfig", () => {
             "evil/package": "1.0.0",
           },
           auto_install: true,
-          // Audit-2 v0.17 #10: schema is .positive() — use 1 instead of 0 to
+          // schema is .positive() — use 1 instead of 0 to
           // pass schema validation, then verify strict allowlist still drops it.
           grace_days: 1,
           disabled: ["yamlls"],
@@ -1260,7 +1260,7 @@ describe("loadAftConfig", () => {
     expect(config.lsp.versions).toEqual({ "typescript-language-server": "4.4.0" });
     expect(config.lsp.auto_install).toBe(false);
     expect(config.lsp.grace_days).toBe(14);
-    // Audit v0.17 #5: only user-level disabled survives — project's ["yamlls"] is stripped.
+    // Only user-level disabled survives — project's ["yamlls"] is stripped.
     expect(config.lsp.disabled).toEqual(["pyright"]);
     expect(config.lsp.python).toBe("ty");
     expect(result.stderr).toContain(

@@ -1,7 +1,7 @@
 /**
  * Tests for the per-install version metadata helpers in lsp-cache.ts.
  *
- * Audit v0.17 #4: persisting the installed version lets us detect a
+ * Persisting the installed version lets us detect a
  * `lsp.versions` pin change and trigger a transparent reinstall.
  */
 
@@ -101,7 +101,7 @@ describe("writeInstalledMetaIn / readInstalledMetaIn (GitHub path / arbitrary di
   });
 });
 
-// Audit v0.17 #1: TOFU verification persists the SHA-256 of the downloaded
+// TOFU verification persists the SHA-256 of the downloaded
 // archive so a second install of the same tag can detect a tampered release.
 describe("InstalledMeta sha256 (TOFU verification)", () => {
   test("sha256 round-trips when provided", () => {

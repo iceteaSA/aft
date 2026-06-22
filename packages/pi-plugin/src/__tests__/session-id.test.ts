@@ -1,5 +1,5 @@
 /**
- * Regression tests for Pi session ID propagation (audit #7).
+ * Regression tests for Pi session ID propagation.
  *
  * Previously the extension generated one static UUID per extension load, so
  * `/new`, `/fork`, and `/resume` all shared one backup/undo namespace in

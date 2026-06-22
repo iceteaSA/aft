@@ -132,10 +132,10 @@ describe("BinaryBridge background task accounting on bridge death", () => {
   }
 
   test("crash clears outstanding task ids so the bridge does not stay pinned forever", () => {
-    // Council finding (unanimous, v0.36.2 RC audit): a crash abandons every
-    // removal hook (foreground polls rejected, no completion frame from a
-    // dead child). Without clearing, the phantom ids pin the bridge against
-    // idle eviction permanently — defeating the #7 feature.
+    // A crash abandons every removal hook (foreground polls rejected, no
+    // completion frame from a dead child). Without clearing, the phantom ids
+    // pin the bridge against idle eviction permanently — defeating the
+    // idle-eviction feature.
     const bridge = new BinaryBridge("/bin/false", { autoRestart: false });
     deliverResponse(bridge, "bash", {
       success: true,

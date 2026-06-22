@@ -1114,7 +1114,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       // DESTINATIONS (h.move_path for move hunks). Move destinations have to
       // be tracked because the old code only checkpointed sources; a partial
       // move that succeeded at the destination but failed at source deletion
-      // left orphan files behind that rollback never cleaned up (audit #8).
+      // left orphan files behind that rollback never cleaned up.
       const affectedAbs = new Set<string>();
       // Snapshot initial existence for every touched path BEFORE applying any
       // hunk. A patch can delete an existing file and then add the same path

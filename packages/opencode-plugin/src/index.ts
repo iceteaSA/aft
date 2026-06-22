@@ -346,7 +346,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       );
     }
 
-    // ─── Surface install outcomes once installs settle (audit #6) ───
+    // ─── Surface install outcomes once installs settle ───
     //
     // Both `runAutoInstall` and `runGithubAutoInstall` return synchronously
     // with the obvious skips (disabled, irrelevant, auto_install: false). The

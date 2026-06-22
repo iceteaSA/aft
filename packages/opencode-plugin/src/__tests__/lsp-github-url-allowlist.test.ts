@@ -1,5 +1,5 @@
 /**
- * Audit-3 v0.17 #5: GitHub download URL hostname allowlist.
+ * GitHub download URL hostname allowlist.
  *
  * `browser_download_url` returned by the GitHub API is attacker-
  * controllable: a malicious or compromised release record could swap the

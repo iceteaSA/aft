@@ -191,7 +191,7 @@ async function resolveTargetVersion(
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ version: string | null; pinned: boolean; probe: VersionPickResult | null }> {
   // 1. User pin.
-  // Audit-2 v0.17 #2: validate npm pins with the same regex GitHub pins use.
+  // Validate npm pins with the same regex GitHub pins use.
   // Bun/npm version specifiers also accept `file:`, `npm:`, `git+https:` schemes
   // that could redirect the install to an attacker-controlled source if the user
   // config is compromised. Even though spawn() with argv array prevents shell
@@ -204,7 +204,7 @@ async function resolveTargetVersion(
 
   // 2. Cached check still fresh.
   //
-  // Audit-3 v0.17 #2: validate `cached.latest_eligible` with assertSafeVersion
+  // Validate `cached.latest_eligible` with assertSafeVersion
   // before consuming it. The cache file is JSON we wrote ourselves, but a
   // disk-tampering attacker (or a future bug that writes garbage) could put
   // a shell-injectable string there. `npm install <pkg>@<version>` then receives
@@ -406,13 +406,13 @@ async function ensureServerInstalled(
       return { started: false, reason: blocked };
     }
 
-    // Audit v0.17 #4: skip-if-installed must compare the installed version
+    // Skip-if-installed must compare the installed version
     // against `version` (the resolved target). Otherwise pin changes have
     // no effect until the user manually clears the cache. We persist the
     // installed version in `.aft-installed` after every successful install
     // and read it back here to detect drift.
     //
-    // Audit-2 v0.17 #1: when the same version is already installed AND we
+    // When the same version is already installed AND we
     // recorded a sha256 last time, verify the binary still hashes to the
     // same value. A mismatch is a TOFU violation (binary tampered or
     // replaced post-install). Reject the install and let the user decide
@@ -458,7 +458,7 @@ async function ensureServerInstalled(
     if (!ok) {
       return { started: true, reason: "install failed (see plugin log)" };
     }
-    // Audit v0.17 #4 + Audit-2 v0.17 #1: record version AND sha256.
+    // Record version AND sha256.
     // Hash logging is also recorded for forensic comparison if a user later
     // suspects tampering (npm doesn't publish per-binary checksums but we
     // can compare against another developer's machine running the same pin).
@@ -495,7 +495,7 @@ function cachedPackageDir(npmPackage: string): string {
 /**
  * Compute the SHA-256 of the installed npm binary.
  *
- * Audit-2 v0.17 #1: TOFU verification for npm-distributed LSP servers.
+ * TOFU verification for npm-distributed LSP servers.
  * GitHub installs hash the downloaded archive; npm installs hash the
  * resolved binary file directly because there's no single archive
  * (npm extracts node_modules across many files).

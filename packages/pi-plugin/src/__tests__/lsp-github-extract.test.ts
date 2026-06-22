@@ -1,7 +1,7 @@
 /**
  * Tests for `validateExtraction` in lsp-github-install.ts.
  *
- * Audit v0.17 #2: total uncompressed bytes capped at MAX_EXTRACT_BYTES (1 GiB).
+ * Total uncompressed bytes capped at MAX_EXTRACT_BYTES (1 GiB).
  * Mirrors the OpenCode plugin tests.
  */
 

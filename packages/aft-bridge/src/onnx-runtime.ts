@@ -4,12 +4,10 @@
  * Downloads the CPU-only ONNX Runtime from Microsoft's GitHub releases.
  * The library is cached in the storage directory alongside semantic index data.
  *
- * Audit-3 v0.17 #1 hardening (v0.17.1): the previous implementation used
- * `curl` with no size cap, no archive containment validation, no install
- * lock, and no integrity verification — leaving an entire parallel install
- * path that bypassed every defense the LSP GitHub installer had earned in
- * Phase A through Phase E. This rewrite brings ONNX onto the same security
- * floor:
+ * Security hardening: an earlier implementation used `curl` with no size cap,
+ * no archive containment validation, no install lock, and no integrity
+ * verification — an install path that bypassed every defense the LSP GitHub
+ * installer already had. This brings ONNX onto the same security floor:
  *
  *   - Streaming size cap via fetch + ReadableStream transformer (`MAX_DOWNLOAD_BYTES`).
  *   - Streaming SHA-256 of the downloaded archive, persisted in `.aft-onnx-installed`.
@@ -62,7 +60,7 @@ import { PLATFORM_ARCH_MAP } from "./platform.js";
 const ORT_VERSION = "1.24.4";
 const ORT_REPO = "microsoft/onnxruntime";
 
-// Audit-3 v0.17 #1: streaming + extraction size caps.
+// Streaming + extraction size caps.
 //
 // ONNX Runtime archives are around 60–80 MB on most platforms and 250 MB
 // extracted (Windows ships extra debug binaries). 256 MB and 1 GiB give
@@ -191,7 +189,7 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   const libPath = join(resolvedOrtDir, libName);
 
   if (existsSync(libPath)) {
-    // Audit-3 v0.17 #1 (TOFU): if we recorded a hash for this version,
+    // TOFU: if we recorded a hash for this version,
     // verify the library still matches. A mismatch means tampering or
     // partial install corruption. Refuse to use it and let the caller
     // either retry the download (after the user clears the cache) or
@@ -240,7 +238,7 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
     return null;
   }
 
-  // Audit-3 v0.17 #1: serialize concurrent installs.
+  // Serialize concurrent installs.
   //
   // Two AFT plugin instances starting at the same time would otherwise both
   // download and extract into overlapping temp dirs and clobber each other.
@@ -666,7 +664,7 @@ async function downloadFileWithCap(url: string, destPath: string): Promise<void>
  * Validate that every file/dir under `stagingRoot` is contained inside it
  * AND that the total extracted bytes do not exceed `MAX_EXTRACT_BYTES`.
  *
- * Audit-3 v0.17 #1: zip-slip + symlink containment + decompression-bomb
+ * zip-slip + symlink containment + decompression-bomb
  * defense. tar and unzip both can produce paths like `../../etc/passwd`;
  * Windows tar.exe and unzip can also produce symlinks that point outside
  * the destination. We walk the tree post-extraction and reject anything
@@ -745,10 +743,10 @@ async function downloadOnnxRuntime(
     mkdirSync(tmpDir, { recursive: true });
     const archivePath = join(tmpDir, `onnxruntime.${info.archiveType}`);
 
-    // Audit-3 v0.17 #1: download with streaming size cap (no more curl).
+    // Download with a streaming size cap.
     await downloadFileWithCap(url, archivePath);
 
-    // Audit-3 v0.17 #1: hash the archive for TOFU.
+    // Hash the archive for TOFU.
     const archiveSha256 = sha256File(archivePath);
     log(`ONNX Runtime archive sha256=${archiveSha256}`);
 
@@ -770,7 +768,7 @@ async function downloadOnnxRuntime(
       // ignore
     }
 
-    // Audit-3 v0.17 #1: containment + size-bomb check.
+    // Containment + size-bomb check.
     validateExtractedTree(tmpDir);
 
     // Find and copy the library file.
@@ -813,7 +811,7 @@ async function downloadOnnxRuntime(
 
     copyOnnxLibraries(info, extractedDir, targetDir, realFiles, symlinks);
 
-    // Audit-3 v0.17 #1: persist version + archive sha256 for TOFU on
+    // Persist version + archive sha256 for TOFU on
     // future sessions. Hash the actual main library file (not the
     // archive) because that's what we'll re-hash on the next ensure call.
     const libPath = join(targetDir, info.libName);
@@ -922,7 +920,7 @@ function copyOnnxLibraries(
 
 async function extractZipArchive(archivePath: string, destinationDir: string): Promise<void> {
   if (process.platform === "win32") {
-    // Audit-2 v0.17 #12: drop PowerShell. Even via execFileSync, PowerShell
+    // Avoid PowerShell. Even via execFileSync, PowerShell
     // applies its own quoting rules to `$args[N]` lookups that could allow
     // attacker-controlled fragments to escape into command interpretation.
     // tar.exe ships in System32 on Windows 10 build 17063+ — execFileSync

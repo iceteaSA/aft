@@ -89,8 +89,8 @@ function lspBinaryCandidates(binary: string): string[] {
 /**
  * Per-install metadata recorded after a successful install.
  *
- * Audit v0.17 #4: lets the next session detect a `lsp.versions` pin change.
- * Audit v0.17 #1: optional `sha256` enables TOFU verification on GitHub installs.
+ * `version` lets the next session detect a `lsp.versions` pin change.
+ * The optional `sha256` enables TOFU verification on GitHub installs.
  */
 export interface InstalledMeta {
   version: string;
@@ -137,7 +137,7 @@ export function readInstalledMetaIn(installDir: string): InstalledMeta | null {
 
 /** npm install path: write installed metadata into the package cache dir.
  *
- * Audit-2 v0.17 #1: pass `sha256` of the installed binary so the next
+ * Pass `sha256` of the installed binary so the next
  * session can do TOFU verification on reinstalls of the same version.
  */
 export function writeInstalledMeta(packageKey: string, version: string, sha256?: string): void {
@@ -217,7 +217,7 @@ export function acquireInstallLock(lockKey: string): boolean {
 
   // Owning process still alive AND lock is fresh? Don't steal.
   //
-  // Audit-2 v0.17 #7:
+  // Two clock-related hazards:
   //   (a) Use Math.abs(age) so locks with mtime further than STALE_LOCK_MS
   //       in either direction get reclaimed (clock skew defense). Small
   //       negative ages from FS mtime rounding still count as fresh.
@@ -264,7 +264,7 @@ function isProcessAlive(pid: number): boolean {
 
 export function releaseInstallLock(lockKey: string): void {
   const lock = lockPath(lockKey);
-  // Audit-3 v0.17 #3: TOCTOU defense — only unlink if we still own the lock.
+  // TOCTOU defense — only unlink if we still own the lock.
   // The previous `existsSync && unlinkSync` would delete another process's
   // lock if A's lock had been reclaimed by B due to STALE_LOCK_MS.
   try {

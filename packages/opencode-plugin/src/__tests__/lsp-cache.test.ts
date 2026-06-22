@@ -136,7 +136,7 @@ describe("install lock", () => {
     releaseInstallLock("pkg-d");
   });
 
-  // Audit-3 v0.17 #3: TOCTOU defense — a process must not delete another
+  // TOCTOU defense — a process must not delete another
   // process's lock during its own release. Simulates the scenario where
   // process A's lock was reclaimed by B (because A exceeded STALE_LOCK_MS)
   // and A then runs releaseInstallLock in its finally block.

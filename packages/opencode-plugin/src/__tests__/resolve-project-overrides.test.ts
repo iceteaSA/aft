@@ -138,7 +138,7 @@ describe("resolveProjectOverridesForConfigure", () => {
     // tools OpenCode registers when the plugin function returns. They
     // CANNOT change per-bridge. Smuggling them through the per-project
     // override path would silently fail to take effect — worse than
-    // documenting the limitation. See note #157 for the v0.28+ design.
+    // documenting the limitation.
     const overrides = resolveProjectOverridesForConfigure({
       tool_surface: "minimal",
       disabled_tools: ["aft_callgraph"],

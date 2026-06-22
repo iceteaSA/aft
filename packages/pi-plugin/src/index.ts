@@ -539,7 +539,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       );
     }
 
-    // ─── Surface install outcomes once installs settle (audit #6) ───
+    // ─── Surface install outcomes once installs settle ───
     //
     // Pi loads this extension once at startup, before any session exists, so
     // we can't send an ignored session message the way the OpenCode plugin

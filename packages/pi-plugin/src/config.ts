@@ -397,7 +397,7 @@ const LspConfigSchema = z.object({
    * the registry / GitHub releases for at least this many days. Default: 7.
    * User pins via `lsp.versions` bypass this.
    */
-  // Audit-2 v0.17 #10: grace_days must be >= 1 because grace_days: 0 disables
+  // grace_days must be >= 1 because grace_days: 0 disables
   // the supply-chain grace window entirely with no warning. Users debugging
   // can still bypass the grace per-package via `lsp.versions` pins.
   grace_days: z.number().int().positive().optional(),
@@ -1121,7 +1121,7 @@ function getProjectLspStrippedKeys(lsp?: LspConfig): string[] {
  * strict-allowlist trust boundary — adding a new field requires explicit
  * security review of whether a hostile repo could weaponize it.
  *
- * Audit v0.17 #17: previously `restrict_to_project_root`, `url_fetch_allow_private`,
+ * Previously `restrict_to_project_root`, `url_fetch_allow_private`,
  * and `max_callgraph_files` flowed through the implicit `...safeOverride` spread,
  * allowing project config to weaken security boundaries.
  *

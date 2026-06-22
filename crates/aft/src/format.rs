@@ -1423,7 +1423,7 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
     // type-checker path (`validate_full`) already does this via
     // `path.parent()`; formatters need the same treatment. Without it,
     // formatters silently fall back to built-in defaults when the aft
-    // process CWD differs from the project root (audit #18).
+    // process CWD differs from the project root.
     let working_dir = config.project_root.as_deref();
 
     match run_external_tool(&cmd, &arg_refs, working_dir, config.formatter_timeout_secs) {

@@ -1,8 +1,7 @@
 // ---------------------------------------------------------------------------
 // Workflow hints — short system prompt block teaching the agent
 // token-efficient AFT workflows. Mirrors packages/opencode-plugin/src/workflow-hints.ts;
-// scheduled to consolidate into a shared package in v0.19 alongside the
-// bridge-extraction refactor (see ctx_note #53).
+// the two copies are kept in sync by hand.
 // ---------------------------------------------------------------------------
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";

@@ -89,10 +89,10 @@ function lspBinaryCandidates(binary: string): string[] {
 /**
  * Per-install metadata recorded after a successful install.
  *
- * Audit v0.17 #4: persisting the installed version lets us detect a
+ * Persisting the installed version lets us detect a
  * `lsp.versions` pin change and trigger a transparent reinstall.
  *
- * Audit v0.17 #1: persisting the SHA-256 of the downloaded archive enables
+ * Persisting the SHA-256 of the downloaded archive enables
  * Trust-On-First-Use verification — if the same tag is ever reinstalled
  * with a different hash, we reject it (the release was retroactively
  * rewritten or the download was tampered with). `sha256` is optional
@@ -157,7 +157,7 @@ export function readInstalledMetaIn(installDir: string): InstalledMeta | null {
 
 /** npm install path: write installed metadata into the package cache dir.
  *
- * Audit-2 v0.17 #1: pass `sha256` of the installed binary so the next
+ * Pass `sha256` of the installed binary so the next
  * session can do TOFU verification on reinstalls of the same version.
  */
 export function writeInstalledMeta(packageKey: string, version: string, sha256?: string): void {
@@ -237,7 +237,7 @@ export function acquireInstallLock(lockKey: string): boolean {
 
   // Owning process still alive AND lock is fresh? Don't steal.
   //
-  // Audit-2 v0.17 #7:
+  // Two clock-related hazards:
   //   (a) Large-negative `age` happens when the system clock moves backward
   //       (NTP correction, sleep/wake on a stale RTC, manual clock change).
   //       The original `age < STALE_LOCK_MS` check treats huge negatives as
@@ -292,7 +292,7 @@ function isProcessAlive(pid: number): boolean {
 
 export function releaseInstallLock(lockKey: string): void {
   const lock = lockPath(lockKey);
-  // Audit-3 v0.17 #3: TOCTOU defense.
+  // TOCTOU defense.
   //
   // The previous implementation did `existsSync(lock) && unlinkSync(lock)` with
   // no ownership check. If process A's lock was reclaimed by process B (because

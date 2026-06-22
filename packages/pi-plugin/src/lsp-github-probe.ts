@@ -117,7 +117,7 @@ export async function probeGithubReleases(
 /**
  * Allowed characters in a release tag/version string.
  *
- * Audit v0.17 #3 + #13: tag/version strings flow into both file paths
+ * Tag/version strings flow into both file paths
  * (`archivePath`) and shell-adjacent contexts. A hostile or compromised
  * release could publish tags like `1.0&calc.exe`, `1.0/../etc`, or
  * `v"; rm -rf /; #` to attempt path traversal or shell injection.
@@ -140,7 +140,7 @@ export function assertSafeVersion(version: string): void {
   }
 }
 
-/** Audit-3 v0.17 #2: non-throwing predicate for cache-miss-on-corruption flow. */
+/** Non-throwing predicate for the cache-miss-on-corruption flow. */
 export function isSafeVersion(version: string | null | undefined): version is string {
   return typeof version === "string" && version.length > 0 && SAFE_VERSION_RE.test(version);
 }

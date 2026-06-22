@@ -12,8 +12,8 @@
  * `bin/<binary>` is what we add to `lsp_paths_extra` so the Rust resolver
  * can find it.
  *
- * Extraction containment (audit #3):
- *   1. Download to `<id>/<asset-name>` with a hard size cap (audit #4).
+ * Extraction containment:
+ *   1. Download to `<id>/<asset-name>` with a hard size cap.
  *   2. Extract into a quarantine dir `<id>/.staging-<rand>/`.
  *   3. Walk the staging tree and reject any entry that is a symlink, hardlink,
  *      or whose canonical path escapes the staging root.
@@ -21,7 +21,7 @@
  *      replaces any prior extraction.
  *   5. Stage dir is always cleaned up — success or failure.
  *
- * GitHub pin resolution (audit #5):
+ * GitHub pin resolution:
  *   When `lsp.versions: { "owner/repo": "X" }` is set, we use GitHub's
  *   `/releases/tags/<tag>` endpoint directly (with `v`-prefix tolerance)
  *   instead of relying on the broader `/releases?per_page=30` probe. The
@@ -184,7 +184,7 @@ export interface GithubInstallConfig {
 /* ─────────────────────────── safety constants ─────────────────────────── */
 
 /**
- * Hard cap on a single LSP-binary download (audit #4: GitHub downloads
+ * Hard cap on a single LSP-binary download (GitHub downloads are otherwise
  * unbounded).
  *
  * 256 MB. The largest currently-shipped LSP we install is `clangd` at
@@ -200,7 +200,7 @@ const MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024;
 
 /**
  * Maximum total uncompressed size for the extracted contents of one LSP
- * archive (1 GiB). Audit v0.17 #2: even with `MAX_DOWNLOAD_BYTES` capping
+ * archive (1 GiB). Even with `MAX_DOWNLOAD_BYTES` capping
  * the compressed payload, modern compressors can achieve very high ratios
  * on uniform data — a 256 MB ZIP can decompress to dozens of GBs of zeros
  * and fill the user's disk before any individual file looks suspicious.
@@ -209,7 +209,7 @@ const MAX_EXTRACT_BYTES = 1024 * 1024 * 1024;
 
 /**
  * Compute the SHA-256 of `path` by streaming.
- * Audit v0.17 #1: enables hash logging + TOFU verification.
+ * Enables hash logging + TOFU verification.
  */
 function sha256OfFile(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -225,7 +225,7 @@ function sha256OfFileSync(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-/* ─────────────────────────── pin resolution (audit #5) ─────────────────────────── */
+/* ─────────────────────────── pin resolution ─────────────────────────── */
 
 /**
  * Fetch a single release by tag from GitHub's `/releases/tags/<tag>` endpoint.
@@ -348,13 +348,13 @@ async function resolveTargetTag(
 }> {
   // 1. User pin via `lsp.versions: { "clangd/clangd": "21.1.0" }`.
   //
-  // Audit #5 fix: use GitHub's release-by-tag endpoint directly. The
+  // Use GitHub's release-by-tag endpoint directly. The
   // previous code tried to find the pin in the latest-releases probe
   // and returned `assets: []` if it wasn't there, silently breaking the
   // documented escape hatch for any pin older than the latest 30 releases.
   const pinned = config.versions[spec.githubRepo];
   if (pinned) {
-    // Audit v0.17 #3 + #13: validate the pin defense-in-depth before it
+    // Validate the pin defense-in-depth before it
     // flows into URL paths and (eventually, via the probed tag) filesystem
     // paths and `tar -xf`.
     try {
@@ -385,7 +385,7 @@ async function resolveTargetTag(
 
   // 2. Cached check still fresh.
   //
-  // Audit-2 v0.17 #3: previously this branch always probed the network
+  // Previously this branch always probed the network
   // even with fresh cache, then on failure fell through to a second
   // probe and returned `{ tag: cached, assets: [] }` — a non-null tag
   // with empty assets that produced misleading "asset not found" errors.
@@ -393,7 +393,7 @@ async function resolveTargetTag(
   // Fix: when cache is fresh, fetch assets for the cached tag directly.
   // If that lookup fails, fall through to live probe. If live probe also
   // fails, return tag:null so the caller skips cleanly.
-  // Audit-3 v0.17 #2: validate cached.latest_eligible before consuming.
+  // Validate cached.latest_eligible before consuming.
   const cached = readVersionCheck(spec.githubRepo);
   const weeklyMs = config.graceDays * 24 * 60 * 60 * 1000;
   const cachedTag = cached?.latest_eligible ?? null;
@@ -412,7 +412,7 @@ async function resolveTargetTag(
   // 3. Live probe.
   const probe = await probeGithubReleases(spec.githubRepo, config.graceDays, fetchImpl);
   if (!probe) {
-    // Audit-2 v0.17 #3: return tag:null on probe failure so the caller
+    // Return tag:null on probe failure so the caller
     // skips cleanly instead of trying to install with empty assets.
     return {
       tag: null,
@@ -425,7 +425,7 @@ async function resolveTargetTag(
   return { tag: probe.tag, assets: probe.assets, blockedByGrace: probe.blockedByGrace };
 }
 
-/* ─────────────────────────── download (audit #4) ─────────────────────────── */
+/* ─────────────────────────── download ─────────────────────────── */
 
 function controlledTimeoutSignal(
   timeoutMs: number,
@@ -451,7 +451,7 @@ function controlledTimeoutSignal(
 /**
  * Stream a remote URL to disk with a hard byte cap.
  *
- * Audit #4 fix: previously the download was unbounded, so a malicious or
+ * Previously the download was unbounded, so a malicious or
  * misconfigured release could fill the user's disk and stall plugin
  * startup forever. We now:
  *   - Reject if `Content-Length` (when present) exceeds the cap.
@@ -464,7 +464,7 @@ function controlledTimeoutSignal(
  * we sanity-check it against the cap before even starting the download.
  */
 /**
- * Audit-3 v0.17 #5: hostname allowlist. browser_download_url from the
+ * Hostname allowlist. browser_download_url from the
  * GitHub API is attacker-controllable; reject anything that is not on
  * a github.com / githubusercontent.com host before any network I/O.
  */
@@ -502,7 +502,7 @@ async function downloadFile(
   assetSize?: number,
   signal?: AbortSignal,
 ): Promise<void> {
-  // Audit-3 v0.17 #5: enforce hostname allowlist before any network I/O.
+  // Enforce the hostname allowlist before any network I/O.
   if (assetSize !== undefined && assetSize > MAX_DOWNLOAD_BYTES) {
     throw new Error(
       `asset size ${assetSize} exceeds max ${MAX_DOWNLOAD_BYTES} (set lsp.versions to pin a smaller release if this is wrong)`,
@@ -584,11 +584,11 @@ async function fetchFollowingRedirects(
   throw new Error(`too many redirects (>${maxRedirects})`);
 }
 
-/* ─────────────────────────── extraction (audit #3) ─────────────────────────── */
+/* ─────────────────────────── extraction ─────────────────────────── */
 
 /**
  * Recursively validate that every entry under `stagingRoot` is contained
- * within it (audit #3: zip-slip + symlink containment).
+ * within it (zip-slip + symlink containment).
  *
  * Rejects:
  *   - Any symlink (regardless of where it points). Symlinks in LSP
@@ -659,7 +659,7 @@ export function validateExtraction(stagingRoot: string): void {
       if (lst.isDirectory()) {
         walk(full);
       } else if (lst.isFile()) {
-        // Audit v0.17 #2: accumulate uncompressed sizes and abort early if
+        // Accumulate uncompressed sizes and abort early if
         // we cross the cap. Walking the whole tree first would let a
         // decompression bomb fill the disk before we noticed.
         totalBytes += lst.size;
@@ -818,7 +818,7 @@ function validateCachedGithubInstall(spec: GithubServerSpec, platform: Platform)
 function runPlatformExtractor(archivePath: string, destDir: string, archiveType: string): void {
   if (archiveType === "zip") {
     if (process.platform === "win32") {
-      // Audit-2 v0.17 #12: drop PowerShell. Even via execFileSync, PowerShell
+      // Avoid PowerShell. Even via execFileSync, PowerShell
       // applies its own quoting rules to `$args[N]` lookups that could allow
       // attacker-controlled fragments to escape. Windows 10 build 17063+ ships
       // tar.exe in System32 — execFileSync with argv has no shell parser in
@@ -861,7 +861,7 @@ function runPlatformExtractor(archivePath: string, destDir: string, archiveType:
  * Run the download + extract + binary-place flow for a single server.
  * Returns archive and final-binary SHA-256 hashes on success, or null on any failure.
  *
- * Audit v0.17 #1: caller persists the hash in `.aft-installed` for TOFU
+ * The caller persists the hash in `.aft-installed` for TOFU
  * verification on subsequent installs of the same tag.
  */
 async function downloadAndInstall(
@@ -900,7 +900,7 @@ async function downloadAndInstall(
     return null;
   }
 
-  // Audit v0.17 #1: SHA-256 always-log + TOFU verification.
+  // SHA-256 always-log + TOFU verification.
   let archiveSha256: string;
   try {
     archiveSha256 = await sha256OfFile(archivePath);
@@ -969,7 +969,7 @@ async function downloadAndInstall(
   return { archiveSha256, binarySha256 };
 }
 
-/* ─────────────────────────── per-server flow (audit #2) ─────────────────────────── */
+/* ─────────────────────────── per-server flow ─────────────────────────── */
 
 async function ensureGithubInstalled(
   spec: GithubServerSpec,
@@ -979,7 +979,7 @@ async function ensureGithubInstalled(
   arch: Arch,
   signal?: AbortSignal,
 ): Promise<{ started: boolean; reason?: string }> {
-  // Audit #2: hold the install lock through the FULL download+extract+install
+  // Hold the install lock through the FULL download+extract+install
   // cycle, not just the start decision. Two parallel sessions racing into
   // the same package would otherwise both pass the "already installed" check,
   // both claim the lock, both release it before downloading, and corrupt
@@ -1009,7 +1009,7 @@ async function ensureGithubInstalled(
       return { started: false, reason: fallbackReason };
     }
 
-    // Audit v0.17 #4: skip-if-installed must compare the installed tag
+    // Skip-if-installed must compare the installed tag
     // against the resolved target so pin changes take effect.
     if (isGithubInstalled(spec, platform)) {
       const installedMeta = readInstalledMetaIn(ghPackageDir(spec));
@@ -1249,7 +1249,7 @@ export function discoverRelevantGithubServers(projectRoot: string): Set<string> 
 
 /* ─────────────────────────── re-exports ─────────────────────────── */
 
-/** Audit-3 v0.17 #5: test-only re-export. Production code uses it inline. */
+/** Test-only re-exports. Production code uses these inline. */
 export {
   type Arch,
   assertAllowedDownloadUrl as _assertAllowedDownloadUrlForTesting,

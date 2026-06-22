@@ -99,7 +99,7 @@ describe("validateExtraction", () => {
     expect(() => validateExtraction(staging)).toThrow(/symlink.*zip-slip defense/);
   });
 
-  // Audit v0.17 #2: decompression bomb defense
+  // decompression bomb defense
   test("rejects extraction whose total bytes exceed MAX_EXTRACT_BYTES", () => {
     const staging = createStagingFixture();
 

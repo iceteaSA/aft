@@ -3,7 +3,7 @@
 /**
  * Tests for the `$HOME` project root behavior in `BridgePool.getBridge`.
  *
- * Historical context (note #65 / commit dc81fc8): when OpenCode Desktop / Pi
+ * Historical context: when OpenCode Desktop / Pi
  * launches from `~` and a session has no stored project directory, the
  * resolver could hand the plugin the home dir as the "project root".
  * Configuring an aft bridge against `$HOME` walks the entire user home tree

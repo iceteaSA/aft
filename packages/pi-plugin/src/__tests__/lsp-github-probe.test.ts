@@ -119,7 +119,7 @@ describe("stripTagV", () => {
   test("does not strip multiple v's", () => {
     expect(stripTagV("vv1.0")).toBe("v1.0");
   });
-  // Audit v0.17 #3 + #13: stripTagV must reject tag strings outside the
+  // stripTagV must reject tag strings outside the
   // safe-version allowlist before they flow into paths or commands.
   test("rejects tags with shell metacharacters", () => {
     expect(() => stripTagV("1.0&calc.exe")).toThrow(/unsafe version\/tag string/);

@@ -12,8 +12,8 @@
  * `bin/<binary>` is what we add to `lsp_paths_extra` so the Rust resolver
  * can find it.
  *
- * Extraction containment (audit #3):
- *   1. Download to `<id>/<asset-name>` with a hard size cap (audit #4).
+ * Extraction containment:
+ *   1. Download to `<id>/<asset-name>` with a hard size cap.
  *   2. Extract into a quarantine dir `<id>/.staging-<rand>/`.
  *   3. Walk the staging tree and reject any entry that is a symlink, hardlink,
  *      or whose canonical path escapes the staging root.
@@ -21,7 +21,7 @@
  *      replaces any prior extraction.
  *   5. Stage dir is always cleaned up — success or failure.
  *
- * GitHub pin resolution (audit #5):
+ * GitHub pin resolution:
  *   When `lsp.versions: { "owner/repo": "X" }` is set, we use GitHub's
  *   `/releases/tags/<tag>` endpoint directly (with `v`-prefix tolerance)
  *   instead of relying on the broader `/releases?per_page=30` probe. The
@@ -186,7 +186,7 @@ export interface GithubInstallConfig {
 /* ─────────────────────────── safety constants ─────────────────────────── */
 
 /**
- * Hard cap on a single LSP-binary download (audit #4: GitHub downloads
+ * Hard cap on a single LSP-binary download (GitHub downloads are otherwise
  * unbounded).
  *
  * 256 MB. The largest currently-shipped LSP we install is `clangd` at
@@ -204,7 +204,7 @@ const MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024;
  * Maximum total uncompressed size for the extracted contents of one LSP
  * archive (1 GiB, ~4× the download cap to allow for typical compression).
  *
- * Audit v0.17 #2: even with `MAX_DOWNLOAD_BYTES` capping the compressed
+ * Even with `MAX_DOWNLOAD_BYTES` capping the compressed
  * payload, modern compressors can achieve very high ratios on uniform
  * data — a 256 MB ZIP can decompress to dozens of GBs of zeros and fill
  * the user's disk before any individual file looks suspicious. This cap
@@ -220,7 +220,7 @@ const MAX_EXTRACT_BYTES = 1024 * 1024 * 1024;
 /**
  * Compute the SHA-256 of `path` by streaming.
  *
- * Audit v0.17 #1: enables always-log of every downloaded archive's hash
+ * Enables always-log of every downloaded archive's hash
  * (forensics) plus TOFU verification when the same tag is reinstalled.
  * Streaming avoids loading the (potentially 200 MB) archive into memory.
  */
@@ -238,7 +238,7 @@ function sha256OfFileSync(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-/* ─────────────────────────── pin resolution (audit #5) ─────────────────────────── */
+/* ─────────────────────────── pin resolution ─────────────────────────── */
 
 /**
  * Fetch a single release by tag from GitHub's `/releases/tags/<tag>` endpoint.
@@ -367,7 +367,7 @@ async function resolveTargetTag(
   // documented escape hatch for any pin older than the latest 30 releases.
   const pinned = config.versions[spec.githubRepo];
   if (pinned) {
-    // Audit v0.17 #3 + #13: even though `lsp.versions` is user-only config,
+    // Even though `lsp.versions` is user-only config,
     // validate the pin defense-in-depth before it flows into URL paths and
     // (eventually, via the probed tag) filesystem paths and `tar -xf`.
     try {
@@ -398,7 +398,7 @@ async function resolveTargetTag(
 
   // 2. Cached check still fresh.
   //
-  // Audit-2 v0.17 #3: previously this branch ALWAYS issued a live probe
+  // Previously this branch ALWAYS issued a live probe
   // even on a fresh cache, just to verify the cached tag still matched.
   // That had two failure modes:
   //   (a) Wasted unauthenticated GitHub API calls on every session start
@@ -417,7 +417,7 @@ async function resolveTargetTag(
   // We have to fetch the assets at install time anyway via the live probe
   // below — so the only thing the verification probe was buying was a
   // staleness check, which the grace timer already provides.
-  // Audit-3 v0.17 #2: validate cached.latest_eligible before consuming.
+  // Validate cached.latest_eligible before consuming.
   // Disk corruption (or a future bug) could insert an unsafe value here
   // that flows into archive paths and external commands. Treat unsafe
   // cache as miss so the live probe below is forced.
@@ -442,7 +442,7 @@ async function resolveTargetTag(
   // 3. Live probe.
   const probe = await probeGithubReleases(spec.githubRepo, config.graceDays, fetchImpl);
   if (!probe) {
-    // Audit-2 v0.17 #3: probe failed. Return tag:null instead of
+    // Probe failed. Return tag:null instead of
     // `cached.latest_eligible` with empty assets. Returning a non-null
     // tag with empty assets makes the caller try (and fail) to install,
     // emitting misleading "asset not found" errors. Returning null lets
@@ -458,7 +458,7 @@ async function resolveTargetTag(
   return { tag: probe.tag, assets: probe.assets, blockedByGrace: probe.blockedByGrace };
 }
 
-/* ─────────────────────────── download (audit #4) ─────────────────────────── */
+/* ─────────────────────────── download ─────────────────────────── */
 
 function controlledTimeoutSignal(
   timeoutMs: number,
@@ -484,7 +484,7 @@ function controlledTimeoutSignal(
 /**
  * Stream a remote URL to disk with a hard byte cap.
  *
- * Audit #4 fix: previously the download was unbounded, so a malicious or
+ * Previously the download was unbounded, so a malicious or
  * misconfigured release could fill the user's disk and stall plugin
  * startup forever. We now:
  *   - Reject if `Content-Length` (when present) exceeds the cap.
@@ -502,7 +502,7 @@ function controlledTimeoutSignal(
  * `github.com` (the canonical URL), but the actual blob is served from
  * `objects.githubusercontent.com` after redirect. We allow both.
  *
- * Audit-3 v0.17 #5: without this allowlist, a compromised or malicious
+ * Without this allowlist, a compromised or malicious
  * GitHub API response could swap `browser_download_url` to an attacker-
  * controlled host (e.g. `evil.example/payload.zip`) and we would happily
  * follow the redirect chain. The download size cap and SHA-256 TOFU help
@@ -627,11 +627,11 @@ async function fetchFollowingRedirects(
   throw new Error(`too many redirects (>${maxRedirects})`);
 }
 
-/* ─────────────────────────── extraction (audit #3) ─────────────────────────── */
+/* ─────────────────────────── extraction ─────────────────────────── */
 
 /**
  * Recursively validate that every entry under `stagingRoot` is contained
- * within it (audit #3: zip-slip + symlink containment).
+ * within it (zip-slip + symlink containment).
  *
  * Rejects:
  *   - Any symlink (regardless of where it points). Symlinks in LSP
@@ -702,7 +702,7 @@ export function validateExtraction(stagingRoot: string): void {
       if (lst.isDirectory()) {
         walk(full);
       } else if (lst.isFile()) {
-        // Audit v0.17 #2: accumulate uncompressed sizes and abort early if
+        // Accumulate uncompressed sizes and abort early if
         // we cross the cap. Walking the whole tree first would let a
         // decompression bomb fill the disk before we noticed.
         totalBytes += lst.size;
@@ -869,7 +869,7 @@ function validateCachedGithubInstall(spec: GithubServerSpec, platform: Platform)
 function runPlatformExtractor(archivePath: string, destDir: string, archiveType: string): void {
   if (archiveType === "zip") {
     if (process.platform === "win32") {
-      // Audit-2 v0.17 #12: PowerShell-via-execFileSync is technically argv-mode
+      // PowerShell-via-execFileSync is technically argv-mode
       // (no shell parser between us and `Expand-Archive`), but PowerShell still
       // applies its own quoting/escape rules to `$args[N]` lookups, and a
       // determined attacker-controlled path or tag can hit those edges. We
@@ -917,7 +917,7 @@ function runPlatformExtractor(archivePath: string, destDir: string, archiveType:
 /**
  * Run the download + extract + binary-place flow for a single server.
  * Returns archive and final-binary SHA-256 hashes on success, or null on any failure.
- * Audit v0.17 #1: caller persists the hash in `.aft-installed` for TOFU
+ * The caller persists the hash in `.aft-installed` for TOFU
  * verification on subsequent installs of the same tag.
  */
 async function downloadAndInstall(
@@ -956,7 +956,7 @@ async function downloadAndInstall(
     return null;
   }
 
-  // Audit v0.17 #1: SHA-256 + TOFU verification.
+  // SHA-256 + TOFU verification.
   //
   // Always-log: compute and surface the hash of every downloaded archive so
   // users (and our support tooling) can compare against published checksums
@@ -1036,7 +1036,7 @@ async function downloadAndInstall(
   return { archiveSha256, binarySha256 };
 }
 
-/* ─────────────────────────── per-server flow (audit #2) ─────────────────────────── */
+/* ─────────────────────────── per-server flow ─────────────────────────── */
 
 async function ensureGithubInstalled(
   spec: GithubServerSpec,
@@ -1046,7 +1046,7 @@ async function ensureGithubInstalled(
   arch: Arch,
   signal?: AbortSignal,
 ): Promise<{ started: boolean; reason?: string }> {
-  // Audit #2: hold the install lock through the FULL download+extract+install
+  // Hold the install lock through the FULL download+extract+install
   // cycle, not just the start decision. Two parallel sessions racing into
   // the same package would otherwise both pass the "already installed" check,
   // both claim the lock, both release it before downloading, and corrupt
@@ -1076,7 +1076,7 @@ async function ensureGithubInstalled(
       return { started: false, reason: fallbackReason };
     }
 
-    // Audit v0.17 #4: skip-if-installed must compare the installed tag
+    // Skip-if-installed must compare the installed tag
     // against the resolved target. Otherwise pin changes have no effect
     // until the user manually clears `<cache>/lsp-github/<spec.id>/`.
     // Persist the tag in `.aft-installed` after each successful install
@@ -1322,7 +1322,7 @@ export function discoverRelevantGithubServers(projectRoot: string): Set<string> 
 /**
  * Test-only re-export of the GitHub download URL allowlist guard.
  *
- * Audit-3 v0.17 #5: prefix marks this as test-internal. Production code
+ * The `__test` prefix marks this as test-internal. Production code
  * inside this module already calls `assertAllowedDownloadUrl` at the top
  * of `downloadFile`. We expose it here so the test suite can verify the
  * allowlist independently of full network mocking.
