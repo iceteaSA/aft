@@ -271,7 +271,7 @@ flows through five tiers in order:
    `gradle`, `xcodebuild`, `terraform`, `helm`, `docker`, `kubectl`, `gh`, `ansible-playbook`,
    `aws`, `curl`, `wget`, `deno`, `pip`, `uv`, `psql`. User-supplied filters at
    `<storage_dir>/filters/*.toml` override built-ins; project-supplied filters at
-   `<project>/.aft/filters/*.toml` override both but require explicit trust via
+   `<project>/.cortexkit/aft/filters/*.toml` override both but require explicit trust via
    `npx @cortexkit/aft@latest doctor filters trust`.
 5. **Generic fallback** — ANSI stripping plus consecutive-line deduplication and middle-truncate.
 
@@ -308,7 +308,7 @@ replacement = "my-tool: ok"
 strip = true                          # default true
 ```
 
-Project filters under `.aft/filters/` are an attack vector — a malicious repo could ship a filter
+Project filters under `.cortexkit/aft/filters/` are an attack vector — a malicious repo could ship a filter
 that strips real failures and replaces them with `tests: ok`. AFT therefore **only loads project
 filters from explicitly trusted projects**. Run `npx @cortexkit/aft@latest doctor filters trust` to
 review and approve them. Inspect the active set with `npx @cortexkit/aft@latest doctor filters` and dump

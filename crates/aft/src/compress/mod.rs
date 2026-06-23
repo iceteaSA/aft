@@ -489,7 +489,7 @@ fn contains_nonzero_failure_word(line: &str, word: &str) -> bool {
 /// active context. Called lazily by [`AppContext::filter_registry`].
 ///
 /// Layering (highest priority first):
-/// 1. Project filters at `<project_root>/.aft/filters/*.toml` — loaded only
+/// 1. Project filters at `<project_root>/.cortexkit/aft/filters/*.toml` — loaded only
 ///    when the project is in the trusted set (see [`trust`]).
 /// 2. User filters at `<storage_dir>/<harness>/filters/*.toml`.
 /// 3. Builtin filters compiled into the binary via [`builtin_filters`].
@@ -507,7 +507,7 @@ pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
     let project_dir = match (project_root.as_ref(), storage_dir.as_ref()) {
         (Some(root), Some(storage)) => {
             if trust::is_project_trusted(Some(storage), root) {
-                Some(root.join(".aft").join("filters"))
+                Some(project_filter_dir(root))
             } else {
                 None
             }
@@ -860,7 +860,7 @@ pub(crate) fn repair_legacy_user_filter_dir(storage_dir: &Path, harness: Harness
 /// Returns the directory regardless of trust state — caller must check trust
 /// separately if it wants to gate loading.
 pub fn project_filter_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".aft").join("filters")
+    project_root.join(".cortexkit").join("aft").join("filters")
 }
 
 #[cfg(test)]
@@ -876,7 +876,10 @@ mod tests {
         );
 
         let project = Path::new("/repo");
-        assert_eq!(project_filter_dir(project), Path::new("/repo/.aft/filters"));
+        assert_eq!(
+            project_filter_dir(project),
+            Path::new("/repo/.cortexkit/aft/filters")
+        );
     }
 
     #[test]

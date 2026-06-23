@@ -1,6 +1,6 @@
 //! Trust state for project-supplied TOML compression filters.
 //!
-//! Project filters at `<project>/.aft/filters/*.toml` are off by default
+//! Project filters at `<project>/.cortexkit/aft/filters/*.toml` are off by default
 //! because a malicious repository could ship a filter that lies about output
 //! (e.g. strips real test failures and replaces them with `tests: ok`).
 //!
@@ -27,7 +27,7 @@ static TRUST_SAVE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TrustState {
     /// Canonicalized absolute project root paths the user has explicitly
-    /// trusted to load `.aft/filters/*.toml`.
+    /// trusted to load `.cortexkit/aft/filters/*.toml`.
     trusted_projects: BTreeSet<String>,
 }
 

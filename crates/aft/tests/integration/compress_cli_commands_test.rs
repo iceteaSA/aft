@@ -43,7 +43,7 @@ description = "User build filter"
 "#,
     );
     write_filter(
-        &project.path().join(".aft/filters"),
+        &project.path().join(".cortexkit/aft/filters"),
         "internal-test",
         r#"[filter]
 matches = ["internal-test"]
@@ -51,7 +51,7 @@ description = "Internal test filter"
 "#,
     );
     write_filter(
-        &project.path().join(".aft/filters"),
+        &project.path().join(".cortexkit/aft/filters"),
         "bad",
         "not valid = toml = at all =",
     );
@@ -99,7 +99,7 @@ fn trust_project_marks_current_project_trusted() {
     let project = tempdir().unwrap();
     let storage = tempdir().unwrap();
     write_filter(
-        &project.path().join(".aft/filters"),
+        &project.path().join(".cortexkit/aft/filters"),
         "printf",
         r#"[filter]
 matches = ["printf"]

@@ -20,7 +20,7 @@
 //! Filters come from three sources, layered project > user > builtin by filename:
 //! - **builtin**: shipped via `include_str!()` from `compress/builtin_filters/`
 //! - **user**: `~/.config/aft/filters/*.toml` (or `$XDG_CONFIG_HOME`-aware path)
-//! - **project**: `<project>/.aft/filters/*.toml` — trust-gated, see [`crate::compress::trust`]
+//! - **project**: `<project>/.cortexkit/aft/filters/*.toml` — trust-gated, see [`crate::compress::trust`]
 //!
 //! Bad filters are skipped with a warning, never panic.
 

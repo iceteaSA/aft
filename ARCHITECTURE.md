@@ -256,7 +256,7 @@
 4. **Declarative TOML filters** -- strip + truncate + cap + shortcircuit rules for the long tail of CLI tools, loaded from three sources at startup with project > user > builtin priority by filename:
     - **Builtin**: shipped via `include_str!()` from `crates/aft/src/compress/builtin_filters/*.toml`, registered in `crates/aft/src/compress/builtin_filters.rs::ALL`. Currently 22 filters: ansible-playbook, aws, curl, deno, df, docker, du, find, gh, gradle, helm, kubectl, ls, make, pip, psql, terraform, tree, uv, wc, wget, xcodebuild.
     - **User**: `<storage_dir>/filters/*.toml` (XDG-aware via the active `storage_dir`)
-    - **Project**: `<project_root>/.aft/filters/*.toml` -- gated by `crate::compress::trust`; never loaded for an untrusted project
+    - **Project**: `<project_root>/.cortexkit/aft/filters/*.toml` -- gated by `crate::compress::trust`; never loaded for an untrusted project
 
 5. **Generic fallback** -- ANSI strip + consecutive-line dedup + middle-truncate. Always applies when no Rust module or TOML filter matches.
 
