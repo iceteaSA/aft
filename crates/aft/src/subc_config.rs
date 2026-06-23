@@ -163,8 +163,23 @@ mod tests {
 
     #[test]
     fn user_path_prefers_absolute_xdg_config_home() {
-        let path = user_config_path_from(Some(OsStr::new("/xdg/cfg")), Some(OsStr::new("/home/u")));
-        assert_eq!(path, Some(PathBuf::from("/xdg/cfg/cortexkit/aft.jsonc")));
+        // The XDG base must be absolute ON THE HOST OS: `/xdg/cfg` is absolute on
+        // Unix but NOT on Windows (which needs a drive letter), and the production
+        // filter correctly ignores a non-absolute XDG per the XDG spec. Build the
+        // expected path the same way production does so the separator matches.
+        let xdg = if cfg!(windows) {
+            r"C:\xdg\cfg"
+        } else {
+            "/xdg/cfg"
+        };
+        let home = if cfg!(windows) {
+            r"C:\home\u"
+        } else {
+            "/home/u"
+        };
+        let path = user_config_path_from(Some(OsStr::new(xdg)), Some(OsStr::new(home)));
+        let expected = PathBuf::from(xdg).join("cortexkit").join("aft.jsonc");
+        assert_eq!(path, Some(expected));
     }
 
     #[test]
