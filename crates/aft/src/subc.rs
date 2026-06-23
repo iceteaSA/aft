@@ -758,6 +758,27 @@ pub fn run_subc_mode(
     dispatch: DispatchFn,
     user_config_path: Option<PathBuf>,
 ) -> Result<(), SubcError> {
+    // Production NEVER allows non-manifest tool names on route channels: AFT
+    // fails closed and does not trust subc to enforce the manifest. The
+    // test-only harness sets this through `run_subc_mode_for_test`.
+    run_subc_mode_inner(
+        connection_file_path,
+        ctx,
+        executor,
+        dispatch,
+        user_config_path,
+        false,
+    )
+}
+
+fn run_subc_mode_inner(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    allow_native_passthrough: bool,
+) -> Result<(), SubcError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -780,6 +801,7 @@ pub fn run_subc_mode(
             executor_for_loop,
             dispatch,
             user_config_path,
+            allow_native_passthrough,
         )
         .await
     });
@@ -790,6 +812,28 @@ pub fn run_subc_mode(
     }
 
     loop_result
+}
+
+/// Test-only entry that enables the non-manifest native-command passthrough on
+/// route channels. Integration tests drive synthetic native commands (`glob`,
+/// `callers`, `subc_test_echo_session`, …) through the executor to exercise
+/// mechanics; production callers use [`run_subc_mode`], which fails closed.
+#[doc(hidden)]
+pub fn run_subc_mode_for_test(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+) -> Result<(), SubcError> {
+    run_subc_mode_inner(
+        connection_file_path,
+        ctx,
+        executor,
+        dispatch,
+        user_config_path,
+        true,
+    )
 }
 
 /// Read the connection file → resolve the first endpoint → TCP connect → HMAC
@@ -845,6 +889,7 @@ async fn run_module_loop<R, W>(
     executor: Arc<Executor>,
     dispatch: DispatchFn,
     user_config_path: Option<PathBuf>,
+    allow_native_passthrough: bool,
 ) -> Result<(), SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1029,6 +1074,7 @@ where
                             &executor,
                             &shutdown,
                             dispatch,
+                            allow_native_passthrough,
                         )
                         .await
                         {
@@ -1672,6 +1718,7 @@ async fn handle_tool_call(
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
+    allow_native_passthrough: bool,
 ) -> Result<(), SubcError> {
     let route_id = route_key(frame.header.channel);
     if pending_binds.contains_key(&route_id) {
@@ -1707,31 +1754,63 @@ async fn handle_tool_call(
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let project_root = identity.project_root.as_path();
-    let (command, translated_args) =
-        match crate::subc_translate::subc_translate(&call.name, &call.arguments, project_root) {
-            Ok(t) => (t.command, t.args),
-            // A core agent tool that fails translation is a real client error
-            // (e.g. `edit` with no resolvable mode) — surface it, never guess.
-            Err(err) if is_subc_agent_core_tool(&call.name) => {
-                let response = Response::error(request_id.clone(), err.code, err.message);
-                let response_frame = build_tool_response_frame(
-                    frame.header.ver,
-                    frame.header.channel,
-                    frame.header.corr,
-                    frame.header.flags,
-                    &bare_name,
-                    agent_specified_range,
-                    &response,
-                )?;
-                return send_frame(tx, response_frame).await;
-            }
-            // Non-core names are already native commands (internal RPCs and the
-            // integration-test synthetic tools) — pass them through verbatim.
-            Err(_) => {
-                let map = call.arguments.as_object().cloned().unwrap_or_default();
-                (call.name.clone(), map)
-            }
-        };
+    let (command, translated_args) = match crate::subc_translate::subc_translate(
+        &call.name,
+        &call.arguments,
+        project_root,
+    ) {
+        Ok(t) => (t.command, t.args),
+        // A core agent tool that fails translation is a real client error
+        // (e.g. `edit` with no resolvable mode) — surface it, never guess.
+        Err(err) if is_subc_agent_core_tool(&call.name) => {
+            let response = Response::error(request_id.clone(), err.code, err.message);
+            let response_frame = build_tool_response_frame(
+                frame.header.ver,
+                frame.header.channel,
+                frame.header.corr,
+                frame.header.flags,
+                &bare_name,
+                agent_specified_range,
+                &response,
+            )?;
+            return send_frame(tx, response_frame).await;
+        }
+        // A non-core name is NOT in the tool manifest. AFT fails closed and
+        // does not trust subc to enforce the manifest: rejecting here is the
+        // defense-in-depth backstop that prevents a forwarded native command
+        // (e.g. `configure`, which would reach handle_configure and bypass
+        // the RouteBind config-trust cap) from ever reaching dispatch. Only
+        // the integration-test harness (run_subc_mode_for_test) opens this to
+        // drive synthetic native commands through the executor.
+        Err(_) if !allow_native_passthrough => {
+            log::warn!(
+                "subc tool call: rejecting non-manifest tool name {:?} on route {} (fail-closed)",
+                call.name,
+                frame.header.channel
+            );
+            let response = Response::error(
+                request_id.clone(),
+                "unknown_tool",
+                format!("tool {:?} is not in the AFT tool manifest", call.name),
+            );
+            let response_frame = build_tool_response_frame(
+                frame.header.ver,
+                frame.header.channel,
+                frame.header.corr,
+                frame.header.flags,
+                &bare_name,
+                agent_specified_range,
+                &response,
+            )?;
+            return send_frame(tx, response_frame).await;
+        }
+        // Test-only: non-core names are native commands (the integration-test
+        // synthetic tools) — pass them through verbatim.
+        Err(_) => {
+            let map = call.arguments.as_object().cloned().unwrap_or_default();
+            (call.name.clone(), map)
+        }
+    };
 
     let lane = command_lane(&command);
     let command_for_finalize = command.clone();

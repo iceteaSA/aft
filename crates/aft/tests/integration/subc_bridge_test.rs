@@ -19,7 +19,7 @@ use aft::protocol::{
     BashCompletedFrame, BashLongRunningFrame, ConfigureWarningsFrame, PushFrame, RawRequest,
     Response, StatusChangedFrame,
 };
-use aft::subc::run_subc_mode;
+use aft::subc::{run_subc_mode, run_subc_mode_for_test};
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
@@ -1003,7 +1003,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     // Inject a hermetic (nonexistent) user config path so the W5 local read
     // never touches a real ~/.config/cortexkit/aft.jsonc on the dev/CI machine.
     let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
-    run_subc_mode(
+    run_subc_mode_for_test(
         &conn_path,
         ctx,
         executor,
@@ -1056,6 +1056,227 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     drop(slow_root);
     drop(callgraph_root);
     drop(storage);
+}
+
+/// Flips true if the S1 attacker's `configure` payload ever reaches `dispatch`.
+/// It must stay false: a forwarded non-manifest `configure` must be rejected by
+/// the fail-closed gate BEFORE building a RawRequest, so the attacker's tiers
+/// never reach `handle_configure` (which would bypass the W5 RouteBind cap).
+static S1_ATTACKER_CONFIG_REACHED_DISPATCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const S1_ATTACKER_MARKER: &str = "S1_ATTACKER_SECRET_ENV";
+
+fn s1_guard_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
+    // The RouteBind reconcile dispatches a clean `configure` (no marker); only a
+    // forwarded tool-call `configure` would carry the marker. If the marker ever
+    // arrives here, the fail-closed gate failed and the cap was bypassed.
+    if req.command == "configure" {
+        let raw = serde_json::to_string(&req.params).unwrap_or_default();
+        if raw.contains(S1_ATTACKER_MARKER) {
+            S1_ATTACKER_CONFIG_REACHED_DISPATCH.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    Response::success(req.id, json!({}))
+}
+
+/// Security regression for audit finding S1: in production mode an `mcp:*` front
+/// that gets subc to forward a non-manifest tool call named `configure` must be
+/// REJECTED with `unknown_tool` before reaching dispatch — never allowed to
+/// reconcile attacker-controlled config tiers (which would bypass the W5
+/// RouteBind config-trust cap). This drives the PRODUCTION `run_subc_mode`
+/// (passthrough off), unlike the mega-test which uses `run_subc_mode_for_test`.
+#[test]
+fn subc_rejects_forwarded_configure_tool_call_in_production() {
+    S1_ATTACKER_CONFIG_REACHED_DISPATCH.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let root = tempfile::tempdir().expect("root tempdir");
+    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let conn_path = conn_dir.path().join("subc-connection.json");
+
+    let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    std_listener
+        .set_nonblocking(true)
+        .expect("set fake daemon nonblocking");
+    let port = std_listener.local_addr().expect("fake daemon addr").port();
+    let key = vec![0x42; subc_transport::KEY_LEN];
+    let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+    let conn = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".to_string(),
+            port,
+        }],
+        key: key.clone(),
+        daemon_id,
+        pid: std::process::id(),
+        daemon_ver: "subc-test".to_string(),
+    };
+    connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
+
+    let root_path = root.path().to_path_buf();
+    let daemon = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fake daemon runtime");
+        runtime.block_on(async move {
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                drive_s1_rejection_daemon(std_listener, key, daemon_id, root_path),
+            )
+            .await
+            .expect("s1 rejection daemon watchdog");
+        });
+    });
+
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        },
+    ));
+    let executor = Arc::new(Executor::with_config(ExecutorConfig {
+        pool_size: 2,
+        read_cap: 2,
+        actor_cap: 2,
+        heavy_permits: 1,
+        drr_quantum: 1,
+    }));
+    let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
+
+    // PRODUCTION entry — passthrough is OFF.
+    run_subc_mode(
+        &conn_path,
+        ctx,
+        executor,
+        s1_guard_dispatch,
+        Some(user_config_path),
+    )
+    .expect("subc mode exits cleanly");
+    daemon.join().expect("s1 rejection daemon joins");
+
+    assert!(
+        !S1_ATTACKER_CONFIG_REACHED_DISPATCH.load(std::sync::atomic::Ordering::SeqCst),
+        "forwarded `configure` tool call reached dispatch — the fail-closed gate did not reject it"
+    );
+
+    drop(root);
+    drop(storage);
+}
+
+async fn drive_s1_rejection_daemon(
+    std_listener: StdTcpListener,
+    key: Vec<u8>,
+    daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
+    root: std::path::PathBuf,
+) {
+    let listener = TcpListener::from_std(std_listener).expect("tokio listener");
+    let (mut stream, _) = listener.accept().await.expect("accept aft client");
+    authenticate_server(
+        &mut stream,
+        &key,
+        &daemon_id,
+        "subc-test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("authenticate aft client");
+
+    let hello = read_any_frame_timeout(&mut stream, "ModuleHello").await;
+    assert_eq!(hello.header.ty, FrameType::Hello);
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            hello.header.corr,
+            serde_json::to_vec(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: Vec::new(),
+                subc_capabilities: Vec::new(),
+            })
+            .expect("hello ack body"),
+        )
+        .expect("hello ack frame"),
+    )
+    .await;
+
+    // An mcp:* front binds a route with a CLEAN config (no marker).
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: BindIdentity {
+            project_root: root.clone(),
+            harness: "mcp:generic".to_string(),
+            session: "s1-session".to_string(),
+        },
+        config: vec![user_config_tier(json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }))],
+    };
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            1,
+            serde_json::to_vec(&bind).expect("route bind body"),
+        )
+        .expect("route bind frame"),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 1).await;
+
+    // The attack: forward a non-manifest `configure` tool call carrying an inline
+    // user-tier privileged field. If dispatched, it would reach handle_configure
+    // and bypass the W5 cap entirely.
+    send_tool_call(
+        &mut stream,
+        1,
+        100,
+        "configure",
+        json!({
+            "config": [{
+                "tier": "user",
+                "source": "wire",
+                "doc": format!("{{ \"semantic\": {{ \"api_key_env\": \"{S1_ATTACKER_MARKER}\" }} }}"),
+            }],
+        }),
+    )
+    .await;
+
+    // The fail-closed gate must answer with an `unknown_tool` error, NOT execute.
+    let response = read_frame_timeout(&mut stream, "rejected configure response").await;
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "must be a tool Response frame"
+    );
+    assert_eq!(response.header.channel, 1);
+    assert_eq!(response.header.corr, 100);
+    let body: Value = serde_json::from_slice(&response.body).expect("tool result body");
+    assert_eq!(
+        body["isError"].as_bool(),
+        Some(true),
+        "rejected tool call must be isError: {body:?}"
+    );
+    let inner = tool_response_json(&response);
+    assert_eq!(
+        inner.get("code").and_then(Value::as_str),
+        Some("unknown_tool"),
+        "rejection must carry unknown_tool: {inner:?}"
+    );
+
+    // Close the stream so the production run_subc_mode reader hits EOF and exits.
+    drop(stream);
 }
 
 async fn drive_fake_daemon(input: FakeDaemonInput) {
