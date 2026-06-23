@@ -1461,7 +1461,11 @@ async fn handle_control_request(
             route_channel,
             target: _,
             identity,
-            config,
+            // Any wire-relayed `config` field is ignored via `..`: AFT reads config
+            // from CortexKit files, never the wire. `..` keeps this tolerant whether
+            // the protocol version still carries the field or has dropped it, so a
+            // protocol field-removal cannot break this destructure either way.
+            ..
         } => {
             let route_id = route_key(route_channel);
             if pending_binds.contains_key(&route_id) {
@@ -1502,10 +1506,9 @@ async fn handle_control_request(
             // harness binding a project gets the identical on-disk config, so two
             // trust domains sharing the per-root actor can never diverge or
             // inherit each other's capabilities (the cross-bind escalation class).
-            // The `config` field on the wire is accepted by the protocol but no
-            // longer consulted; the per-tier trust boundary (user trusted, project
+            // Wire-relayed config tiers (if the protocol still carries them) are
+            // ignored entirely; the per-tier trust boundary (user trusted, project
             // privileged-dropped) is applied to the FILE tiers in handle_configure.
-            let _ = &config; // wire config intentionally ignored — see above.
             let local_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
                 user_config_path,
                 Path::new(&bind_project_root),
