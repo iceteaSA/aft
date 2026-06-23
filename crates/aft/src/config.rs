@@ -221,7 +221,11 @@ impl Default for Config {
             max_symbol_depth: 10,
             formatter_timeout_secs: 10,
             type_checker_timeout_secs: 30,
-            format_on_edit: true,
+            // Default OFF: formatting after an edit can silently reflow the file
+            // under the agent (a formatter splitting/joining lines), staling the
+            // context for the next edit/patch. Agents that want formatting opt in
+            // via `format_on_edit: true`.
+            format_on_edit: false,
             validate_on_edit: None,
             formatter: HashMap::new(),
             checker: HashMap::new(),

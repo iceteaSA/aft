@@ -137,11 +137,9 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   if (hasBash && hasBgBash) {
     sections.push(
       [
-        `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns a \`taskId\` immediately.`,
-        "1. Nothing else useful to do (a build/test/validation whose result is the next thing you need) → sync `bash_watch` to block until it exits (pass a longer timeoutMs for long commands; the user can interrupt).",
-        "2. Useful parallel work available → end your turn; the completion reminder delivers the result. (Or spawn a subagent for the side work.)",
-        "3. Want to react to a specific early output line → async `bash_watch` (background:true + pattern).",
-        "Never loop `bash_status` to wait — it's a one-shot inspector, not a wait primitive.",
+        `**Long-running commands** (builds, installs, full test suites): run them in the FOREGROUND — \`${bashName}({ command })\` waits and returns the result in ONE step, and if it outlives the short wait window it auto-promotes to background and delivers a completion reminder when it finishes. Don't reach for \`background: true\` for the common "I'm waiting on this result" case — that costs an extra turn.`,
+        "- `background: true` is ONLY for when you have OTHER useful work to do while it runs: start it, do the other work, and the completion reminder delivers the result (or spawn a subagent for the side work). Do NOT background a command and then immediately `bash_watch` it — that spends a whole extra turn waiting for something foreground returns in one.",
+        "- `bash_watch` is for blocking on an ALREADY-backgrounded task once you've run out of parallel work (sync — the user can interrupt), or reacting to a specific early output line (async: background:true + pattern). Never loop `bash_status` to wait — it's a one-shot inspector.",
       ].join("\n"),
     );
     sections.push(

@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::config::{Config, InspectConfig, SemanticBackend, SemanticBackendConfig, UserServerDef};
 
-const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 8_000;
+const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 15_000;
 const FOREGROUND_WAIT_WINDOW_MIN_MS: u64 = 5_000;
 
 // Semantic budget clamps — restored from the deleted configure-time

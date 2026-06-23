@@ -101,8 +101,9 @@ function buildSchema(): Record<string, unknown> {
 
       format_on_edit: {
         type: "boolean",
-        default: true,
-        description: "Auto-format files after edits with the language's configured formatter.",
+        default: false,
+        description:
+          "Auto-format files after edits with the language's configured formatter. Default false: formatting can reflow the file under the agent and stale the next edit's context.",
       },
 
       formatter_timeout_secs: {

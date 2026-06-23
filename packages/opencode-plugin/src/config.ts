@@ -237,7 +237,11 @@ export const AftConfigSchema = z
      * schema for autocomplete + validation. `aft setup` auto-inserts this.
      */
     $schema: z.string().optional(),
-    /** Whether to auto-format files after edits. Default: true. */
+    /**
+     * Whether to auto-format files after edits. Default: false — formatting can
+     * reflow the file under the agent and stale the next edit's context. Opt in
+     * with `true` if you want AFT to format after edits.
+     */
     format_on_edit: z.boolean().optional(),
     /**
      * Maximum seconds an external formatter is allowed to run before AFT
@@ -507,7 +511,7 @@ export interface ResolvedBashConfig {
 }
 
 /** Default foreground wait-window before auto-promotion (ms). */
-export const FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 8_000;
+export const FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 15_000;
 /** Minimum allowed foreground wait-window (ms); smaller values clamp up. */
 export const FOREGROUND_WAIT_WINDOW_MIN_MS = 5_000;
 
