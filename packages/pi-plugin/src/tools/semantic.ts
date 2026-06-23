@@ -70,6 +70,13 @@ const SearchParams = Type.Object({
       },
     ),
   ),
+  includeTests: Type.Optional(
+    Type.Boolean({
+      default: false,
+      description:
+        "Include test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+    }),
+  ),
 });
 
 /** Exported for renderer unit tests. */
@@ -222,6 +229,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       const req: Record<string, unknown> = { query: params.query };
       if (params.topK !== undefined) req.top_k = params.topK;
       if (params.hint !== undefined) req.hint = params.hint;
+      if (params.includeTests !== undefined) req.include_tests = params.includeTests;
       // Pi has no grep-style permission prompt; callBridge throws success:false
       // envelopes so the host renders them via renderErrorResult below.
       const response = await callBridge(bridge, "semantic_search", req, extCtx);

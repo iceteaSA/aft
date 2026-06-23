@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use serde::Deserialize;
 
+use crate::commands::callgraph_store_adapter::callers_result;
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::grep_executor::{self, GrepParams};
+use crate::inspect::job::is_test_support_file;
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
@@ -25,6 +27,8 @@ const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
 const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
+const RANK0_FULL_SNIPPET_CONTEXT_LINES: usize = 5;
+const RANK0_FULL_SNIPPET_MAX_LINES: usize = 80;
 
 #[derive(Debug, Clone)]
 pub struct HybridResult {
@@ -59,6 +63,8 @@ struct SemanticSearchParams {
     top_k: usize,
     #[serde(default)]
     hint: SearchHint,
+    #[serde(default, alias = "includeTests")]
+    include_tests: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +151,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             semantic_status,
             warnings,
             &project_root,
+            params.include_tests,
         ),
         SearchMode::Semantic | SearchMode::Hybrid => handle_semantic_or_hybrid_search(
             req,
@@ -169,6 +176,62 @@ fn semantic_candidate_limit(top_k: usize) -> usize {
     top_k
         .saturating_mul(SEMANTIC_OVERFETCH_MULTIPLIER)
         .clamp(SEMANTIC_OVERFETCH_FLOOR, MAX_TOP_K)
+}
+
+fn grep_candidate_limit(top_k: usize, include_tests: bool) -> usize {
+    if include_tests {
+        return top_k;
+    }
+    DEGRADED_GREP_RESULT_LIMIT.max(top_k)
+}
+
+fn project_relative_path<'a>(path: &'a Path, project_root: &'a Path) -> &'a Path {
+    path.strip_prefix(project_root).unwrap_or(path)
+}
+
+fn path_is_test_support_file(path: &Path, project_root: &Path) -> bool {
+    let relative = project_relative_path(path, project_root);
+    is_test_support_file(relative.to_string_lossy().as_ref())
+}
+
+fn path_allowed_by_include_tests(path: &Path, project_root: &Path, include_tests: bool) -> bool {
+    include_tests || !path_is_test_support_file(path, project_root)
+}
+
+fn grep_visible_file_count(matches: &[GrepMatch]) -> usize {
+    matches
+        .iter()
+        .map(|grep_match| grep_match.file.clone())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn filter_grep_result_for_tests(
+    mut result: GrepResult,
+    include_tests: bool,
+    project_root: &Path,
+    top_k: usize,
+) -> GrepResult {
+    if include_tests {
+        return result;
+    }
+
+    let mut visible = result
+        .matches
+        .into_iter()
+        .filter(|grep_match| !path_is_test_support_file(&grep_match.file, project_root))
+        .collect::<Vec<_>>();
+    let visible_total = visible.len();
+    let truncated_by_filter = visible.len() > top_k;
+    if truncated_by_filter {
+        visible.truncate(top_k);
+    }
+
+    result.matches = visible;
+    result.total_matches = visible_total;
+    result.files_with_matches = grep_visible_file_count(&result.matches);
+    result.truncated |= truncated_by_filter;
+    result
 }
 
 fn choose_mode(
@@ -248,6 +311,7 @@ fn handle_grep_search(
     semantic_status: &'static str,
     mut warnings: Vec<String>,
     project_root: &Path,
+    include_tests: bool,
 ) -> Response {
     let auto_regex = mode == SearchMode::Regex && !regex_explicit;
     let mut effective_mode = mode;
@@ -328,19 +392,21 @@ fn handle_grep_search(
     };
 
     let literal = effective_mode == SearchMode::Literal;
-    let scope = match grep_executor::resolve_grep_scope(ctx, None, top_k, &req.id) {
+    let grep_limit = grep_candidate_limit(top_k, include_tests);
+    let scope = match grep_executor::resolve_grep_scope(ctx, None, grep_limit, &req.id) {
         Ok(scope) => scope,
         Err(response) => return response,
     };
     let params = GrepParams {
         include: Vec::new(),
         exclude: Vec::new(),
-        max_results: top_k,
+        max_results: grep_limit,
     };
-    let result = grep_executor::execute(ctx, &compiled, &scope, &params);
+    let mut result = grep_executor::execute(ctx, &compiled, &scope, &params);
     if result.fully_degraded {
         warnings.push(degraded_warning(ctx));
     }
+    result = filter_grep_result_for_tests(result, include_tests, project_root, top_k);
 
     let result_source = if literal { "literal" } else { "regex" };
     let result_values = result
@@ -406,7 +472,13 @@ fn handle_semantic_or_hybrid_search(
     project_root: &Path,
 ) -> Response {
     let lexical = if mode == SearchMode::Hybrid {
-        collect_lexical_files(ctx, &params.query, &shape)
+        collect_lexical_files(
+            ctx,
+            &params.query,
+            &shape,
+            params.include_tests,
+            project_root,
+        )
     } else {
         LexicalCollection {
             files: Vec::new(),
@@ -481,7 +553,14 @@ fn handle_semantic_or_hybrid_search(
 
             let lexical_count = lexical.files.len();
             let lexical_engine_capped = lexical.engine_capped;
-            let results = fuse_hybrid_results(Vec::new(), lexical.files, &shape, top_k);
+            let results = fuse_hybrid_results(
+                Vec::new(),
+                lexical.files,
+                &shape,
+                top_k,
+                params.include_tests,
+                project_root,
+            );
             let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
             let note = building_lexical_note(lexical.ready);
             let mut extras = serde_json::Map::new();
@@ -581,7 +660,11 @@ fn handle_semantic_or_hybrid_search(
         }
     };
 
-    let semantic_limit = semantic_candidate_limit(top_k);
+    let semantic_limit = if params.include_tests {
+        semantic_candidate_limit(top_k)
+    } else {
+        MAX_TOP_K
+    };
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
     let mut semantic_results = {
         let semantic_index = ctx
@@ -603,6 +686,8 @@ fn handle_semantic_or_hybrid_search(
         lexical.files,
         &shape,
         top_k.saturating_add(1),
+        params.include_tests,
+        project_root,
     );
     let fused_more_available = results.len() > top_k;
     if fused_more_available {
@@ -617,7 +702,7 @@ fn handle_semantic_or_hybrid_search(
     // Read display snippets from source on the fly (top 3 only, rank-budgeted)
     // so both the text rendering and the JSON `results` carry fresh, correctly
     // sized previews. Drives the conditional zoom hint.
-    let snippets_incomplete = enrich_snippets_from_source(&mut results);
+    let snippets_incomplete = enrich_snippets_from_source(&mut results, project_root);
 
     search_response(
         req,
@@ -628,7 +713,13 @@ fn handle_semantic_or_hybrid_search(
             semantic_status,
             status: "ready",
             complete: true,
-            text: format_semantic_text(&results, project_root, more_available, snippets_incomplete),
+            text: format_semantic_text(
+                &results,
+                project_root,
+                more_available,
+                snippets_incomplete,
+                Some(ctx),
+            ),
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
             more_available,
             engine_capped: lexical.engine_capped,
@@ -730,7 +821,14 @@ fn semantic_unavailable_or_fallback_response(
     if lexical_ready {
         let lexical_count = lexical.files.len();
         let lexical_engine_capped = lexical.engine_capped;
-        let results = fuse_hybrid_results(Vec::new(), lexical.files, shape, top_k);
+        let results = fuse_hybrid_results(
+            Vec::new(),
+            lexical.files,
+            shape,
+            top_k,
+            params.include_tests,
+            project_root,
+        );
         let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
         warnings.push(
             "Semantic search unavailable; returning lexical-only fallback results.".to_string(),
@@ -850,8 +948,13 @@ fn semantic_unavailable_grep_fallback_response(
     project_root: &Path,
     top_k: usize,
 ) -> Response {
-    let fallback = match execute_degraded_grep_fallback(&params.query, project_root, top_k, &req.id)
-    {
+    let fallback = match execute_degraded_grep_fallback(
+        &params.query,
+        project_root,
+        top_k,
+        params.include_tests,
+        &req.id,
+    ) {
         Ok(result) => result,
         Err(response) => return response,
     };
@@ -919,6 +1022,7 @@ fn execute_degraded_grep_fallback(
     query: &str,
     project_root: &Path,
     top_k: usize,
+    include_tests: bool,
     request_id: &str,
 ) -> Result<DegradedGrepFallbackResult, Response> {
     let compiled = match pattern_compile::compile(
@@ -950,7 +1054,7 @@ fn execute_degraded_grep_fallback(
     };
 
     let max_results = top_k.clamp(1, DEGRADED_GREP_RESULT_LIMIT);
-    let (files, file_cap_reached) = collect_degraded_grep_files(project_root);
+    let (files, file_cap_reached) = collect_degraded_grep_files(project_root, include_tests);
     let candidate_files = files.len();
     let mut matches = Vec::new();
     let mut total_matches = 0usize;
@@ -1015,7 +1119,7 @@ fn execute_degraded_grep_fallback(
     })
 }
 
-fn collect_degraded_grep_files(project_root: &Path) -> (Vec<PathBuf>, bool) {
+fn collect_degraded_grep_files(project_root: &Path, include_tests: bool) -> (Vec<PathBuf>, bool) {
     let walker = ignore::WalkBuilder::new(project_root)
         .hidden(false)
         .git_ignore(true)
@@ -1053,10 +1157,14 @@ fn collect_degraded_grep_files(project_root: &Path) -> (Vec<PathBuf>, bool) {
         {
             continue;
         }
+        let path = entry.into_path();
+        if !include_tests && path_is_test_support_file(&path, project_root) {
+            continue;
+        }
         if files.len() >= DEGRADED_GREP_FILE_LIMIT {
             return (files, true);
         }
-        files.push(entry.into_path());
+        files.push(path);
     }
 
     (files, false)
@@ -1171,7 +1279,13 @@ fn semantic_index_loaded(ctx: &AppContext) -> bool {
         .is_some()
 }
 
-fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> LexicalCollection {
+fn collect_lexical_files(
+    ctx: &AppContext,
+    query: &str,
+    shape: &QueryShape,
+    include_tests: bool,
+    project_root: &Path,
+) -> LexicalCollection {
     // No `should_use_lexical` gate here: collect_lexical_files is only called
     // when choose_mode picked Hybrid, which already means we want the lexical
     // lane. The shape weight was a second, conflicting gate that suppressed
@@ -1206,7 +1320,10 @@ fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> L
                 engine_capped: false,
             };
         };
-        index.lexical_rank_with_stats(&query_trigrams, None, LEXICAL_ENUMERATION_LIMIT)
+        let production_file_filter =
+            |path: &Path| path_allowed_by_include_tests(path, project_root, include_tests);
+        let filter = (!include_tests).then_some(&production_file_filter as &dyn Fn(&Path) -> bool);
+        index.lexical_rank_with_stats(&query_trigrams, filter, LEXICAL_ENUMERATION_LIMIT)
     };
 
     LexicalCollection {
@@ -1281,10 +1398,21 @@ pub fn fuse_hybrid_results(
     lexical_files: Vec<(PathBuf, f32)>,
     shape: &QueryShape,
     top_k: usize,
+    include_tests: bool,
+    project_root: &Path,
 ) -> Vec<HybridResult> {
     if top_k == 0 {
         return Vec::new();
     }
+
+    let semantic = semantic
+        .into_iter()
+        .filter(|result| path_allowed_by_include_tests(&result.file, project_root, include_tests))
+        .collect::<Vec<_>>();
+    let lexical_files = lexical_files
+        .into_iter()
+        .filter(|(file, _)| path_allowed_by_include_tests(file, project_root, include_tests))
+        .collect::<Vec<_>>();
 
     if lexical_files.is_empty() {
         return semantic
@@ -1498,6 +1626,8 @@ fn format_building_lexical_text(
 /// (uncalibrated for ranking), but its absolute floor is a real signal: an
 /// all-weak result set looks identical to a strong one without it.
 const WEAK_MATCH_COSINE_FLOOR: f32 = 0.35;
+// Intentionally high: the default MiniLM scores are uncalibrated, so under-trigger rather than over-promise.
+const HIGH_CONFIDENCE_COSINE_FLOOR: f32 = 0.60;
 
 /// True when the best result's raw semantic cosine is below the weak floor.
 /// Uses `semantic_score` (the raw cosine), not the fused `score`. Lexical-only
@@ -1515,12 +1645,13 @@ fn format_semantic_text(
     project_root: &Path,
     more_available: bool,
     snippets_incomplete: bool,
+    ctx: Option<&AppContext>,
 ) -> String {
     if results.is_empty() {
         return "Found 0 results.".to_string();
     }
 
-    let mut text = format_result_sections(results, project_root);
+    let mut text = format_result_sections_with_context(results, project_root, ctx);
     // Drop the unconditional "[index: ready]" tag — it was pure per-call tax on
     // the common path. Degraded/building/unavailable paths carry their own
     // distinct "[semantic: ...]" labels, so absence of a label means ready.
@@ -1581,7 +1712,7 @@ fn snippet_line_budget(global_rank: usize) -> usize {
 /// summaries keep the generated summary (not source lines). Returns true when
 /// any snippet was truncated or omitted, so the caller emits the zoom hint only
 /// when it is actionable.
-fn enrich_snippets_from_source(results: &mut [HybridResult]) -> bool {
+fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path) -> bool {
     // Cache reads so two top-3 hits in the same file read it once.
     let mut file_lines: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
     let mut incomplete = false;
@@ -1621,6 +1752,17 @@ fn enrich_snippets_from_source(results: &mut [HybridResult]) -> bool {
             continue;
         }
 
+        if should_expand_rank0_snippet(rank, result, project_root) {
+            let expanded_start = start.saturating_sub(RANK0_FULL_SNIPPET_CONTEXT_LINES);
+            let expanded_end = end
+                .saturating_add(RANK0_FULL_SNIPPET_CONTEXT_LINES)
+                .min(lines.len());
+            if expanded_end.saturating_sub(expanded_start) <= RANK0_FULL_SNIPPET_MAX_LINES {
+                result.snippet = lines[expanded_start..expanded_end].join("\n");
+                continue;
+            }
+        }
+
         let range_len = end - start;
         let shown = range_len.min(budget);
         let mut snippet = lines[start..start + shown].join("\n");
@@ -1638,16 +1780,35 @@ fn enrich_snippets_from_source(results: &mut [HybridResult]) -> bool {
     incomplete
 }
 
+fn should_expand_rank0_snippet(rank: usize, result: &HybridResult, project_root: &Path) -> bool {
+    rank == 0
+        && result
+            .semantic_score
+            .is_some_and(|cosine| cosine >= HIGH_CONFIDENCE_COSINE_FLOOR)
+        && !path_is_test_support_file(&result.file, project_root)
+}
+
 fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {
+    format_result_sections_with_context(results, project_root, None)
+}
+
+fn format_result_sections_with_context(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+) -> String {
     // Results arrive sorted by fused score desc. Group by file preserving
     // first-appearance order so the most relevant file's group renders first.
     // A BTreeMap would re-sort groups alphabetically by path and scramble the
     // ranking the agent relies on to read most-relevant-first. Snippets are
     // already budgeted by enrich_snippets_from_source; render them verbatim.
+    let annotations = ctx
+        .map(|ctx| blast_radius_annotations(ctx, results))
+        .unwrap_or_else(|| vec![None; results.len()]);
     let mut group_order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<&HybridResult>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<(usize, &HybridResult)>> = HashMap::new();
 
-    for result in results.iter() {
+    for (index, result) in results.iter().enumerate() {
         let display_path = result
             .file
             .strip_prefix(project_root)
@@ -1657,7 +1818,10 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
         if !groups.contains_key(&display_path) {
             group_order.push(display_path.clone());
         }
-        groups.entry(display_path).or_default().push(result);
+        groups
+            .entry(display_path)
+            .or_default()
+            .push((index, result));
     }
 
     group_order
@@ -1670,7 +1834,7 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
             // extension), symbol header at 2 spaces, snippet body at 6. Without
             // this, file paths and symbol headers were both at col 0 and could
             // only be told apart by parsing the "[kind] lines X-Y" suffix.
-            for result in &groups[file] {
+            for (index, result) in &groups[file] {
                 if result.source == "lexical" {
                     // Whole-file lexical match (no specific symbol).
                     section.push_str(" [lexical match]");
@@ -1680,11 +1844,15 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
                     section.push_str(&format!("\n  {} [file summary]", result.name));
                 } else {
                     section.push_str(&format!(
-                        "\n  {} [{}] lines {}-{}",
+                        "\n  {} [{}] lines {}-{}{}",
                         result.name,
                         symbol_kind_label(&result.kind),
                         display_line_number(result.start_line),
                         display_line_number(result.end_line),
+                        annotations
+                            .get(*index)
+                            .and_then(|annotation| annotation.as_deref())
+                            .unwrap_or("")
                     ));
                 }
                 if !result.snippet.trim().is_empty() {
@@ -1699,6 +1867,94 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<Option<String>> {
+    let Some(store) = warm_callgraph_store(ctx) else {
+        return vec![None; results.len()];
+    };
+
+    results
+        .iter()
+        .map(|result| blast_radius_annotation_for_result(&store, result))
+        .collect()
+}
+
+fn warm_callgraph_store(
+    ctx: &AppContext,
+) -> Option<std::sync::Arc<crate::callgraph_store::CallGraphStore>> {
+    if ctx.callgraph_store_rx().lock().is_some() {
+        return None;
+    }
+    ctx.revalidate_callgraph_store_generation();
+    ctx.callgraph_store()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(std::sync::Arc::clone)
+}
+
+fn blast_radius_annotation_for_result(
+    store: &crate::callgraph_store::CallGraphStore,
+    result: &HybridResult,
+) -> Option<String> {
+    if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
+        return None;
+    }
+    if result.name.trim().is_empty() {
+        return None;
+    }
+
+    let callers = callers_result(store, &result.file, &result.name, 1).ok()?;
+    let mut caller_basenames = Vec::new();
+    let mut seen_files = HashSet::new();
+    let mut has_test_caller = false;
+    for group in &callers.callers {
+        if is_test_support_file(&group.file) {
+            has_test_caller = true;
+        }
+        if seen_files.insert(group.file.clone()) {
+            caller_basenames.push(compact_caller_basename(&group.file));
+        }
+    }
+
+    let mut suffix = format!("  ↩{}", callers.total_callers);
+    if !caller_basenames.is_empty() {
+        let more = caller_basenames.len() > 2;
+        let names = caller_basenames
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        suffix.push(' ');
+        suffix.push_str(&names);
+        if more {
+            suffix.push_str(",…");
+        }
+    }
+    if !has_test_caller {
+        suffix.push_str(" ⚠untested");
+    }
+    Some(suffix)
+}
+
+fn compact_caller_basename(file: &str) -> String {
+    let basename = Path::new(file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file);
+    truncate_chars(basename, 18)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 fn result_to_json(result: &HybridResult) -> serde_json::Value {
@@ -1872,13 +2128,19 @@ fn degraded_warning(ctx: &AppContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::callgraph::walk_project_files;
+    use crate::callgraph_store::CallGraphStore;
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
-    use crate::context::AppContext;
+    use crate::context::{
+        callgraph_cold_build_spawn_count_for_test, reset_callgraph_cold_build_spawn_count_for_test,
+        AppContext,
+    };
     use crate::parser::TreeSitterProvider;
     use crate::semantic_index::SemanticIndex;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::thread;
 
     fn semantic_request(query: &str, top_k: usize) -> RawRequest {
@@ -1914,6 +2176,17 @@ mod tests {
                 ..Config::default()
             },
         )
+    }
+
+    fn install_warm_callgraph_store(ctx: &AppContext, project_root: &Path) {
+        let root = std::fs::canonicalize(project_root).expect("canonical project root");
+        let files = walk_project_files(&root).collect::<Vec<_>>();
+        let store = CallGraphStore::open(root.join(".callgraph-store-test"), root)
+            .expect("open callgraph store");
+        store.cold_build(&files).expect("build callgraph store");
+        *ctx.callgraph_store()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));
     }
 
     fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {
@@ -2340,7 +2613,7 @@ mod tests {
             hybrid_boosted: false,
         }];
 
-        let text = format_semantic_text(&results, project_root, false, false);
+        let text = format_semantic_text(&results, project_root, false, false, None);
 
         // File-summary rows show "[file summary]" with no line range, and no
         // longer leak the internal score/source.
@@ -2360,6 +2633,9 @@ mod tests {
         body_lines: usize,
     ) -> HybridResult {
         let path = dir.join(file_name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create symbol parent");
+        }
         let body = (0..body_lines)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
@@ -2385,8 +2661,8 @@ mod tests {
     fn rows_omit_score_and_source() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut results = vec![write_symbol_hit(dir.path(), "a.rs", "foo", 2)];
-        let incomplete = enrich_snippets_from_source(&mut results);
-        let text = format_semantic_text(&results, dir.path(), false, incomplete);
+        let incomplete = enrich_snippets_from_source(&mut results, dir.path());
+        let text = format_semantic_text(&results, dir.path(), false, incomplete, None);
         assert!(text.contains("foo [function] lines 1-2"));
         assert!(!text.contains("score"));
         assert!(!text.contains("source"));
@@ -2402,9 +2678,9 @@ mod tests {
         let mut results: Vec<HybridResult> = (0..5)
             .map(|i| write_symbol_hit(dir.path(), &format!("f{i}.rs"), &format!("fn{i}"), 30))
             .collect();
-        let incomplete = enrich_snippets_from_source(&mut results);
+        let incomplete = enrich_snippets_from_source(&mut results, dir.path());
         assert!(incomplete);
-        let text = format_semantic_text(&results, dir.path(), false, incomplete);
+        let text = format_semantic_text(&results, dir.path(), false, incomplete, None);
 
         assert!(text.contains("fn0 [function]"));
         // "lines" wording is load-bearing (vs "+N more" reading as results).
@@ -2429,6 +2705,72 @@ mod tests {
     }
 
     #[test]
+    fn high_confidence_rank0_expands_full_symbol_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut results = vec![write_symbol_hit(dir.path(), "full.rs", "full", 30)];
+        results[0].semantic_score = Some(HIGH_CONFIDENCE_COSINE_FLOOR);
+        results[0].score = HIGH_CONFIDENCE_COSINE_FLOOR;
+
+        let incomplete = enrich_snippets_from_source(&mut results, dir.path());
+
+        assert!(
+            !incomplete,
+            "full rank-0 symbol should not need a zoom hint"
+        );
+        assert!(results[0].snippet.contains("line29"));
+        assert!(!results[0].snippet.contains("+10 more lines"));
+    }
+
+    #[test]
+    fn subfloor_rank0_keeps_preview_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut results = vec![write_symbol_hit(dir.path(), "preview.rs", "preview", 30)];
+        results[0].semantic_score = Some(HIGH_CONFIDENCE_COSINE_FLOOR - 0.01);
+        results[0].score = HIGH_CONFIDENCE_COSINE_FLOOR - 0.01;
+
+        let incomplete = enrich_snippets_from_source(&mut results, dir.path());
+
+        assert!(incomplete);
+        assert!(results[0].snippet.contains("line19"));
+        assert!(!results[0].snippet.contains("line29"));
+        assert!(results[0].snippet.contains("+10 more lines"));
+    }
+
+    #[test]
+    fn test_support_rank0_never_full_expands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut results = vec![write_symbol_hit(
+            dir.path(),
+            "fixtures/full.rs",
+            "fixture",
+            30,
+        )];
+        results[0].semantic_score = Some(0.99);
+        results[0].score = 0.99;
+
+        let incomplete = enrich_snippets_from_source(&mut results, dir.path());
+
+        assert!(incomplete);
+        assert!(!results[0].snippet.contains("line29"));
+        assert!(results[0].snippet.contains("+10 more lines"));
+    }
+
+    #[test]
+    fn oversized_rank0_full_expansion_falls_back_to_preview() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut results = vec![write_symbol_hit(dir.path(), "huge.rs", "huge", 90)];
+        results[0].semantic_score = Some(0.99);
+        results[0].score = 0.99;
+
+        let incomplete = enrich_snippets_from_source(&mut results, dir.path());
+
+        assert!(incomplete);
+        assert!(results[0].snippet.contains("line19"));
+        assert!(!results[0].snippet.contains("line89"));
+        assert!(results[0].snippet.contains("+70 more lines"));
+    }
+
+    #[test]
     fn weak_top_match_emits_low_confidence_note() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut hit = write_symbol_hit(dir.path(), "a.rs", "foo", 2);
@@ -2436,7 +2778,7 @@ mod tests {
         hit.semantic_score = Some(0.22);
         hit.score = 0.22;
         let results = vec![hit];
-        let text = format_semantic_text(&results, dir.path(), false, false);
+        let text = format_semantic_text(&results, dir.path(), false, false, None);
         assert!(
             text.contains("Top match is weak"),
             "expected weak-match note, got: {text}"
@@ -2450,7 +2792,7 @@ mod tests {
         hit.semantic_score = Some(0.72);
         hit.score = 0.72;
         let results = vec![hit];
-        let text = format_semantic_text(&results, dir.path(), false, false);
+        let text = format_semantic_text(&results, dir.path(), false, false, None);
         assert!(!text.contains("Top match is weak"), "got: {text}");
         // And no unconditional "[index: ready]" tax on the happy path.
         assert!(!text.contains("[index: ready]"), "got: {text}");
@@ -2464,9 +2806,9 @@ mod tests {
             write_symbol_hit(dir.path(), "a.rs", "foo", 3),
             write_symbol_hit(dir.path(), "b.rs", "bar", 3),
         ];
-        let incomplete = enrich_snippets_from_source(&mut results);
+        let incomplete = enrich_snippets_from_source(&mut results, dir.path());
         assert!(!incomplete);
-        let text = format_semantic_text(&results, dir.path(), false, incomplete);
+        let text = format_semantic_text(&results, dir.path(), false, incomplete, None);
         assert!(!text.contains("+"), "no truncation marker expected: {text}");
         assert!(!text.contains("aft_zoom"), "no zoom hint expected: {text}");
     }
@@ -2489,7 +2831,7 @@ mod tests {
             hybrid_boosted: false,
         }];
         // Must not panic; header renders, no snippet body.
-        let _ = enrich_snippets_from_source(&mut results);
+        let _ = enrich_snippets_from_source(&mut results, dir.path());
         assert!(results[0].snippet.is_empty());
         let text = format_result_sections(&results, dir.path());
         assert!(text.contains("ghost [function]"));
@@ -2511,10 +2853,120 @@ mod tests {
     }
 
     #[test]
+    fn warm_callgraph_adds_compact_blast_radius_suffixes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        let fixture_dir = dir.path().join("fixtures");
+        std::fs::create_dir_all(&src_dir).expect("create src");
+        std::fs::create_dir_all(&fixture_dir).expect("create fixtures");
+        let target_file = src_dir.join("target.ts");
+        std::fs::write(
+            &target_file,
+            "export function covered() {\n  return 1;\n}\nexport function untested() {\n  return 2;\n}\n",
+        )
+        .expect("write target");
+        std::fs::write(
+            src_dir.join("app.ts"),
+            "import { covered, untested } from './target';\nexport function callerOne() {\n  return covered() + untested();\n}\nexport function callerTwo() {\n  return covered();\n}\n",
+        )
+        .expect("write app");
+        std::fs::write(
+            fixture_dir.join("covered_fixture.ts"),
+            "import { covered } from '../src/target';\nexport function fixtureCaller() {\n  return covered();\n}\n",
+        )
+        .expect("write fixture");
+        let ctx = test_context(dir.path());
+        install_warm_callgraph_store(&ctx, dir.path());
+
+        let results = vec![
+            HybridResult {
+                file: target_file.clone(),
+                name: "covered".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 2,
+                exported: true,
+                snippet: String::new(),
+                score: 0.8,
+                source: "semantic",
+                semantic_score: Some(0.8),
+                lexical_score: None,
+                hybrid_boosted: false,
+            },
+            HybridResult {
+                file: target_file,
+                name: "untested".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 3,
+                end_line: 5,
+                exported: true,
+                snippet: String::new(),
+                score: 0.7,
+                source: "semantic",
+                semantic_score: Some(0.7),
+                lexical_score: None,
+                hybrid_boosted: false,
+            },
+        ];
+
+        let text = format_semantic_text(&results, dir.path(), false, false, Some(&ctx));
+        let covered_line = text
+            .lines()
+            .find(|line| line.contains("covered [function]"))
+            .expect("covered row");
+        assert!(
+            covered_line.contains("↩"),
+            "covered row should show callers: {text}"
+        );
+        assert!(
+            covered_line.contains("app.ts") || covered_line.contains("covered_fixture.ts"),
+            "covered row should include caller basenames: {covered_line}"
+        );
+        assert!(
+            !covered_line.contains("⚠untested"),
+            "fixture caller should suppress untested marker: {covered_line}"
+        );
+
+        let untested_line = text
+            .lines()
+            .find(|line| line.contains("untested [function]"))
+            .expect("untested row");
+        assert!(
+            untested_line.contains("↩"),
+            "untested row should show callers: {text}"
+        );
+        assert!(
+            untested_line.contains("app.ts"),
+            "untested caller basename missing: {untested_line}"
+        );
+        assert!(
+            untested_line.contains("⚠untested"),
+            "non-test callers only should show untested marker: {untested_line}"
+        );
+    }
+
+    #[test]
+    fn absent_warm_callgraph_emits_no_blast_radius_and_starts_no_build() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = test_context(dir.path());
+        reset_callgraph_cold_build_spawn_count_for_test();
+        let results = vec![write_symbol_hit(dir.path(), "target.rs", "target", 1)];
+
+        let text = format_semantic_text(&results, dir.path(), false, false, Some(&ctx));
+
+        assert!(
+            !text.contains("↩"),
+            "cold store should not annotate rows: {text}"
+        );
+        assert_eq!(callgraph_cold_build_spawn_count_for_test(), 0);
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+    }
+
+    #[test]
     fn more_available_appends_raise_topk_note() {
         let dir = tempfile::tempdir().expect("tempdir");
         let results = vec![write_symbol_hit(dir.path(), "a.rs", "foo", 1)];
-        let text = format_semantic_text(&results, dir.path(), true, false);
+        let text = format_semantic_text(&results, dir.path(), true, false, None);
         assert!(text.contains("More results available; raise topK to see more."));
     }
 

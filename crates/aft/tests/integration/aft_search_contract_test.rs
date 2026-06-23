@@ -33,6 +33,25 @@ fn request_with_top_k(query: &str, hint: Option<&str>, top_k: usize) -> RawReque
     serde_json::from_value(value).expect("build semantic search request")
 }
 
+fn request_with_include_tests(
+    query: &str,
+    hint: Option<&str>,
+    top_k: usize,
+    include_tests: bool,
+) -> RawRequest {
+    let mut value = serde_json::json!({
+        "id": "aft-search-contract",
+        "command": "semantic_search",
+        "query": query,
+        "top_k": top_k,
+        "include_tests": include_tests,
+    });
+    if let Some(hint) = hint {
+        value["hint"] = serde_json::json!(hint);
+    }
+    serde_json::from_value(value).expect("build semantic search request")
+}
+
 fn response_value(response: Response) -> Value {
     serde_json::to_value(response).expect("serialize response")
 }
@@ -563,6 +582,124 @@ fn grep_results_report_regex_or_literal_source() {
             );
         }
     }
+}
+
+#[test]
+fn literal_grep_filters_test_support_files_unless_requested() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    let fixture_file = project.path().join("fixtures/schema.sql");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::create_dir_all(fixture_file.parent().expect("fixture parent"))
+        .expect("create fixture dir");
+    std::fs::write(&fixture_file, "CREATE TABLE needle_table(id int);\n")
+        .expect("write fixture file");
+    std::fs::write(
+        &source_file,
+        "pub fn build_schema() { /* CREATE TABLE needle_table */ }\n",
+    )
+    .expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let default_response = response_value(handle_semantic_search(
+        &request_with("CREATE TABLE needle_table", Some("literal")),
+        &ctx,
+    ));
+    assert_eq!(
+        default_response["success"], true,
+        "default grep should succeed"
+    );
+    let default_results = default_response["results"]
+        .as_array()
+        .expect("results array");
+    assert!(
+        default_results.iter().all(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| !file.replace('\\', "/").contains("/fixtures/"))),
+        "default grep should hide fixtures: {default_response:?}"
+    );
+    assert!(default_results.iter().any(|result| result["file"]
+        .as_str()
+        .is_some_and(|file| file.replace('\\', "/").ends_with("src/lib.rs"))));
+
+    let include_response = response_value(handle_semantic_search(
+        &request_with_include_tests("CREATE TABLE needle_table", Some("literal"), 5, true),
+        &ctx,
+    ));
+    assert_eq!(
+        include_response["success"], true,
+        "include_tests grep should succeed"
+    );
+    let include_results = include_response["results"]
+        .as_array()
+        .expect("results array");
+    assert!(
+        include_results.iter().any(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| file.replace('\\', "/").ends_with("fixtures/schema.sql"))),
+        "include_tests:true should surface fixtures: {include_response:?}"
+    );
+}
+
+#[test]
+fn degraded_grep_filters_test_support_files_unless_requested() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    let fixture_file = project.path().join("fixtures/notes.txt");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::create_dir_all(fixture_file.parent().expect("fixture parent"))
+        .expect("create fixture dir");
+    std::fs::write(&fixture_file, "how retry schema fallback works\n").expect("write fixture file");
+    std::fs::write(
+        &source_file,
+        "pub fn retry() { /* how retry schema fallback works */ }\n",
+    )
+    .expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let default_response = response_value(handle_semantic_search(
+        &request("how retry schema fallback works"),
+        &ctx,
+    ));
+    assert_eq!(
+        default_response["success"], true,
+        "default fallback should succeed"
+    );
+    let default_results = default_response["results"]
+        .as_array()
+        .expect("results array");
+    assert!(
+        default_results.iter().all(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| !file.replace('\\', "/").contains("/fixtures/"))),
+        "default degraded grep should hide fixtures: {default_response:?}"
+    );
+
+    let include_response = response_value(handle_semantic_search(
+        &request_with_include_tests("how retry schema fallback works", None, 5, true),
+        &ctx,
+    ));
+    assert_eq!(
+        include_response["success"], true,
+        "include_tests fallback should succeed"
+    );
+    let include_results = include_response["results"]
+        .as_array()
+        .expect("results array");
+    assert!(
+        include_results.iter().any(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| file.replace('\\', "/").ends_with("fixtures/notes.txt"))),
+        "include_tests:true should surface degraded fixtures: {include_response:?}"
+    );
 }
 
 #[test]

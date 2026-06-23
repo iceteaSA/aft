@@ -60,6 +60,14 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
           .optional()
           .describe("Optional routing hint. Defaults to 'auto'."),
       ),
+      includeTests: arg(
+        z
+          .boolean()
+          .optional()
+          .describe(
+            "Include test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+          ),
+      ),
     },
     execute: async (args, context): Promise<string> => {
       if (
@@ -84,6 +92,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         top_k: args.topK ?? 10,
       };
       if (hint) bridgeParams.hint = hint;
+      if (typeof args.includeTests === "boolean") bridgeParams.include_tests = args.includeTests;
       const response = await callBridge(ctx, context, "semantic_search", bridgeParams);
 
       if (response.success === false) {

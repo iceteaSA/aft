@@ -130,6 +130,18 @@ describe("semanticTools", () => {
     expect(output).not.toContain('"source"');
   });
 
+  test("maps includeTests to the bridge include_tests param", async () => {
+    const sdkCtx = createMockSdkContext("/tmp/project");
+    const { sendCalls, tools } = createMockSemanticHarness({}, () => ({
+      success: true,
+      text: "ok",
+    }));
+
+    await tools.aft_search.execute({ query: "fixtures", includeTests: true }, sdkCtx);
+
+    expect(sendCalls[0].params.include_tests).toBe(true);
+  });
+
   test("rejects blank queries before permission or bridge calls", async () => {
     const ask = mockAsk();
     const sdkCtx = createMockSdkContext("/tmp/project", ask);

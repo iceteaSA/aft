@@ -45,6 +45,8 @@ fn identifier_file_in_both_lanes_gets_hybrid_boost() {
         vec![(PathBuf::from("/project/src/hooks.ts"), 2.0)],
         &shape,
         10,
+        true,
+        Path::new("/project"),
     );
 
     // v0.32 contract: a file in both lanes keeps source "semantic" and is flagged
@@ -64,6 +66,8 @@ fn identifier_file_only_in_lexical_top_twenty_surfaces() {
         vec![(PathBuf::from("/project/src/hooks.ts"), 2.0)],
         &shape,
         10,
+        true,
+        Path::new("/project"),
     );
 
     let lexical = results
@@ -97,7 +101,14 @@ fn lexical_candidate_beyond_old_twenty_cap_still_surfaces() {
         .collect();
     let target = PathBuf::from("/project/src/file23.ts"); // 24th-ranked (index 23)
 
-    let results = fuse_hybrid_results(Vec::new(), lexical_files, &shape, 100);
+    let results = fuse_hybrid_results(
+        Vec::new(),
+        lexical_files,
+        &shape,
+        100,
+        true,
+        Path::new("/project"),
+    );
 
     assert!(
         results.iter().any(|result| result.file == target),
@@ -110,6 +121,44 @@ fn lexical_candidate_beyond_old_twenty_cap_still_surfaces() {
 }
 
 #[test]
+fn fusion_filters_test_support_before_truncating_by_default() {
+    let shape = classify("create table query");
+    let semantic_results = vec![
+        semantic("/project/fixtures/schema.sql", "fixture_schema", 0.95),
+        semantic("/project/src/schema.ts", "real_schema", 0.9),
+        semantic("/project/src/query_builder.ts", "query_builder", 0.85),
+    ];
+
+    let filtered = fuse_hybrid_results(
+        semantic_results.clone(),
+        Vec::new(),
+        &shape,
+        2,
+        false,
+        Path::new("/project"),
+    );
+
+    assert_eq!(filtered.len(), 2, "filtering must not leave a top_k gap");
+    assert_eq!(filtered[0].file, PathBuf::from("/project/src/schema.ts"));
+    assert!(filtered
+        .iter()
+        .all(|result| !result.file.display().to_string().contains("fixtures")));
+
+    let with_tests = fuse_hybrid_results(
+        semantic_results,
+        Vec::new(),
+        &shape,
+        2,
+        true,
+        Path::new("/project"),
+    );
+    assert_eq!(
+        with_tests[0].file,
+        PathBuf::from("/project/fixtures/schema.sql")
+    );
+}
+
+#[test]
 fn natural_language_query_with_no_lexical_lane_stays_semantic() {
     let shape = classify("how does auth work");
     let results = fuse_hybrid_results(
@@ -117,6 +166,8 @@ fn natural_language_query_with_no_lexical_lane_stays_semantic() {
         Vec::new(),
         &shape,
         10,
+        true,
+        Path::new("/project"),
     );
 
     assert!(results.iter().all(|result| result.source == "semantic"));
@@ -134,6 +185,8 @@ fn per_file_cap_keeps_top_two_results() {
         vec![(PathBuf::from("/project/src/elsewhere.ts"), 0.5)],
         &shape,
         10,
+        true,
+        Path::new("/project"),
     );
     let hooks_file = PathBuf::from("/project/src/hooks.ts");
 
@@ -161,8 +214,22 @@ fn same_inputs_produce_stable_results() {
         (PathBuf::from("/project/src/c.ts"), 0.9),
     ];
 
-    let first = fuse_hybrid_results(semantic_results.clone(), lexical.clone(), &shape, 10);
-    let second = fuse_hybrid_results(semantic_results, lexical, &shape, 10);
+    let first = fuse_hybrid_results(
+        semantic_results.clone(),
+        lexical.clone(),
+        &shape,
+        10,
+        true,
+        Path::new("/project"),
+    );
+    let second = fuse_hybrid_results(
+        semantic_results,
+        lexical,
+        &shape,
+        10,
+        true,
+        Path::new("/project"),
+    );
 
     assert_eq!(fingerprint(&first), fingerprint(&second));
 }

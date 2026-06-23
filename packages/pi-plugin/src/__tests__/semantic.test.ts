@@ -35,10 +35,16 @@ describe("aft_search adapter", () => {
       query: "retry logic",
       topK: 7,
       hint: "literal",
+      includeTests: true,
     })) as { content: Array<{ text: string }>; details: Record<string, unknown> };
 
     expect(calls[0].command).toBe("semantic_search");
-    expect(calls[0].params).toEqual({ query: "retry logic", top_k: 7, hint: "literal" });
+    expect(calls[0].params).toEqual({
+      query: "retry logic",
+      top_k: 7,
+      hint: "literal",
+      include_tests: true,
+    });
     expect(result.content[0].text).toBe("ready results");
     expect(result.details.interpreted_as).toBe("hybrid");
     expect(result.details.semantic_status).toBe("ready");
@@ -99,5 +105,16 @@ describe("aft_search adapter", () => {
     expect(schemaAccepts(schema, { query: "auth", topK: 101 })).toBe(false);
     expect(schemaAccepts(schema, { query: "auth", topK: 1.5 })).toBe(false);
     expect(schemaAccepts(schema, { query: "auth", topK: "10" })).toBe(false);
+  });
+
+  test("includeTests schema accepts booleans only", () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge();
+    registerSemanticTool(api, makePluginContext(bridge));
+    const schema = tools.get("aft_search")!.parameters;
+
+    expect(schemaAccepts(schema, { query: "auth", includeTests: true })).toBe(true);
+    expect(schemaAccepts(schema, { query: "auth", includeTests: false })).toBe(true);
+    expect(schemaAccepts(schema, { query: "auth", includeTests: "true" })).toBe(false);
   });
 });
