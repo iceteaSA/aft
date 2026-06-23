@@ -195,7 +195,7 @@ fn vue_unsupported_formatter_but_import_organize_succeeds() {
     let file = dir.path().join("src/App.vue");
 
     let mut aft = AftProcess::spawn();
-    assert_eq!(aft.configure(dir.path())["success"], true);
+    assert_eq!(aft.configure_format_on_edit(dir.path())["success"], true);
 
     let write = send(
         &mut aft,

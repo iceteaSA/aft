@@ -201,7 +201,10 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({ "validate_on_edit": "syntax" }))
+            "config": user_config(serde_json::json!({
+                "format_on_edit": true,
+                "validate_on_edit": "syntax"
+            }))
         })
         .to_string(),
     );

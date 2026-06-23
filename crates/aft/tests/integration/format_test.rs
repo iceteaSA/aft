@@ -109,7 +109,7 @@ fn format_integration_applied_rustfmt() {
 
     let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
-    aft.configure(&dir);
+    aft.configure_format_on_edit(&dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-1","command":"write","file":{},"content":"{}"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -171,7 +171,16 @@ fn format_integration_edit_match_reformatted_excerpt_on_reflow() {
 
     let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
-    aft.configure(&dir);
+    aft.send(
+        &serde_json::json!({
+            "id": "cfg-fmt-reflow",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.display().to_string(),
+            "config": user_config(serde_json::json!({ "format_on_edit": true })),
+        })
+        .to_string(),
+    );
 
     let req = serde_json::json!({
         "id": "fmt-edit-match",
@@ -246,6 +255,7 @@ fn format_integration_unsupported_language() {
 
     let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    aft.configure_format_on_edit(&dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-2","command":"write","file":{},"content":"hello world"}}"#,
         crate::helpers::json_string(&target.display())
@@ -307,7 +317,7 @@ fn format_integration_formatter_not_installed() {
         ("PATH", path.as_os_str()),
         ("AFT_DISABLE_WELL_KNOWN_LOOKUP", std::ffi::OsStr::new("1")),
     ]);
-    let cfg = aft.configure(&dir);
+    let cfg = aft.configure_format_on_edit(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-3b","command":"write","file":{},"content":"const x = 1;\n"}}"#,
@@ -347,7 +357,7 @@ fn format_integration_oxfmt_config_runs_oxfmt() {
     let _ = fs::remove_file(&target);
     let path = prepend_path(&std::ffi::OsString::new(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
-    let cfg = aft.configure(&dir);
+    let cfg = aft.configure_format_on_edit(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
@@ -387,7 +397,7 @@ fn format_integration_oxfmt_ignored_path_reports_formatter_excluded_path() {
     let _ = fs::remove_file(&target);
     let path = prepend_path(&std::ffi::OsString::new(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
-    let cfg = aft.configure(&dir);
+    let cfg = aft.configure_format_on_edit(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
@@ -502,7 +512,7 @@ fn format_integration_fields_always_present() {
     let _ = fs::remove_file(&md_target);
 
     let mut aft = AftProcess::spawn();
-    aft.configure(&dir);
+    aft.configure_format_on_edit(&dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-6a","command":"write","file":{},"content":"Hello markdown"}}"#,
         crate::helpers::json_string(&md_target.display())

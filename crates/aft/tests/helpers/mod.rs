@@ -316,6 +316,26 @@ impl AftProcess {
         self.send(&request.to_string())
     }
 
+    /// Send a configure command with `format_on_edit: true`.
+    ///
+    /// The default is now `false` (formatting after an edit can reflow the file
+    /// under the agent), so tests that exercise the formatting subsystem
+    /// (applied formatting, skip-reason taxonomy, missing-formatter warnings)
+    /// must opt in explicitly. The OFF path is covered by its own tests.
+    pub fn configure_format_on_edit(
+        &mut self,
+        project_root: &std::path::Path,
+    ) -> serde_json::Value {
+        let request = serde_json::json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project_root.to_string_lossy(),
+            "config": user_config(serde_json::json!({ "format_on_edit": true })),
+        });
+        self.send(&request.to_string())
+    }
+
     /// Wait for and consume a `configure_warnings` push frame, returning its
     /// `warnings` array merged into the original configure response.
     ///

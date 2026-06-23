@@ -1439,7 +1439,19 @@ exit 0
 
     let path = path_with_node_bin(root);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
-    let cfg = aft.configure(root);
+    let cfg = aft.send(
+        &serde_json::json!({
+            "id": "cfg-glob-fmt",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.display().to_string(),
+            "config": user_config(serde_json::json!({
+                "format_on_edit": true,
+                "formatter": { "typescript": "biome" }
+            }))
+        })
+        .to_string(),
+    );
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
     let resp = aft.send(
         &serde_json::json!({
