@@ -1298,10 +1298,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // applied here before process-state fields below; the legacy Group-B flat
     // params are intentionally not read so they cannot bypass tier trust.
     // Project-tier trust-boundary drops are surfaced for the warning path.
-    let mut config_dropped_keys: Vec<crate::config_resolve::DroppedKey> = Vec::new();
-    if let Some(tiers) = parse_config_tiers(params) {
-        config_dropped_keys = crate::config_resolve::resolve_config_onto(&tiers, &mut next_config);
-    }
+    // ALWAYS resolve, even when no tiers are supplied. `resolve_config_onto`
+    // uses reset-onto-default semantics, so an absent/empty `config` must still
+    // run it to reset the core-domain config to defaults — otherwise a bind with
+    // no tiers would keep the PREVIOUS bind's resolved core config (the
+    // cross-bind escalation: a later low-trust bind inheriting an earlier
+    // high-trust bind's capability by simply omitting tiers).
+    let tiers = parse_config_tiers(params).unwrap_or_default();
+    let config_dropped_keys: Vec<crate::config_resolve::DroppedKey> =
+        crate::config_resolve::resolve_config_onto(&tiers, &mut next_config);
 
     // NO configure-time SSRF guard on semantic.base_url — deliberate (config
     // relocation posture). The original guard existed to stop UNTRUSTED *project*
@@ -2623,11 +2628,16 @@ mod tests {
         }
 
         let ctx = test_context();
-        ctx.update_config(|config| {
-            config.search_index = true;
-            config.semantic_search = true;
-        });
-        let req = configure_request(json!(temp.path()));
+        // Supply search_index/semantic_search as a user config TIER (how real
+        // configures carry core fields under reset resolution). The point of this
+        // test is that the HOME-root degraded gate force-disables them EVEN WHEN
+        // user config enables them — so they must actually be enabled by the tier
+        // first, then asserted off below.
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "config": [user_tier(json!({ "search_index": true, "semantic_search": true }))],
+        }));
         let response = super::handle_configure(&req, &ctx);
 
         // Restore env immediately so a later assertion failure doesn't leak.
@@ -2680,10 +2690,15 @@ mod tests {
         }
 
         let ctx = test_context();
-        ctx.update_config(|config| {
-            config.search_index = true;
-        });
-        let req = configure_request(json!(subdir));
+        // search_index is a core-domain field that arrives via a config TIER on
+        // every real configure (P1 relocation). With reset-onto-default resolution
+        // it must be supplied as a tier, not seeded via update_config — a tier-less
+        // configure correctly resets core fields to default.
+        let req = configure_request_with_params(json!({
+            "project_root": subdir,
+            "harness": "opencode",
+            "config": [user_tier(json!({ "search_index": true }))],
+        }));
         let response = super::handle_configure(&req, &ctx);
 
         unsafe {

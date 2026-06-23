@@ -430,30 +430,64 @@ pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
     ResolveResult { config, dropped }
 }
 
-/// Resolve raw config tiers and OVERLAY the core-domain fields onto an existing
-/// `base` config (preserving its process-state fields: storage_dir, harness,
-/// lsp_paths_extra, bash_permissions, …). This is the configure-path entry: the
-/// caller seeds `base` with process-state, then applies the tier-derived core
-/// config on top. Returns the project-tier trust-boundary drops for warning
-/// surfacing.
+/// Resolve raw config tiers into the core-domain config and RESET it onto an
+/// existing `base`, preserving only `base`'s process-state fields (storage_dir,
+/// harness, lsp_paths_extra, bash_permissions, …). This is the configure-path
+/// entry.
+///
+/// RESET, not overlay: the core-domain config is rebuilt from DEFAULT + the
+/// supplied tiers, so a field absent from the tiers returns to its default —
+/// it NEVER keeps `base`'s prior value. This closes a cross-bind privilege
+/// escalation: under the subc daemon a single `AppContext` per project root is
+/// shared across harness identities, and `configure` seeds `base` from the
+/// previous bind's config. With the old overlay semantics, a later low-trust
+/// bind (e.g. `mcp:*`) that omitted a field inherited an earlier high-trust
+/// bind's capability for it (confirmed on the wire: `url_fetch_allow_private`
+/// SSRF, and `lsp_servers` arbitrary-binary). Reset-onto-default makes the
+/// resolved core config a pure function of THIS bind's own tiers.
+///
+/// Parity-safe by construction: this routes through [`resolve_config`] (the same
+/// entry the cross-language parity gate validates), which builds onto
+/// `Config::default()` — so reset-onto-default == overlay-onto-default there and
+/// no parity/unit fixture changes. Only this configure path, seeded from a prior
+/// config, changes behavior — which is exactly the leak site.
+///
+/// Process-state fields are not part of `RawAftConfig`; they are carried from
+/// `base` here and re-applied by `handle_configure`'s flat-param parsing
+/// afterwards, so plugin-mode behavior is unchanged (the plugin re-sends them on
+/// every configure). They are also unreachable as a subc escalation vector: a
+/// subc RouteBind sends only `config:[tiers]`, never the flat process-state
+/// params, so they stay at default for every subc bind regardless.
 pub fn resolve_config_onto(tiers: &[ConfigTier], base: &mut Config) -> Vec<DroppedKey> {
-    let mut merged = RawAftConfig::default();
-    let mut dropped = Vec::new();
-
-    for tier in tiers {
-        let Some(raw) = parse_tier(tier) else {
-            continue;
-        };
-        if tier.tier == "user" {
-            merge_trusted_config(&mut merged, raw);
-        } else {
-            record_project_drops(&raw, &tier.tier, &mut dropped);
-            merge_project_config(&mut merged, raw);
-        }
-    }
-
-    apply_resolved_config(&merged, base);
+    let ResolveResult {
+        mut config,
+        dropped,
+    } = resolve_config(tiers);
+    carry_process_state(base, &mut config);
+    *base = config;
     dropped
+}
+
+/// Carry the process-state (non-`RawAftConfig`) fields from `base` onto a
+/// freshly-resolved core config. EVERY `Config` field not copied here is
+/// core-domain and intentionally comes from the resolved tiers (reset). Keeping
+/// this list complete is load-bearing: a core field accidentally copied here
+/// would re-introduce cross-bind inheritance for it.
+fn carry_process_state(base: &Config, resolved: &mut Config) {
+    resolved.project_root = base.project_root.clone();
+    resolved.harness = base.harness.clone();
+    resolved.validation_depth = base.validation_depth;
+    resolved.checkpoint_ttl_hours = base.checkpoint_ttl_hours;
+    resolved.max_symbol_depth = base.max_symbol_depth;
+    resolved.diagnostic_cache_size = base.diagnostic_cache_size;
+    resolved.aft_search_registered = base.aft_search_registered;
+    resolved.max_background_bash_tasks = base.max_background_bash_tasks;
+    resolved.bash_permissions = base.bash_permissions;
+    resolved.search_index_max_file_size = base.search_index_max_file_size;
+    resolved.storage_dir = base.storage_dir.clone();
+    resolved.lsp_paths_extra = base.lsp_paths_extra.clone();
+    resolved.lsp_auto_install_binaries = base.lsp_auto_install_binaries.clone();
+    resolved.lsp_inflight_installs = base.lsp_inflight_installs.clone();
 }
 
 fn parse_tier(tier: &ConfigTier) -> Option<RawAftConfig> {
@@ -1925,6 +1959,101 @@ mod tests {
 
         assert!(result.config.search_index);
         assert!(result.dropped.is_empty());
+    }
+
+    #[test]
+    fn resolve_config_onto_resets_core_fields_no_cross_bind_inheritance() {
+        // Cross-bind escalation regression: a first (trusted) bind sets a
+        // capability field; a second bind that omits it must NOT inherit it.
+        // This is the configure-path entry (seeded from a prior config), where
+        // reset-onto-default — unlike the old overlay — makes the resolved core
+        // config a pure function of the CURRENT bind's tiers.
+        let mut config = Config::default();
+
+        // Bind 1 (trusted user tier) sets url_fetch_allow_private + a custom LSP
+        // server + restrict_to_project_root.
+        let dropped1 = resolve_config_onto(
+            &[tier(
+                "user",
+                r#"{
+                  "url_fetch_allow_private": true,
+                  "restrict_to_project_root": true,
+                  "lsp": { "servers": { "rust": { "extensions": [".rs"], "binary": "rust-analyzer" } } }
+                }"#,
+            )],
+            &mut config,
+        );
+        assert!(dropped1.is_empty());
+        assert!(config.url_fetch_allow_private);
+        assert!(config.restrict_to_project_root);
+        assert_eq!(config.lsp_servers.len(), 1);
+
+        // Bind 2 omits all three. With reset semantics they return to DEFAULT —
+        // the second bind cannot inherit the first bind's capabilities.
+        let _ = resolve_config_onto(&[tier("user", r#"{ "search_index": true }"#)], &mut config);
+        assert!(
+            !config.url_fetch_allow_private,
+            "url_fetch_allow_private must reset to default, not inherit prior bind"
+        );
+        assert!(
+            !config.restrict_to_project_root,
+            "restrict_to_project_root must reset to default"
+        );
+        assert!(
+            config.lsp_servers.is_empty(),
+            "lsp_servers must reset to default, not inherit prior bind's custom server"
+        );
+        assert!(config.search_index, "this bind's own field still applies");
+    }
+
+    #[test]
+    fn resolve_config_onto_empty_tiers_resets_to_default() {
+        // The empty-tier path must still reset (it routes through the same
+        // always-run resolution in handle_configure). A bind with no tiers after
+        // a privileged bind must drop the privileged config.
+        let mut config = Config::default();
+        let _ = resolve_config_onto(
+            &[tier("user", r#"{ "url_fetch_allow_private": true }"#)],
+            &mut config,
+        );
+        assert!(config.url_fetch_allow_private);
+
+        let _ = resolve_config_onto(&[], &mut config);
+        assert!(
+            !config.url_fetch_allow_private,
+            "empty-tier bind must reset core config to default"
+        );
+    }
+
+    #[test]
+    fn resolve_config_onto_preserves_process_state_fields() {
+        // Process-state fields (not part of RawAftConfig) are carried across the
+        // reset so plugin-mode behavior is unchanged (the plugin re-sends them
+        // via flat configure params right after this call).
+        let mut config = Config {
+            storage_dir: Some(std::path::PathBuf::from("/tmp/aft-store")),
+            lsp_paths_extra: vec![std::path::PathBuf::from("/tmp/lsp-bin")],
+            bash_permissions: true,
+            project_root: Some(std::path::PathBuf::from("/tmp/proj")),
+            ..Default::default()
+        };
+
+        let _ = resolve_config_onto(&[tier("user", r#"{ "search_index": true }"#)], &mut config);
+
+        assert_eq!(
+            config.storage_dir,
+            Some(std::path::PathBuf::from("/tmp/aft-store"))
+        );
+        assert_eq!(
+            config.lsp_paths_extra,
+            vec![std::path::PathBuf::from("/tmp/lsp-bin")]
+        );
+        assert!(config.bash_permissions);
+        assert_eq!(
+            config.project_root,
+            Some(std::path::PathBuf::from("/tmp/proj"))
+        );
+        assert!(config.search_index);
     }
 
     #[test]

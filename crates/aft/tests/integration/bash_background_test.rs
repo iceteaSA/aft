@@ -523,12 +523,24 @@ fn background_output_spills_to_disk() {
 fn background_feature_flag_disabled_rejects_spawn() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
+    // Explicitly disable background via a config tier. configure now ALWAYS
+    // resolves (a tier-less configure applies the recommended-surface defaults,
+    // which ENABLE background) — so to test the "background disabled rejects
+    // spawn" path we must supply `bash: { background: false }` as a tier, the way
+    // a real plugin sends its resolved config. This is also how the feature is
+    // genuinely turned off, not an artifact of the prior skip-resolution leaving
+    // Config::default().
     let configure = aft.send(
         &json!({
             "id": "cfg-disabled",
             "command": "configure",
             "harness": "opencode",
-            "project_root": dir.path()
+            "project_root": dir.path(),
+            "config": [{
+                "tier": "user",
+                "source": "/tmp/aft-bg-disabled.jsonc",
+                "doc": "{ \"bash\": { \"background\": false } }"
+            }]
         })
         .to_string(),
     );
