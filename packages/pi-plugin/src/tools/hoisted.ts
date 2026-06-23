@@ -21,6 +21,7 @@ import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
+  coerceBoolean,
   formatEditSummary,
   formatReadFooter as formatSharedReadFooter,
 } from "@cortexkit/aft-bridge";
@@ -447,7 +448,8 @@ export function registerHoistedTools(
           diagnostics: diagnosticsOnEditDefault(ctx),
           include_diff_content: true,
         };
-        if (params.replaceAll === true) req.replace_all = true;
+        // Coerce at the boundary: stringified replaceAll must forward true (coerceBoolean).
+        if (coerceBoolean(params.replaceAll)) req.replace_all = true;
         const occurrence = coerceOptionalInt(
           params.occurrence,
           "occurrence",

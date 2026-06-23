@@ -899,7 +899,8 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         command = "edit_match";
         params.match = args.oldString;
         params.replacement = args.newString ?? "";
-        if (args.replaceAll !== undefined) params.replace_all = args.replaceAll;
+        // Coerce at the boundary: stringified replaceAll must forward true (coerceBoolean).
+        if (coerceBoolean(args.replaceAll)) params.replace_all = true;
         if (args.occurrence !== undefined) params.occurrence = args.occurrence;
       } else {
         // No mode-selecting parameter matched. We deliberately do NOT fall

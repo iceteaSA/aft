@@ -1,6 +1,7 @@
 import {
   appendPipeStripNote,
   type BridgeRequestOptions,
+  coerceBoolean,
   formatForegroundResult,
   formatSeconds,
   isTerminalStatus,
@@ -255,11 +256,13 @@ export function createBashTool(
       // command still runs to completion, just inline.
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       const backgroundDisabled = !bashCfg.background;
-      const requestedPty = !backgroundDisabled && args.pty === true;
+      // Coerce at the boundary: stringified pty/background flags (coerceBoolean).
+      const requestedPty = !backgroundDisabled && coerceBoolean(args.pty);
       // pty:true silently implies background:true (Rust bash.rs handles the
       // auto-promote). Agents don't need to set both flags. When background is
       // disabled, those args are omitted from the schema and defensively ignored.
-      const requestedBackground = !backgroundDisabled && (args.background === true || requestedPty);
+      const requestedBackground =
+        !backgroundDisabled && (coerceBoolean(args.background) || requestedPty);
       // ptyRows/ptyCols are silently ignored when pty is false so agents
       // that defensively pass them on normal bash calls don't get stuck in
       // a retry loop. pty: true silently implies background: true (Rust

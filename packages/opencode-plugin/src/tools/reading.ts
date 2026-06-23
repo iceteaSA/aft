@@ -1,4 +1,5 @@
 import {
+  coerceBoolean,
   formatZoomMultiTargetResult,
   formatZoomText,
   unwrapRustZoomBatchEnvelope,
@@ -82,7 +83,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       },
       execute: async (args, context): Promise<string> => {
         const target = args.target;
-        const filesMode = args.files === true;
+        // Coerce at the boundary: stringified "true" must enable files mode (coerceBoolean).
+        const filesMode = coerceBoolean(args.files);
         const hasUrl =
           typeof target === "string" &&
           (target.startsWith("http://") || target.startsWith("https://"));
@@ -293,7 +295,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         const hasUrl = !isEmptyParam(args.url);
         const hasTargets = hasTargetsProvided(args.targets);
         const hasSymbols = !isEmptyParam(args.symbols);
-        const wantCallgraph = args.callgraph === true;
+        // Coerce at the boundary: stringified "true" must request callgraph (coerceBoolean).
+        const wantCallgraph = coerceBoolean(args.callgraph);
 
         // TUI title + scalar metadata for the tool-call header. OpenCode's UI
         // only auto-renders SCALAR args (strings, numbers, booleans) — arrays

@@ -74,4 +74,20 @@ describe("AST tool adapters", () => {
       dry_run: true,
     });
   });
+
+  test('ast_grep_replace treats string dryRun "true" as preview (dry_run true)', async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "preview" }));
+    registerAstTools(api, makePluginContext(bridge), { astSearch: false, astReplace: true });
+
+    await executeTool(tools.get("ast_grep_replace")!, {
+      pattern: "foo($A)",
+      rewrite: "bar($A)",
+      lang: "javascript",
+      dryRun: "true" as unknown as boolean,
+    });
+
+    expect(calls[0].command).toBe("ast_replace");
+    expect(calls[0].params.dry_run).toBe(true);
+  });
 });

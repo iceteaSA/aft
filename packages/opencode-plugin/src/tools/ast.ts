@@ -8,6 +8,7 @@ import { tool } from "@opencode-ai/plugin";
 
 const z = tool.schema;
 
+import { coerceBoolean } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
@@ -226,7 +227,8 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       dryRun: z.boolean().optional().describe("Preview changes without applying (default: false)"),
     },
     execute: async (args, context): Promise<string> => {
-      const isDryRun = args.dryRun === true;
+      // Coerce at the boundary: dryRun "true" must stay preview-only (coerceBoolean).
+      const isDryRun = coerceBoolean(args.dryRun);
       const paths = await resolveAstPaths(ctx, context, args.paths);
 
       const externalDenied = await checkAstPathsPermission(ctx, context, paths);
@@ -269,7 +271,9 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       // Use isEmptyParam — see ast_search above for rationale.
       if (!isEmptyParam(paths)) params.paths = paths;
       if (!isEmptyParam(args.globs)) params.globs = args.globs;
-      params.dry_run = args.dryRun === true;
+      // Normalize dryRun at the plugin-to-bridge boundary with coerceBoolean so
+      // a string "true" still sets dry_run to a real boolean and the replace stays preview-only.
+      params.dry_run = coerceBoolean(args.dryRun);
       const response = await callBridge(ctx, context, "ast_replace", params);
 
       // Error response (e.g. invalid pattern)

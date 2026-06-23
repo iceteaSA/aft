@@ -3,6 +3,7 @@
  * 8 languages: typescript, tsx, javascript, python, rust, go, pascal, r.
  */
 
+import { coerceBoolean } from "@cortexkit/aft-bridge";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   AgentToolResult,
@@ -347,8 +348,8 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         // Use isEmptyParam — see ast_search above for rationale.
         if (!isEmptyParam(paths)) req.paths = paths;
         if (!isEmptyParam(params.globs)) req.globs = params.globs;
-        // Rust ast_replace defaults to dry_run=true; apply by default to match description.
-        req.dry_run = params.dryRun === true;
+        // Coerce at the boundary: dryRun "true" must stay preview-only (coerceBoolean).
+        req.dry_run = coerceBoolean(params.dryRun);
         const response = await callBridge(bridge, "ast_replace", req, extCtx);
         return textResult((response.text as string | undefined) ?? JSON.stringify(response));
       },

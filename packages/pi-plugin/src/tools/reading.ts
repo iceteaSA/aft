@@ -5,6 +5,7 @@
 
 import { stat } from "node:fs/promises";
 import {
+  coerceBoolean,
   formatZoomMultiTargetResult,
   formatZoomText,
   unwrapRustZoomBatchEnvelope,
@@ -323,7 +324,8 @@ export function registerReadingTools(
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const target = params.target;
-        const filesMode = params.files === true;
+        // Coerce at the boundary: stringified "true" must enable files mode (coerceBoolean).
+        const filesMode = coerceBoolean(params.files);
         const isArray = Array.isArray(target) && target.length > 0;
 
         if (filesMode) {
@@ -471,7 +473,8 @@ export function registerReadingTools(
         const hasUrl = !isEmptyParam(params.url);
         const hasTargets = hasTargetsProvided(params.targets);
         const hasSymbols = !isEmptyParam(params.symbols);
-        const wantCallgraph = params.callgraph === true;
+        // Coerce at the boundary: stringified "true" must request callgraph (coerceBoolean).
+        const wantCallgraph = coerceBoolean(params.callgraph);
 
         // Multi-target mode (cross-file). Mutually exclusive with the other
         // modes so the agent doesn't accidentally provide overlapping inputs

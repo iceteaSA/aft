@@ -3,6 +3,7 @@ import {
   appendPipeStripNote,
   type BinaryBridge,
   type BridgeRequestOptions,
+  coerceBoolean,
   formatForegroundResult,
   formatSeconds,
   isBridgeTransportTimeout,
@@ -380,9 +381,10 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
       const ptyCols = backgroundDisabled
         ? undefined
         : coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
-      const requestedPty = !backgroundDisabled && params.pty === true;
+      // Coerce at the boundary: stringified pty/background flags (coerceBoolean).
+      const requestedPty = !backgroundDisabled && coerceBoolean(params.pty);
       const effectiveBackground =
-        !backgroundDisabled && (params.background === true || requestedPty);
+        !backgroundDisabled && (coerceBoolean(params.background) || requestedPty);
       // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
       // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
       // FOREGROUND auto-promote path a `timeout` below the foreground wait
@@ -665,7 +667,8 @@ export function createBashWatchTool(ctx: PluginContext) {
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const waitFor = parseWaitPattern(params.pattern);
-      if (params.background === true) {
+      // Coerce at the boundary: stringified background must enable async mode (coerceBoolean).
+      if (coerceBoolean(params.background)) {
         if (!waitFor) {
           throw new Error(
             "invalid_request: Use auto-reminder; bash_watch without pattern in async mode is redundant",

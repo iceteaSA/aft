@@ -900,6 +900,29 @@ describe("Hoisted tool execute handlers", () => {
     });
   });
 
+  test('edit forwards string replaceAll "true" to Rust replace_all', async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      replacements: 1,
+    }));
+
+    await tools.edit.execute(
+      {
+        filePath: "repeated.ts",
+        oldString: "oldName",
+        newString: "newName",
+        replaceAll: "true" as unknown as boolean,
+      },
+      sdkCtx,
+    );
+
+    const applyCall = calls.find((c) => c.command === "edit_match" && c.params.preview !== true);
+    expect(applyCall?.params.replace_all).toBe(true);
+  });
+
   /// Diff-payload contract: the plugin requests full before/after from Rust
   /// (include_diff_content) for UI metadata, but the AGENT-facing result must
   /// strip the file content down to counts only. Echoing before/after into the

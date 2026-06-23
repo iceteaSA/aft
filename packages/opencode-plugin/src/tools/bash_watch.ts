@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import {
   type BridgeRequestOptions,
+  coerceBoolean,
   isBridgeTransportTimeout,
   isTerminalStatus,
   sleep,
@@ -77,7 +78,8 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
     },
     execute: async (args, context) => {
       const taskId = args.taskId as string;
-      const requestedAsync = args.background === true;
+      // Coerce at the boundary: stringified background must enable async mode (coerceBoolean).
+      const requestedAsync = coerceBoolean(args.background);
       const waitFor = parseWaitPattern(args.pattern);
       const bashCfg = resolveBashConfig(ctx.config);
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
