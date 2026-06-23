@@ -1,0 +1,8 @@
+{
+  "agent_args": {
+    "path": "src docs missing-dir",
+    "pattern": "value"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "grep"
+}

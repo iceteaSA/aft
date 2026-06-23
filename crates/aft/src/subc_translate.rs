@@ -10,6 +10,11 @@ pub struct Translated {
     pub args: Map<String, Value>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranslateContext {
+    pub diagnostics_on_edit: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslateError {
     pub code: &'static str,
@@ -27,7 +32,7 @@ fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)?;
-    Some(std::fs::canonicalize(&raw).unwrap_or(raw))
+    Some(raw)
 }
 
 fn expand_tilde(target: &str) -> String {
@@ -47,10 +52,35 @@ fn expand_tilde(target: &str) -> String {
 pub fn resolve_path_from_project_root(project_root: &Path, target: &str) -> PathBuf {
     let expanded = expand_tilde(target);
     let path = Path::new(&expanded);
-    if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         project_root.join(path)
+    };
+    normalize_lexically(&joined)
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component.as_os_str());
+                }
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
     }
 }
 
@@ -64,26 +94,48 @@ fn is_empty_param(value: &Value) -> bool {
     }
 }
 
-fn coerce_optional_int(value: Option<&Value>, min: i64, max: i64) -> Option<u64> {
-    let value = value?;
-    if value.is_null() || matches!(value, Value::String(s) if s.is_empty()) {
-        return None;
-    }
-    if matches!(value, Value::Array(a) if a.is_empty()) {
-        return None;
-    }
-    let n = match value {
-        Value::Number(num) => num.as_i64()?,
-        Value::String(s) => s.parse::<i64>().ok()?,
-        _ => return None,
+fn coerce_optional_int_result(
+    value: Option<&Value>,
+    param_name: &str,
+    min: i64,
+    max: i64,
+) -> Result<Option<u64>, TranslateError> {
+    let Some(value) = value else {
+        return Ok(None);
     };
-    if n == 0 && min > 0 {
-        return None;
+    if value.is_null()
+        || matches!(value, Value::String(s) if s.is_empty())
+        || matches!(value, Value::Array(a) if a.is_empty())
+        || matches!(value, Value::Object(o) if o.is_empty())
+    {
+        return Ok(None);
     }
+    if matches!(value, Value::Number(num) if num.as_i64() == Some(0) && min > 0) {
+        return Ok(None);
+    }
+
+    let int_error = || {
+        invalid_request(format!(
+            "{param_name} must be an integer between {min} and {max}"
+        ))
+    };
+    let n = match value {
+        Value::Number(num) => num.as_i64().ok_or_else(int_error)?,
+        Value::String(s) => {
+            let parsed = s.parse::<f64>().map_err(|_| int_error())?;
+            if !parsed.is_finite() || parsed.fract() != 0.0 {
+                return Err(int_error());
+            }
+            parsed as i64
+        }
+        _ => return Err(int_error()),
+    };
     if n < min || n > max {
-        return None;
+        return Err(invalid_request(format!(
+            "{param_name} must be between {min} and {max}"
+        )));
     }
-    Some(n as u64)
+    Ok(Some(n as u64))
 }
 
 fn agent_args_map(args: &Value) -> Map<String, Value> {
@@ -103,14 +155,28 @@ pub fn subc_translate(
     agent_args: &Value,
     project_root: &Path,
 ) -> Result<Translated, TranslateError> {
+    subc_translate_with_context(
+        bare_name,
+        agent_args,
+        project_root,
+        TranslateContext::default(),
+    )
+}
+
+pub fn subc_translate_with_context(
+    bare_name: &str,
+    agent_args: &Value,
+    project_root: &Path,
+    ctx: TranslateContext,
+) -> Result<Translated, TranslateError> {
     match bare_name {
         "status" => Ok(Translated {
             command: "status".into(),
             args: Map::new(),
         }),
         "read" => translate_read(agent_args, project_root),
-        "write" => translate_write(agent_args, project_root),
-        "edit" => translate_edit(agent_args, project_root),
+        "write" => translate_write(agent_args, project_root, ctx),
+        "edit" => translate_edit(agent_args, project_root, ctx),
         "grep" => translate_grep(agent_args, project_root),
         "search" => translate_search(agent_args),
         "outline" => translate_outline(agent_args, project_root),
@@ -119,6 +185,14 @@ pub fn subc_translate(
             "subc_translate: unsupported tool {other:?}"
         ))),
     }
+}
+
+fn insert_common_mutation_flags(out: &mut Map<String, Value>, ctx: TranslateContext) {
+    out.insert(
+        "diagnostics".to_string(),
+        Value::Bool(ctx.diagnostics_on_edit),
+    );
+    out.insert("include_diff_content".to_string(), Value::Bool(true));
 }
 
 fn translate_read(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
@@ -162,7 +236,11 @@ fn translate_read(args: &Value, project_root: &Path) -> Result<Translated, Trans
     })
 }
 
-fn translate_write(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_write(
+    args: &Value,
+    project_root: &Path,
+    ctx: TranslateContext,
+) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let file_path = map_in
         .get("filePath")
@@ -178,7 +256,7 @@ fn translate_write(args: &Value, project_root: &Path) -> Result<Translated, Tran
     insert_resolved_file(&mut out, project_root, file_path);
     out.insert("content".to_string(), Value::String(content.to_string()));
     out.insert("create_dirs".to_string(), Value::Bool(true));
-    out.insert("include_diff_content".to_string(), Value::Bool(true));
+    insert_common_mutation_flags(&mut out, ctx);
 
     Ok(Translated {
         command: "write".into(),
@@ -186,7 +264,11 @@ fn translate_write(args: &Value, project_root: &Path) -> Result<Translated, Tran
     })
 }
 
-fn translate_edit(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_edit(
+    args: &Value,
+    project_root: &Path,
+    ctx: TranslateContext,
+) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
 
     if map_in.get("startLine").is_some() || map_in.get("endLine").is_some() {
@@ -216,6 +298,7 @@ fn translate_edit(args: &Value, project_root: &Path) -> Result<Translated, Trans
             Value::String(append.to_string()),
         );
         out.insert("create_dirs".to_string(), Value::Bool(true));
+        insert_common_mutation_flags(&mut out, ctx);
         return Ok(Translated {
             command: "edit_match".into(),
             args: out,
@@ -244,6 +327,7 @@ fn translate_edit(args: &Value, project_root: &Path) -> Result<Translated, Trans
             })
             .collect();
         out.insert("edits".to_string(), Value::Array(translated_edits));
+        insert_common_mutation_flags(&mut out, ctx);
         return Ok(Translated {
             command: "batch".into(),
             args: out,
@@ -266,6 +350,7 @@ fn translate_edit(args: &Value, project_root: &Path) -> Result<Translated, Trans
             "content".to_string(),
             map_in.get("content").cloned().unwrap_or(Value::Null),
         );
+        insert_common_mutation_flags(&mut out, ctx);
         return Ok(Translated {
             command: "edit_symbol".into(),
             args: out,
@@ -301,6 +386,7 @@ fn translate_edit(args: &Value, project_root: &Path) -> Result<Translated, Trans
                 out.insert("occurrence".to_string(), v.clone());
             }
         }
+        insert_common_mutation_flags(&mut out, ctx);
         return Ok(Translated {
             command: "edit_match".into(),
             args: out,
@@ -322,26 +408,32 @@ fn translate_grep(args: &Value, project_root: &Path) -> Result<Translated, Trans
 
     let mut out = Map::new();
     out.insert("pattern".to_string(), Value::String(pattern.to_string()));
+    out.insert("case_sensitive".to_string(), Value::Bool(true));
     if let Some(include) = map_in.get("include") {
         if !is_empty_param(include) {
-            out.insert("include".to_string(), include.clone());
+            let include_arg = include.as_str().ok_or_else(|| {
+                invalid_request("grep: 'include' must be a comma-separated string")
+            })?;
+            let includes = split_include_arg(include_arg)
+                .into_iter()
+                .map(|pattern| Value::String(normalize_glob(&pattern)))
+                .collect::<Vec<_>>();
+            if !includes.is_empty() {
+                out.insert("include".to_string(), Value::Array(includes));
+            }
         }
     }
     if let Some(path_val) = map_in.get("path") {
         if !is_empty_param(path_val) {
             if let Some(path_str) = path_val.as_str() {
-                if path_str.contains(',') || path_str.contains('{') {
-                    out.insert("path".to_string(), Value::String(path_str.to_string()));
-                } else {
-                    let resolved = resolve_path_from_project_root(project_root, path_str);
-                    out.insert(
-                        "path".to_string(),
-                        Value::String(resolved.to_string_lossy().into_owned()),
-                    );
-                }
+                out.insert(
+                    "path".to_string(),
+                    Value::String(resolve_grep_path_arg(project_root, path_str)),
+                );
             }
         }
     }
+    out.insert("max_results".to_string(), Value::Number(100u64.into()));
 
     Ok(Translated {
         command: "grep".into(),
@@ -349,17 +441,99 @@ fn translate_grep(args: &Value, project_root: &Path) -> Result<Translated, Trans
     })
 }
 
+fn normalize_glob(pattern: &str) -> String {
+    if !pattern.contains('/') && !pattern.starts_with("**/") {
+        format!("**/{pattern}")
+    } else {
+        pattern.to_string()
+    }
+}
+
+fn split_include_arg(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut buf = String::new();
+    for ch in raw.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                buf.push(ch);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                buf.push(ch);
+            }
+            ',' if depth == 0 => {
+                let trimmed = buf.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+                buf.clear();
+            }
+            _ => buf.push(ch),
+        }
+    }
+    let trimmed = buf.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+fn search_path_exists(project_root: &Path, raw: &str) -> bool {
+    resolve_path_from_project_root(project_root, raw).exists()
+}
+
+fn split_search_path_arg(project_root: &Path, raw: &str) -> Vec<String> {
+    if search_path_exists(project_root, raw) || !raw.chars().any(char::is_whitespace) {
+        return vec![raw.to_string()];
+    }
+
+    let fragments = raw
+        .split_whitespace()
+        .filter(|fragment| !fragment.is_empty())
+        .collect::<Vec<_>>();
+    if fragments.len() < 2 {
+        return vec![raw.to_string()];
+    }
+
+    let existing = fragments
+        .iter()
+        .filter(|fragment| search_path_exists(project_root, fragment))
+        .map(|fragment| (*fragment).to_string())
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        vec![raw.to_string()]
+    } else {
+        existing
+    }
+}
+
+fn resolve_grep_path_arg(project_root: &Path, raw: &str) -> String {
+    split_search_path_arg(project_root, raw)
+        .iter()
+        .map(|target| {
+            resolve_path_from_project_root(project_root, target)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn translate_search(args: &Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let query = map_in
         .get("query")
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| invalid_request("semantic_search: missing required param 'query'"))?;
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            invalid_request("semantic_search: invalid params: `query` must be a non-empty string")
+        })?;
 
     let mut out = Map::new();
     out.insert("query".to_string(), Value::String(query.to_string()));
-    let top_k = coerce_optional_int(map_in.get("topK"), 1, 100).unwrap_or(10);
+    let top_k = coerce_optional_int_result(map_in.get("topK"), "topK", 1, 100)?.unwrap_or(10);
     out.insert("top_k".to_string(), Value::Number(top_k.into()));
     if let Some(hint) = map_in.get("hint") {
         if !is_empty_param(hint) {
@@ -391,16 +565,6 @@ fn translate_outline(args: &Value, project_root: &Path) -> Result<Translated, Tr
     }
 
     let mut out = Map::new();
-
-    if let Some(url) = target.as_str() {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            out.insert("file".to_string(), Value::String(url.to_string()));
-            return Ok(Translated {
-                command: "outline".into(),
-                args: out,
-            });
-        }
-    }
 
     if let Some(arr) = target.as_array() {
         if arr.is_empty() {
@@ -437,6 +601,16 @@ fn translate_outline(args: &Value, project_root: &Path) -> Result<Translated, Tr
             command: "outline".into(),
             args: out,
         });
+    }
+
+    if let Some(url) = target.as_str() {
+        if !files_flag && (url.starts_with("http://") || url.starts_with("https://")) {
+            out.insert("file".to_string(), Value::String(url.to_string()));
+            return Ok(Translated {
+                command: "outline".into(),
+                args: out,
+            });
+        }
     }
 
     let target_str = target.as_str().ok_or_else(|| {
@@ -517,7 +691,7 @@ fn translate_inspect(args: &Value, project_root: &Path) -> Result<Translated, Tr
         }
     }
 
-    if let Some(top_k) = coerce_optional_int(map_in.get("topK"), 1, 100) {
+    if let Some(top_k) = coerce_optional_int_result(map_in.get("topK"), "topK", 1, 100)? {
         out.insert("topK".to_string(), Value::Number(top_k.into()));
     }
 

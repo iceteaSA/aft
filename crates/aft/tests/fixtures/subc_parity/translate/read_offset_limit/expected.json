@@ -1,0 +1,8 @@
+{
+  "args": {
+    "end_line": 4,
+    "file": "<PROJECT_ROOT>/README.md",
+    "start_line": 2
+  },
+  "command": "read"
+}

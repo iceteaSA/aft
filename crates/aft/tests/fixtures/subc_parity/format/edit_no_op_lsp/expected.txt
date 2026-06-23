@@ -1,0 +1,10 @@
+Edited (+0/-0).
+
+Note: formatter skipped some glob edit result file(s): error, timeout. See per-file format_skipped_reason values for details.
+
+Note: no net file change — the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.
+
+LSP errors detected, please fix:
+  Line 2: bad
+
+Note: LSP server(s) did not respond in time: typescript. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.

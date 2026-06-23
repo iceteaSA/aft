@@ -1,0 +1,9 @@
+{
+  "agent_args": {
+    "filePath": "src/../README.md",
+    "limit": 3,
+    "offset": 2
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "read"
+}

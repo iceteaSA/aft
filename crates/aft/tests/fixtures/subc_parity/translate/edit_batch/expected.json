@@ -1,0 +1,16 @@
+{
+  "args": {
+    "diagnostics": false,
+    "edits": [
+      {
+        "line_end": 1,
+        "line_start": 1,
+        "match": "value",
+        "replacement": "answer"
+      }
+    ],
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "include_diff_content": true
+  },
+  "command": "batch"
+}

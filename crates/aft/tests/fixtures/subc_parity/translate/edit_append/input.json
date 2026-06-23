@@ -1,0 +1,9 @@
+{
+  "agent_args": {
+    "appendContent": "\nexport {};\n",
+    "filePath": "src/main.ts"
+  },
+  "diagnostics_on_edit": true,
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "edit"
+}

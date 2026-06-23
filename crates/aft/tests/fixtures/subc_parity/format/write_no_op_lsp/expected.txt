@@ -1,0 +1,9 @@
+File updated. Auto-formatted. No net change — the written content is byte-identical to what was already on disk.
+
+LSP errors detected, please fix:
+  Line 3: Type mismatch
+
+
+Note: LSP server(s) did not respond in time: typescript. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.
+
+Note: LSP server(s) exited during this edit: eslint. Their diagnostics could not be collected.

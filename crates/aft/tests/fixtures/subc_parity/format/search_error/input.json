@@ -1,0 +1,15 @@
+{
+  "tool_name": "search",
+  "native_response_json": {
+    "id": "1",
+    "success": false,
+    "code": "semantic_unavailable",
+    "message": "semantic index unavailable"
+  },
+  "ctx": {
+    "agent_args": {
+      "query": "value"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

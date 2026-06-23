@@ -1,0 +1,7 @@
+{
+  "args": {
+    "file": "<PROJECT_ROOT>/https:/example.com/doc",
+    "files": true
+  },
+  "command": "outline"
+}

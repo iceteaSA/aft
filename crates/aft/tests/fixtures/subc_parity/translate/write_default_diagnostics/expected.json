@@ -1,0 +1,10 @@
+{
+  "args": {
+    "content": "export {};\n",
+    "create_dirs": true,
+    "diagnostics": false,
+    "file": "<PROJECT_ROOT>/src/new.ts",
+    "include_diff_content": true
+  },
+  "command": "write"
+}

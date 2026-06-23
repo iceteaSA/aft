@@ -1,0 +1,17 @@
+{
+  "tool_name": "search",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "more_available": true,
+    "engine_capped": true,
+    "fully_degraded": true,
+    "complete": false
+  },
+  "ctx": {
+    "agent_args": {
+      "query": "value"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

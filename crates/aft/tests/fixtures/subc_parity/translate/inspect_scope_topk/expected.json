@@ -1,0 +1,13 @@
+{
+  "args": {
+    "scope": [
+      "<PROJECT_ROOT>/src",
+      "<PROJECT_ROOT>/docs"
+    ],
+    "sections": [
+      "diagnostics"
+    ],
+    "topK": 5
+  },
+  "command": "inspect"
+}

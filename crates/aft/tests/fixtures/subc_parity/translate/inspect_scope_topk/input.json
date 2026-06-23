@@ -1,0 +1,14 @@
+{
+  "agent_args": {
+    "scope": [
+      "src",
+      "docs"
+    ],
+    "sections": [
+      "diagnostics"
+    ],
+    "topK": 5
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "inspect"
+}

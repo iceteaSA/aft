@@ -1,255 +1,140 @@
-//! Golden parity tests for subc_format::format_response (TS formatter reference).
+#![cfg(unix)]
+
+//! Cross-language parity gate for subc native responses -> agent-facing text.
+//!
+//! Feeds the golden fixtures captured from the current TypeScript OpenCode tool
+//! wrappers (`scripts/capture-subc-parity.ts`) through `aft::subc_format` and
+//! asserts the rendered text matches byte-for-byte.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use aft::protocol::Response;
-use aft::subc_format::format_response;
-use serde_json::json;
+use aft::subc_format::{format_response_with_context, FormatContext};
+use serde::Deserialize;
+use serde_json::Value;
 
-fn ok(id: &str, data: serde_json::Value) -> Response {
-    Response::success(id, data)
+static PROJECT_FIXTURE: Once = Once::new();
+const PROJECT_ROOT_TOKEN: &str = "<PROJECT_ROOT>";
+
+#[derive(Debug, Deserialize)]
+struct FormatFixture {
+    tool_name: String,
+    native_response_json: Value,
+    ctx: FormatFixtureContext,
 }
 
-fn err(id: &str, code: &str, message: &str) -> Response {
-    Response::error(id, code, message)
+#[derive(Debug, Deserialize)]
+struct FormatFixtureContext {
+    agent_args: Value,
+    project_root: String,
 }
 
-#[test]
-fn edit_rolled_back() {
-    let r = ok(
-        "1",
-        json!({ "rolled_back": true, "replacements": 1, "diff": { "additions": 1, "deletions": 1 } }),
-    );
-    assert_eq!(
-        format_response("edit", &r, false),
-        "Edit rolled back: the change produced invalid syntax, so the file was left unchanged."
-    );
+fn fixtures_root() -> PathBuf {
+    crate::helpers::cargo_manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("subc_parity")
+        .join("format")
 }
 
-#[test]
-fn edit_files_modified_plural() {
-    let r = ok("1", json!({ "files_modified": 3 }));
-    assert_eq!(
-        format_response("edit", &r, false),
-        "Applied edits to 3 files."
-    );
+fn setup_project_fixture(root: &Path) {
+    PROJECT_FIXTURE.call_once(|| {
+        fs::create_dir_all(root.join("src")).expect("create src fixture dir");
+        fs::write(root.join("src/main.ts"), "const value = 1;\n").expect("write main fixture");
+    });
 }
 
-#[test]
-fn edit_glob_total_files() {
-    let r = ok("1", json!({ "total_files": 3, "total_replacements": 7 }));
-    assert_eq!(
-        format_response("edit", &r, false),
-        "Edited 3 files (7 replacements)."
-    );
+fn fixture_project_root() -> PathBuf {
+    std::env::temp_dir().join("aft-subc-parity").join("project")
 }
 
-#[test]
-fn write_created_with_counts() {
-    let r = ok(
-        "1",
-        json!({ "created": true, "diff": { "additions": 10, "deletions": 0 } }),
-    );
-    assert_eq!(
-        format_response("write", &r, false),
-        "Created file (+10/-0)."
-    );
+fn project_root_for_input(raw: &str) -> PathBuf {
+    if raw == PROJECT_ROOT_TOKEN {
+        fixture_project_root()
+    } else {
+        PathBuf::from(raw)
+    }
 }
 
-#[test]
-fn edit_plain_with_edits_applied() {
-    let r = ok(
-        "1",
-        json!({ "edits_applied": 2, "diff": { "additions": 4, "deletions": 1 } }),
-    );
-    assert_eq!(
-        format_response("edit", &r, false),
-        "Edited (+4/-1, 2 edits)."
-    );
+fn replace_project_root(text: String, project_root: &Path) -> String {
+    text.replace(
+        &project_root.to_string_lossy().to_string(),
+        PROJECT_ROOT_TOKEN,
+    )
 }
 
-#[test]
-fn edit_replacements_gt_one() {
-    let r = ok(
-        "1",
-        json!({ "replacements": 3, "diff": { "additions": 3, "deletions": 0 } }),
-    );
-    assert_eq!(
-        format_response("edit", &r, false),
-        "Edited (+3/-0, 3 replacements)."
-    );
+fn response_from_flattened(value: Value) -> Response {
+    let obj = value
+        .as_object()
+        .unwrap_or_else(|| panic!("native_response_json must be an object"));
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "fixture".to_string());
+    let success = obj.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+    let mut data = serde_json::Map::new();
+    for (key, value) in obj {
+        if key != "id" && key != "success" {
+            data.insert(key.clone(), value.clone());
+        }
+    }
+    Response {
+        id,
+        success,
+        data: Value::Object(data),
+    }
 }
 
-#[test]
-fn edit_formatted_reformatted_text() {
-    let r = ok(
-        "1",
-        json!({
-            "replacements": 1,
-            "formatted": true,
-            "diff": { "additions": 2, "deletions": 1 },
-            "reformatted": { "text": "fn main() {\n    let x = 1;\n}" }
-        }),
-    );
-    let out = format_response("edit", &r, false);
-    assert!(out.contains("reflowed your edit"));
-    assert!(out.contains("fn main()"));
-    assert!(!out.ends_with(" Auto-formatted."));
-}
+fn assert_case(dir: &Path) -> Option<String> {
+    let case = dir.file_name().unwrap().to_string_lossy().to_string();
+    let input: FormatFixture =
+        serde_json::from_str(&fs::read_to_string(dir.join("input.json")).expect("read input.json"))
+            .expect("parse input.json");
+    let project_root = project_root_for_input(&input.ctx.project_root);
+    setup_project_fixture(&project_root);
 
-#[test]
-fn edit_formatted_extensive() {
-    let r = ok(
-        "1",
-        json!({
-            "replacements": 1,
-            "formatted": true,
-            "diff": { "additions": 1, "deletions": 1 },
-            "reformatted": { "extensive": true }
-        }),
+    let response = response_from_flattened(input.native_response_json);
+    let ctx = FormatContext::from_tool_call(&input.tool_name, &input.ctx.agent_args, &project_root);
+    let actual = replace_project_root(
+        format_response_with_context(&input.tool_name, &response, &ctx),
+        &project_root,
     );
-    assert_eq!(
-        format_response("edit", &r, false),
-        "Edited (+1/-1). Auto-formatted — extensive reflow; re-read the file before your next anchored edit."
-    );
+    let expected = fs::read_to_string(dir.join("expected.txt")).expect("read expected.txt");
+    if actual == expected {
+        None
+    } else {
+        Some(format!(
+            "case `{case}`:\n  actual:\n{actual}\n  expected:\n{expected}"
+        ))
+    }
 }
 
 #[test]
-fn edit_formatted_plain_suffix() {
-    let r = ok(
-        "1",
-        json!({
-            "replacements": 1,
-            "formatted": true,
-            "diff": { "additions": 1, "deletions": 1 }
-        }),
-    );
-    assert_eq!(
-        format_response("edit", &r, false),
-        "Edited (+1/-1). Auto-formatted."
-    );
-}
+fn subc_format_matches_typescript_golden_fixtures() {
+    let root = fixtures_root();
+    let mut cases: Vec<PathBuf> = fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read fixtures dir {}: {e}", root.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    cases.sort();
 
-#[test]
-fn read_directory_entries() {
-    let r = ok("1", json!({ "entries": ["src/", "Cargo.toml"] }));
-    assert_eq!(format_response("read", &r, false), "src/\nCargo.toml");
-}
+    assert!(
+        cases.len() >= 20,
+        "expected >=20 format parity fixtures, found {}",
+        cases.len()
+    );
 
-#[test]
-fn read_binary_message() {
-    let r = ok(
-        "1",
-        json!({ "binary": true, "message": "Binary file (42 bytes), cannot display as text" }),
+    let failures = cases
+        .iter()
+        .filter_map(|dir| assert_case(dir))
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "{} format parity mismatch(es):\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
     );
-    assert_eq!(
-        format_response("read", &r, false),
-        "Binary file (42 bytes), cannot display as text"
-    );
-}
-
-#[test]
-fn read_truncated_footer_when_agent_did_not_specify_range() {
-    let r = ok(
-        "1",
-        json!({
-            "content": "1: line\n",
-            "truncated": true,
-            "start_line": 1,
-            "end_line": 100,
-            "total_lines": 500
-        }),
-    );
-    assert_eq!(
-        format_response("read", &r, false),
-        "1: line\n\n(Showing lines 1-100 of 500. Use startLine/endLine to read other sections.)"
-    );
-}
-
-#[test]
-fn read_no_footer_when_agent_specified_range() {
-    let r = ok(
-        "1",
-        json!({
-            "content": "1: line\n",
-            "truncated": true,
-            "start_line": 1,
-            "end_line": 100,
-            "total_lines": 500
-        }),
-    );
-    assert_eq!(format_response("read", &r, true), "1: line\n");
-}
-
-#[test]
-fn search_text_plus_honesty_note() {
-    let r = ok(
-        "1",
-        json!({
-            "text": "1. foo.rs:10 — bar",
-            "fully_degraded": true,
-            "complete": false
-        }),
-    );
-    assert_eq!(
-        format_response("search", &r, false),
-        "1. foo.rs:10 — bar\nSearch status: fully degraded; partial/incomplete."
-    );
-}
-
-#[test]
-fn inspect_text_plus_diagnostics() {
-    let r = ok(
-        "1",
-        json!({
-            "text": "todos: 2",
-            "summary": { "diagnostics": { "errors": 1, "warnings": 2, "info": 0, "hints": 0 } },
-            "details": {
-                "diagnostics": [
-                    {
-                        "file": "a.rs",
-                        "line": 1,
-                        "column": 2,
-                        "severity": "error",
-                        "message": "boom",
-                        "source": "rustc"
-                    }
-                ]
-            }
-        }),
-    );
-    let out = format_response("inspect", &r, false);
-    assert!(out.starts_with("todos: 2"));
-    assert!(out.contains("diagnostics: 1 errors, 2 warnings, 0 info, 0 hints"));
-    assert!(out.contains("a.rs:1:2 error boom [rustc]"));
-}
-
-#[test]
-fn outline_partial_footer() {
-    let r = ok(
-        "1",
-        json!({
-            "text": "tree",
-            "complete": false,
-            "unchecked_files": ["z.rs"]
-        }),
-    );
-    assert_eq!(
-        format_response("outline", &r, false),
-        "tree\n\n⚠ Partial result: 1 files in this directory were not indexed.\nUnchecked files:\n  z.rs"
-    );
-}
-
-#[test]
-fn status_text_passthrough() {
-    let r = ok("1", json!({ "text": "indexes ready" }));
-    assert_eq!(format_response("status", &r, false), "indexes ready");
-}
-
-#[test]
-fn error_code_and_message_not_json() {
-    let r = err("1", "invalid_request", "edit: missing filePath");
-    assert_eq!(
-        format_response("edit", &r, false),
-        "invalid_request: edit: missing filePath"
-    );
-    assert!(!format_response("edit", &r, false).contains('{'));
 }

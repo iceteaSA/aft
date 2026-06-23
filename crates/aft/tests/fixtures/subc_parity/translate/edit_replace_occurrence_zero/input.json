@@ -1,0 +1,10 @@
+{
+  "agent_args": {
+    "filePath": "src/main.ts",
+    "newString": "answer",
+    "occurrence": 0,
+    "oldString": "value"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "edit"
+}

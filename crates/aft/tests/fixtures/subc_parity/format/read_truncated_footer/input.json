@@ -1,0 +1,18 @@
+{
+  "tool_name": "read",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "content": "1: hello\n",
+    "truncated": true,
+    "start_line": 1,
+    "end_line": 100,
+    "total_lines": 250
+  },
+  "ctx": {
+    "agent_args": {
+      "filePath": "README.md"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

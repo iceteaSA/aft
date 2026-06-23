@@ -1,0 +1,6 @@
+{
+  "args": {
+    "file": "https://example.com/doc"
+  },
+  "command": "outline"
+}

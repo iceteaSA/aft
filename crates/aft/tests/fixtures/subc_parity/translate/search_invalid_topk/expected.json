@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "topK must be between 1 and 100"
+  }
+}

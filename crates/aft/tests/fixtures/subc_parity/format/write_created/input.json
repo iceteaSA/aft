@@ -1,0 +1,19 @@
+{
+  "tool_name": "write",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "created": true,
+    "diff": {
+      "additions": 1,
+      "deletions": 0
+    }
+  },
+  "ctx": {
+    "agent_args": {
+      "filePath": "src/new.ts",
+      "content": "export {};\n"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

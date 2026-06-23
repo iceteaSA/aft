@@ -1,0 +1,8 @@
+{
+  "agent_args": {
+    "files": true,
+    "target": "https://example.com/doc"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "outline"
+}

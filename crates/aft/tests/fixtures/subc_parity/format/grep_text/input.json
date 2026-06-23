@@ -1,0 +1,14 @@
+{
+  "tool_name": "grep",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "text": "src/main.ts:1: const value = 1;"
+  },
+  "ctx": {
+    "agent_args": {
+      "pattern": "value"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

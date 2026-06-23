@@ -1,0 +1,15 @@
+{
+  "agent_args": {
+    "edits": [
+      {
+        "endLine": 1,
+        "newString": "answer",
+        "oldString": "value",
+        "startLine": 1
+      }
+    ],
+    "filePath": "src/main.ts"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "edit"
+}

@@ -1,231 +1,168 @@
-//! Golden parity tests: agent-facing args → native (command, args).
+#![cfg(unix)]
 
-use std::path::PathBuf;
+//! Cross-language parity gate for subc agent args -> native command translation.
+//!
+//! Feeds the golden fixtures captured from the current TypeScript OpenCode tool
+//! wrappers (`scripts/capture-subc-parity.ts`) through `aft::subc_translate` and
+//! asserts the native command payload matches byte-for-byte after deterministic
+//! JSON key sorting.
 
-use aft::subc_translate::subc_translate;
-use serde_json::{json, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
 
-fn root() -> PathBuf {
-    PathBuf::from("/tmp/subc-parity-root")
+use aft::subc_translate::{subc_translate_with_context, TranslateContext};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+
+static PROJECT_FIXTURE: Once = Once::new();
+const PROJECT_ROOT_TOKEN: &str = "<PROJECT_ROOT>";
+
+#[derive(Debug, Deserialize)]
+struct TranslateInput {
+    tool_name: String,
+    agent_args: Value,
+    project_root: String,
+    diagnostics_on_edit: Option<bool>,
 }
 
-/// Expected resolved path for a project-root-relative arg, built with the same
-/// `Path::join` the translator uses so the separator matches the host OS
-/// (forward slash on Unix, backslash on Windows).
-fn expected_resolved(rel: &str) -> String {
-    root().join(rel).to_string_lossy().into_owned()
+fn fixtures_root() -> PathBuf {
+    crate::helpers::cargo_manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("subc_parity")
+        .join("translate")
 }
 
-fn assert_edit_error(args: Value, fragment: &str) {
-    let err = subc_translate("edit", &args, &root()).unwrap_err();
-    assert_eq!(err.code, "invalid_request");
+fn setup_project_fixture(root: &Path) {
+    PROJECT_FIXTURE.call_once(|| {
+        fs::create_dir_all(root.join("src")).expect("create src fixture dir");
+        fs::create_dir_all(root.join("docs")).expect("create docs fixture dir");
+        fs::create_dir_all(root.join("packages/app")).expect("create package fixture dir");
+        fs::write(root.join("README.md"), "# parity\n").expect("write README fixture");
+        fs::write(root.join("src/main.ts"), "const value = 1;\n").expect("write main fixture");
+        fs::write(root.join("docs/guide.md"), "# guide\n").expect("write docs fixture");
+        fs::write(
+            root.join("packages/app/index.tsx"),
+            "export const App = () => null;\n",
+        )
+        .expect("write app fixture");
+    });
+}
+
+fn fixture_project_root() -> PathBuf {
+    std::env::temp_dir().join("aft-subc-parity").join("project")
+}
+
+fn project_root_for_input(raw: &str) -> PathBuf {
+    if raw == PROJECT_ROOT_TOKEN {
+        fixture_project_root()
+    } else {
+        PathBuf::from(raw)
+    }
+}
+
+fn replace_project_root(value: Value, project_root: &Path) -> Value {
+    let root = project_root.to_string_lossy();
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| replace_project_root(item, project_root))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, value) in map {
+                out.insert(key, replace_project_root(value, project_root));
+            }
+            Value::Object(out)
+        }
+        Value::String(s) => Value::String(s.replace(root.as_ref(), PROJECT_ROOT_TOKEN)),
+        other => other,
+    }
+}
+
+fn sort_value(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_value).collect()),
+        Value::Object(map) => {
+            let mut sorted = Map::new();
+            let mut entries = map.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (key, value) in entries {
+                sorted.insert(key, sort_value(value));
+            }
+            Value::Object(sorted)
+        }
+        other => other,
+    }
+}
+
+fn pretty_sorted(value: Value) -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&sort_value(value)).expect("serialize sorted JSON")
+    )
+}
+
+fn assert_case(dir: &Path) -> Option<String> {
+    let case = dir.file_name().unwrap().to_string_lossy().to_string();
+    let input: TranslateInput =
+        serde_json::from_str(&fs::read_to_string(dir.join("input.json")).expect("read input.json"))
+            .expect("parse input.json");
+    let project_root = project_root_for_input(&input.project_root);
+    setup_project_fixture(&project_root);
+
+    let ctx = TranslateContext {
+        diagnostics_on_edit: input.diagnostics_on_edit.unwrap_or(false),
+    };
+    let actual = match subc_translate_with_context(
+        &input.tool_name,
+        &input.agent_args,
+        &project_root,
+        ctx,
+    ) {
+        Ok(t) => json!({ "command": t.command, "args": t.args }),
+        Err(err) => json!({ "error": { "code": err.code, "message": err.message } }),
+    };
+    let actual = pretty_sorted(replace_project_root(actual, &project_root));
+    let expected = fs::read_to_string(dir.join("expected.json")).expect("read expected.json");
+    if actual == expected {
+        None
+    } else {
+        Some(format!(
+            "case `{case}`:\n  actual:\n{actual}\n  expected:\n{expected}"
+        ))
+    }
+}
+
+#[test]
+fn subc_translate_matches_typescript_golden_fixtures() {
+    let root = fixtures_root();
+    let mut cases: Vec<PathBuf> = fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read fixtures dir {}: {e}", root.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    cases.sort();
+
     assert!(
-        err.message.contains(fragment),
-        "expected {fragment:?} in {}",
-        err.message
+        cases.len() >= 19,
+        "expected >=19 translate parity fixtures, found {}",
+        cases.len()
     );
-}
 
-#[test]
-fn status_empty_args() {
-    let t = subc_translate("status", &json!({}), &root()).unwrap();
-    assert_eq!(t.command, "status");
-    assert!(t.args.is_empty());
-}
-
-#[test]
-fn read_offset_limit_normalizes_to_start_end_line() {
-    let t = subc_translate(
-        "read",
-        &json!({ "filePath": "a.rs", "offset": 10, "limit": 5 }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(t.command, "read");
-    assert_eq!(
-        t.args.get("file").and_then(Value::as_str).unwrap(),
-        expected_resolved("a.rs")
+    let failures = cases
+        .iter()
+        .filter_map(|dir| assert_case(dir))
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "{} translate parity mismatch(es):\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
     );
-    assert_eq!(t.args.get("start_line").and_then(Value::as_u64), Some(10));
-    assert_eq!(t.args.get("end_line").and_then(Value::as_u64), Some(14));
-    assert!(t.args.get("limit").is_none());
-}
-
-#[test]
-fn read_limit_without_offset_forwards_limit() {
-    let t = subc_translate("read", &json!({ "filePath": "a.rs", "limit": 20 }), &root()).unwrap();
-    assert_eq!(t.args.get("limit").and_then(Value::as_u64), Some(20));
-    assert!(t.args.get("start_line").is_none());
-}
-
-#[test]
-fn edit_top_level_start_line_errors() {
-    assert_edit_error(
-        json!({ "filePath": "f", "startLine": 1, "oldString": "x" }),
-        "startLine",
-    );
-}
-
-#[test]
-fn edit_missing_file_path_errors() {
-    assert_edit_error(json!({ "oldString": "x" }), "'filePath' is required");
-}
-
-#[test]
-fn edit_append_content_routes_edit_match_append() {
-    let t = subc_translate(
-        "edit",
-        &json!({ "filePath": "n.txt", "appendContent": "line\n" }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(t.command, "edit_match");
-    assert_eq!(t.args.get("op").and_then(Value::as_str), Some("append"));
-    assert_eq!(
-        t.args.get("append_content").and_then(Value::as_str),
-        Some("line\n")
-    );
-    assert_eq!(
-        t.args.get("create_dirs").and_then(Value::as_bool),
-        Some(true)
-    );
-}
-
-#[test]
-fn edit_edits_array_routes_batch_with_key_translation() {
-    let t = subc_translate(
-        "edit",
-        &json!({
-            "filePath": "f.ts",
-            "edits": [{ "oldString": "a", "newString": "b", "startLine": 1, "endLine": 2 }]
-        }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(t.command, "batch");
-    let edits = t.args.get("edits").and_then(Value::as_array).unwrap();
-    let first = edits[0].as_object().unwrap();
-    assert_eq!(first.get("match").and_then(Value::as_str), Some("a"));
-    assert_eq!(first.get("replacement").and_then(Value::as_str), Some("b"));
-    assert_eq!(first.get("line_start").and_then(Value::as_u64), Some(1));
-    assert_eq!(first.get("line_end").and_then(Value::as_u64), Some(2));
-}
-
-#[test]
-fn edit_symbol_and_content_without_old_string() {
-    let t = subc_translate(
-        "edit",
-        &json!({ "filePath": "f.ts", "symbol": "foo", "content": "fn foo() {}" }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(t.command, "edit_symbol");
-    assert_eq!(
-        t.args.get("operation").and_then(Value::as_str),
-        Some("replace")
-    );
-}
-
-#[test]
-fn edit_symbol_with_old_string_wins_edit_match() {
-    let t = subc_translate(
-        "edit",
-        &json!({
-            "filePath": "f.ts",
-            "symbol": "foo",
-            "content": "ignored",
-            "oldString": "needle"
-        }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(t.command, "edit_match");
-    assert_eq!(t.args.get("match").and_then(Value::as_str), Some("needle"));
-    assert!(!t.args.contains_key("symbol"));
-}
-
-#[test]
-fn edit_old_string_only_default_replacement_empty() {
-    let t = subc_translate(
-        "edit",
-        &json!({ "filePath": "f.ts", "oldString": "x" }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(t.command, "edit_match");
-    assert_eq!(t.args.get("replacement").and_then(Value::as_str), Some(""));
-}
-
-#[test]
-fn edit_occurrence_zero_is_present() {
-    let t = subc_translate(
-        "edit",
-        &json!({ "filePath": "f.ts", "oldString": "x", "newString": "y", "occurrence": 0 }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(t.args.get("occurrence").and_then(Value::as_u64), Some(0));
-}
-
-#[test]
-fn edit_no_mode_errors() {
-    assert_edit_error(
-        json!({ "filePath": "f.ts", "content": "whole file" }),
-        "no edit mode resolved",
-    );
-}
-
-#[test]
-fn search_top_k_maps_to_top_k_default_10() {
-    let t = subc_translate("search", &json!({ "query": "foo" }), &root()).unwrap();
-    assert_eq!(t.command, "semantic_search");
-    assert_eq!(t.args.get("top_k").and_then(Value::as_u64), Some(10));
-    let t2 = subc_translate("search", &json!({ "query": "foo", "topK": 25 }), &root()).unwrap();
-    assert_eq!(t2.args.get("top_k").and_then(Value::as_u64), Some(25));
-}
-
-#[test]
-fn grep_path_resolves_relative() {
-    let t = subc_translate(
-        "grep",
-        &json!({ "pattern": "fn main", "path": "src" }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(
-        t.args.get("path").and_then(Value::as_str).unwrap(),
-        expected_resolved("src")
-    );
-}
-
-#[test]
-fn outline_url_passthrough() {
-    let t = subc_translate(
-        "outline",
-        &json!({ "target": "https://example.com/doc" }),
-        &root(),
-    )
-    .unwrap();
-    assert_eq!(
-        t.args.get("file").and_then(Value::as_str),
-        Some("https://example.com/doc")
-    );
-}
-
-#[test]
-fn outline_string_file_vs_directory_uses_stat() {
-    let dir = std::env::temp_dir().join(format!("subc_outline_dir_{}", std::process::id()));
-    let file = dir.join("one.rs");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(&file, "fn one() {}\n").unwrap();
-
-    let t_dir = subc_translate("outline", &json!({ "target": "." }), &dir).unwrap();
-    assert!(t_dir.args.contains_key("directory"));
-
-    let t_file = subc_translate("outline", &json!({ "target": "one.rs" }), &dir).unwrap();
-    assert!(t_file.args.contains_key("file"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

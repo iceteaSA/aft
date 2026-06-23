@@ -1,9 +1,80 @@
 //! Agent-facing text formatters for subc-mode tool results (parity with TS plugins).
 
+use std::path::Path;
+
 use crate::protocol::Response;
+use crate::subc_translate::resolve_path_from_project_root;
 use serde_json::Value;
 
 const MAX_UNCHECKED_FILES_IN_FOOTER: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineMode {
+    Text,
+    Files,
+    DirectoryJson,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatContext {
+    pub agent_specified_range: bool,
+    pub outline_mode: OutlineMode,
+}
+
+impl Default for FormatContext {
+    fn default() -> Self {
+        Self {
+            agent_specified_range: false,
+            outline_mode: OutlineMode::Text,
+        }
+    }
+}
+
+impl FormatContext {
+    pub fn from_tool_call(bare_name: &str, arguments: &Value, project_root: &Path) -> Self {
+        Self {
+            agent_specified_range: agent_specified_read_range(arguments),
+            outline_mode: outline_mode_for_call(bare_name, arguments, project_root),
+        }
+    }
+}
+
+fn agent_specified_read_range(arguments: &Value) -> bool {
+    let Some(obj) = arguments.as_object() else {
+        return false;
+    };
+    obj.contains_key("startLine")
+        || obj.contains_key("endLine")
+        || obj.contains_key("offset")
+        || obj.contains_key("limit")
+}
+
+fn outline_mode_for_call(bare_name: &str, arguments: &Value, project_root: &Path) -> OutlineMode {
+    if bare_name != "outline" {
+        return OutlineMode::Text;
+    }
+    let Some(obj) = arguments.as_object() else {
+        return OutlineMode::Text;
+    };
+    if obj.get("files").and_then(Value::as_bool) == Some(true) {
+        return OutlineMode::Files;
+    }
+    let Some(target) = obj.get("target").and_then(Value::as_str) else {
+        return OutlineMode::Text;
+    };
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return OutlineMode::Text;
+    }
+    let resolved = resolve_path_from_project_root(project_root, target);
+    if std::fs::metadata(resolved)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        OutlineMode::DirectoryJson
+    } else {
+        OutlineMode::Text
+    }
+}
 
 fn is_core_agent_tool(bare_name: &str) -> bool {
     matches!(
@@ -18,28 +89,43 @@ pub fn format_response(
     response: &Response,
     agent_specified_range: bool,
 ) -> String {
+    let ctx = FormatContext {
+        agent_specified_range,
+        ..FormatContext::default()
+    };
+    format_response_with_context(bare_name, response, &ctx)
+}
+
+/// Render the text block for a tool `CallToolResult` from the structured AFT `Response`.
+pub fn format_response_with_context(
+    bare_name: &str,
+    response: &Response,
+    ctx: &FormatContext,
+) -> String {
     if !is_core_agent_tool(bare_name) {
         return serde_json::to_string(response).unwrap_or_else(|_| "{}".to_string());
     }
 
     let data = &response.data;
     if !response.success {
-        return format_error(data);
+        return format_error(bare_name, data);
     }
 
     match bare_name {
-        "edit" | "write" => format_edit_summary(data),
-        "read" => format_read(data, agent_specified_range),
-        "grep" => field_text_or_fallback(data, "grep: no output"),
+        "edit" => format_edit_response(data),
+        "write" => format_write_response(data),
+        "read" => format_read(data, ctx.agent_specified_range),
+        "grep" => format_grep(data),
         "search" => format_search(data),
-        "outline" => format_outline(data),
-        "inspect" => format_inspect(data),
+        "outline" => format_outline(response, ctx.outline_mode),
+        "inspect" => format_inspect(response),
         "status" => format_status(data),
         _ => unreachable!("core agent tools are exhaustive"),
     }
 }
 
-fn format_error(data: &Value) -> String {
+// Mirrors per-tool OpenCode wrapper error handling in packages/opencode-plugin/src/tools/*.ts.
+fn format_error(bare_name: &str, data: &Value) -> String {
     let code = data
         .get("code")
         .and_then(Value::as_str)
@@ -49,20 +135,132 @@ fn format_error(data: &Value) -> String {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .unwrap_or("request failed");
-    match code {
-        Some(c) => format!("{c}: {message}"),
-        None => message.to_string(),
+    match (bare_name, code) {
+        ("search", Some(c)) => format!("semantic_search: {c} — {message}"),
+        _ => message.to_string(),
     }
 }
 
-fn field_text_or_fallback(data: &Value, fallback: &str) -> String {
-    data.get("text")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| fallback.to_string())
+// Mirrors packages/opencode-plugin/src/tools/hoisted.ts createWriteTool.
+fn format_write_response(data: &Value) -> String {
+    if data.get("rolled_back").and_then(Value::as_bool) == Some(true) {
+        return "Write rolled back: the content produced invalid syntax, so the file was left unchanged."
+            .to_string();
+    }
+
+    let mut output = if data.get("created").and_then(Value::as_bool) == Some(true) {
+        "Created new file.".to_string()
+    } else {
+        "File updated.".to_string()
+    };
+    if is_truthy_formatted(data) {
+        output.push_str(" Auto-formatted.");
+    }
+    if data.get("no_op").and_then(Value::as_bool) == Some(true) {
+        output.push_str(
+            " No net change — the written content is byte-identical to what was already on disk.",
+        );
+    }
+    append_lsp_error_lines(&mut output, data, true);
+    append_lsp_server_notes(&mut output, data);
+    output
 }
 
+// Mirrors packages/opencode-plugin/src/tools/hoisted.ts createEditTool.
+fn format_edit_response(data: &Value) -> String {
+    let mut result = format_edit_summary(data);
+
+    if let Some(note) = format_glob_skip_reasons_note(data.get("format_skip_reasons")) {
+        result.push_str("\n\n");
+        result.push_str(&note);
+    }
+    if data.get("no_op").and_then(Value::as_bool) == Some(true) {
+        result.push_str(
+            "\n\nNote: no net file change — the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.",
+        );
+    }
+    append_lsp_error_lines(&mut result, data, false);
+    append_lsp_server_notes(&mut result, data);
+    result
+}
+
+fn format_glob_skip_reasons_note(reasons: Option<&Value>) -> Option<String> {
+    let actionable = reasons?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|reason| {
+            matches!(
+                *reason,
+                "formatter_not_installed" | "formatter_excluded_path" | "timeout" | "error"
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if actionable.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Note: formatter skipped some glob edit result file(s): {}. See per-file format_skipped_reason values for details.",
+            actionable.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
+fn append_lsp_error_lines(output: &mut String, data: &Value, trailing_newline: bool) {
+    let errors = data
+        .get("lsp_diagnostics")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|d| d.get("severity").and_then(Value::as_str) == Some("error"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if errors.is_empty() {
+        return;
+    }
+
+    output.push_str("\n\nLSP errors detected, please fix:\n");
+    let lines = errors
+        .iter()
+        .map(|d| {
+            let line = d
+                .get("line")
+                .and_then(Value::as_u64)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "undefined".to_string());
+            let message = d
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("undefined");
+            format!("  Line {line}: {message}")
+        })
+        .collect::<Vec<_>>();
+    output.push_str(&lines.join("\n"));
+    if trailing_newline {
+        output.push('\n');
+    }
+}
+
+fn append_lsp_server_notes(output: &mut String, data: &Value) {
+    let pending = string_array(data.get("lsp_pending_servers"));
+    if !pending.is_empty() {
+        output.push_str(&format!(
+            "\n\nNote: LSP server(s) did not respond in time: {}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.",
+            pending.join(", ")
+        ));
+    }
+    let exited = string_array(data.get("lsp_exited_servers"));
+    if !exited.is_empty() {
+        output.push_str(&format!(
+            "\n\nNote: LSP server(s) exited during this edit: {}. Their diagnostics could not be collected.",
+            exited.join(", ")
+        ));
+    }
+}
+
+// Mirrors packages/aft-bridge/src/edit-summary.ts formatEditSummary.
 fn format_edit_summary(data: &Value) -> String {
     if data.get("rolled_back").and_then(Value::as_bool) == Some(true) {
         return "Edit rolled back: the change produced invalid syntax, so the file was left unchanged."
@@ -161,6 +359,7 @@ fn format_auto_formatted_suffix(data: &Value) -> String {
     " Auto-formatted.".to_string()
 }
 
+// Mirrors packages/opencode-plugin/src/tools/hoisted.ts createReadTool.
 fn format_read(data: &Value, agent_specified_range: bool) -> String {
     if let Some(entries) = data.get("entries").and_then(Value::as_array) {
         return entries
@@ -209,6 +408,54 @@ fn format_read_footer(agent_specified_range: bool, data: &Value) -> String {
     }
 }
 
+// Mirrors packages/opencode-plugin/src/tools/search.ts formatGrepOutput.
+fn format_grep(data: &Value) -> String {
+    if let Some(text) = data.get("text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+
+    let matches = data
+        .get("matches")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total_matches = data
+        .get("total_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or(matches.len() as u64);
+    let files_with_matches = data
+        .get("files_with_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            matches
+                .iter()
+                .filter_map(|m| m.get("file").and_then(Value::as_str))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len() as u64
+        });
+
+    if matches.is_empty() {
+        return format!("Found {total_matches} match across {files_with_matches} file");
+    }
+
+    let body = matches
+        .iter()
+        .map(|m| {
+            let file = m.get("file").and_then(Value::as_str).unwrap_or("unknown");
+            let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let text = m
+                .get("line_text")
+                .or_else(|| m.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!("{file}:{line}: {text}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{body}\n\nFound {total_matches} match across {files_with_matches} file")
+}
+
+// Mirrors packages/opencode-plugin/src/tools/semantic.ts semanticTools.
 fn format_search(data: &Value) -> String {
     let note = extra_honesty_note(data);
     if let Some(text) = data
@@ -221,7 +468,28 @@ fn format_search(data: &Value) -> String {
             None => text.to_string(),
         };
     }
-    note.unwrap_or_else(|| "No results.".to_string())
+    semantic_honesty_note(data).unwrap_or_else(|| "No results.".to_string())
+}
+
+fn semantic_honesty_note(data: &Value) -> Option<String> {
+    let mut notes = Vec::new();
+    if data.get("more_available").and_then(Value::as_bool) == Some(true) {
+        notes.push("more results available");
+    }
+    if data.get("engine_capped").and_then(Value::as_bool) == Some(true) {
+        notes.push("enumeration capped");
+    }
+    if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
+        notes.push("fully degraded");
+    }
+    if data.get("complete").and_then(Value::as_bool) == Some(false) {
+        notes.push("partial/incomplete");
+    }
+    if notes.is_empty() {
+        None
+    } else {
+        Some(format!("Search status: {}.", notes.join("; ")))
+    }
 }
 
 fn extra_honesty_note(data: &Value) -> Option<String> {
@@ -239,7 +507,19 @@ fn extra_honesty_note(data: &Value) -> Option<String> {
     }
 }
 
-fn format_outline(data: &Value) -> String {
+// Mirrors packages/opencode-plugin/src/tools/reading.ts aft_outline dispatch.
+fn format_outline(response: &Response, mode: OutlineMode) -> String {
+    match mode {
+        OutlineMode::Text => format_outline_text(&response.data),
+        OutlineMode::Files => format_outline_files_text(&response.data),
+        OutlineMode::DirectoryJson => {
+            serde_json::to_string_pretty(response).unwrap_or_else(|_| "{}".to_string())
+        }
+    }
+}
+
+// Mirrors packages/opencode-plugin/src/tools/reading.ts formatOutlineFilesText.
+fn format_outline_files_text(data: &Value) -> String {
     let text = format_outline_text(data);
     let unchecked: Vec<String> = data
         .get("unchecked_files")
@@ -336,21 +616,21 @@ fn format_outline_text(data: &Value) -> String {
     )
 }
 
-fn format_inspect(data: &Value) -> String {
-    let text = data.get("text").and_then(Value::as_str).unwrap_or("");
-    append_rendered_diagnostics(text, data)
+// Mirrors packages/opencode-plugin/src/tools/inspect.ts inspectTools.
+fn format_inspect(response: &Response) -> String {
+    if let Some(text) = response.data.get("text").and_then(Value::as_str) {
+        return append_rendered_diagnostics(text, &response.data);
+    }
+    let json = serde_json::to_string_pretty(response).unwrap_or_else(|_| "{}".to_string());
+    append_rendered_diagnostics(&json, &response.data)
 }
 
+// Mirrors packages/opencode-plugin/src/tools/inspect.ts appendRenderedDiagnostics.
 fn append_rendered_diagnostics(text: &str, data: &Value) -> String {
-    if text
-        .lines()
-        .next()
-        .map(|line| {
-            let lower = line.to_lowercase();
-            lower.starts_with("diagnostics:") || lower.starts_with("diagnostics ")
-        })
-        .unwrap_or(false)
-    {
+    if text.lines().any(|line| {
+        let lower = line.to_lowercase();
+        lower.starts_with("diagnostics:") || lower.starts_with("diagnostics ")
+    }) {
         return text.to_string();
     }
     let diagnostics = render_inspect_diagnostics(data);
@@ -508,6 +788,7 @@ fn format_diagnostic_location(d: &serde_json::Map<String, Value>) -> String {
     }
 }
 
+// Status has no TypeScript wrapper; this mirrors the subc bare status fallback.
 fn format_status(data: &Value) -> String {
     if let Some(text) = data
         .get("text")

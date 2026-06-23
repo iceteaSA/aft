@@ -1,0 +1,1 @@
+Write rolled back: the content produced invalid syntax, so the file was left unchanged.

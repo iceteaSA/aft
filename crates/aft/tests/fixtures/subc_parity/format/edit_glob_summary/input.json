@@ -1,0 +1,18 @@
+{
+  "tool_name": "edit",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "total_files": 2,
+    "total_replacements": 3
+  },
+  "ctx": {
+    "agent_args": {
+      "filePath": "src/**/*.ts",
+      "oldString": "value",
+      "newString": "answer",
+      "replaceAll": true
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

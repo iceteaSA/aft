@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
+use crate::config_resolve::ConfigTier;
 use crate::context::{App, AppContext, ProgressSender};
 use crate::executor::{Executor, Lane};
 use crate::log_ctx;
@@ -79,6 +80,7 @@ struct PushSenders {
 struct RootMeta {
     maintenance_pending: bool,
     last_touched: Instant,
+    diagnostics_on_edit: bool,
 }
 
 #[derive(Debug)]
@@ -95,6 +97,7 @@ struct RouteBindCompletion {
     inserted_new_actor: bool,
     configure_response: Response,
     drain_response: Option<Response>,
+    diagnostics_on_edit: bool,
     ver: u8,
     corr: u64,
     flags: Flags,
@@ -156,6 +159,7 @@ impl RootMeta {
         Self {
             maintenance_pending: false,
             last_touched: now,
+            diagnostics_on_edit: false,
         }
     }
 
@@ -1394,8 +1398,14 @@ async fn handle_route_bind_completion(
     insert_route_channel(routes, root_channels, route_id, completion.identity);
     live_roots
         .entry(completion.bind_root_id.clone())
-        .and_modify(RootMeta::touch)
+        .and_modify(|meta| {
+            meta.touch();
+            meta.diagnostics_on_edit = completion.diagnostics_on_edit;
+        })
         .or_insert_with(|| RootMeta::new(Instant::now()));
+    if let Some(meta) = live_roots.get_mut(&completion.bind_root_id) {
+        meta.diagnostics_on_edit = completion.diagnostics_on_edit;
+    }
 
     let ack =
         serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
@@ -1504,6 +1514,7 @@ async fn handle_control_request(
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
                 .collect();
+            let diagnostics_on_edit = diagnostics_on_edit_from_tiers(&local_tiers);
             let configure_json = json!({
                 "id": request_id,
                 "command": "configure",
@@ -1620,6 +1631,7 @@ async fn handle_control_request(
                     inserted_new_actor,
                     configure_response,
                     drain_response,
+                    diagnostics_on_edit,
                     ver: completion_ver,
                     corr: completion_corr,
                     flags: completion_flags,
@@ -1658,6 +1670,137 @@ fn install_bash_compressor(ctx: &AppContext) {
             )
         },
     );
+}
+
+fn diagnostics_on_edit_from_tiers(tiers: &[ConfigTier]) -> bool {
+    let mut diagnostics_on_edit = false;
+    for tier in tiers {
+        if let Some(value) = diagnostics_on_edit_from_doc(&tier.doc) {
+            diagnostics_on_edit = value;
+        }
+    }
+    diagnostics_on_edit
+}
+
+fn diagnostics_on_edit_from_doc(doc: &str) -> Option<bool> {
+    let stripped = strip_jsonc_for_subc(doc);
+    let value = serde_json::from_str::<Value>(&stripped).ok()?;
+    value
+        .get("lsp")
+        .and_then(Value::as_object)?
+        .get("diagnostics_on_edit")
+        .and_then(Value::as_bool)
+}
+
+fn strip_jsonc_for_subc(source: &str) -> String {
+    strip_trailing_commas_for_subc(&strip_jsonc_comments_for_subc(source))
+}
+
+fn strip_jsonc_comments_for_subc(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+            continue;
+        }
+
+        if ch == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut previous = '\0';
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            output.push('\n');
+                        }
+                        if previous == '*' && next == '/' {
+                            break;
+                        }
+                        previous = next;
+                    }
+                }
+                _ => output.push(ch),
+            }
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn strip_trailing_commas_for_subc(source: &str) -> String {
+    let chars = source.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(source.len());
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+
+        if ch == ',' {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].is_whitespace() {
+                next += 1;
+            }
+            if next < chars.len() && matches!(chars[next], '}' | ']') {
+                index += 1;
+                continue;
+            }
+        }
+
+        output.push(ch);
+        index += 1;
+    }
+
+    output
 }
 
 async fn send_route_bind_error(
@@ -1736,64 +1879,79 @@ async fn handle_tool_call(
 
     let call = serde_json::from_slice::<ToolCallRequest>(&frame.body).map_err(SubcError::Json)?;
     let bare_name = call.name.clone();
-    let agent_specified_range = agent_specified_read_range(&call.arguments);
+    let format_context = crate::subc_format::FormatContext::from_tool_call(
+        &bare_name,
+        &call.arguments,
+        identity.project_root.as_path(),
+    );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let project_root = identity.project_root.as_path();
-    let (command, translated_args) =
-        match crate::subc_translate::subc_translate(&call.name, &call.arguments, project_root) {
-            Ok(t) => (t.command, t.args),
-            // A core agent tool that fails translation is a real client error
-            // (e.g. `edit` with no resolvable mode) — surface it, never guess.
-            Err(err) if is_subc_agent_core_tool(&call.name) => {
-                let response = Response::error(request_id.clone(), err.code, err.message);
-                let response_frame = build_tool_response_frame(
-                    frame.header.ver,
-                    frame.header.channel,
-                    frame.header.corr,
-                    frame.header.flags,
-                    &bare_name,
-                    agent_specified_range,
-                    &response,
-                )?;
-                return send_frame(tx, response_frame).await;
-            }
-            // A non-core name is NOT in the tool manifest. AFT fails closed and
-            // does not trust subc to enforce the manifest: rejecting here is the
-            // defense-in-depth backstop that prevents a forwarded native command
-            // (e.g. `configure`, which would reach handle_configure and bypass
-            // the RouteBind config-trust cap) from ever reaching dispatch. Only
-            // the integration-test harness (run_subc_mode_for_test) opens this to
-            // drive synthetic native commands through the executor.
-            Err(_) if !allow_native_passthrough => {
-                log::warn!(
+    let diagnostics_on_edit = live_roots
+        .get(&identity.root)
+        .map(|meta| meta.diagnostics_on_edit)
+        .unwrap_or(false);
+    let translate_context = crate::subc_translate::TranslateContext {
+        diagnostics_on_edit,
+    };
+    let (command, translated_args) = match crate::subc_translate::subc_translate_with_context(
+        &call.name,
+        &call.arguments,
+        project_root,
+        translate_context,
+    ) {
+        Ok(t) => (t.command, t.args),
+        // A core agent tool that fails translation is a real client error
+        // (e.g. `edit` with no resolvable mode) — surface it, never guess.
+        Err(err) if is_subc_agent_core_tool(&call.name) => {
+            let response = Response::error(request_id.clone(), err.code, err.message);
+            let response_frame = build_tool_response_frame(
+                frame.header.ver,
+                frame.header.channel,
+                frame.header.corr,
+                frame.header.flags,
+                &bare_name,
+                &format_context,
+                &response,
+            )?;
+            return send_frame(tx, response_frame).await;
+        }
+        // A non-core name is NOT in the tool manifest. AFT fails closed and
+        // does not trust subc to enforce the manifest: rejecting here is the
+        // defense-in-depth backstop that prevents a forwarded native command
+        // (e.g. `configure`, which would reach handle_configure and bypass
+        // the RouteBind config-trust cap) from ever reaching dispatch. Only
+        // the integration-test harness (run_subc_mode_for_test) opens this to
+        // drive synthetic native commands through the executor.
+        Err(_) if !allow_native_passthrough => {
+            log::warn!(
                 "subc tool call: rejecting non-manifest tool name {:?} on route {} (fail-closed)",
                 call.name,
                 frame.header.channel
             );
-                let response = Response::error(
-                    request_id.clone(),
-                    "unknown_tool",
-                    format!("tool {:?} is not in the AFT tool manifest", call.name),
-                );
-                let response_frame = build_tool_response_frame(
-                    frame.header.ver,
-                    frame.header.channel,
-                    frame.header.corr,
-                    frame.header.flags,
-                    &bare_name,
-                    agent_specified_range,
-                    &response,
-                )?;
-                return send_frame(tx, response_frame).await;
-            }
-            // Test-only: non-core names are native commands (the integration-test
-            // synthetic tools) — pass them through verbatim.
-            Err(_) => {
-                let map = call.arguments.as_object().cloned().unwrap_or_default();
-                (call.name.clone(), map)
-            }
-        };
+            let response = Response::error(
+                request_id.clone(),
+                "unknown_tool",
+                format!("tool {:?} is not in the AFT tool manifest", call.name),
+            );
+            let response_frame = build_tool_response_frame(
+                frame.header.ver,
+                frame.header.channel,
+                frame.header.corr,
+                frame.header.flags,
+                &bare_name,
+                &format_context,
+                &response,
+            )?;
+            return send_frame(tx, response_frame).await;
+        }
+        // Test-only: non-core names are native commands (the integration-test
+        // synthetic tools) — pass them through verbatim.
+        Err(_) => {
+            let map = call.arguments.as_object().cloned().unwrap_or_default();
+            (call.name.clone(), map)
+        }
+    };
 
     let lane = command_lane(&command);
     let command_for_finalize = command.clone();
@@ -1817,7 +1975,7 @@ async fn handle_tool_call(
                 frame.header.corr,
                 frame.header.flags,
                 &bare_name,
-                agent_specified_range,
+                &format_context,
                 &response,
             )?;
             return send_frame(tx, response_frame).await;
@@ -1825,7 +1983,7 @@ async fn handle_tool_call(
     };
 
     let bare_name_for_frame = bare_name.clone();
-    let agent_range_for_frame = agent_specified_range;
+    let format_context_for_frame = format_context;
     let rx = executor.submit_async(
         identity.root,
         lane,
@@ -1864,7 +2022,7 @@ async fn handle_tool_call(
             corr,
             flags,
             &bare_name_for_frame,
-            agent_range_for_frame,
+            &format_context_for_frame,
             &response,
         ) {
             Ok(response_frame) => {
@@ -1927,26 +2085,17 @@ async fn await_executor_response(rx: oneshot::Receiver<Response>, request_id: St
         .unwrap_or_else(|_| Response::error(request_id, "internal_error", "executor dropped"))
 }
 
-fn agent_specified_read_range(arguments: &Value) -> bool {
-    let Some(obj) = arguments.as_object() else {
-        return false;
-    };
-    obj.contains_key("startLine")
-        || obj.contains_key("endLine")
-        || obj.contains_key("offset")
-        || obj.contains_key("limit")
-}
-
 fn build_tool_response_frame(
     ver: u8,
     route_channel: u16,
     corr: u64,
     flags: Flags,
     bare_name: &str,
-    agent_specified_range: bool,
+    format_context: &crate::subc_format::FormatContext,
     response: &Response,
 ) -> Result<Frame, SubcError> {
-    let text = crate::subc_format::format_response(bare_name, response, agent_specified_range);
+    let text =
+        crate::subc_format::format_response_with_context(bare_name, response, format_context);
     let is_error = !response.success;
     let result = json!({
         "content": [{ "type": "text", "text": text }],

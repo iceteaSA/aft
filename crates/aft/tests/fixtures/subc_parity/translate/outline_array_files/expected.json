@@ -1,0 +1,10 @@
+{
+  "args": {
+    "files": true,
+    "target": [
+      "<PROJECT_ROOT>/src",
+      "<PROJECT_ROOT>/docs"
+    ]
+  },
+  "command": "outline"
+}
