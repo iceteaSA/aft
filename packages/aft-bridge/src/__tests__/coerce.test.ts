@@ -1,5 +1,33 @@
 import { describe, expect, test } from "bun:test";
-import { coerceStringArray } from "../coerce.js";
+import { coerceBoolean, coerceStringArray } from "../coerce.js";
+
+describe("coerceBoolean", () => {
+  test("passes real booleans through", () => {
+    expect(coerceBoolean(true)).toBe(true);
+    expect(coerceBoolean(false)).toBe(false);
+  });
+
+  test("coerces the stringified booleans models emit (the recursive bug)", () => {
+    expect(coerceBoolean("true")).toBe(true);
+    expect(coerceBoolean("TRUE")).toBe(true);
+    expect(coerceBoolean("  true  ")).toBe(true);
+    expect(coerceBoolean("1")).toBe(true);
+    expect(coerceBoolean(1)).toBe(true);
+  });
+
+  test("treats everything else as false (tight truthy set for safety gates)", () => {
+    expect(coerceBoolean("false")).toBe(false);
+    expect(coerceBoolean("0")).toBe(false);
+    expect(coerceBoolean(0)).toBe(false);
+    expect(coerceBoolean(2)).toBe(false);
+    expect(coerceBoolean("yes")).toBe(false);
+    expect(coerceBoolean("")).toBe(false);
+    expect(coerceBoolean(undefined)).toBe(false);
+    expect(coerceBoolean(null)).toBe(false);
+    expect(coerceBoolean({})).toBe(false);
+    expect(coerceBoolean([])).toBe(false);
+  });
+});
 
 describe("coerceStringArray", () => {
   test("passes a real string array through, dropping empties + non-strings", () => {

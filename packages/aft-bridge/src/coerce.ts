@@ -44,6 +44,35 @@ export function coerceStringArray(value: unknown): string[] {
 }
 
 /**
+ * Coerce a tool argument that is contractually a boolean into a real boolean,
+ * tolerating the shapes models send in practice.
+ *
+ * Like array and integer params (see `coerceStringArray` / `coerceOptionalInt`),
+ * hosts deliver a boolean-typed param as the model's raw emitted value WITHOUT
+ * coercing it to the declared schema type — and models non-deterministically
+ * emit `true` as the string `"true"` (or `1` / `"1"`). A strict `args.x === true`
+ * check then reads a stringified `"true"` as false, silently dropping the flag.
+ * This bit `aft_delete`'s `recursive`: an agent passing `recursive: true` got
+ * "is a directory, pass recursive: true" because the wire value was `"true"`.
+ *
+ * Conservative by design: only values that UNAMBIGUOUSLY mean true coerce to
+ * true (`true`, case-insensitive `"true"`, `1`, `"1"`). Everything else —
+ * `false`, `"false"`, `0`, `""`, `null`, `undefined`, objects — is `false`. A
+ * false-negative just re-surfaces the original "pass the flag" error (safe); a
+ * false-positive on a destructive gate like `recursive` would not be, so the
+ * truthy set is kept tight rather than accepting arbitrary truthy values.
+ */
+export function coerceBoolean(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value === 1;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "true" || normalized === "1";
+  }
+  return false;
+}
+
+/**
  * Runtime coercion for agent-friendly sentinel handling.
  *
  * Some agents emit null / "" / 0 when they mean "param not provided".

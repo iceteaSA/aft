@@ -12,6 +12,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  coerceBoolean,
   coerceStringArray,
   formatEditSummary,
   formatReadFooter as formatSharedReadFooter,
@@ -1683,7 +1684,11 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
       if (inputs.length === 0) {
         throw new Error("delete: `files` must be a non-empty array of paths");
       }
-      const recursive = args.recursive === true;
+      // Coerce at the boundary: hosts deliver this boolean as the model's raw
+      // emitted value (e.g. the string "true") despite the declared schema, same
+      // as `files` above. A strict `=== true` then drops a stringified flag and
+      // an agent's `recursive: true` is silently lost (see coerceBoolean).
+      const recursive = coerceBoolean(args.recursive);
       const projectRoot = await resolveProjectRoot(ctx, context);
       const absolutePaths = inputs.map((f) => resolvePathFromProjectRoot(projectRoot, f));
 

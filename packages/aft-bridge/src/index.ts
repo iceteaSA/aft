@@ -44,7 +44,7 @@ export {
 // --- aft_callgraph flat formatter (shared by both plugin hosts) ---
 export type { CallgraphTheme } from "./callgraph-format.js";
 export { formatCallgraphSections, PLAIN_CALLGRAPH_THEME } from "./callgraph-format.js";
-export { coerceOptionalInt, coerceStringArray, isEmptyParam } from "./coerce.js";
+export { coerceBoolean, coerceOptionalInt, coerceStringArray, isEmptyParam } from "./coerce.js";
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
 // --- config tiers ---
 export type { ConfigTier } from "./config-tiers.js";

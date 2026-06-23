@@ -3,7 +3,7 @@
  * Both go through Rust so backups and checkpoint rollback work the same way.
  */
 
-import { coerceStringArray } from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceStringArray } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
@@ -158,7 +158,9 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           "delete_file",
           {
             files,
-            recursive: params.recursive === true,
+            // Coerce at the boundary, like `files`: a stringified "true" from the
+            // model must not silently drop the flag (see coerceBoolean).
+            recursive: coerceBoolean(params.recursive),
           },
           extCtx,
         );
