@@ -2216,6 +2216,21 @@ async fn send_route_bind_with_session_and_doc(
     session: &str,
     doc: Value,
 ) {
+    // Config is read by AFT from <root>/.cortexkit/aft.jsonc, NOT from the wire
+    // (the wire `config` is ignored since the unification). Write the bind's doc
+    // (real config fields + any subc_test_* directives the fake dispatch reads)
+    // to the project config file so it reaches handle_control_request's local
+    // read. The wire `config` is still attached but no longer consulted by
+    // production; keeping it asserts it's harmlessly ignored.
+    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
+    std::fs::create_dir_all(project_cfg.parent().expect("cortexkit dir parent"))
+        .expect("create .cortexkit dir");
+    std::fs::write(
+        &project_cfg,
+        serde_json::to_string(&doc).expect("serialize bind doc"),
+    )
+    .expect("write project config");
+
     let request = ModuleControlRequest::RouteBind {
         route_channel,
         target: RouteTarget::ToolProvider {

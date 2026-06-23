@@ -1,25 +1,21 @@
-//! Subc-mode local config read + wire-tier trust capping (subc edge only).
+//! Subc-mode local config read (subc edge only).
 //!
-//! Under the daemon there is no harness plugin to read the user's `aft.jsonc`
-//! and relay it as wire tiers, so AFT reads its own config off disk from the
-//! CortexKit config home. That on-disk read is a TRUSTED-LOCAL origin: AFT read
-//! it itself, never over the wire, so its `user` tier is honored in full even
-//! under an untrusted `mcp:*` front.
+//! Config is single-per-project, read by AFT directly off disk from the
+//! CortexKit config files: user `~/.config/cortexkit/aft.jsonc` and project
+//! `<root>/.cortexkit/aft.jsonc`. There is NO wire-relayed config path — a front
+//! (runner or `mcp:*`) cannot push config over the connection. This makes the
+//! resolved config harness-INDEPENDENT: every harness binding a project reads
+//! the identical on-disk config, so two trust domains sharing the per-root actor
+//! can never diverge or inherit each other's capabilities.
 //!
-//! Wire-relayed inline tiers, by contrast, are capped by the fronting harness:
-//! an `mcp:*` (or otherwise un-vetted) front's `user` tier is downgraded to
-//! `project` so the resolver's trust boundary strips its privileged fields. The
-//! first-party fronts (`runner`, and the legacy `opencode`/`pi` plugins) keep
-//! their tier labels.
-//!
-//! The capping is a label rewrite here at the subc edge — where the origin is
-//! known from the code path — so `config_resolve` stays purely label-trusting.
+//! Trust is purely per-TIER, applied by `config_resolve` to the FILE tiers: the
+//! user file is trusted (the user's own disk), the project file is untrusted
+//! (in-repo) and has its privileged fields dropped.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::config_resolve::ConfigTier;
-use crate::harness::Harness;
 
 /// CortexKit user config home: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`, falling
 /// back to `~/.config/cortexkit/aft.jsonc`. Matches the shared CortexKit
@@ -94,70 +90,11 @@ pub fn read_local_cortexkit_config_tiers(
     )
 }
 
-/// True only for first-party fronts whose relayed tier labels are trusted as-is.
-/// `mcp:*` and any unparseable harness fall through to capping (fail-safe toward
-/// less privilege).
-fn front_is_trusted(harness: Option<&Harness>) -> bool {
-    matches!(
-        harness,
-        Some(Harness::Opencode | Harness::Pi | Harness::Runner)
-    )
-}
-
-/// Cap wire-relayed inline tiers by the fronting harness's trust. For an
-/// un-vetted front (`mcp:*` or unknown), a `user` tier on the wire is downgraded
-/// to `project` so the resolver strips its privileged fields — an un-vetted agent
-/// must never inject user-tier config over the wire. Returns the capped tiers and
-/// whether any downgrade occurred (for warning surfacing).
-fn cap_wire_tiers(wire: Vec<ConfigTier>, harness: Option<&Harness>) -> (Vec<ConfigTier>, bool) {
-    if front_is_trusted(harness) {
-        return (wire, false);
-    }
-    let mut downgraded = false;
-    let capped = wire
-        .into_iter()
-        .map(|mut tier| {
-            if tier.tier == "user" {
-                tier.tier = "project".to_string();
-                downgraded = true;
-            }
-            tier
-        })
-        .collect();
-    (capped, downgraded)
-}
-
-/// Compose the final tier list for a subc RouteBind: the AFT-read local config
-/// (trusted-local origin) as the base, then the harness-capped wire tiers
-/// refining on top. Later tiers override earlier ones for shared fields, so a
-/// trusted front's relayed session config refines the on-disk config, while an
-/// un-vetted front can only touch project-safe fields. Returns the composed
-/// tiers and whether any wire `user` tier was downgraded (for warning).
-pub fn compose_route_bind_tiers(
-    user_config_path: Option<&Path>,
-    project_root: &Path,
-    wire: Vec<ConfigTier>,
-    harness: Option<&Harness>,
-) -> (Vec<ConfigTier>, bool) {
-    let mut tiers = read_local_cortexkit_config_tiers(user_config_path, project_root);
-    let (capped_wire, downgraded) = cap_wire_tiers(wire, harness);
-    tiers.extend(capped_wire);
-    (tiers, downgraded)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
     use crate::config_resolve::resolve_config_onto;
-
-    fn tier(tier: &str, doc: &str) -> ConfigTier {
-        ConfigTier {
-            tier: tier.to_string(),
-            source: "wire".to_string(),
-            doc: doc.to_string(),
-        }
-    }
 
     // ---- path resolution (pure, no env mutation) ----
 
@@ -234,68 +171,45 @@ mod tests {
         assert!(tiers.is_empty());
     }
 
-    // ---- the security property: mcp:* cannot inject user-tier privilege ----
+    // ---- the security property: per-tier file trust ----
+    // Config is harness-independent — it comes from the FILES, identical for every
+    // harness binding a project, so there is nothing for one harness to inject or
+    // another to inherit. The only trust distinction is per-TIER: the user FILE is
+    // trusted (the user's own disk), the project FILE is untrusted (in-repo) and
+    // has its privileged fields dropped by the resolver.
 
     const PRIVILEGED_DOC: &str = r#"{ "semantic": { "api_key_env": "SECRET_KEY" } }"#;
 
     #[test]
-    fn mcp_front_user_tier_is_capped_and_privileged_field_dropped() {
-        let (capped, downgraded) = cap_wire_tiers(
-            vec![tier("user", PRIVILEGED_DOC)],
-            Some(&Harness::Mcp {
-                client: "claude-code".to_string(),
-            }),
-        );
-        assert!(downgraded, "mcp user tier must be downgraded");
-        assert_eq!(capped[0].tier, "project");
+    fn user_file_privileged_field_is_trusted_project_file_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user-aft.jsonc");
+        std::fs::write(&user, PRIVILEGED_DOC).unwrap();
 
+        // Project file (in-repo, untrusted) tries to set the same privileged field.
+        let project_root = dir.path();
+        let project_cfg_dir = project_root.join(".cortexkit");
+        std::fs::create_dir_all(&project_cfg_dir).unwrap();
+        std::fs::write(
+            project_cfg_dir.join("aft.jsonc"),
+            r#"{ "semantic": { "api_key_env": "PROJECT_INJECTED" } }"#,
+        )
+        .unwrap();
+
+        let tiers = read_local_cortexkit_config_tiers(Some(&user), project_root);
         let mut base = Config::default();
-        let dropped = resolve_config_onto(&capped, &mut base);
+        let dropped = resolve_config_onto(&tiers, &mut base);
+
+        // The user FILE's privileged value is honored.
+        assert_eq!(
+            base.semantic.api_key_env.as_deref(),
+            Some("SECRET_KEY"),
+            "user-file privileged field must be trusted"
+        );
+        // The project FILE's attempt to override it is dropped.
         assert!(
             dropped.iter().any(|d| d.key == "semantic.api_key_env"),
-            "capped privileged field must be dropped by the resolver"
+            "project-file privileged field must be dropped by the resolver"
         );
-        assert!(
-            base.semantic.api_key_env.is_none(),
-            "dropped field must NOT reach the resolved config"
-        );
-    }
-
-    #[test]
-    fn runner_front_user_tier_is_trusted_and_privileged_field_survives() {
-        let (capped, downgraded) =
-            cap_wire_tiers(vec![tier("user", PRIVILEGED_DOC)], Some(&Harness::Runner));
-        assert!(!downgraded, "runner user tier must not be downgraded");
-        assert_eq!(capped[0].tier, "user");
-
-        let mut base = Config::default();
-        let dropped = resolve_config_onto(&capped, &mut base);
-        assert!(
-            !dropped.iter().any(|d| d.key == "semantic.api_key_env"),
-            "trusted user-tier field must not be dropped"
-        );
-        assert_eq!(base.semantic.api_key_env.as_deref(), Some("SECRET_KEY"));
-    }
-
-    #[test]
-    fn unknown_front_is_capped_like_mcp() {
-        let (_capped, downgraded) = cap_wire_tiers(vec![tier("user", PRIVILEGED_DOC)], None);
-        assert!(
-            downgraded,
-            "unparseable/unknown front must cap conservatively"
-        );
-    }
-
-    #[test]
-    fn project_tier_passes_through_uncapped_for_any_front() {
-        // A project tier is already untrusted; capping is a no-op on it.
-        let (capped, downgraded) = cap_wire_tiers(
-            vec![tier("project", PRIVILEGED_DOC)],
-            Some(&Harness::Mcp {
-                client: "x".to_string(),
-            }),
-        );
-        assert!(!downgraded);
-        assert_eq!(capped[0].tier, "project");
     }
 }

@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -25,7 +24,6 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::context::{App, AppContext, ProgressSender};
 use crate::executor::{Executor, Lane};
-use crate::harness::Harness;
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
 use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
@@ -1486,35 +1484,23 @@ async fn handle_control_request(
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
 
-            // W5: compose the configure tiers from AFT's own local read of the
-            // CortexKit config home (trusted-local origin) plus the wire-relayed
-            // inline tiers, capped by the fronting harness's trust (an mcp:* front
-            // cannot inject a user tier — it is downgraded to project so the
-            // resolver strips its privileged fields). Under the gateway there is
-            // no plugin to read on-disk config, so this local read is how a
-            // gateway user's `aft.jsonc` reaches AFT at all.
-            let wire_tiers: Vec<crate::config_resolve::ConfigTier> = config
-                .iter()
-                .map(|t| crate::config_resolve::ConfigTier {
-                    tier: t.tier.clone(),
-                    source: t.source.clone(),
-                    doc: t.doc.clone(),
-                })
-                .collect();
-            let parsed_harness = Harness::from_str(&bind_harness).ok();
-            let (composed_tiers, wire_user_downgraded) =
-                crate::subc_config::compose_route_bind_tiers(
-                    user_config_path,
-                    Path::new(&bind_project_root),
-                    wire_tiers,
-                    parsed_harness.as_ref(),
-                );
-            if wire_user_downgraded {
-                log::warn!(
-                    "subc attach: route {route_channel} front {bind_harness:?} relayed a user-tier config over the wire; downgraded to project-tier (privileged fields dropped)"
-                );
-            }
-            let config_tiers: Vec<Value> = composed_tiers
+            // Config is single-per-project, read by AFT directly from the
+            // CortexKit config files (user: ~/.config/cortexkit/aft.jsonc,
+            // project: <root>/.cortexkit/aft.jsonc). Wire-relayed config tiers are
+            // IGNORED entirely: a front (runner or mcp:*) cannot push config over
+            // the wire. This is what makes config harness-INDEPENDENT — every
+            // harness binding a project gets the identical on-disk config, so two
+            // trust domains sharing the per-root actor can never diverge or
+            // inherit each other's capabilities (the cross-bind escalation class).
+            // The `config` field on the wire is accepted by the protocol but no
+            // longer consulted; the per-tier trust boundary (user trusted, project
+            // privileged-dropped) is applied to the FILE tiers in handle_configure.
+            let _ = &config; // wire config intentionally ignored — see above.
+            let local_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
+                user_config_path,
+                Path::new(&bind_project_root),
+            );
+            let config_tiers: Vec<Value> = local_tiers
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
                 .collect();
@@ -1754,63 +1740,60 @@ async fn handle_tool_call(
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let project_root = identity.project_root.as_path();
-    let (command, translated_args) = match crate::subc_translate::subc_translate(
-        &call.name,
-        &call.arguments,
-        project_root,
-    ) {
-        Ok(t) => (t.command, t.args),
-        // A core agent tool that fails translation is a real client error
-        // (e.g. `edit` with no resolvable mode) — surface it, never guess.
-        Err(err) if is_subc_agent_core_tool(&call.name) => {
-            let response = Response::error(request_id.clone(), err.code, err.message);
-            let response_frame = build_tool_response_frame(
-                frame.header.ver,
-                frame.header.channel,
-                frame.header.corr,
-                frame.header.flags,
-                &bare_name,
-                agent_specified_range,
-                &response,
-            )?;
-            return send_frame(tx, response_frame).await;
-        }
-        // A non-core name is NOT in the tool manifest. AFT fails closed and
-        // does not trust subc to enforce the manifest: rejecting here is the
-        // defense-in-depth backstop that prevents a forwarded native command
-        // (e.g. `configure`, which would reach handle_configure and bypass
-        // the RouteBind config-trust cap) from ever reaching dispatch. Only
-        // the integration-test harness (run_subc_mode_for_test) opens this to
-        // drive synthetic native commands through the executor.
-        Err(_) if !allow_native_passthrough => {
-            log::warn!(
+    let (command, translated_args) =
+        match crate::subc_translate::subc_translate(&call.name, &call.arguments, project_root) {
+            Ok(t) => (t.command, t.args),
+            // A core agent tool that fails translation is a real client error
+            // (e.g. `edit` with no resolvable mode) — surface it, never guess.
+            Err(err) if is_subc_agent_core_tool(&call.name) => {
+                let response = Response::error(request_id.clone(), err.code, err.message);
+                let response_frame = build_tool_response_frame(
+                    frame.header.ver,
+                    frame.header.channel,
+                    frame.header.corr,
+                    frame.header.flags,
+                    &bare_name,
+                    agent_specified_range,
+                    &response,
+                )?;
+                return send_frame(tx, response_frame).await;
+            }
+            // A non-core name is NOT in the tool manifest. AFT fails closed and
+            // does not trust subc to enforce the manifest: rejecting here is the
+            // defense-in-depth backstop that prevents a forwarded native command
+            // (e.g. `configure`, which would reach handle_configure and bypass
+            // the RouteBind config-trust cap) from ever reaching dispatch. Only
+            // the integration-test harness (run_subc_mode_for_test) opens this to
+            // drive synthetic native commands through the executor.
+            Err(_) if !allow_native_passthrough => {
+                log::warn!(
                 "subc tool call: rejecting non-manifest tool name {:?} on route {} (fail-closed)",
                 call.name,
                 frame.header.channel
             );
-            let response = Response::error(
-                request_id.clone(),
-                "unknown_tool",
-                format!("tool {:?} is not in the AFT tool manifest", call.name),
-            );
-            let response_frame = build_tool_response_frame(
-                frame.header.ver,
-                frame.header.channel,
-                frame.header.corr,
-                frame.header.flags,
-                &bare_name,
-                agent_specified_range,
-                &response,
-            )?;
-            return send_frame(tx, response_frame).await;
-        }
-        // Test-only: non-core names are native commands (the integration-test
-        // synthetic tools) — pass them through verbatim.
-        Err(_) => {
-            let map = call.arguments.as_object().cloned().unwrap_or_default();
-            (call.name.clone(), map)
-        }
-    };
+                let response = Response::error(
+                    request_id.clone(),
+                    "unknown_tool",
+                    format!("tool {:?} is not in the AFT tool manifest", call.name),
+                );
+                let response_frame = build_tool_response_frame(
+                    frame.header.ver,
+                    frame.header.channel,
+                    frame.header.corr,
+                    frame.header.flags,
+                    &bare_name,
+                    agent_specified_range,
+                    &response,
+                )?;
+                return send_frame(tx, response_frame).await;
+            }
+            // Test-only: non-core names are native commands (the integration-test
+            // synthetic tools) — pass them through verbatim.
+            Err(_) => {
+                let map = call.arguments.as_object().cloned().unwrap_or_default();
+                (call.name.clone(), map)
+            }
+        };
 
     let lane = command_lane(&command);
     let command_for_finalize = command.clone();
