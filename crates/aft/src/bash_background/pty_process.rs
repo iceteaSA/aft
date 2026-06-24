@@ -215,8 +215,9 @@ fn try_spawn_pty(
     })
 }
 
-/// DSR escape sequence `\x1b[6n` is 4 bytes. We carry over the last 3
-/// bytes of each read so the sequence can be detected across read boundaries.
+/// DSR escape sequence `\x1b[6n` is 4 bytes, so a carry of the last 3 bytes of
+/// the running stream is enough to detect a needle straddling any read boundary
+/// (see `DsrScanner`).
 const DSR_CARRY_OVER: usize = 3;
 
 pub(crate) fn spawn_reader(
@@ -236,14 +237,14 @@ pub(crate) fn spawn_reader(
                 .append(true)
                 .open(&spill_path)?;
             let mut buf = [0_u8; 8192];
-            let mut prev_tail: Vec<u8> = Vec::new();
+            let mut dsr = DsrScanner::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         file.write_all(&buf[..n])?;
                         file.flush()?;
-                        if dsr_detected(&prev_tail, &buf[..n]) {
+                        if dsr.scan(&buf[..n]) {
                             // Some Windows console hosts/apps query the
                             // terminal cursor position with DSR (ESC[6n)
                             // before accepting input. A real terminal answers
@@ -258,9 +259,6 @@ pub(crate) fn spawn_reader(
                                 }
                             }
                         }
-                        prev_tail.clear();
-                        let start = n.saturating_sub(DSR_CARRY_OVER);
-                        prev_tail.extend_from_slice(&buf[start..n]);
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),
@@ -280,17 +278,31 @@ pub(crate) fn spawn_reader(
     });
 }
 
-fn dsr_detected(prev_tail: &[u8], current: &[u8]) -> bool {
-    if current.windows(4).any(|w| w == b"\x1b[6n") {
-        return true;
+/// Detects the DSR cursor-position query `\x1b[6n` (4 bytes) in a byte stream
+/// delivered in arbitrary chunks. A `read()` may return as little as one byte,
+/// so the 4-byte needle can split across ANY number of reads. We keep a rolling
+/// carry of the last 3 bytes seen and prepend it to each new chunk before
+/// scanning. Crucially the carry is taken from the COMBINED (carry + chunk)
+/// buffer, not just the chunk's own tail — that is what lets detection survive
+/// more than two reads (e.g. `\x1b`, `[`, `6`, `n` arriving as four reads).
+#[derive(Default)]
+struct DsrScanner {
+    carry: Vec<u8>,
+}
+
+impl DsrScanner {
+    fn scan(&mut self, chunk: &[u8]) -> bool {
+        let mut combined = Vec::with_capacity(self.carry.len() + chunk.len());
+        combined.extend_from_slice(&self.carry);
+        combined.extend_from_slice(chunk);
+        let detected = combined.windows(4).any(|w| w == b"\x1b[6n");
+        // Carry the last 3 bytes of the combined stream forward: a 4-byte
+        // needle straddling this boundary keeps at most 3 bytes on this side.
+        let start = combined.len().saturating_sub(DSR_CARRY_OVER);
+        self.carry.clear();
+        self.carry.extend_from_slice(&combined[start..]);
+        detected
     }
-    if prev_tail.is_empty() {
-        return false;
-    }
-    let mut combined = Vec::with_capacity(prev_tail.len() + current.len());
-    combined.extend_from_slice(prev_tail);
-    combined.extend_from_slice(current);
-    combined.windows(4).any(|w| w == b"\x1b[6n")
 }
 
 pub(crate) fn spawn_waiter(
@@ -472,42 +484,48 @@ mod tests {
         assert_eq!(fs::read_to_string(exit_path).unwrap(), "0");
     }
 
+    /// Feed `chunks` to a fresh scanner and return how many chunks reported a
+    /// detection. The needle appears exactly once across all chunks, so a
+    /// correct scanner returns exactly 1 (detect once, never double-fire).
+    fn scan_chunks(chunks: &[&[u8]]) -> usize {
+        let mut scanner = DsrScanner::default();
+        chunks.iter().filter(|chunk| scanner.scan(chunk)).count()
+    }
+
     #[test]
     fn dsr_detected_within_single_read() {
-        assert!(dsr_detected(b"", b"\x1b[6n"));
+        assert_eq!(scan_chunks(&[b"\x1b[6n"]), 1);
     }
 
     #[test]
-    fn dsr_detected_split_across_reads_3_1() {
-        assert!(dsr_detected(b"\x1b[6", b"n"));
+    fn dsr_detected_two_read_splits() {
+        assert_eq!(scan_chunks(&[b"\x1b[6", b"n"]), 1); // 3/1
+        assert_eq!(scan_chunks(&[b"\x1b[", b"6n"]), 1); // 2/2
+        assert_eq!(scan_chunks(&[b"\x1b", b"[6n"]), 1); // 1/3
     }
 
     #[test]
-    fn dsr_detected_split_across_reads_2_2() {
-        assert!(dsr_detected(b"\x1b[", b"6n"));
+    fn dsr_detected_across_more_than_two_reads() {
+        // The original carry-over (keep only the chunk's own last 3 bytes)
+        // missed these because by the time `n` arrives the `\x1b` had aged out.
+        assert_eq!(scan_chunks(&[b"\x1b", b"[", b"6", b"n"]), 1); // 1/1/1/1
+        assert_eq!(scan_chunks(&[b"\x1b", b"[", b"6n"]), 1); // 1/1/2
+        assert_eq!(scan_chunks(&[b"\x1b[", b"6", b"n"]), 1); // 2/1/1
+                                                             // With unrelated leading noise that pushes the needle across reads.
+        assert_eq!(scan_chunks(&[b"junk\x1b", b"[6", b"n more"]), 1);
     }
 
     #[test]
-    fn dsr_detected_split_1_3() {
-        assert!(dsr_detected(b"\x1b", b"[6n"));
+    fn dsr_detected_once_with_surrounding_output() {
+        // Single sequence embedded in a larger single read fires exactly once.
+        assert_eq!(scan_chunks(&[b"hello\x1b[6nworld"]), 1);
     }
 
     #[test]
     fn dsr_not_detected_no_match() {
-        assert!(!dsr_detected(b"abc", b"def"));
-        assert!(!dsr_detected(b"", b"hello"));
+        assert_eq!(scan_chunks(&[b"abc", b"def"]), 0);
+        assert_eq!(scan_chunks(&[b"hello"]), 0);
+        // Partial-but-never-completed sequence must not fire.
+        assert_eq!(scan_chunks(&[b"\x1b[6", b"x"]), 0);
     }
-
-    #[test]
-    fn dsr_not_detected_near_miss_false_positive() {
-        // Combined buffer is \x1b[6X (4 bytes) but not \x1b[6n
-        assert!(!dsr_detected(b"\x1b[6", b"X"));
-    }
-
-    // Known limitation: a 3-read split (1-byte reads) defeats detection.
-    // Read 1: \x1b -> prev_tail = [\x1b]
-    // Read 2: [6   -> combined = [\x1b, [, 6] (3 bytes, no 4-byte window)
-    //          -> prev_tail = [[, 6] (\x1b is lost)
-    // Read 3: n    -> combined = [[, 6, n] (3 bytes, no 4-byte window)
-    // In practice PTY reads return hundreds of bytes, so 1-byte splits are pathological.
 }
