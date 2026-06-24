@@ -563,7 +563,10 @@ src/bar.go:3:8: ineffectual assignment (ineffassign)
 
     #[test]
     fn go_subcommand_returns_subcommand_when_before_pipe() {
-        assert_eq!(go_subcommand("go test | grep FAIL").as_deref(), Some("test"));
+        assert_eq!(
+            go_subcommand("go test | grep FAIL").as_deref(),
+            Some("test")
+        );
     }
 
     #[test]

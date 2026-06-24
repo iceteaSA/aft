@@ -281,11 +281,17 @@ mod tests {
 
     #[test]
     fn cargo_subcommand_returns_subcommand_when_before_pipe() {
-        assert_eq!(cargo_subcommand("cargo test | grep FAIL").as_deref(), Some("test"));
+        assert_eq!(
+            cargo_subcommand("cargo test | grep FAIL").as_deref(),
+            Some("test")
+        );
     }
 
     #[test]
     fn cargo_subcommand_unaffected_without_metacharacters() {
-        assert_eq!(cargo_subcommand("cargo test --release").as_deref(), Some("test"));
+        assert_eq!(
+            cargo_subcommand("cargo test --release").as_deref(),
+            Some("test")
+        );
     }
 }
