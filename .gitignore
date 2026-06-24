@@ -47,10 +47,7 @@ ts-bench/
 # Benchmark configs (may contain API keys)
 benchmarks/configs/
 # OpenCode plugin install dir + per-session artifacts.
-# Track only the two config files we ship in the repo.
 .opencode/*
-!.opencode/aft.jsonc
-!.opencode/magic-context.jsonc
 codedb.snapshot
 benchmarks/search-bench-results.json
 
