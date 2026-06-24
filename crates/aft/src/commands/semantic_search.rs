@@ -27,8 +27,12 @@ const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
 const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
-const RANK0_FULL_SNIPPET_CONTEXT_LINES: usize = 5;
-const RANK0_FULL_SNIPPET_MAX_LINES: usize = 80;
+/// Cap on the rank-0 full-symbol preview. Sized to absorb the follow-up zoom for
+/// virtually every real function/type so the agent doesn't re-read a file it
+/// already saw in search; a symbol exceeding it falls back to the line-budget
+/// preview + "+N more lines". aft_zoom itself is uncapped, but search expansion is
+/// automatic (not explicitly requested), so a runaway giant stays bounded.
+const RANK0_FULL_SNIPPET_MAX_LINES: usize = 250;
 
 #[derive(Debug, Clone)]
 pub struct HybridResult {
@@ -1763,12 +1767,14 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
         }
 
         if should_expand_rank0_snippet(rank, result, project_root) {
-            let expanded_start = start.saturating_sub(RANK0_FULL_SNIPPET_CONTEXT_LINES);
-            let expanded_end = end
-                .saturating_add(RANK0_FULL_SNIPPET_CONTEXT_LINES)
-                .min(lines.len());
-            if expanded_end.saturating_sub(expanded_start) <= RANK0_FULL_SNIPPET_MAX_LINES {
-                result.snippet = lines[expanded_start..expanded_end].join("\n");
+            // Render the symbol the way aft_zoom does: its exact body bounds plus
+            // its leading doc comment / attributes / decorators, and nothing after
+            // its end (no trailing neighbor bleed). This spares the agent a
+            // follow-up zoom/read of a file it already saw here, so the cap is
+            // generous; only a runaway giant falls through to the preview budget.
+            let doc_start = doc_comment_start(lines, start);
+            if end.saturating_sub(doc_start) <= RANK0_FULL_SNIPPET_MAX_LINES {
+                result.snippet = lines[doc_start..end].join("\n");
                 continue;
             }
         }
@@ -1788,6 +1794,32 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
     }
 
     incomplete
+}
+
+/// Walk `start` (0-based index of the symbol's first body line) backwards over a
+/// contiguous block of leading doc-comment / attribute / decorator lines, so the
+/// rank-0 preview includes the symbol's doc the way aft_zoom does. Stops at the
+/// first blank line or non-comment/non-decorator line — i.e. the previous
+/// symbol's code — so it never bleeds a neighbor into the preview. Heuristic by
+/// line prefix to stay language-agnostic: `//` `///` `//!` (Rust/TS/JS/Go/…),
+/// `/*` `*` `*/` (block / JSDoc), `#` (Python/Ruby/Bash comment, Rust `#[attr]`),
+/// `--` (Lua/SQL), `@` (TS/Java/Python decorators).
+fn doc_comment_start(lines: &[String], start: usize) -> usize {
+    let mut s = start;
+    while s > 0 {
+        let prev = lines[s - 1].trim_start();
+        let is_doc_or_attr = prev.starts_with("//")
+            || prev.starts_with("/*")
+            || prev.starts_with('*')
+            || prev.starts_with('#')
+            || prev.starts_with("--")
+            || prev.starts_with('@');
+        if !is_doc_or_attr {
+            break;
+        }
+        s -= 1;
+    }
+    s
 }
 
 fn should_expand_rank0_snippet(rank: usize, result: &HybridResult, project_root: &Path) -> bool {
@@ -2760,8 +2792,10 @@ mod tests {
 
     #[test]
     fn oversized_rank0_full_expansion_falls_back_to_preview() {
+        // Larger than RANK0_FULL_SNIPPET_MAX_LINES (250) so full expansion is
+        // declined and the line-budget preview kicks in.
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut results = vec![write_symbol_hit(dir.path(), "huge.rs", "huge", 90)];
+        let mut results = vec![write_symbol_hit(dir.path(), "huge.rs", "huge", 300)];
         results[0].semantic_score = Some(0.99);
         results[0].score = 0.99;
 
@@ -2769,8 +2803,65 @@ mod tests {
 
         assert!(incomplete);
         assert!(results[0].snippet.contains("line19"));
-        assert!(!results[0].snippet.contains("line89"));
-        assert!(results[0].snippet.contains("+70 more lines"));
+        assert!(!results[0].snippet.contains("line299"));
+        assert!(results[0].snippet.contains("+280 more lines"));
+    }
+
+    #[test]
+    fn rank0_expansion_includes_leading_doc_and_excludes_trailing_neighbor() {
+        // A symbol preceded by a doc comment and a decorator, with a NEXT symbol
+        // immediately after. Rank-0 expansion must show the doc + the symbol, and
+        // must NOT bleed the following symbol in.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("doc.ts");
+        let content = "import x from 'y';\n\
+                       \n\
+                       /** Does the thing. */\n\
+                       @decorator\n\
+                       export function target() {\n\
+                       \x20\x20return 1;\n\
+                       }\n\
+                       \n\
+                       export function nextSymbol() {\n\
+                       \x20\x20return 2;\n\
+                       }\n";
+        std::fs::write(&path, content).expect("write");
+        // target() body spans the `export function target` line (index 4) through
+        // its closing brace (index 6), 0-based inclusive.
+        let mut results = vec![HybridResult {
+            file: path,
+            name: "target".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 4,
+            end_line: 6,
+            exported: true,
+            snippet: String::new(),
+            score: 0.99,
+            source: "semantic",
+            semantic_score: Some(0.99),
+            lexical_score: None,
+            hybrid_boosted: false,
+        }];
+
+        enrich_snippets_from_source(&mut results, dir.path());
+        let snippet = &results[0].snippet;
+
+        assert!(
+            snippet.contains("Does the thing."),
+            "leading doc comment must be included: {snippet}"
+        );
+        assert!(
+            snippet.contains("@decorator"),
+            "leading decorator must be included: {snippet}"
+        );
+        assert!(
+            snippet.contains("export function target()"),
+            "symbol signature must be present: {snippet}"
+        );
+        assert!(
+            !snippet.contains("nextSymbol"),
+            "trailing neighbor must NOT bleed in: {snippet}"
+        );
     }
 
     #[test]
