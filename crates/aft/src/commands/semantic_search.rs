@@ -1908,11 +1908,7 @@ fn blast_radius_annotation_for_result(
     let callers = callers_result(store, &result.file, &result.name, 1).ok()?;
     let mut caller_basenames = Vec::new();
     let mut seen_files = HashSet::new();
-    let mut has_test_caller = false;
     for group in &callers.callers {
-        if is_test_support_file(&group.file) {
-            has_test_caller = true;
-        }
         if seen_files.insert(group.file.clone()) {
             caller_basenames.push(compact_caller_basename(&group.file));
         }
@@ -1932,9 +1928,6 @@ fn blast_radius_annotation_for_result(
         if more {
             suffix.push_str(",…");
         }
-    }
-    if !has_test_caller {
-        suffix.push_str(" ⚠untested");
     }
     Some(suffix)
 }
@@ -2922,10 +2915,6 @@ mod tests {
             covered_line.contains("app.ts") || covered_line.contains("covered_fixture.ts"),
             "covered row should include caller basenames: {covered_line}"
         );
-        assert!(
-            !covered_line.contains("⚠untested"),
-            "fixture caller should suppress untested marker: {covered_line}"
-        );
 
         let untested_line = text
             .lines()
@@ -2939,9 +2928,14 @@ mod tests {
             untested_line.contains("app.ts"),
             "untested caller basename missing: {untested_line}"
         );
+
+        // The `⚠untested` marker was removed: it provided no actionable signal in
+        // a discovery tool and relied on is_test_support_file (fixtures/mocks
+        // only), so it false-flagged genuinely tested code. Blast radius keeps
+        // only the accurate `↩callers` + basenames.
         assert!(
-            untested_line.contains("⚠untested"),
-            "non-test callers only should show untested marker: {untested_line}"
+            !text.contains("⚠untested"),
+            "untested marker must no longer appear in search output: {text}"
         );
     }
 
