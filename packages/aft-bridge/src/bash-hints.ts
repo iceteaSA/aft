@@ -99,23 +99,82 @@ function shouldSuppressGrepSearchHint(command: string, projectRoot: string | und
   const statements = splitTopLevelStatements(command);
   if (statements === null) return false;
 
+  const resolvedRoot = path.resolve(root);
+  // Track the effective cwd across top-level statements so a `cd` into another
+  // repo before the grep is honored: aft_search only indexes THIS project, so a
+  // grep that runs outside the project root must NOT be nudged toward it. `null`
+  // means the cwd became unknown (dynamic/`cd -`) and we can't confirm the grep
+  // is in-project — treat such greps as external (suppress).
+  let effectiveCwd: string | null = resolvedRoot;
   let sawCodeSearchStatement = false;
+
   for (const statement of statements) {
     const firstStage = firstPipelineStage(statement);
     if (firstStage === null) continue;
     const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0));
     if (firstToken === null) continue;
-    if (firstToken.token !== "grep" && firstToken.token !== "rg") continue;
+    const head = firstToken.token;
 
+    if (head === "cd") {
+      effectiveCwd = nextCwdAfterCd(effectiveCwd, firstStage, firstToken.end);
+      continue;
+    }
+
+    if (head !== "grep" && head !== "rg") continue;
     sawCodeSearchStatement = true;
+
+    // A grep whose effective cwd is unknown or outside the project is external —
+    // don't fire for it. Keep scanning in case a later statement greps in-project.
+    if (effectiveCwd === null) continue;
+    if (!isDirInsideProject(resolvedRoot, effectiveCwd)) continue;
+
     const operands = collectPathOperands(firstStage, firstToken.end);
+    // No path operands → grep reads stdin or searches the (in-project) cwd.
     if (operands.length === 0) return false;
     for (const operand of operands) {
-      if (isPathInsideProject(root, operand)) return false;
+      if (isPathInsideProject(resolvedRoot, effectiveCwd, operand)) return false;
     }
+    // All operands resolve outside the project → this grep is external.
   }
 
   return sawCodeSearchStatement;
+}
+
+/**
+ * Resolve the cwd after a top-level `cd` statement. Returns the new absolute
+ * cwd, or `null` when it can't be determined (a dynamic target like `$DIR`/
+ * `$(...)`, `cd -`, or an already-unknown starting cwd). Flags (`cd -P dir`) are
+ * skipped; a bare `cd` (no operand) resolves to the home directory.
+ */
+function nextCwdAfterCd(
+  currentCwd: string | null,
+  firstStage: string,
+  afterCd: number,
+): string | null {
+  let index = skipSpaces(firstStage, afterCd);
+  let target: string | null = null;
+  while (index < firstStage.length) {
+    const tokenResult = readShellToken(firstStage, index);
+    if (tokenResult === null) break;
+    const { token, end } = tokenResult;
+    if (end <= index) break; // parked on an operator boundary
+    index = skipSpaces(firstStage, end);
+    if (token === "-") return null; // `cd -` → previous dir, unknown
+    if (token.length > 1 && token.startsWith("-")) continue; // a flag like -P/-L
+    target = token;
+    break;
+  }
+  if (target === null) return path.resolve(os.homedir()); // bare `cd` → home
+  if (target.includes("$") || target.includes("`")) return null; // dynamic
+  const expanded = expandTilde(target);
+  if (path.isAbsolute(expanded)) return path.resolve(expanded);
+  if (currentCwd === null) return null;
+  return path.resolve(currentCwd, expanded);
+}
+
+function isDirInsideProject(resolvedRoot: string, dir: string): boolean {
+  const rel = path.relative(resolvedRoot, path.resolve(dir));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 function collectPathOperands(firstStage: string, startAfterCommand: number): string[] {
@@ -163,10 +222,11 @@ function resolvePathOperand(projectRoot: string, operand: string): string {
   return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(projectRoot, expanded);
 }
 
-function isPathInsideProject(projectRoot: string, operand: string): boolean {
-  const root = path.resolve(projectRoot);
-  const resolved = resolvePathOperand(root, operand);
-  const rel = path.relative(root, resolved);
+function isPathInsideProject(resolvedRoot: string, baseCwd: string, operand: string): boolean {
+  // Relative operands resolve against the grep's effective cwd (which may differ
+  // from the project root after a `cd`), absolute/`~` operands against the FS.
+  const resolved = resolvePathOperand(baseCwd, operand);
+  const rel = path.relative(resolvedRoot, resolved);
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 

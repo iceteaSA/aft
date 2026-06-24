@@ -160,6 +160,47 @@ describe("maybeAppendGrepSearchHint", () => {
     ).toBe(output);
   });
 
+  test("does NOT append when a cd into another repo precedes a relative-path grep (#issue)", () => {
+    // The bug: `cd <other-repo> && grep foo tools/bash.ts` resolved the relative
+    // operand against the SESSION root, looked in-project, and fired — even though
+    // the grep runs in a different repo aft_search can't search.
+    const output = "match in another repo";
+    expect(
+      maybeAppendGrepSearchHint(
+        output,
+        "cd /other/repo/src && grep -n foo tools/bash.ts",
+        true,
+        projectRoot,
+      ),
+    ).toBe(output);
+    // Multi-line cd;…;grep form (as a host may send it).
+    expect(
+      maybeAppendGrepSearchHint(
+        output,
+        "cd /other/repo\necho scanning\ngrep -n foo tools/bash.ts",
+        true,
+        projectRoot,
+      ),
+    ).toBe(output);
+  });
+
+  test("still appends when a cd stays inside the project, then greps a relative path", () => {
+    const result = maybeAppendGrepSearchHint(
+      "hits",
+      "cd src && grep -n foo file.ts",
+      true,
+      projectRoot,
+    );
+    expect(result).toBe(`hits\n\n${AFT_SEARCH_HINT}`);
+  });
+
+  test("does NOT append when cd target is dynamic (cwd unknown → cannot confirm in-project)", () => {
+    const output = "match";
+    expect(
+      maybeAppendGrepSearchHint(output, "cd $DIR && grep -n foo file.ts", true, projectRoot),
+    ).toBe(output);
+  });
+
   test("appends when mixed operands include an in-project path", () => {
     const result = maybeAppendGrepSearchHint(
       "hits",
