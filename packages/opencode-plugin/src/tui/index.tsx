@@ -133,7 +133,6 @@ interface StatusDialogProps {
   sessionID: string;
   initial: AftStatusSnapshot | null;
   initialError: string | null;
-  onClose: () => void;
 }
 
 /**
@@ -576,28 +575,31 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
     initialError = "AFT is starting up. Status will refresh automatically...";
   }
 
-  const dismissStatusDialog = () => {
-    api.ui.dialog.setSize("medium");
-    api.ui.dialog.clear();
-  };
-
+  // The host's DialogProvider already wraps every replace()'d element in its own
+  // <Dialog> frame (absolute, centered, zIndex 3000) and binds Esc/Ctrl-C to pop
+  // the stack. Rendering our own <api.ui.Dialog> inside it was a frame-inside-a-
+  // frame: the inner absolute box anchored within the already-narrowed parent and
+  // rendered shifted down-right off the screen edge, unthemed, with key focus on
+  // the wrong layer. Pass the bare component — the host frames it — exactly like
+  // the DialogAlert/DialogConfirm paths and magic-context's status dialog do.
+  //
+  // Also: do NOT pass an onClose that calls dialog.clear(). The host invokes the
+  // entry's onClose on Esc AND clear() re-invokes every entry's onClose, so a
+  // clear()-based onClose recursed infinitely on close. The host pops the stack
+  // itself, and StatusDialog stops its own polling via onCleanup when unmounted,
+  // so no custom onClose is needed. `replace` resets size to "medium", so request
+  // "large" AFTER it.
+  api.ui.dialog.replace(() => (
+    <StatusDialog
+      api={api}
+      client={client}
+      directory={directory}
+      sessionID={sessionID}
+      initial={initial}
+      initialError={initialError}
+    />
+  ));
   api.ui.dialog.setSize("large");
-  api.ui.dialog.replace(
-    () => (
-      <api.ui.Dialog size="large" onClose={dismissStatusDialog}>
-        <StatusDialog
-          api={api}
-          client={client}
-          directory={directory}
-          sessionID={sessionID}
-          initial={initial}
-          initialError={initialError}
-          onClose={dismissStatusDialog}
-        />
-      </api.ui.Dialog>
-    ),
-    dismissStatusDialog,
-  );
 }
 
 /**
