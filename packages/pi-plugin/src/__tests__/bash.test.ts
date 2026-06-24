@@ -155,6 +155,7 @@ describe("bash tool adapter", () => {
     // Tool description mentions compressed and background options, and the
     // background-management mechanism the agent actually uses to wait.
     expect(bashTool!.description).toContain("compressed");
+    expect(bashTool!.description).toContain("Piped commands run verbatim");
     expect(bashTool!.description).toContain("background");
     expect(bashTool!.description).toContain("bash_watch");
   });
@@ -228,7 +229,7 @@ describe("bash tool adapter", () => {
     expect(result.details.duration_ms).toBe(100);
   });
 
-  test("strips compressor-handled filter pipes before bridge and appends note", async () => {
+  test("forwards piped commands unchanged and does not append strip notes", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const { bridge, calls } = makeTrackableMockBridge({
@@ -241,18 +242,23 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const result = (await bashTool.execute(
-      "test-call",
-      { command: "bun test | grep fail" },
-      undefined,
-      undefined,
-      { cwd: "/test" },
-    )) as { content: Array<{ type: string; text: string }> };
+    const commands = [
+      "bun test | grep fail",
+      "cargo test | grep -v '^'",
+      "cargo test | awk 'END{exit 1}'",
+      "pytest -q | grep SENTINEL || exit 1",
+    ];
 
-    const callArgs = calls[0] as [string, Record<string, unknown>];
-    expect(callArgs[1].command).toBe("bun test");
-    expect(result.content[0].text).toContain("failure details");
-    expect(result.content[0].text).toContain("[AFT dropped `| grep fail`");
+    for (const command of commands) {
+      const result = (await bashTool.execute("test-call", { command }, undefined, undefined, {
+        cwd: "/test",
+      })) as { content: Array<{ type: string; text: string }> };
+
+      const callArgs = calls.at(-1) as [string, Record<string, unknown>];
+      expect(callArgs[1].command).toBe(command);
+      expect(result.content[0].text).toContain("failure details");
+      expect(result.content[0].text).not.toContain("AFT dropped");
+    }
   });
 
   test("keeps filter pipes when compressed:false", async () => {

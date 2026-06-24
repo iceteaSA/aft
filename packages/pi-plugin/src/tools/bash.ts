@@ -1,6 +1,5 @@
 import * as fs from "node:fs/promises";
 import {
-  appendPipeStripNote,
   type BinaryBridge,
   type BridgeRequestOptions,
   coerceBoolean,
@@ -10,7 +9,6 @@ import {
   isTerminalStatus,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
-  maybeStripCompressorPipe,
   resolveBashKillTimeout,
   sleep,
 } from "@cortexkit/aft-bridge";
@@ -343,7 +341,7 @@ export function registerBashTool(
     : "use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead";
   const bashCfg = resolveBashConfig(ctx.config);
   const compressionSentence = bashCfg.compress
-    ? " Output is compressed by default; pass `compressed: false` for raw output."
+    ? " Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`."
     : "";
   const tasksSentence = bashCfg.background
     ? ' Commands run in the foreground and return inline; a long-running one auto-promotes to background and delivers a completion reminder when it finishes — so for the common "I am waiting on this result" case, just run it and wait, no flags needed. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` waits on the task (sync blocks until exit/pattern, async notifies) and `bash_status` peeks at it — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: "screen" })` plus `bash_write`.'
@@ -360,6 +358,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
     promptGuidelines: [
       `DO NOT use bash for code search or exploration — ${searchSteer}.`,
       "Set compressed: false when you need ANSI color codes in the output.",
+      "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary.",
     ],
     parameters: bashParamsForConfig(bashCfg.background),
     async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
@@ -415,9 +414,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
         }
       }
 
-      const compressionEnabled = bashCfg.compress && params.compressed !== false;
-      const pipeStrip = maybeStripCompressorPipe(spawnContext.command, compressionEnabled);
-      const bridgeCommand = pipeStrip.command;
+      const bridgeCommand = spawnContext.command;
 
       let streamed = "";
       const response = await callBashBridge(
@@ -469,12 +466,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
       if (response.status === "running" && taskId) {
         if (effectiveBackground) {
           trackBgTask(resolveSessionId(extCtx), taskId);
-          // Surface the strip note on the background path too, so the agent
-          // knows their pipe was dropped when they read the task output later.
-          return bashResult(
-            appendPipeStripNote(formatBackgroundLaunch(taskId, requestedPty), pipeStrip.note),
-            { task_id: taskId },
-          );
+          return bashResult(formatBackgroundLaunch(taskId, requestedPty), { task_id: taskId });
         }
 
         // Wait-window decoupled from params.timeout. With background enabled,
@@ -497,14 +489,11 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           }
           if (isTerminalStatus(status.status)) {
             return bashResult(
-              appendPipeStripNote(
-                withBashHints(
-                  formatForegroundResult(status),
-                  bridgeCommand,
-                  aftSearchRegistered,
-                  extCtx.cwd,
-                ),
-                pipeStrip.note,
+              withBashHints(
+                formatForegroundResult(status),
+                bridgeCommand,
+                aftSearchRegistered,
+                extCtx.cwd,
               ),
               {
                 exit_code: status.exit_code as number | undefined,
@@ -530,13 +519,9 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
             trackBgTask(resolveSessionId(extCtx), taskId);
-            return bashResult(
-              appendPipeStripNote(
-                formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs),
-                pipeStrip.note,
-              ),
-              { task_id: taskId },
-            );
+            return bashResult(formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs), {
+              task_id: taskId,
+            });
           }
           await sleep(FOREGROUND_POLL_INTERVAL_MS);
         }
@@ -552,10 +537,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
 
       const output = (response.output as string | undefined) ?? "";
       return bashResult(
-        appendPipeStripNote(
-          withBashHints(output, bridgeCommand, aftSearchRegistered, extCtx.cwd),
-          pipeStrip.note,
-        ),
+        withBashHints(output, bridgeCommand, aftSearchRegistered, extCtx.cwd),
         details,
       );
     },

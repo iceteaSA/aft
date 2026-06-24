@@ -82,9 +82,8 @@ describe("buildWorkflowHints", () => {
       bashCompressionEnabled: true,
       disabledTools: new Set(),
     });
-    expect(on).toContain(
-      "bash output is auto-compressed — failures and the summary are always kept",
-    );
+    expect(on).toContain("bash output is auto-compressed for non-piped commands");
+    expect(on).toContain("Piped commands run verbatim and show the pipeline's output");
     expect(on).toContain("`bun test | grep fail` → run `bun test`");
     // The agent can't check the config — the section is gated instead of hedged.
     expect(on).not.toContain("compression is on,");

@@ -1,6 +1,47 @@
 use super::helpers::{user_config, AftProcess};
 
 #[cfg(unix)]
+fn shell_quote_path(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn write_executable_shim(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, body).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn wait_for_terminal_status(aft: &mut AftProcess, task_id: &str) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    loop {
+        let status = aft.send(
+            &serde_json::json!({
+                "id": format!("status-{task_id}"),
+                "method": "bash_status",
+                "params": { "task_id": task_id }
+            })
+            .to_string(),
+        );
+        if matches!(
+            status["status"].as_str(),
+            Some("completed" | "failed" | "killed" | "timed_out")
+        ) {
+            return status;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "timed out waiting for terminal bash status: {status:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
     let output = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -159,6 +200,69 @@ fn bash_rejects_invalid_pty_dimensions() {
         assert!(
             response["message"].as_str().unwrap().contains(message),
             "case {id}: expected message containing {message:?}, got {response:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_piped_runner_exit_status_is_not_hidden() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    write_executable_shim(
+        &bin_dir.join("cargo"),
+        "#!/bin/sh\nprintf 'fake cargo line\\n'\nexit 0\n",
+    );
+    write_executable_shim(
+        &bin_dir.join("pytest"),
+        "#!/bin/sh\nprintf 'fake pytest line\\n'\nexit 0\n",
+    );
+    let path_prefix = shell_quote_path(&bin_dir);
+    let cases = [
+        (
+            "grep-v-empty",
+            format!("PATH={path_prefix}:$PATH cargo test | grep -v '^'"),
+        ),
+        (
+            "awk-end-exit",
+            format!("PATH={path_prefix}:$PATH cargo test | awk 'END{{exit 1}}'"),
+        ),
+        (
+            "pytest-grep-sentinel",
+            format!("PATH={path_prefix}:$PATH pytest -q | grep SENTINEL || exit 1"),
+        ),
+    ];
+
+    for (id, command) in cases {
+        let response = aft.send(
+            &serde_json::json!({
+                "id": id,
+                "method": "bash",
+                "params": { "command": command }
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            response["success"], true,
+            "spawn failed for {id}: {response:?}"
+        );
+        assert_eq!(
+            response["status"], "running",
+            "unexpected spawn status for {id}: {response:?}"
+        );
+        let task_id = response["task_id"].as_str().unwrap();
+        let status = wait_for_terminal_status(&mut aft, task_id);
+        assert_eq!(
+            status["status"], "failed",
+            "{id} should preserve pipeline failure: {status:?}"
+        );
+        assert_eq!(
+            status["exit_code"], 1,
+            "{id} should report the shell pipeline exit code: {status:?}"
         );
     }
 

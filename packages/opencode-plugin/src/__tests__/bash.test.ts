@@ -109,6 +109,7 @@ describe("OpenCode bash adapter", () => {
 
     expect(bash.description).toContain("Output is compressed by default");
     expect(bash.description).toContain("compressed: false");
+    expect(bash.description).toContain("Piped commands run verbatim");
     expect(bash.description).toContain("background: true");
 
     expect(safeParse(bash.args.command, "ls -la").success).toBe(true);
@@ -278,7 +279,7 @@ describe("OpenCode bash adapter", () => {
     expect(calls[0].params.env).toEqual({ FOO: "bar", TOKEN: "redacted" });
   });
 
-  test("strips compressor-handled filter pipes before bridge and appends note", async () => {
+  test("forwards piped commands unchanged and does not append strip notes", async () => {
     const { calls, tool: bash } = createHarness(() => ({
       success: true,
       output: "failure details",
@@ -286,13 +287,19 @@ describe("OpenCode bash adapter", () => {
       truncated: false,
     }));
 
-    const output = bashText(
-      await bash.execute({ command: "bun test | grep fail" }, createMockSdkContext()),
-    );
+    const commands = [
+      "bun test | grep fail",
+      "cargo test | grep -v '^'",
+      "cargo test | awk 'END{exit 1}'",
+      "pytest -q | grep SENTINEL || exit 1",
+    ];
 
-    expect(calls[0].params.command).toBe("bun test");
-    expect(output).toContain("failure details");
-    expect(output).toContain("[AFT dropped `| grep fail`");
+    for (const command of commands) {
+      const output = bashText(await bash.execute({ command }, createMockSdkContext()));
+      expect(calls.at(-1)?.params.command).toBe(command);
+      expect(output).toContain("failure details");
+      expect(output).not.toContain("AFT dropped");
+    }
   });
 
   test("keeps filter pipes when compressed:false", async () => {

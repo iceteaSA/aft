@@ -61,7 +61,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     // "when compression is on" — the agent can't check the config; we can.
     sections.push(
       [
-        "**Test/build output**: bash output is auto-compressed — failures and the summary are always kept. DO NOT pipe test/build commands through filters to summarize; that hides failures:",
+        "**Test/build output**: bash output is auto-compressed for non-piped commands. Piped commands run verbatim and show the pipeline's output. For AFT's test/build summary, run the runner without filters:",
         "- `bun test | grep fail` → run `bun test`",
         "- `cargo test 2>&1 | tail -20` → run `cargo test`",
         "- `npm run build | head -50` → run `npm run build`",

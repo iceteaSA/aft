@@ -305,13 +305,12 @@ pub fn compress_with_registry_exit_code(
 
     // Resolve what to dispatch on: peel shell-prefix idioms (`cd /path && bun
     // test`, `env FOO=bar npm install`, `timeout 30 cargo build`, `(cd /path;
-    // cmd)`) so head-token matchers see the real command, and resolve top-level
-    // pipelines to the LAST stage (whose stdout we captured). A piped command
-    // that can't be parsed safely returns ForceGeneric: we must NOT let a
-    // head-token compressor claim it (e.g. CargoCompressor on `cargo test | …`
-    // would drop the grep-filtered line — issue #137), so jump to generic.
+    // cmd)`) so head-token matchers see the real command. Any top-level pipe
+    // must stay generic: the shell already ran the user's pipeline verbatim, so
+    // the captured output belongs to the pipeline result, not necessarily to the
+    // runner that appeared before `|`.
     let dispatch_owned = match resolve_dispatch_target(command) {
-        DispatchTarget::ForceGeneric => {
+        DispatchTarget::Pipeline(_) | DispatchTarget::ForceGeneric => {
             return GenericCompressor.compress_with_exit_code(
                 command,
                 &stripped_for_generic,
@@ -626,7 +625,7 @@ pub fn normalize_command_for_dispatch(command: &str) -> Option<String> {
         // Ambiguous/unsafe pipeline: callers that want a head token (e.g. the
         // gh-structured detector) fall back to the raw command via unwrap_or.
         DispatchTarget::ForceGeneric => None,
-        DispatchTarget::Command(resolved) => {
+        DispatchTarget::Command(resolved) | DispatchTarget::Pipeline(resolved) => {
             if resolved == command.trim_start() {
                 None
             } else {
@@ -642,6 +641,10 @@ enum DispatchTarget {
     /// Match compressors against this command string (peeled, and/or the last
     /// pipeline stage whose stdout was captured).
     Command(String),
+    /// A clean top-level pipeline was found. The contained string is the last
+    /// stage for callers that only need a normalized command, but compression
+    /// dispatch treats the original command as generic raw pipeline output.
+    Pipeline(String),
     /// An unsafe pipeline was detected (a `|` is present but the command could
     /// not be parsed safely). Skip all specific compressors and use generic —
     /// a head-token compressor claiming `cargo test | …` would drop the output.
@@ -659,7 +662,7 @@ fn resolve_dispatch_target(command: &str) -> DispatchTarget {
         .as_deref()
         .unwrap_or_else(|| decommented.trim_start());
     match split_top_level_pipe(base) {
-        PipeSplit::LastStage(last) => DispatchTarget::Command(last),
+        PipeSplit::LastStage(last) => DispatchTarget::Pipeline(last),
         PipeSplit::Unsafe => DispatchTarget::ForceGeneric,
         PipeSplit::None => DispatchTarget::Command(base.to_string()),
     }
@@ -1449,6 +1452,34 @@ mod dispatch_specificity_tests {
         let compressed = dispatch("cargo test", output);
         // Cargo's test compressor preserves PASS/FAIL semantics.
         assert!(compressed.contains("failed") || compressed.contains("FAILED"));
+    }
+
+    #[test]
+    fn top_level_piped_cargo_test_uses_generic_output() {
+        let output = "running 1 test\ntest ok_test ... ok\n\ntest result: ok. 1 passed; 0 failed\n";
+
+        let compressed = compress_with_registry("cargo test | cat", output, &empty_registry());
+
+        assert!(
+            compressed.text.contains("test ok_test ... ok"),
+            "piped cargo output must stay generic/raw, got: {}",
+            compressed.text
+        );
+    }
+
+    #[test]
+    fn non_piped_cargo_test_still_uses_cargo_compressor() {
+        let output = "running 1 test\ntest ok_test ... ok\n\ntest result: ok. 1 passed; 0 failed\n";
+
+        let compressed = compress_with_registry("cargo test", output, &empty_registry());
+
+        assert!(compressed.text.contains("running 1 test"));
+        assert!(compressed.text.contains("test result: ok"));
+        assert!(
+            !compressed.text.contains("test ok_test ... ok"),
+            "non-piped cargo test should keep using the cargo compressor, got: {}",
+            compressed.text
+        );
     }
 
     #[test]

@@ -1,12 +1,10 @@
 import {
-  appendPipeStripNote,
   type BridgeRequestOptions,
   coerceBoolean,
   formatForegroundResult,
   formatSeconds,
   isTerminalStatus,
   maybeAppendGrepSearchHint,
-  maybeStripCompressorPipe,
   resolveBashKillTimeout,
   sleep,
 } from "@cortexkit/aft-bridge";
@@ -81,7 +79,7 @@ export function bashToolDescription(
     ? "use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead"
     : "use the grep tool, read, aft_outline, or aft_zoom instead";
   const compression = compressionOn
-    ? " Output is compressed by default; pass compressed: false for raw output."
+    ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep."
     : "";
   const tasks = backgroundOn
     ? ' Commands run in the foreground and return inline; a long-running one auto-promotes to background and delivers a completion reminder when it finishes — so for the common "I am waiting on this result" case, just run it and wait, no flags needed. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.'
@@ -240,9 +238,7 @@ export function createBashTool(
       const description = args.description as string | undefined;
       const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
       const rawCommand = args.command as string;
-      const compressionEnabled = bashCfg.compress && args.compressed !== false;
-      const pipeStrip = maybeStripCompressorPipe(rawCommand, compressionEnabled);
-      const command = pipeStrip.command;
+      const command = rawCommand;
       const cwd = (args.workdir as string | undefined) ?? context.directory;
 
       // Detect whether the calling session is a subagent (has a non-empty
@@ -341,10 +337,6 @@ export function createBashTool(
           trackBgTask(context.sessionID, taskId);
           let startedLine = formatBackgroundLaunch(taskId, requestedPty);
           if (isSubagent && allowSubagentBg) startedLine += subagentGuidance(taskId);
-          // Tell the agent the pipe was stripped even on the background path, so
-          // when they later read the task output they know why it isn't filtered
-          // and can re-run with compressed:false to keep their pipeline.
-          startedLine = appendPipeStripNote(startedLine, pipeStrip.note);
           const metadataPayload = { description, output: startedLine, status: "running", taskId };
           metadata?.(metadataPayload);
           return { output: startedLine, title: uiTitle, metadata: metadataPayload };
@@ -384,7 +376,7 @@ export function createBashTool(
           }
           if (isTerminalStatus(status.status)) {
             const rendered = maybeAppendGrepSearchHint(
-              appendPipeStripNote(formatForegroundResult(status), pipeStrip.note),
+              formatForegroundResult(status),
               command,
               aftSearchRegistered,
               projectRootFor(context),
@@ -407,7 +399,6 @@ export function createBashTool(
             trackBgTask(context.sessionID, taskId);
             let message = formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs);
             if (isSubagent && allowSubagentBg) message += subagentGuidance(taskId);
-            message = appendPipeStripNote(message, pipeStrip.note);
             const metadataPayload = { description, output: message, status: "running", taskId };
             metadata?.(metadataPayload);
             return { output: message, title: uiTitle, metadata: metadataPayload };
@@ -449,7 +440,6 @@ export function createBashTool(
       if (typeof exit === "number" && exit !== 0) {
         rendered += `\n[exit code: ${exit}]`;
       }
-      rendered = appendPipeStripNote(rendered, pipeStrip.note);
       return {
         output: rendered,
         title: description ?? shortenCommand(command),

@@ -1,9 +1,5 @@
 /** Shared pure formatting helpers for host bash tool wrappers. */
 
-export function appendPipeStripNote(output: string, note: string | undefined): string {
-  return note ? `${output}\n\n${note}` : output;
-}
-
 /** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
 export function formatSeconds(ms: number): string {
   return `${Number((ms / 1000).toFixed(1))}s`;
