@@ -1,5 +1,7 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import {
+  chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -107,6 +109,59 @@ function childEnv(configDir: string): Record<string, string> {
   return result;
 }
 
+/**
+ * Seed the freshly-built aft binary into the versioned cache the spawned Pi
+ * process will read, so the resolver uses the code UNDER TEST — not a published
+ * artifact.
+ *
+ * The Pi RPC harness spawns the real Pi CLI, which loads the AFT Pi plugin and
+ * resolves the binary via the aft-bridge resolver. That resolver checks the
+ * versioned cache (`XDG_CACHE_HOME/aft/bin/v<ver>/aft`) at step 1, BEFORE the
+ * npm platform package at step 2. During the pre-release window the lockfile
+ * pins a PUBLISHED `@cortexkit/aft-<platform>` at the SAME version as this HEAD
+ * build (e.g. both `0.39.4` until v0.40.0 is cut), so `bun install` materializes
+ * a stale published binary in node_modules and the resolver's same-version guard
+ * (it only rejects MISMATCHED versions) happily uses it at step 2 — running code
+ * that predates HEAD and breaking the very behavior under test. Seeding step 1
+ * makes the build under test win, exactly as a local `dev-rebuild` does (which is
+ * why this never reproduced locally). Production is unaffected: real installs
+ * have no source build, so the npm platform package is the correct source there.
+ */
+function seedBinaryCache(configDir: string): void {
+  const ext = process.platform === "win32" ? ".exe" : "";
+  const builtBinary = [
+    join(REPO_ROOT, "target", "release", `aft${ext}`),
+    join(REPO_ROOT, "target", "debug", `aft${ext}`),
+  ].find((candidate) => existsSync(candidate));
+  if (builtBinary === undefined) {
+    throw new Error(
+      `No built aft binary at target/release/aft${ext} or target/debug/aft${ext}. ` +
+        "Run: cargo build --release -p agent-file-tools",
+    );
+  }
+  // The cache lookup keys on the version the binary reports (the resolver then
+  // verifies the cached binary reports the expected version), so derive the tag
+  // straight from the binary rather than guessing the workspace version.
+  const reported = execFileSync(builtBinary, ["--version"], { encoding: "utf8" })
+    .trim()
+    .replace(/^aft\s+/, "");
+  const cacheBinDir = join(configDir, "cache", "aft", "bin", `v${reported}`);
+  mkdirSync(cacheBinDir, { recursive: true });
+  const dest = join(cacheBinDir, `aft${ext}`);
+  copyFileSync(builtBinary, dest);
+  chmodSync(dest, 0o755);
+  // The copy is only linker-signed; macOS Sequoia SIGKILLs such binaries on
+  // exec. Ad-hoc re-sign (best-effort) so local macOS runs don't die — the
+  // Linux CI job doesn't need it. Mirrors scripts/dev-rebuild.sh.
+  if (process.platform === "darwin") {
+    try {
+      execFileSync("codesign", ["--force", "--sign", "-", dest], { stdio: "ignore" });
+    } catch {
+      // codesign unavailable / failed — leave the copy as-is.
+    }
+  }
+}
+
 function writeConfigs(opts: PiSpawnOptions): string {
   const agentDir = join(opts.configDir, ".pi", "agent");
   const extensionsDir = join(agentDir, "extensions");
@@ -114,6 +169,8 @@ function writeConfigs(opts: PiSpawnOptions): string {
   mkdirSync(join(opts.configDir, "config"), { recursive: true });
   mkdirSync(join(opts.configDir, "data"), { recursive: true });
   mkdirSync(join(opts.configDir, "cache"), { recursive: true });
+  // Resolve to the build under test, not the lockfile's published platform pkg.
+  seedBinaryCache(opts.configDir);
 
   const distEntry = join(opts.aftPluginDir, "dist", "index.js");
   if (!existsSync(distEntry)) {
