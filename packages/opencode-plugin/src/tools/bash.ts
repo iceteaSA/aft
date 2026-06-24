@@ -84,7 +84,7 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output."
     : "";
   const tasks = backgroundOn
-    ? ' Pass background: true to run in the background and get a taskId for bash_status/bash_watch/bash_kill. Pass pty: true for interactive programs (REPLs, TUIs) and drive them with bash_status({ outputMode: "screen" }) plus bash_write (pty implies background automatically). Use bash_watch to wait for exit or output patterns (sync blocks, async notifies). Do not loop bash_status to wait.'
+    ? ' Commands run in the foreground and return inline; a long-running one auto-promotes to background and delivers a completion reminder when it finishes — so for the common "I am waiting on this result" case, just run it and wait, no flags needed. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.'
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   return `Execute shell commands.${compression}${tasks}
 

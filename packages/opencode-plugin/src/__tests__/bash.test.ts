@@ -1491,11 +1491,17 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(bashToolDescription(true, false, true)).not.toContain("compressed");
   });
 
-  test("background on steers waiting to bash_watch and forbids bash_status polling loops", () => {
+  test("background on is foreground-first and names the background+bash_watch anti-pattern", () => {
     const on = bashToolDescription(true, true, true);
-    expect(on).toContain("bash_status/bash_watch/bash_kill");
-    expect(on).toContain("sync blocks, async notifies");
-    expect(on).toContain("Do not loop bash_status to wait");
+    // Lead with foreground-returns-inline + auto-promotion (the common case).
+    expect(on).toContain("foreground");
+    expect(on).toContain("auto-promotes to background");
+    // Demote background: true to the parallel-work-only case.
+    expect(on).toContain("other useful work to do while it runs");
+    // Name the exact anti-pattern this description previously caused.
+    expect(on).toContain("never background a command and immediately bash_watch it");
+    // Still forbid the bash_status polling loop.
+    expect(on).toContain("never loop bash_status to wait");
   });
 
   test("bash_watch description endorses long sync waits and user interrupt", () => {
