@@ -34,6 +34,15 @@ const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 /// automatic (not explicitly requested), so a runaway giant stays bounded.
 const RANK0_FULL_SNIPPET_MAX_LINES: usize = 250;
 
+/// Appended under the rank-0 snippet ONLY when the complete symbol was shown
+/// (full expansion, not the capped preview). Tells the agent the body is the live
+/// on-disk content so it can edit directly instead of spending a redundant
+/// zoom/read — which is the entire point of the full-symbol expansion. It must
+/// never appear on a partial preview (ranks 1-2, or the >cap fallback that ends
+/// in "+N more lines"), where re-reading IS needed.
+const RANK0_FULL_SYMBOL_NOTICE: &str =
+    "full symbol shown as-is on disk; no re-read or zoom needed before editing";
+
 #[derive(Debug, Clone)]
 pub struct HybridResult {
     pub file: PathBuf,
@@ -1774,7 +1783,14 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
             // generous; only a runaway giant falls through to the preview budget.
             let doc_start = doc_comment_start(lines, start);
             if end.saturating_sub(doc_start) <= RANK0_FULL_SNIPPET_MAX_LINES {
-                result.snippet = lines[doc_start..end].join("\n");
+                // Complete symbol shown — tell the agent it can edit without a
+                // re-read. Only on this full-expansion path, never the capped
+                // preview below. Appended to the snippet (display-only) like the
+                // "+N more lines" trailer, so it renders under the body.
+                result.snippet = format!(
+                    "{}\n{RANK0_FULL_SYMBOL_NOTICE}",
+                    lines[doc_start..end].join("\n")
+                );
                 continue;
             }
         }
@@ -2805,6 +2821,10 @@ mod tests {
         assert!(results[0].snippet.contains("line19"));
         assert!(!results[0].snippet.contains("line299"));
         assert!(results[0].snippet.contains("+280 more lines"));
+        assert!(
+            !results[0].snippet.contains(RANK0_FULL_SYMBOL_NOTICE),
+            "capped fallback is incomplete — must NOT claim no-re-read"
+        );
     }
 
     #[test]
@@ -2861,6 +2881,10 @@ mod tests {
         assert!(
             !snippet.contains("nextSymbol"),
             "trailing neighbor must NOT bleed in: {snippet}"
+        );
+        assert!(
+            snippet.contains(RANK0_FULL_SYMBOL_NOTICE),
+            "full expansion must carry the no-re-read notice: {snippet}"
         );
     }
 
