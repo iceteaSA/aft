@@ -201,12 +201,10 @@ impl AppContext {
         let compression = self.compression_stats_for_session(session_id);
 
         // Degraded-mode reasons recorded by `handle_configure` when the
-        // project root doesn't look like a real project (`home_root`) or the
-        // file count exceeds the search-index threshold
-        // (`search_too_many_files:N`). Heavy subsystems are auto-disabled in
-        // these modes; the plugin / TUI sidebar surface the reasons so users
-        // know why and can decide whether to open a project subdirectory.
-        // Empty list = full-featured mode.
+        // project root doesn't look like a real project (`home_root`). Heavy
+        // subsystems are auto-disabled in that mode; the plugin / TUI sidebar
+        // surface the reason so users know why and can decide whether to open a
+        // project subdirectory. Empty list = full-featured mode.
         let degraded_reasons = self.degraded_reasons();
         let degraded = !degraded_reasons.is_empty();
 

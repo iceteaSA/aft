@@ -32,7 +32,13 @@ use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-const MAX_SEARCH_INDEX_FILES: usize = 20_000;
+/// Bounds the synchronous source-file count walk in `handle_configure` so it
+/// costs O(bound), not O(project), on monorepo-scale repos. This is only the
+/// `source_file_count` display/telemetry hint — it does NOT disable the search
+/// index. The disk-backed (pread) trigram index is RAM-bounded at any repo
+/// size (~745 MiB measured on Chromium's 176k files), so there is no longer a
+/// file-count ceiling on search.
+const SOURCE_FILE_COUNT_WALK_BOUND: usize = 20_000;
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 
@@ -1448,12 +1454,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         degraded_reasons.push("home_root".to_string());
     }
 
-    // `_bypass_size_limits` (set by `aft warmup --force`) lifts file-count
-    // caps so a very large repo is fully indexed for measurement: search index
-    // (`MAX_SEARCH_INDEX_FILES`) and semantic (`semantic.max_files`). Not a
-    // user-facing config knob — it is
-    // an internal benchmarking escape hatch. We raise to a large-but-safe value
-    // (not usize::MAX) so the `+ 1` below cannot overflow.
+    // `_bypass_size_limits` (set by `aft warmup --force`) lifts the semantic
+    // `max_files` cap so a very large repo is fully embedded for measurement.
+    // Internal benchmarking escape hatch, not a user-facing knob. (The search
+    // index has no file-count cap — its disk-backed design is RAM-bounded.)
     let bypass_size_limits = params
         .get("_bypass_size_limits")
         .and_then(|v| v.as_bool())
@@ -1463,32 +1467,20 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
     }
 
-    // The cap-bounded count below uses `take(max + 1)` so it costs O(cap),
-    // not O(project), and feeds search-index auto-disable decisions.
-    // `--force`/bypass also lifts the hardcoded search-index file limit.
-    let search_index_limit = if bypass_size_limits {
-        usize::MAX - 1
+    // Bounded source-file count for the sidebar/status `source_file_count` hint.
+    // `take(bound + 1)` keeps it O(bound), not O(project), on monorepo-scale
+    // repos. Purely informational — search is no longer disabled by file count.
+    let source_file_count = if home_match {
+        // When the project root is the user's home directory, indexing is
+        // force-disabled later in this function, so the count hint is never
+        // used — skip the (potentially whole-home-tree) walk and return the
+        // bound so the value still reads as "large".
+        SOURCE_FILE_COUNT_WALK_BOUND.saturating_add(1)
     } else {
-        MAX_SEARCH_INDEX_FILES
+        crate::callgraph::walk_project_files(&root_path)
+            .take(SOURCE_FILE_COUNT_WALK_BOUND.saturating_add(1))
+            .count()
     };
-    let (source_file_count, exceeds_search_threshold) = if home_match {
-        (search_index_limit.saturating_add(1), true)
-    } else {
-        let walk_limit = search_index_limit.saturating_add(1);
-        let count = crate::callgraph::walk_project_files(&root_path)
-            .take(walk_limit)
-            .count();
-        let exceeds_search = count > search_index_limit;
-        (count, exceeds_search)
-    };
-    if exceeds_search_threshold && next_config.search_index {
-        slog_warn!(
-            "project has >{} source files. Search index auto-disabled — open a project subdirectory for grep/aft_search.",
-            MAX_SEARCH_INDEX_FILES
-        );
-        next_config.search_index = false;
-        degraded_reasons.push(format!("search_too_many_files:{}", MAX_SEARCH_INDEX_FILES));
-    }
 
     if home_match {
         if next_config.search_index {
@@ -1654,8 +1646,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.clear_pending_index_updates();
 
     // Snapshot accumulated degraded reasons on the context so status /
-    // sidebar / future tool calls all see the same state. Reasons emitted
-    // synchronously so far: `home_root` and `search_too_many_files:N`.
+    // sidebar / future tool calls all see the same state. The only
+    // synchronously-emitted reason is `home_root`.
     // The semantic-build thread may push its own "skipped — too many files"
     // status downstream; we don't yet thread that back into the persistent
     // reasons list because semantic auto-skip is already surfaced through

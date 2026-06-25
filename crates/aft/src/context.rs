@@ -584,10 +584,9 @@ pub struct AppContext {
     git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
     /// Reasons (if any) why heavy AFT subsystems were auto-disabled for the
     /// current project root. Populated by `handle_configure` based on the
-    /// canonical project root and synchronous file count. Each reason is a
-    /// stable machine-readable string suffix (`"home_root"`,
-    /// `"search_too_many_files:N"`, etc.) so the plugin can render distinct
-    /// degraded-mode UI states without re-deriving the reason locally.
+    /// canonical project root. Each reason is a stable machine-readable string
+    /// (e.g. `"home_root"`, `"watcher_unavailable"`) so the plugin can render
+    /// distinct degraded-mode UI states without re-deriving the reason locally.
     /// Empty when the project is healthy / full-featured.
     degraded_reasons: parking_lot::Mutex<Vec<String>>,
     callgraph_store: RwLock<Option<Arc<CallGraphStore>>>,
