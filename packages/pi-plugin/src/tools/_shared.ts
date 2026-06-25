@@ -9,6 +9,10 @@ import { Type } from "typebox";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import type { PluginContext } from "../types.js";
 
+type TextContent = { type: "text"; text: string; textSignature?: string };
+type ImageContent = { type: "image"; data: string; mimeType: string };
+type ContentBlock = TextContent | ImageContent;
+
 export const optionalInt = (_min: number, _max: number) =>
   Type.Optional(Type.Any({ description: "(integer)" }));
 
@@ -106,8 +110,16 @@ export function textResult<TDetails = unknown>(
   text: string,
   details?: TDetails,
 ): AgentToolResult<TDetails> {
+  return contentResult([{ type: "text", text }], details);
+}
+
+/** Build an AgentToolResult that can include image content blocks. */
+export function contentResult<TDetails = unknown>(
+  content: ContentBlock[],
+  details?: TDetails,
+): AgentToolResult<TDetails> {
   return {
-    content: [{ type: "text", text }],
+    content,
     details: details as TDetails,
   };
 }

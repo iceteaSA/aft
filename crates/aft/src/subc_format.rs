@@ -369,6 +369,10 @@ fn format_read(data: &Value, agent_specified_range: bool) -> String {
             .join("\n");
     }
 
+    if let Some(attachment_line) = format_read_attachments(data) {
+        return attachment_line;
+    }
+
     if data.get("binary").and_then(Value::as_bool).unwrap_or(false) {
         return data
             .get("message")
@@ -384,6 +388,62 @@ fn format_read(data: &Value, agent_specified_range: bool) -> String {
         .to_string();
     text.push_str(&format_read_footer(agent_specified_range, data));
     text
+}
+
+fn format_read_attachments(data: &Value) -> Option<String> {
+    let attachments = data.get("attachments")?.as_array()?;
+    let first = attachments.first()?.as_object()?;
+    let kind = first.get("kind").and_then(Value::as_str).unwrap_or("file");
+    let mime = first
+        .get("mime")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream");
+    let size = first
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .map(format_attachment_size);
+    let extra_count = attachments.len().saturating_sub(1);
+    let suffix = if extra_count > 0 {
+        format!("; +{extra_count} more")
+    } else {
+        String::new()
+    };
+
+    if kind == "image" || mime.starts_with("image/") {
+        let dimensions = match (
+            first.get("width").and_then(Value::as_u64),
+            first.get("height").and_then(Value::as_u64),
+        ) {
+            (Some(width), Some(height)) => format!(", {width}×{height}"),
+            _ => String::new(),
+        };
+        let size = size.map(|size| format!(", {size}")).unwrap_or_default();
+        return Some(format!(
+            "[image attachment: {mime}{dimensions}{size}{suffix} — inline delivery pending MCP image support]"
+        ));
+    }
+
+    if kind == "pdf" || mime == "application/pdf" {
+        let size = size.map(|size| format!(", {size}")).unwrap_or_default();
+        return Some(format!(
+            "[pdf attachment: {mime}{size}{suffix} — inline delivery pending MCP file support]"
+        ));
+    }
+
+    let size = size.map(|size| format!(", {size}")).unwrap_or_default();
+    Some(format!(
+        "[attachment: {mime}{size}{suffix} — inline delivery pending MCP file support]"
+    ))
+}
+
+fn format_attachment_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{} KB", bytes.div_ceil(1024))
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 fn format_read_footer(agent_specified_range: bool, data: &Value) -> String {

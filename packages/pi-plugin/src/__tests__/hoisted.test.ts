@@ -9,7 +9,13 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { formatReadFooter, registerHoistedTools } from "../tools/hoisted.js";
-import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
+import {
+  executeTool,
+  makeExtContext,
+  makeMockApi,
+  makeMockBridge,
+  makePluginContext,
+} from "./tool-test-utils.js";
 
 const roots: string[] = [];
 
@@ -56,6 +62,112 @@ describe("hoisted tool adapters", () => {
       content: Array<{ text: string }>;
     };
     expect(unbounded.content[0].text).toContain("Showing lines 1-2 of 10");
+  });
+
+  test("read emits image content for vision-capable Pi models", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({
+      success: true,
+      attachments: [
+        {
+          kind: "image",
+          mime: "image/png",
+          data: "aW1hZ2U=",
+          bytes: 1024,
+          base64_bytes: 8,
+          width: 32,
+          height: 16,
+          resized: false,
+          animation: "none",
+          orientation_applied: false,
+        },
+      ],
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: true,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("read")!, { path: "image.png" }, {
+      ...makeExtContext(),
+      model: { input: ["text", "image"] },
+    } as never)) as {
+      content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+    };
+
+    expect(result.content[0]).toMatchObject({ type: "text" });
+    expect(result.content[1]).toEqual({ type: "image", data: "aW1hZ2U=", mimeType: "image/png" });
+  });
+
+  test("read omits image content for non-vision Pi models", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({
+      success: true,
+      attachments: [
+        {
+          kind: "image",
+          mime: "image/png",
+          data: "aW1hZ2U=",
+          bytes: 1024,
+          base64_bytes: 8,
+          width: 32,
+          height: 16,
+          resized: false,
+          animation: "none",
+          orientation_applied: false,
+        },
+      ],
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: true,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("read")!, { path: "image.png" }, {
+      ...makeExtContext(),
+      model: { input: ["text"] },
+    } as never)) as { content: Array<{ type: string; text?: string }> };
+
+    expect(result.content).toHaveLength(1);
+    expect(result.content[0].type).toBe("text");
+    expect(result.content[0].text).toContain("Current model does not support images");
+  });
+
+  test("read reports PDFs as unsupported text on Pi", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({
+      success: true,
+      attachments: [
+        {
+          kind: "pdf",
+          mime: "application/pdf",
+          data: "JVBERi0=",
+          bytes: 128,
+          base64_bytes: 8,
+        },
+      ],
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: true,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("read")!, { path: "doc.pdf" })) as {
+      content: Array<{ type: string; text?: string }>;
+    };
+
+    expect(result.content).toHaveLength(1);
+    expect(result.content[0].type).toBe("text");
+    expect(result.content[0].text).toContain("PDFs aren't supported on the Pi harness yet.");
   });
 
   test("edit appendContent uses append op instead of match/replacement fields", async () => {

@@ -125,6 +125,77 @@ describe("Hoisted tool execute handlers", () => {
     );
   });
 
+  test("read maps image attachments to OpenCode data URLs and metadata", async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command) => {
+      expect(command).toBe("read");
+      return {
+        success: true,
+        attachments: [
+          {
+            kind: "image",
+            mime: "image/png",
+            data: "aW1hZ2U=",
+            bytes: 1024,
+            base64_bytes: 8,
+            width: 32,
+            height: 16,
+            resized: false,
+            animation: "none",
+            orientation_applied: false,
+          },
+        ],
+      };
+    });
+
+    const result = (await tools.read.execute({ filePath: "image.png" }, sdkCtx)) as {
+      output: string;
+      attachments?: Array<{ type: string; mime: string; url: string }>;
+      metadata?: { isImage?: boolean; isPdf?: boolean };
+    };
+
+    expect(result.output).toContain("Read image");
+    expect(result.attachments).toEqual([
+      { type: "file", mime: "image/png", url: "data:image/png;base64,aW1hZ2U=" },
+    ]);
+    expect(result.metadata?.isImage).toBe(true);
+    expect(result.metadata?.isPdf).toBe(false);
+  });
+
+  test("read maps PDF attachments to OpenCode data URLs and metadata", async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command) => {
+      expect(command).toBe("read");
+      return {
+        success: true,
+        attachments: [
+          {
+            kind: "pdf",
+            mime: "application/pdf",
+            data: "JVBERi0=",
+            bytes: 128,
+            base64_bytes: 8,
+          },
+        ],
+      };
+    });
+
+    const result = (await tools.read.execute({ filePath: "doc.pdf" }, sdkCtx)) as {
+      attachments?: Array<{ type: string; mime: string; url: string }>;
+      metadata?: { isImage?: boolean; isPdf?: boolean };
+    };
+
+    expect(result.attachments).toEqual([
+      { type: "file", mime: "application/pdf", url: "data:application/pdf;base64,JVBERi0=" },
+    ]);
+    expect(result.metadata?.isImage).toBe(false);
+    expect(result.metadata?.isPdf).toBe(true);
+  });
+
   test("write throws the Rust error response for invalid writes", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);

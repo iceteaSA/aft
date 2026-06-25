@@ -55,6 +55,44 @@ function formatReadFooter(agentSpecifiedRange: boolean, data: Record<string, unk
   return formatSharedReadFooter(agentSpecifiedRange, data, { rangeHint: "startLine/endLine" });
 }
 
+type ReadAttachment = {
+  kind?: unknown;
+  mime?: unknown;
+  data?: unknown;
+  bytes?: unknown;
+  width?: unknown;
+  height?: unknown;
+  resized?: unknown;
+};
+
+function readAttachments(data: Record<string, unknown>): ReadAttachment[] {
+  return Array.isArray(data.attachments) ? (data.attachments as ReadAttachment[]) : [];
+}
+
+function formatAttachmentSize(bytes: unknown): string | undefined {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return undefined;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${bytes} bytes`;
+}
+
+function formatReadAttachmentOutput(attachment: ReadAttachment): string {
+  const mime = typeof attachment.mime === "string" ? attachment.mime : "application/octet-stream";
+  const size = formatAttachmentSize(attachment.bytes);
+  if (attachment.kind === "image" || mime.startsWith("image/")) {
+    const dimensions =
+      typeof attachment.width === "number" && typeof attachment.height === "number"
+        ? `, ${attachment.width}×${attachment.height}`
+        : "";
+    const resized = attachment.resized === true ? ", resized" : "";
+    return `Read image (${mime}${dimensions}${resized}${size ? `, ${size}` : ""}).`;
+  }
+  if (attachment.kind === "pdf" || mime === "application/pdf") {
+    return `Read PDF${size ? ` (${size})` : ""}.`;
+  }
+  return `Read attachment (${mime}${size ? `, ${size}` : ""}).`;
+}
+
 /** Test-only export. Production code uses buildUnifiedDiff directly. */
 export const _buildUnifiedDiffForTest = (fp: string, before: string, after: string): string =>
   buildUnifiedDiff(fp, before, after);
@@ -445,7 +483,7 @@ Behavior:
 - Lines longer than 2000 characters are truncated
 - Output capped at 50KB
 - Binary files are auto-detected and return a size-only message
-- Image files (.png, .jpg, .gif, .webp, etc.) and PDFs return a metadata string (format, size, path) — no file content is returned
+- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media
 - Directories return sorted entries with trailing / for subdirectories
 
 Examples:
@@ -508,53 +546,6 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         return permissionDeniedResponse("Permission denied.");
       }
 
-      // Image/PDF detection — return metadata for UI preview
-      const ext = path.extname(filePath).toLowerCase();
-      const mimeMap: Record<string, string> = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-        ".bmp": "image/bmp",
-        ".ico": "image/x-icon",
-        ".tiff": "image/tiff",
-        ".tif": "image/tiff",
-        ".avif": "image/avif",
-        ".heic": "image/heic",
-        ".heif": "image/heif",
-        ".pdf": "application/pdf",
-      };
-      const mime = mimeMap[ext];
-      if (mime) {
-        const isImage = mime.startsWith("image/");
-        const label = isImage ? "Image" : "PDF";
-        let fileSize = 0;
-        try {
-          const stat = await import("node:fs/promises").then((fs) => fs.stat(filePath));
-          fileSize = stat.size;
-        } catch {
-          /* ignore */
-        }
-        const sizeStr =
-          fileSize > 1024 * 1024
-            ? `${(fileSize / (1024 * 1024)).toFixed(1)}MB`
-            : fileSize > 1024
-              ? `${(fileSize / 1024).toFixed(0)}KB`
-              : `${fileSize} bytes`;
-        const msg = `${label} read successfully`;
-        return {
-          output: `${msg} (${ext.slice(1).toUpperCase()}, ${sizeStr}). File: ${filePath}`,
-          title: path.relative(projectRoot, filePath),
-          metadata: {
-            preview: msg,
-            filepath: filePath,
-            isImage,
-            isPdf: mime === "application/pdf",
-          },
-        };
-      }
-
       const rawStartLine = coerceOptionalInt(
         args.startLine,
         "startLine",
@@ -590,6 +581,40 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       }
 
       const dp = relativeToWorktree(filePath, projectRoot) || file;
+
+      const attachments = readAttachments(data);
+      if (attachments.length > 0) {
+        const toolAttachments = attachments
+          .filter(
+            (attachment) =>
+              typeof attachment.mime === "string" && typeof attachment.data === "string",
+          )
+          .map((attachment) => ({
+            type: "file" as const,
+            mime: attachment.mime as string,
+            url: `data:${attachment.mime};base64,${attachment.data}`,
+          }));
+        if (toolAttachments.length > 0) {
+          const first = attachments[0];
+          const firstMime = typeof first.mime === "string" ? first.mime : "";
+          const output =
+            typeof data.content === "string" && data.content.length > 0
+              ? data.content
+              : formatReadAttachmentOutput(first);
+          return {
+            output,
+            title: dp,
+            attachments: toolAttachments,
+            metadata: {
+              preview: output,
+              filepath: filePath,
+              title: dp,
+              isImage: first.kind === "image" || firstMime.startsWith("image/"),
+              isPdf: first.kind === "pdf" || firstMime === "application/pdf",
+            },
+          };
+        }
+      }
 
       // Directory response
       if (data.entries) {

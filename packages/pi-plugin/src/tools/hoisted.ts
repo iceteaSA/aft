@@ -34,7 +34,14 @@ import {
 import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, coerceOptionalInt, optionalInt, textResult } from "./_shared.js";
+import {
+  bridgeFor,
+  callBridge,
+  coerceOptionalInt,
+  contentResult,
+  optionalInt,
+  textResult,
+} from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
 
 // Diagnostics on edit are config-driven only (`lsp.diagnostics_on_edit`).
@@ -45,6 +52,51 @@ import { formatDiffForPi } from "./diff-format.js";
 function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
   return ctx.config.lsp?.diagnostics_on_edit ?? false;
 }
+
+type ReadAttachment = {
+  kind?: unknown;
+  mime?: unknown;
+  data?: unknown;
+  bytes?: unknown;
+  width?: unknown;
+  height?: unknown;
+  resized?: unknown;
+};
+
+function readAttachments(response: Record<string, unknown>): ReadAttachment[] {
+  return Array.isArray(response.attachments) ? (response.attachments as ReadAttachment[]) : [];
+}
+
+function formatAttachmentSize(bytes: unknown): string | undefined {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return undefined;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${bytes} bytes`;
+}
+
+function formatReadAttachmentText(attachment: ReadAttachment): string {
+  const mime = typeof attachment.mime === "string" ? attachment.mime : "application/octet-stream";
+  const size = formatAttachmentSize(attachment.bytes);
+  if (attachment.kind === "image" || mime.startsWith("image/")) {
+    const dimensions =
+      typeof attachment.width === "number" && typeof attachment.height === "number"
+        ? `, ${attachment.width}×${attachment.height}`
+        : "";
+    const resized = attachment.resized === true ? ", resized" : "";
+    return `Read image file [${mime}]${dimensions}${resized}${size ? `, ${size}` : ""}`;
+  }
+  if (attachment.kind === "pdf" || mime === "application/pdf") {
+    return `Read PDF file${size ? ` [${size}]` : ""}`;
+  }
+  return `Read attachment [${mime}]${size ? ` ${size}` : ""}`;
+}
+
+function modelSupportsImages(extCtx: { model?: { input?: unknown } }): boolean {
+  return Array.isArray(extCtx.model?.input) && extCtx.model.input.includes("image");
+}
+
+const NON_VISION_IMAGE_NOTE =
+  "[Current model does not support images. The image will be omitted from this request.]";
 
 /**
  * Local shape for Pi's render context — the real type is exposed by
@@ -294,7 +346,7 @@ export function registerHoistedTools(
       name: "read",
       label: "read",
       description:
-        "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos and correctly handles images/PDFs as attachments.",
+        "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.",
       promptSnippet: "Read file contents (supports offset/limit for large files)",
       promptGuidelines: ["Use read to examine files instead of cat or sed."],
       parameters: ReadParams,
@@ -327,6 +379,31 @@ export function registerHoistedTools(
           req.end_line = limit;
         }
         const response = await callBridge(bridge, "read", req, extCtx);
+        const attachments = readAttachments(response);
+        if (attachments.length > 0) {
+          const first = attachments[0];
+          const mime = typeof first.mime === "string" ? first.mime : "";
+          const note =
+            typeof response.content === "string" && response.content.length > 0
+              ? response.content
+              : formatReadAttachmentText(first);
+          if (first.kind === "image" || mime.startsWith("image/")) {
+            if (typeof first.data === "string" && modelSupportsImages(extCtx)) {
+              return contentResult(
+                [
+                  { type: "text", text: note },
+                  { type: "image", data: first.data, mimeType: mime },
+                ],
+                response,
+              );
+            }
+            return textResult(`${note}\n${NON_VISION_IMAGE_NOTE}`, response);
+          }
+          if (first.kind === "pdf" || mime === "application/pdf") {
+            return textResult(`${note}\nPDFs aren't supported on the Pi harness yet.`, response);
+          }
+          return textResult(note, response);
+        }
         if (Array.isArray(response.entries)) {
           return textResult((response.entries as string[]).join("\n"));
         }
