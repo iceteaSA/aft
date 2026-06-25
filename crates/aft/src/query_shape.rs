@@ -140,6 +140,28 @@ pub fn extract_short_nl_lexical_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Code-shaped tokens that are explicit enough to use for semantic name priors
+/// inside natural-language queries. Bare prose words are excluded: a lone
+/// capitalized word like "Engine" is too ambiguous unless quoted, while adjacent
+/// TitleCase words are treated as one qualified name such as "Engine.Index".
+pub(crate) fn extract_explicit_code_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    push_quoted_code_tokens(query, &mut tokens);
+    let title_spans = push_adjacent_titlecase_tokens(query, 0, &mut tokens);
+    for mat in IDENTIFIER_TOKEN_RE.find_iter(query) {
+        if span_is_covered(&title_spans, mat.start(), mat.end()) {
+            continue;
+        }
+        let token = mat.as_str();
+        if is_code_identifier_token(token) {
+            push_unique(&mut tokens, token);
+        }
+    }
+
+    tokens
+}
+
 pub fn pre_tier_exempt(query: &str) -> Option<&'static str> {
     if let Some(kind) = check_url_exemption(query) {
         return Some(kind);
@@ -620,6 +642,120 @@ fn escaped_paren_count(query: &str) -> usize {
     count
 }
 
+fn push_quoted_code_tokens(query: &str, tokens: &mut Vec<String>) {
+    let mut open: Option<(char, usize)> = None;
+    let mut escaped = false;
+
+    for (index, ch) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if let Some((delimiter, content_start)) = open {
+            if ch == delimiter {
+                let content = &query[content_start..index];
+                let title_spans = push_adjacent_titlecase_tokens(content, content_start, tokens);
+                for mat in IDENTIFIER_TOKEN_RE.find_iter(content) {
+                    let start = content_start + mat.start();
+                    let end = content_start + mat.end();
+                    if !span_is_covered(&title_spans, start, end) {
+                        push_unique(tokens, mat.as_str());
+                    }
+                }
+                open = None;
+            }
+        } else if matches!(ch, '"' | '\'' | '`') {
+            open = Some((ch, index + ch.len_utf8()));
+        }
+    }
+}
+
+fn push_adjacent_titlecase_tokens(
+    text: &str,
+    base_offset: usize,
+    tokens: &mut Vec<String>,
+) -> Vec<(usize, usize)> {
+    let mut covered_spans = Vec::new();
+    let mut current: Vec<(usize, usize, &str)> = Vec::new();
+    let mut previous_end: Option<usize> = None;
+
+    for mat in IDENTIFIER_TOKEN_RE.find_iter(text) {
+        let token = mat.as_str();
+        let adjacent_to_current = previous_end.is_some_and(|end| {
+            !current.is_empty() && text[end..mat.start()].chars().all(|ch| ch.is_whitespace())
+        });
+        if is_titlecase_word(token) && (current.is_empty() || adjacent_to_current) {
+            current.push((base_offset + mat.start(), base_offset + mat.end(), token));
+        } else {
+            flush_titlecase_sequence(&mut current, &mut covered_spans, tokens);
+            if is_titlecase_word(token) {
+                current.push((base_offset + mat.start(), base_offset + mat.end(), token));
+            }
+        }
+        previous_end = Some(mat.end());
+    }
+
+    flush_titlecase_sequence(&mut current, &mut covered_spans, tokens);
+    covered_spans
+}
+
+fn flush_titlecase_sequence(
+    current: &mut Vec<(usize, usize, &str)>,
+    covered_spans: &mut Vec<(usize, usize)>,
+    tokens: &mut Vec<String>,
+) {
+    if current.len() >= 2 {
+        let qualified = current
+            .iter()
+            .map(|(_, _, token)| *token)
+            .collect::<Vec<_>>()
+            .join(".");
+        push_unique(tokens, &qualified);
+        covered_spans.extend(current.iter().map(|(start, end, _)| (*start, *end)));
+    }
+    current.clear();
+}
+
+fn span_is_covered(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
+    spans
+        .iter()
+        .any(|(span_start, span_end)| start >= *span_start && end <= *span_end)
+}
+
+fn is_titlecase_word(token: &str) -> bool {
+    if token.contains(['.', '_', '$']) {
+        return false;
+    }
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+
+    let mut has_letter_after_first = false;
+    let mut has_lowercase = false;
+    for ch in chars {
+        if !ch.is_ascii_alphanumeric() {
+            return false;
+        }
+        if ch.is_ascii_alphabetic() {
+            has_letter_after_first = true;
+        }
+        if ch.is_ascii_lowercase() {
+            has_lowercase = true;
+        }
+    }
+
+    has_letter_after_first && (has_lowercase || token.chars().all(|ch| !ch.is_ascii_lowercase()))
+}
+
 fn extract_path_tokens(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     for segment in query
@@ -854,6 +990,23 @@ mod tests {
         ] {
             assert_eq!(kind(query), QueryKind::Regex, "{query}");
         }
+    }
+
+    #[test]
+    fn explicit_code_tokens_for_natural_language_skip_bare_capitalized_words() {
+        assert!(extract_explicit_code_tokens("Engine implementations").is_empty());
+        assert_eq!(
+            extract_explicit_code_tokens("find `Engine` and engine_factory"),
+            vec!["Engine".to_string(), "engine_factory".to_string()]
+        );
+        assert_eq!(
+            extract_explicit_code_tokens("Engine Index"),
+            vec!["Engine.Index".to_string()]
+        );
+        assert_eq!(
+            extract_explicit_code_tokens("use Engine.Index and AllocationService"),
+            vec!["Engine.Index".to_string(), "AllocationService".to_string()]
+        );
     }
 
     #[test]

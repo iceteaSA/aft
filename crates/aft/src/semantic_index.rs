@@ -50,6 +50,8 @@ const SEMANTIC_INDEX_VERSION_V4: u8 = 4;
 const SEMANTIC_INDEX_VERSION_V5: u8 = 5;
 /// V6 stores paths relative to project_root and adds content hashes.
 const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
+/// V7 adds qualified symbol names for ranking metadata without changing embeddings.
+const SEMANTIC_INDEX_VERSION_V7: u8 = 7;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 // Build/refresh embedding requests keep a larger budget because they run on
@@ -1199,6 +1201,8 @@ pub struct SemanticChunk {
     pub file: PathBuf,
     /// Symbol name
     pub name: String,
+    /// Fully-qualified symbol name, when known from the outline scope chain.
+    pub qualified_name: Option<String>,
     /// Symbol kind (function, class, struct, etc.)
     pub kind: SymbolKind,
     /// Line range (0-based internally, inclusive)
@@ -1206,7 +1210,7 @@ pub struct SemanticChunk {
     pub end_line: u32,
     /// Whether the symbol is exported
     pub exported: bool,
-    /// The enriched text that gets embedded (scope + signature + body snippet)
+    /// The enriched text that gets embedded (name + file + kind + signature + body snippet)
     pub embed_text: String,
     /// Short code snippet for display in results
     pub snippet: String,
@@ -1283,12 +1287,15 @@ type ChunkReuseMap = HashMap<PathBuf, HashMap<blake3::Hash, Vec<ReusableEmbeddin
 pub struct SemanticResult {
     pub file: PathBuf,
     pub name: String,
+    pub qualified_name: Option<String>,
     pub kind: SymbolKind,
     pub start_line: u32,
     pub end_line: u32,
     pub exported: bool,
     pub snippet: String,
     pub score: f32,
+    pub rank_score: f32,
+    pub cap_protected: bool,
     pub source: &'static str,
 }
 
@@ -2187,12 +2194,15 @@ impl SemanticIndex {
                 SemanticResult {
                     file: entry.chunk.file.clone(),
                     name: entry.chunk.name.clone(),
+                    qualified_name: entry.chunk.qualified_name.clone(),
                     kind: entry.chunk.kind.clone(),
                     start_line: entry.chunk.start_line,
                     end_line: entry.chunk.end_line,
                     exported: entry.chunk.exported,
                     snippet: entry.chunk.snippet.clone(),
                     score,
+                    rank_score: score,
+                    cap_protected: false,
                     source: "semantic",
                 }
             })
@@ -2361,11 +2371,11 @@ impl SemanticIndex {
         let mut version_buf = [0u8; 1];
         reader.read_exact(&mut version_buf).ok()?;
         let version = version_buf[0];
-        if version != SEMANTIC_INDEX_VERSION_V6 {
+        if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
             slog_info!(
-                "cached semantic index version {} is older than {}, rebuilding",
+                "cached semantic index version {} is not compatible with {}, rebuilding",
                 version,
-                SEMANTIC_INDEX_VERSION_V6
+                SEMANTIC_INDEX_VERSION_V7
             );
             if !is_worktree_bridge {
                 let _ = fs::remove_file(&data_path);
@@ -2448,7 +2458,8 @@ impl SemanticIndex {
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
-        // V6 is the single write format. Layout extends V5:
+        // V7 is the single write format. Layout extends V6 with per-entry
+        // qualified_name metadata while preserving the embedding fingerprint:
         //   - fingerprint is always represented (absent ⇒ fingerprint_len=0,
         //     no bytes follow). Uniform format simplifies the reader.
         //   - paths are relative to project_root.
@@ -2457,8 +2468,9 @@ impl SemanticIndex {
         //
         // V1/V2 remain readable for backward compatibility (see from_bytes).
         // V3/V4 load as compatible formats but are rejected on disk so snippets
-        // and file sizes are rebuilt once.
-        let version = SEMANTIC_INDEX_VERSION_V6;
+        // and file sizes are rebuilt once. V6 remains accepted on disk and
+        // yields qualified_name=None until the next V7 write.
+        let version = SEMANTIC_INDEX_VERSION_V7;
         write_counted(writer, &[version], &mut bytes_written)?;
         write_counted(
             writer,
@@ -2545,6 +2557,15 @@ impl SemanticIndex {
             )?;
             write_counted(writer, name_bytes, &mut bytes_written)?;
 
+            // Qualified name (V7 metadata; absent is encoded as length 0)
+            let qualified_name_bytes = c.qualified_name.as_deref().unwrap_or_default().as_bytes();
+            write_counted(
+                writer,
+                &(qualified_name_bytes.len() as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(writer, qualified_name_bytes, &mut bytes_written)?;
+
             // Kind (1 byte)
             write_counted(writer, &[symbol_kind_to_u8(&c.kind)], &mut bytes_written)?;
 
@@ -2620,6 +2641,7 @@ impl SemanticIndex {
             && version != SEMANTIC_INDEX_VERSION_V4
             && version != SEMANTIC_INDEX_VERSION_V5
             && version != SEMANTIC_INDEX_VERSION_V6
+            && version != SEMANTIC_INDEX_VERSION_V7
         {
             return Err(format!("unsupported version: {}", version));
         }
@@ -2630,10 +2652,11 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V3
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
-            || version == SEMANTIC_INDEX_VERSION_V6)
+            || version == SEMANTIC_INDEX_VERSION_V6
+            || version == SEMANTIC_INDEX_VERSION_V7)
             && total_len.is_some_and(|len| len < HEADER_BYTES_V2)
         {
-            return Err("data too short for semantic index v2/v3/v4/v5/v6 header".to_string());
+            return Err("data too short for semantic index v2/v3/v4/v5/v6/v7 header".to_string());
         }
 
         let dimension = read_u32_stream(&mut reader)? as usize;
@@ -2652,7 +2675,8 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V3
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
-            || version == SEMANTIC_INDEX_VERSION_V6;
+            || version == SEMANTIC_INDEX_VERSION_V6
+            || version == SEMANTIC_INDEX_VERSION_V7;
         let fingerprint = if has_fingerprint_field {
             let fingerprint_len = read_u32_stream(&mut reader)? as usize;
             if total_len
@@ -2708,28 +2732,32 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V4
                 || version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
             {
                 read_u32_stream(&mut reader)?
             } else {
                 0
             };
-            let size =
-                if version == SEMANTIC_INDEX_VERSION_V5 || version == SEMANTIC_INDEX_VERSION_V6 {
-                    read_u64_stream(&mut reader)?
-                } else {
-                    0
-                };
-            let content_hash = if version == SEMANTIC_INDEX_VERSION_V6 {
-                let mut hash_bytes = [0u8; 32];
-                read_exact_stream(
-                    &mut reader,
-                    &mut hash_bytes,
-                    "unexpected end of data reading content hash",
-                )?;
-                blake3::Hash::from_bytes(hash_bytes)
+            let size = if version == SEMANTIC_INDEX_VERSION_V5
+                || version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+            {
+                read_u64_stream(&mut reader)?
             } else {
-                cache_freshness::zero_hash()
+                0
             };
+            let content_hash =
+                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
+                    let mut hash_bytes = [0u8; 32];
+                    read_exact_stream(
+                        &mut reader,
+                        &mut hash_bytes,
+                        "unexpected end of data reading content hash",
+                    )?;
+                    blake3::Hash::from_bytes(hash_bytes)
+                } else {
+                    cache_freshness::zero_hash()
+                };
             // Hardening against corrupt / maliciously crafted cache files
             // (v0.15.2). `Duration::new(secs, nanos)` can panic when the
             // nanosecond carry overflows the second counter, and
@@ -2751,7 +2779,9 @@ impl SemanticIndex {
                         secs, nanos
                     )
                 })?;
-            let path = if version == SEMANTIC_INDEX_VERSION_V6 {
+            let path = if version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+            {
                 cached_path_under_root(current_canonical_root, &PathBuf::from(path))
                     .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
             } else {
@@ -2766,13 +2796,25 @@ impl SemanticIndex {
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
             let raw_file = PathBuf::from(read_string_stream(&mut reader, total_len)?);
-            let file = if version == SEMANTIC_INDEX_VERSION_V6 {
+            let file = if version == SEMANTIC_INDEX_VERSION_V6
+                || version == SEMANTIC_INDEX_VERSION_V7
+            {
                 cached_path_under_root(current_canonical_root, &raw_file)
                     .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
             } else {
                 raw_file
             };
             let name = read_string_stream(&mut reader, total_len)?;
+            let qualified_name = if version == SEMANTIC_INDEX_VERSION_V7 {
+                let qualified_name = read_string_stream(&mut reader, total_len)?;
+                if qualified_name.is_empty() {
+                    None
+                } else {
+                    Some(qualified_name)
+                }
+            } else {
+                None
+            };
 
             let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?);
 
@@ -2806,6 +2848,7 @@ impl SemanticIndex {
                 chunk: SemanticChunk {
                     file,
                     name,
+                    qualified_name,
                     kind,
                     start_line,
                     end_line,
@@ -3134,6 +3177,7 @@ fn build_file_summary_chunk_with_lines(
     SemanticChunk {
         file: file.to_path_buf(),
         name,
+        qualified_name: None,
         kind: SymbolKind::FileSummary,
         start_line: 0,
         end_line: 0,
@@ -3354,6 +3398,19 @@ fn build_snippet(symbol: &Symbol, source: &str) -> String {
     build_snippet_with_lines(symbol, &line_cache)
 }
 
+fn qualified_name_for_symbol(symbol: &Symbol) -> Option<String> {
+    let mut parts = symbol
+        .scope_chain
+        .iter()
+        .filter(|part| !part.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !symbol.name.is_empty() {
+        parts.push(symbol.name.clone());
+    }
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
 /// Convert symbols to semantic chunks with enriched context
 fn symbols_to_chunks(
     file: &Path,
@@ -3420,6 +3477,7 @@ fn symbols_to_chunks(
         chunks.push(SemanticChunk {
             file: file.to_path_buf(),
             name: symbol.name.clone(),
+            qualified_name: qualified_name_for_symbol(symbol),
             kind: symbol.kind.clone(),
             start_line: symbol.range.start_line,
             end_line: symbol.range.end_line,
@@ -4258,6 +4316,7 @@ Connection: close
             chunk: SemanticChunk {
                 file: outside,
                 name: "outside".to_string(),
+                qualified_name: None,
                 kind: SymbolKind::Function,
                 start_line: 0,
                 end_line: 0,
@@ -4291,6 +4350,7 @@ Connection: close
                 chunk: SemanticChunk {
                     file: file.clone(),
                     name: name.to_string(),
+                    qualified_name: None,
                     kind: SymbolKind::Function,
                     start_line: line as u32 + 1,
                     end_line: line as u32 + 1,
@@ -4371,6 +4431,7 @@ Connection: close
             chunk: SemanticChunk {
                 file: file.clone(),
                 name: "handle_request".to_string(),
+                qualified_name: None,
                 kind: SymbolKind::Function,
                 start_line: 10,
                 end_line: 25,
@@ -4405,7 +4466,7 @@ Connection: close
     }
 
     #[test]
-    fn semantic_cache_streaming_persistence_matches_legacy_bytes_and_round_trips() {
+    fn semantic_cache_v6_loads_and_v7_round_trips_qualified_names() {
         let storage = tempfile::tempdir().expect("create storage dir");
         let project = storage.path().join("project");
         fs::create_dir_all(project.join("src")).expect("create project src");
@@ -4425,6 +4486,7 @@ Connection: close
             chunk: SemanticChunk {
                 file: file.clone(),
                 name: "alpha".to_string(),
+                qualified_name: Some("Service.alpha".to_string()),
                 kind: SymbolKind::Function,
                 start_line: 0,
                 end_line: 0,
@@ -4438,6 +4500,7 @@ Connection: close
             chunk: SemanticChunk {
                 file: file.clone(),
                 name: "beta".to_string(),
+                qualified_name: Some("Service.beta".to_string()),
                 kind: SymbolKind::Function,
                 start_line: 1,
                 end_line: 1,
@@ -4454,31 +4517,71 @@ Connection: close
             dimension: 3,
             chunking_version: default_chunking_version(),
         };
+        let fingerprint_before = fingerprint.as_string();
         index.set_fingerprint(fingerprint.clone());
 
         let legacy_bytes = legacy_semantic_index_bytes(&index);
-        assert_eq!(index.to_bytes(), legacy_bytes);
+        assert_eq!(legacy_bytes[0], SEMANTIC_INDEX_VERSION_V6);
+        let legacy_dir = storage.path().join("semantic/legacy-proj");
+        fs::create_dir_all(&legacy_dir).expect("create legacy semantic dir");
+        let legacy_path = legacy_dir.join("semantic.bin");
+        fs::write(&legacy_path, &legacy_bytes).expect("write legacy semantic.bin");
+        let legacy_loaded = SemanticIndex::read_from_disk(
+            storage.path(),
+            "legacy-proj",
+            &project_root,
+            false,
+            Some(&fingerprint_before),
+        )
+        .expect("load v6 semantic index");
+        assert!(
+            legacy_path.exists(),
+            "compatible V6 cache must not be deleted"
+        );
+        assert!(legacy_loaded
+            .entries
+            .iter()
+            .all(|entry| entry.chunk.qualified_name.is_none()));
+        assert_eq!(
+            legacy_loaded.fingerprint().unwrap().as_string(),
+            fingerprint_before
+        );
+
+        let v7_bytes = index.to_bytes();
+        assert_eq!(v7_bytes[0], SEMANTIC_INDEX_VERSION_V7);
+        assert_ne!(v7_bytes, legacy_bytes);
+        let restored = SemanticIndex::from_bytes(&v7_bytes, &project_root).unwrap();
+        assert_eq!(
+            restored.entries[0].chunk.qualified_name.as_deref(),
+            Some("Service.alpha")
+        );
+        assert_eq!(
+            restored.entries[1].chunk.qualified_name.as_deref(),
+            Some("Service.beta")
+        );
+        assert_eq!(
+            restored.fingerprint().unwrap().as_string(),
+            fingerprint_before
+        );
 
         index.write_to_disk(storage.path(), "proj");
         let data_path = storage.path().join("semantic/proj/semantic.bin");
-        assert_eq!(
-            fs::read(&data_path).expect("read semantic.bin"),
-            legacy_bytes
-        );
+        let persisted = fs::read(&data_path).expect("read semantic.bin");
+        assert_eq!(persisted[0], SEMANTIC_INDEX_VERSION_V7);
 
         let loaded = SemanticIndex::read_from_disk(
             storage.path(),
             "proj",
             &project_root,
             false,
-            Some(&fingerprint.as_string()),
+            Some(&fingerprint_before),
         )
         .expect("load semantic index");
         assert_eq!(loaded.entries.len(), index.entries.len());
         assert_eq!(loaded.dimension, index.dimension);
         assert_eq!(
             loaded.fingerprint().unwrap().as_string(),
-            fingerprint.as_string()
+            fingerprint_before
         );
         assert_eq!(loaded.file_mtimes.get(&file), Some(&mtime));
         assert_eq!(loaded.file_sizes.get(&file), Some(&42));
@@ -4489,6 +4592,7 @@ Connection: close
         for (actual, expected) in loaded.entries.iter().zip(index.entries.iter()) {
             assert_eq!(actual.chunk.file, expected.chunk.file);
             assert_eq!(actual.chunk.name, expected.chunk.name);
+            assert_eq!(actual.chunk.qualified_name, expected.chunk.qualified_name);
             assert_eq!(actual.chunk.kind, expected.chunk.kind);
             assert_eq!(actual.chunk.start_line, expected.chunk.start_line);
             assert_eq!(actual.chunk.end_line, expected.chunk.end_line);
@@ -4497,7 +4601,8 @@ Connection: close
             assert_eq!(actual.chunk.snippet, expected.chunk.snippet);
             assert_eq!(actual.vector, expected.vector);
         }
-        assert_eq!(loaded.to_bytes(), legacy_bytes);
+        assert_eq!(loaded.to_bytes(), persisted);
+        assert_eq!(fingerprint.as_string(), fingerprint_before);
     }
 
     #[test]
@@ -4534,6 +4639,7 @@ Connection: close
                 chunk: SemanticChunk {
                     file: PathBuf::from("/src/lib.rs"),
                     name: name.to_string(),
+                    qualified_name: None,
                     kind: SymbolKind::Function,
                     start_line: (i * 10 + 1) as u32,
                     end_line: (i * 10 + 5) as u32,
@@ -4713,6 +4819,7 @@ public class Greeter {
             chunk: SemanticChunk {
                 file: target.clone(),
                 name: "main".to_string(),
+                qualified_name: None,
                 kind: SymbolKind::Function,
                 start_line: 0,
                 end_line: 1,
@@ -5183,6 +5290,7 @@ public class Greeter {
             chunk: SemanticChunk {
                 file: file.clone(),
                 name: "handle_request".to_string(),
+                qualified_name: None,
                 kind: SymbolKind::Function,
                 start_line: 10,
                 end_line: 25,
@@ -5246,6 +5354,7 @@ public class Greeter {
             chunk: SemanticChunk {
                 file: PathBuf::from("/src/main.rs"),
                 name: "handle_request".to_string(),
+                qualified_name: None,
                 kind: SymbolKind::Function,
                 start_line: 0,
                 end_line: 0,
@@ -5299,6 +5408,28 @@ public class Greeter {
             exported: false,
             parent: None,
         }
+    }
+
+    #[test]
+    fn symbols_to_chunks_sets_qualified_name_without_changing_embed_text() {
+        let project_root = PathBuf::from("/proj");
+        let file = project_root.join("src/engine.ts");
+        let source = "class Index {\n}\n";
+        let mut symbol = make_symbol(SymbolKind::Class, "Index", 0, 1);
+        symbol.scope_chain = vec!["Engine".to_string()];
+        symbol.signature = Some("class Index".to_string());
+        let embed_text = build_embed_text(&symbol, source, &file, &project_root);
+
+        let chunks = symbols_to_chunks(&file, &[symbol], source, &project_root);
+        let chunk = chunks
+            .iter()
+            .find(|chunk| chunk.name == "Index")
+            .expect("class chunk");
+
+        assert_eq!(chunk.name, "Index");
+        assert_eq!(chunk.qualified_name.as_deref(), Some("Engine.Index"));
+        assert_eq!(chunk.embed_text, embed_text);
+        assert!(!chunk.embed_text.contains("Engine.Index"));
     }
 
     /// Heading symbols (Markdown / HTML headings) must NOT be indexed —

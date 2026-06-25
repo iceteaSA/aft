@@ -10,12 +10,15 @@ fn semantic(file: &str, name: &str, score: f32) -> SemanticResult {
     SemanticResult {
         file: PathBuf::from(file),
         name: name.to_string(),
+        qualified_name: None,
         kind: SymbolKind::Function,
         start_line: 0,
         end_line: 2,
         exported: true,
         snippet: format!("fn {name}() {{}}"),
         score,
+        rank_score: score,
+        cap_protected: false,
         source: "semantic",
     }
 }

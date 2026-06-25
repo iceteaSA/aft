@@ -56,6 +56,7 @@ pub struct HybridResult {
     pub semantic_score: Option<f32>,
     pub lexical_score: Option<f32>,
     pub hybrid_boosted: bool,
+    pub(crate) cap_protected: bool,
     pub snippet: String,
 }
 
@@ -703,6 +704,7 @@ fn handle_semantic_or_hybrid_search(
     if semantic_more_available {
         semantic_results.truncate(semantic_limit);
     }
+    rerank_semantic_candidates(&mut semantic_results, &shape, &params.query);
 
     let mut results = fuse_hybrid_results(
         semantic_results,
@@ -1418,6 +1420,130 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     Ok(query_vector)
 }
 
+fn rerank_semantic_candidates(results: &mut Vec<SemanticResult>, shape: &QueryShape, query: &str) {
+    let (tokens, allow_case_fold) = semantic_rerank_tokens(query, shape);
+
+    for result in results.iter_mut() {
+        result.rank_score = result.score;
+        result.cap_protected = false;
+        result.rank_score *= semantic_kind_multiplier(&result.kind, shape);
+
+        if !tokens.is_empty()
+            && is_definition_kind(&result.kind)
+            && tokens
+                .iter()
+                .any(|token| token_matches_candidate_name(token, result, allow_case_fold))
+        {
+            result.rank_score *= EXACT_NAME_DEFINITION_BOOST;
+            if result.score >= P2_CAP_PROTECTED_COSINE_FLOOR {
+                result.cap_protected = true;
+            }
+        }
+    }
+
+    if shape.kind == QueryKind::NaturalLanguage {
+        apply_natural_language_diversity_cap(results);
+    }
+}
+
+fn semantic_rerank_tokens(query: &str, shape: &QueryShape) -> (Vec<String>, bool) {
+    match shape.kind {
+        QueryKind::Identifier => (query_shape::extract_tokens(query, shape), false),
+        QueryKind::Mixed => (query_shape::extract_tokens(query, shape), true),
+        QueryKind::NaturalLanguage => (query_shape::extract_explicit_code_tokens(query), true),
+        QueryKind::Path | QueryKind::ErrorCode | QueryKind::Regex => (Vec::new(), false),
+    }
+}
+
+fn semantic_kind_multiplier(kind: &SymbolKind, shape: &QueryShape) -> f32 {
+    match shape.kind {
+        QueryKind::NaturalLanguage => match kind {
+            SymbolKind::Function
+            | SymbolKind::Class
+            | SymbolKind::Method
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::Enum
+            | SymbolKind::TypeAlias => 1.08,
+            SymbolKind::Variable => 0.92,
+            SymbolKind::FileSummary => 0.80,
+            SymbolKind::Heading => 1.0,
+        },
+        QueryKind::Mixed => match kind {
+            SymbolKind::Function
+            | SymbolKind::Class
+            | SymbolKind::Method
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::Enum
+            | SymbolKind::TypeAlias => 1.03,
+            SymbolKind::FileSummary => 0.90,
+            SymbolKind::Variable | SymbolKind::Heading => 1.0,
+        },
+        QueryKind::Identifier | QueryKind::Path | QueryKind::ErrorCode | QueryKind::Regex => 1.0,
+    }
+}
+
+fn is_definition_kind(kind: &SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Function
+            | SymbolKind::Class
+            | SymbolKind::Method
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::Enum
+            | SymbolKind::TypeAlias
+    )
+}
+
+fn token_matches_candidate_name(
+    token: &str,
+    result: &SemanticResult,
+    allow_case_fold: bool,
+) -> bool {
+    names_equal(token, &result.name, allow_case_fold)
+        || result
+            .qualified_name
+            .as_deref()
+            .is_some_and(|qualified_name| names_equal(token, qualified_name, allow_case_fold))
+}
+
+fn names_equal(token: &str, name: &str, allow_case_fold: bool) -> bool {
+    token == name || (allow_case_fold && token.eq_ignore_ascii_case(name))
+}
+
+fn apply_natural_language_diversity_cap(results: &mut Vec<SemanticResult>) {
+    let mut cluster_counts: HashMap<(String, SymbolKind), usize> = HashMap::new();
+    results.retain(|result| {
+        let key = (
+            result
+                .qualified_name
+                .as_deref()
+                .unwrap_or(&result.name)
+                .to_string(),
+            result.kind.clone(),
+        );
+        let count = cluster_counts.entry(key).or_insert(0);
+        if *count < NATURAL_LANGUAGE_CLUSTER_CAP {
+            *count += 1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn sort_hybrid_results(results: &mut [HybridResult]) {
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
 pub fn fuse_hybrid_results(
     semantic: Vec<SemanticResult>,
     lexical_files: Vec<(PathBuf, f32)>,
@@ -1440,11 +1566,13 @@ pub fn fuse_hybrid_results(
         .collect::<Vec<_>>();
 
     if lexical_files.is_empty() {
-        return semantic
+        let mut results = semantic
             .into_iter()
             .map(|result| hybrid_from_semantic(result, None))
-            .take(top_k)
-            .collect();
+            .collect::<Vec<_>>();
+        sort_hybrid_results(&mut results);
+        results.truncate(top_k);
+        return results;
     }
 
     if semantic.is_empty() {
@@ -1480,32 +1608,22 @@ pub fn fuse_hybrid_results(
         }
     }
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    sort_hybrid_results(&mut results);
     let mut results = cap_per_file(results, 2);
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    sort_hybrid_results(&mut results);
     results.truncate(top_k);
     results
 }
 
 fn hybrid_from_semantic(result: SemanticResult, lexical_score: Option<f32>) -> HybridResult {
     let semantic_score = result.score;
+    let ranking_score = result.rank_score;
+    let cap_protected = result.cap_protected;
     let hybrid_boosted = lexical_score.is_some();
     let score = if hybrid_boosted {
-        semantic_score * HYBRID_LEXICAL_BOOST
+        ranking_score * HYBRID_LEXICAL_BOOST
     } else {
-        semantic_score
+        ranking_score
     };
 
     HybridResult {
@@ -1521,6 +1639,7 @@ fn hybrid_from_semantic(result: SemanticResult, lexical_score: Option<f32>) -> H
         semantic_score: Some(semantic_score),
         lexical_score,
         hybrid_boosted,
+        cap_protected,
     }
 }
 
@@ -1541,6 +1660,7 @@ fn lexical_only_result(file: PathBuf, lexical_score: f32, shape: &QueryShape) ->
         semantic_score: None,
         lexical_score: Some(lexical_score),
         hybrid_boosted: false,
+        cap_protected: false,
         snippet: "[lexical match — use aft_zoom or read for context]".to_string(),
     }
 }
@@ -1554,10 +1674,15 @@ fn shape_dependent_lexical_only_weight(shape: &QueryShape) -> f32 {
 }
 
 fn cap_per_file(results: Vec<HybridResult>, cap: usize) -> Vec<HybridResult> {
-    let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+    let mut ordinary_counts: HashMap<PathBuf, usize> = HashMap::new();
     let mut capped = Vec::new();
     for result in results {
-        let count = counts.entry(result.file.clone()).or_insert(0);
+        if result.cap_protected {
+            capped.push(result);
+            continue;
+        }
+
+        let count = ordinary_counts.entry(result.file.clone()).or_insert(0);
         if *count < cap {
             *count += 1;
             capped.push(result);
@@ -1651,6 +1776,9 @@ fn format_building_lexical_text(
 /// (uncalibrated for ranking), but its absolute floor is a real signal: an
 /// all-weak result set looks identical to a strong one without it.
 const WEAK_MATCH_COSINE_FLOOR: f32 = 0.35;
+const P2_CAP_PROTECTED_COSINE_FLOOR: f32 = WEAK_MATCH_COSINE_FLOOR;
+const EXACT_NAME_DEFINITION_BOOST: f32 = 1.20;
+const NATURAL_LANGUAGE_CLUSTER_CAP: usize = 2;
 // Intentionally high: the default MiniLM scores are uncalibrated, so under-trigger rather than over-promise.
 const HIGH_CONFIDENCE_COSINE_FLOOR: f32 = 0.60;
 
@@ -2635,6 +2763,371 @@ mod tests {
         assert_eq!(semantic_candidate_limit(100), MAX_TOP_K);
     }
 
+    fn rerank_shape(kind: QueryKind) -> QueryShape {
+        QueryShape {
+            kind,
+            weights: query_shape::ShapeWeights {
+                semantic: 0.0,
+                lexical: 0.0,
+                should_use_lexical: false,
+            },
+        }
+    }
+
+    fn semantic_candidate(
+        file: &str,
+        name: &str,
+        qualified_name: Option<&str>,
+        kind: SymbolKind,
+        score: f32,
+    ) -> SemanticResult {
+        SemanticResult {
+            file: PathBuf::from(file),
+            name: name.to_string(),
+            qualified_name: qualified_name.map(str::to_string),
+            kind,
+            start_line: 0,
+            end_line: 0,
+            exported: false,
+            snippet: String::new(),
+            score,
+            rank_score: score,
+            cap_protected: false,
+            source: "semantic",
+        }
+    }
+
+    fn candidate_rank<'a>(results: &'a [SemanticResult], name: &str) -> &'a SemanticResult {
+        results
+            .iter()
+            .find(|result| result.name == name)
+            .expect("candidate present")
+    }
+
+    #[test]
+    fn natural_language_kind_prior_and_semantic_only_fuse_raise_definitions() {
+        let shape = rerank_shape(QueryKind::NaturalLanguage);
+        let mut candidates = vec![
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "engineFactory",
+                None,
+                SymbolKind::Variable,
+                0.80,
+            ),
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "engineCache",
+                None,
+                SymbolKind::Variable,
+                0.79,
+            ),
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "engineState",
+                None,
+                SymbolKind::Variable,
+                0.78,
+            ),
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "Engine",
+                Some("Engine"),
+                SymbolKind::Class,
+                0.76,
+            ),
+        ];
+
+        rerank_semantic_candidates(&mut candidates, &shape, "Engine implementations");
+        let results = fuse_hybrid_results(
+            candidates,
+            Vec::new(),
+            &shape,
+            10,
+            true,
+            Path::new("/project"),
+        );
+
+        assert_eq!(results[0].name, "Engine");
+        assert_eq!(results[0].semantic_score, Some(0.76));
+        assert!(
+            results[0].score > 0.80,
+            "definition prior should drive semantic-only ordering"
+        );
+    }
+
+    #[test]
+    fn natural_language_diversity_cap_limits_repeated_name_kind_clusters() {
+        let nl_shape = rerank_shape(QueryKind::NaturalLanguage);
+        let mixed_shape = rerank_shape(QueryKind::Mixed);
+        let candidates = vec![
+            semantic_candidate(
+                "/project/src/a.ts",
+                "engineFactory",
+                None,
+                SymbolKind::Variable,
+                0.90,
+            ),
+            semantic_candidate(
+                "/project/src/b.ts",
+                "engineFactory",
+                None,
+                SymbolKind::Variable,
+                0.89,
+            ),
+            semantic_candidate(
+                "/project/src/c.ts",
+                "engineFactory",
+                None,
+                SymbolKind::Variable,
+                0.88,
+            ),
+        ];
+
+        let mut nl_candidates = candidates.clone();
+        rerank_semantic_candidates(
+            &mut nl_candidates,
+            &nl_shape,
+            "engine factory implementations",
+        );
+        assert_eq!(nl_candidates.len(), 2);
+
+        let mut mixed_candidates = candidates;
+        rerank_semantic_candidates(
+            &mut mixed_candidates,
+            &mixed_shape,
+            "engineFactory implementations",
+        );
+        assert_eq!(mixed_candidates.len(), 3);
+        assert!(mixed_candidates
+            .iter()
+            .all(|result| (result.rank_score - result.score).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn exact_identifier_definition_boost_and_cap_protection_survive_file_cap() {
+        let shape = rerank_shape(QueryKind::Identifier);
+        let file = "/project/src/allocation.ts";
+        let mut candidates = vec![
+            semantic_candidate(file, "unrelatedField", None, SymbolKind::Variable, 0.99),
+            semantic_candidate(file, "unrelatedMethod", None, SymbolKind::Method, 0.98),
+            semantic_candidate(
+                file,
+                "AllocationService",
+                Some("AllocationService"),
+                SymbolKind::Class,
+                0.80,
+            ),
+            semantic_candidate(file, "allocationService", None, SymbolKind::Variable, 0.79),
+            semantic_candidate(file, "allocate", None, SymbolKind::Method, 0.78),
+        ];
+
+        rerank_semantic_candidates(&mut candidates, &shape, "AllocationService");
+        let class = candidate_rank(&candidates, "AllocationService");
+        assert!(class.rank_score > candidate_rank(&candidates, "allocationService").rank_score);
+        assert!(class.rank_score > candidate_rank(&candidates, "allocate").rank_score);
+        assert!(class.cap_protected);
+
+        let fused = fuse_hybrid_results(
+            candidates,
+            vec![(PathBuf::from(file), 1.0)],
+            &shape,
+            10,
+            true,
+            Path::new("/project"),
+        );
+
+        assert!(fused
+            .iter()
+            .any(|result| result.name == "AllocationService"));
+        assert_eq!(
+            fused
+                .iter()
+                .filter(|result| result.file.as_path() == Path::new(file))
+                .count(),
+            3,
+            "protected exact-name hit should be reserved in addition to two ordinary siblings"
+        );
+    }
+
+    #[test]
+    fn qualified_name_tokens_rank_nested_definitions_over_outer_types() {
+        let nl_shape = rerank_shape(QueryKind::NaturalLanguage);
+        let id_shape = rerank_shape(QueryKind::Identifier);
+        let candidates = vec![
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "Engine",
+                Some("Engine"),
+                SymbolKind::Class,
+                0.80,
+            ),
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "Index",
+                Some("Engine.Index"),
+                SymbolKind::Class,
+                0.70,
+            ),
+        ];
+
+        let mut spaced = candidates.clone();
+        rerank_semantic_candidates(&mut spaced, &nl_shape, "Engine Index");
+        let spaced_results = fuse_hybrid_results(
+            spaced,
+            Vec::new(),
+            &nl_shape,
+            10,
+            true,
+            Path::new("/project"),
+        );
+        assert_eq!(spaced_results[0].name, "Index");
+
+        let mut dotted = candidates;
+        rerank_semantic_candidates(&mut dotted, &id_shape, "Engine.Index");
+        let dotted_results = fuse_hybrid_results(
+            dotted,
+            Vec::new(),
+            &id_shape,
+            10,
+            true,
+            Path::new("/project"),
+        );
+        assert_eq!(dotted_results[0].name, "Index");
+    }
+
+    #[test]
+    fn identifier_engine_factory_and_non_name_shapes_leave_priors_inert() {
+        let identifier_shape = rerank_shape(QueryKind::Identifier);
+        let mut identifier_candidates = vec![
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "engineFactory",
+                None,
+                SymbolKind::Variable,
+                0.80,
+            ),
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "EngineFactory",
+                Some("EngineFactory"),
+                SymbolKind::Class,
+                0.79,
+            ),
+        ];
+
+        rerank_semantic_candidates(
+            &mut identifier_candidates,
+            &identifier_shape,
+            "engineFactory",
+        );
+        assert_eq!(
+            identifier_candidates[0].rank_score,
+            identifier_candidates[0].score
+        );
+        assert_eq!(
+            identifier_candidates[1].rank_score,
+            identifier_candidates[1].score
+        );
+        assert!(!identifier_candidates
+            .iter()
+            .any(|result| result.cap_protected));
+        let identifier_results = fuse_hybrid_results(
+            identifier_candidates,
+            Vec::new(),
+            &identifier_shape,
+            10,
+            true,
+            Path::new("/project"),
+        );
+        assert_eq!(identifier_results[0].name, "engineFactory");
+
+        for kind in [QueryKind::Path, QueryKind::Regex, QueryKind::ErrorCode] {
+            let shape = rerank_shape(kind);
+            let mut candidates = vec![semantic_candidate(
+                "/project/src/engine.ts",
+                "EngineFactory",
+                Some("EngineFactory"),
+                SymbolKind::Class,
+                0.79,
+            )];
+            rerank_semantic_candidates(&mut candidates, &shape, "EngineFactory");
+            assert_eq!(candidates[0].rank_score, candidates[0].score);
+            assert!(!candidates[0].cap_protected);
+        }
+    }
+
+    #[test]
+    fn exact_name_boost_does_not_cap_protect_near_zero_common_names() {
+        let shape = rerank_shape(QueryKind::Identifier);
+        let mut candidates = vec![semantic_candidate(
+            "/project/src/list.ts",
+            "List",
+            Some("List"),
+            SymbolKind::Class,
+            0.01,
+        )];
+
+        rerank_semantic_candidates(&mut candidates, &shape, "List");
+
+        assert!((candidates[0].rank_score - 0.012).abs() < 0.0001);
+        assert!(!candidates[0].cap_protected);
+    }
+
+    #[test]
+    fn boosted_rank_score_keeps_raw_cosine_honesty_checks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allocation.rs");
+        let body = (0..30)
+            .map(|index| format!("line{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).expect("write symbol body");
+        let shape = rerank_shape(QueryKind::Identifier);
+        let mut candidates = vec![SemanticResult {
+            file: path,
+            name: "AllocationService".to_string(),
+            qualified_name: Some("AllocationService".to_string()),
+            kind: SymbolKind::Class,
+            start_line: 0,
+            end_line: 29,
+            exported: false,
+            snippet: String::new(),
+            score: HIGH_CONFIDENCE_COSINE_FLOOR - 0.01,
+            rank_score: HIGH_CONFIDENCE_COSINE_FLOOR - 0.01,
+            cap_protected: false,
+            source: "semantic",
+        }];
+
+        rerank_semantic_candidates(&mut candidates, &shape, "AllocationService");
+        assert!(candidates[0].rank_score > HIGH_CONFIDENCE_COSINE_FLOOR);
+        let mut fused = fuse_hybrid_results(candidates, Vec::new(), &shape, 10, true, dir.path());
+        assert_eq!(
+            fused[0].semantic_score,
+            Some(HIGH_CONFIDENCE_COSINE_FLOOR - 0.01)
+        );
+
+        let incomplete = enrich_snippets_from_source(&mut fused, dir.path());
+        assert!(incomplete);
+        assert!(fused[0].snippet.contains("line19"));
+        assert!(!fused[0].snippet.contains("line29"));
+        assert!(!fused[0].snippet.contains(RANK0_FULL_SYMBOL_NOTICE));
+
+        let mut weak = vec![semantic_candidate(
+            "/project/src/weak.ts",
+            "WeakService",
+            Some("WeakService"),
+            SymbolKind::Class,
+            WEAK_MATCH_COSINE_FLOOR - 0.01,
+        )];
+        rerank_semantic_candidates(&mut weak, &shape, "WeakService");
+        let weak_results =
+            fuse_hybrid_results(weak, Vec::new(), &shape, 10, true, Path::new("/project"));
+        assert!(weak_results[0].score > WEAK_MATCH_COSINE_FLOOR);
+        let text = format_semantic_text(&weak_results, Path::new("/project"), false, false, None);
+        assert!(text.contains("Top match is weak"), "got: {text}");
+    }
+
     #[test]
     fn empty_semantic_index_skips_query_dimension_check() {
         let project = tempfile::tempdir().expect("create project dir");
@@ -2694,6 +3187,7 @@ mod tests {
             semantic_score: Some(0.75),
             lexical_score: None,
             hybrid_boosted: false,
+            cap_protected: false,
         }];
 
         let text = format_semantic_text(&results, project_root, false, false, None);
@@ -2737,6 +3231,7 @@ mod tests {
             semantic_score: Some(0.5),
             lexical_score: None,
             hybrid_boosted: false,
+            cap_protected: false,
         }
     }
 
@@ -2893,6 +3388,7 @@ mod tests {
             semantic_score: Some(0.99),
             lexical_score: None,
             hybrid_boosted: false,
+            cap_protected: false,
         }];
 
         enrich_snippets_from_source(&mut results, dir.path());
@@ -2943,6 +3439,7 @@ mod tests {
             semantic_score: Some(HIGH_CONFIDENCE_COSINE_FLOOR),
             lexical_score: None,
             hybrid_boosted: false,
+            cap_protected: false,
         }];
 
         enrich_snippets_from_source(&mut results, dir.path());
@@ -3021,6 +3518,7 @@ mod tests {
             semantic_score: Some(0.5),
             lexical_score: None,
             hybrid_boosted: false,
+            cap_protected: false,
         }];
         // Must not panic; header renders, no snippet body.
         let _ = enrich_snippets_from_source(&mut results, dir.path());
@@ -3084,6 +3582,7 @@ mod tests {
                 semantic_score: Some(0.8),
                 lexical_score: None,
                 hybrid_boosted: false,
+                cap_protected: false,
             },
             HybridResult {
                 file: target_file,
@@ -3098,6 +3597,7 @@ mod tests {
                 semantic_score: Some(0.7),
                 lexical_score: None,
                 hybrid_boosted: false,
+                cap_protected: false,
             },
         ];
 
@@ -3178,6 +3678,7 @@ mod tests {
             semantic_score: Some(0.75),
             lexical_score: None,
             hybrid_boosted: false,
+            cap_protected: false,
         };
 
         let json = result_to_json(&result);
