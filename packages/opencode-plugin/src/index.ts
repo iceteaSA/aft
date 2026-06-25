@@ -200,12 +200,9 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.40.0";
+const ANNOUNCEMENT_VERSION = "0.40.3";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Groundwork for Subconscious, the CortexKit daemon: configuration now lives in one place under ~/.config/cortexkit/ and <project>/.cortexkit/ (auto-migrated). The daemon integration is dormant — nothing changes in how you run AFT today.",
-  "Bash output never hides a failure: piped commands run exactly as written with their real exit status, cancelled tasks report as failed, and a failing run is never compressed to a clean-looking summary.",
-  "The top aft_search result is now the complete, ready-to-edit symbol (no re-read needed); test files are hidden from results by default.",
-  "format_on_edit is now off by default, and bash commands default to the foreground.",
+  "read now hands images (PNG, JPEG, GIF, WebP) to the model as visual attachments instead of a binary placeholder, downsized to stay light in context; on OpenCode, PDFs are handed over too.",
 ];
 
 /**
