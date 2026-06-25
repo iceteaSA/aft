@@ -116,6 +116,18 @@ struct MockEmbeddingServer {
 impl MockEmbeddingServer {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
+        // The LISTENER is nonblocking so the accept loop can poll `running` and
+        // exit promptly on Drop. Each ACCEPTED stream is explicitly set back to
+        // blocking before it is handled (below) — accepted sockets inherit the
+        // listener's nonblocking flag on some platforms (notably Windows), and a
+        // nonblocking `read()` returns `WouldBlock`, which `handle_embedding_request`
+        // propagates via `?` and drops the connection mid-request. reqwest then
+        // reports a generic "error sending request" that is NOT classified
+        // connect/timeout transient, so the semantic build parks in terminal
+        // `Failed` instead of riding it out — the root cause of the Windows-CI
+        // flake (note #351). `set_read_timeout` alone does not reliably override
+        // an inherited nonblocking socket on Windows, so we clear the flag
+        // explicitly.
         listener
             .set_nonblocking(true)
             .expect("set embedding server nonblocking");
@@ -125,16 +137,37 @@ impl MockEmbeddingServer {
         let release_refresh = Arc::new(AtomicBool::new(false));
         let release_for_thread = Arc::clone(&release_refresh);
         let handle = thread::spawn(move || {
+            // Each connection is served on its own thread so a slow or gated
+            // request (the held post-edit embed) never blocks accepting the
+            // concurrent cold-build batch or the mid-refresh query. Single-threaded
+            // inline handling head-of-line-blocked those concurrent embeds under
+            // loaded CI, starving readiness round-trips.
+            let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while running_for_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = handle_embedding_request(&mut stream, &release_for_thread);
+                    Ok((stream, _)) => {
+                        // Restore blocking mode so the handler's read()/write()
+                        // block (honoring the per-request read timeout) instead of
+                        // returning WouldBlock and dropping the connection.
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        let release = Arc::clone(&release_for_thread);
+                        workers.push(thread::spawn(move || {
+                            let mut stream = stream;
+                            let _ = handle_embedding_request(&mut stream, &release);
+                        }));
+                        // Reap finished handlers so the vec stays bounded.
+                        workers.retain(|worker| !worker.is_finished());
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
+                        thread::sleep(Duration::from_millis(5));
                     }
                     Err(_) => break,
                 }
+            }
+            for worker in workers {
+                let _ = worker.join();
             }
         });
 
@@ -274,7 +307,12 @@ where
     F: Fn(&Value) -> bool,
 {
     let mut last_response = None;
-    for _ in 0..100 {
+    // 300 x 100ms = 30s. A contended Windows CI runner executes the integration
+    // binary several times slower than local (note: memory 6987), so a 10s
+    // budget can expire before a cold semantic build + first embed round-trip
+    // completes even when nothing is actually wrong. 30s comfortably covers it
+    // while still failing fast on a genuine wedge.
+    for _ in 0..300 {
         let response = status(aft);
         assert_eq!(
             response["success"], true,
@@ -413,7 +451,17 @@ fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidati
     // watcher-driven refresh. The default `spawn()` disables the OS watcher
     // (see AftProcess::spawn_with_real_watcher); this test must opt in. Runs in
     // its own standalone `semantic_test` binary (sequential, no concurrent load).
-    let mut aft = AftProcess::spawn_with_real_watcher();
+    //
+    // Shrink the build-level retry backoff so that if the very first embed
+    // request transiently connect-fails (e.g. the mock server thread has not
+    // started accepting yet), the build self-heals within the readiness poll
+    // window instead of waiting the real 15s first backoff (which exceeds the
+    // 10s poll and would flake). This is the documented test seam, not a
+    // user-facing knob.
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[(
+        "AFT_SEMANTIC_RETRY_BACKOFF_MS",
+        std::ffi::OsStr::new("200"),
+    )]);
 
     let configure =
         configure_semantic_openai(&mut aft, project.path(), storage.path(), &server.base_url);
