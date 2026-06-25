@@ -12,7 +12,6 @@ use rusqlite::Connection;
 use crate::backup::hash_session;
 use crate::backup::BackupStore;
 use crate::bash_background::{BgCompletion, BgTaskRegistry};
-use crate::callgraph::CallGraph;
 use crate::callgraph_store::{CallGraphStore, CallGraphStoreError};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
@@ -564,14 +563,14 @@ const _: fn() = || {
 
 /// Shared application context threaded through all command handlers.
 ///
-/// Holds the language provider, backup/checkpoint stores, configuration,
-/// and call graph engine. Constructed once at startup and passed by
+/// Holds the language provider, backup/checkpoint stores, and configuration.
+/// Constructed once at startup and passed by
 /// reference to `dispatch`.
 ///
-/// Write-rarely stores use `parking_lot::Mutex` for interior mutability so the
-/// context substrate can become thread-safe without changing the current N=1
+/// Write-rarely stores use `parking_lot::Mutex` for interior mutability so this
+/// context can become thread-safe while preserving the current single-request
 /// dispatch behavior. `config` is a thread-safe owned snapshot so future
-/// read-side dispatch can hold configuration across other work without holding
+/// read-only dispatch can hold configuration across other work without holding
 /// a lock guard.
 pub struct AppContext {
     app: Arc<App>,
@@ -591,7 +590,6 @@ pub struct AppContext {
     /// degraded-mode UI states without re-deriving the reason locally.
     /// Empty when the project is healthy / full-featured.
     degraded_reasons: parking_lot::Mutex<Vec<String>>,
-    callgraph: parking_lot::Mutex<Option<CallGraph>>,
     callgraph_store: RwLock<Option<Arc<CallGraphStore>>>,
     callgraph_store_force_rebuild: parking_lot::Mutex<bool>,
     callgraph_store_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
@@ -763,7 +761,6 @@ impl AppContext {
             is_worktree_bridge: parking_lot::Mutex::new(false),
             git_common_dir: parking_lot::Mutex::new(None),
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
-            callgraph: parking_lot::Mutex::new(None),
             callgraph_store: RwLock::new(None),
             callgraph_store_force_rebuild: parking_lot::Mutex::new(false),
             callgraph_store_rx: parking_lot::Mutex::new(None),
@@ -1445,11 +1442,6 @@ impl AppContext {
         } else {
             "main"
         }
-    }
-
-    /// Access the call graph engine.
-    pub fn callgraph(&self) -> &parking_lot::Mutex<Option<CallGraph>> {
-        &self.callgraph
     }
 
     /// Access the persisted call graph store.

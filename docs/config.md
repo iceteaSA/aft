@@ -128,15 +128,6 @@ The schema is identical across harnesses. Only file location differs.
   // suppressing security updates.
   "auto_update": true,
 
-  // Maximum source files allowed for call-graph operations (callers, trace_to,
-  // trace_data, impact). Projects above this size return "project_too_large"
-  // with guidance to open a specific subdirectory. Does not affect grep,
-  // glob, read, edit, or any other tool.
-  // Default: 5000. Measured cost: ~1ms per source file for the reverse-index
-  // build, so 5000 ≈ 5–10s on cold start. The previous 20000 default exceeded
-  // the bridge timeout on real ~7K-file projects, surfacing as bridge restart
-  // instead of `project_too_large`. Raise this if you have patience and want
-
   //   typescript-language-server, pyright-langserver, rust-analyzer, gopls,
   //   bash-language-server, yaml-language-server
   //
@@ -361,9 +352,8 @@ roadmap.
 If you point AFT at a very large directory (monorepo root, `~/Work`, `/home`, etc.), certain
 features guard against unbounded work to keep the bridge responsive:
 
-- **Call-graph ops** (`callers`, `trace_to`, `trace_data`, `impact`) return `project_too_large`
-  above `max_callgraph_files` (default 5,000 — the empirical limit before the reverse-index build
-  exceeds the bridge timeout on real workloads). Raise it in your config if you have patience.
+- **Call-graph ops** (`callers`, `trace_to`, `trace_data`, `impact`) use the persisted store and
+  are not capped by the removed legacy in-memory reverse-index limit.
 - **Semantic indexing** is capped at `semantic.max_files` source files (default 20,000). Raise it
   when using a remote backend that embeds server-side, or lower it on memory-constrained machines.
 - **`grep`, `glob`, `read`, `edit`, and other tools** work at any size.

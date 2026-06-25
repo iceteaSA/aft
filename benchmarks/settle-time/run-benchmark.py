@@ -146,7 +146,6 @@ class BenchmarkState:
         self.semantic_terminal_offset: float | None = None
         self.status_bar_ready_offset: float | None = None
         self.configure_warning_source_files: int | None = None
-        self.configure_warning_exceeds_max: bool | None = None
         self.configure_response: dict[str, Any] | None = None
         self.latest_status: dict[str, Any] = {}
         self.search_log: dict[str, Any] | None = None
@@ -198,12 +197,10 @@ class BenchmarkState:
         elif frame_type == "configure_warnings":
             with self.lock:
                 self.configure_warning_source_files = int(frame.get("source_file_count") or 0)
-                self.configure_warning_exceeds_max = bool(frame.get("source_file_count_exceeds_max"))
                 self._event(
                     offset,
                     "configure_warnings",
                     source_file_count=self.configure_warning_source_files,
-                    source_file_count_exceeds_max=self.configure_warning_exceeds_max,
                 )
 
     def update_response(self, response: dict[str, Any]) -> None:
@@ -388,7 +385,6 @@ class BenchmarkState:
                 "semantic_terminal_offset_s": self.semantic_terminal_offset,
                 "status_bar_ready_offset_s": self.status_bar_ready_offset,
                 "configure_warning_source_files": self.configure_warning_source_files,
-                "configure_warning_exceeds_max": self.configure_warning_exceeds_max,
                 "configure_response": self.configure_response,
                 "latest_status": self.latest_status,
                 "search_log": self.search_log,

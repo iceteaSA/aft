@@ -3203,7 +3203,18 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "pp"
                 | "dpr"
                 | "dpk"
-                | "lpr",
+                | "lpr"
+                | "java"
+                | "kt"
+                | "kts"
+                | "rb"
+                | "swift"
+                | "scala"
+                | "sc"
+                | "lua"
+                | "pl"
+                | "pm"
+                | "t",
         )
     )
 }
@@ -4587,6 +4598,44 @@ Connection: close
         assert_eq!(
             chunk_fingerprint(&optimized_chunks),
             chunk_fingerprint(&legacy_chunks)
+        );
+    }
+
+    #[test]
+    fn collect_file_chunks_indexes_java_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Greeter.java");
+        std::fs::write(
+            &file,
+            r#"package example;
+
+public class Greeter {
+    public String greet(String name) {
+        return "Hello, " + name;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let mut parsers = HashMap::new();
+        let chunks = collect_file_chunks(dir.path(), &file, &mut parsers).unwrap();
+
+        assert!(
+            !chunks.is_empty(),
+            "Java file should produce semantic chunks"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.name == "Greeter" && chunk.kind == SymbolKind::Class),
+            "Java class symbol should be chunked: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.name == "greet" && chunk.kind == SymbolKind::Method),
+            "Java method symbol should be chunked: {chunks:?}"
         );
     }
 

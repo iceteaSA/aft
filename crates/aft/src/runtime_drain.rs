@@ -1037,20 +1037,13 @@ pub fn spawn_search_corpus_refresh(
 pub fn refresh_project_corpus(
     ctx: &AppContext,
     reason: &str,
-    invalidate_ignore_paths: bool,
+    _invalidate_ignore_paths: bool,
 ) -> bool {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return false;
     };
     let config = ctx.config();
     let mut status_changed = false;
-
-    if invalidate_ignore_paths {
-        if let Some(graph) = ctx.callgraph().lock().as_mut() {
-            graph.invalidate_file(&root.join(".gitignore"));
-            graph.invalidate_file(&root.join(".aftignore"));
-        }
-    }
 
     if !ctx.is_worktree_bridge() {
         // Do NOT cold-build the callgraph store synchronously here. This function
@@ -1138,18 +1131,14 @@ pub fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
 }
 
 pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
-    let Some(root) = ctx.canonical_cache_root_opt() else {
+    if ctx.canonical_cache_root_opt().is_none() {
         return false;
-    };
+    }
     ctx.clear_pending_index_updates();
     ctx.reset_symbol_cache();
     let _ = ctx.mark_status_bar_tier2_stale();
     ctx.clear_tsconfig_membership_cache();
     let mut status_changed = true;
-
-    if ctx.callgraph().lock().is_some() {
-        *ctx.callgraph().lock() = Some(aft::callgraph::CallGraph::new(root));
-    }
 
     status_changed |= refresh_project_corpus(ctx, "watcher overflow", false);
     status_changed
@@ -1376,17 +1365,6 @@ pub fn drain_watcher_events(ctx: &AppContext) {
             symbol_cache.invalidate(path);
         }
     }
-
-    // Invalidate each changed file in the call graph.
-    let mut graph_ref = ctx.callgraph().lock();
-    if let Some(graph) = graph_ref.as_mut() {
-        for path in &changed {
-            if watcher_path_is_source(path) {
-                graph.invalidate_file(path);
-            }
-        }
-    }
-    drop(graph_ref);
 
     let mut semantic_refresh_paths = Vec::new();
     if !oversized_inline_batch {

@@ -17,7 +17,6 @@
  *     checker, restrict_to_project_root, search_index, semantic_search,
  *     callgraph_store, callgraph_chunk_size,
  *     experimental.bash.*, experimental.lsp_ty, lsp (project-safe subset),
- *     semantic (project-safe subset), max_callgraph_files.
  *   - EXCLUDES tool-registration fields that lock at plugin init:
  *     tool_surface, disabled_tools, hoist_builtin_tools (OpenCode registers
  *     tools synchronously when the plugin function returns).
@@ -63,7 +62,6 @@ describe("resolveProjectOverridesForConfigure", () => {
         lsp_ty: true,
       },
       semantic: { backend: "fastembed", timeout_ms: 25000 },
-      max_callgraph_files: 10000,
     });
 
     expect(overrides).toEqual({
@@ -82,7 +80,6 @@ describe("resolveProjectOverridesForConfigure", () => {
       experimental_bash_background: false,
       experimental_lsp_ty: true,
       semantic: { backend: "fastembed", timeout_ms: 25000 },
-      max_callgraph_files: 10000,
     });
   });
 

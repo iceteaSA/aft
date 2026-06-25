@@ -249,7 +249,6 @@ describe("loadAftConfig", () => {
   });
 
   // Project config CANNOT set `restrict_to_project_root`,
-  // `url_fetch_allow_private`, or `max_callgraph_files`. These are user-only
   // because a hostile repo opening in OpenCode could otherwise weaken the
   // file/network/resource boundary protecting the user's machine.
   test("project config can override lsp.diagnostics_on_edit", () => {
@@ -300,22 +299,6 @@ describe("loadAftConfig", () => {
     // User's false value preserved; project's true ignored.
     expect(config.url_fetch_allow_private).toBe(false);
     expect(result.stderr).toContain("Ignoring url_fetch_allow_private from project config");
-  });
-
-  test("project config cannot set max_callgraph_files (strict allowlist)", () => {
-    const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ max_callgraph_files: 20000 }));
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ max_callgraph_files: 1 }));
-
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    // User's 20000 preserved; project's 1 ignored.
-    expect(config.max_callgraph_files).toBe(20000);
-    expect(result.stderr).toContain("Ignoring max_callgraph_files from project config");
   });
 
   test("project config cannot set auto_update (strict allowlist)", () => {
@@ -899,48 +882,6 @@ describe("loadAftConfig", () => {
 
     expect(JSON.parse(result.stdout)).toEqual({});
     expect(result.stderr).toContain("Partial config loaded — invalid sections skipped");
-  });
-
-  // Regression test for Oracle v0.15.1 review bug #3: `max_callgraph_files` was
-  // advertised in README but not declared on the zod schema, so zod silently
-  // stripped it before the plugin could forward it to the Rust binary. This
-  // test verifies the knob is accepted by the schema. It MUST be set from
-  // user-level config (audit v0.17 #17 strict-allowlist — see separate test
-  // for project-config rejection above).
-  test("max_callgraph_files from user config is accepted and forwarded", () => {
-    const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ max_callgraph_files: 5000 }, null, 2));
-
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(config.max_callgraph_files).toBe(5000);
-    // No zod validation error in stderr — the schema accepts the field.
-    expect(result.stderr).not.toContain("max_callgraph_files");
-  });
-
-  test("max_callgraph_files rejects non-positive values via zod", () => {
-    const fixture = createConfigFixture();
-    // Zero, negatives, and floats are all invalid per `z.number().int().positive()`.
-    // Invalid sections are skipped but surrounding valid config still loads.
-    writeFileSync(
-      fixture.projectConfigPath,
-      JSON.stringify({ max_callgraph_files: 0, format_on_edit: true }, null, 2),
-    );
-
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    // Invalid field is dropped
-    expect(config.max_callgraph_files).toBeUndefined();
-    // Valid surrounding field survives
-    expect(config.format_on_edit).toBe(true);
   });
 
   test("loads user object-map lsp servers with entry defaults", () => {

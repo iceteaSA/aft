@@ -87,8 +87,6 @@ pub struct RawAftConfig {
     pub lsp: Option<RawLsp>,
     pub url_fetch_allow_private: Option<bool>,
     pub semantic: Option<RawSemantic>,
-    #[serde(deserialize_with = "deserialize_opt_positive_usize")]
-    pub max_callgraph_files: Option<usize>,
     pub auto_update: Option<bool>,
     pub bridge: Option<RawBridge>,
 }
@@ -584,9 +582,6 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.semantic.is_some() {
         base.semantic = override_config.semantic;
     }
-    if override_config.max_callgraph_files.is_some() {
-        base.max_callgraph_files = override_config.max_callgraph_files;
-    }
     if override_config.auto_update.is_some() {
         base.auto_update = override_config.auto_update;
     }
@@ -881,9 +876,6 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.url_fetch_allow_private.is_some() {
         push_drop(dropped, "url_fetch_allow_private", tier, USER_ONLY_REASON);
     }
-    if raw.max_callgraph_files.is_some() {
-        push_drop(dropped, "max_callgraph_files", tier, USER_ONLY_REASON);
-    }
     if raw.formatter_timeout_secs.is_some() {
         push_drop(dropped, "formatter_timeout_secs", tier, USER_ONLY_REASON);
     }
@@ -989,10 +981,6 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     if let Some(value) = raw.url_fetch_allow_private {
         config.url_fetch_allow_private = value;
     }
-    if let Some(value) = raw.max_callgraph_files {
-        config.max_callgraph_files = value;
-    }
-
     config.semantic = resolve_semantic_config(raw.semantic.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
     resolve_lsp_config(raw, config);
@@ -1648,7 +1636,6 @@ mod tests {
               "callgraph_store": false,
               "callgraph_chunk_size": 17,
               "url_fetch_allow_private": true,
-              "max_callgraph_files": 1234,
               "semantic": {
                 "backend": "openai_compatible",
                 "model": "  user-model  ",
@@ -1692,7 +1679,6 @@ mod tests {
         assert!(!result.config.callgraph_store);
         assert_eq!(result.config.callgraph_chunk_size, 17);
         assert!(result.config.url_fetch_allow_private);
-        assert_eq!(result.config.max_callgraph_files, 1234);
         assert_eq!(
             result.config.semantic.backend,
             SemanticBackend::OpenAiCompatible
@@ -1750,7 +1736,6 @@ mod tests {
                 r#"{
                   "restrict_to_project_root": true,
                   "url_fetch_allow_private": true,
-                  "max_callgraph_files": 111,
                   "formatter_timeout_secs": 11,
                   "type_checker_timeout_secs": 33,
                   "auto_update": true,
@@ -1777,7 +1762,6 @@ mod tests {
                 r#"{
                   "restrict_to_project_root": false,
                   "url_fetch_allow_private": false,
-                  "max_callgraph_files": 222,
                   "formatter_timeout_secs": 22,
                   "type_checker_timeout_secs": 44,
                   "auto_update": false,
@@ -1805,7 +1789,6 @@ mod tests {
 
         assert!(result.config.restrict_to_project_root);
         assert!(result.config.url_fetch_allow_private);
-        assert_eq!(result.config.max_callgraph_files, 111);
         assert_eq!(result.config.formatter_timeout_secs, 11);
         assert_eq!(result.config.type_checker_timeout_secs, 33);
         assert_eq!(
@@ -1833,7 +1816,6 @@ mod tests {
         let expected = [
             "restrict_to_project_root",
             "url_fetch_allow_private",
-            "max_callgraph_files",
             "formatter_timeout_secs",
             "type_checker_timeout_secs",
             "auto_update",

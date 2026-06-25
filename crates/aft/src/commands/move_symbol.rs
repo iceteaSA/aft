@@ -7,9 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::context::AppContext;
+use crate::commands::callgraph_store_adapter::{building_response, store_error_response};
+use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit;
-use crate::error::AftError;
 use crate::imports;
 use crate::lsp_hints;
 use crate::parser::{detect_language, grammar_for, LangId};
@@ -148,19 +148,6 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     }
-
-    // --- Call graph guard (D089) ---
-    let mut cg_ref = ctx.callgraph().lock();
-    let graph = match cg_ref.as_mut() {
-        Some(g) => g,
-        None => {
-            return Response::error(
-                &req.id,
-                "not_configured",
-                "move_symbol: project not configured — send 'configure' first",
-            );
-        }
-    };
 
     // --- Resolve symbol ---
     let matches = match ctx.provider().resolve_symbol(&source_path, symbol_name) {
@@ -328,38 +315,50 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Prepare new destination content
     let new_dest = append_symbol_to_dest(&dest_content, &dest_symbol_text);
 
-    // --- Discover consumers via callers_of ---
-    // Build file first to ensure it's indexed
-    if let Err(e) = graph.build_file(source_path) {
-        return Response::error(&req.id, e.code(), e.to_string());
-    }
-
-    let consumers = match graph.callers_of(
-        source_path,
-        symbol_name,
-        1,
-        ctx.config().max_callgraph_files,
-    ) {
-        Ok(result) => result.callers,
-        // ProjectTooLarge MUST surface — silently proceeding would move the
-        // symbol without rewriting consumer imports across the project and
-        // leave the workspace in a broken state. Every other caller-discovery
-        // failure (symbol not found, parse error, etc.) keeps the pre-0.15.1
-        // "no callers found is fine" fallback because those scenarios produce
-        // a zero-consumers result that is the same as a clean move.
-        Err(err @ AftError::ProjectTooLarge { .. }) => {
-            return Response::error(&req.id, "project_too_large", format!("{}", err));
+    // --- Discover consumers through the persisted callgraph store ---
+    let (project_root, consumers) = match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => {
+            let rel_source = source_path
+                .strip_prefix(store.project_root())
+                .unwrap_or(source_path);
+            let source_node = match store.node_for(rel_source, symbol_name) {
+                Ok(node) => node,
+                Err(error) => return store_error_response(&req.id, "move_symbol", error),
+            };
+            let sites =
+                match store.direct_callers_of(Path::new(&source_node.file), &source_node.symbol) {
+                    Ok(sites) => sites,
+                    Err(error) => return store_error_response(&req.id, "move_symbol", error),
+                };
+            (store.project_root().to_path_buf(), sites)
         }
-        Err(_) => Vec::new(),
+        CallgraphStoreAccess::Building => return building_response(&req.id, "move_symbol"),
+        CallgraphStoreAccess::Unavailable => {
+            let project_root = ctx.canonical_cache_root_opt().or_else(|| {
+                ctx.config()
+                    .project_root
+                    .clone()
+                    .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+            });
+            let Some(project_root) = project_root else {
+                return Response::error(
+                    &req.id,
+                    "not_configured",
+                    "move_symbol: project not configured — send 'configure' first",
+                );
+            };
+            (project_root, Vec::new())
+        }
+        CallgraphStoreAccess::Error(error) => {
+            return store_error_response(&req.id, "move_symbol", error)
+        }
     };
 
-    // Collect consumer files that need import rewriting
-    // CallerGroup.file is relative to project root — resolve to absolute
-    let project_root = graph.project_root().to_path_buf();
+    // Collect consumer files that need import rewriting.
     let mut consumer_files: Vec<PathBuf> = consumers
         .iter()
-        .map(|cg| {
-            let p = PathBuf::from(&cg.file);
+        .map(|site| {
+            let p = PathBuf::from(&site.caller.file);
             if p.is_absolute() {
                 p
             } else {

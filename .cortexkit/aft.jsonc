@@ -24,8 +24,4 @@
 
   // Enable indexed search for grep and glob hoisting
   "search_index": true
-
-  // Example: lower the call-graph file cap. Default is 20000 which this repo
-  // sits comfortably under — uncomment to experiment with tighter limits.
-  // "max_callgraph_files": 20000
 }

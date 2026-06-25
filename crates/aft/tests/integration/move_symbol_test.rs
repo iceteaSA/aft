@@ -357,6 +357,126 @@ fn move_symbol_basic() {
     aft.shutdown();
 }
 
+/// Disabling the persisted callgraph store still keeps TypeScript/JavaScript
+/// moves safe because `move_symbol` brute-scans TS/JS consumers independently.
+#[test]
+fn move_symbol_configured_without_store_still_rewrites_ts_consumers() {
+    let (_tmp, root) = setup_move_fixture();
+    let mut aft = AftProcess::spawn();
+
+    let configure = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(json!({ "callgraph_store": false }))
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    let source = format!("{}/service.ts", root);
+    let dest = format!("{}/utils.ts", root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "move_symbol should succeed: {resp:?}"
+    );
+    assert!(
+        resp["consumers_updated"].as_u64().unwrap_or(0) >= 1,
+        "TS/JS consumers should still be rewritten without the store: {resp:?}"
+    );
+
+    let consumer_a =
+        std::fs::read_to_string(format!("{}/consumer_a.ts", root)).expect("read consumer_a");
+    assert!(
+        consumer_a.contains("'./utils'") || consumer_a.contains("\"./utils\""),
+        "consumer_a should import from ./utils, got:\n{}",
+        consumer_a
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_large_project_has_no_legacy_file_cap() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+
+    write_file(
+        &tmp.path().join("service.ts"),
+        "export function formatDate() { return 'today'; }\n",
+    );
+    write_file(
+        &tmp.path().join("utils.ts"),
+        "export function slugify(value: string) { return value; }\n",
+    );
+    write_file(
+        &tmp.path().join("consumer.ts"),
+        "import { formatDate } from './service';\nexport const label = formatDate();\n",
+    );
+
+    for index in 0..5_050 {
+        write_file(
+            &tmp.path().join(format!("filler_{index}.ts")),
+            &format!("export const filler_{index} = {index};\n"),
+        );
+    }
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(json!({ "callgraph_store": false }))
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    let source = tmp.path().join("service.ts").display().to_string();
+    let dest = tmp.path().join("utils.ts").display().to_string();
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "move_symbol should not hit a legacy file cap: {resp:?}"
+    );
+    assert_ne!(
+        resp.get("code"),
+        Some(&json!("project_too_large")),
+        "legacy project_too_large response must be gone: {resp:?}"
+    );
+
+    let consumer = std::fs::read_to_string(tmp.path().join("consumer.ts")).expect("read consumer");
+    assert!(
+        consumer.contains("'./utils'") || consumer.contains("\"./utils\""),
+        "consumer should import from ./utils, got:\n{}",
+        consumer
+    );
+
+    aft.shutdown();
+}
+
 /// Explicitly verify ALL 5+ consumer files have correct import paths after move.
 #[test]
 fn move_symbol_multiple_consumers() {
@@ -1104,51 +1224,6 @@ fn move_symbol_file_not_found() {
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
     assert_eq!(resp["code"], "file_not_found");
-
-    aft.shutdown();
-}
-
-/// `move_symbol` must surface `project_too_large` instead of silently moving
-/// the symbol. Moving without rewriting consumer imports leaves the workspace
-/// broken, so the fail-loud behavior is a correctness fix (Oracle v0.15.1
-/// review, bug #2). Pre-fix the callers_of Err branch caught every error
-/// including `project_too_large` and defaulted to zero consumers.
-#[test]
-fn move_symbol_project_too_large() {
-    let (_tmp, root) = setup_move_fixture();
-    let mut aft = AftProcess::spawn();
-
-    // Configure with an artificially low cap so the 7+ file fixture trips the
-    // guard. This asserts the guard fires BEFORE the move writes anything.
-    let resp = aft.send(
-        &json!({
-            "id": "cfg",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": root,
-            "config": user_config(serde_json::json!({ "max_callgraph_files": 1 }))
-        })
-        .to_string(),
-    );
-    assert_eq!(resp["success"], true);
-
-    let source = format!("{}/service.ts", root);
-    let dest = format!("{}/utils.ts", root);
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
-        crate::helpers::json_string(&source),
-        crate::helpers::json_string(&dest)
-    ));
-
-    assert_eq!(resp["success"], false, "move should fail: {:?}", resp);
-    assert_eq!(resp["code"], "project_too_large");
-    let msg = resp["message"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("max_callgraph_files"),
-        "error should mention max_callgraph_files: {}",
-        msg
-    );
 
     aft.shutdown();
 }

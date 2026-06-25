@@ -324,13 +324,6 @@ export const AftConfigSchema = z
     url_fetch_allow_private: z.boolean().optional(),
     /** External semantic backend configuration for embedding and retrieval. */
     semantic: SemanticConfigSchema.optional(),
-    /**
-     * Maximum source files allowed for call-graph operations (callers, trace_to,
-     * trace_to_symbol, trace_data, impact). Projects above this size return `project_too_large`
-     * instead of attempting the reverse-index build. Does not affect grep,
-     * glob, read, edit, or any other tool. Default: 5000.
-     */
-    max_callgraph_files: z.number().int().positive().optional(),
     /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
     auto_update: z.boolean().optional(),
     /** Per-bridge transport timeout and hang-escalation (USER-only; shared pool). */
@@ -471,14 +464,12 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.callgraph_chunk_size !== undefined)
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
-  // Bash / LSP / semantic / max_callgraph_files — all flow through dedicated
-  // resolvers because they have their own merge / project-safety rules.
+  // Bash / LSP / semantic all flow through dedicated resolvers because they
+  // have their own merge / project-safety rules.
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
-  if (config.max_callgraph_files !== undefined)
-    overrides.max_callgraph_files = config.max_callgraph_files;
 
   return overrides;
 }
@@ -1220,9 +1211,9 @@ function getProjectLspStrippedKeys(lsp: AftConfig["lsp"]): string[] {
  * strict-allowlist trust boundary — adding a new field requires explicit
  * security review of whether a hostile repo could weaponize it.
  *
- * Previously `restrict_to_project_root`, `url_fetch_allow_private`,
- * and `max_callgraph_files` flowed through the implicit `...safeOverride` spread,
- * allowing project config to weaken security boundaries.
+ * Previously `restrict_to_project_root` and `url_fetch_allow_private` flowed
+ * through the implicit `...safeOverride` spread, allowing project config to
+ * weaken security boundaries.
  *
  * (Note: `storage_dir` is not a config-schema field — the plugin always sets
  * it at configure time. It cannot be set from any aft.jsonc file.)
@@ -1254,7 +1245,6 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "storage_dir" — USER ONLY (controls where AFT writes).
-  // "max_callgraph_files" — USER ONLY (resource budget).
   // "auto_update" — USER ONLY (silently suppressing security updates is a real risk).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
 ]);
@@ -1274,7 +1264,6 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   const stripped: string[] = [];
   if (override.restrict_to_project_root !== undefined) stripped.push("restrict_to_project_root");
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
-  if (override.max_callgraph_files !== undefined) stripped.push("max_callgraph_files");
   if (override.auto_update !== undefined) stripped.push("auto_update");
   if (override.bridge !== undefined) stripped.push("bridge");
   return stripped;

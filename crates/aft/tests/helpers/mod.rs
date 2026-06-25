@@ -363,9 +363,6 @@ impl AftProcess {
         if let Some(count) = frame.get("source_file_count").cloned() {
             configure["source_file_count"] = count;
         }
-        if let Some(exceeds) = frame.get("source_file_count_exceeds_max").cloned() {
-            configure["source_file_count_exceeds_max"] = exceeds;
-        }
         configure["warnings_pending"] = serde_json::Value::Bool(false);
         configure
     }

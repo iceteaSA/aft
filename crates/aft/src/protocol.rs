@@ -99,7 +99,7 @@ pub struct BashPatternMatchFrame {
 
 /// Pushed after configure has completed, when the deferred file walk and
 /// language detection produce warnings (missing formatter/checker/LSP binaries,
-/// or "project too large" file-count exceeded). The walk runs in a background
+/// and search-index file-count warnings). The walk runs in a background
 /// thread so configure itself returns in <100 ms even on huge directories
 /// (e.g. user's $HOME). When the walk finishes, AFT pushes one frame with
 /// the merged warnings — the plugin delivers them through the same path as
@@ -116,14 +116,8 @@ pub struct ConfigureWarningsFrame {
     /// Project root the warnings refer to. Plugins use this to scope the
     /// session-id deduplication of repeated identical warnings.
     pub project_root: String,
-    /// Source-file count discovered by the bounded walk (may stop short of
-    /// the full count if `max_callgraph_files` is exceeded).
+    /// Source-file count discovered by the bounded walk.
     pub source_file_count: usize,
-    /// `true` when the walk hit the configured `max_callgraph_files` cap;
-    /// in that case `source_file_count` is `cap + 1`.
-    pub source_file_count_exceeds_max: bool,
-    /// Configured callgraph file cap, echoed for plugin display.
-    pub max_callgraph_files: usize,
     /// Merged formatter/checker/LSP missing-binary warnings.
     pub warnings: Vec<serde_json::Value>,
 }
@@ -177,26 +171,15 @@ impl ConfigureWarningsFrame {
     pub fn new(
         project_root: impl Into<String>,
         source_file_count: usize,
-        source_file_count_exceeds_max: bool,
-        max_callgraph_files: usize,
         warnings: Vec<serde_json::Value>,
     ) -> Self {
-        Self::new_with_session_id(
-            None,
-            project_root,
-            source_file_count,
-            source_file_count_exceeds_max,
-            max_callgraph_files,
-            warnings,
-        )
+        Self::new_with_session_id(None, project_root, source_file_count, warnings)
     }
 
     pub fn new_with_session_id(
         session_id: Option<String>,
         project_root: impl Into<String>,
         source_file_count: usize,
-        source_file_count_exceeds_max: bool,
-        max_callgraph_files: usize,
         warnings: Vec<serde_json::Value>,
     ) -> Self {
         Self {
@@ -204,8 +187,6 @@ impl ConfigureWarningsFrame {
             session_id,
             project_root: project_root.into(),
             source_file_count,
-            source_file_count_exceeds_max,
-            max_callgraph_files,
             warnings,
         }
     }
@@ -247,7 +228,6 @@ mod tests {
         session_id: Option<String>,
         project_root: String,
         source_file_count: usize,
-        max_callgraph_files: usize,
         warnings: Vec<serde_json::Value>,
     }
 
@@ -256,8 +236,6 @@ mod tests {
         let frame = ConfigureWarningsFrame::new(
             "/repo",
             42,
-            false,
-            5_000,
             vec![json!({
                 "kind": "formatter_not_installed",
                 "tool": "biome",
@@ -278,8 +256,6 @@ mod tests {
             Some("session-1".to_string()),
             "/repo",
             42,
-            false,
-            5_000,
             vec![json!({
                 "kind": "formatter_not_installed",
                 "tool": "biome",
@@ -295,7 +271,6 @@ mod tests {
         assert_eq!(decoded.session_id.as_deref(), Some("session-1"));
         assert_eq!(decoded.project_root, "/repo");
         assert_eq!(decoded.source_file_count, 42);
-        assert_eq!(decoded.max_callgraph_files, 5_000);
         assert_eq!(decoded.warnings[0]["tool"], "biome");
     }
 

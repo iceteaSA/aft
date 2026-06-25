@@ -2429,8 +2429,6 @@ mod tests {
             session_id: session_id.map(str::to_string),
             project_root: "/tmp/subc-test".to_string(),
             source_file_count: 0,
-            source_file_count_exceeds_max: false,
-            max_callgraph_files: 0,
             warnings: Vec::new(),
         })
     }

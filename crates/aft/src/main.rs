@@ -1114,13 +1114,8 @@ mod watcher_filter_tests {
         }
 
         let shutdown = std::sync::atomic::AtomicBool::new(false);
-        let frame = PushFrame::ConfigureWarnings(ConfigureWarningsFrame::new(
-            "/repo",
-            0,
-            false,
-            5_000,
-            Vec::new(),
-        ));
+        let frame =
+            PushFrame::ConfigureWarnings(ConfigureWarningsFrame::new("/repo", 0, Vec::new()));
 
         write_push_frame_or_request_shutdown(&mut BrokenWriter, &frame, &shutdown);
 
@@ -1164,13 +1159,13 @@ mod watcher_filter_tests {
         warnings_tx
             .send((
                 current_generation - 1,
-                ConfigureWarningsFrame::new("/stale", 1, false, 5_000, Vec::new()),
+                ConfigureWarningsFrame::new("/stale", 1, Vec::new()),
             ))
             .unwrap();
         warnings_tx
             .send((
                 current_generation,
-                ConfigureWarningsFrame::new("/current", 2, false, 5_000, Vec::new()),
+                ConfigureWarningsFrame::new("/current", 2, Vec::new()),
             ))
             .unwrap();
 
@@ -1504,7 +1499,6 @@ mod watcher_filter_tests {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let ctx = make_ctx_with_root(&root);
-        *ctx.callgraph().lock() = Some(aft::callgraph::CallGraph::new(root.clone()));
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx
             .send(WatcherDispatchEvent::Error(
@@ -1524,7 +1518,6 @@ mod watcher_filter_tests {
             status["degraded_reasons"],
             serde_json::json!(["watcher_unavailable"])
         );
-        assert!(ctx.callgraph().lock().is_some(), "callgraph remains usable");
     }
 
     #[test]

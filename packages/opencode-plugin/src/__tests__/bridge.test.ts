@@ -126,8 +126,6 @@ describe("BinaryBridge lifecycle", () => {
         session_id: "session-1",
         project_root: "/repo",
         source_file_count: 10,
-        source_file_count_exceeds_max: false,
-        max_callgraph_files: 5_000,
         warnings: [
           {
             kind: "formatter_not_installed",
@@ -175,8 +173,6 @@ describe("BinaryBridge lifecycle", () => {
           type: "configure_warnings",
           project_root: "/repo",
           source_file_count: 10,
-          source_file_count_exceeds_max: false,
-          max_callgraph_files: 5_000,
           warnings: [
             {
               kind: "formatter_not_installed",
@@ -229,8 +225,6 @@ describe("BinaryBridge lifecycle", () => {
         session_id: "session-a",
         project_root: "/repo",
         source_file_count: 10,
-        source_file_count_exceeds_max: false,
-        max_callgraph_files: 5_000,
         warnings: [
           {
             kind: "formatter_not_installed",

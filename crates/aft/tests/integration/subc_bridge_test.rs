@@ -5,7 +5,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::bash_background::BgTaskStatus;
-use aft::callgraph::CallGraph;
 use aft::config::Config;
 use aft::context::{
     AppContext, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
@@ -404,7 +403,6 @@ fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(canonical_root);
     ctx.set_cache_role(false, None);
-    *ctx.callgraph().lock() = Some(CallGraph::new(root.clone()));
     *ctx.callgraph_store()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -604,8 +602,6 @@ fn enqueue_configure_warning_if_requested(req: &RawRequest, ctx: &AppContext) {
         aft::log_ctx::current_session(),
         project_root,
         1,
-        false,
-        5_000,
         vec![json!({
             "code": "subc_test_configure_warning",
             "message": message,

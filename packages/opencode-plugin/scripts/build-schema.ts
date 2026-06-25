@@ -535,14 +535,6 @@ function buildSchema(): Record<string, unknown> {
           "Shared NDJSON bridge transport tuning (OpenCode and Pi). User-scoped only — project configs cannot set this block (bridge safety and per-machine transport budget).",
       },
 
-      max_callgraph_files: {
-        type: "integer",
-        minimum: 1,
-        default: 5000,
-        description:
-          "Maximum source files allowed for call-graph operations (callers, trace_to, trace_to_symbol, trace_data, impact, refactor move). Projects above this size return `project_too_large` instead of attempting the reverse-index build. Does not affect grep, glob, read, edit, or any other tool.",
-      },
-
       auto_update: {
         type: "boolean",
         default: true,

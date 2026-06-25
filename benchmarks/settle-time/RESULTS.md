@@ -106,7 +106,7 @@ That overlong run is why the benchmark harness/reporting was re-scoped to 30-min
 
 The prime suspect is confirmed for the measured regression path.
 
-`crates/aft/src/inspect/manager.rs::build_tier2_callgraph_snapshot` builds a callgraph snapshot over every `graph.project_files()` entry for Tier-2 `dead_code`. It is not capped by `max_callgraph_files`, unlike interactive callgraph operations. The new instrumentation shows this phase starts at the Tier-2 warm scan and dominates CPU:
+At the time of this run, `crates/aft/src/inspect/manager.rs::build_tier2_callgraph_snapshot` built a legacy callgraph snapshot over every project file for Tier-2 `dead_code`. It bypassed the old interactive callgraph cap. The instrumentation showed this phase started at the Tier-2 warm scan and dominated CPU:
 
 - On small repos it is already visible (11-50s), while `unused_exports` and `duplicates` stay below 1s.
 - On VSCode-sized repos it continues past the 30-minute cap, pegging ~8-10 cores and reaching ~12 GiB RSS in the bounded run.

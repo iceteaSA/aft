@@ -12,7 +12,6 @@ use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
-use crate::callgraph::CallGraph;
 use crate::config::SemanticBackendConfig;
 use crate::context::{
     AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
@@ -1449,10 +1448,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         degraded_reasons.push("home_root".to_string());
     }
 
-    // `_bypass_size_limits` (set by `aft warmup --force`) lifts all three
-    // file-count caps so a very large repo is fully indexed for measurement:
-    // callgraph (`max_callgraph_files`), search index (`MAX_SEARCH_INDEX_FILES`),
-    // and semantic (`semantic.max_files`). Not a user-facing config knob — it is
+    // `_bypass_size_limits` (set by `aft warmup --force`) lifts file-count
+    // caps so a very large repo is fully indexed for measurement: search index
+    // (`MAX_SEARCH_INDEX_FILES`) and semantic (`semantic.max_files`). Not a
+    // user-facing config knob — it is
     // an internal benchmarking escape hatch. We raise to a large-but-safe value
     // (not usize::MAX) so the `+ 1` below cannot overflow.
     let bypass_size_limits = params
@@ -1461,39 +1460,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(false);
     if bypass_size_limits {
         const UNCAPPED: usize = 1_000_000_000;
-        next_config.max_callgraph_files = next_config.max_callgraph_files.max(UNCAPPED);
         next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
     }
 
     // The cap-bounded count below uses `take(max + 1)` so it costs O(cap),
-    // not O(project), and feeds both call-graph viability and search-index
-    // auto-disable decisions.
-    let max_callgraph_files = next_config.max_callgraph_files;
+    // not O(project), and feeds search-index auto-disable decisions.
     // `--force`/bypass also lifts the hardcoded search-index file limit.
     let search_index_limit = if bypass_size_limits {
         usize::MAX - 1
     } else {
         MAX_SEARCH_INDEX_FILES
     };
-    let (source_file_count, exceeds, exceeds_search_threshold) = if home_match {
-        (max_callgraph_files + 1, true, true)
+    let (source_file_count, exceeds_search_threshold) = if home_match {
+        (search_index_limit.saturating_add(1), true)
     } else {
-        let walk_limit = max_callgraph_files
-            .max(search_index_limit)
-            .saturating_add(1);
+        let walk_limit = search_index_limit.saturating_add(1);
         let count = crate::callgraph::walk_project_files(&root_path)
             .take(walk_limit)
             .count();
-        let exceeds_cg = count > max_callgraph_files;
         let exceeds_search = count > search_index_limit;
-        (count, exceeds_cg, exceeds_search)
+        (count, exceeds_search)
     };
-    if exceeds {
-        slog_warn!(
-            "project has >{} source files. Legacy in-memory call-graph operations (trace_data, symbol move analysis) will be disabled. Store-backed dead_code and callers/call_tree/impact/trace_to/trace_to_symbol remain available.",
-            max_callgraph_files
-        );
-    }
     if exceeds_search_threshold && next_config.search_index {
         slog_warn!(
             "project has >{} source files. Search index auto-disabled — open a project subdirectory for grep/aft_search.",
@@ -2185,9 +2172,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         });
     }
 
-    // Initialize call graph with the project root
-    let graph = CallGraph::new(root_path.clone());
-    *ctx.callgraph().lock() = Some(graph);
+    // Clear the workspace package caches here because reconfigure can point AFT at a
+    // different root; reset them before warming the callgraph store for the new project.
+    crate::callgraph::clear_workspace_package_cache();
 
     if next_config.callgraph_store && !home_match {
         match ctx.callgraph_store_for_ops() {
@@ -2258,7 +2245,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let warning_tx = ctx.configure_warnings_sender();
         let warning_generation = configure_generation;
         let walk_root = root_path.clone();
-        let max_files = config_snapshot.max_callgraph_files;
         let project_root_display = root_path.display().to_string();
         let config_for_bg = config_snapshot.clone();
         let session_id_for_bg = log_ctx::current_session();
@@ -2272,8 +2258,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     .filter_map(|path| detect_language(path))
                     .collect();
                 let full_count = source_files.len();
-                let full_exceeds = full_count > max_files;
-
                 let mut warnings =
                     detect_missing_tools_for_languages(&detected_languages, &config_for_bg)
                         .into_iter()
@@ -2285,8 +2269,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     session_id_for_frame,
                     project_root_display,
                     full_count,
-                    full_exceeds,
-                    max_files,
                     warnings,
                 );
                 let _ = warning_tx.send((warning_generation, frame));
@@ -2294,18 +2276,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         });
     }
 
-    // Configure now returns immediately. The plugin should treat the response
-    // as the "configured" signal and listen for a follow-up
-    // `configure_warnings` push frame for missing-binary warnings and the
-    // accurate file count. The bounded source_file_count below is good
-    // enough for an early "is this project too big for callgraph" hint.
+    // Return the success response immediately so the plugin can mark the project as
+    // configured. Missing-binary warnings and the accurate file count are sent later
+    // in a `configure_warnings` push frame; this bounded count only supports the
+    // initial search-index size hint.
     let response = Response::success(
         &req.id,
         json!({
             "project_root": root_path.display().to_string(),
             "source_file_count": source_file_count,
-            "source_file_count_exceeds_max": exceeds,
-            "max_callgraph_files": config_snapshot.max_callgraph_files,
             "source_file_count_bounded": true,
             "warnings": [],
             "warnings_pending": warnings_pending,
@@ -3208,7 +3187,7 @@ mod tests {
         let first_req = configure_request_with_params(json!({
             "project_root": first.path(),
             "harness": "opencode",
-            "config": [user_tier(json!({ "max_callgraph_files": 1000 }))]
+            "config": [user_tier(json!({ "format_on_edit": true }))]
         }));
         let first_response = super::handle_configure(&first_req, &ctx);
         assert!(first_response.success);
@@ -3228,7 +3207,7 @@ mod tests {
         let config = ctx.config();
         assert_eq!(config.project_root.as_deref(), Some(first.path()));
         assert_eq!(config.harness, Some(crate::harness::Harness::Opencode));
-        assert_eq!(config.max_callgraph_files, 1000);
+        assert!(config.format_on_edit);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Integration tests for `trace_to_symbol`.
 
-use crate::helpers::{user_config, AftProcess};
+use crate::helpers::AftProcess;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -13,20 +13,6 @@ fn configure_project(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-        })
-        .to_string(),
-    );
-    assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
-}
-
-fn configure_project_with_cap(aft: &mut AftProcess, root: &Path, max_callgraph_files: usize) {
-    let resp = aft.send(
-        &json!({
-            "id": "configure",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": root.to_string_lossy(),
-            "config": user_config(serde_json::json!({ "max_callgraph_files": max_callgraph_files })),
         })
         .to_string(),
     );
@@ -363,38 +349,6 @@ fn trace_to_symbol_cycle_does_not_loop_and_finds_shortest_path() {
     assert_eq!(resp["success"], true, "trace should succeed: {resp:?}");
     assert_eq!(resp["complete"], true);
     assert_eq!(path_symbols(&resp), vec!["b", "a", "c"]);
-
-    aft.shutdown();
-}
-
-#[test]
-fn trace_to_symbol_ignores_legacy_project_size_cap() {
-    let temp = tempdir().unwrap();
-    let root = temp.path();
-    let start = root.join("start.ts");
-    let target = root.join("target.ts");
-    fs::write(
-        &start,
-        "import { target } from './target.js';\nexport function run(): string { return target(); }\n",
-    )
-    .unwrap();
-    fs::write(
-        &target,
-        "export function target(): string { return 'target'; }\n",
-    )
-    .unwrap();
-
-    let mut aft = AftProcess::spawn();
-    configure_project_with_cap(&mut aft, root, 1);
-
-    let resp = trace_to_symbol(&mut aft, &start, "run", "target", Some(&target), None);
-
-    assert_eq!(
-        resp["success"], true,
-        "store-backed trace_to_symbol should ignore max_callgraph_files: {resp:?}"
-    );
-    assert_eq!(resp["complete"], true);
-    assert_eq!(path_symbols(&resp), vec!["run", "target"]);
 
     aft.shutdown();
 }

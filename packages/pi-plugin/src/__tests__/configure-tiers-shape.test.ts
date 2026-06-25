@@ -45,7 +45,6 @@ const GROUP_B_CORE_KEYS = [
   "disabled_lsp",
   "semantic",
   "inspect",
-  "max_callgraph_files",
   "url_fetch_allow_private",
 ] as const;
 
@@ -135,7 +134,6 @@ describe("Pi configure config tiers cutover", () => {
         },
         lsp: { disabled: ["tsserver"], servers: { custom: { binary: "custom-lsp" } } },
         inspect: { enabled: true },
-        max_callgraph_files: 1234,
       },
       null,
       2,

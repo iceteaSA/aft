@@ -160,14 +160,6 @@ pub struct Config {
     pub bash_permissions: bool,
     /// Maximum file size to fully index in bytes (default: 1MB).
     pub search_index_max_file_size: u64,
-    /// Maximum number of source files allowed for legacy in-memory call-graph operations
-    /// (`trace_data` and symbol move analysis). Store-backed dead_code and
-    /// edge-query commands (`callers`, `call_tree`, `impact`, `trace_to`,
-    /// `trace_to_symbol`) are not capped by this setting. Does not affect
-    /// `grep`, `glob`, `read`, `edit`, or other non-callgraph features.
-    /// Default: 5_000 (matches measured per-op cost ceilings; raise for
-    /// very large projects if you accept multi-minute per-call latency).
-    pub max_callgraph_files: usize,
     pub semantic: SemanticBackendConfig,
     pub inspect: InspectConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
@@ -245,26 +237,6 @@ impl Default for Config {
             bash_long_running_reminder_interval_ms: 600_000,
             bash_permissions: false,
             search_index_max_file_size: 1_048_576,
-            // Projects larger than this skip legacy in-memory reverse-index construction.
-            //
-            // The previous default (20_000) was set by hand-wave to "fits under
-            // the 30 s bridge timeout" without measurement. Direct benchmarks
-            // showed the cost is super-linear (tree-sitter parse + reverse-index
-            // build per file): a 6.8K-file Rust project took 41 s — already past
-            // the 60 s per-callgraph-op timeout. At 10 K extrapolated cost is
-            // ~80–100 s; at 20 K it's 5+ minutes. So the old default routinely
-            // produced "timed out, restarting bridge" rather than a clean
-            // `project_too_large` rejection.
-            //
-            // 5_000 reflects measured reality: at this size, callgraph
-            // operations on a real Rust/TS project complete in roughly 30–40 s,
-            // matching the per-op timeout budget. Users with bigger projects
-            // can raise this knob, but the default should not advertise
-            // capabilities that fail in practice. Read/edit/grep/glob/outline/
-            // semantic_search/AST/LSP and the store-backed callgraph edge ops all
-            // remain unaffected by this cap — it gates legacy `trace_data`,
-            // dead-code snapshots, and `aft_refactor op="move"`.
-            max_callgraph_files: 5_000,
             semantic: SemanticBackendConfig::default(),
             inspect: InspectConfig::default(),
             experimental_lsp_ty: false,

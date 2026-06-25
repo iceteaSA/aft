@@ -165,8 +165,8 @@ struct WarmupArgs {
     help: bool,
     /// Subsystems to warm (default: all).
     areas: WarmupAreas,
-    /// Bypass the file-count caps (callgraph `max_callgraph_files`, semantic
-    /// `semantic.max_files`) so a very large repo is fully indexed. Intended
+    /// Bypass file-count caps (semantic `semantic.max_files` and the search
+    /// index limit) so a very large repo is fully indexed. Intended
     /// for benchmarking/measuring the worst case, not normal warmup.
     force: bool,
 }
@@ -284,8 +284,8 @@ fn build_warmup_configure_params(
         }],
     });
     if force {
-        // Lift the file-count caps (callgraph `max_callgraph_files`, semantic
-        // `semantic.max_files`, and the hardcoded search-index file limit) so a
+        // Lift file-count caps (semantic `semantic.max_files` and the
+        // hardcoded search-index file limit) so a
         // very large repo is fully indexed for measurement. configure honors
         // this internal flag by raising the effective caps and skipping the
         // size-based auto-disable.

@@ -251,19 +251,6 @@ mod tests {
     }
 
     #[test]
-    fn error_display_project_too_large() {
-        let err = AftError::ProjectTooLarge {
-            count: 20001,
-            max: 20000,
-        };
-        assert_eq!(
-            err.to_string(),
-            "project has 20001 source files, exceeding max_callgraph_files=20000. Legacy in-memory call-graph operations (trace_data, dead_code snapshots, and symbol move analysis) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
-        );
-        assert_eq!(err.code(), "project_too_large");
-    }
-
-    #[test]
     fn error_to_json_has_code_and_message() {
         let err = AftError::FileNotFound { path: "/x".into() };
         let j = err.to_error_json();
@@ -282,6 +269,5 @@ mod tests {
         assert_eq!(cfg.max_symbol_depth, 10);
         assert_eq!(cfg.formatter_timeout_secs, 10);
         assert_eq!(cfg.type_checker_timeout_secs, 30);
-        assert_eq!(cfg.max_callgraph_files, 5_000);
     }
 }

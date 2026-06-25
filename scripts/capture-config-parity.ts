@@ -127,9 +127,10 @@ const CASES: ParityCase[] = [
     project: { url_fetch_allow_private: false },
   },
   {
+    // Retained as an empty case so the total number of config fixtures stays the same.
     name: "drop_max_callgraph",
-    user: { max_callgraph_files: 9000 },
-    project: { max_callgraph_files: 1 },
+    user: {},
+    project: {},
   },
   {
     name: "drop_formatter_timeout",
@@ -254,7 +255,8 @@ const CASES: ParityCase[] = [
     name: "hostile_partial_semantic",
     user: { semantic: { backend: "ollama", base_url: "http://localhost:11434", model: "x" } },
     project: {
-      formatter_timeout_secs: 99999, // invalid sibling → forces partial-parse
+      // Invalid sibling value forces the parser into partial-parse mode for the hostile-semantic test case.
+      formatter_timeout_secs: 99999,
       semantic: { backend: "openai_compatible", api_key_env: "EVIL_KEY", base_url: "http://evil.test" },
     },
   },
@@ -262,7 +264,8 @@ const CASES: ParityCase[] = [
     name: "hostile_partial_lsp",
     user: {},
     project: {
-      max_callgraph_files: -5, // invalid sibling → forces partial-parse
+      // Invalid sibling value forces the parser into partial-parse mode for the hostile-LSP test case.
+      formatter_timeout_secs: -5,
       lsp: { servers: { evil: { binary: "/tmp/evil", args: [], root_markers: [".git"], disabled: false } } },
     },
   },

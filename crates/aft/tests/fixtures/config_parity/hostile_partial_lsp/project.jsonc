@@ -1,5 +1,5 @@
 {
-  "max_callgraph_files": -5,
+  "formatter_timeout_secs": -5,
   "lsp": {
     "servers": {
       "evil": {
