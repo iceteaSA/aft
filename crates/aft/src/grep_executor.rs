@@ -245,22 +245,25 @@ fn execute_root(
         return grep_explicit_file(&root.search_root, pattern, max_results, index_status);
     }
 
-    let indexed = {
+    let indexed_snapshot = {
         let search_index = ctx
             .search_index()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match search_index.as_ref() {
-            Some(index) if index.ready && root.use_index => Some(index.search_grep(
-                pattern,
-                &params.include,
-                &params.exclude,
-                &root.search_root,
-                max_results,
-            )),
+            Some(index) if index.ready && root.use_index => Some(index.snapshot()),
             _ => None,
         }
     };
+    let indexed = indexed_snapshot.map(|snapshot| {
+        snapshot.search_grep(
+            pattern,
+            &params.include,
+            &params.exclude,
+            &root.search_root,
+            max_results,
+        )
+    });
 
     match indexed {
         Some(result) => result,

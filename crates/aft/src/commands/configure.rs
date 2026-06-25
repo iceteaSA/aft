@@ -1774,15 +1774,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     }
                                 }
                             };
-                            let index = SearchIndex::rebuild_or_refresh(
+                            let mut index = SearchIndex::rebuild_or_refresh(
                                 &root_clone,
                                 search_index_max_file_size,
                                 current_head,
                                 baseline,
+                                Some(&cache_dir),
                             );
                             delay_search_rebuild_publish_for_debug();
                             if !is_worktree_bridge_for_search {
-                                index.write_to_disk(&cache_dir, index.stored_git_head());
+                                let head = index.stored_git_head().map(str::to_owned);
+                                index.write_to_disk(&cache_dir, head.as_deref());
                             }
                             index
                         };

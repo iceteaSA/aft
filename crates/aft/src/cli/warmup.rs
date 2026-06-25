@@ -271,6 +271,7 @@ fn build_warmup_configure_params(
     let warmup_config_doc = json!({
         "search_index": areas.search,
         "semantic_search": areas.semantic,
+        "callgraph_store": areas.callgraph,
     })
     .to_string();
     let mut params = json!({

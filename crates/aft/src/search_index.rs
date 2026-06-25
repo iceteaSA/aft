@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Cursor, Read, Seek, Write};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
@@ -23,9 +23,17 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
+const SPILL_MAGIC: &[u8; 8] = b"AFTSPI01";
+const FILE_TRIGRAM_COUNT_MAGIC: &[u8; 8] = b"AFTFTC01";
 const INDEX_VERSION: u32 = 4;
 const PREVIEW_BYTES: usize = 8 * 1024;
-const PARALLEL_INGEST_CHUNK_SIZE: usize = 256;
+const SPIMI_SOFT_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+const SPIMI_HARD_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+const SPILL_RECORD_ESTIMATED_BYTES: usize = 16;
+const DELTA_COMPACT_SOFT_FILES: usize = 1_000;
+const DELTA_COMPACT_HARD_FILES: usize = 5_000;
+const DELTA_COMPACT_SOFT_BYTES: usize = 32 * 1024 * 1024;
+const DELTA_COMPACT_HARD_BYTES: usize = 128 * 1024 * 1024;
 const EOF_SENTINEL: u8 = 0;
 const MAX_ENTRIES: usize = 10_000_000;
 const MIN_FILE_ENTRY_BYTES: usize = 57;
@@ -57,16 +65,57 @@ impl CacheLock {
 
 #[derive(Clone, Debug)]
 pub struct SearchIndex {
-    pub postings: HashMap<u32, Vec<Posting>>,
-    pub files: Vec<FileEntry>,
-    pub path_to_id: HashMap<PathBuf, u32>,
+    base: Option<Arc<BasePostings>>,
+    delta_postings: HashMap<u32, Vec<Posting>>,
+    delta_file_trigrams: HashMap<u32, Vec<u32>>,
+    pub files: Arc<Vec<FileEntry>>,
+    pub path_to_id: Arc<HashMap<PathBuf, u32>>,
     pub ready: bool,
     project_root: PathBuf,
     git_head: Option<String>,
     max_file_size: u64,
     ignore_rules_fingerprint: String,
-    pub file_trigrams: HashMap<u32, Vec<u32>>,
-    unindexed_files: HashSet<u32>,
+    pub file_trigram_count: Arc<Vec<u32>>,
+    unindexed_files: Arc<HashSet<u32>>,
+    superseded: HashSet<u32>,
+    base_file_count: u32,
+    delta_packed_bytes: usize,
+    compaction_state: Arc<Mutex<CompactionState>>,
+}
+
+#[derive(Clone, Debug)]
+struct BasePostings {
+    file: Arc<File>,
+    postings_blob_start: u64,
+    postings_blob_len: u64,
+    lookup: Arc<Vec<LookupEntry>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LookupEntry {
+    trigram: u32,
+    offset: u64,
+    count: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompactionState {
+    running: bool,
+    requested_again: bool,
+    buffered_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SearchIndexSnapshot {
+    base: Option<Arc<BasePostings>>,
+    delta_postings: Arc<HashMap<u32, Vec<Posting>>>,
+    files: Arc<Vec<FileEntry>>,
+    path_to_id: Arc<HashMap<PathBuf, u32>>,
+    ready: bool,
+    project_root: PathBuf,
+    file_trigram_count: Arc<Vec<u32>>,
+    unindexed_files: Arc<HashSet<u32>>,
+    superseded: Arc<HashSet<u32>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,9 +130,27 @@ impl SearchIndex {
         self.files.len()
     }
 
-    /// Number of unique trigrams in the index.
+    /// Number of unique trigrams in the combined base index and delta postings.
     pub fn trigram_count(&self) -> usize {
-        self.postings.len()
+        self.snapshot().trigram_count()
+    }
+
+    /// Returns an immutable snapshot for queries. Callers must obtain the
+    /// snapshot while holding the RwLock that protects the SearchIndex, then
+    /// drop the guard before running expensive operations such as grep, glob, or
+    /// lexical ranking.
+    pub fn snapshot(&self) -> SearchIndexSnapshot {
+        SearchIndexSnapshot {
+            base: self.base.clone(),
+            delta_postings: Arc::new(self.delta_postings.clone()),
+            files: Arc::clone(&self.files),
+            path_to_id: Arc::clone(&self.path_to_id),
+            ready: self.ready,
+            project_root: self.project_root.clone(),
+            file_trigram_count: Arc::clone(&self.file_trigram_count),
+            unindexed_files: Arc::clone(&self.unindexed_files),
+            superseded: Arc::new(self.superseded.clone()),
+        }
     }
 
     /// Compute distinct query trigrams from literal tokens.
@@ -98,12 +165,41 @@ impl SearchIndex {
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         max_files: usize,
     ) -> Vec<(PathBuf, f32)> {
-        self.lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
+        self.snapshot()
+            .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
             .files
     }
 
-    /// Score-rank file candidates and report whether pre-filter candidate
-    /// enumeration hit the internal 200/500 cap before ranking.
+    /// Score-rank file candidates and report whether the pre-filter step that
+    /// collects candidates reached its internal size limit before ranking.
+    pub fn lexical_rank_with_stats(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        max_files: usize,
+    ) -> LexicalRankResult {
+        self.snapshot()
+            .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
+    }
+}
+
+impl SearchIndexSnapshot {
+    /// Number of unique trigrams in the combined base index and delta postings.
+    pub fn trigram_count(&self) -> usize {
+        let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
+        let Some(base) = &self.base else {
+            return self.delta_postings.len();
+        };
+        base_count
+            + self
+                .delta_postings
+                .keys()
+                .filter(|trigram| base.lookup_entry(**trigram).is_none())
+                .count()
+    }
+
+    /// Score-rank file candidates and report whether the pre-filter step that
+    /// collects candidates reached its internal size limit before ranking.
     pub fn lexical_rank_with_stats(
         &self,
         query_trigrams: &[u32],
@@ -117,7 +213,7 @@ impl SearchIndex {
         let mut non_zero: Vec<(u32, usize)> = query_trigrams
             .iter()
             .filter_map(|trigram| {
-                let posting_count = self.postings.get(trigram).map_or(0, Vec::len);
+                let posting_count = self.posting_count(*trigram);
                 (posting_count > 0).then_some((*trigram, posting_count))
             })
             .collect();
@@ -131,12 +227,8 @@ impl SearchIndex {
 
         let mut candidate_ids = BTreeSet::new();
         for (trigram, _) in non_zero.iter().take(selected_count) {
-            if let Some(postings) = self.postings.get(trigram) {
-                for posting in postings {
-                    if self.is_active_file(posting.file_id) {
-                        candidate_ids.insert(posting.file_id);
-                    }
-                }
+            for file_id in self.postings_for_trigram(*trigram, None) {
+                candidate_ids.insert(file_id);
             }
         }
         let pre_filter_candidate_count = candidate_ids.len();
@@ -159,7 +251,7 @@ impl SearchIndex {
 
         let mut ranked = Vec::new();
         for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {
-            let score = lexical_score(self, query_trigrams, file_id);
+            let score = lexical_score_snapshot(self, query_trigrams, file_id);
             if score > 0.0 {
                 ranked.push((entry.path.clone(), score));
             }
@@ -299,16 +391,22 @@ enum SearchMatcher {
 impl SearchIndex {
     pub fn new() -> Self {
         SearchIndex {
-            postings: HashMap::new(),
-            files: Vec::new(),
-            path_to_id: HashMap::new(),
+            base: None,
+            delta_postings: HashMap::new(),
+            delta_file_trigrams: HashMap::new(),
+            files: Arc::new(Vec::new()),
+            path_to_id: Arc::new(HashMap::new()),
             ready: false,
             project_root: PathBuf::new(),
             git_head: None,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             ignore_rules_fingerprint: String::new(),
-            file_trigrams: HashMap::new(),
-            unindexed_files: HashSet::new(),
+            file_trigram_count: Arc::new(Vec::new()),
+            unindexed_files: Arc::new(HashSet::new()),
+            superseded: HashSet::new(),
+            base_file_count: 0,
+            delta_packed_bytes: 0,
+            compaction_state: Arc::new(Mutex::new(CompactionState::default())),
         }
     }
 
@@ -317,29 +415,56 @@ impl SearchIndex {
     }
 
     pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
+        let cache_dir = transient_search_cache_dir(root);
+        Self::build_with_limit_to_cache_dir(root, max_file_size, &cache_dir)
+    }
+
+    pub fn build_with_limit_to_cache_dir(
+        root: &Path,
+        max_file_size: u64,
+        cache_dir: &Path,
+    ) -> Self {
         let started = std::time::Instant::now();
-        let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let mut index = SearchIndex {
-            project_root: project_root.clone(),
-            max_file_size,
-            ignore_rules_fingerprint: ignore_rules_fingerprint(&project_root),
-            ..SearchIndex::new()
-        };
-
-        let filters = PathFilters::default();
-        let paths: Vec<PathBuf> = walk_project_files(&project_root, &filters);
-        let indexed = index.ingest_paths_parallel(&paths);
-
-        index.git_head = current_git_head(&project_root);
-        index.ready = true;
-        crate::slog_info!(
-            "search index cold build: {} files, {} trigrams, {} ms (pool={})",
-            indexed,
-            index.postings.len(),
-            started.elapsed().as_millis(),
-            search_index_build_pool_size()
-        );
-        index
+        match build_streaming_index(root, max_file_size, cache_dir) {
+            Ok((mut index, indexed)) => {
+                index.ready = true;
+                crate::slog_info!(
+                    "search index cold streaming build: {} files, {} trigrams, {} ms (pool={})",
+                    indexed,
+                    index.trigram_count(),
+                    started.elapsed().as_millis(),
+                    search_index_build_pool_size()
+                );
+                index
+            }
+            Err(error) => {
+                log::warn!(
+                    "search index: streaming build failed ({}); falling back to bounded in-memory delta",
+                    error
+                );
+                let mut index = SearchIndex {
+                    project_root: fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+                    max_file_size,
+                    ignore_rules_fingerprint: ignore_rules_fingerprint(
+                        &fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+                    ),
+                    ..SearchIndex::new()
+                };
+                let filters = PathFilters::default();
+                let paths: Vec<PathBuf> = walk_project_files(&index.project_root, &filters);
+                let indexed = index.ingest_paths_parallel(&paths);
+                index.git_head = current_git_head(&index.project_root);
+                index.ready = true;
+                crate::slog_info!(
+                    "search index fallback build: {} files, {} trigrams, {} ms (pool={})",
+                    indexed,
+                    index.trigram_count(),
+                    started.elapsed().as_millis(),
+                    search_index_build_pool_size()
+                );
+                index
+            }
+        }
     }
 
     /// Serial cold build for tests and parity checks against [`build_with_limit`].
@@ -363,8 +488,10 @@ impl SearchIndex {
 
     fn ingest_paths_parallel(&mut self, paths: &[PathBuf]) -> usize {
         let max_file_size = self.max_file_size;
+        let pool_size = search_index_build_pool_size();
+        let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
         let pool = match rayon::ThreadPoolBuilder::new()
-            .num_threads(search_index_build_pool_size())
+            .num_threads(pool_size)
             .thread_name(|index| format!("aft-search-build-{index}"))
             .stack_size(8 * 1024 * 1024)
             .build()
@@ -379,7 +506,7 @@ impl SearchIndex {
         };
 
         let mut indexed = 0usize;
-        for chunk in paths.chunks(PARALLEL_INGEST_CHUNK_SIZE) {
+        for chunk in paths.chunks(chunk_size) {
             let prepare_chunk = || -> Vec<PreparedSearchPath> {
                 chunk
                     .par_iter()
@@ -435,21 +562,18 @@ impl SearchIndex {
             Some(file_id) => file_id,
             None => return false,
         };
-        if let Some(entry) = self.files.get_mut(file_id as usize) {
+        if let Some(entry) = Arc::make_mut(&mut self.files).get_mut(file_id as usize) {
             entry.content_hash = file.content_hash;
         }
 
         let mut file_trigrams = Vec::with_capacity(file.trigram_map.len());
         for (trigram, filter) in file.trigram_map {
-            let postings = self.postings.entry(trigram).or_default();
+            let postings = self.delta_postings.entry(trigram).or_default();
             postings.push(Posting {
                 file_id,
                 next_mask: filter.next_mask,
                 loc_mask: filter.loc_mask,
             });
-            // Posting lists are kept sorted by file_id for binary search during
-            // intersection. Since file_ids are allocated incrementally, the new
-            // entry is usually already in order. Only sort when needed.
             if postings.len() > 1
                 && postings[postings.len() - 2].file_id > postings[postings.len() - 1].file_id
             {
@@ -458,27 +582,46 @@ impl SearchIndex {
             file_trigrams.push(trigram);
         }
 
-        self.file_trigrams.insert(file_id, file_trigrams);
-        self.unindexed_files.remove(&file_id);
+        let trigram_count = file_trigrams.len() as u32;
+        self.delta_packed_bytes = self
+            .delta_packed_bytes
+            .saturating_add(file_trigrams.len().saturating_mul(POSTING_BYTES));
+        self.delta_file_trigrams.insert(file_id, file_trigrams);
+        ensure_count_slot(Arc::make_mut(&mut self.file_trigram_count), file_id);
+        if let Some(count) = Arc::make_mut(&mut self.file_trigram_count).get_mut(file_id as usize) {
+            *count = trigram_count;
+        }
+        Arc::make_mut(&mut self.unindexed_files).remove(&file_id);
+        self.update_compaction_flags(Some(path));
         true
     }
 
     pub fn remove_file(&mut self, path: &Path) {
         let canonical_path = canonicalize_existing_or_deleted_path(path);
-        let file_id = if let Some(file_id) = self.path_to_id.remove(path) {
-            file_id
-        } else if canonical_path.as_path() != path {
-            let Some(file_id) = self.path_to_id.remove(&canonical_path) else {
+        let file_id = {
+            let path_to_id = Arc::make_mut(&mut self.path_to_id);
+            if let Some(file_id) = path_to_id.remove(path) {
+                file_id
+            } else if canonical_path.as_path() != path {
+                let Some(file_id) = path_to_id.remove(&canonical_path) else {
+                    return;
+                };
+                file_id
+            } else {
                 return;
-            };
-            file_id
-        } else {
-            return;
+            }
         };
 
-        if let Some(trigrams) = self.file_trigrams.remove(&file_id) {
+        if file_id < self.base_file_count {
+            self.superseded.insert(file_id);
+        }
+
+        if let Some(trigrams) = self.delta_file_trigrams.remove(&file_id) {
+            self.delta_packed_bytes = self
+                .delta_packed_bytes
+                .saturating_sub(trigrams.len().saturating_mul(POSTING_BYTES));
             for trigram in trigrams {
-                let should_remove = if let Some(postings) = self.postings.get_mut(&trigram) {
+                let should_remove = if let Some(postings) = self.delta_postings.get_mut(&trigram) {
                     postings.retain(|posting| posting.file_id != file_id);
                     postings.is_empty()
                 } else {
@@ -486,18 +629,22 @@ impl SearchIndex {
                 };
 
                 if should_remove {
-                    self.postings.remove(&trigram);
+                    self.delta_postings.remove(&trigram);
                 }
             }
         }
 
-        self.unindexed_files.remove(&file_id);
-        if let Some(file) = self.files.get_mut(file_id as usize) {
+        Arc::make_mut(&mut self.unindexed_files).remove(&file_id);
+        if let Some(file) = Arc::make_mut(&mut self.files).get_mut(file_id as usize) {
             file.path = PathBuf::new();
             file.size = 0;
             file.modified = UNIX_EPOCH;
             file.content_hash = cache_freshness::zero_hash();
         }
+        if let Some(count) = Arc::make_mut(&mut self.file_trigram_count).get_mut(file_id as usize) {
+            *count = 0;
+        }
+        self.update_compaction_flags(Some(path));
     }
 
     pub fn update_file(&mut self, path: &Path) {
@@ -533,6 +680,515 @@ impl SearchIndex {
         self.index_file_with_metadata(path, &content, metadata);
     }
 
+    pub fn grep(
+        &self,
+        pattern: &str,
+        case_sensitive: bool,
+        include: &[String],
+        exclude: &[String],
+        search_root: &Path,
+        max_results: usize,
+    ) -> GrepResult {
+        self.snapshot().grep(
+            pattern,
+            case_sensitive,
+            include,
+            exclude,
+            search_root,
+            max_results,
+        )
+    }
+
+    pub fn search_grep(
+        &self,
+        pattern: &CompiledPattern,
+        include: &[String],
+        exclude: &[String],
+        search_root: &Path,
+        max_results: usize,
+    ) -> GrepResult {
+        self.snapshot()
+            .search_grep(pattern, include, exclude, search_root, max_results)
+    }
+
+    pub fn glob(&self, pattern: &str, search_root: &Path) -> Vec<PathBuf> {
+        self.snapshot().glob(pattern, search_root)
+    }
+
+    pub fn candidates(&self, query: &RegexQuery) -> Vec<u32> {
+        self.snapshot().candidates(query)
+    }
+
+    pub fn write_to_disk(&mut self, cache_dir: &Path, git_head: Option<&str>) {
+        let Some(plan) = CacheWritePlan::from_index(self, git_head) else {
+            return;
+        };
+
+        let write_result = {
+            let mut sources = self.compaction_record_sources(Arc::clone(&plan.id_map));
+            write_cache_file_from_sources(cache_dir, &plan, &mut sources)
+        };
+
+        match write_result {
+            Ok(base) => {
+                self.base = Some(Arc::new(base));
+                self.delta_postings.clear();
+                self.delta_file_trigrams.clear();
+                self.superseded.clear();
+                self.delta_packed_bytes = 0;
+                self.base_file_count = u32::try_from(plan.files.len()).unwrap_or(u32::MAX);
+                self.files = Arc::new(plan.files);
+                self.path_to_id = Arc::new(plan.path_to_id);
+                self.unindexed_files = Arc::new(plan.unindexed_files);
+                self.file_trigram_count = Arc::new(plan.file_trigram_count);
+                self.git_head = plan.git_head.filter(|head| !head.is_empty());
+                self.ignore_rules_fingerprint = plan.ignore_fingerprint;
+            }
+            Err(error) => {
+                log::warn!("search index: failed to write disk cache: {}", error);
+            }
+        }
+    }
+
+    pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
+        debug_assert!(current_canonical_root.is_absolute());
+        let cache_path = cache_dir.join("cache.bin");
+        let cache_file = open_cache_file_read(&cache_path).ok()?;
+        let file_len = cache_file.metadata().ok()?.len();
+        if file_len < 16 {
+            return None;
+        }
+
+        let mut reader = BufReader::new(cache_file.try_clone().ok()?);
+        if read_u32(&mut reader).ok()? != CACHE_MAGIC {
+            return None;
+        }
+        if read_u32(&mut reader).ok()? != INDEX_VERSION {
+            return None;
+        }
+        let postings_len_total = read_u64(&mut reader).ok()?;
+        let postings_section_start = reader.stream_position().ok()?;
+        let postings_section_end = postings_section_start.checked_add(postings_len_total)?;
+        if postings_len_total < 4 || postings_section_end > file_len {
+            return None;
+        }
+        let postings_body_end = postings_section_end.checked_sub(4)?;
+
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic).ok()?;
+        if &magic != INDEX_MAGIC {
+            return None;
+        }
+        if read_u32(&mut reader).ok()? != INDEX_VERSION {
+            return None;
+        }
+
+        let head_len = read_u32(&mut reader).ok()? as usize;
+        let root_len = read_u32(&mut reader).ok()? as usize;
+        let ignore_fingerprint_len = read_u32(&mut reader).ok()? as usize;
+        let max_file_size = read_u64(&mut reader).ok()?;
+        let file_count = read_u32(&mut reader).ok()? as usize;
+        if file_count > MAX_ENTRIES {
+            return None;
+        }
+
+        if !reader_has_remaining(&mut reader, postings_body_end, head_len).ok()? {
+            return None;
+        }
+        let mut head_bytes = vec![0u8; head_len];
+        reader.read_exact(&mut head_bytes).ok()?;
+        let git_head = String::from_utf8(head_bytes)
+            .ok()
+            .filter(|head| !head.is_empty());
+
+        if !reader_has_remaining(&mut reader, postings_body_end, root_len).ok()? {
+            return None;
+        }
+        let mut root_bytes = vec![0u8; root_len];
+        reader.read_exact(&mut root_bytes).ok()?;
+        let _stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
+        let project_root = current_canonical_root.to_path_buf();
+
+        if !reader_has_remaining(&mut reader, postings_body_end, ignore_fingerprint_len).ok()? {
+            return None;
+        }
+        let mut ignore_fingerprint_bytes = vec![0u8; ignore_fingerprint_len];
+        reader.read_exact(&mut ignore_fingerprint_bytes).ok()?;
+        let stored_ignore_rules_fingerprint = String::from_utf8(ignore_fingerprint_bytes).ok()?;
+        let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&project_root);
+        if stored_ignore_rules_fingerprint != current_ignore_rules_fingerprint {
+            return None;
+        }
+
+        let mut files = Vec::with_capacity(file_count);
+        let mut path_to_id = HashMap::new();
+        let mut unindexed_files = HashSet::new();
+
+        for file_id in 0..file_count {
+            if !reader_has_remaining(&mut reader, postings_body_end, MIN_FILE_ENTRY_BYTES).ok()? {
+                return None;
+            }
+            let mut unindexed = [0u8; 1];
+            reader.read_exact(&mut unindexed).ok()?;
+            let path_len = read_u32(&mut reader).ok()? as usize;
+            let size = read_u64(&mut reader).ok()?;
+            let secs = read_u64(&mut reader).ok()?;
+            let nanos = read_u32(&mut reader).ok()?;
+            let mut hash_bytes = [0u8; 32];
+            reader.read_exact(&mut hash_bytes).ok()?;
+            let content_hash = blake3::Hash::from_bytes(hash_bytes);
+            if nanos >= 1_000_000_000 {
+                return None;
+            }
+            if !reader_has_remaining(&mut reader, postings_body_end, path_len).ok()? {
+                return None;
+            }
+            let mut path_bytes = vec![0u8; path_len];
+            reader.read_exact(&mut path_bytes).ok()?;
+            let relative_path = PathBuf::from(String::from_utf8(path_bytes).ok()?);
+            let full_path = cached_path_under_root(&project_root, &relative_path)?;
+            let file_id_u32 = u32::try_from(file_id).ok()?;
+
+            files.push(FileEntry {
+                path: full_path.clone(),
+                size,
+                modified: UNIX_EPOCH + Duration::new(secs, nanos),
+                content_hash,
+            });
+            path_to_id.insert(full_path, file_id_u32);
+            if unindexed[0] == 1 {
+                unindexed_files.insert(file_id_u32);
+            }
+        }
+
+        if !reader_has_remaining(&mut reader, postings_body_end, 8).ok()? {
+            return None;
+        }
+        let postings_blob_len = read_u64(&mut reader).ok()?;
+        let postings_blob_start = reader.stream_position().ok()?;
+        let postings_blob_end = postings_blob_start.checked_add(postings_blob_len)?;
+        if postings_blob_end > postings_body_end || postings_blob_len % POSTING_BYTES as u64 != 0 {
+            return None;
+        }
+
+        let lookup_section_start = postings_section_end;
+        if lookup_section_start >= file_len {
+            return None;
+        }
+        let mut lookup_file = cache_file.try_clone().ok()?;
+        lookup_file
+            .seek(SeekFrom::Start(lookup_section_start))
+            .ok()?;
+        let mut lookup_bytes = Vec::new();
+        lookup_file.read_to_end(&mut lookup_bytes).ok()?;
+        if lookup_bytes.len() < 4 {
+            return None;
+        }
+        verify_crc32_bytes_slice(&lookup_bytes).ok()?;
+        let lookup_body_len = lookup_bytes.len().checked_sub(4)?;
+        let mut lookup_reader = BufReader::new(Cursor::new(&lookup_bytes));
+        let mut lookup_magic = [0u8; 8];
+        lookup_reader.read_exact(&mut lookup_magic).ok()?;
+        if &lookup_magic != LOOKUP_MAGIC {
+            return None;
+        }
+        if read_u32(&mut lookup_reader).ok()? != INDEX_VERSION {
+            return None;
+        }
+        let entry_count = read_u32(&mut lookup_reader).ok()? as usize;
+        if entry_count > MAX_ENTRIES {
+            return None;
+        }
+        let remaining_lookup = remaining_bytes(&mut lookup_reader, lookup_body_len)?;
+        let minimum_lookup_bytes = entry_count.checked_mul(LOOKUP_ENTRY_BYTES)?;
+        if minimum_lookup_bytes > remaining_lookup {
+            return None;
+        }
+
+        let mut lookup = Vec::with_capacity(entry_count);
+        let mut previous_trigram = None;
+        for _ in 0..entry_count {
+            let trigram = read_u32(&mut lookup_reader).ok()?;
+            let offset = read_u64(&mut lookup_reader).ok()?;
+            let count = read_u32(&mut lookup_reader).ok()?;
+            if count as usize > MAX_ENTRIES {
+                return None;
+            }
+            if previous_trigram.is_some_and(|previous| previous >= trigram) {
+                return None;
+            }
+            previous_trigram = Some(trigram);
+            let bytes_len = (count as u64).checked_mul(POSTING_BYTES as u64)?;
+            let end = offset.checked_add(bytes_len)?;
+            if end > postings_blob_len {
+                return None;
+            }
+            lookup.push(LookupEntry {
+                trigram,
+                offset,
+                count,
+            });
+        }
+
+        let base = BasePostings {
+            file: Arc::new(cache_file),
+            postings_blob_start,
+            postings_blob_len,
+            lookup: Arc::new(lookup),
+        };
+
+        let (file_trigram_count, migrated_counts) = match read_file_trigram_count_extension(
+            &base,
+            postings_blob_end,
+            postings_body_end,
+            file_count,
+        ) {
+            Ok(Some(counts)) => (counts, false),
+            Ok(None) => (
+                compute_file_trigram_counts_from_base(&base, file_count).ok()?,
+                true,
+            ),
+            Err(_) => return None,
+        };
+
+        let mut index = SearchIndex {
+            base: Some(Arc::new(base)),
+            delta_postings: HashMap::new(),
+            delta_file_trigrams: HashMap::new(),
+            files: Arc::new(files),
+            path_to_id: Arc::new(path_to_id),
+            ready: false,
+            project_root,
+            git_head,
+            max_file_size,
+            ignore_rules_fingerprint: current_ignore_rules_fingerprint,
+            file_trigram_count: Arc::new(file_trigram_count),
+            unindexed_files: Arc::new(unindexed_files),
+            superseded: HashSet::new(),
+            base_file_count: u32::try_from(file_count).ok()?,
+            delta_packed_bytes: 0,
+            compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+        };
+
+        if migrated_counts {
+            if let Ok(_lock) = CacheLock::acquire(cache_dir) {
+                let head = index.git_head.clone();
+                index.write_to_disk(cache_dir, head.as_deref());
+            }
+        }
+
+        Some(index)
+    }
+
+    pub fn stored_git_head(&self) -> Option<&str> {
+        self.git_head.as_deref()
+    }
+
+    pub(crate) fn set_ready(&mut self, ready: bool) {
+        self.ready = ready;
+    }
+
+    pub(crate) fn verify_against_disk(&mut self, current_head: Option<String>) {
+        self.git_head = current_head;
+        verify_file_mtimes(self);
+        self.ready = true;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn verify_against_disk_for_debug(&mut self, current_head: Option<String>) {
+        self.verify_against_disk(current_head);
+    }
+
+    pub(crate) fn rebuild_or_refresh(
+        root: &Path,
+        max_file_size: u64,
+        current_head: Option<String>,
+        baseline: Option<SearchIndex>,
+        cache_dir: Option<&Path>,
+    ) -> Self {
+        if let Some(mut baseline) = baseline {
+            baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            baseline.max_file_size = max_file_size;
+            let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
+            if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
+                return match cache_dir {
+                    Some(cache_dir) => {
+                        SearchIndex::build_with_limit_to_cache_dir(root, max_file_size, cache_dir)
+                    }
+                    None => SearchIndex::build_with_limit(root, max_file_size),
+                };
+            }
+            baseline.ignore_rules_fingerprint = current_ignore_rules_fingerprint;
+
+            if baseline.git_head == current_head || current_head.is_none() {
+                // HEAD matches, but files may have changed on disk since the index was
+                // last written (e.g., uncommitted edits, stash pop, manual file changes
+                // while OpenCode was closed). Verify mtimes and re-index stale files.
+                // Non-git projects also use this per-file (path, mtime, size)
+                // fingerprint so unchanged trees reuse the disk cache instead of
+                // rebuilding every configure.
+                baseline.git_head = current_head;
+                verify_file_mtimes(&mut baseline);
+                baseline.ready = true;
+                return baseline;
+            }
+
+            if let (Some(previous), Some(current)) =
+                (baseline.git_head.clone(), current_head.clone())
+            {
+                let project_root = baseline.project_root.clone();
+                if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
+                    baseline.git_head = Some(current);
+                    verify_file_mtimes(&mut baseline);
+                    baseline.ready = true;
+                    return baseline;
+                }
+            }
+        }
+
+        match cache_dir {
+            Some(cache_dir) => {
+                SearchIndex::build_with_limit_to_cache_dir(root, max_file_size, cache_dir)
+            }
+            None => SearchIndex::build_with_limit(root, max_file_size),
+        }
+    }
+
+    fn allocate_file_id_with_metadata(
+        &mut self,
+        path: &Path,
+        metadata: SearchFileMetadata,
+    ) -> Option<u32> {
+        let file_id = u32::try_from(self.files.len()).ok()?;
+        Arc::make_mut(&mut self.files).push(FileEntry {
+            path: path.to_path_buf(),
+            size: metadata.size,
+            modified: metadata.modified,
+            content_hash: cache_freshness::zero_hash(),
+        });
+        Arc::make_mut(&mut self.path_to_id).insert(path.to_path_buf(), file_id);
+        ensure_count_slot(Arc::make_mut(&mut self.file_trigram_count), file_id);
+        Some(file_id)
+    }
+
+    fn track_unindexed_file_with_metadata(
+        &mut self,
+        path: &Path,
+        metadata: SearchFileMetadata,
+    ) -> bool {
+        let Some(file_id) = self.allocate_file_id_with_metadata(path, metadata) else {
+            return false;
+        };
+        Arc::make_mut(&mut self.unindexed_files).insert(file_id);
+        if let Some(count) = Arc::make_mut(&mut self.file_trigram_count).get_mut(file_id as usize) {
+            *count = 0;
+        }
+        true
+    }
+
+    fn active_file_ids(&self) -> Vec<u32> {
+        self.snapshot().active_file_ids()
+    }
+
+    #[cfg(test)]
+    fn postings_for_trigram(&self, trigram: u32, filter: Option<PostingFilter>) -> Vec<u32> {
+        self.snapshot().postings_for_trigram(trigram, filter)
+    }
+
+    fn update_compaction_flags(&mut self, changed_path: Option<&Path>) {
+        let delta_files = self.delta_file_trigrams.len();
+        let hard = delta_files >= DELTA_COMPACT_HARD_FILES
+            || self.delta_packed_bytes >= DELTA_COMPACT_HARD_BYTES;
+        let soft = delta_files >= DELTA_COMPACT_SOFT_FILES
+            || self.delta_packed_bytes >= DELTA_COMPACT_SOFT_BYTES;
+        if let Ok(mut state) = self.compaction_state.lock() {
+            if state.running {
+                if let Some(path) = changed_path {
+                    state.buffered_paths.push(path.to_path_buf());
+                }
+                if soft || hard {
+                    state.requested_again = true;
+                }
+            } else if hard || (soft && !state.requested_again) {
+                state.requested_again = true;
+            }
+        }
+    }
+
+    fn compaction_record_sources(
+        &self,
+        id_map: Arc<HashMap<u32, u32>>,
+    ) -> Vec<Box<dyn PostingRecordSource>> {
+        let mut sources: Vec<Box<dyn PostingRecordSource>> = Vec::new();
+        if let Some(base) = self.base.clone() {
+            sources.push(Box::new(BaseRecordSource::new(
+                base,
+                Arc::clone(&id_map),
+                Arc::new(self.superseded.clone()),
+            )));
+        }
+
+        let mut delta_records = Vec::new();
+        for (&trigram, postings) in &self.delta_postings {
+            for posting in postings {
+                let Some(mapped_file_id) = id_map.get(&posting.file_id).copied() else {
+                    continue;
+                };
+                delta_records.push(SpillRecord {
+                    trigram,
+                    file_id: mapped_file_id,
+                    next_mask: posting.next_mask,
+                    loc_mask: posting.loc_mask,
+                });
+            }
+        }
+        if !delta_records.is_empty() {
+            delta_records.sort_unstable_by_key(|record| (record.trigram, record.file_id));
+            sources.push(Box::new(VecRecordSource::new(delta_records)));
+        }
+        sources
+    }
+}
+
+impl BasePostings {
+    fn lookup_entry(&self, trigram: u32) -> Option<LookupEntry> {
+        self.lookup
+            .binary_search_by_key(&trigram, |entry| entry.trigram)
+            .ok()
+            .and_then(|index| self.lookup.get(index).copied())
+    }
+
+    fn read_postings(&self, entry: LookupEntry) -> std::io::Result<Vec<Posting>> {
+        let bytes_len = (entry.count as usize)
+            .checked_mul(POSTING_BYTES)
+            .ok_or_else(|| std::io::Error::other("posting list too large"))?;
+        let offset = self
+            .postings_blob_start
+            .checked_add(entry.offset)
+            .ok_or_else(|| std::io::Error::other("posting offset overflow"))?;
+        let end = entry
+            .offset
+            .checked_add(bytes_len as u64)
+            .ok_or_else(|| std::io::Error::other("posting offset overflow"))?;
+        if end > self.postings_blob_len {
+            return Err(std::io::Error::other("posting list exceeds blob"));
+        }
+        let mut bytes = vec![0u8; bytes_len];
+        pread_exact(&self.file, offset, &mut bytes)?;
+        let mut postings = Vec::with_capacity(entry.count as usize);
+        for chunk in bytes.chunks_exact(POSTING_BYTES) {
+            postings.push(Posting {
+                file_id: u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                next_mask: chunk[4],
+                loc_mask: chunk[5],
+            });
+        }
+        Ok(postings)
+    }
+}
+
+impl SearchIndexSnapshot {
     pub fn grep(
         &self,
         pattern: &str,
@@ -629,13 +1285,9 @@ impl SearchIndex {
                     )
                 })
                 .reduce(Vec::new, |mut left, mut right| {
-                    // NOTE: do NOT set engine_capped here. reduce() runs on every
-                    // partial-result merge in a multi-chunk parallel search,
-                    // capped or not — setting it unconditionally would falsely
-                    // report every indexed grep over >10 candidates as capped.
-                    // Cap detection is owned by grep_scan_should_stop (in the map
-                    // closure) and should_stop_search (serial path), which set
-                    // engine_capped only when the result cap is actually reached.
+                    // When concatenating partial match lists from parallel file
+                    // searches, simply append the chunks. The stop checks in
+                    // each worker decide whether the result cap was reached.
                     left.append(&mut right);
                     left
                 })
@@ -746,7 +1398,7 @@ impl SearchIndex {
         }
 
         let mut and_trigrams = query.and_trigrams.clone();
-        and_trigrams.sort_unstable_by_key(|trigram| self.postings.get(trigram).map_or(0, Vec::len));
+        and_trigrams.sort_unstable_by_key(|trigram| self.posting_count(*trigram));
 
         let mut current: Option<Vec<u32>> = None;
 
@@ -799,477 +1451,26 @@ impl SearchIndex {
         current
     }
 
-    pub fn write_to_disk(&self, cache_dir: &Path, git_head: Option<&str>) {
-        if fs::create_dir_all(cache_dir).is_err() {
-            return;
-        }
-
-        let cache_path = cache_dir.join("cache.bin");
-        let tmp_cache = cache_dir.join(format!(
-            "cache.bin.tmp.{}.{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_nanos()
-        ));
-
-        let active_ids = self.active_file_ids();
-        let mut id_map = HashMap::new();
-        for (new_id, old_id) in active_ids.iter().enumerate() {
-            let Ok(new_id_u32) = u32::try_from(new_id) else {
-                return;
-            };
-            id_map.insert(*old_id, new_id_u32);
-        }
-
-        let write_result = (|| -> std::io::Result<()> {
-            let mut postings_writer = BufWriter::new(Cursor::new(Vec::new()));
-
-            postings_writer.write_all(INDEX_MAGIC)?;
-            write_u32(&mut postings_writer, INDEX_VERSION)?;
-
-            let head = git_head.unwrap_or_default();
-            let root = self.project_root.to_string_lossy();
-            let ignore_fingerprint = if self.ignore_rules_fingerprint.is_empty() {
-                ignore_rules_fingerprint(&self.project_root)
-            } else {
-                self.ignore_rules_fingerprint.clone()
-            };
-            let head_len = u32::try_from(head.len())
-                .map_err(|_| std::io::Error::other("git head too large to cache"))?;
-            let root_len = u32::try_from(root.len())
-                .map_err(|_| std::io::Error::other("project root too large to cache"))?;
-            let ignore_fingerprint_len = u32::try_from(ignore_fingerprint.len())
-                .map_err(|_| std::io::Error::other("ignore fingerprint too large to cache"))?;
-            let file_count = u32::try_from(active_ids.len())
-                .map_err(|_| std::io::Error::other("too many files to cache"))?;
-
-            write_u32(&mut postings_writer, head_len)?;
-            write_u32(&mut postings_writer, root_len)?;
-            write_u32(&mut postings_writer, ignore_fingerprint_len)?;
-            write_u64(&mut postings_writer, self.max_file_size)?;
-            write_u32(&mut postings_writer, file_count)?;
-            postings_writer.write_all(head.as_bytes())?;
-            postings_writer.write_all(root.as_bytes())?;
-            postings_writer.write_all(ignore_fingerprint.as_bytes())?;
-
-            for old_id in &active_ids {
-                let Some(file) = self.files.get(*old_id as usize) else {
-                    return Err(std::io::Error::other("missing file entry for cache write"));
-                };
-                let path =
-                    cache_relative_path(&self.project_root, &file.path).ok_or_else(|| {
-                        std::io::Error::other(format!(
-                            "refusing to cache path outside project root: {}",
-                            file.path.display()
-                        ))
-                    })?;
-                let path = path.to_string_lossy();
-                let path_len = u32::try_from(path.len())
-                    .map_err(|_| std::io::Error::other("cached path too large"))?;
-                let modified = file
-                    .modified
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(Duration::ZERO);
-                let unindexed = if self.unindexed_files.contains(old_id) {
-                    1u8
-                } else {
-                    0u8
-                };
-
-                postings_writer.write_all(&[unindexed])?;
-                write_u32(&mut postings_writer, path_len)?;
-                write_u64(&mut postings_writer, file.size)?;
-                write_u64(&mut postings_writer, modified.as_secs())?;
-                write_u32(&mut postings_writer, modified.subsec_nanos())?;
-                postings_writer.write_all(file.content_hash.as_bytes())?;
-                postings_writer.write_all(path.as_bytes())?;
-            }
-
-            let mut lookup_entries = Vec::new();
-            let mut postings_blob = Vec::new();
-            let mut sorted_postings: Vec<_> = self.postings.iter().collect();
-            sorted_postings.sort_by_key(|(trigram, _)| **trigram);
-
-            for (trigram, postings) in sorted_postings {
-                let offset = u64::try_from(postings_blob.len())
-                    .map_err(|_| std::io::Error::other("postings blob too large"))?;
-                let mut count = 0u32;
-
-                for posting in postings {
-                    let Some(mapped_file_id) = id_map.get(&posting.file_id).copied() else {
-                        continue;
-                    };
-
-                    postings_blob.extend_from_slice(&mapped_file_id.to_le_bytes());
-                    postings_blob.push(posting.next_mask);
-                    postings_blob.push(posting.loc_mask);
-                    count = count.saturating_add(1);
-                }
-
-                if count > 0 {
-                    lookup_entries.push((*trigram, offset, count));
-                }
-            }
-
-            write_u64(
-                &mut postings_writer,
-                u64::try_from(postings_blob.len())
-                    .map_err(|_| std::io::Error::other("postings blob too large"))?,
-            )?;
-            postings_writer.write_all(&postings_blob)?;
-            postings_writer.flush()?;
-            let mut postings_blob_file = postings_writer
-                .into_inner()
-                .map_err(|error| std::io::Error::other(error.to_string()))?
-                .into_inner();
-            let checksum = crc32fast::hash(&postings_blob_file);
-            postings_blob_file.extend_from_slice(&checksum.to_le_bytes());
-
-            let mut lookup_writer = BufWriter::new(Cursor::new(Vec::new()));
-            let entry_count = u32::try_from(lookup_entries.len())
-                .map_err(|_| std::io::Error::other("too many lookup entries to cache"))?;
-
-            lookup_writer.write_all(LOOKUP_MAGIC)?;
-            write_u32(&mut lookup_writer, INDEX_VERSION)?;
-            write_u32(&mut lookup_writer, entry_count)?;
-
-            for (trigram, offset, count) in lookup_entries {
-                write_u32(&mut lookup_writer, trigram)?;
-                write_u64(&mut lookup_writer, offset)?;
-                write_u32(&mut lookup_writer, count)?;
-            }
-
-            lookup_writer.flush()?;
-            let mut lookup_blob_file = lookup_writer
-                .into_inner()
-                .map_err(|error| std::io::Error::other(error.to_string()))?
-                .into_inner();
-            let checksum = crc32fast::hash(&lookup_blob_file);
-            lookup_blob_file.extend_from_slice(&checksum.to_le_bytes());
-
-            let mut cache_writer = BufWriter::new(File::create(&tmp_cache)?);
-            write_u32(&mut cache_writer, CACHE_MAGIC)?;
-            write_u32(&mut cache_writer, INDEX_VERSION)?;
-            write_u64(
-                &mut cache_writer,
-                u64::try_from(postings_blob_file.len())
-                    .map_err(|_| std::io::Error::other("postings section too large"))?,
-            )?;
-            cache_writer.write_all(&postings_blob_file)?;
-            cache_writer.write_all(&lookup_blob_file)?;
-            cache_writer.flush()?;
-            cache_writer.get_ref().sync_all()?;
-            drop(cache_writer);
-            fs::rename(&tmp_cache, &cache_path)?;
-
-            Ok(())
-        })();
-
-        if write_result.is_err() {
-            let _ = fs::remove_file(&tmp_cache);
-        }
-    }
-
-    pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
-        debug_assert!(current_canonical_root.is_absolute());
-        let cache_path = cache_dir.join("cache.bin");
-        let cache_bytes = fs::read(&cache_path).ok()?;
-        if cache_bytes.len() < 16 {
-            return None;
-        }
-        let mut header = Cursor::new(&cache_bytes);
-        if read_u32(&mut header).ok()? != CACHE_MAGIC {
-            return None;
-        }
-        if read_u32(&mut header).ok()? != INDEX_VERSION {
-            return None;
-        }
-        let postings_len_total = usize::try_from(read_u64(&mut header).ok()?).ok()?;
-        let start = usize::try_from(header.position()).ok()?;
-        let postings_end = start.checked_add(postings_len_total)?;
-        if postings_end > cache_bytes.len() {
-            return None;
-        }
-        let postings_bytes = &cache_bytes[start..postings_end];
-        let lookup_bytes = &cache_bytes[postings_end..];
-        let lookup_len_total = lookup_bytes.len();
-        let mut postings_reader = BufReader::new(Cursor::new(postings_bytes));
-        let mut lookup_reader = BufReader::new(Cursor::new(lookup_bytes));
-        if postings_len_total < 4 || lookup_len_total < 4 {
-            return None;
-        }
-        verify_crc32_bytes_slice(postings_bytes).ok()?;
-        verify_crc32_bytes_slice(lookup_bytes).ok()?;
-
-        let mut magic = [0u8; 8];
-        postings_reader.read_exact(&mut magic).ok()?;
-        if &magic != INDEX_MAGIC {
-            return None;
-        }
-        if read_u32(&mut postings_reader).ok()? != INDEX_VERSION {
-            return None;
-        }
-
-        let head_len = read_u32(&mut postings_reader).ok()? as usize;
-        let root_len = read_u32(&mut postings_reader).ok()? as usize;
-        let ignore_fingerprint_len = read_u32(&mut postings_reader).ok()? as usize;
-        let max_file_size = read_u64(&mut postings_reader).ok()?;
-        let file_count = read_u32(&mut postings_reader).ok()? as usize;
-        if file_count > MAX_ENTRIES {
-            return None;
-        }
-        let postings_body_len = postings_len_total.checked_sub(4)?;
-        let lookup_body_len = lookup_len_total.checked_sub(4)?;
-
-        let remaining_postings = remaining_bytes(&mut postings_reader, postings_body_len)?;
-        let minimum_file_bytes = file_count.checked_mul(MIN_FILE_ENTRY_BYTES)?;
-        if minimum_file_bytes > remaining_postings {
-            return None;
-        }
-
-        if head_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
-            return None;
-        }
-        let mut head_bytes = vec![0u8; head_len];
-        postings_reader.read_exact(&mut head_bytes).ok()?;
-        let git_head = String::from_utf8(head_bytes)
-            .ok()
-            .filter(|head| !head.is_empty());
-
-        if root_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
-            return None;
-        }
-        let mut root_bytes = vec![0u8; root_len];
-        postings_reader.read_exact(&mut root_bytes).ok()?;
-        let _stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
-        let project_root = current_canonical_root.to_path_buf();
-
-        if ignore_fingerprint_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
-            return None;
-        }
-        let mut ignore_fingerprint_bytes = vec![0u8; ignore_fingerprint_len];
-        postings_reader
-            .read_exact(&mut ignore_fingerprint_bytes)
-            .ok()?;
-        let stored_ignore_rules_fingerprint = String::from_utf8(ignore_fingerprint_bytes).ok()?;
-        let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&project_root);
-        if stored_ignore_rules_fingerprint != current_ignore_rules_fingerprint {
-            return None;
-        }
-
-        let mut files = Vec::with_capacity(file_count);
-        let mut path_to_id = HashMap::new();
-        let mut unindexed_files = HashSet::new();
-
-        for file_id in 0..file_count {
-            let mut unindexed = [0u8; 1];
-            postings_reader.read_exact(&mut unindexed).ok()?;
-            let path_len = read_u32(&mut postings_reader).ok()? as usize;
-            let size = read_u64(&mut postings_reader).ok()?;
-            let secs = read_u64(&mut postings_reader).ok()?;
-            let nanos = read_u32(&mut postings_reader).ok()?;
-            let mut hash_bytes = [0u8; 32];
-            postings_reader.read_exact(&mut hash_bytes).ok()?;
-            let content_hash = blake3::Hash::from_bytes(hash_bytes);
-            if nanos >= 1_000_000_000 {
-                return None;
-            }
-            if path_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
-                return None;
-            }
-            let mut path_bytes = vec![0u8; path_len];
-            postings_reader.read_exact(&mut path_bytes).ok()?;
-            let relative_path = PathBuf::from(String::from_utf8(path_bytes).ok()?);
-            let full_path = cached_path_under_root(&project_root, &relative_path)?;
-            let file_id_u32 = u32::try_from(file_id).ok()?;
-
-            files.push(FileEntry {
-                path: full_path.clone(),
-                size,
-                modified: UNIX_EPOCH + Duration::new(secs, nanos),
-                content_hash,
-            });
-            path_to_id.insert(full_path, file_id_u32);
-            if unindexed[0] == 1 {
-                unindexed_files.insert(file_id_u32);
-            }
-        }
-
-        let postings_len = read_u64(&mut postings_reader).ok()? as usize;
-        let max_postings_bytes = MAX_ENTRIES.checked_mul(POSTING_BYTES)?;
-        if postings_len > max_postings_bytes {
-            return None;
-        }
-        if postings_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
-            return None;
-        }
-        let mut postings_blob = vec![0u8; postings_len];
-        postings_reader.read_exact(&mut postings_blob).ok()?;
-
-        let mut lookup_magic = [0u8; 8];
-        lookup_reader.read_exact(&mut lookup_magic).ok()?;
-        if &lookup_magic != LOOKUP_MAGIC {
-            return None;
-        }
-        if read_u32(&mut lookup_reader).ok()? != INDEX_VERSION {
-            return None;
-        }
-        let entry_count = read_u32(&mut lookup_reader).ok()? as usize;
-        if entry_count > MAX_ENTRIES {
-            return None;
-        }
-        let remaining_lookup = remaining_bytes(&mut lookup_reader, lookup_body_len)?;
-        let minimum_lookup_bytes = entry_count.checked_mul(LOOKUP_ENTRY_BYTES)?;
-        if minimum_lookup_bytes > remaining_lookup {
-            return None;
-        }
-
-        let mut postings = HashMap::new();
-        let mut file_trigrams: HashMap<u32, Vec<u32>> = HashMap::new();
-
-        for _ in 0..entry_count {
-            let trigram = read_u32(&mut lookup_reader).ok()?;
-            let offset = read_u64(&mut lookup_reader).ok()? as usize;
-            let count = read_u32(&mut lookup_reader).ok()? as usize;
-            if count > MAX_ENTRIES {
-                return None;
-            }
-            let bytes_len = count.checked_mul(POSTING_BYTES)?;
-            let end = offset.checked_add(bytes_len)?;
-            if end > postings_blob.len() {
-                return None;
-            }
-
-            let mut trigram_postings = Vec::with_capacity(count);
-            for chunk in postings_blob[offset..end].chunks_exact(6) {
-                let file_id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let posting = Posting {
-                    file_id,
-                    next_mask: chunk[4],
-                    loc_mask: chunk[5],
-                };
-                trigram_postings.push(posting.clone());
-                file_trigrams.entry(file_id).or_default().push(trigram);
-            }
-            postings.insert(trigram, trigram_postings);
-        }
-
-        Some(SearchIndex {
-            postings,
-            files,
-            path_to_id,
-            ready: false,
-            project_root,
-            git_head,
-            max_file_size,
-            ignore_rules_fingerprint: current_ignore_rules_fingerprint,
-            file_trigrams,
-            unindexed_files,
-        })
-    }
-
-    pub fn stored_git_head(&self) -> Option<&str> {
-        self.git_head.as_deref()
-    }
-
-    pub(crate) fn set_ready(&mut self, ready: bool) {
-        self.ready = ready;
-    }
-
-    pub(crate) fn verify_against_disk(&mut self, current_head: Option<String>) {
-        self.git_head = current_head;
-        verify_file_mtimes(self);
-        self.ready = true;
-    }
-
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn verify_against_disk_for_debug(&mut self, current_head: Option<String>) {
-        self.verify_against_disk(current_head);
-    }
-
-    pub(crate) fn rebuild_or_refresh(
-        root: &Path,
-        max_file_size: u64,
-        current_head: Option<String>,
-        baseline: Option<SearchIndex>,
-    ) -> Self {
-        if let Some(mut baseline) = baseline {
-            baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            baseline.max_file_size = max_file_size;
-            let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
-            if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
-                return SearchIndex::build_with_limit(root, max_file_size);
-            }
-            baseline.ignore_rules_fingerprint = current_ignore_rules_fingerprint;
-
-            if baseline.git_head == current_head || current_head.is_none() {
-                // HEAD matches, but files may have changed on disk since the index was
-                // last written (e.g., uncommitted edits, stash pop, manual file changes
-                // while OpenCode was closed). Verify mtimes and re-index stale files.
-                // Non-git projects also use this per-file (path, mtime, size)
-                // fingerprint so unchanged trees reuse the disk cache instead of
-                // rebuilding every configure.
-                baseline.git_head = current_head;
-                verify_file_mtimes(&mut baseline);
-                baseline.ready = true;
-                return baseline;
-            }
-
-            if let (Some(previous), Some(current)) =
-                (baseline.git_head.clone(), current_head.clone())
-            {
-                let project_root = baseline.project_root.clone();
-                if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
-                    baseline.git_head = Some(current);
-                    verify_file_mtimes(&mut baseline);
-                    baseline.ready = true;
-                    return baseline;
-                }
-            }
-        }
-
-        SearchIndex::build_with_limit(root, max_file_size)
-    }
-
-    fn allocate_file_id_with_metadata(
-        &mut self,
-        path: &Path,
-        metadata: SearchFileMetadata,
-    ) -> Option<u32> {
-        let file_id = u32::try_from(self.files.len()).ok()?;
-        self.files.push(FileEntry {
-            path: path.to_path_buf(),
-            size: metadata.size,
-            modified: metadata.modified,
-            content_hash: cache_freshness::zero_hash(),
-        });
-        self.path_to_id.insert(path.to_path_buf(), file_id);
-        Some(file_id)
-    }
-
-    fn track_unindexed_file_with_metadata(
-        &mut self,
-        path: &Path,
-        metadata: SearchFileMetadata,
-    ) -> bool {
-        let Some(file_id) = self.allocate_file_id_with_metadata(path, metadata) else {
-            return false;
-        };
-        self.unindexed_files.insert(file_id);
-        self.file_trigrams.insert(file_id, Vec::new());
-        true
+    fn posting_count(&self, trigram: u32) -> usize {
+        let base_count = self
+            .base
+            .as_ref()
+            .and_then(|base| base.lookup_entry(trigram))
+            .map_or(0usize, |entry| entry.count as usize);
+        base_count.saturating_add(self.delta_postings.get(&trigram).map_or(0usize, Vec::len))
     }
 
     fn active_file_ids(&self) -> Vec<u32> {
         let mut ids: Vec<u32> = self.path_to_id.values().copied().collect();
+        ids.retain(|file_id| self.is_active_file(*file_id));
         ids.sort_unstable();
         ids
     }
 
     fn is_active_file(&self, file_id: u32) -> bool {
+        if self.superseded.contains(&file_id) {
+            return false;
+        }
         self.files
             .get(file_id as usize)
             .map(|file| !file.path.as_os_str().is_empty())
@@ -1277,31 +1478,63 @@ impl SearchIndex {
     }
 
     fn postings_for_trigram(&self, trigram: u32, filter: Option<PostingFilter>) -> Vec<u32> {
-        let Some(postings) = self.postings.get(&trigram) else {
-            return Vec::new();
-        };
+        let mut matches = Vec::new();
 
-        let mut matches = Vec::with_capacity(postings.len());
-
-        for posting in postings {
-            if let Some(filter) = filter {
-                // next_mask: bloom filter check — the character following this trigram in the
-                // query must also appear after this trigram somewhere in the file.
-                if filter.next_mask != 0 && posting.next_mask & filter.next_mask == 0 {
-                    continue;
+        if let Some(base_entry) = self
+            .base
+            .as_ref()
+            .and_then(|base| base.lookup_entry(trigram))
+        {
+            if let Some(base) = &self.base {
+                if let Ok(postings) = base.read_postings(base_entry) {
+                    matches.reserve(postings.len());
+                    for posting in postings {
+                        if self.superseded.contains(&posting.file_id) {
+                            continue;
+                        }
+                        if !posting_matches_filter(&posting, filter) {
+                            continue;
+                        }
+                        if self.is_active_file(posting.file_id) {
+                            matches.push(posting.file_id);
+                        }
+                    }
                 }
-                // NOTE: loc_mask (position mod 8) is stored for future adjacency checks
-                // between consecutive trigram pairs, but is NOT used as a single-trigram
-                // filter because the position in the query string has no relationship to
-                // the position in the file. Using it here causes false negatives.
-            }
-            if self.is_active_file(posting.file_id) {
-                matches.push(posting.file_id);
             }
         }
 
+        if let Some(postings) = self.delta_postings.get(&trigram) {
+            matches.reserve(postings.len());
+            for posting in postings {
+                if !posting_matches_filter(posting, filter) {
+                    continue;
+                }
+                if self.is_active_file(posting.file_id) {
+                    matches.push(posting.file_id);
+                }
+            }
+        }
+
+        if matches.len() > 1 {
+            matches.sort_unstable();
+            matches.dedup();
+        }
         matches
     }
+}
+
+fn posting_matches_filter(posting: &Posting, filter: Option<PostingFilter>) -> bool {
+    if let Some(filter) = filter {
+        // next_mask is a bloom filter: the character following this trigram in
+        // the query must also appear after this trigram somewhere in the file.
+        if filter.next_mask != 0 && posting.next_mask & filter.next_mask == 0 {
+            return false;
+        }
+        // loc_mask is persisted for future adjacency checks. It is intentionally
+        // not used as a single-trigram filter because query positions do not
+        // correspond to file positions.
+    }
+    true
 }
 
 fn search_candidate_file(
@@ -1533,13 +1766,889 @@ fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
     })
 }
 
-/// Bound cold search-index ingestion to half the cores (cap 8), matching callgraph store.
+/// Returns the worker pool size for cold search-index builds: half of available
+/// cores, capped at 8 to keep the same limit used by the callgraph store.
 fn search_index_build_pool_size() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1)
         .div_ceil(2)
         .clamp(1, 8)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpillRecord {
+    trigram: u32,
+    file_id: u32,
+    next_mask: u8,
+    loc_mask: u8,
+}
+
+struct CacheWritePlan {
+    project_root: PathBuf,
+    git_head: Option<String>,
+    ignore_fingerprint: String,
+    max_file_size: u64,
+    files: Vec<FileEntry>,
+    path_to_id: HashMap<PathBuf, u32>,
+    unindexed_files: HashSet<u32>,
+    file_trigram_count: Vec<u32>,
+    id_map: Arc<HashMap<u32, u32>>,
+}
+
+impl CacheWritePlan {
+    fn from_index(index: &SearchIndex, git_head: Option<&str>) -> Option<Self> {
+        let active_ids = index.active_file_ids();
+        let mut id_map = HashMap::with_capacity(active_ids.len());
+        for (new_id, old_id) in active_ids.iter().enumerate() {
+            let new_id = u32::try_from(new_id).ok()?;
+            id_map.insert(*old_id, new_id);
+        }
+
+        let mut files = Vec::with_capacity(active_ids.len());
+        let mut path_to_id = HashMap::with_capacity(active_ids.len());
+        let mut unindexed_files = HashSet::new();
+        let mut file_trigram_count = Vec::with_capacity(active_ids.len());
+        for old_id in active_ids {
+            let new_id = *id_map.get(&old_id)?;
+            let file = index.files.get(old_id as usize)?.clone();
+            if file.path.as_os_str().is_empty() {
+                continue;
+            }
+            path_to_id.insert(file.path.clone(), new_id);
+            if index.unindexed_files.contains(&old_id) {
+                unindexed_files.insert(new_id);
+            }
+            file_trigram_count.push(
+                index
+                    .file_trigram_count
+                    .get(old_id as usize)
+                    .copied()
+                    .unwrap_or(0),
+            );
+            files.push(file);
+        }
+
+        Some(Self {
+            project_root: index.project_root.clone(),
+            git_head: git_head.map(ToOwned::to_owned),
+            ignore_fingerprint: if index.ignore_rules_fingerprint.is_empty() {
+                ignore_rules_fingerprint(&index.project_root)
+            } else {
+                index.ignore_rules_fingerprint.clone()
+            },
+            max_file_size: index.max_file_size,
+            files,
+            path_to_id,
+            unindexed_files,
+            file_trigram_count,
+            id_map: Arc::new(id_map),
+        })
+    }
+}
+
+trait PostingRecordSource {
+    fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>>;
+}
+
+struct VecRecordSource {
+    records: Vec<SpillRecord>,
+    index: usize,
+}
+
+impl VecRecordSource {
+    fn new(records: Vec<SpillRecord>) -> Self {
+        Self { records, index: 0 }
+    }
+}
+
+impl PostingRecordSource for VecRecordSource {
+    fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
+        let record = self.records.get(self.index).copied();
+        if record.is_some() {
+            self.index += 1;
+        }
+        Ok(record)
+    }
+}
+
+struct SpillSegmentSource {
+    reader: BufReader<File>,
+    remaining_records: u64,
+    current_trigram: u32,
+    remaining_in_group: u32,
+}
+
+impl SpillSegmentSource {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != SPILL_MAGIC {
+            return Err(std::io::Error::other("invalid search spill magic"));
+        }
+        if read_u32(&mut reader)? != INDEX_VERSION {
+            return Err(std::io::Error::other("invalid search spill version"));
+        }
+        let remaining_records = read_u64(&mut reader)?;
+        Ok(Self {
+            reader,
+            remaining_records,
+            current_trigram: 0,
+            remaining_in_group: 0,
+        })
+    }
+}
+
+impl PostingRecordSource for SpillSegmentSource {
+    fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
+        if self.remaining_records == 0 {
+            return Ok(None);
+        }
+        if self.remaining_in_group == 0 {
+            self.current_trigram = read_u32(&mut self.reader)?;
+            self.remaining_in_group = read_u32(&mut self.reader)?;
+            if self.remaining_in_group == 0 {
+                return Err(std::io::Error::other("empty search spill group"));
+            }
+        }
+        let mut file_id = [0u8; 4];
+        self.reader.read_exact(&mut file_id)?;
+        let mut masks = [0u8; 2];
+        self.reader.read_exact(&mut masks)?;
+        self.remaining_in_group -= 1;
+        self.remaining_records -= 1;
+        Ok(Some(SpillRecord {
+            trigram: self.current_trigram,
+            file_id: u32::from_le_bytes(file_id),
+            next_mask: masks[0],
+            loc_mask: masks[1],
+        }))
+    }
+}
+
+struct BaseRecordSource {
+    base: Arc<BasePostings>,
+    id_map: Arc<HashMap<u32, u32>>,
+    superseded: Arc<HashSet<u32>>,
+    lookup_index: usize,
+    current: Vec<SpillRecord>,
+    current_index: usize,
+}
+
+impl BaseRecordSource {
+    fn new(
+        base: Arc<BasePostings>,
+        id_map: Arc<HashMap<u32, u32>>,
+        superseded: Arc<HashSet<u32>>,
+    ) -> Self {
+        Self {
+            base,
+            id_map,
+            superseded,
+            lookup_index: 0,
+            current: Vec::new(),
+            current_index: 0,
+        }
+    }
+
+    fn load_next_group(&mut self) -> std::io::Result<bool> {
+        while let Some(entry) = self.base.lookup.get(self.lookup_index).copied() {
+            self.lookup_index += 1;
+            let postings = self.base.read_postings(entry)?;
+            self.current.clear();
+            self.current_index = 0;
+            for posting in postings {
+                if self.superseded.contains(&posting.file_id) {
+                    continue;
+                }
+                let Some(mapped_file_id) = self.id_map.get(&posting.file_id).copied() else {
+                    continue;
+                };
+                self.current.push(SpillRecord {
+                    trigram: entry.trigram,
+                    file_id: mapped_file_id,
+                    next_mask: posting.next_mask,
+                    loc_mask: posting.loc_mask,
+                });
+            }
+            if !self.current.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl PostingRecordSource for BaseRecordSource {
+    fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
+        if self.current_index >= self.current.len() && !self.load_next_group()? {
+            return Ok(None);
+        }
+        let record = self.current[self.current_index];
+        self.current_index += 1;
+        Ok(Some(record))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeapItem {
+    record: SpillRecord,
+    source_index: usize,
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .record
+            .trigram
+            .cmp(&self.record.trigram)
+            .then_with(|| other.record.file_id.cmp(&self.record.file_id))
+            .then_with(|| other.source_index.cmp(&self.source_index))
+    }
+}
+
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn build_streaming_index(
+    root: &Path,
+    max_file_size: u64,
+    cache_dir: &Path,
+) -> std::io::Result<(SearchIndex, usize)> {
+    fs::create_dir_all(cache_dir)?;
+    sweep_stale_search_build_dirs(cache_dir);
+    let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let ignore_fingerprint = ignore_rules_fingerprint(&project_root);
+    let filters = PathFilters::default();
+    let paths: Vec<PathBuf> = walk_project_files(&project_root, &filters);
+    let pool_size = search_index_build_pool_size();
+    let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(pool_size)
+        .thread_name(|index| format!("aft-search-build-{index}"))
+        .stack_size(8 * 1024 * 1024)
+        .build()
+        .ok();
+
+    let spill_dir = create_spill_dir(cache_dir)?;
+    let mut spill_paths = Vec::new();
+    let mut spill_seq = 0usize;
+    let mut block: Vec<SpillRecord> = Vec::new();
+    let mut files = Vec::new();
+    let mut path_to_id = HashMap::new();
+    let mut unindexed_files = HashSet::new();
+    let mut file_trigram_count = Vec::new();
+    let mut indexed = 0usize;
+
+    let build_result = (|| -> std::io::Result<BasePostings> {
+        for chunk in paths.chunks(chunk_size) {
+            let prepare_chunk = || -> Vec<PreparedSearchPath> {
+                chunk
+                    .par_iter()
+                    .map(|path| prepare_search_path(path, max_file_size))
+                    .collect()
+            };
+            let prepared = match &pool {
+                Some(pool) => pool.install(prepare_chunk),
+                None => prepare_chunk(),
+            };
+
+            for (path, prepared) in chunk.iter().zip(prepared) {
+                match prepared {
+                    PreparedSearchPath::Indexed(file) => {
+                        let file_id = u32::try_from(files.len())
+                            .map_err(|_| std::io::Error::other("too many files to index"))?;
+                        files.push(FileEntry {
+                            path: path.clone(),
+                            size: file.metadata.size,
+                            modified: file.metadata.modified,
+                            content_hash: file.content_hash,
+                        });
+                        path_to_id.insert(path.clone(), file_id);
+                        file_trigram_count.push(file.trigram_map.len() as u32);
+                        for (trigram, filter) in file.trigram_map {
+                            block.push(SpillRecord {
+                                trigram,
+                                file_id,
+                                next_mask: filter.next_mask,
+                                loc_mask: filter.loc_mask,
+                            });
+                        }
+                        indexed += 1;
+                    }
+                    PreparedSearchPath::Unindexed(metadata) => {
+                        let file_id = u32::try_from(files.len())
+                            .map_err(|_| std::io::Error::other("too many files to index"))?;
+                        files.push(FileEntry {
+                            path: path.clone(),
+                            size: metadata.size,
+                            modified: metadata.modified,
+                            content_hash: cache_freshness::zero_hash(),
+                        });
+                        path_to_id.insert(path.clone(), file_id);
+                        unindexed_files.insert(file_id);
+                        file_trigram_count.push(0);
+                        indexed += 1;
+                    }
+                    PreparedSearchPath::Skipped => {}
+                }
+
+                let block_bytes = block.len().saturating_mul(SPILL_RECORD_ESTIMATED_BYTES);
+                if block_bytes >= SPIMI_SOFT_LIMIT_BYTES || block_bytes >= SPIMI_HARD_LIMIT_BYTES {
+                    let path = flush_spill_segment(&spill_dir, spill_seq, &mut block)?;
+                    spill_paths.push(path);
+                    spill_seq += 1;
+                }
+            }
+        }
+
+        block.sort_unstable_by_key(|record| (record.trigram, record.file_id));
+        let mut sources: Vec<Box<dyn PostingRecordSource>> = Vec::new();
+        for path in &spill_paths {
+            sources.push(Box::new(SpillSegmentSource::open(path)?));
+        }
+        if !block.is_empty() {
+            sources.push(Box::new(VecRecordSource::new(std::mem::take(&mut block))));
+        }
+
+        let plan = CacheWritePlan {
+            project_root: project_root.clone(),
+            git_head: current_git_head(&project_root),
+            ignore_fingerprint: ignore_fingerprint.clone(),
+            max_file_size,
+            files: files.clone(),
+            path_to_id: path_to_id.clone(),
+            unindexed_files: unindexed_files.clone(),
+            file_trigram_count: file_trigram_count.clone(),
+            id_map: Arc::new(
+                (0..files.len())
+                    .filter_map(|id| {
+                        let id = u32::try_from(id).ok()?;
+                        Some((id, id))
+                    })
+                    .collect(),
+            ),
+        };
+        write_cache_file_from_sources(cache_dir, &plan, &mut sources)
+    })();
+
+    let _ = fs::remove_dir_all(&spill_dir);
+    let base = build_result?;
+    let base_file_count =
+        u32::try_from(files.len()).map_err(|_| std::io::Error::other("too many files to index"))?;
+    let git_head = current_git_head(&project_root);
+    let index = SearchIndex {
+        base: Some(Arc::new(base)),
+        delta_postings: HashMap::new(),
+        delta_file_trigrams: HashMap::new(),
+        files: Arc::new(files),
+        path_to_id: Arc::new(path_to_id),
+        ready: false,
+        project_root,
+        git_head,
+        max_file_size,
+        ignore_rules_fingerprint: ignore_fingerprint,
+        file_trigram_count: Arc::new(file_trigram_count),
+        unindexed_files: Arc::new(unindexed_files),
+        superseded: HashSet::new(),
+        base_file_count,
+        delta_packed_bytes: 0,
+        compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+    };
+    Ok((index, indexed))
+}
+
+fn write_cache_file_from_sources(
+    cache_dir: &Path,
+    plan: &CacheWritePlan,
+    sources: &mut [Box<dyn PostingRecordSource>],
+) -> std::io::Result<BasePostings> {
+    fs::create_dir_all(cache_dir)?;
+    sweep_stale_search_build_dirs(cache_dir);
+    let cache_path = cache_dir.join("cache.bin");
+    let tmp_cache = cache_dir.join(format!(
+        "cache.bin.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+
+    let write_result = (|| -> std::io::Result<BasePostings> {
+        let raw = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_cache)?;
+        let mut writer = BufWriter::new(raw);
+        write_u32(&mut writer, CACHE_MAGIC)?;
+        write_u32(&mut writer, INDEX_VERSION)?;
+        let postings_len_patch = writer.stream_position()?;
+        write_u64(&mut writer, 0)?;
+
+        let postings_section_start = writer.stream_position()?;
+        let postings_header = build_postings_header_bytes(plan)?;
+        writer.write_all(&postings_header)?;
+        let postings_blob_len_patch = writer.stream_position()?;
+        write_u64(&mut writer, 0)?;
+        let postings_blob_start = writer.stream_position()?;
+
+        let (lookup_entries, postings_blob_len) = merge_sources_to_writer(sources, &mut writer)?;
+        let extension = build_file_trigram_count_extension(&plan.file_trigram_count)?;
+        writer.write_all(&extension)?;
+        let postings_crc_end = writer.stream_position()?;
+
+        writer.flush()?;
+        writer.seek(SeekFrom::Start(postings_blob_len_patch))?;
+        write_u64(&mut writer, postings_blob_len)?;
+        writer.flush()?;
+
+        let checksum = crc32_file_range(
+            &tmp_cache,
+            postings_section_start,
+            postings_crc_end.saturating_sub(postings_section_start),
+        )?;
+        writer.seek(SeekFrom::Start(postings_crc_end))?;
+        writer.write_all(&checksum.to_le_bytes())?;
+        let postings_section_end = writer.stream_position()?;
+        let postings_len_total = postings_section_end.saturating_sub(postings_section_start);
+        writer.seek(SeekFrom::Start(postings_len_patch))?;
+        write_u64(&mut writer, postings_len_total)?;
+        writer.seek(SeekFrom::Start(postings_section_end))?;
+
+        let lookup_blob = build_lookup_section_bytes(&lookup_entries)?;
+        writer.write_all(&lookup_blob)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+
+        fs::rename(&tmp_cache, &cache_path)?;
+        sync_parent_dir(&cache_path);
+        let file = open_cache_file_read(&cache_path)?;
+        Ok(BasePostings {
+            file: Arc::new(file),
+            postings_blob_start,
+            postings_blob_len,
+            lookup: Arc::new(lookup_entries),
+        })
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_cache);
+    }
+    write_result
+}
+
+fn merge_sources_to_writer(
+    sources: &mut [Box<dyn PostingRecordSource>],
+    writer: &mut BufWriter<File>,
+) -> std::io::Result<(Vec<LookupEntry>, u64)> {
+    let mut heap = BinaryHeap::new();
+    for (source_index, source) in sources.iter_mut().enumerate() {
+        if let Some(record) = source.next_record()? {
+            heap.push(HeapItem {
+                record,
+                source_index,
+            });
+        }
+    }
+
+    let mut lookup_entries = Vec::new();
+    let mut postings_blob_len = 0u64;
+    let mut current_trigram: Option<u32> = None;
+    let mut current_offset = 0u64;
+    let mut current_count = 0u32;
+
+    while let Some(item) = heap.pop() {
+        let record = item.record;
+        if current_trigram != Some(record.trigram) {
+            if let Some(trigram) = current_trigram {
+                lookup_entries.push(LookupEntry {
+                    trigram,
+                    offset: current_offset,
+                    count: current_count,
+                });
+            }
+            current_trigram = Some(record.trigram);
+            current_offset = postings_blob_len;
+            current_count = 0;
+        }
+
+        writer.write_all(&record.file_id.to_le_bytes())?;
+        writer.write_all(&[record.next_mask, record.loc_mask])?;
+        postings_blob_len = postings_blob_len
+            .checked_add(POSTING_BYTES as u64)
+            .ok_or_else(|| std::io::Error::other("postings blob too large"))?;
+        current_count = current_count
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("posting list too large"))?;
+
+        if let Some(next) = sources[item.source_index].next_record()? {
+            heap.push(HeapItem {
+                record: next,
+                source_index: item.source_index,
+            });
+        }
+    }
+
+    if let Some(trigram) = current_trigram {
+        lookup_entries.push(LookupEntry {
+            trigram,
+            offset: current_offset,
+            count: current_count,
+        });
+    }
+
+    Ok((lookup_entries, postings_blob_len))
+}
+
+fn build_postings_header_bytes(plan: &CacheWritePlan) -> std::io::Result<Vec<u8>> {
+    let mut writer = BufWriter::new(Cursor::new(Vec::new()));
+    writer.write_all(INDEX_MAGIC)?;
+    write_u32(&mut writer, INDEX_VERSION)?;
+
+    let head = plan.git_head.as_deref().unwrap_or_default();
+    let root = plan.project_root.to_string_lossy();
+    let head_len = u32::try_from(head.len())
+        .map_err(|_| std::io::Error::other("git head too large to cache"))?;
+    let root_len = u32::try_from(root.len())
+        .map_err(|_| std::io::Error::other("project root too large to cache"))?;
+    let ignore_fingerprint_len = u32::try_from(plan.ignore_fingerprint.len())
+        .map_err(|_| std::io::Error::other("ignore fingerprint too large to cache"))?;
+    let file_count = u32::try_from(plan.files.len())
+        .map_err(|_| std::io::Error::other("too many files to cache"))?;
+
+    write_u32(&mut writer, head_len)?;
+    write_u32(&mut writer, root_len)?;
+    write_u32(&mut writer, ignore_fingerprint_len)?;
+    write_u64(&mut writer, plan.max_file_size)?;
+    write_u32(&mut writer, file_count)?;
+    writer.write_all(head.as_bytes())?;
+    writer.write_all(root.as_bytes())?;
+    writer.write_all(plan.ignore_fingerprint.as_bytes())?;
+
+    for (file_id, file) in plan.files.iter().enumerate() {
+        let file_id =
+            u32::try_from(file_id).map_err(|_| std::io::Error::other("too many files to cache"))?;
+        let path = cache_relative_path(&plan.project_root, &file.path)
+            .or_else(|| {
+                fs::canonicalize(&file.path)
+                    .ok()
+                    .and_then(|canonical| cache_relative_path(&plan.project_root, &canonical))
+            })
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "refusing to cache path outside project root: {}",
+                    file.path.display()
+                ))
+            })?;
+        let path = path.to_string_lossy();
+        let path_len = u32::try_from(path.len())
+            .map_err(|_| std::io::Error::other("cached path too large"))?;
+        let modified = file
+            .modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        let unindexed = if plan.unindexed_files.contains(&file_id) {
+            1u8
+        } else {
+            0u8
+        };
+
+        writer.write_all(&[unindexed])?;
+        write_u32(&mut writer, path_len)?;
+        write_u64(&mut writer, file.size)?;
+        write_u64(&mut writer, modified.as_secs())?;
+        write_u32(&mut writer, modified.subsec_nanos())?;
+        writer.write_all(file.content_hash.as_bytes())?;
+        writer.write_all(path.as_bytes())?;
+    }
+
+    writer.flush()?;
+    Ok(writer
+        .into_inner()
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .into_inner())
+}
+
+fn build_lookup_section_bytes(lookup_entries: &[LookupEntry]) -> std::io::Result<Vec<u8>> {
+    let mut writer = BufWriter::new(Cursor::new(Vec::new()));
+    let entry_count = u32::try_from(lookup_entries.len())
+        .map_err(|_| std::io::Error::other("too many lookup entries to cache"))?;
+    writer.write_all(LOOKUP_MAGIC)?;
+    write_u32(&mut writer, INDEX_VERSION)?;
+    write_u32(&mut writer, entry_count)?;
+    for entry in lookup_entries {
+        write_u32(&mut writer, entry.trigram)?;
+        write_u64(&mut writer, entry.offset)?;
+        write_u32(&mut writer, entry.count)?;
+    }
+    writer.flush()?;
+    let mut lookup_blob = writer
+        .into_inner()
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .into_inner();
+    let checksum = crc32fast::hash(&lookup_blob);
+    lookup_blob.extend_from_slice(&checksum.to_le_bytes());
+    Ok(lookup_blob)
+}
+
+fn build_file_trigram_count_extension(counts: &[u32]) -> std::io::Result<Vec<u8>> {
+    let mut writer = BufWriter::new(Cursor::new(Vec::new()));
+    writer.write_all(FILE_TRIGRAM_COUNT_MAGIC)?;
+    write_u32(&mut writer, INDEX_VERSION)?;
+    write_u32(
+        &mut writer,
+        u32::try_from(counts.len())
+            .map_err(|_| std::io::Error::other("too many file trigram counts"))?,
+    )?;
+    for count in counts {
+        write_u32(&mut writer, *count)?;
+    }
+    writer.flush()?;
+    Ok(writer
+        .into_inner()
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .into_inner())
+}
+
+fn flush_spill_segment(
+    spill_dir: &Path,
+    seq: usize,
+    block: &mut Vec<SpillRecord>,
+) -> std::io::Result<PathBuf> {
+    if block.is_empty() {
+        return Err(std::io::Error::other(
+            "refusing to write empty search spill",
+        ));
+    }
+    block.sort_unstable_by_key(|record| (record.trigram, record.file_id));
+    let path = spill_dir.join(format!("segment.{seq:06}.bin"));
+    let mut writer = BufWriter::new(File::create(&path)?);
+    writer.write_all(SPILL_MAGIC)?;
+    write_u32(&mut writer, INDEX_VERSION)?;
+    write_u64(
+        &mut writer,
+        u64::try_from(block.len()).map_err(|_| std::io::Error::other("search spill too large"))?,
+    )?;
+
+    let mut index = 0usize;
+    while index < block.len() {
+        let trigram = block[index].trigram;
+        let group_start = index;
+        while index < block.len() && block[index].trigram == trigram {
+            index += 1;
+        }
+        write_u32(&mut writer, trigram)?;
+        write_u32(
+            &mut writer,
+            u32::try_from(index - group_start)
+                .map_err(|_| std::io::Error::other("search spill group too large"))?,
+        )?;
+        for record in &block[group_start..index] {
+            writer.write_all(&record.file_id.to_le_bytes())?;
+            writer.write_all(&[record.next_mask, record.loc_mask])?;
+        }
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    block.clear();
+    Ok(path)
+}
+
+fn create_spill_dir(cache_dir: &Path) -> std::io::Result<PathBuf> {
+    let dir = cache_dir.join(format!(
+        "search-build.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn sweep_stale_search_build_dirs(cache_dir: &Path) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        if file_name.to_string_lossy().starts_with("search-build.tmp.") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn transient_search_cache_dir(root: &Path) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "aft-search-cache.{}.{}.{}",
+        artifact_cache_key(root),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ))
+}
+
+fn read_file_trigram_count_extension(
+    base: &BasePostings,
+    extension_start: u64,
+    postings_body_end: u64,
+    file_count: usize,
+) -> std::io::Result<Option<Vec<u32>>> {
+    if extension_start >= postings_body_end {
+        return Ok(None);
+    }
+    let extension_len = postings_body_end - extension_start;
+    if extension_len < 16 {
+        return Ok(None);
+    }
+    let mut header = [0u8; 16];
+    pread_exact(&base.file, extension_start, &mut header)?;
+    if &header[..8] != FILE_TRIGRAM_COUNT_MAGIC {
+        return Ok(None);
+    }
+    let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    if version != INDEX_VERSION {
+        return Err(std::io::Error::other("invalid file trigram count version"));
+    }
+    let count = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+    if count != file_count {
+        return Err(std::io::Error::other("file trigram count length mismatch"));
+    }
+    let counts_len = count
+        .checked_mul(4)
+        .ok_or_else(|| std::io::Error::other("file trigram count extension too large"))?;
+    if 16u64 + counts_len as u64 > extension_len {
+        return Err(std::io::Error::other(
+            "truncated file trigram count extension",
+        ));
+    }
+    let mut bytes = vec![0u8; counts_len];
+    pread_exact(&base.file, extension_start + 16, &mut bytes)?;
+    let mut counts = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(4) {
+        counts.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(Some(counts))
+}
+
+fn compute_file_trigram_counts_from_base(
+    base: &BasePostings,
+    file_count: usize,
+) -> std::io::Result<Vec<u32>> {
+    let mut counts = vec![0u32; file_count];
+    for entry in base.lookup.iter().copied() {
+        for posting in base.read_postings(entry)? {
+            let Some(count) = counts.get_mut(posting.file_id as usize) else {
+                return Err(std::io::Error::other("posting references missing file"));
+            };
+            *count = count.saturating_add(1);
+        }
+    }
+    Ok(counts)
+}
+
+fn ensure_count_slot(counts: &mut Vec<u32>, file_id: u32) {
+    let len = file_id as usize + 1;
+    if counts.len() < len {
+        counts.resize(len, 0);
+    }
+}
+
+fn reader_has_remaining<R: Seek>(
+    reader: &mut R,
+    absolute_end: u64,
+    len: usize,
+) -> std::io::Result<bool> {
+    let position = reader.stream_position()?;
+    Ok(position <= absolute_end && (len as u64) <= absolute_end - position)
+}
+
+fn crc32_file_range(path: &Path, start: u64, len: u64) -> std::io::Result<u32> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut remaining = len;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    while remaining > 0 {
+        let read_len = buffer.len().min(remaining as usize);
+        let bytes_read = file.read(&mut buffer[..read_len])?;
+        if bytes_read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated cache while checksumming",
+            ));
+        }
+        hasher.update(&buffer[..bytes_read]);
+        remaining -= bytes_read as u64;
+    }
+    Ok(hasher.finalize())
+}
+
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+fn open_cache_file_read(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn pread_exact(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !buffer.is_empty() {
+        let bytes_read = file.read_at(buffer, offset)?;
+        if bytes_read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short pread from search cache",
+            ));
+        }
+        offset += bytes_read as u64;
+        let (_, rest) = buffer.split_at_mut(bytes_read);
+        buffer = rest;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pread_exact(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        let bytes_read = file.seek_read(buffer, offset)?;
+        if bytes_read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short pread from search cache",
+            ));
+        }
+        offset += bytes_read as u64;
+        let (_, rest) = buffer.split_at_mut(bytes_read);
+        buffer = rest;
+    }
+    Ok(())
 }
 
 fn intersect_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
@@ -1658,19 +2767,23 @@ pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
 }
 
 pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) -> f32 {
+    lexical_score_snapshot(&index.snapshot(), query_trigrams, file_id)
+}
+
+fn lexical_score_snapshot(
+    index: &SearchIndexSnapshot,
+    query_trigrams: &[u32],
+    file_id: u32,
+) -> f32 {
     if query_trigrams.is_empty() {
         return 0.0;
     }
 
     let mut hits = 0u32;
     for &trigram in query_trigrams {
-        if let Some(postings) = index.postings.get(&trigram) {
-            if postings
-                .binary_search_by(|posting| posting.file_id.cmp(&file_id))
-                .is_ok()
-            {
-                hits += 1;
-            }
+        let postings = index.postings_for_trigram(trigram, None);
+        if postings.binary_search(&file_id).is_ok() {
+            hits += 1;
         }
     }
 
@@ -1679,9 +2792,11 @@ pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) 
     }
 
     let file_trigram_count = index
-        .file_trigrams
-        .get(&file_id)
-        .map_or(1, |trigrams| trigrams.len().max(1)) as f32;
+        .file_trigram_count
+        .get(file_id as usize)
+        .copied()
+        .unwrap_or(1)
+        .max(1) as f32;
     (hits as f32) / (1.0 + file_trigram_count.ln())
 }
 
@@ -2293,7 +3408,7 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
     let mut stale_paths = Vec::new();
     let mut removed_paths = Vec::new();
 
-    for entry in &mut index.files {
+    for entry in Arc::make_mut(&mut index.files).iter_mut() {
         if entry.path.as_os_str().is_empty() {
             continue; // tombstoned entry
         }
@@ -2754,10 +3869,16 @@ mod tests {
         index.index_file(&path, content);
 
         let file_id = *index.path_to_id.get(&path).expect("file indexed");
-        let file_trigrams = index.file_trigrams.get(&file_id).expect("file trigrams");
+        let file_trigrams = index
+            .delta_file_trigrams
+            .get(&file_id)
+            .expect("delta file trigrams");
         assert_eq!(file_trigrams, &expected.keys().copied().collect::<Vec<_>>());
         for (trigram, filter) in expected {
-            let postings = index.postings.get(&trigram).expect("posting list");
+            let postings = index
+                .delta_postings
+                .get(&trigram)
+                .expect("delta posting list");
             assert_eq!(postings.len(), 1);
             assert_eq!(postings[0].file_id, file_id);
             assert_eq!(postings[0].next_mask, filter.next_mask);
@@ -2831,6 +3952,175 @@ mod tests {
     }
 
     #[test]
+    fn base_delta_readd_masks_base_and_keeps_postings_sorted() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let a = project.join("a.txt");
+        let b = project.join("b.txt");
+        fs::write(&a, "abc old").expect("write a");
+        fs::write(&b, "abc base").expect("write b");
+
+        let mut built = SearchIndex::build(&project);
+        let cache_dir = dir.path().join("cache");
+        built.write_to_disk(&cache_dir, None);
+        let mut index = SearchIndex::read_from_disk(&cache_dir, &project).expect("load base");
+        assert_eq!(index.base_file_count, 2);
+
+        let old_a_id = *index.path_to_id.get(&a).expect("original a id");
+        let b_id = *index.path_to_id.get(&b).expect("original b id");
+        index.remove_file(&a);
+        index.index_file(&a, b"abc new");
+        let new_id = *index.path_to_id.get(&a).expect("re-added file id");
+        assert!(new_id >= index.base_file_count);
+        let abc = pack_trigram(b'a', b'b', b'c');
+        let ids = index.postings_for_trigram(abc, None);
+        assert_eq!(ids, {
+            let mut expected = vec![b_id, new_id];
+            expected.sort_unstable();
+            expected
+        });
+        assert!(!ids.contains(&old_a_id));
+    }
+
+    #[test]
+    fn write_to_disk_compacts_base_and_delta() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("src.txt");
+        fs::write(&file, "abcdef").expect("write source");
+        let mut index = SearchIndex::build(&project);
+        let cache_dir = dir.path().join("cache");
+        index.write_to_disk(&cache_dir, None);
+        fs::write(&file, "abcxyz").expect("edit source");
+        index.update_file(&file);
+        assert!(!index.delta_postings.is_empty());
+        index.write_to_disk(&cache_dir, None);
+        assert!(index.delta_postings.is_empty());
+        assert!(index.superseded.is_empty());
+        assert_eq!(
+            index.postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None),
+            vec![0]
+        );
+        assert!(index
+            .postings_for_trigram(pack_trigram(b'd', b'e', b'f'), None)
+            .is_empty());
+    }
+
+    #[test]
+    fn legacy_cache_without_file_trigram_count_migrates_streaming_counts() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::write(project.join("src.txt"), "abcdef").expect("write source");
+        let cache_dir = dir.path().join("cache");
+        let mut index = SearchIndex::build(&project);
+        index.write_to_disk(&cache_dir, None);
+        let cache_path = cache_dir.join("cache.bin");
+        strip_file_trigram_count_extension(&cache_path);
+        assert!(!cache_has_file_trigram_count_extension(&cache_path));
+
+        let loaded = SearchIndex::read_from_disk(&cache_dir, &project).expect("load legacy cache");
+        assert_eq!(loaded.file_trigram_count.as_ref(), &[4]);
+        assert!(loaded.delta_postings.is_empty());
+        assert!(cache_has_file_trigram_count_extension(&cache_path));
+    }
+
+    #[test]
+    fn compaction_flags_buffer_paths_while_running() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("src.txt");
+        fs::write(&file, "abcdef").expect("write source");
+        let mut index = SearchIndex::new();
+        index.project_root = project.clone();
+        {
+            let mut state = index.compaction_state.lock().expect("compaction state");
+            state.running = true;
+        }
+        index.update_file(&file);
+        let state = index.compaction_state.lock().expect("compaction state");
+        assert!(state.requested_again || !index.delta_postings.is_empty());
+        assert!(state.buffered_paths.contains(&file));
+    }
+
+    fn cache_has_file_trigram_count_extension(cache_path: &Path) -> bool {
+        file_trigram_count_extension_range(cache_path).is_some()
+    }
+
+    fn strip_file_trigram_count_extension(cache_path: &Path) {
+        let mut bytes = fs::read(cache_path).expect("read cache");
+        let (start, end) = file_trigram_count_extension_range_from_bytes(&bytes)
+            .expect("file trigram count extension");
+        bytes.drain(start..end);
+        let postings_len_total = u64::from_le_bytes(bytes[8..16].try_into().unwrap())
+            - u64::try_from(end - start).unwrap();
+        bytes[8..16].copy_from_slice(&postings_len_total.to_le_bytes());
+        let checksum_pos = 16 + usize::try_from(postings_len_total).unwrap() - 4;
+        let checksum = crc32fast::hash(&bytes[16..checksum_pos]);
+        bytes[checksum_pos..checksum_pos + 4].copy_from_slice(&checksum.to_le_bytes());
+        fs::write(cache_path, bytes).expect("write legacy cache");
+    }
+
+    fn file_trigram_count_extension_range(cache_path: &Path) -> Option<(usize, usize)> {
+        let bytes = fs::read(cache_path).ok()?;
+        file_trigram_count_extension_range_from_bytes(&bytes)
+    }
+
+    fn file_trigram_count_extension_range_from_bytes(bytes: &[u8]) -> Option<(usize, usize)> {
+        let postings_len_total = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?) as usize;
+        let postings_start = 16usize;
+        let postings_end = postings_start.checked_add(postings_len_total)?;
+        let postings_body_end = postings_end.checked_sub(4)?;
+        let mut reader = Cursor::new(&bytes[postings_start..postings_body_end]);
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic).ok()?;
+        if &magic != INDEX_MAGIC {
+            return None;
+        }
+        read_u32(&mut reader).ok()?;
+        let head_len = read_u32(&mut reader).ok()? as u64;
+        let root_len = read_u32(&mut reader).ok()? as u64;
+        let ignore_len = read_u32(&mut reader).ok()? as u64;
+        read_u64(&mut reader).ok()?;
+        let file_count = read_u32(&mut reader).ok()? as usize;
+        let skip = head_len.checked_add(root_len)?.checked_add(ignore_len)?;
+        reader.seek(SeekFrom::Current(skip as i64)).ok()?;
+        for _ in 0..file_count {
+            let mut unindexed = [0u8; 1];
+            reader.read_exact(&mut unindexed).ok()?;
+            let path_len = read_u32(&mut reader).ok()? as u64;
+            read_u64(&mut reader).ok()?;
+            read_u64(&mut reader).ok()?;
+            read_u32(&mut reader).ok()?;
+            let mut hash = [0u8; 32];
+            reader.read_exact(&mut hash).ok()?;
+            reader.seek(SeekFrom::Current(path_len as i64)).ok()?;
+        }
+        let postings_blob_len = read_u64(&mut reader).ok()? as usize;
+        let extension_start = postings_start
+            .checked_add(reader.position() as usize)?
+            .checked_add(postings_blob_len)?;
+        if extension_start + 16 > postings_body_end {
+            return None;
+        }
+        if bytes.get(extension_start..extension_start + 8)? != FILE_TRIGRAM_COUNT_MAGIC {
+            return None;
+        }
+        let count = u32::from_le_bytes(
+            bytes[extension_start + 12..extension_start + 16]
+                .try_into()
+                .ok()?,
+        ) as usize;
+        let extension_end = extension_start
+            .checked_add(16)?
+            .checked_add(count.checked_mul(4)?)?;
+        (extension_end <= postings_body_end).then_some((extension_start, extension_end))
+    }
+
+    #[test]
     fn disk_round_trip_preserves_postings_and_files() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
@@ -2841,7 +4131,8 @@ mod tests {
         let mut index = SearchIndex::build(&project);
         index.git_head = Some("deadbeef".to_string());
         let cache_dir = dir.path().join("cache");
-        index.write_to_disk(&cache_dir, index.git_head.as_deref());
+        let head = index.git_head.clone();
+        index.write_to_disk(&cache_dir, head.as_deref());
 
         let loaded =
             SearchIndex::read_from_disk(&cache_dir, &project).expect("load index from disk");
@@ -2851,10 +4142,15 @@ mod tests {
             relative_to_root(&loaded.project_root, &loaded.files[0].path),
             PathBuf::from("src.txt")
         );
-        assert_eq!(loaded.postings.len(), index.postings.len());
-        assert!(loaded
-            .postings
-            .contains_key(&pack_trigram(b'a', b'b', b'c')));
+        assert_eq!(loaded.trigram_count(), index.trigram_count());
+        assert_eq!(
+            loaded.postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None),
+            vec![0]
+        );
+        assert_eq!(
+            loaded.file_trigram_count.as_ref(),
+            index.file_trigram_count.as_ref()
+        );
     }
 
     #[test]
@@ -2938,6 +4234,7 @@ mod tests {
             DEFAULT_MAX_FILE_SIZE,
             Some(current),
             Some(baseline),
+            None,
         );
 
         assert!(!refreshed
@@ -2954,20 +4251,20 @@ mod tests {
     }
 
     #[test]
-    fn read_from_disk_rejects_corrupt_postings_checksum() {
+    fn read_from_disk_rejects_corrupt_lookup_checksum() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project dir");
         fs::write(project.join("src.txt"), "abcdef").expect("write source");
 
-        let index = SearchIndex::build(&project);
+        let mut index = SearchIndex::build(&project);
         let cache_dir = dir.path().join("cache");
         index.write_to_disk(&cache_dir, None);
 
         let cache_path = cache_dir.join("cache.bin");
         let mut bytes = fs::read(&cache_path).expect("read cache");
-        let middle = bytes.len() / 2;
-        bytes[middle] ^= 0xff;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
         fs::write(&cache_path, bytes).expect("write corrupted cache");
 
         assert!(SearchIndex::read_from_disk(&cache_dir, &project).is_none());
@@ -2980,7 +4277,7 @@ mod tests {
         fs::create_dir_all(&project).expect("create project dir");
         fs::write(project.join("src.txt"), "abcdef").expect("write source");
 
-        let index = SearchIndex::build(&project);
+        let mut index = SearchIndex::build(&project);
         let cache_dir = dir.path().join("cache");
         index.write_to_disk(&cache_dir, None);
 
@@ -3006,14 +4303,14 @@ mod tests {
         let a_cache = cache_dir.clone();
         let a = std::thread::spawn(move || {
             let _lock = CacheLock::acquire(&a_cache).expect("acquire cache lock a");
-            let index = SearchIndex::build(&a_project);
+            let mut index = SearchIndex::build(&a_project);
             index.write_to_disk(&a_cache, None);
         });
         let b_project = project.clone();
         let b_cache = cache_dir.clone();
         let b = std::thread::spawn(move || {
             let _lock = CacheLock::acquire(&b_cache).expect("acquire cache lock b");
-            let index = SearchIndex::build(&b_project);
+            let mut index = SearchIndex::build(&b_project);
             index.write_to_disk(&b_cache, None);
         });
         a.join().expect("writer a");
@@ -3122,8 +4419,13 @@ mod tests {
         baseline.git_head = head.clone();
         fs::write(&file, "newtoken\n").expect("edit tracked file");
 
-        let refreshed =
-            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, head, Some(baseline));
+        let refreshed = SearchIndex::rebuild_or_refresh(
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            head,
+            Some(baseline),
+            None,
+        );
         let result = refreshed.grep("newtoken", true, &[], &[], &project, 10);
 
         assert_eq!(result.total_matches, 1);
@@ -3138,8 +4440,13 @@ mod tests {
         let baseline = SearchIndex::build(&project);
         let baseline_file_count = baseline.file_count();
 
-        let refreshed =
-            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, None, Some(baseline));
+        let refreshed = SearchIndex::rebuild_or_refresh(
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            None,
+            Some(baseline),
+            None,
+        );
 
         assert_eq!(refreshed.file_count(), baseline_file_count);
         assert_eq!(
@@ -3237,8 +4544,13 @@ mod tests {
         fs::write(&file, "bravo").expect("write same-size edit");
         filetime::set_file_mtime(&file, original_mtime).expect("restore original mtime");
 
-        let refreshed =
-            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, None, Some(baseline));
+        let refreshed = SearchIndex::rebuild_or_refresh(
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            None,
+            Some(baseline),
+            None,
+        );
         let result = refreshed.grep("bravo", true, &[], &[], &project, 10);
         let canonical_file = fs::canonicalize(&file).expect("canonicalize edited file");
         let refreshed_id = *refreshed
@@ -3373,12 +4685,14 @@ mod tests {
         assert_eq!(serial.file_count(), parallel.file_count());
         assert_eq!(serial.trigram_count(), parallel.trigram_count());
         assert_eq!(serial.path_to_id.len(), parallel.path_to_id.len());
-        assert_eq!(serial.postings, parallel.postings);
-        assert_eq!(serial.file_trigrams, parallel.file_trigrams);
-        for (path, id) in &serial.path_to_id {
+        assert_eq!(
+            serial.file_trigram_count.as_ref(),
+            parallel.file_trigram_count.as_ref()
+        );
+        for (path, id) in serial.path_to_id.iter() {
             assert_eq!(parallel.path_to_id.get(path), Some(id));
         }
-        for (serial_file, parallel_file) in serial.files.iter().zip(&parallel.files) {
+        for (serial_file, parallel_file) in serial.files.iter().zip(parallel.files.iter()) {
             assert_eq!(serial_file.path, parallel_file.path);
             assert_eq!(serial_file.size, parallel_file.size);
             assert_eq!(serial_file.modified, parallel_file.modified);

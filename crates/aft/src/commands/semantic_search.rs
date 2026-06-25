@@ -1331,7 +1331,7 @@ fn collect_lexical_files(
     // allow-list made named config/doc files (Cargo.toml, README.md,
     // package.json) structurally unreachable in hybrid mode — exactly the
     // literal-filename hits the lexical lane exists to catch.
-    let ranked = {
+    let snapshot = {
         let search_index = ctx
             .search_index()
             .read()
@@ -1343,11 +1343,13 @@ fn collect_lexical_files(
                 engine_capped: false,
             };
         };
-        let production_file_filter =
-            |path: &Path| path_allowed_by_include_tests(path, project_root, include_tests);
-        let filter = (!include_tests).then_some(&production_file_filter as &dyn Fn(&Path) -> bool);
-        index.lexical_rank_with_stats(&query_trigrams, filter, LEXICAL_ENUMERATION_LIMIT)
+        index.snapshot()
     };
+    let production_file_filter =
+        |path: &Path| path_allowed_by_include_tests(path, project_root, include_tests);
+    let filter = (!include_tests).then_some(&production_file_filter as &dyn Fn(&Path) -> bool);
+    let ranked =
+        snapshot.lexical_rank_with_stats(&query_trigrams, filter, LEXICAL_ENUMERATION_LIMIT);
 
     LexicalCollection {
         files: ranked.files,

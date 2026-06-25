@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 
 use aft::search_index::{extract_trigrams, lexical_score, SearchIndex};
 
@@ -59,7 +60,7 @@ fn query_trigram_helper_dedupes_repeated_offsets() {
 #[test]
 fn empty_file_trigram_entry_uses_defensive_guard() {
     let (_project, mut index, file_id) = indexed_file("abcdef");
-    index.file_trigrams.insert(file_id, Vec::new());
+    Arc::make_mut(&mut index.file_trigram_count)[file_id as usize] = 0;
     let query = SearchIndex::query_trigrams_from_tokens(&["abc"]);
 
     assert_eq!(lexical_score(&index, &query, file_id), 1.0);

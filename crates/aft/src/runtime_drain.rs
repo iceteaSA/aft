@@ -1021,13 +1021,15 @@ pub fn spawn_search_corpus_refresh(
                     }
                 }
             };
-            let index = aft::search_index::SearchIndex::build_with_limit(
+            let mut index = aft::search_index::SearchIndex::build_with_limit_to_cache_dir(
                 &root,
                 config.search_index_max_file_size,
+                &cache_dir,
             );
             delay_search_rebuild_publish_for_debug();
             if !is_worktree_bridge {
-                index.write_to_disk(&cache_dir, index.stored_git_head());
+                let head = index.stored_git_head().map(str::to_owned);
+                index.write_to_disk(&cache_dir, head.as_deref());
             }
             let _ = tx.send(index);
         });
