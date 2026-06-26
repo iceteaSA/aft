@@ -41,7 +41,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
     // system prompt works to suppress, and sibling tools (aft_outline,
     // aft_callgraph) already describe themselves.
     description: [
-      "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. Use it for any code search — including when you only know what the code does, not what it's named ('where is rate limiting handled', 'retry logic', '^export', 'Cargo.lock').",
+      "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').",
       "",
       "Set hint to 'regex', 'literal', or 'semantic' to force a lane.",
     ].join("\n"),

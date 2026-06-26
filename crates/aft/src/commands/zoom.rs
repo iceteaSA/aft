@@ -2,12 +2,15 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::commands::outline::{
+    build_outline_tree, format_entry_with_sig, symbol_to_entry, OutlineEntry,
+};
 use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
 use crate::lsp_hints;
 use crate::parser::{detect_language, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
-use crate::symbols::Range;
+use crate::symbols::{Range, Symbol, SymbolKind};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
 
 /// A reference to a called/calling function.
@@ -42,6 +45,13 @@ struct RawCall {
     line: u32,
     start_byte: usize,
     end_byte: usize,
+}
+
+const LARGE_CONTAINER_MENU_LINE_THRESHOLD: usize = 150;
+
+struct ContainerOutline {
+    entry: OutlineEntry,
+    symbols: Vec<Symbol>,
 }
 
 fn resolve_file_or_url(
@@ -430,39 +440,32 @@ fn zoom_one_symbol(
     };
 
     if matches.len() > 1 {
-        // Ambiguous — return qualified candidates with 1-based line ranges.
-        // Internal symbols.rs ranges are 0-based; we add 1 to both start and end.
-        let candidates: Vec<String> = matches
+        let content = render_ambiguous_symbol_menu(symbol_name, &matches);
+        let candidates = matches
             .iter()
-            .map(|m| {
-                let sym = &m.symbol;
-                let start = sym.range.start_line + 1;
-                let end = sym.range.end_line + 1;
-                let line_range = if start == end {
-                    format!("{}", start)
-                } else {
-                    format!("{}-{}", start, end)
-                };
-                if sym.scope_chain.is_empty() {
-                    format!("{}:{}", sym.name, line_range)
-                } else {
-                    format!(
-                        "{}::{}:{}",
-                        sym.scope_chain.join("::"),
-                        sym.name,
-                        line_range
-                    )
-                }
+            .map(|candidate| {
+                let sym = &candidate.symbol;
+                serde_json::json!({
+                    "name": sym.name.clone(),
+                    "qualified_name": qualified_symbol_name(sym),
+                    "kind": symbol_kind_string(&sym.kind),
+                    "range": sym.range.clone(),
+                    "signature": sym.signature.clone(),
+                })
             })
-            .collect();
-        return Response::error(
+            .collect::<Vec<_>>();
+
+        return Response::success(
             &req.id,
-            "ambiguous_symbol",
-            format!(
-                "symbol '{}' is ambiguous, candidates: [{}]",
-                symbol_name,
-                candidates.join(", ")
-            ),
+            serde_json::json!({
+                "name": symbol_name,
+                "kind": "ambiguous_symbol",
+                "content": content,
+                "context_before": [],
+                "context_after": [],
+                "annotations": empty_annotations(),
+                "candidates": candidates,
+            }),
         );
     }
 
@@ -501,6 +504,43 @@ fn zoom_one_symbol(
     } else {
         effective_lines[start..].join("\n")
     };
+
+    let resolved_lang = detect_language(resolved_file_path);
+    let container_outline = if might_have_container_members(target) {
+        match build_container_outline(ctx, resolved_file_path, target) {
+            Ok(outline) => Some(outline),
+            Err(e) => {
+                return Response::error(&req.id, e.code(), e.to_string());
+            }
+        }
+    } else {
+        None
+    };
+
+    if should_return_member_menu(target, resolved_lang, container_outline.as_ref()) {
+        let kind_str = symbol_kind_string(&target.kind);
+        let menu = render_container_member_menu(target, container_outline.as_ref().unwrap());
+        let resp = ZoomResponse {
+            name: target.name.clone(),
+            kind: kind_str,
+            range: target.range.clone(),
+            content: menu,
+            context_before: Vec::new(),
+            context_after: Vec::new(),
+            annotations: Annotations {
+                calls_out: Vec::new(),
+                called_by: Vec::new(),
+            },
+        };
+        return match serde_json::to_value(&resp) {
+            Ok(resp_json) => Response::success(&req.id, resp_json),
+            Err(err) => Response::error(
+                &req.id,
+                "internal_error",
+                format!("zoom: failed to serialize response: {err}"),
+            ),
+        };
+    }
 
     // Context before
     let ctx_start = start.saturating_sub(context_lines);
@@ -609,10 +649,7 @@ fn zoom_one_symbol(
         (Vec::new(), Vec::new())
     };
 
-    let kind_str = serde_json::to_value(&target.kind)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| format!("{:?}", target.kind).to_lowercase());
+    let kind_str = symbol_kind_string(&target.kind);
 
     let resp = ZoomResponse {
         name: target.name.clone(),
@@ -635,6 +672,214 @@ fn zoom_one_symbol(
             format!("zoom: failed to serialize response: {err}"),
         ),
     }
+}
+
+fn empty_annotations() -> serde_json::Value {
+    serde_json::json!({
+        "calls_out": [],
+        "called_by": [],
+    })
+}
+
+fn symbol_kind_string(kind: &SymbolKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| format!("{:?}", kind).to_lowercase())
+}
+
+fn qualified_symbol_name(symbol: &Symbol) -> String {
+    let mut parts = symbol
+        .scope_chain
+        .iter()
+        .filter(|part| !part.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    parts.push(symbol.name.clone());
+    parts.join(".")
+}
+
+fn range_line_count(range: &Range) -> usize {
+    range
+        .end_line
+        .saturating_sub(range.start_line)
+        .saturating_add(1) as usize
+}
+
+fn range_contains(outer: &Range, inner: &Range) -> bool {
+    (outer.start_line, outer.start_col) <= (inner.start_line, inner.start_col)
+        && (outer.end_line, outer.end_col) >= (inner.end_line, inner.end_col)
+}
+
+fn might_have_container_members(symbol: &Symbol) -> bool {
+    matches!(
+        &symbol.kind,
+        SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::Enum
+            | SymbolKind::Variable
+            | SymbolKind::TypeAlias
+    )
+}
+
+fn is_container_kind(kind: &SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Enum
+    )
+}
+
+fn build_container_outline(
+    ctx: &AppContext,
+    resolved_file_path: &Path,
+    target: &Symbol,
+) -> Result<ContainerOutline, crate::error::AftError> {
+    let symbols = ctx.provider().list_symbols(resolved_file_path)?;
+    let entries = build_outline_tree(&symbols);
+    let entry = find_outline_entry(&entries, target)
+        .cloned()
+        .unwrap_or_else(|| symbol_to_entry(target));
+    Ok(ContainerOutline { entry, symbols })
+}
+
+fn find_outline_entry<'a>(
+    entries: &'a [OutlineEntry],
+    target: &Symbol,
+) -> Option<&'a OutlineEntry> {
+    for entry in entries {
+        if entry.name == target.name && entry.range == target.range {
+            return Some(entry);
+        }
+        if let Some(found) = find_outline_entry(&entry.members, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn should_return_member_menu(
+    target: &Symbol,
+    lang: Option<LangId>,
+    outline: Option<&ContainerOutline>,
+) -> bool {
+    let Some(outline) = outline else {
+        return false;
+    };
+    let is_container = is_container_kind(&target.kind) || !outline.entry.members.is_empty();
+    if !is_container {
+        return false;
+    }
+
+    container_rendered_line_count(target, lang, &outline.entry)
+        > LARGE_CONTAINER_MENU_LINE_THRESHOLD
+}
+
+fn container_rendered_line_count(
+    target: &Symbol,
+    lang: Option<LangId>,
+    entry: &OutlineEntry,
+) -> usize {
+    let mut line_count = range_line_count(&target.range);
+
+    // Rust impl blocks are associated with the type in the outline symbol model,
+    // but their method ranges sit outside the struct/enum/trait declaration.
+    // Count those associated method spans so behavior-heavy Rust types get a
+    // drill-down menu without introducing a separate `impl` zoom target.
+    if lang == Some(LangId::Rust) {
+        for member in &entry.members {
+            if !range_contains(&target.range, &member.range) {
+                line_count = line_count.saturating_add(range_line_count(&member.range));
+            }
+        }
+    }
+
+    line_count
+}
+
+fn render_container_member_menu(target: &Symbol, outline: &ContainerOutline) -> String {
+    let kind = symbol_kind_string(&target.kind);
+    let qualified_name = qualified_symbol_name(target);
+    let member_count = outline.entry.members.len();
+    let mut lines = vec![format!(
+        "{kind} {qualified_name} ({member_count} members) — member-signature menu; zoom a member for its body"
+    )];
+
+    lines.push(format_qualified_entry(&outline.entry, Some(target)));
+    if outline.entry.members.is_empty() {
+        lines.push("  (no direct members found)".to_string());
+    } else {
+        for member in &outline.entry.members {
+            let symbol = find_symbol_for_entry(&outline.symbols, member);
+            lines.push(format!("  .{}", format_qualified_entry(member, symbol)));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn find_symbol_for_entry<'a>(symbols: &'a [Symbol], entry: &OutlineEntry) -> Option<&'a Symbol> {
+    symbols
+        .iter()
+        .find(|symbol| symbol.name == entry.name && symbol.range == entry.range)
+}
+
+fn format_qualified_entry(entry: &OutlineEntry, symbol: Option<&Symbol>) -> String {
+    let Some(symbol) = symbol else {
+        return format_entry_with_sig(entry);
+    };
+    let qualified_name = qualified_symbol_name(symbol);
+    if qualified_name == symbol.name {
+        return format_entry_with_sig(entry);
+    }
+
+    let mut display = entry.clone();
+    display.name = qualified_name.clone();
+    let signature = entry.signature.as_deref().unwrap_or(entry.name.as_str());
+    display.signature = Some(qualified_signature(
+        &symbol.name,
+        &qualified_name,
+        signature,
+    ));
+    format_entry_with_sig(&display)
+}
+
+fn qualified_signature(name: &str, qualified_name: &str, signature: &str) -> String {
+    if signature == name {
+        return qualified_name.to_string();
+    }
+
+    if let Some(rest) = signature.strip_prefix(name) {
+        let boundary = rest
+            .chars()
+            .next()
+            .map_or(true, |ch| !ch.is_alphanumeric() && ch != '_' && ch != '$');
+        if boundary {
+            return format!("{qualified_name}{rest}");
+        }
+    }
+
+    format!("{qualified_name} — {signature}")
+}
+
+fn render_ambiguous_symbol_menu(
+    symbol_name: &str,
+    matches: &[crate::symbols::SymbolMatch],
+) -> String {
+    let mut lines = vec![format!(
+        "symbol '{symbol_name}' is ambiguous ({} candidates) — zoom a qualified name for its body",
+        matches.len()
+    )];
+
+    for candidate in matches {
+        let entry = symbol_to_entry(&candidate.symbol);
+        lines.push(format!(
+            "- {}",
+            format_qualified_entry(&entry, Some(&candidate.symbol))
+        ));
+    }
+
+    lines.join("\n")
 }
 
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {

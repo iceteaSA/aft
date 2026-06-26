@@ -228,7 +228,7 @@ fn resolve_file_or_url(
 ///
 /// Symbols whose parent can't be found in the list are promoted to top level
 /// (defensive — shouldn't happen with well-formed parser output).
-fn build_outline_tree(symbols: &[Symbol]) -> Vec<OutlineEntry> {
+pub(crate) fn build_outline_tree(symbols: &[Symbol]) -> Vec<OutlineEntry> {
     // Separate top-level and child symbols
     let mut top_level: Vec<OutlineEntry> = Vec::new();
     let mut children: Vec<&Symbol> = Vec::new();
@@ -255,8 +255,17 @@ fn build_outline_tree(symbols: &[Symbol]) -> Vec<OutlineEntry> {
 
         // Walk the scope chain to find the correct parent container
         if !insert_at_scope(&mut top_level, scope, entry.clone()) {
-            // Parent not found — promote to top level
-            top_level.push(entry);
+            // Some languages expose association through `parent` even when the
+            // display scope is more specific than the container name (for
+            // example Rust `impl Trait for Type` methods). Fall back to the
+            // direct parent before treating the child as an orphan.
+            let parent_scope = child.parent.as_ref().map(std::slice::from_ref);
+            if !parent_scope
+                .is_some_and(|scope| insert_at_scope(&mut top_level, scope, entry.clone()))
+            {
+                // Parent not found — promote to top level
+                top_level.push(entry);
+            }
         }
     }
 
@@ -936,7 +945,7 @@ fn format_entry_compact(entry: &OutlineEntry) -> String {
 }
 
 /// Format a single entry line for single-file mode (with signature).
-fn format_entry_with_sig(entry: &OutlineEntry) -> String {
+pub(crate) fn format_entry_with_sig(entry: &OutlineEntry) -> String {
     let vis = if entry.exported { 'E' } else { '-' };
     let kind = kind_abbrev(&entry.kind);
     let sl = entry.range.start_line + 1;
@@ -1078,7 +1087,7 @@ fn format_multi_file_tree(
     output
 }
 
-fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
+pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
     OutlineEntry {
         name: sym.name.clone(),
         kind: serde_json::to_value(&sym.kind)
@@ -1157,6 +1166,29 @@ mod tests {
         assert_eq!(tree[0].members.len(), 2);
         assert_eq!(tree[0].members[0].name, "getUser");
         assert_eq!(tree[0].members[1].name, "addUser");
+    }
+
+    #[test]
+    fn parent_fallback_nests_trait_impl_methods_under_type() {
+        let symbols = vec![
+            make_symbol("Widget", SymbolKind::Struct, None, vec![], true),
+            make_symbol(
+                "fmt",
+                SymbolKind::Method,
+                Some("Widget"),
+                vec!["Display for Widget"],
+                true,
+            ),
+        ];
+        let tree = build_outline_tree(&symbols);
+        assert_eq!(
+            tree.len(),
+            1,
+            "trait impl method should nest under parent type"
+        );
+        assert_eq!(tree[0].name, "Widget");
+        assert_eq!(tree[0].members.len(), 1);
+        assert_eq!(tree[0].members[0].name, "fmt");
     }
 
     #[test]

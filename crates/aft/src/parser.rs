@@ -6577,13 +6577,36 @@ impl TreeSitterProvider {
 fn symbol_matches_in_file(file: &Path, symbols: &[Symbol], name: &str) -> Vec<SymbolMatch> {
     symbols
         .iter()
-        .filter(|symbol| symbol.name == name)
+        .filter(|symbol| symbol_query_matches(symbol, name))
         .cloned()
         .map(|symbol| SymbolMatch {
             file: file.display().to_string(),
             symbol,
         })
         .collect()
+}
+
+fn symbol_query_matches(symbol: &Symbol, query: &str) -> bool {
+    if symbol.name == query {
+        return true;
+    }
+
+    if !query.contains('.') && !query.contains("::") {
+        return false;
+    }
+
+    let mut parts = symbol
+        .scope_chain
+        .iter()
+        .filter(|part| !part.is_empty())
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return false;
+    }
+    parts.push(symbol.name.as_str());
+
+    parts.join(".") == query || parts.join("::") == query
 }
 
 fn string_content(source: &str, node: &Node) -> Option<String> {

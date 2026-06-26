@@ -17,6 +17,29 @@ fn send(aft: &mut AftProcess, request: serde_json::Value) -> serde_json::Value {
     aft.send(&request.to_string())
 }
 
+fn large_ts_class_source() -> String {
+    let mut source = String::from(
+        r#"class BigContainer {
+  methodOne(): number {
+    const visibleMethodBodyLine = 1;
+"#,
+    );
+    for i in 0..155 {
+        source.push_str(&format!("    const filler{i} = {i};\n"));
+    }
+    source.push_str(
+        r#"    return visibleMethodBodyLine;
+  }
+
+  methodTwo(): void {
+    console.log("second");
+  }
+}
+"#,
+    );
+    source
+}
+
 #[cfg(unix)]
 fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dst)
@@ -461,6 +484,224 @@ function unused(): void {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn zoom_large_container_returns_member_signature_menu() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "large.ts", &large_ts_class_source());
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({"id": "zoom-large-container", "command": "zoom", "file": file, "symbol": "BigContainer"}),
+    );
+
+    assert_eq!(resp["success"], true, "large container zoom: {resp:?}");
+    assert_eq!(resp["kind"], "class");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("member-signature menu; zoom a member for its body"),
+        "large container should explain menu output: {content}"
+    );
+    assert!(
+        content.contains("BigContainer.methodOne(): number"),
+        "menu should include qualified method signature: {content}"
+    );
+    assert!(
+        content.contains("BigContainer.methodTwo(): void"),
+        "menu should include second method signature: {content}"
+    );
+    assert!(
+        !content.contains("visibleMethodBodyLine"),
+        "menu must not include method bodies: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_small_container_returns_whole_body() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "small.ts",
+        r#"class SmallContainer {
+  run(): string {
+    const smallBodyLine = "small";
+    return smallBodyLine;
+  }
+}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({"id": "zoom-small-container", "command": "zoom", "file": file, "symbol": "SmallContainer"}),
+    );
+
+    assert_eq!(resp["success"], true, "small container zoom: {resp:?}");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("smallBodyLine"),
+        "small container should still return full body: {content}"
+    );
+    assert!(
+        !content.contains("member-signature menu"),
+        "small container should not be converted to a menu: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_leaf_qualified_method_returns_full_body_even_when_large() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "large.ts", &large_ts_class_source());
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({"id": "zoom-qualified-leaf", "command": "zoom", "file": file, "symbol": "BigContainer.methodOne"}),
+    );
+
+    assert_eq!(resp["success"], true, "qualified leaf zoom: {resp:?}");
+    assert_eq!(resp["name"], "methodOne");
+    assert_eq!(resp["kind"], "method");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("visibleMethodBodyLine"),
+        "leaf zoom should include the full method body: {content}"
+    );
+    assert!(
+        content.contains("return visibleMethodBodyLine"),
+        "leaf zoom should preserve the method return body: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_ambiguous_bare_name_returns_candidate_signatures() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "ambiguous.ts",
+        r#"class First {
+  execute(): string {
+    const firstBodyLine = "first";
+    return firstBodyLine;
+  }
+}
+
+class Second {
+  execute(): string {
+    const secondBodyLine = "second";
+    return secondBodyLine;
+  }
+}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({"id": "zoom-ambiguous", "command": "zoom", "file": file, "symbol": "execute"}),
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "ambiguous zoom should not be an error: {resp:?}"
+    );
+    assert_eq!(resp["kind"], "ambiguous_symbol");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("First.execute(): string"),
+        "candidate menu should include first qualified signature: {content}"
+    );
+    assert!(
+        content.contains("Second.execute(): string"),
+        "candidate menu should include second qualified signature: {content}"
+    );
+    assert!(
+        !content.contains("firstBodyLine") && !content.contains("secondBodyLine"),
+        "ambiguous disambiguation should not include bodies: {content}"
+    );
+    assert_eq!(resp["candidates"].as_array().unwrap().len(), 2);
+
+    let qualified = send(
+        &mut aft,
+        json!({"id": "zoom-qualified-candidate", "command": "zoom", "file": file, "symbol": "First.execute"}),
+    );
+    assert_eq!(
+        qualified["success"], true,
+        "qualified candidate zoom: {qualified:?}"
+    );
+    assert!(qualified["content"]
+        .as_str()
+        .unwrap()
+        .contains("firstBodyLine"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_rust_type_counts_impl_method_spans_for_menu() {
+    let dir = TempDir::new().unwrap();
+    let mut source = String::from(
+        r#"pub struct Widget {
+    value: i32,
+}
+
+impl Widget {
+    pub fn heavy(&self) -> i32 {
+        let mut total = self.value;
+"#,
+    );
+    for i in 0..155 {
+        source.push_str(&format!("        total += {i};\n"));
+    }
+    source.push_str(
+        r#"        total
+    }
+}
+"#,
+    );
+    let file = write_file(dir.path(), "widget.rs", &source);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({"id": "zoom-rust-type", "command": "zoom", "file": file, "symbol": "Widget"}),
+    );
+
+    assert_eq!(resp["success"], true, "rust type zoom: {resp:?}");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("member-signature menu; zoom a member for its body"),
+        "large Rust type should return a menu: {content}"
+    );
+    assert!(
+        content.contains("Widget.heavy — pub fn heavy(&self) -> i32"),
+        "Rust impl method should be qualified under the type: {content}"
+    );
+    assert!(
+        !content.contains("total += 154"),
+        "Rust menu must not include impl method body lines: {content}"
+    );
+
+    assert!(aft.shutdown().success());
 }
 
 #[test]
