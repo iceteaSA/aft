@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -31,7 +32,8 @@ use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VER
 use subc_transport::{authenticate_server, read_frame, write_frame};
 use tokio::net::TcpListener;
 
-static BRIDGE_STATE: OnceLock<Arc<BridgeState>> = OnceLock::new();
+static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
+static BRIDGE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct FakeDaemonInput {
     listener: TcpListener,
@@ -45,6 +47,63 @@ struct FakeDaemonInput {
     callgraph_root: std::path::PathBuf,
     callgraph_file: std::path::PathBuf,
     state: Arc<BridgeState>,
+}
+
+struct FakeDaemonSession {
+    stream: tokio::net::TcpStream,
+    root1: std::path::PathBuf,
+    root2: std::path::PathBuf,
+    failed_root: std::path::PathBuf,
+    push_burst_root: std::path::PathBuf,
+    slow_root: std::path::PathBuf,
+    callgraph_root: std::path::PathBuf,
+    callgraph_file: std::path::PathBuf,
+    state: Arc<BridgeState>,
+}
+
+struct SubcBridgeTestRoots {
+    root1: tempfile::TempDir,
+    root2: tempfile::TempDir,
+    failed_root: tempfile::TempDir,
+    push_burst_root: tempfile::TempDir,
+    slow_root: tempfile::TempDir,
+    callgraph_root: tempfile::TempDir,
+    callgraph_file: std::path::PathBuf,
+    storage: tempfile::TempDir,
+    conn_dir: tempfile::TempDir,
+}
+
+impl SubcBridgeTestRoots {
+    fn new() -> Self {
+        let root1 = tempfile::tempdir().expect("root1 tempdir");
+        let root2 = tempfile::tempdir().expect("root2 tempdir");
+        let failed_root = tempfile::tempdir().expect("failed root tempdir");
+        let push_burst_root = tempfile::tempdir().expect("push burst root tempdir");
+        let slow_root = tempfile::tempdir().expect("slow root tempdir");
+        let callgraph_root = tempfile::tempdir().expect("callgraph root tempdir");
+        let callgraph_src = callgraph_root.path().join("src");
+        std::fs::create_dir_all(&callgraph_src).expect("callgraph src dir");
+        let callgraph_file = callgraph_src.join("lib.rs");
+        std::fs::write(
+            &callgraph_file,
+            "pub fn caller() { callee(); }\npub fn callee() {}\n",
+        )
+        .expect("callgraph source file");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let conn_dir = tempfile::tempdir().expect("connection tempdir");
+
+        Self {
+            root1,
+            root2,
+            failed_root,
+            push_burst_root,
+            slow_root,
+            callgraph_root,
+            callgraph_file,
+            storage,
+            conn_dir,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -80,6 +139,40 @@ struct BridgeInner {
     configure_events: Vec<ConfigureEvent>,
     watcher_senders: Vec<crossbeam_channel::Sender<WatcherDispatchEvent>>,
     semantic_refresh_event_senders: Vec<crossbeam_channel::Sender<SemanticRefreshEvent>>,
+}
+
+fn bridge_state_slot() -> &'static Mutex<Option<Arc<BridgeState>>> {
+    BRIDGE_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn bridge_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    BRIDGE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn install_bridge_state(state: Arc<BridgeState>) {
+    let mut guard = bridge_state_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(state);
+}
+
+fn clear_bridge_state() {
+    let mut guard = bridge_state_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
+}
+
+fn current_bridge_state() -> Arc<BridgeState> {
+    bridge_state_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .expect("bridge state installed")
+        .clone()
 }
 
 impl BridgeState {
@@ -708,7 +801,7 @@ fn enqueue_semantic_refresh_event_for_test(
 }
 
 fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
-    let state = Arc::clone(BRIDGE_STATE.get().expect("bridge state installed"));
+    let state = current_bridge_state();
     match req.command.as_str() {
         "configure" => {
             state.configure(&req, ctx);
@@ -894,28 +987,18 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
-#[test]
-fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
+fn run_subc_bridge_test<F, Fut, A>(name: &'static str, watchdog: Duration, driver: F, after: A)
+where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    let _serial = bridge_test_serial_guard();
     let state = Arc::new(BridgeState::default());
-    let _ = BRIDGE_STATE.set(Arc::clone(&state));
+    install_bridge_state(Arc::clone(&state));
 
-    let root1 = tempfile::tempdir().expect("root1 tempdir");
-    let root2 = tempfile::tempdir().expect("root2 tempdir");
-    let failed_root = tempfile::tempdir().expect("failed root tempdir");
-    let push_burst_root = tempfile::tempdir().expect("push burst root tempdir");
-    let slow_root = tempfile::tempdir().expect("slow root tempdir");
-    let callgraph_root = tempfile::tempdir().expect("callgraph root tempdir");
-    let callgraph_src = callgraph_root.path().join("src");
-    std::fs::create_dir_all(&callgraph_src).expect("callgraph src dir");
-    let callgraph_file = callgraph_src.join("lib.rs");
-    std::fs::write(
-        &callgraph_file,
-        "pub fn caller() { callee(); }\npub fn callee() {}\n",
-    )
-    .expect("callgraph source file");
-    let storage = tempfile::tempdir().expect("storage tempdir");
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
-    let conn_path = conn_dir.path().join("subc-connection.json");
+    let roots = SubcBridgeTestRoots::new();
+    let conn_path = roots.conn_dir.path().join("subc-connection.json");
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
     std_listener
@@ -938,13 +1021,13 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
 
     let daemon_state = Arc::clone(&state);
-    let root1_path = root1.path().to_path_buf();
-    let root2_path = root2.path().to_path_buf();
-    let failed_root_path = failed_root.path().to_path_buf();
-    let push_burst_root_path = push_burst_root.path().to_path_buf();
-    let slow_root_path = slow_root.path().to_path_buf();
-    let callgraph_root_path = callgraph_root.path().to_path_buf();
-    let callgraph_file_path = callgraph_file.clone();
+    let root1_path = roots.root1.path().to_path_buf();
+    let root2_path = roots.root2.path().to_path_buf();
+    let failed_root_path = roots.failed_root.path().to_path_buf();
+    let push_burst_root_path = roots.push_burst_root.path().to_path_buf();
+    let slow_root_path = roots.slow_root.path().to_path_buf();
+    let callgraph_root_path = roots.callgraph_root.path().to_path_buf();
+    let callgraph_file_path = roots.callgraph_file.clone();
     let daemon = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -952,16 +1035,9 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
             .expect("fake daemon runtime");
         runtime.block_on(async move {
             let listener = TcpListener::from_std(std_listener).expect("tokio listener");
-            // Whole-driver hang guard, not a behavioral assertion. The driver runs
-            // dozens of tool-call round-trips (plus bounded settle polls) across many
-            // scenarios; a heavily loaded Windows CI runner executes this integration
-            // binary several times slower than locally, so the budget must be generous
-            // enough to never false-fire on contention while still bounding a genuine
-            // hang. Keep it well above the real driver runtime (a couple seconds
-            // locally, low tens of seconds on a loaded runner).
             tokio::time::timeout(
-                Duration::from_secs(120),
-                drive_fake_daemon(FakeDaemonInput {
+                watchdog,
+                driver(FakeDaemonInput {
                     listener,
                     key,
                     daemon_id,
@@ -976,14 +1052,14 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
                 }),
             )
             .await
-            .expect("subc bridge test watchdog")
+            .unwrap_or_else(|_| panic!("{name} fake daemon watchdog"));
         });
     });
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
         Config {
-            storage_dir: Some(storage.path().to_path_buf()),
+            storage_dir: Some(roots.storage.path().to_path_buf()),
             ..Config::default()
         },
     ));
@@ -998,60 +1074,227 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     let executor_for_check = Arc::clone(&executor);
     // Inject a hermetic (nonexistent) user config path so the W5 local read
     // never touches a real ~/.config/cortexkit/aft.jsonc on the dev/CI machine.
-    let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
-    run_subc_mode_for_test(
+    let user_config_path = roots.storage.path().join("nonexistent-user-aft.jsonc");
+    let run_result = run_subc_mode_for_test(
         &conn_path,
         ctx,
         executor,
         bridge_dispatch,
         Some(user_config_path),
-    )
-    .expect("subc mode exits cleanly");
-    daemon.join().expect("fake daemon joins");
+    );
+    let join_result = daemon.join();
+    clear_bridge_state();
 
-    state.assert_overlap();
-    state.assert_configure_root("subc-bind-1", root1.path());
-    state.assert_configure_root("subc-bind-2", root2.path());
-    state.assert_configure_root("subc-bind-4", root1.path());
-    state.assert_distinct_contexts("subc-bind-1", "subc-bind-2");
-    state.assert_same_context("subc-bind-1", "subc-bind-4");
-    assert!(
-        state.wait_for_configure("subc-bind-2").epoch_reads_at_start >= 2,
-        "different-root configure should run while route 1 reads are in flight"
-    );
-    assert_eq!(
-        state.wait_for_configure("subc-bind-4").epoch_reads_at_start,
-        0,
-        "same-root reconfigure must wait for route 1 reads to drain"
-    );
+    run_result.expect("subc mode exits cleanly");
+    join_result.expect("fake daemon joins");
+    after(&state, &executor_for_check, &roots);
+}
 
-    let failed_root_id = ProjectRootId::from_path(failed_root.path()).expect("failed root id");
-    let actor_check = executor_for_check.submit(
-        failed_root_id,
-        Lane::PureRead,
-        "b3-actor-check".to_string(),
-        Box::new(|_| Response::success("b3-actor-check", json!({ "unexpected": true }))),
+#[test]
+fn subc_bridge_core_routing_reuses_same_root_actor_and_allows_different_roots() {
+    run_subc_bridge_test(
+        "subc_bridge_core_routing_reuses_same_root_actor_and_allows_different_roots",
+        Duration::from_secs(45),
+        drive_core_routing_daemon,
+        |state, _, roots| {
+            state.assert_overlap();
+            state.assert_configure_root("subc-bind-1", roots.root1.path());
+            state.assert_configure_root("subc-bind-2", roots.root2.path());
+            state.assert_configure_root("subc-bind-4", roots.root1.path());
+            state.assert_distinct_contexts("subc-bind-1", "subc-bind-2");
+            state.assert_same_context("subc-bind-1", "subc-bind-4");
+            assert!(
+                state.wait_for_configure("subc-bind-2").epoch_reads_at_start >= 2,
+                "different-root configure should run while route 1 reads are in flight"
+            );
+            assert_eq!(
+                state.wait_for_configure("subc-bind-4").epoch_reads_at_start,
+                0,
+                "same-root reconfigure must wait for route 1 reads to drain"
+            );
+        },
     );
-    let actor_check_response = actor_check
-        .recv_timeout(Duration::from_secs(30))
-        .expect("B3 actor check response");
-    assert!(!actor_check_response.success);
-    assert_eq!(
-        actor_check_response
-            .data
-            .get("code")
-            .and_then(Value::as_str),
-        Some("actor_not_registered"),
-        "failed new-root bind must remove its just-registered actor"
-    );
+}
 
-    drop(root1);
-    drop(root2);
-    drop(failed_root);
-    drop(push_burst_root);
-    drop(slow_root);
-    drop(callgraph_root);
-    drop(storage);
+#[test]
+fn subc_bridge_configure_warning_pushes_are_session_scoped() {
+    run_subc_bridge_test(
+        "subc_bridge_configure_warning_pushes_are_session_scoped",
+        Duration::from_secs(30),
+        drive_configure_warning_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_semantic_refresh_maintenance_push() {
+    run_subc_bridge_test(
+        "subc_bridge_semantic_refresh_maintenance_push",
+        Duration::from_secs(30),
+        drive_semantic_refresh_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_watcher_stale_maintenance_push() {
+    run_subc_bridge_test(
+        "subc_bridge_watcher_stale_maintenance_push",
+        Duration::from_secs(30),
+        drive_watcher_stale_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_tool_calls_carry_route_bind_session() {
+    run_subc_bridge_test(
+        "subc_bridge_tool_calls_carry_route_bind_session",
+        Duration::from_secs(30),
+        drive_route_bind_session_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_l3_fanout_seq_ordering() {
+    run_subc_bridge_test(
+        "subc_bridge_l3_fanout_seq_ordering",
+        Duration::from_secs(30),
+        drive_l3_fanout_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_routebind_nonblocking_slow_configure() {
+    run_subc_bridge_test(
+        "subc_bridge_routebind_nonblocking_slow_configure",
+        Duration::from_secs(30),
+        drive_routebind_nonblocking_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_duplicate_routebind_rejects_in_flight_bind() {
+    run_subc_bridge_test(
+        "subc_bridge_duplicate_routebind_rejects_in_flight_bind",
+        Duration::from_secs(30),
+        drive_duplicate_routebind_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_tool_call_before_bind_ack_is_route_not_bound() {
+    run_subc_bridge_test(
+        "subc_bridge_tool_call_before_bind_ack_is_route_not_bound",
+        Duration::from_secs(30),
+        drive_pending_bind_tool_call_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_goodbye_cancels_pending_bind() {
+    run_subc_bridge_test(
+        "subc_bridge_goodbye_cancels_pending_bind",
+        Duration::from_secs(30),
+        drive_goodbye_cancels_pending_bind_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_l3_coalesces_already_bound_route_burst() {
+    run_subc_bridge_test(
+        "subc_bridge_l3_coalesces_already_bound_route_burst",
+        Duration::from_secs(30),
+        drive_l3_coalescing_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_lossy_pressure_reliable_completion_still_delivers() {
+    run_subc_bridge_test(
+        "subc_bridge_lossy_pressure_reliable_completion_still_delivers",
+        Duration::from_secs(45),
+        drive_lossy_pressure_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_response_finalizer_status_bar_and_bg_completion_once_per_epoch() {
+    run_subc_bridge_test(
+        "subc_bridge_response_finalizer_status_bar_and_bg_completion_once_per_epoch",
+        Duration::from_secs(60),
+        drive_response_finalizer_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_session_scoped_bg_completion_and_push_isolation() {
+    run_subc_bridge_test(
+        "subc_bridge_session_scoped_bg_completion_and_push_isolation",
+        Duration::from_secs(60),
+        drive_session_scoped_bg_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_reliable_replay_and_lossy_drop_for_detached_session() {
+    run_subc_bridge_test(
+        "subc_bridge_reliable_replay_and_lossy_drop_for_detached_session",
+        Duration::from_secs(45),
+        drive_detached_session_replay_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_failed_new_root_bind_rolls_back_actor_and_drops_pre_ack_push() {
+    run_subc_bridge_test(
+        "subc_bridge_failed_new_root_bind_rolls_back_actor_and_drops_pre_ack_push",
+        Duration::from_secs(30),
+        drive_failed_new_root_daemon,
+        |_, executor, roots| {
+            let failed_root_id =
+                ProjectRootId::from_path(roots.failed_root.path()).expect("failed root id");
+            let actor_check = executor.submit(
+                failed_root_id,
+                Lane::PureRead,
+                "b3-actor-check".to_string(),
+                Box::new(|_| Response::success("b3-actor-check", json!({ "unexpected": true }))),
+            );
+            let actor_check_response = actor_check
+                .recv_timeout(Duration::from_secs(30))
+                .expect("B3 actor check response");
+            assert!(!actor_check_response.success);
+            assert_eq!(
+                actor_check_response
+                    .data
+                    .get("code")
+                    .and_then(Value::as_str),
+                Some("actor_not_registered"),
+                "failed new-root bind must remove its just-registered actor"
+            );
+        },
+    );
+}
+
+#[test]
+fn subc_bridge_callgraph_maintenance_is_per_root() {
+    run_subc_bridge_test(
+        "subc_bridge_callgraph_maintenance_is_per_root",
+        Duration::from_secs(60),
+        drive_callgraph_maintenance_daemon,
+        |_, _, _| {},
+    );
 }
 
 /// Flips true if the S1 attacker's `configure` payload ever reaches `dispatch`.
@@ -1275,7 +1518,7 @@ async fn drive_s1_rejection_daemon(
     drop(stream);
 }
 
-async fn drive_fake_daemon(input: FakeDaemonInput) {
+async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
     let FakeDaemonInput {
         listener,
         key,
@@ -1322,6 +1565,171 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     )
     .await;
 
+    FakeDaemonSession {
+        stream,
+        root1,
+        root2,
+        failed_root,
+        push_burst_root,
+        slow_root,
+        callgraph_root,
+        callgraph_file,
+        state,
+    }
+}
+
+async fn bind_route1(stream: &mut tokio::net::TcpStream, root1: &std::path::Path) {
+    send_route_bind(stream, 1, 10, root1).await;
+    expect_route_bind_ack(stream, 10).await;
+}
+
+async fn bind_routes_1_and_4(stream: &mut tokio::net::TcpStream, root1: &std::path::Path) {
+    bind_route1(stream, root1).await;
+    send_route_bind(stream, 4, 44, root1).await;
+    expect_route_bind_ack(stream, 44).await;
+}
+
+async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
+    send_frame(
+        stream,
+        Frame::build(FrameType::Goodbye, control_flags(), 0, 99, Vec::new())
+            .expect("goodbye frame"),
+    )
+    .await;
+}
+
+async fn drive_core_routing_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    // 1. Overlap: three PureRead calls on one route must all reach dispatch
+    // before any is released.
+    for corr in 100..103 {
+        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "overlap" })).await;
+    }
+    state.wait_until("overlap reads started", |inner| inner.overlap_started == 3);
+    state.assert_overlap();
+    state.release_overlap();
+    let overlap_corrs = collect_response_corrs(&mut stream, 3).await;
+    assert_eq!(overlap_corrs, HashSet::from([100, 101, 102]));
+
+    // 2. Slow HeavyInit + fast PureRead: a read submitted after the heavy job has
+    // started returns before the heavy response.
+    send_tool_call(
+        &mut stream,
+        1,
+        200,
+        "semantic_search",
+        json!({ "case": "heavy" }),
+    )
+    .await;
+    state.wait_until("heavy started", |inner| inner.heavy_started);
+    send_tool_call(&mut stream, 1, 201, "glob", json!({ "case": "fast" })).await;
+    let fast = read_frame_timeout(&mut stream, "fast read response").await;
+    assert_eq!(fast.header.ty, FrameType::Response);
+    assert_eq!(fast.header.channel, 1);
+    assert_eq!(
+        fast.header.corr, 201,
+        "fast read should beat heavy response"
+    );
+    assert_eq!(tool_response_json(&fast)["id"], "subc-1-201");
+    state.release_heavy();
+    let heavy = read_frame_timeout(&mut stream, "heavy response").await;
+    assert_eq!(heavy.header.corr, 200);
+
+    // 3. Different roots: route 2 binds while route 1 reads are in flight.
+    // It must get its own actor, so its configure can start and ack before
+    // route 1's read epoch is released.
+    let epoch_base = state.begin_epoch_wave();
+    for corr in 300..302 {
+        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "epoch" })).await;
+    }
+    state.wait_until("epoch reads started", |inner| {
+        inner.epoch_started == epoch_base + 2
+    });
+    send_route_bind(&mut stream, 2, 30, &root2).await;
+    let route2_configure = state.wait_for_configure("subc-bind-2");
+    assert!(
+        route2_configure.epoch_reads_at_start >= 2,
+        "different-root configure should not be blocked by route 1 reads"
+    );
+    expect_route_bind_ack(&mut stream, 30).await;
+    state.release_epoch_reads();
+    let epoch_corrs = collect_response_corrs(&mut stream, 2).await;
+    assert_eq!(epoch_corrs, HashSet::from([300, 301]));
+
+    send_tool_call(&mut stream, 1, 400, "glob", json!({ "case": "fast" })).await;
+    let route1_read = read_frame_timeout(&mut stream, "route 1 read response").await;
+    assert_eq!(route1_read.header.channel, 1);
+    assert_eq!(route1_read.header.corr, 400);
+    assert_tool_project_root(&route1_read, &root1);
+    send_tool_call(&mut stream, 2, 401, "glob", json!({ "case": "fast" })).await;
+    let route2_read = read_frame_timeout(&mut stream, "route 2 read response").await;
+    assert_eq!(route2_read.header.channel, 2);
+    assert_eq!(route2_read.header.corr, 401);
+    assert_tool_project_root(&route2_read, &root2);
+
+    // PUSH isolation: root-1 emits do not leak to root-2's bound channel.
+    send_tool_call(
+        &mut stream,
+        1,
+        402,
+        "subc_test_emit_status",
+        json!({ "marker": "root1-isolation", "seq": 2 }),
+    )
+    .await;
+    let isolation_pushes =
+        expect_status_pushes_for_tool(&mut stream, 402, "root1-isolation", HashSet::from([1]))
+            .await;
+    assert_eq!(isolation_pushes.len(), 1);
+    assert_eq!(push_seq(&isolation_pushes[0]), Some(2));
+
+    // 4. Same root: route 4 binds to root 1 while route 1 reads are in flight.
+    // It must reuse the existing actor, so configure cannot start until those
+    // reads leave the shared per-root epoch.
+    let same_root_epoch_base = state.begin_epoch_wave();
+    for corr in 410..412 {
+        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "epoch" })).await;
+    }
+    state.wait_until("same-root epoch reads started", |inner| {
+        inner.epoch_started == same_root_epoch_base + 2
+    });
+    send_route_bind(&mut stream, 4, 44, &root1).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    state.assert_configure_not_started("subc-bind-4");
+    state.release_epoch_reads();
+    // The same-root configure for route 4 starts only after these reads drain,
+    // so RouteBindAck(44) (channel 0) and the read responses (channel 1) are
+    // emitted concurrently and can reach the stream in any order. Demux by
+    // channel rather than assuming the reads land before the ack.
+    let same_root_corrs =
+        collect_tool_responses_and_route_bind_ack(&mut stream, &[410, 411], 44).await;
+    assert_eq!(same_root_corrs, HashSet::from([410, 411]));
+    assert_eq!(
+        state.wait_for_configure("subc-bind-4").epoch_reads_at_start,
+        0,
+        "same-root configure should start only after route 1 reads drain"
+    );
+    send_tool_call(&mut stream, 4, 420, "glob", json!({ "case": "fast" })).await;
+    let route4_read = read_frame_timeout(&mut stream, "route 4 read response").await;
+    assert_eq!(route4_read.header.channel, 4);
+    assert_eq!(route4_read.header.corr, 420);
+    assert_tool_project_root(&route4_read, &root1);
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+
     send_route_bind_with_doc(
         &mut stream,
         1,
@@ -1348,9 +1756,64 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     .await;
     assert_eq!(configure_warning_pushes.len(), 1);
 
-    // L1 semantic-refresh maintenance: inject a SemanticRefreshEvent through the
-    // same event_rx seam used by standalone tests. The full 8-drain subc tick
-    // must run the moved semantic refresh drain and emit the refreshing status.
+    send_route_bind(&mut stream, 4, 44, &root1).await;
+    expect_route_bind_ack(&mut stream, 44).await;
+
+    // Configure warnings for one session on a shared root must carry that
+    // session id and not leak to sibling sessions.
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        49,
+        &root1,
+        "session-1",
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_configure_warning": {
+                "message": "session-1-reconfigure-warning",
+            },
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 49).await;
+    let session_configure_warning_pushes = expect_configure_warning_pushes(
+        &mut stream,
+        HashSet::from([1]),
+        &root1,
+        "session-1-reconfigure-warning",
+        "session-1",
+    )
+    .await;
+    assert_eq!(session_configure_warning_pushes.len(), 1);
+    assert_eq!(
+        session_configure_warning_pushes[0]
+            .get("session_id")
+            .and_then(Value::as_str),
+        Some("session-1")
+    );
+    send_tool_call(&mut stream, 4, 50, "glob", json!({ "case": "fast" })).await;
+    expect_tool_response_without_configure_warning_for_message(
+        &mut stream,
+        50,
+        &root1,
+        "session-1-reconfigure-warning",
+    )
+    .await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_semantic_refresh_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    // Semantic-refresh maintenance injects a SemanticRefreshEvent through the
+    // same event_rx seam used by standalone tests. The full subc maintenance
+    // tick must run the semantic refresh drain and emit the refreshing status.
     send_tool_call(
         &mut stream,
         1,
@@ -1364,9 +1827,18 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
             .await;
     assert_eq!(semantic_refresh_pushes.len(), 1);
 
-    // L1 watcher maintenance: inject a compact watcher event through the same
-    // watcher_rx seam standalone tests use, then let the subc 250ms maintenance
-    // tick drain it on the Mutating lane and emit the stale-status Push.
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_watcher_stale_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    // Watcher maintenance injects a compact watcher event through the same
+    // watcher_rx seam standalone tests use, then lets the subc maintenance tick
+    // drain it on the Mutating lane and emit the stale-status Push.
     send_tool_call(
         &mut stream,
         1,
@@ -1380,7 +1852,16 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
             .await;
     assert_eq!(watcher_pushes.len(), 1);
 
-    // Phase 4d-2a: subc tool calls carry RouteBind session on the RawRequest.
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_route_bind_session_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_routes_1_and_4(&mut stream, &root1).await;
+
+    // Subc tool calls carry the RouteBind session on the RawRequest.
     send_tool_call(&mut stream, 1, 11, "subc_test_echo_session", json!({})).await;
     let echo_s1 = read_frame_timeout(&mut stream, "echo session route 1").await;
     assert_eq!(echo_s1.header.corr, 11);
@@ -1390,6 +1871,23 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         Some("session-1"),
         "route 1 bind identity session: {echo_s1_body:?}"
     );
+
+    send_tool_call(&mut stream, 4, 422, "subc_test_echo_session", json!({})).await;
+    let echo_s4 = read_frame_timeout(&mut stream, "echo session route 4").await;
+    assert_eq!(echo_s4.header.corr, 422);
+    assert_eq!(
+        tool_response_json(&echo_s4)["transport_session"].as_str(),
+        Some("session-4"),
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_l3_fanout_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
 
     // L3 PUSH fan-out: a root-1 actor emit is serialized as a server-initiated
     // Push frame on route 1 with corr=0.
@@ -1404,6 +1902,19 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     let fanout_pushes =
         expect_status_pushes_for_tool(&mut stream, 70, "root1-fanout", HashSet::from([1])).await;
     assert_eq!(push_seq(&fanout_pushes[0]), Some(1));
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_routebind_nonblocking_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
 
     // P5b B2 #4: a slow RouteBind configure must not block the subc loop.
     // While route 9 is pending, route 1 is already bound and must still service
@@ -1442,6 +1953,17 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
     expect_route_bind_ack(&mut stream, 19).await;
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_duplicate_routebind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+
     // P5b B2 amend 5: duplicate RouteBind on a channel with an in-flight bind
     // is rejected immediately and does not submit a second configure.
     let duplicate_bind_base = state.begin_slow_configure_wave();
@@ -1467,6 +1989,17 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     state.wait_for_slow_configure_finished(duplicate_bind_base + 1);
     expect_route_bind_ack(&mut stream, 111).await;
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+
     // P5b B2 finding (d): a route-channel tool call sent before its bind ack is
     // a protocol error and remains route_not_bound while the bind is pending.
     let pending_tool_base = state.begin_slow_configure_wave();
@@ -1491,6 +2024,17 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     state.release_slow_configures();
     state.wait_for_slow_configure_finished(pending_tool_base + 1);
     expect_route_bind_ack(&mut stream, 1200).await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
 
     // P5b B2 amend 5: Goodbye during a pending bind cancels completion so it
     // cannot install a ghost route or send an ack for the closed channel.
@@ -1523,8 +2067,18 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     send_tool_call(&mut stream, 10, 1111, "glob", json!({ "case": "fast" })).await;
     expect_error_frame_skipping_optional_ack(&mut stream, 10, 1111, "route_not_bound", 110).await;
 
-    // Bind a single-channel root for the configure-emitted push scenarios below.
-    // The follow-up RouteBinds exercise already-live reconfigure behavior while
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        push_burst_root,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    // Bind a single-channel root for the configure-emitted push scenario. The
+    // follow-up RouteBind exercises already-live reconfigure behavior while
     // keeping project-scoped status fan-out unambiguous.
     send_route_bind(&mut stream, 6, 15, &push_burst_root).await;
     expect_route_bind_ack(&mut stream, 15).await;
@@ -1565,8 +2119,37 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
             .any(|push| push_seq(push) == Some(15)),
         "configure burst should include the final status snapshot"
     );
-    assert_no_status_push_for_marker(&mut stream, "configure-burst", Duration::from_millis(150))
-        .await;
+    send_tool_call(
+        &mut stream,
+        6,
+        160,
+        "subc_test_emit_status",
+        json!({ "marker": "configure-burst-sentinel", "seq": 16 }),
+    )
+    .await;
+    let sentinel_pushes = expect_status_sentinel_without_marker_before(
+        &mut stream,
+        160,
+        "configure-burst-sentinel",
+        "configure-burst",
+        HashSet::from([6]),
+    )
+    .await;
+    assert_eq!(sentinel_pushes.len(), 1);
+    assert_eq!(push_seq(&sentinel_pushes[0]), Some(16));
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        push_burst_root,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    send_route_bind(&mut stream, 6, 15, &push_burst_root).await;
+    expect_route_bind_ack(&mut stream, 15).await;
 
     // P5b B1: reliable Push frames bypass the bounded lossy funnel. This
     // configure emits enough lossy status frames to fill lossy_tx, then emits a
@@ -1605,8 +2188,49 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         "lossy pressure should still deliver at least one coalesced status frame"
     );
     assert_eq!(pressure_completions.len(), 1);
-    assert_no_status_push_for_marker(&mut stream, "lossy-pressure", Duration::from_millis(150))
+    if !pressure_statuses
+        .iter()
+        .any(|push| push_seq(push) == Some(2047))
+    {
+        let final_pressure_pushes = expect_status_pushes_for_marker_seq(
+            &mut stream,
+            "lossy-pressure",
+            2047,
+            HashSet::from([6]),
+        )
         .await;
+        assert_eq!(final_pressure_pushes.len(), 1);
+    }
+    send_tool_call(
+        &mut stream,
+        6,
+        170,
+        "subc_test_emit_status",
+        json!({ "marker": "lossy-pressure-sentinel", "seq": 2048 }),
+    )
+    .await;
+    let sentinel_pushes = expect_status_sentinel_without_marker_before(
+        &mut stream,
+        170,
+        "lossy-pressure-sentinel",
+        "lossy-pressure",
+        HashSet::from([6]),
+    )
+    .await;
+    assert_eq!(sentinel_pushes.len(), 1);
+    assert_eq!(push_seq(&sentinel_pushes[0]), Some(2048));
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
 
     // L2 response finalizer: a normal route-channel read gets status_bar once
     // the actor has real Tier-2 counts, matching standalone response shape.
@@ -1696,171 +2320,16 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     }
     assert_eq!(finalizer_corrs, HashSet::from([122, 123]));
 
-    // 1. Overlap: three PureRead calls on one route must all reach dispatch
-    // before any is released.
-    for corr in 100..103 {
-        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "overlap" })).await;
-    }
-    state.wait_until("overlap reads started", |inner| inner.overlap_started == 3);
-    state.assert_overlap();
-    state.release_overlap();
-    let overlap_corrs = collect_response_corrs(&mut stream, 3).await;
-    assert_eq!(overlap_corrs, HashSet::from([100, 101, 102]));
+    send_connection_goodbye(&mut stream).await;
+}
 
-    // 2. Slow HeavyInit + fast PureRead: a read submitted after the heavy job has
-    // started returns before the heavy response.
-    send_tool_call(
-        &mut stream,
-        1,
-        200,
-        "semantic_search",
-        json!({ "case": "heavy" }),
-    )
-    .await;
-    state.wait_until("heavy started", |inner| inner.heavy_started);
-    send_tool_call(&mut stream, 1, 201, "glob", json!({ "case": "fast" })).await;
-    let fast = read_frame_timeout(&mut stream, "fast read response").await;
-    assert_eq!(fast.header.ty, FrameType::Response);
-    assert_eq!(fast.header.channel, 1);
-    assert_eq!(
-        fast.header.corr, 201,
-        "fast read should beat heavy response"
-    );
-    assert_eq!(tool_response_json(&fast)["id"], "subc-1-201");
-    state.release_heavy();
-    let heavy = read_frame_timeout(&mut stream, "heavy response").await;
-    assert_eq!(heavy.header.corr, 200);
+async fn drive_session_scoped_bg_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_routes_1_and_4(&mut stream, &root1).await;
 
-    // 3. Different roots: route 2 binds while route 1 reads are in flight.
-    // It must get its own actor, so its configure can start and ack before
-    // route 1's read epoch is released.
-    let epoch_base = state.begin_epoch_wave();
-    for corr in 300..302 {
-        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "epoch" })).await;
-    }
-    state.wait_until("epoch reads started", |inner| {
-        inner.epoch_started == epoch_base + 2
-    });
-    send_route_bind(&mut stream, 2, 30, &root2).await;
-    let route2_configure = state.wait_for_configure("subc-bind-2");
-    assert!(
-        route2_configure.epoch_reads_at_start >= 2,
-        "different-root configure should not be blocked by route 1 reads"
-    );
-    expect_route_bind_ack(&mut stream, 30).await;
-    state.release_epoch_reads();
-    let epoch_corrs = collect_response_corrs(&mut stream, 2).await;
-    assert_eq!(epoch_corrs, HashSet::from([300, 301]));
-
-    send_tool_call(&mut stream, 1, 400, "glob", json!({ "case": "fast" })).await;
-    let route1_read = read_frame_timeout(&mut stream, "route 1 read response").await;
-    assert_eq!(route1_read.header.channel, 1);
-    assert_eq!(route1_read.header.corr, 400);
-    assert_tool_project_root(&route1_read, &root1);
-    send_tool_call(&mut stream, 2, 401, "glob", json!({ "case": "fast" })).await;
-    let route2_read = read_frame_timeout(&mut stream, "route 2 read response").await;
-    assert_eq!(route2_read.header.channel, 2);
-    assert_eq!(route2_read.header.corr, 401);
-    assert_tool_project_root(&route2_read, &root2);
-
-    // L3 PUSH isolation: root-1 emits do not leak to root-2's bound channel.
-    send_tool_call(
-        &mut stream,
-        1,
-        402,
-        "subc_test_emit_status",
-        json!({ "marker": "root1-isolation", "seq": 2 }),
-    )
-    .await;
-    let isolation_pushes =
-        expect_status_pushes_for_tool(&mut stream, 402, "root1-isolation", HashSet::from([1]))
-            .await;
-    assert_eq!(isolation_pushes.len(), 1);
-    assert_eq!(push_seq(&isolation_pushes[0]), Some(2));
-
-    // 4. Same root: route 4 binds to root 1 while route 1 reads are in flight.
-    // It must reuse the existing actor, so configure cannot start until those
-    // reads leave the shared per-root epoch.
-    let same_root_epoch_base = state.begin_epoch_wave();
-    for corr in 410..412 {
-        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "epoch" })).await;
-    }
-    state.wait_until("same-root epoch reads started", |inner| {
-        inner.epoch_started == same_root_epoch_base + 2
-    });
-    send_route_bind(&mut stream, 4, 44, &root1).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    state.assert_configure_not_started("subc-bind-4");
-    state.release_epoch_reads();
-    // The same-root configure for route 4 starts only after these reads drain,
-    // so RouteBindAck(44) (channel 0) and the read responses (channel 1) are
-    // emitted concurrently and can reach the stream in any order. Demux by
-    // channel rather than assuming the reads land before the ack.
-    let same_root_corrs =
-        collect_tool_responses_and_route_bind_ack(&mut stream, &[410, 411], 44).await;
-    assert_eq!(same_root_corrs, HashSet::from([410, 411]));
-    assert_eq!(
-        state.wait_for_configure("subc-bind-4").epoch_reads_at_start,
-        0,
-        "same-root configure should start only after route 1 reads drain"
-    );
-    send_tool_call(&mut stream, 4, 420, "glob", json!({ "case": "fast" })).await;
-    let route4_read = read_frame_timeout(&mut stream, "route 4 read response").await;
-    assert_eq!(route4_read.header.channel, 4);
-    assert_eq!(route4_read.header.corr, 420);
-    assert_tool_project_root(&route4_read, &root1);
-
-    // P5b Slice A #2: configure warnings for one session on a shared root
-    // must carry that session id and not leak to sibling sessions.
-    send_route_bind_with_session_and_doc(
-        &mut stream,
-        1,
-        49,
-        &root1,
-        "session-1",
-        json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
-            "subc_test_configure_warning": {
-                "message": "session-1-reconfigure-warning",
-            },
-        }),
-    )
-    .await;
-    expect_route_bind_ack(&mut stream, 49).await;
-    let session_configure_warning_pushes = expect_configure_warning_pushes(
-        &mut stream,
-        HashSet::from([1]),
-        &root1,
-        "session-1-reconfigure-warning",
-        "session-1",
-    )
-    .await;
-    assert_eq!(session_configure_warning_pushes.len(), 1);
-    assert_eq!(
-        session_configure_warning_pushes[0]
-            .get("session_id")
-            .and_then(Value::as_str),
-        Some("session-1")
-    );
-    assert_no_configure_warning_for_message(
-        &mut stream,
-        &root1,
-        "session-1-reconfigure-warning",
-        Duration::from_millis(150),
-    )
-    .await;
-
-    // Phase 4d-2a: second session on same root — transport session + bg isolation.
-    send_tool_call(&mut stream, 4, 422, "subc_test_echo_session", json!({})).await;
-    let echo_s4 = read_frame_timeout(&mut stream, "echo session route 4").await;
-    assert_eq!(echo_s4.header.corr, 422);
-    assert_eq!(
-        tool_response_json(&echo_s4)["transport_session"].as_str(),
-        Some("session-4"),
-    );
-
+    // A second session on the same root has its own transport session and bg state.
     send_tool_call(
         &mut stream,
         4,
@@ -1958,12 +2427,38 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     )
     .await;
     assert_eq!(session_pushes.len(), 1);
-    assert_no_bash_push_for_task(
+    send_tool_call(
         &mut stream,
-        "session-scoped-isolation",
-        Duration::from_millis(150),
+        4,
+        431,
+        "subc_test_emit_bash_completed",
+        json!({ "task_id": "session-4-isolation-sentinel" }),
     )
     .await;
+    let sentinel = expect_bash_completed_sentinel_without_task_before(
+        &mut stream,
+        431,
+        "session-4-isolation-sentinel",
+        "session-scoped-isolation",
+        4,
+    )
+    .await;
+    assert_eq!(
+        push_task_id(&sentinel),
+        Some("session-4-isolation-sentinel")
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_detached_session_replay_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_routes_1_and_4(&mut stream, &root1).await;
 
     // 4d-2b reliable buffer + replay: release route 1, emit a reliable
     // session-1 frame while only sibling session-4 remains, then re-bind the
@@ -1992,7 +2487,6 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     send_tool_call(&mut stream, 1, 4311, "glob", json!({ "case": "fast" })).await;
     expect_error_frame(&mut stream, 1, 4311, "route_not_bound").await;
     state.release_deferred_pushes();
-    assert_no_bash_push_for_task(&mut stream, reliable_task, Duration::from_millis(300)).await;
     send_route_bind_with_session(&mut stream, 7, 47, &root1, "session-1").await;
     let replayed =
         expect_route_bind_ack_and_bash_completed_push(&mut stream, 47, reliable_task, 7).await;
@@ -2024,10 +2518,25 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     send_tool_call(&mut stream, 7, 4321, "glob", json!({ "case": "fast" })).await;
     expect_error_frame(&mut stream, 7, 4321, "route_not_bound").await;
     state.release_deferred_pushes();
-    assert_no_bash_push_for_task(&mut stream, lossy_task, Duration::from_millis(300)).await;
     send_route_bind_with_session(&mut stream, 8, 48, &root1, "session-1").await;
     expect_route_bind_ack_without_task_push(&mut stream, 48, lossy_task).await;
-    assert_no_bash_push_for_task(&mut stream, lossy_task, Duration::from_millis(150)).await;
+    send_tool_call(
+        &mut stream,
+        8,
+        480,
+        "subc_test_emit_bash_completed",
+        json!({ "task_id": "lossy-drop-sentinel" }),
+    )
+    .await;
+    let lossy_sentinel = expect_bash_completed_sentinel_without_task_before(
+        &mut stream,
+        480,
+        "lossy-drop-sentinel",
+        lossy_task,
+        8,
+    )
+    .await;
+    assert_eq!(push_task_id(&lossy_sentinel), Some("lossy-drop-sentinel"));
 
     // P5b B1 finding (b): a lossy BashLongRunning emitted after its reliable
     // BashCompleted is stale and should be suppressed by the subc edge.
@@ -2048,12 +2557,38 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     )
     .await;
     assert_eq!(stale_completion.len(), 1);
-    assert_no_bash_long_running_push_for_task(
+    send_tool_call(
         &mut stream,
-        stale_long_running_task,
-        Duration::from_millis(300),
+        8,
+        434,
+        "subc_test_emit_bash_completed",
+        json!({ "task_id": "stale-long-running-sentinel" }),
     )
     .await;
+    let stale_sentinel = expect_bash_completed_sentinel_without_task_before(
+        &mut stream,
+        434,
+        "stale-long-running-sentinel",
+        stale_long_running_task,
+        8,
+    )
+    .await;
+    assert_eq!(
+        push_task_id(&stale_sentinel),
+        Some("stale-long-running-sentinel")
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_failed_new_root_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        failed_root,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
 
     // 5. B3: a new-root configure failure must not install a route and must be
     // removed from the executor before the connection exits. Any Push emitted by
@@ -2075,10 +2610,41 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     )
     .await;
     expect_route_bind_error(&mut stream, 50, "config_divergence").await;
-    assert_no_status_push_for_marker(&mut stream, "failed-no-channel", Duration::from_millis(150))
-        .await;
+    send_tool_call(
+        &mut stream,
+        1,
+        551,
+        "subc_test_emit_status",
+        json!({ "marker": "failed-no-channel-sentinel", "seq": 1 }),
+    )
+    .await;
+    let sentinel_pushes = expect_status_sentinel_without_marker_before(
+        &mut stream,
+        551,
+        "failed-no-channel-sentinel",
+        "failed-no-channel",
+        HashSet::from([1]),
+    )
+    .await;
+    assert_eq!(sentinel_pushes.len(), 1);
+    assert_eq!(push_seq(&sentinel_pushes[0]), Some(1));
     send_tool_call(&mut stream, 5, 550, "glob", json!({ "case": "fast" })).await;
     expect_error_frame(&mut stream, 5, 550, "route_not_bound").await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root2,
+        callgraph_root,
+        callgraph_file,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    send_route_bind(&mut stream, 2, 30, &root2).await;
+    expect_route_bind_ack(&mut stream, 30).await;
 
     // 6. Per-root maintenance: route 3 triggers a callgraph build and the
     // coalesced maintenance tick drains route 3's actor without collapsing route
@@ -2136,12 +2702,7 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     assert_eq!(route2_after_maintenance.header.channel, 2);
     assert_tool_project_root(&route2_after_maintenance, &root2);
 
-    send_frame(
-        &mut stream,
-        Frame::build(FrameType::Goodbye, control_flags(), 0, 99, Vec::new())
-            .expect("goodbye frame"),
-    )
-    .await;
+    send_connection_goodbye(&mut stream).await;
 }
 
 async fn send_route_bind(
@@ -2455,40 +3016,55 @@ async fn expect_configure_warning_pushes(
     pushes
 }
 
-async fn assert_no_configure_warning_for_message(
+async fn expect_tool_response_without_configure_warning_for_message(
     stream: &mut tokio::net::TcpStream,
+    corr: u64,
     expected_root: &std::path::Path,
     expected_message: &str,
-    duration: Duration,
 ) {
-    let deadline = Instant::now() + duration;
+    let deadline = Instant::now() + Duration::from_secs(30);
     let expected_root = expected_root.to_string_lossy().into_owned();
     loop {
         let now = Instant::now();
-        if now >= deadline {
-            return;
-        }
+        assert!(
+            now < deadline,
+            "timed out waiting for sentinel response without configure warning"
+        );
         let remaining = deadline.saturating_duration_since(now);
-        match tokio::time::timeout(remaining, read_frame(stream)).await {
-            Err(_) => return,
-            Ok(Ok(Some(frame))) => {
-                if frame.header.ty == FrameType::Push {
-                    let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-                    let matches_warning = push_type(&body) == Some("configure_warnings")
-                        && body.get("project_root").and_then(Value::as_str)
-                            == Some(expected_root.as_str())
-                        && configure_warning_message_from_push(&body) == Some(expected_message);
-                    assert!(
-                        !matches_warning,
-                        "configure_warnings push leaked to channel {}: {body:?}",
-                        frame.header.channel
-                    );
-                }
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for sentinel response without configure warning")
+            })
+            .expect("read frame")
+            .unwrap_or_else(|| {
+                panic!("EOF waiting for sentinel response without configure warning")
+            });
+        match frame.header.ty {
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                let matches_warning = push_type(&body) == Some("configure_warnings")
+                    && body.get("project_root").and_then(Value::as_str)
+                        == Some(expected_root.as_str())
+                    && configure_warning_message_from_push(&body) == Some(expected_message);
+                assert!(
+                    !matches_warning,
+                    "configure_warnings push leaked before sentinel response on channel {}: {body:?}",
+                    frame.header.channel
+                );
             }
-            Ok(Ok(None)) => panic!("EOF while checking absence of configure_warnings push"),
-            Ok(Err(error)) => {
-                panic!("error while checking absence of configure_warnings push: {error}")
+            FrameType::Response if frame.header.corr == corr => {
+                let response = tool_response_json(&frame);
+                assert!(
+                    response["success"].as_bool().unwrap_or(false),
+                    "sentinel tool response should succeed: {response:?}"
+                );
+                return;
             }
+            other => panic!(
+                "unexpected frame while waiting for sentinel response without configure warning: {other:?}"
+            ),
         }
     }
 }
@@ -2684,71 +3260,65 @@ async fn expect_route_bind_ack_status_and_bash_completed_pushes(
     (status_pushes, bash_pushes)
 }
 
-async fn assert_no_bash_push_for_task(
+async fn expect_bash_completed_sentinel_without_task_before(
     stream: &mut tokio::net::TcpStream,
-    task_id: &str,
-    duration: Duration,
-) {
-    let deadline = Instant::now() + duration;
-    loop {
+    corr: u64,
+    sentinel_task_id: &str,
+    forbidden_task_id: &str,
+    expected_channel: u16,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut response_seen = false;
+    let mut sentinel_seen = None;
+
+    while !response_seen || sentinel_seen.is_none() {
         let now = Instant::now();
-        if now >= deadline {
-            return;
-        }
+        assert!(
+            now < deadline,
+            "timed out waiting for sentinel bash push {sentinel_task_id}"
+        );
         let remaining = deadline.saturating_duration_since(now);
-        match tokio::time::timeout(remaining, read_frame(stream)).await {
-            Err(_) => return,
-            Ok(Ok(Some(frame))) => {
-                if frame.header.ty == FrameType::Push {
-                    let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for sentinel bash push {sentinel_task_id}")
+            })
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for sentinel bash push {sentinel_task_id}"));
+        match frame.header.ty {
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if sentinel_seen.is_none() {
                     assert_ne!(
                         push_task_id(&body),
-                        Some(task_id),
-                        "unexpected push for task {task_id} on channel {}: {body:?}",
+                        Some(forbidden_task_id),
+                        "forbidden push for task {forbidden_task_id} was queued before sentinel {sentinel_task_id} on channel {}: {body:?}",
                         frame.header.channel
                     );
                 }
+                if push_type(&body) == Some("bash_completed")
+                    && push_task_id(&body) == Some(sentinel_task_id)
+                {
+                    assert_eq!(frame.header.channel, expected_channel);
+                    sentinel_seen = Some(body);
+                }
             }
-            Ok(Ok(None)) => panic!("EOF while checking absence of bash push {task_id}"),
-            Ok(Err(error)) => {
-                panic!("error while checking absence of bash push {task_id}: {error}")
+            FrameType::Response if frame.header.corr == corr => {
+                let response = tool_response_json(&frame);
+                assert!(
+                    response["success"].as_bool().unwrap_or(false),
+                    "sentinel bash emit response should succeed: {response:?}"
+                );
+                response_seen = true;
             }
+            other => panic!(
+                "unexpected frame while waiting for sentinel bash push {sentinel_task_id}: {other:?}"
+            ),
         }
     }
-}
 
-async fn assert_no_bash_long_running_push_for_task(
-    stream: &mut tokio::net::TcpStream,
-    task_id: &str,
-    duration: Duration,
-) {
-    let deadline = Instant::now() + duration;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return;
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        match tokio::time::timeout(remaining, read_frame(stream)).await {
-            Err(_) => return,
-            Ok(Ok(Some(frame))) => {
-                if frame.header.ty == FrameType::Push {
-                    let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-                    let stale_long_running = push_type(&body) == Some("bash_long_running")
-                        && push_task_id(&body) == Some(task_id);
-                    assert!(
-                        !stale_long_running,
-                        "unexpected stale long-running push for task {task_id} on channel {}: {body:?}",
-                        frame.header.channel
-                    );
-                }
-            }
-            Ok(Ok(None)) => panic!("EOF while checking absence of stale long-running push"),
-            Ok(Err(error)) => {
-                panic!("error while checking absence of stale long-running push: {error}")
-            }
-        }
-    }
+    sentinel_seen.expect("sentinel bash push seen")
 }
 
 async fn expect_route_bind_ack_and_bash_completed_push(
@@ -2995,36 +3565,114 @@ async fn expect_status_pushes_for_tool(
     pushes
 }
 
-async fn assert_no_status_push_for_marker(
+async fn expect_status_pushes_for_marker_seq(
     stream: &mut tokio::net::TcpStream,
     marker: &str,
-    duration: Duration,
-) {
-    let deadline = Instant::now() + duration;
-    loop {
+    seq: u64,
+    expected_channels: HashSet<u16>,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut pushes = Vec::new();
+    let mut channels = HashSet::new();
+
+    while channels != expected_channels {
         let now = Instant::now();
-        if now >= deadline {
-            return;
-        }
+        assert!(
+            now < deadline,
+            "timed out waiting for push marker {marker} seq {seq}"
+        );
         let remaining = deadline.saturating_duration_since(now);
-        match tokio::time::timeout(remaining, read_frame(stream)).await {
-            Err(_) => return,
-            Ok(Ok(Some(frame))) => {
-                if frame.header.ty == FrameType::Push {
-                    let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-                    assert_ne!(
-                        push_marker(&body),
-                        Some(marker),
-                        "unexpected push marker {marker}: {body:?}"
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for push marker {marker} seq {seq}"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for push marker {marker} seq {seq}"));
+        match frame.header.ty {
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if push_marker(&body) == Some(marker) && push_seq(&body) == Some(seq) {
+                    assert!(
+                        expected_channels.contains(&frame.header.channel),
+                        "status push {marker} seq {seq} leaked to unexpected channel {}",
+                        frame.header.channel
                     );
+                    channels.insert(frame.header.channel);
+                    pushes.push(body);
                 }
             }
-            Ok(Ok(None)) => panic!("EOF while checking absence of push marker {marker}"),
-            Ok(Err(error)) => {
-                panic!("error while checking absence of push marker {marker}: {error}")
-            }
+            other => panic!(
+                "unexpected frame while waiting for push marker {marker} seq {seq}: {other:?}"
+            ),
         }
     }
+
+    assert_eq!(channels, expected_channels);
+    pushes
+}
+
+async fn expect_status_sentinel_without_marker_before(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    sentinel_marker: &str,
+    forbidden_marker: &str,
+    expected_channels: HashSet<u16>,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut response_seen = false;
+    let mut sentinel_pushes = Vec::new();
+    let mut sentinel_channels = HashSet::new();
+
+    while !response_seen || sentinel_channels != expected_channels {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for sentinel marker {sentinel_marker}"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for sentinel marker {sentinel_marker}"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for sentinel marker {sentinel_marker}"));
+        match frame.header.ty {
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if sentinel_channels != expected_channels {
+                    assert_ne!(
+                        push_marker(&body),
+                        Some(forbidden_marker),
+                        "forbidden status marker {forbidden_marker} was queued before sentinel {sentinel_marker} on channel {}: {body:?}",
+                        frame.header.channel
+                    );
+                }
+                if push_marker(&body) == Some(sentinel_marker) {
+                    assert!(
+                        expected_channels.contains(&frame.header.channel),
+                        "sentinel status push {sentinel_marker} leaked to unexpected channel {}",
+                        frame.header.channel
+                    );
+                    sentinel_channels.insert(frame.header.channel);
+                    sentinel_pushes.push(body);
+                }
+            }
+            FrameType::Response if frame.header.corr == corr => {
+                let response = tool_response_json(&frame);
+                assert!(
+                    response["success"].as_bool().unwrap_or(false),
+                    "sentinel status emit response should succeed: {response:?}"
+                );
+                response_seen = true;
+            }
+            other => panic!(
+                "unexpected frame while waiting for sentinel marker {sentinel_marker}: {other:?}"
+            ),
+        }
+    }
+
+    assert_eq!(sentinel_channels, expected_channels);
+    sentinel_pushes
 }
 
 fn assert_tool_project_root(frame: &Frame, root: &std::path::Path) {
