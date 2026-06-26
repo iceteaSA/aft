@@ -15,6 +15,33 @@ pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
 const MAX_UNDO_DEPTH: usize = DEFAULT_MAX_UNDO_DEPTH;
 const V2_FORMAT_VERSION: &str = "v2";
 
+#[cfg(test)]
+type RestoreBeforeLockHook = (String, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+static RESTORE_BEFORE_LOCK_HOOK: Mutex<Option<RestoreBeforeLockHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_restore_before_lock_hook_for_tests(session: &str, hook: impl FnOnce() + Send + 'static) {
+    *RESTORE_BEFORE_LOCK_HOOK.lock().unwrap() = Some((session.to_string(), Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_restore_before_lock_hook_for_tests(session: &str) {
+    let mut hook_slot = RESTORE_BEFORE_LOCK_HOOK.lock().unwrap();
+    if hook_slot
+        .as_ref()
+        .is_some_and(|(hook_session, _)| hook_session == session)
+    {
+        let (_, hook) = hook_slot.take().unwrap();
+        drop(hook_slot);
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_restore_before_lock_hook_for_tests(_session: &str) {}
+
 /// Current on-disk backup metadata schema version.
 ///
 /// Bump this when the `meta.json` shape changes. Readers check the field and
@@ -229,6 +256,8 @@ pub struct BackupStore {
     db_harness: RwLock<Option<String>>,
     db_project_key: RwLock<Option<String>>,
     policy: BackupPolicy,
+    #[cfg(test)]
+    fail_next_disk_write: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -257,20 +286,42 @@ impl BackupStore {
             db_harness: RwLock::new(None),
             db_project_key: RwLock::new(None),
             policy: BackupPolicy::default(),
+            #[cfg(test)]
+            fail_next_disk_write: false,
         }
     }
 
     pub fn set_policy(&mut self, policy: BackupPolicy) {
+        let old_policy = self.policy;
         self.policy = policy;
-        for files in self.entries.values_mut() {
-            for stack in files.values_mut() {
+
+        let failed_disk_prunes = if policy.max_depth < old_policy.max_depth {
+            self.prune_disk_stacks_to_depth(policy.max_depth)
+        } else {
+            HashSet::new()
+        };
+
+        for (session, files) in &mut self.entries {
+            for (key, stack) in files {
+                if failed_disk_prunes.contains(&(session.clone(), key.clone())) {
+                    continue;
+                }
                 trim_stack_to_depth(stack, self.policy.max_depth);
             }
         }
+        self.entries.retain(|_, files| {
+            files.retain(|_, stack| !stack.is_empty());
+            !files.is_empty()
+        });
     }
 
     pub fn policy(&self) -> BackupPolicy {
         self.policy
+    }
+
+    #[cfg(test)]
+    fn fail_next_disk_write_for_tests(&mut self) {
+        self.fail_next_disk_write = true;
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<Connection>>) {
@@ -361,6 +412,11 @@ impl BackupStore {
         let entry = backup_entry_from_path(path, id.clone(), order, description, op_id)?;
 
         let max_depth = self.policy.max_depth;
+        let pre_mutation_stack = self
+            .entries
+            .get(session)
+            .and_then(|files| files.get(&key))
+            .cloned();
         let session_entries = self.entries.entry(session.to_string()).or_default();
         let stack = session_entries.entry(key.clone()).or_default();
         trim_stack_to_depth(stack, max_depth.saturating_sub(1));
@@ -370,17 +426,7 @@ impl BackupStore {
         // Persist to disk
         let stack_clone = stack.clone();
         if let Err(error) = self.write_snapshot_to_disk_locked(session, &key, &stack_clone) {
-            if let Some(session_entries) = self.entries.get_mut(session) {
-                if let Some(stack) = session_entries.get_mut(&key) {
-                    stack.retain(|entry| entry.backup_id != id);
-                    if stack.is_empty() {
-                        session_entries.remove(&key);
-                    }
-                }
-                if session_entries.is_empty() {
-                    self.entries.remove(session);
-                }
-            }
+            self.restore_in_memory_stack(session, &key, pre_mutation_stack);
             return Err(error);
         }
         self.touch_session(session);
@@ -420,6 +466,11 @@ impl BackupStore {
         };
 
         let max_depth = self.policy.max_depth;
+        let pre_mutation_stack = self
+            .entries
+            .get(session)
+            .and_then(|files| files.get(&key))
+            .cloned();
         let session_entries = self.entries.entry(session.to_string()).or_default();
         let stack = session_entries.entry(key.clone()).or_default();
         trim_stack_to_depth(stack, max_depth.saturating_sub(1));
@@ -428,17 +479,7 @@ impl BackupStore {
 
         let stack_clone = stack.clone();
         if let Err(error) = self.write_snapshot_to_disk_locked(session, &key, &stack_clone) {
-            if let Some(session_entries) = self.entries.get_mut(session) {
-                if let Some(stack) = session_entries.get_mut(&key) {
-                    stack.retain(|entry| entry.backup_id != id);
-                    if stack.is_empty() {
-                        session_entries.remove(&key);
-                    }
-                }
-                if session_entries.is_empty() {
-                    self.entries.remove(session);
-                }
-            }
+            self.restore_in_memory_stack(session, &key, pre_mutation_stack);
             return Err(error);
         }
         self.touch_session(session);
@@ -449,162 +490,121 @@ impl BackupStore {
     /// Restore every top-of-stack backup entry belonging to the most recent
     /// operation in this session.
     pub fn restore_last_operation(&mut self, session: &str) -> Result<RestoredOperation, AftError> {
-        self.load_all_disk_backups(session);
-        let has_in_memory_entries = self
-            .entries
-            .get(session)
-            .is_some_and(|files| files.values().any(|stack| !stack.is_empty()));
-        if !has_in_memory_entries {
-            match self.load_latest_operation_from_db(session) {
-                Some(Ok(true)) => {}
-                Some(Ok(false)) => {
-                    crate::slog_info!(
-                        "backup latest operation DB miss for session {}; disk meta is authoritative",
-                        session
-                    );
-                }
-                Some(Err(error)) => {
-                    crate::slog_warn!(
-                        "backup latest operation DB lookup failed for session {}: {}",
-                        session,
-                        error
-                    );
-                }
-                None => {
-                    crate::slog_info!(
-                        "backup latest operation DB unavailable for session {}",
-                        session
-                    );
-                }
-            }
+        let mut candidate_keys = self.restore_operation_candidate_keys(session)?;
+        if candidate_keys.is_empty() {
+            self.load_latest_operation_from_db_or_log(session);
+            candidate_keys = self.restore_operation_candidate_keys(session)?;
         }
 
-        let mut latest: Option<(u128, String)> = None;
-        if let Some(files) = self.entries.get(session) {
-            for stack in files.values() {
-                if let Some(entry) = stack.last() {
-                    if let Some(op_id) = &entry.op_id {
-                        let order = entry.order;
-                        if latest
-                            .as_ref()
-                            .map_or(true, |(latest_order, _)| order > *latest_order)
-                        {
-                            latest = Some((order, op_id.clone()));
-                        }
-                    }
-                }
-            }
-        }
-
-        let Some((_, op_id)) = latest else {
-            return Err(AftError::NoUndoHistory {
-                path: "operation".to_string(),
-            });
-        };
-
-        let mut keys_to_restore: Vec<PathBuf> = self
-            .entries
-            .get(session)
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(|(key, stack)| {
-                        stack.last().and_then(|entry| {
-                            (entry.op_id.as_deref() == Some(op_id.as_str())).then(|| key.clone())
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        keys_to_restore.sort();
-
-        if keys_to_restore.is_empty() {
-            return Err(AftError::NoUndoHistory {
-                path: "operation".to_string(),
-            });
-        }
-
-        let _disk_locks = self.acquire_stack_disk_locks(session, &keys_to_restore)?;
-
-        let mut content_targets = Vec::new();
-        let mut tombstone_targets = Vec::new();
-        for key in &keys_to_restore {
-            let entry = self
-                .entries
-                .get(session)
-                .and_then(|files| files.get(key))
-                .and_then(|stack| stack.last())
-                .cloned()
-                .ok_or_else(|| AftError::NoUndoHistory {
-                    path: key.display().to_string(),
-                })?;
-            match entry.kind {
-                BackupEntryKind::Content | BackupEntryKind::Symlink => {
-                    let existing_state = capture_path_state(key)?;
-                    let warning = self.check_external_modification(session, key, key);
-                    content_targets.push((key.clone(), entry, warning, existing_state));
-                }
-                BackupEntryKind::Tombstone => {
-                    let existing_state = capture_path_state(key)?;
-                    tombstone_targets.push((key.clone(), entry, existing_state));
-                }
-            }
-        }
-
-        let mut created_dirs = Vec::new();
-        for (key, _, _, _) in &content_targets {
-            if let Some(parent) = key.parent() {
-                if !parent.as_os_str().is_empty() {
-                    let missing_dirs = missing_parent_dirs(parent);
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        let mut dirs_to_remove = created_dirs;
-                        dirs_to_remove.extend(missing_dirs);
-                        let rollback_ok = rollback_created_dirs(&dirs_to_remove);
-                        return Err(AftError::IoError {
-                            path: parent.display().to_string(),
-                            message: format!(
-                                "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
-                                e,
-                                !rollback_ok,
-                                rollback_ok
-                            ),
-                        });
-                    }
-                    created_dirs.extend(missing_dirs);
-                }
-            }
-        }
-
-        let mut written = Vec::new();
-        for (key, entry, _, existing_state) in &content_targets {
-            if let Err(e) = restore_entry_to_path(key, entry) {
-                let files_rollback_ok =
-                    rollback_transactional_restore(&written, Some((key, existing_state)));
-                let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
-                let rollback_ok = files_rollback_ok && dirs_rollback_ok;
-                return Err(AftError::IoError {
-                    path: key.display().to_string(),
-                    message: format!(
-                        "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
-                        e,
-                        !rollback_ok,
-                        rollback_ok
-                    ),
+        let mut hook_ran = false;
+        loop {
+            if candidate_keys.is_empty() {
+                return Err(AftError::NoUndoHistory {
+                    path: "operation".to_string(),
                 });
             }
-            written.push((key.clone(), existing_state.clone()));
-        }
 
-        let mut deleted_tombstones = Vec::new();
-        for (key, _, existing_state) in &tombstone_targets {
-            match remove_tombstone_path(key) {
-                Ok(()) => deleted_tombstones.push((key.clone(), existing_state.clone())),
-                Err(e) => {
-                    let files_rollback_ok = rollback_transactional_restore(&written, None);
-                    let tombstone_rollback_ok = rollback_deleted_tombstones(&deleted_tombstones);
+            if !hook_ran {
+                run_restore_before_lock_hook_for_tests(session);
+                hook_ran = true;
+            }
+
+            let disk_locks = self.acquire_stack_disk_locks(session, &candidate_keys)?;
+            let locked_keys: HashSet<PathBuf> = candidate_keys.iter().cloned().collect();
+            let current_keys = self.restore_operation_candidate_keys(session)?;
+            let current_key_set: HashSet<PathBuf> = current_keys.iter().cloned().collect();
+            if !current_key_set.is_subset(&locked_keys) {
+                drop(disk_locks);
+                candidate_keys = current_key_set.into_iter().collect();
+                candidate_keys.sort();
+                continue;
+            }
+
+            for key in &current_keys {
+                self.load_from_disk_if_needed_locked(session, key)?;
+            }
+
+            if !self.has_in_memory_entries(session) {
+                self.load_latest_operation_from_db_or_log(session);
+            }
+
+            let Some(op_id) = self.latest_operation_id_from_memory(session) else {
+                return Err(AftError::NoUndoHistory {
+                    path: "operation".to_string(),
+                });
+            };
+
+            let keys_to_restore = self.operation_keys_for_top_op(session, &op_id);
+            if keys_to_restore.is_empty() {
+                return Err(AftError::NoUndoHistory {
+                    path: "operation".to_string(),
+                });
+            }
+            if !keys_to_restore.iter().all(|key| locked_keys.contains(key)) {
+                drop(disk_locks);
+                candidate_keys = locked_keys.into_iter().collect();
+                candidate_keys.extend(keys_to_restore);
+                candidate_keys.sort();
+                candidate_keys.dedup();
+                continue;
+            }
+
+            let mut content_targets = Vec::new();
+            let mut tombstone_targets = Vec::new();
+            for key in &keys_to_restore {
+                let entry = self
+                    .entries
+                    .get(session)
+                    .and_then(|files| files.get(key))
+                    .and_then(|stack| stack.last())
+                    .cloned()
+                    .ok_or_else(|| AftError::NoUndoHistory {
+                        path: key.display().to_string(),
+                    })?;
+                match entry.kind {
+                    BackupEntryKind::Content | BackupEntryKind::Symlink => {
+                        let existing_state = capture_path_state(key)?;
+                        let warning = self.check_external_modification(session, key, key);
+                        content_targets.push((key.clone(), entry, warning, existing_state));
+                    }
+                    BackupEntryKind::Tombstone => {
+                        let existing_state = capture_path_state(key)?;
+                        tombstone_targets.push((key.clone(), entry, existing_state));
+                    }
+                }
+            }
+
+            let mut created_dirs = Vec::new();
+            for (key, _, _, _) in &content_targets {
+                if let Some(parent) = key.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let missing_dirs = missing_parent_dirs(parent);
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            let mut dirs_to_remove = created_dirs;
+                            dirs_to_remove.extend(missing_dirs);
+                            let rollback_ok = rollback_created_dirs(&dirs_to_remove);
+                            return Err(AftError::IoError {
+                                path: parent.display().to_string(),
+                                message: format!(
+                                    "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
+                                    e,
+                                    !rollback_ok,
+                                    rollback_ok
+                                ),
+                            });
+                        }
+                        created_dirs.extend(missing_dirs);
+                    }
+                }
+            }
+
+            let mut written = Vec::new();
+            for (key, entry, _, existing_state) in &content_targets {
+                if let Err(e) = restore_entry_to_path(key, entry) {
+                    let files_rollback_ok =
+                        rollback_transactional_restore(&written, Some((key, existing_state)));
                     let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
-                    let rollback_ok =
-                        files_rollback_ok && tombstone_rollback_ok && dirs_rollback_ok;
+                    let rollback_ok = files_rollback_ok && dirs_rollback_ok;
                     return Err(AftError::IoError {
                         path: key.display().to_string(),
                         message: format!(
@@ -615,36 +615,62 @@ impl BackupStore {
                         ),
                     });
                 }
+                written.push((key.clone(), existing_state.clone()));
             }
-        }
-        let tombstone_created_dirs = tombstone_targets
-            .iter()
-            .flat_map(|(_, entry, _)| entry.created_dirs.iter().cloned())
-            .collect::<Vec<_>>();
-        remove_created_dirs_best_effort(&tombstone_created_dirs);
 
-        let mut restored = Vec::new();
-        let mut warnings = Vec::new();
-        for (key, entry, warning, _) in content_targets {
-            self.commit_restored_backup_locked(session, &key)?;
-            if let Some(warning) = warning {
-                warnings.push(format!("{}: {}", key.display(), warning));
+            let mut deleted_tombstones = Vec::new();
+            for (key, _, existing_state) in &tombstone_targets {
+                match remove_tombstone_path(key) {
+                    Ok(()) => deleted_tombstones.push((key.clone(), existing_state.clone())),
+                    Err(e) => {
+                        let files_rollback_ok = rollback_transactional_restore(&written, None);
+                        let tombstone_rollback_ok =
+                            rollback_deleted_tombstones(&deleted_tombstones);
+                        let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
+                        let rollback_ok =
+                            files_rollback_ok && tombstone_rollback_ok && dirs_rollback_ok;
+                        return Err(AftError::IoError {
+                            path: key.display().to_string(),
+                            message: format!(
+                                "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
+                                e,
+                                !rollback_ok,
+                                rollback_ok
+                            ),
+                        });
+                    }
+                }
             }
-            restored.push(RestoredFile {
-                path: key,
-                backup_id: entry.backup_id,
+            let tombstone_created_dirs = tombstone_targets
+                .iter()
+                .flat_map(|(_, entry, _)| entry.created_dirs.iter().cloned())
+                .collect::<Vec<_>>();
+            remove_created_dirs_best_effort(&tombstone_created_dirs);
+
+            let mut restored = Vec::new();
+            let mut warnings = Vec::new();
+            for (key, entry, warning, _) in content_targets {
+                self.commit_restored_backup_locked(session, &key)?;
+                if let Some(warning) = warning {
+                    warnings.push(format!("{}: {}", key.display(), warning));
+                }
+                restored.push(RestoredFile {
+                    path: key,
+                    backup_id: entry.backup_id,
+                });
+            }
+            for (key, _, _) in tombstone_targets {
+                self.commit_restored_backup_locked(session, &key)?;
+            }
+            self.touch_session(session);
+            drop(disk_locks);
+
+            return Ok(RestoredOperation {
+                op_id,
+                restored,
+                warnings,
             });
         }
-        for (key, _, _) in tombstone_targets {
-            self.commit_restored_backup_locked(session, &key)?;
-        }
-        self.touch_session(session);
-
-        Ok(RestoredOperation {
-            op_id,
-            restored,
-            warnings,
-        })
     }
 
     /// Pop the most recent backup for `(session, path)` and restore the file.
@@ -1083,7 +1109,7 @@ impl BackupStore {
                 .map_err(|error| error.to_string())
                 .and_then(|rows| {
                     rows.into_iter()
-                        .map(BackupEntry::try_from)
+                        .map(|row| self.backup_entry_from_db_row(row))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|error| error.to_string())
                 }),
@@ -1147,7 +1173,7 @@ impl BackupStore {
                     Ok(rows) => {
                         let file_path = rows.first().map(|row| row.file_path.clone());
                         rows.into_iter()
-                            .map(BackupEntry::try_from)
+                            .map(|row| self.backup_entry_from_db_row(row))
                             .collect::<Result<Vec<_>, _>>()
                             .map(|stack| (file_path, stack))
                             .map_err(|error| error.to_string())
@@ -1190,6 +1216,121 @@ impl BackupStore {
                     (current < next_counter).then_some(next_counter)
                 });
         }
+    }
+
+    fn restore_in_memory_stack(
+        &mut self,
+        session: &str,
+        key: &Path,
+        stack: Option<Vec<BackupEntry>>,
+    ) {
+        match stack {
+            Some(stack) if !stack.is_empty() => {
+                self.entries
+                    .entry(session.to_string())
+                    .or_default()
+                    .insert(key.to_path_buf(), stack);
+            }
+            _ => {
+                if let Some(files) = self.entries.get_mut(session) {
+                    files.remove(key);
+                    if files.is_empty() {
+                        self.entries.remove(session);
+                    }
+                }
+            }
+        }
+    }
+
+    fn has_in_memory_entries(&self, session: &str) -> bool {
+        self.entries
+            .get(session)
+            .is_some_and(|files| files.values().any(|stack| !stack.is_empty()))
+    }
+
+    fn latest_operation_id_from_memory(&self, session: &str) -> Option<String> {
+        let mut latest: Option<(u128, String)> = None;
+        if let Some(files) = self.entries.get(session) {
+            for stack in files.values() {
+                if let Some(entry) = stack.last() {
+                    if let Some(op_id) = &entry.op_id {
+                        if latest
+                            .as_ref()
+                            .is_none_or(|(latest_order, _)| entry.order > *latest_order)
+                        {
+                            latest = Some((entry.order, op_id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        latest.map(|(_, op_id)| op_id)
+    }
+
+    fn operation_keys_for_top_op(&self, session: &str, op_id: &str) -> Vec<PathBuf> {
+        let mut keys: Vec<PathBuf> = self
+            .entries
+            .get(session)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|(key, stack)| {
+                        stack.last().and_then(|entry| {
+                            (entry.op_id.as_deref() == Some(op_id)).then(|| key.clone())
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
+    fn load_latest_operation_from_db_or_log(&mut self, session: &str) {
+        match self.load_latest_operation_from_db(session) {
+            Some(Ok(true)) => {}
+            Some(Ok(false)) => {
+                crate::slog_info!(
+                    "backup latest operation DB miss for session {}; disk meta is authoritative",
+                    session
+                );
+            }
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "backup latest operation DB lookup failed for session {}: {}",
+                    session,
+                    error
+                );
+            }
+            None => {
+                crate::slog_info!(
+                    "backup latest operation DB unavailable for session {}",
+                    session
+                );
+            }
+        }
+    }
+
+    fn resolve_db_backup_row_path(&self, mut row: BackupRow) -> BackupRow {
+        if let Some(backup_path) = row.backup_path.clone() {
+            let path = PathBuf::from(&backup_path);
+            if path.is_relative() {
+                if let Some(session_dir) = self.session_dir(&row.session_id) {
+                    row.backup_path = Some(
+                        session_dir
+                            .join(&row.path_hash)
+                            .join(path)
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        row
+    }
+
+    fn backup_entry_from_db_row(&self, row: BackupRow) -> Result<BackupEntry, std::io::Error> {
+        BackupEntry::try_from(self.resolve_db_backup_row_path(row))
     }
 
     pub fn discard_operation_entries(&mut self, session: &str, op_id: &str) {
@@ -1837,6 +1978,7 @@ impl BackupStore {
         Ok(guards)
     }
 
+    #[cfg(test)]
     fn load_from_disk_if_needed(&mut self, session: &str, key: &Path) -> Result<bool, AftError> {
         let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
         self.load_from_disk_if_needed_locked(session, key)
@@ -1849,7 +1991,23 @@ impl BackupStore {
     ) -> Result<bool, AftError> {
         let entries = match self.read_stack_from_disk_unlocked(session, key) {
             Ok(Some(entries)) => entries,
-            Ok(None) => return Ok(false),
+            Ok(None) => {
+                let disk_meta_present = self
+                    .read_disk_meta_value(session, key)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if disk_meta_present {
+                    self.restore_in_memory_stack(session, key, None);
+                }
+                if let Some(files) = self.disk_index.get_mut(session) {
+                    files.remove(key);
+                    if files.is_empty() {
+                        self.disk_index.remove(session);
+                    }
+                }
+                return Ok(false);
+            }
             Err(error) => {
                 return Err(AftError::IoError {
                     path: key.display().to_string(),
@@ -1859,7 +2017,12 @@ impl BackupStore {
         };
 
         self.update_counter_from_entries(&entries);
-
+        if let Ok(Some((disk_meta, _))) = self.read_disk_meta_value(session, key) {
+            self.disk_index
+                .entry(session.to_string())
+                .or_default()
+                .insert(key.to_path_buf(), disk_meta);
+        }
         self.entries
             .entry(session.to_string())
             .or_default()
@@ -1867,47 +2030,105 @@ impl BackupStore {
         Ok(true)
     }
 
-    /// Ensure the in-memory undo stack for `(session, key)` reflects any prior
-    /// on-disk history before a new snapshot is appended.
+    /// Re-read the on-disk stack while the per-stack disk lock is held.
     ///
-    /// Without this, a fresh `BackupStore` (e.g. after a bridge/process
-    /// restart, which clears `self.entries` and resets `counter` to 0) would
-    /// append a new snapshot onto an EMPTY in-memory stack and then
-    /// `write_snapshot_to_disk` would overwrite the file's `meta.json`/`.bak`
-    /// set with that single entry — silently discarding all undo history
-    /// captured before the restart, and reusing `backup-0` because the counter
-    /// was never advanced past the persisted entries. Hydrating here preserves
-    /// the prior stack AND advances the counter via
-    /// `update_counter_from_entries`. Only loads when nothing is in memory yet,
-    /// so it never clobbers a stack already mutated in this run and adds at
-    /// most one disk read per file per session.
+    /// The on-disk stack is authoritative across processes. A long-running
+    /// process may have a non-empty but stale in-memory stack, so every mutating
+    /// append validates disk state before it writes new metadata or prunes old
+    /// content files.
     fn ensure_stack_hydrated_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
-        let already_in_memory = self
-            .entries
-            .get(session)
-            .and_then(|files| files.get(key))
-            .is_some_and(|stack| !stack.is_empty());
-        if !already_in_memory {
-            self.load_from_disk_if_needed_locked(session, key)?;
-        }
+        self.load_from_disk_if_needed_locked(session, key)?;
         Ok(())
     }
 
-    fn load_all_disk_backups(&mut self, session: &str) {
-        let disk_keys: Vec<PathBuf> = self
-            .disk_index
-            .get(session)
-            .map(|files| files.keys().cloned().collect())
-            .unwrap_or_default();
-        for key in disk_keys {
-            if let Err(error) = self.load_from_disk_if_needed(session, &key) {
-                crate::slog_warn!(
-                    "failed to hydrate backup stack for {}: {}",
-                    key.display(),
-                    error
+    fn refresh_disk_index_for_session(&mut self, session: &str) -> Result<Vec<PathBuf>, AftError> {
+        let Some(session_dir) = self.session_dir(session) else {
+            self.disk_index.remove(session);
+            return Ok(Vec::new());
+        };
+        if !session_dir.exists() {
+            self.disk_index.remove(session);
+            return Ok(Vec::new());
+        }
+
+        let path_dirs = std::fs::read_dir(&session_dir).map_err(|error| AftError::IoError {
+            path: session_dir.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let mut per_session = HashMap::new();
+        for path_entry in path_dirs {
+            let path_entry = path_entry.map_err(|error| AftError::IoError {
+                path: session_dir.display().to_string(),
+                message: error.to_string(),
+            })?;
+            let path_dir = path_entry.path();
+            if !path_dir.is_dir() {
+                continue;
+            }
+            let meta_path = path_dir.join("meta.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            let content =
+                std::fs::read_to_string(&meta_path).map_err(|error| AftError::IoError {
+                    path: meta_path.display().to_string(),
+                    message: error.to_string(),
+                })?;
+            let meta = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
+                AftError::IoError {
+                    path: meta_path.display().to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+            let path_str = meta
+                .get("path")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| AftError::IoError {
+                    path: meta_path.display().to_string(),
+                    message: "backup meta missing path".to_string(),
+                })?;
+            let key = PathBuf::from(path_str);
+            if !is_loadable_backup_path(&key, &path_dir) {
+                continue;
+            }
+            let count = meta_entry_count(&meta).ok_or_else(|| AftError::IoError {
+                path: meta_path.display().to_string(),
+                message: "backup meta missing entry count".to_string(),
+            })?;
+            if count > 0 {
+                per_session.insert(
+                    key,
+                    DiskMeta {
+                        dir: path_dir,
+                        count,
+                    },
                 );
             }
         }
+
+        let keys = per_session.keys().cloned().collect::<Vec<_>>();
+        if per_session.is_empty() {
+            self.disk_index.remove(session);
+        } else {
+            self.disk_index.insert(session.to_string(), per_session);
+        }
+        Ok(keys)
+    }
+
+    fn restore_operation_candidate_keys(
+        &mut self,
+        session: &str,
+    ) -> Result<Vec<PathBuf>, AftError> {
+        let mut keys: HashSet<PathBuf> = self
+            .refresh_disk_index_for_session(session)?
+            .into_iter()
+            .collect();
+        if let Some(files) = self.entries.get(session) {
+            keys.extend(files.keys().cloned());
+        }
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        keys.sort();
+        Ok(keys)
     }
 
     fn read_stack_heads_from_disk(
@@ -2009,39 +2230,29 @@ impl BackupStore {
         session: &str,
         key: &Path,
     ) -> Result<Option<(DiskMeta, serde_json::Value)>, String> {
-        let Some(disk_meta) = self.disk_meta_for_stack(session, key) else {
+        let Some(session_dir) = self.session_dir(session) else {
             return Ok(None);
         };
-        let meta_path = disk_meta.dir.join("meta.json");
+        let dir = session_dir.join(Self::path_hash(key));
+        let meta_path = dir.join("meta.json");
+        if !meta_path.exists() {
+            return Ok(None);
+        }
         let content = std::fs::read_to_string(&meta_path)
             .map_err(|error| format!("failed to read {}: {}", meta_path.display(), error))?;
         let meta = serde_json::from_str::<serde_json::Value>(&content)
             .map_err(|error| format!("failed to parse {}: {}", meta_path.display(), error))?;
-        Ok(Some((disk_meta, meta)))
-    }
-
-    fn disk_meta_for_stack(&self, session: &str, key: &Path) -> Option<DiskMeta> {
-        if let Some(meta) = self
-            .disk_index
-            .get(session)
-            .and_then(|files| files.get(key))
-            .cloned()
-            .filter(|meta| meta.count > 0)
-        {
-            return Some(meta);
-        }
-
-        let dir = self.session_dir(session)?.join(Self::path_hash(key));
-        let meta_path = dir.join("meta.json");
-        let content = std::fs::read_to_string(meta_path).ok()?;
-        let meta = serde_json::from_str::<serde_json::Value>(&content).ok()?;
-        let path_str = meta.get("path").and_then(|value| value.as_str())?;
+        let path_str = meta
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("backup meta {} missing path", meta_path.display()))?;
         let stored_key = PathBuf::from(path_str);
         if stored_key != key || !is_loadable_backup_path(&stored_key, &dir) {
-            return None;
+            return Ok(None);
         }
-        let count = meta_entry_count(&meta)?;
-        (count > 0).then_some(DiskMeta { dir, count })
+        let count = meta_entry_count(&meta)
+            .ok_or_else(|| format!("backup meta {} missing entry count", meta_path.display()))?;
+        Ok(Some((DiskMeta { dir, count }, meta)))
     }
 
     fn validate_v2_content_reference(
@@ -2109,6 +2320,15 @@ impl BackupStore {
         key: &Path,
         stack: &[BackupEntry],
     ) -> Result<(), AftError> {
+        #[cfg(test)]
+        if self.fail_next_disk_write {
+            self.fail_next_disk_write = false;
+            return Err(AftError::IoError {
+                path: key.display().to_string(),
+                message: "injected backup disk write failure".to_string(),
+            });
+        }
+
         let Some(session_dir) = self.session_dir(session) else {
             return Ok(());
         };
@@ -2201,11 +2421,11 @@ impl BackupStore {
                     count: retained.len(),
                 },
             );
-        self.dual_write_stack_to_db(session, key, &dir, retained);
+        self.dual_write_stack_to_db(session, key, retained);
         Ok(())
     }
 
-    fn dual_write_stack_to_db(&self, session: &str, key: &Path, dir: &Path, stack: &[BackupEntry]) {
+    fn dual_write_stack_to_db(&self, session: &str, key: &Path, stack: &[BackupEntry]) {
         let pool = self.db_pool.read().ok().and_then(|slot| slot.clone());
         let Some(pool) = pool else {
             return;
@@ -2255,8 +2475,7 @@ impl BackupStore {
             let tx = conn.unchecked_transaction()?;
             crate::db::backups::delete_backups_for_path(&tx, &harness, session, &path_hash)?;
             for entry in stack {
-                let backup_path = content_filename_for_entry(entry)
-                    .map(|filename| dir.join(filename).display().to_string());
+                let backup_path = content_filename_for_entry(entry);
                 let row = entry.to_backup_row(
                     &harness,
                     session,
@@ -2276,6 +2495,80 @@ impl BackupStore {
                 error
             );
         }
+    }
+
+    fn prune_disk_stacks_to_depth(&mut self, max_depth: usize) -> HashSet<(String, PathBuf)> {
+        self.disk_index.clear();
+        self.load_disk_index();
+        let disk_keys = self
+            .disk_index
+            .iter()
+            .flat_map(|(session, files)| {
+                files
+                    .keys()
+                    .cloned()
+                    .map(|key| (session.clone(), key))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut failed = HashSet::new();
+
+        for (session, key) in disk_keys {
+            let disk_lock = match self.acquire_stack_disk_lock(&session, &key) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "failed to lock backup stack for {} while applying max_depth: {}",
+                        key.display(),
+                        error
+                    );
+                    failed.insert((session, key));
+                    continue;
+                }
+            };
+
+            let mut stack = match self.read_stack_from_disk_unlocked(&session, &key) {
+                Ok(Some(stack)) => stack,
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    crate::slog_warn!(
+                        "failed to read backup stack for {} while applying max_depth: {}",
+                        key.display(),
+                        error
+                    );
+                    failed.insert((session, key));
+                    drop(disk_lock);
+                    continue;
+                }
+            };
+            trim_stack_to_depth(&mut stack, max_depth);
+            if let Err(error) = self.write_snapshot_to_disk_locked(&session, &key, &stack) {
+                crate::slog_warn!(
+                    "failed to prune backup stack for {} while applying max_depth: {}",
+                    key.display(),
+                    error
+                );
+                failed.insert((session, key));
+                drop(disk_lock);
+                continue;
+            }
+            if stack.is_empty() {
+                if let Some(files) = self.entries.get_mut(&session) {
+                    files.remove(&key);
+                    if files.is_empty() {
+                        self.entries.remove(&session);
+                    }
+                }
+            } else {
+                self.entries
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(key.clone(), stack);
+            }
+            drop(disk_lock);
+        }
+
+        failed
     }
 
     fn remove_disk_backups(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
@@ -3070,16 +3363,9 @@ fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std:
     replace_file(&tmp_path, &final_path)
 }
 
-#[cfg(windows)]
 fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    if to.exists() {
-        std::fs::remove_file(to)?;
-    }
-    std::fs::rename(from, to)
-}
-
-#[cfg(not(windows))]
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    // On Windows, std::fs::rename uses MoveFileExW replace-existing semantics,
+    // so a single rename keeps meta.json atomic instead of deleting it first.
     std::fs::rename(from, to)
 }
 
@@ -3147,10 +3433,12 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::Harness;
     use crate::protocol::DEFAULT_SESSION_ID;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
 
     fn temp_file(name: &str, content: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("aft_backup_tests");
@@ -4036,6 +4324,304 @@ mod tests {
         );
         assert!(!stack_dir.join("0.bak").exists());
         assert_eq!(backup_content_names(&stack_dir).len(), 2);
+    }
+
+    #[test]
+    fn snapshot_reloads_non_empty_stale_stack_before_append() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = project.path().join("stale-memory.txt");
+        fs::write(&path, "v0").unwrap();
+        let policy = BackupPolicy {
+            enabled: true,
+            max_depth: 2,
+            max_file_size: None,
+        };
+
+        let mut store_a = BackupStore::new();
+        store_a.set_storage_dir(storage.path().to_path_buf(), 72);
+        store_a.set_policy(policy);
+        store_a
+            .snapshot(DEFAULT_SESSION_ID, &path, "a captures v0")
+            .unwrap();
+        fs::write(&path, "v1").unwrap();
+
+        let mut store_b = BackupStore::new();
+        store_b.set_storage_dir(storage.path().to_path_buf(), 72);
+        store_b.set_policy(policy);
+        store_b
+            .snapshot(DEFAULT_SESSION_ID, &path, "b captures v1")
+            .unwrap();
+        fs::write(&path, "v2").unwrap();
+
+        store_a
+            .snapshot(DEFAULT_SESSION_ID, &path, "a captures v2")
+            .unwrap();
+
+        let mut fresh = BackupStore::new();
+        fresh.set_storage_dir(storage.path().to_path_buf(), 72);
+        let contents = fresh
+            .history(DEFAULT_SESSION_ID, &path)
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect::<Vec<_>>();
+        assert_eq!(contents, vec!["v1".to_string(), "v2".to_string()]);
+    }
+
+    #[test]
+    fn restore_last_operation_rescans_stack_after_locking() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "restore-toctou-session";
+        let path = project.path().join("restore-toctou.txt");
+        fs::write(&path, "v0").unwrap();
+
+        let mut store_a = BackupStore::new();
+        store_a.set_storage_dir(storage.path().to_path_buf(), 72);
+        store_a
+            .snapshot_with_op(session, &path, "old op", Some("op-old"))
+            .unwrap();
+        fs::write(&path, "v1").unwrap();
+
+        let hook_storage = storage.path().to_path_buf();
+        let hook_path = path.clone();
+        set_restore_before_lock_hook_for_tests(session, move || {
+            let mut store_b = BackupStore::new();
+            store_b.set_storage_dir(hook_storage, 72);
+            store_b
+                .snapshot_with_op(session, &hook_path, "new op", Some("op-new"))
+                .unwrap();
+            fs::write(&hook_path, "v2").unwrap();
+        });
+
+        let restored = store_a.restore_last_operation(session).unwrap();
+
+        assert_eq!(restored.op_id, "op-new");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v1");
+    }
+
+    #[test]
+    fn corrupt_v2_meta_fails_closed_for_operation_and_single_restore() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "corrupt-v2-session";
+        let path = project.path().join("corrupt-v2.txt");
+        fs::write(&path, "current").unwrap();
+        let key = canonicalize_key(&path);
+        let session_dir = storage
+            .path()
+            .join("backups")
+            .join(BackupStore::session_hash(session));
+        let stack_dir = session_dir.join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&stack_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": session,
+                "last_accessed": current_timestamp(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            stack_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "format_version": "v2",
+                "session_id": session,
+                "path": key.display().to_string(),
+                "count": 1,
+                "entries": [{
+                    "backup_id": "backup-corrupt",
+                    "timestamp": current_timestamp(),
+                    "order": "9",
+                    "description": "corrupt disk should win over DB fallback",
+                    "op_id": "op-corrupt",
+                    "kind": "content",
+                    "content_path": "bak_9_backup-corrupt.bak",
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        let fallback_path = stack_dir.join("db-fallback.bak");
+        fs::write(&fallback_path, "db fallback").unwrap();
+        crate::db::backups::upsert_backup(
+            &conn,
+            &BackupRow {
+                backup_id: "backup-db".to_string(),
+                harness: "opencode".to_string(),
+                session_id: session.to_string(),
+                project_key: "project".to_string(),
+                op_id: Some("op-corrupt".to_string()),
+                order: 9,
+                file_path: key.display().to_string(),
+                path_hash: BackupStore::path_hash(&key),
+                backup_path: Some(fallback_path.display().to_string()),
+                kind: "content".to_string(),
+                description: "db fallback".to_string(),
+                created_at: i64::try_from(current_timestamp()).unwrap(),
+                is_tombstone: false,
+            },
+        )
+        .unwrap();
+        let shared = Arc::new(Mutex::new(conn));
+
+        let mut single = BackupStore::new();
+        single.set_storage_dir(storage.path().to_path_buf(), 72);
+        single.set_db_harness(Harness::Opencode);
+        single.set_db_project_key("project".to_string());
+        single.set_db_pool(shared.clone());
+        let single_error = single.restore_latest(session, &path).unwrap_err();
+        assert_eq!(single_error.code(), "io_error");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "current");
+
+        let mut operation = BackupStore::new();
+        operation.set_storage_dir(storage.path().to_path_buf(), 72);
+        operation.set_db_harness(Harness::Opencode);
+        operation.set_db_project_key("project".to_string());
+        operation.set_db_pool(shared);
+        let operation_error = operation.restore_last_operation(session).unwrap_err();
+        assert_eq!(operation_error.code(), "io_error");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "current");
+    }
+
+    #[test]
+    fn replace_file_replaces_existing_meta_with_single_rename_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.json");
+        let temp_path = dir.path().join("meta.tmp");
+        fs::write(&meta_path, "old").unwrap();
+        fs::write(&temp_path, "new").unwrap();
+
+        replace_file(&temp_path, &meta_path).unwrap();
+
+        assert_eq!(fs::read_to_string(&meta_path).unwrap(), "new");
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn snapshot_write_failure_restores_full_pre_trim_stack() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "rollback-pretrim-session";
+        let path = project.path().join("rollback.txt");
+        fs::write(&path, "v0").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        store.set_policy(BackupPolicy {
+            enabled: true,
+            max_depth: 2,
+            max_file_size: None,
+        });
+
+        store.snapshot(session, &path, "first").unwrap();
+        fs::write(&path, "v1").unwrap();
+        store.snapshot(session, &path, "second").unwrap();
+        fs::write(&path, "v2").unwrap();
+        let key = canonicalize_key(&path);
+        let before_file_stack = store
+            .entries
+            .get(session)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .clone();
+
+        store.fail_next_disk_write_for_tests();
+        let error = store.snapshot(session, &path, "third").unwrap_err();
+        assert_eq!(error.code(), "io_error");
+        let after_file_stack = store.entries.get(session).unwrap().get(&key).unwrap();
+        assert_eq!(
+            after_file_stack
+                .iter()
+                .map(|entry| entry.description.as_str())
+                .collect::<Vec<_>>(),
+            before_file_stack
+                .iter()
+                .map(|entry| entry.description.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let tombstone = project.path().join("created-by-op.txt");
+        store
+            .snapshot_op_tombstone(session, "op-one", &tombstone, "created one")
+            .unwrap();
+        store
+            .snapshot_op_tombstone(session, "op-two", &tombstone, "created two")
+            .unwrap();
+        let tombstone_key = canonicalize_key(&tombstone);
+        let before_tombstone_stack = store
+            .entries
+            .get(session)
+            .unwrap()
+            .get(&tombstone_key)
+            .unwrap()
+            .clone();
+
+        store.fail_next_disk_write_for_tests();
+        let error = store
+            .snapshot_op_tombstone(session, "op-three", &tombstone, "created three")
+            .unwrap_err();
+        assert_eq!(error.code(), "io_error");
+        let after_tombstone_stack = store
+            .entries
+            .get(session)
+            .unwrap()
+            .get(&tombstone_key)
+            .unwrap();
+        assert_eq!(
+            after_tombstone_stack
+                .iter()
+                .map(|entry| entry.op_id.as_deref())
+                .collect::<Vec<_>>(),
+            before_tombstone_stack
+                .iter()
+                .map(|entry| entry.op_id.as_deref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lowering_max_depth_prunes_disk_content_immediately() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = project.path().join("policy-prune.txt");
+        fs::write(&path, "v0").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+
+        for i in 0..3 {
+            store
+                .snapshot(DEFAULT_SESSION_ID, &path, &format!("snapshot {i}"))
+                .unwrap();
+            fs::write(&path, format!("v{}", i + 1)).unwrap();
+        }
+
+        let key = canonicalize_key(&path);
+        let stack_dir = store
+            .session_dir(DEFAULT_SESSION_ID)
+            .unwrap()
+            .join(BackupStore::path_hash(&key));
+        assert_eq!(backup_content_names(&stack_dir).len(), 3);
+
+        store.set_policy(BackupPolicy {
+            enabled: true,
+            max_depth: 1,
+            max_file_size: None,
+        });
+
+        assert_eq!(backup_content_names(&stack_dir).len(), 1);
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(stack_dir.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta_entry_count(&meta), Some(1));
+        let mut fresh = BackupStore::new();
+        fresh.set_storage_dir(storage.path().to_path_buf(), 72);
+        assert_eq!(fresh.history(DEFAULT_SESSION_ID, &path).len(), 1);
     }
 
     #[test]

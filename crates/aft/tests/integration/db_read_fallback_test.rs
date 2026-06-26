@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aft::backup::BackupStore;
+use aft::backup::{hash_session, BackupStore};
 use aft::bash_background::persistence::{task_paths, write_task, PersistedTask};
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use aft::harness::Harness;
@@ -120,17 +120,26 @@ fn db_backup_count(conn: &Arc<Mutex<Connection>>) -> i64 {
         .unwrap()
 }
 
-fn latest_backup_path(conn: &Arc<Mutex<Connection>>) -> PathBuf {
-    let value: String = conn
+fn latest_backup_path(storage: &Path, conn: &Arc<Mutex<Connection>>) -> PathBuf {
+    let (session_id, path_hash, backup_path): (String, String, String) = conn
         .lock()
         .unwrap()
         .query_row(
-            "SELECT backup_path FROM backups WHERE backup_path IS NOT NULL ORDER BY order_blob DESC LIMIT 1",
+            "SELECT session_id, path_hash, backup_path FROM backups WHERE backup_path IS NOT NULL ORDER BY order_blob DESC LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    PathBuf::from(value)
+    let backup_path = PathBuf::from(backup_path);
+    if backup_path.is_absolute() {
+        backup_path
+    } else {
+        storage
+            .join("backups")
+            .join(hash_session(&session_id))
+            .join(path_hash)
+            .join(backup_path)
+    }
 }
 
 #[test]
@@ -365,7 +374,7 @@ fn db_read_fallback_backup_pop_prefers_db_when_present() {
     fs::write(&file, "v3").unwrap();
     store.snapshot(SESSION, &file, "third").unwrap();
     fs::write(&file, "current").unwrap();
-    let latest_path = latest_backup_path(&conn);
+    let latest_path = latest_backup_path(storage.path(), &conn);
 
     let mut fresh = fresh_backup_store(storage.path(), conn.clone());
     let (entry, _) = fresh.restore_latest(SESSION, &file).unwrap();

@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use aft::backup::BackupStore;
+use aft::backup::{hash_session, BackupStore};
 use aft::db::backups::{upsert_backup, BackupRow};
 use aft::harness::Harness;
 use rusqlite::Connection;
@@ -109,13 +109,28 @@ fn backups_dual_write_backup_save_writes_both_disk_and_db_row() {
     assert_eq!(row.description.as_deref(), Some("before edit"));
     assert!(!row.is_tombstone);
     assert!(row.created_at > 0);
-    let backup_path = PathBuf::from(row.backup_path.unwrap());
-    assert!(backup_path.exists());
-    assert_eq!(fs::read_to_string(&backup_path).unwrap(), "original");
+    let backup_path = row.backup_path.unwrap();
+    assert!(!Path::new(&backup_path).is_absolute());
+    let stack_dir = storage
+        .path()
+        .join("backups")
+        .join(hash_session(SESSION))
+        .join(&row.path_hash);
+    let resolved_backup_path = stack_dir.join(&backup_path);
+    assert!(resolved_backup_path.exists());
     assert_eq!(
-        backup_path.parent().unwrap().file_name().unwrap().to_str(),
-        Some(row.path_hash.as_str())
+        fs::read_to_string(&resolved_backup_path).unwrap(),
+        "original"
     );
+    let meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(stack_dir.join("meta.json")).unwrap()).unwrap();
+    let meta_content_path = meta
+        .get("entries")
+        .and_then(|entries| entries.as_array())
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.get("content_path"))
+        .and_then(|value| value.as_str());
+    assert_eq!(meta_content_path, Some(backup_path.as_str()));
 }
 
 #[test]
