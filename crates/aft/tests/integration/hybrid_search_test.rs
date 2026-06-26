@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use aft::commands::semantic_search::fuse_hybrid_results;
+use aft::commands::semantic_search::{fuse_hybrid_results, HybridResult};
 use aft::query_shape::classify;
 use aft::search_index::SearchIndex;
 use aft::semantic_index::SemanticResult;
@@ -38,6 +38,136 @@ fn fingerprint(results: &[aft::commands::semantic_search::HybridResult]) -> Vec<
             )
         })
         .collect()
+}
+
+fn write_fixture_file(path: &Path, contents: &str) {
+    std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture dir");
+    std::fs::write(path, contents).expect("write fixture file");
+}
+
+fn rank_of_suffix(results: &[HybridResult], suffix_components: &[&str]) -> usize {
+    let suffix = suffix_components.iter().collect::<PathBuf>();
+    results
+        .iter()
+        .position(|result| result.file.ends_with(&suffix))
+        .unwrap_or_else(|| panic!("missing result ending with {suffix:?}: {results:?}"))
+}
+
+#[test]
+fn generated_artifacts_stay_findable_but_rank_below_source_lexical_hits() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source = project.path().join("Source/Session.swift");
+    let html = project.path().join("docs/index.html");
+    let classes = project.path().join("docs/Classes.html");
+    let json = project.path().join("docs/search.json");
+    let css = project.path().join("docs/style.css");
+    let svg = project.path().join("docs/badge.svg");
+
+    for path in [&source, &html, &classes, &json, &css, &svg] {
+        write_fixture_file(path, "RequestAdapter generated ranking needle\n");
+    }
+
+    let shape = classify("RequestAdapter");
+    let results = fuse_hybrid_results(
+        Vec::new(),
+        vec![
+            (html.clone(), 100.0),
+            (classes.clone(), 90.0),
+            (json.clone(), 80.0),
+            (css.clone(), 70.0),
+            (svg.clone(), 60.0),
+            (source.clone(), 0.1),
+        ],
+        &shape,
+        10,
+        true,
+        project.path(),
+    );
+
+    let source_rank = rank_of_suffix(&results, &["Source", "Session.swift"]);
+    for suffix in [
+        &["docs", "index.html"][..],
+        &["docs", "Classes.html"][..],
+        &["docs", "search.json"][..],
+        &["docs", "style.css"][..],
+        &["docs", "badge.svg"][..],
+    ] {
+        let generated_rank = rank_of_suffix(&results, suffix);
+        assert!(
+            source_rank < generated_rank,
+            "source should outrank generated artifact {suffix:?}: {results:?}"
+        );
+    }
+}
+
+#[test]
+fn handwritten_docs_and_top_level_json_rank_normally() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let design_doc = project.path().join("docs/architecture.md");
+    let package_json = project.path().join("package.json");
+    let source = project.path().join("src/lib.rs");
+
+    write_fixture_file(&design_doc, "handwritten_docs_needle explains the API\n");
+    write_fixture_file(&package_json, r#"{"name":"handwritten_docs_needle"}"#);
+    write_fixture_file(&source, "pub fn handwritten_docs_needle() {}\n");
+
+    let shape = classify("handwritten_docs_needle");
+    let results = fuse_hybrid_results(
+        Vec::new(),
+        vec![
+            (design_doc.clone(), 3.0),
+            (package_json.clone(), 2.0),
+            (source.clone(), 1.0),
+        ],
+        &shape,
+        10,
+        true,
+        project.path(),
+    );
+
+    assert_eq!(rank_of_suffix(&results, &["docs", "architecture.md"]), 0);
+    assert_eq!(rank_of_suffix(&results, &["package.json"]), 1);
+    assert_eq!(rank_of_suffix(&results, &["src", "lib.rs"]), 2);
+}
+
+#[test]
+fn generated_artifact_boundary_handles_unambiguous_and_ambiguous_types() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source = project.path().join("src/main.swift");
+    let helper = project.path().join("src/helper.swift");
+    let config_json = project.path().join("src/config.json");
+    let lone_html = project.path().join("src/overview.html");
+
+    write_fixture_file(&source, "BoundaryNeedle source\n");
+    write_fixture_file(&helper, "BoundaryNeedle helper\n");
+    write_fixture_file(&config_json, r#"{"BoundaryNeedle": true}"#);
+    write_fixture_file(&lone_html, "<html>BoundaryNeedle</html>\n");
+
+    let shape = classify("BoundaryNeedle");
+    let results = fuse_hybrid_results(
+        Vec::new(),
+        vec![
+            (lone_html.clone(), 100.0),
+            (config_json.clone(), 3.0),
+            (source.clone(), 2.0),
+            (helper.clone(), 1.0),
+        ],
+        &shape,
+        10,
+        true,
+        project.path(),
+    );
+
+    assert_eq!(
+        rank_of_suffix(&results, &["src", "config.json"]),
+        0,
+        "ambiguous JSON in a source-dominated dir should keep normal lexical rank"
+    );
+    assert!(
+        rank_of_suffix(&results, &["src", "overview.html"])
+            > rank_of_suffix(&results, &["src", "helper.swift"]),
+        "unambiguous HTML should be demoted even when its siblings are source files: {results:?}"
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -23,6 +24,8 @@ const MAX_TOP_K: usize = 100;
 const HYBRID_LEXICAL_BOOST: f32 = 1.1;
 const LEXICAL_ONLY_SCORE_CEILING: f32 = 0.25;
 const LEXICAL_ENUMERATION_LIMIT: usize = 50;
+const GENERATED_DIRECTORY_DENSITY_NUMERATOR: usize = 3;
+const GENERATED_DIRECTORY_DENSITY_DENOMINATOR: usize = 5;
 const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
 const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
@@ -57,6 +60,7 @@ pub struct HybridResult {
     pub lexical_score: Option<f32>,
     pub hybrid_boosted: bool,
     pub(crate) cap_protected: bool,
+    pub(crate) lexical_generated_artifact: bool,
     pub snippet: String,
 }
 
@@ -94,6 +98,19 @@ struct LexicalCollection {
     files: Vec<(PathBuf, f32)>,
     ready: bool,
     engine_capped: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LexicalCandidate {
+    file: PathBuf,
+    score: f32,
+    generated_artifact: bool,
+    ordinal: usize,
+}
+
+struct GeneratedArtifactCache<'a> {
+    project_root: &'a Path,
+    directory_cache: HashMap<PathBuf, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +237,135 @@ fn path_is_hidden_test_file(path: &Path, project_root: &Path) -> bool {
 
 fn path_allowed_by_include_tests(path: &Path, project_root: &Path, include_tests: bool) -> bool {
     include_tests || !path_is_hidden_test_file(path, project_root)
+}
+
+fn path_has_unambiguous_generated_artifact_type(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let file_name = file_name.to_ascii_lowercase();
+    if file_name.ends_with(".min.js") || file_name.ends_with(".min.css") {
+        return true;
+    }
+
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("html" | "htm" | "css" | "map")
+    )
+}
+
+fn path_has_ambiguous_generated_artifact_type(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("json" | "svg" | "docset")
+    )
+}
+
+fn directory_is_generated_artifact_dominated(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+
+    let mut file_count = 0usize;
+    let mut generated_count = 0usize;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        file_count += 1;
+        if path_has_unambiguous_generated_artifact_type(&entry.path()) {
+            generated_count += 1;
+        }
+    }
+
+    file_count > 0
+        && generated_count * GENERATED_DIRECTORY_DENSITY_DENOMINATOR
+            >= file_count * GENERATED_DIRECTORY_DENSITY_NUMERATOR
+}
+
+impl<'a> GeneratedArtifactCache<'a> {
+    fn new(project_root: &'a Path) -> Self {
+        Self {
+            project_root,
+            directory_cache: HashMap::new(),
+        }
+    }
+
+    fn is_generated_artifact(&mut self, path: &Path) -> bool {
+        if path_has_unambiguous_generated_artifact_type(path) {
+            return true;
+        }
+        if !path_has_ambiguous_generated_artifact_type(path) {
+            return false;
+        }
+
+        let path_is_inside_project = path.starts_with(self.project_root);
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            if path_is_inside_project && !dir.starts_with(self.project_root) {
+                break;
+            }
+            if self.directory_is_generated_artifact_dominated(dir) {
+                return true;
+            }
+            if path_is_inside_project && dir == self.project_root {
+                break;
+            }
+            current = dir.parent();
+        }
+        false
+    }
+
+    fn directory_is_generated_artifact_dominated(&mut self, dir: &Path) -> bool {
+        if let Some(cached) = self.directory_cache.get(dir) {
+            return *cached;
+        }
+
+        let dominated = directory_is_generated_artifact_dominated(dir);
+        self.directory_cache.insert(dir.to_path_buf(), dominated);
+        dominated
+    }
+}
+
+fn lexical_candidates_with_generated_artifact_rank(
+    lexical_files: Vec<(PathBuf, f32)>,
+    project_root: &Path,
+) -> Vec<LexicalCandidate> {
+    let mut generated_cache = GeneratedArtifactCache::new(project_root);
+    let mut candidates = lexical_files
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (file, score))| {
+            let generated_artifact = generated_cache.is_generated_artifact(&file);
+            LexicalCandidate {
+                file,
+                score,
+                generated_artifact,
+                ordinal,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|a, b| {
+        a.generated_artifact
+            .cmp(&b.generated_artifact)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.ordinal.cmp(&b.ordinal))
+    });
+    candidates
 }
 
 fn grep_visible_file_count(matches: &[GrepMatch]) -> usize {
@@ -1559,9 +1705,13 @@ fn apply_natural_language_diversity_cap(results: &mut Vec<SemanticResult>) {
 
 fn sort_hybrid_results(results: &mut [HybridResult]) {
     results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        a.lexical_generated_artifact
+            .cmp(&b.lexical_generated_artifact)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.name.cmp(&b.name))
     });
@@ -1587,8 +1737,10 @@ pub fn fuse_hybrid_results(
         .into_iter()
         .filter(|(file, _)| path_allowed_by_include_tests(file, project_root, include_tests))
         .collect::<Vec<_>>();
+    let lexical_candidates =
+        lexical_candidates_with_generated_artifact_rank(lexical_files, project_root);
 
-    if lexical_files.is_empty() {
+    if lexical_candidates.is_empty() {
         let mut results = semantic
             .into_iter()
             .map(|result| hybrid_from_semantic(result, None))
@@ -1599,10 +1751,10 @@ pub fn fuse_hybrid_results(
     }
 
     if semantic.is_empty() {
-        return lexical_files
+        return lexical_candidates
             .into_iter()
             .take(top_k)
-            .map(|(file, score)| lexical_only_result(file, score, shape))
+            .map(|candidate| lexical_only_result(candidate, shape))
             .collect();
     }
 
@@ -1613,21 +1765,26 @@ pub fn fuse_hybrid_results(
     // the standalone-lexical results without that loss being reflected in
     // `more_available`/`engine_capped`. The final output is already bounded by
     // cap_per_file + truncate(top_k), so honoring all collected candidates is
-    // both more correct and honest about what was considered.
-    let lexical_top_files: HashMap<PathBuf, f32> = lexical_files.iter().cloned().collect();
+    // both more correct and honest about what was considered. Generated documentation
+    // artifacts stay in that candidate set but are marked so their lexical lane
+    // contribution cannot outrank non-generated files.
+    let lexical_top_files: HashMap<PathBuf, LexicalCandidate> = lexical_candidates
+        .iter()
+        .map(|candidate| (candidate.file.clone(), candidate.clone()))
+        .collect();
     let mut results: Vec<HybridResult> = semantic
         .into_iter()
         .map(|result| {
-            let lexical_score = lexical_top_files.get(&result.file).copied();
-            hybrid_from_semantic(result, lexical_score)
+            let lexical_candidate = lexical_top_files.get(&result.file);
+            hybrid_from_semantic(result, lexical_candidate)
         })
         .collect();
 
     let semantic_files: HashSet<PathBuf> =
         results.iter().map(|result| result.file.clone()).collect();
-    for (file, score) in &lexical_files {
-        if !semantic_files.contains(file) {
-            results.push(lexical_only_result(file.clone(), *score, shape));
+    for candidate in lexical_candidates {
+        if !semantic_files.contains(&candidate.file) {
+            results.push(lexical_only_result(candidate, shape));
         }
     }
 
@@ -1638,11 +1795,15 @@ pub fn fuse_hybrid_results(
     results
 }
 
-fn hybrid_from_semantic(result: SemanticResult, lexical_score: Option<f32>) -> HybridResult {
+fn hybrid_from_semantic(
+    result: SemanticResult,
+    lexical_candidate: Option<&LexicalCandidate>,
+) -> HybridResult {
     let semantic_score = result.score;
     let ranking_score = result.rank_score;
     let cap_protected = result.cap_protected;
-    let hybrid_boosted = lexical_score.is_some();
+    let lexical_score = lexical_candidate.map(|candidate| candidate.score);
+    let hybrid_boosted = lexical_candidate.is_some_and(|candidate| !candidate.generated_artifact);
     let score = if hybrid_boosted {
         ranking_score * HYBRID_LEXICAL_BOOST
     } else {
@@ -1663,27 +1824,35 @@ fn hybrid_from_semantic(result: SemanticResult, lexical_score: Option<f32>) -> H
         lexical_score,
         hybrid_boosted,
         cap_protected,
+        lexical_generated_artifact: false,
     }
 }
 
-fn lexical_only_result(file: PathBuf, lexical_score: f32, shape: &QueryShape) -> HybridResult {
+fn lexical_only_result(candidate: LexicalCandidate, shape: &QueryShape) -> HybridResult {
+    let score = if candidate.generated_artifact {
+        0.0
+    } else {
+        // Lexical scores are not cosine-normalized and can exceed the semantic
+        // lane's score scale. Keep lexical-only files visible without letting
+        // broad trigram overlaps evict strong semantic matches.
+        (candidate.score * shape_dependent_lexical_only_weight(shape))
+            .min(LEXICAL_ONLY_SCORE_CEILING)
+    };
+
     HybridResult {
-        file,
+        file: candidate.file,
         name: String::new(),
         kind: SymbolKind::FileSummary,
         start_line: 0,
         end_line: 0,
         exported: false,
-        // Lexical scores are not cosine-normalized and can exceed the semantic
-        // lane's score scale. Keep lexical-only files visible without letting
-        // broad trigram overlaps evict strong semantic matches.
-        score: (lexical_score * shape_dependent_lexical_only_weight(shape))
-            .min(LEXICAL_ONLY_SCORE_CEILING),
+        score,
         source: "lexical",
         semantic_score: None,
-        lexical_score: Some(lexical_score),
+        lexical_score: Some(candidate.score),
         hybrid_boosted: false,
         cap_protected: false,
+        lexical_generated_artifact: candidate.generated_artifact,
         snippet: "[lexical match — use aft_zoom or read for context]".to_string(),
     }
 }
@@ -3402,6 +3571,7 @@ mod tests {
             lexical_score: None,
             hybrid_boosted: false,
             cap_protected: false,
+            lexical_generated_artifact: false,
         }];
 
         let text = format_semantic_text(&results, project_root, false, false, None);
@@ -3446,6 +3616,7 @@ mod tests {
             lexical_score: None,
             hybrid_boosted: false,
             cap_protected: false,
+            lexical_generated_artifact: false,
         }
     }
 
@@ -3603,6 +3774,7 @@ mod tests {
             lexical_score: None,
             hybrid_boosted: false,
             cap_protected: false,
+            lexical_generated_artifact: false,
         }];
 
         enrich_snippets_from_source(&mut results, dir.path());
@@ -3654,6 +3826,7 @@ mod tests {
             lexical_score: None,
             hybrid_boosted: false,
             cap_protected: false,
+            lexical_generated_artifact: false,
         }];
 
         enrich_snippets_from_source(&mut results, dir.path());
@@ -3733,6 +3906,7 @@ mod tests {
             lexical_score: None,
             hybrid_boosted: false,
             cap_protected: false,
+            lexical_generated_artifact: false,
         }];
         // Must not panic; header renders, no snippet body.
         let _ = enrich_snippets_from_source(&mut results, dir.path());
@@ -3797,6 +3971,7 @@ mod tests {
                 lexical_score: None,
                 hybrid_boosted: false,
                 cap_protected: false,
+                lexical_generated_artifact: false,
             },
             HybridResult {
                 file: target_file,
@@ -3812,6 +3987,7 @@ mod tests {
                 lexical_score: None,
                 hybrid_boosted: false,
                 cap_protected: false,
+                lexical_generated_artifact: false,
             },
         ];
 
@@ -3893,6 +4069,7 @@ mod tests {
             lexical_score: None,
             hybrid_boosted: false,
             cap_protected: false,
+            lexical_generated_artifact: false,
         };
 
         let json = result_to_json(&result);

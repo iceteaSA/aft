@@ -3,6 +3,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::thread;
 
+use aft::commands::grep::handle_grep;
 use aft::commands::semantic_search::handle_semantic_search;
 use aft::config::{Config, SemanticBackend, SemanticBackendConfig};
 use aft::context::{AppContext, SemanticIndexStatus};
@@ -31,6 +32,16 @@ fn request_with_top_k(query: &str, hint: Option<&str>, top_k: usize) -> RawReque
         value["hint"] = serde_json::json!(hint);
     }
     serde_json::from_value(value).expect("build semantic search request")
+}
+
+fn grep_request(pattern: &str, max_results: usize) -> RawRequest {
+    serde_json::from_value(serde_json::json!({
+        "id": "grep-contract",
+        "command": "grep",
+        "pattern": pattern,
+        "max_results": max_results,
+    }))
+    .expect("build grep request")
 }
 
 fn request_with_include_tests(
@@ -582,6 +593,61 @@ fn grep_results_report_regex_or_literal_source() {
             );
         }
     }
+}
+
+#[test]
+fn standalone_grep_keeps_generated_artifacts_in_mtime_order() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source = project.path().join("Source/Session.swift");
+    let html = project.path().join("docs/index.html");
+    let json = project.path().join("docs/search.json");
+    let css = project.path().join("docs/style.css");
+
+    for path in [&source, &html, &json, &css] {
+        std::fs::create_dir_all(path.parent().expect("fixture parent"))
+            .expect("create fixture dir");
+        std::fs::write(path, "StandaloneGrepNeedle\n").expect("write fixture file");
+    }
+    for (path, seconds) in [
+        (&source, 1_700_000_000),
+        (&css, 1_700_000_100),
+        (&json, 1_700_000_200),
+        (&html, 1_700_000_300),
+    ] {
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))
+            .expect("set fixture mtime");
+    }
+
+    let ctx = test_context(project.path());
+    let response = response_value(handle_grep(&grep_request("StandaloneGrepNeedle", 10), &ctx));
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    let matches = response["matches"].as_array().expect("matches array");
+    let files = matches
+        .iter()
+        .map(|result| {
+            result["file"]
+                .as_str()
+                .expect("grep match file")
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        files.iter().any(|file| file.ends_with("docs/index.html"))
+            && files.iter().any(|file| file.ends_with("docs/search.json"))
+            && files.iter().any(|file| file.ends_with("docs/style.css")),
+        "standalone grep should keep generated artifacts findable: {files:?}"
+    );
+    assert!(
+        files
+            .first()
+            .is_some_and(|file| file.ends_with("docs/index.html")),
+        "standalone grep should keep normal mtime ordering instead of search demotion: {files:?}"
+    );
 }
 
 #[test]
