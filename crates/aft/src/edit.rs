@@ -737,4 +737,33 @@ mod tests {
         assert!(excerpt.extensive);
         assert!(excerpt.text.is_empty());
     }
+
+    // --- validate_syntax_str: `&raw` must not be a false syntax error ---
+
+    /// `&raw` where `raw` is an ordinary variable is valid Rust (a reference to
+    /// the binding `raw`). `raw` is only a contextual keyword in the raw-borrow
+    /// operators `&raw const` / `&raw mut`. tree-sitter-rust before 0.24.2
+    /// mis-parsed a bare `&raw` as the start of a raw-borrow and emitted an
+    /// ERROR node, so `validate_syntax_str` returned `Some(false)` and the edit
+    /// pipeline rolled back a correct edit. This pins the fixed grammar
+    /// behavior: a grammar downgrade that reintroduces the false positive fails
+    /// here instead of silently discarding users' edits.
+    #[test]
+    fn validate_syntax_str_accepts_reference_to_variable_named_raw() {
+        let path = Path::new("lib.rs");
+        let src = "fn handle_hash(x: &u32) -> u32 { *x }\n\
+                   fn main() {\n    let raw = 5u32;\n    let _ = handle_hash(&raw);\n}\n";
+        assert_eq!(validate_syntax_str(src, path), Some(true));
+    }
+
+    /// The genuine raw-borrow operators must still parse cleanly (guard against
+    /// a "fix" that loosens the grammar the wrong way).
+    #[test]
+    fn validate_syntax_str_accepts_raw_borrow_operators() {
+        let path = Path::new("lib.rs");
+        let const_borrow = "fn main() {\n    let x = 5u32;\n    let _p = &raw const x;\n}\n";
+        let mut_borrow = "fn main() {\n    let mut x = 5u32;\n    let _p = &raw mut x;\n}\n";
+        assert_eq!(validate_syntax_str(const_borrow, path), Some(true));
+        assert_eq!(validate_syntax_str(mut_borrow, path), Some(true));
+    }
 }
