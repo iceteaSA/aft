@@ -200,11 +200,11 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.41.0";
+const ANNOUNCEMENT_VERSION = "0.42.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Search now works on repositories of any size: the trigram index behind grep and aft_search is disk-backed, so it uses a fixed, small amount of memory (Chromium dropped from ~14 GB to under 800 MB) and the old 20,000-file limit that disabled it on large repos is gone.",
-  "Call-graph navigation (aft_callgraph, symbol move) no longer has a 5,000-file limit — it works on repositories of any size.",
-  "Semantic search (aft_search) now covers Java, Kotlin, Ruby, Swift, Scala, Lua, Perl, and R, in addition to the languages already supported.",
+  "Navigation and search tools now return leaner output: aft_zoom on a large class/struct returns a member menu instead of the whole body, aft_callgraph collapses standard-library noise, and aft_search expands only the top match within a budget — substantially less context per call, same answers.",
+  "Backups behind aft_safety undo are now configurable (backup.enabled, max_depth, max_file_size), and edits are faster (one appended snapshot instead of rewriting the whole stack).",
+  "Editing Rust code with &raw and files whose paths contain [brackets] or {braces} (e.g. Next.js dynamic routes) no longer fails.",
 ];
 
 /**
