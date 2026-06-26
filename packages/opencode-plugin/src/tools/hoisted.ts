@@ -651,13 +651,17 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
 // WRITE tool
 // ---------------------------------------------------------------------------
 
-function getWriteDescription(editToolName: string): string {
-  return `Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety) and auto-formatted when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool.`;
+function getWriteDescription(ctx: PluginContext, editToolName: string): string {
+  const backupText =
+    ctx.config.backup?.enabled === false
+      ? "Backup capture is disabled by user config."
+      : "Existing files are backed up before overwriting (undo via aft_safety).";
+  return `Write content to a file, creating it and parent directories automatically. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool.`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
   return {
-    description: getWriteDescription(editToolName),
+    description: getWriteDescription(ctx, editToolName),
     args: {
       filePath: z
         .string()
@@ -783,7 +787,11 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
 // EDIT tool
 // ---------------------------------------------------------------------------
 
-function getEditDescription(writeToolName: string): string {
+function getEditDescription(ctx: PluginContext, writeToolName: string): string {
+  const backupBehavior =
+    ctx.config.backup?.enabled === false
+      ? "- Backup capture is disabled by user config"
+      : "- Backs up files before editing (recoverable via aft_safety undo)";
   return `Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the \`${writeToolName}\` tool — \`edit\` requires an explicit edit mode and will not silently overwrite a file from \`content\` alone.
 
 **Modes** (determined by which parameters you provide):
@@ -823,7 +831,7 @@ Mode priority: appendContent > edits > symbol (without oldString) > oldString (f
 Note: Modes 5 and 6 are options on mode 4 (find/replace) — they require \`oldString\`.
 
 **Behavior:**
-- Backs up files before editing (recoverable via aft_safety undo)
+${backupBehavior}
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
@@ -832,7 +840,7 @@ Note: Modes 5 and 6 are options on mode 4 (find/replace) — they require \`oldS
 
 function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefinition {
   return {
-    description: getEditDescription(writeToolName),
+    description: getEditDescription(ctx, writeToolName),
     args: {
       filePath: z
         .string()
@@ -1085,7 +1093,12 @@ function formatGlobSkipReasonsNote(reasons: unknown): string | undefined {
 // APPLY_PATCH tool
 // ---------------------------------------------------------------------------
 
-const APPLY_PATCH_DESCRIPTION = `Use the \`apply_patch\` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:
+function applyPatchDescription(ctx: PluginContext): string {
+  const backupBehavior =
+    ctx.config.backup?.enabled === false
+      ? "- Backup capture is disabled by user config; applied file changes are not recorded in the undo stack."
+      : "- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. A pre-patch checkpoint is created automatically — use `aft_safety` undo if you need to revert.\n- Files are backed up before modification";
+  return `Use the \`apply_patch\` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:
 
 *** Begin Patch
 [ one or more file sections ]
@@ -1117,8 +1130,7 @@ Example patch:
 \`\`\`
 
 **Behavior:**
-- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. A pre-patch checkpoint is created automatically — use \`aft_safety\` undo if you need to revert.
-- Files are backed up before modification
+${backupBehavior}
 - Parent directories are created automatically for new files
 - Fuzzy matching for context anchors (handles whitespace and Unicode differences)
 
@@ -1128,10 +1140,11 @@ Example patch:
 - You must prefix new lines with \`+\` even when creating a new file
 
 Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.`;
+}
 
 function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
   return {
-    description: APPLY_PATCH_DESCRIPTION,
+    description: applyPatchDescription(ctx),
     args: {
       patchText: z.string().describe("The full patch text including Begin/End markers"),
     },
@@ -1697,16 +1710,22 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 // Delete
 // ---------------------------------------------------------------------------
 
-const DELETE_DESCRIPTION =
-  "Delete one or more files (or directories) with backup.\n\n" +
-  "Each file is backed up before deletion — use aft_safety undo to recover any of them. " +
-  "For directories, every file inside is individually backed up before the tree is removed.\n\n" +
-  "Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\n" +
-  "Partial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.";
+function deleteDescription(ctx: PluginContext): string {
+  const backupText =
+    ctx.config.backup?.enabled === false
+      ? "Backup capture is disabled by user config, so this tool does not create undo snapshots. "
+      : "Each file is backed up before deletion — use aft_safety undo to recover any of them. For directories, every file inside is individually backed up before the tree is removed. ";
+  return (
+    "Delete one or more files (or directories).\n\n" +
+    backupText +
+    "Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\n" +
+    "Partial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`."
+  );
+}
 
 function createDeleteTool(ctx: PluginContext): ToolDefinition {
   return {
-    description: DELETE_DESCRIPTION,
+    description: deleteDescription(ctx),
     args: {
       files: z
         .array(z.string())
@@ -1794,13 +1813,20 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
 // Move / Rename
 // ---------------------------------------------------------------------------
 
-const MOVE_DESCRIPTION =
-  "Move or rename a file with backup. Creates parent directories for destination automatically\n" +
-  "Note: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead.";
+function moveDescription(ctx: PluginContext): string {
+  const backupText =
+    ctx.config.backup?.enabled === false
+      ? "Backup capture is disabled by user config. "
+      : "Creates an undo backup before moving. ";
+  return (
+    `Move or rename a file. ${backupText}Creates parent directories for destination automatically\n` +
+    "Note: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead."
+  );
+}
 
 function createMoveTool(ctx: PluginContext): ToolDefinition {
   return {
-    description: MOVE_DESCRIPTION,
+    description: moveDescription(ctx),
     args: {
       filePath: z
         .string()

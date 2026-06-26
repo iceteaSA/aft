@@ -1508,7 +1508,18 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Commit phase: no validation returns after this point.
     ctx.set_config(next_config.clone());
     ctx.set_harness(harness.clone());
-    ctx.backup().lock().set_db_harness(harness.clone());
+    {
+        let mut backup = ctx.backup().lock();
+        backup.set_policy(crate::backup::BackupPolicy {
+            enabled: next_config.backup.enabled.unwrap_or(true),
+            max_depth: next_config
+                .backup
+                .max_depth
+                .unwrap_or(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
+            max_file_size: next_config.backup.max_file_size,
+        });
+        backup.set_db_harness(harness.clone());
+    }
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     ctx.reset_tier2_refresh_scheduler();
@@ -2540,9 +2551,9 @@ mod tests {
             "harness": "opencode",
             "config": [
                 { "tier": "user", "source": "/u/aft.jsonc",
-                  "doc": "{ \"restrict_to_project_root\": true, \"search_index\": true }" },
+                  "doc": "{ \"restrict_to_project_root\": true, \"search_index\": true, \"backup\": { \"enabled\": false, \"max_depth\": 7 }, \"disabled_tools\": [\"aft_safety\"] }" },
                 { "tier": "project", "source": "/p/.opencode/aft.jsonc",
-                  "doc": "{ \"restrict_to_project_root\": false, \"semantic\": { \"api_key_env\": \"EVIL\" } }" }
+                  "doc": "{ \"restrict_to_project_root\": false, \"semantic\": { \"api_key_env\": \"EVIL\" }, \"backup\": { \"enabled\": true, \"max_depth\": 1 }, \"disabled_tools\": [\"aft_safety\"] }" }
             ]
         }));
 
@@ -2556,12 +2567,19 @@ mod tests {
         assert!(ctx.config().restrict_to_project_root);
         // Project semantic.api_key_env never reached Config.
         assert!(ctx.config().semantic.api_key_env.is_none());
+        assert_eq!(ctx.config().backup.enabled, Some(false));
+        assert_eq!(ctx.config().backup.max_depth, Some(7));
 
         // Drops surfaced for the warning path.
         let dropped = response.data["config_dropped_keys"].as_array().unwrap();
         let keys: Vec<&str> = dropped.iter().filter_map(|d| d["key"].as_str()).collect();
         assert!(keys.contains(&"restrict_to_project_root"), "keys: {keys:?}");
         assert!(keys.contains(&"semantic.api_key_env"), "keys: {keys:?}");
+        assert!(keys.contains(&"backup"), "keys: {keys:?}");
+        assert!(
+            keys.contains(&"disabled_tools.aft_safety"),
+            "keys: {keys:?}"
+        );
     }
 
     #[test]

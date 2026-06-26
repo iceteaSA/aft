@@ -157,4 +157,37 @@ describe("loadAftConfig — disabled_tools merge behavior", () => {
     const config = JSON.parse(result.stdout);
     expect(config.disabled_tools).toEqual(["aft_callgraph"]);
   });
+
+  it("ignores project-level aft_safety disable while preserving user-level aft_safety disable", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ disabled_tools: ["aft_safety"] }));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ disabled_tools: ["aft_safety", "aft_refactor"] }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.disabled_tools).toContain("aft_safety");
+    expect(config.disabled_tools).toContain("aft_refactor");
+    expect(config.disabled_tools).toHaveLength(2);
+  });
+
+  it("strips project-only aft_safety from disabled_tools", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ disabled_tools: ["aft_callgraph"] }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ disabled_tools: ["aft_safety"] }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.disabled_tools).toEqual(["aft_callgraph"]);
+  });
 });

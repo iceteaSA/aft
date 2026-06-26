@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aft::backup::BackupPolicy;
 use aft::commands::lsp_prepare_rename::handle_lsp_prepare_rename;
 use aft::commands::lsp_rename::handle_lsp_rename;
 use aft::context::AppContext;
@@ -183,6 +184,39 @@ fn test_rename_rollback_on_failure() {
         history.is_empty(),
         "rollback should pop consumed backup entries"
     );
+}
+
+#[test]
+fn test_rename_rollback_on_failure_when_backups_disabled() {
+    let (_temp_dir, main_rs) = rust_workspace_with_file();
+    let ctx = app_context_with_fake_lsp();
+    ctx.backup().lock().set_policy(BackupPolicy {
+        enabled: false,
+        ..BackupPolicy::default()
+    });
+    let original = fs::read_to_string(&main_rs).expect("read original file");
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "rename-rollback-disabled",
+        "command": "lsp_rename",
+        "file": main_rs.display().to_string(),
+        "line": 1,
+        "character": 5,
+        "new_name": "__force_failure__",
+    }))
+    .expect("request parses");
+
+    let response = handle_lsp_rename(&req, &ctx);
+    let json = serde_json::to_value(&response).expect("response serializes");
+
+    assert_eq!(json["success"], false, "expected failure: {json:#}");
+    let current = fs::read_to_string(&main_rs).expect("read rolled back file");
+    assert_eq!(current, original);
+    assert!(ctx
+        .backup()
+        .lock()
+        .history(aft::protocol::DEFAULT_SESSION_ID, &main_rs)
+        .is_empty());
 }
 
 #[test]

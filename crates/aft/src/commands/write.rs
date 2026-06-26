@@ -94,7 +94,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             path.as_path(),
             "write: file created by write",
         ) {
-            Ok(id) => Some(id),
+            Ok(id) => id,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         }
     };

@@ -805,7 +805,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   if (surface.importTool) {
     registerImportTools(pi, ctx);
   }
-  if (surface.safety) {
+  if (surface.safety && config.backup?.enabled !== false) {
     registerSafetyTool(pi, ctx);
   }
   if (surface.astSearch || surface.astReplace) {

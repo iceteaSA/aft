@@ -287,7 +287,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Phase 2 — serial apply. Backup + write must touch shared state (BackupStore
     // is `RefCell`-wrapped on AppContext) so this stays on the main thread.
-    let mut changes_to_apply: Vec<(FileChange, PathBuf, String)> = Vec::new();
+    let mut changes_to_apply: Vec<(FileChange, PathBuf, Option<String>)> = Vec::new();
     for change in computed {
         total_replacements += change.replacement_count;
         total_files += 1;
@@ -382,7 +382,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                         "file": change.file_path.display().to_string(),
                         "replacements": change.replacement_count,
                     });
-                    if let Some(obj) = entry.as_object_mut() {
+                    if let (Some(obj), Some(backup_id)) = (entry.as_object_mut(), backup_id) {
                         obj.insert(
                             "backup_id".to_string(),
                             serde_json::Value::String(backup_id),

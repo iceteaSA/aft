@@ -67,6 +67,60 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("honors user backup config and ignores project backup config", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ backup: { enabled: false, max_depth: 7, max_file_size: 1024 } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ backup: { enabled: true, max_depth: 1 } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.backup).toEqual({ enabled: false, max_depth: 7, max_file_size: 1024 });
+    expect(result.stderr).toContain("Ignoring backup from project config");
+  });
+
+  test("ignores project-level aft_safety disable while preserving user-level aft_safety disable", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ disabled_tools: ["aft_safety"] }));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ disabled_tools: ["aft_safety", "aft_refactor"] }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.disabled_tools).toContain("aft_safety");
+    expect(config.disabled_tools).toContain("aft_refactor");
+    expect(config.disabled_tools).toHaveLength(2);
+  });
+
+  test("strips project-only aft_safety from disabled_tools", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ disabled_tools: ["aft_callgraph"] }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ disabled_tools: ["aft_safety"] }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.disabled_tools).toEqual(["aft_callgraph"]);
+  });
+
   test("project config can override callgraph store chunking knobs", () => {
     const fixture = createConfigFixture();
     writeFileSync(

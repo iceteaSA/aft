@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -9,7 +10,10 @@ use crate::db::backups::BackupRow;
 use crate::error::AftError;
 use sha2::{Digest, Sha256};
 
-const MAX_UNDO_DEPTH: usize = 20;
+pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
+#[cfg(test)]
+const MAX_UNDO_DEPTH: usize = DEFAULT_MAX_UNDO_DEPTH;
+const V2_FORMAT_VERSION: &str = "v2";
 
 /// Current on-disk backup metadata schema version.
 ///
@@ -175,6 +179,23 @@ pub struct RestoredFile {
     pub backup_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupPolicy {
+    pub enabled: bool,
+    pub max_depth: usize,
+    pub max_file_size: Option<u64>,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_depth: DEFAULT_MAX_UNDO_DEPTH,
+            max_file_size: None,
+        }
+    }
+}
+
 /// Per-(session, file) undo store with optional disk persistence.
 ///
 /// Introduced alongside project-shared bridges (issue #14): one bridge can now
@@ -185,10 +206,10 @@ pub struct RestoredFile {
 /// per-file LRU would re-couple sessions and let one busy session evict
 /// another's history.
 ///
-/// Disk layout (schema v2):
+/// Disk layout (metadata `format_version` v2):
 ///   `<storage_dir>/backups/<session_hash>/session.json` — session metadata
 ///   `<storage_dir>/backups/<session_hash>/<path_hash>/meta.json` — file path + count + session
-///   `<storage_dir>/backups/<session_hash>/<path_hash>/0.bak` … `19.bak` — snapshots
+///   `<storage_dir>/backups/<session_hash>/<path_hash>/bak_<order>_<id>.bak` — append-only content
 ///
 /// Legacy layouts from before sessionization (flat `<path_hash>/` directly under
 /// `backups/`) are migrated on first `set_storage_dir` call into the default
@@ -207,6 +228,7 @@ pub struct BackupStore {
     db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     db_harness: RwLock<Option<String>>,
     db_project_key: RwLock<Option<String>>,
+    policy: BackupPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -234,7 +256,21 @@ impl BackupStore {
             db_pool: RwLock::new(None),
             db_harness: RwLock::new(None),
             db_project_key: RwLock::new(None),
+            policy: BackupPolicy::default(),
         }
+    }
+
+    pub fn set_policy(&mut self, policy: BackupPolicy) {
+        self.policy = policy;
+        for files in self.entries.values_mut() {
+            for stack in files.values_mut() {
+                trim_stack_to_depth(stack, self.policy.max_depth);
+            }
+        }
+    }
+
+    pub fn policy(&self) -> BackupPolicy {
+        self.policy
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<Connection>>) {
@@ -297,7 +333,7 @@ impl BackupStore {
         session: &str,
         path: &Path,
         description: &str,
-    ) -> Result<String, AftError> {
+    ) -> Result<Option<String>, AftError> {
         self.snapshot_with_op(session, path, description, None)
     }
 
@@ -310,29 +346,46 @@ impl BackupStore {
         path: &Path,
         description: &str,
         op_id: Option<&str>,
-    ) -> Result<String, AftError> {
+    ) -> Result<Option<String>, AftError> {
+        if !self.should_snapshot_path(path)? {
+            return Ok(None);
+        }
         let key = canonicalize_key(path);
+        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
         // Hydrate any prior on-disk history before appending, so a snapshot
         // taken on a fresh store (post-restart) extends the existing stack and
         // advances the id counter instead of overwriting history with a single
         // entry and reusing backup-0.
-        self.ensure_stack_hydrated(session, &key);
+        self.ensure_stack_hydrated_locked(session, &key)?;
         let (id, order) = self.next_id_and_order();
         let entry = backup_entry_from_path(path, id.clone(), order, description, op_id)?;
 
+        let max_depth = self.policy.max_depth;
         let session_entries = self.entries.entry(session.to_string()).or_default();
         let stack = session_entries.entry(key.clone()).or_default();
-        if stack.len() >= MAX_UNDO_DEPTH {
-            stack.remove(0);
-        }
+        trim_stack_to_depth(stack, max_depth.saturating_sub(1));
         stack.push(entry);
+        trim_stack_to_depth(stack, max_depth);
 
         // Persist to disk
         let stack_clone = stack.clone();
-        self.write_snapshot_to_disk(session, &key, &stack_clone);
+        if let Err(error) = self.write_snapshot_to_disk_locked(session, &key, &stack_clone) {
+            if let Some(session_entries) = self.entries.get_mut(session) {
+                if let Some(stack) = session_entries.get_mut(&key) {
+                    stack.retain(|entry| entry.backup_id != id);
+                    if stack.is_empty() {
+                        session_entries.remove(&key);
+                    }
+                }
+                if session_entries.is_empty() {
+                    self.entries.remove(session);
+                }
+            }
+            return Err(error);
+        }
         self.touch_session(session);
 
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// Record that `path` was created by the operation and should be removed
@@ -343,9 +396,13 @@ impl BackupStore {
         op_id: &str,
         path: &Path,
         description: &str,
-    ) -> Result<String, AftError> {
+    ) -> Result<Option<String>, AftError> {
+        if !self.policy.enabled {
+            return Ok(None);
+        }
         let key = canonicalize_key(path);
-        self.ensure_stack_hydrated(session, &key);
+        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
+        self.ensure_stack_hydrated_locked(session, &key)?;
         let created_dirs = path.parent().map(missing_parent_dirs).unwrap_or_default();
         let (id, order) = self.next_id_and_order();
         let entry = BackupEntry {
@@ -362,46 +419,63 @@ impl BackupStore {
             created_dirs,
         };
 
+        let max_depth = self.policy.max_depth;
         let session_entries = self.entries.entry(session.to_string()).or_default();
         let stack = session_entries.entry(key.clone()).or_default();
-        if stack.len() >= MAX_UNDO_DEPTH {
-            stack.remove(0);
-        }
+        trim_stack_to_depth(stack, max_depth.saturating_sub(1));
         stack.push(entry);
+        trim_stack_to_depth(stack, max_depth);
 
         let stack_clone = stack.clone();
-        self.write_snapshot_to_disk(session, &key, &stack_clone);
+        if let Err(error) = self.write_snapshot_to_disk_locked(session, &key, &stack_clone) {
+            if let Some(session_entries) = self.entries.get_mut(session) {
+                if let Some(stack) = session_entries.get_mut(&key) {
+                    stack.retain(|entry| entry.backup_id != id);
+                    if stack.is_empty() {
+                        session_entries.remove(&key);
+                    }
+                }
+                if session_entries.is_empty() {
+                    self.entries.remove(session);
+                }
+            }
+            return Err(error);
+        }
         self.touch_session(session);
 
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// Restore every top-of-stack backup entry belonging to the most recent
     /// operation in this session.
     pub fn restore_last_operation(&mut self, session: &str) -> Result<RestoredOperation, AftError> {
-        match self.load_latest_operation_from_db(session) {
-            Some(Ok(true)) => {}
-            Some(Ok(false)) => {
-                crate::slog_info!(
-                    "backup latest operation DB miss for session {}; falling back to disk",
-                    session
-                );
-                self.load_all_disk_backups(session);
-            }
-            Some(Err(error)) => {
-                crate::slog_warn!(
-                    "backup latest operation DB lookup failed for session {}; falling back to disk: {}",
-                    session,
-                    error
-                );
-                self.load_all_disk_backups(session);
-            }
-            None => {
-                crate::slog_info!(
-                    "backup latest operation DB unavailable for session {}; falling back to disk",
-                    session
-                );
-                self.load_all_disk_backups(session);
+        self.load_all_disk_backups(session);
+        let has_in_memory_entries = self
+            .entries
+            .get(session)
+            .is_some_and(|files| files.values().any(|stack| !stack.is_empty()));
+        if !has_in_memory_entries {
+            match self.load_latest_operation_from_db(session) {
+                Some(Ok(true)) => {}
+                Some(Ok(false)) => {
+                    crate::slog_info!(
+                        "backup latest operation DB miss for session {}; disk meta is authoritative",
+                        session
+                    );
+                }
+                Some(Err(error)) => {
+                    crate::slog_warn!(
+                        "backup latest operation DB lookup failed for session {}: {}",
+                        session,
+                        error
+                    );
+                }
+                None => {
+                    crate::slog_info!(
+                        "backup latest operation DB unavailable for session {}",
+                        session
+                    );
+                }
             }
         }
 
@@ -449,6 +523,8 @@ impl BackupStore {
                 path: "operation".to_string(),
             });
         }
+
+        let _disk_locks = self.acquire_stack_disk_locks(session, &keys_to_restore)?;
 
         let mut content_targets = Vec::new();
         let mut tombstone_targets = Vec::new();
@@ -550,7 +626,7 @@ impl BackupStore {
         let mut restored = Vec::new();
         let mut warnings = Vec::new();
         for (key, entry, warning, _) in content_targets {
-            self.commit_restored_backup(session, &key);
+            self.commit_restored_backup_locked(session, &key)?;
             if let Some(warning) = warning {
                 warnings.push(format!("{}: {}", key.display(), warning));
             }
@@ -560,7 +636,7 @@ impl BackupStore {
             });
         }
         for (key, _, _) in tombstone_targets {
-            self.commit_restored_backup(session, &key);
+            self.commit_restored_backup_locked(session, &key)?;
         }
         self.touch_session(session);
 
@@ -579,39 +655,55 @@ impl BackupStore {
         path: &Path,
     ) -> Result<(BackupEntry, Option<String>), AftError> {
         let key = canonicalize_key(path);
+        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
 
-        match self.load_from_db_if_present(session, &key) {
-            Some(Ok(true)) => {
-                let warning = self.check_external_modification(session, &key, path);
-                let result = self
-                    .do_restore(session, &key, path)
-                    .map(|(entry, _)| (entry, warning));
-                if result.is_ok() {
-                    self.touch_session(session);
+        match self.read_stack_from_disk_unlocked(session, &key) {
+            Ok(Some(entries)) if !entries.is_empty() => {
+                self.update_counter_from_entries(&entries);
+                self.entries
+                    .entry(session.to_string())
+                    .or_default()
+                    .insert(key.to_path_buf(), entries);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(AftError::IoError {
+                    path: key.display().to_string(),
+                    message: error,
+                });
+            }
+        }
+
+        if self
+            .entries
+            .get(session)
+            .and_then(|s| s.get(&key))
+            .is_none_or(|s| s.is_empty())
+        {
+            match self.load_from_db_if_present(session, &key) {
+                Some(Ok(true)) => {}
+                Some(Ok(false)) => {
+                    crate::slog_info!(
+                        "backup DB miss for session {} path {}; disk meta is authoritative",
+                        session,
+                        key.display()
+                    );
                 }
-                return result;
-            }
-            Some(Ok(false)) => {
-                crate::slog_info!(
-                    "backup DB miss for session {} path {}; falling back to disk",
-                    session,
-                    key.display()
-                );
-            }
-            Some(Err(error)) => {
-                crate::slog_warn!(
-                    "backup DB lookup failed for session {} path {}; falling back to disk: {}",
-                    session,
-                    key.display(),
-                    error
-                );
-            }
-            None => {
-                crate::slog_info!(
-                    "backup DB unavailable for session {} path {}; falling back to disk",
-                    session,
-                    key.display()
-                );
+                Some(Err(error)) => {
+                    crate::slog_warn!(
+                        "backup DB lookup failed for session {} path {}: {}",
+                        session,
+                        key.display(),
+                        error
+                    );
+                }
+                None => {
+                    crate::slog_info!(
+                        "backup DB unavailable for session {} path {}",
+                        session,
+                        key.display()
+                    );
+                }
             }
         }
 
@@ -624,21 +716,12 @@ impl BackupStore {
         if in_memory {
             let warning = self.check_external_modification(session, &key, path);
             let result = self
-                .do_restore(session, &key, path)
+                .do_restore_locked(session, &key, path)
                 .map(|(entry, _)| (entry, warning));
             if result.is_ok() {
                 self.touch_session(session);
             }
             return result;
-        }
-
-        // Try disk fallback
-        if self.load_from_disk_if_needed(session, &key) {
-            // Check for external modification
-            let warning = self.check_external_modification(session, &key, path);
-            let (entry, _) = self.do_restore(session, &key, path)?;
-            self.touch_session(session);
-            return Ok((entry, warning));
         }
 
         Err(AftError::NoUndoHistory {
@@ -649,38 +732,47 @@ impl BackupStore {
     /// Return the backup history for `(session, path)` (oldest first).
     pub fn history(&self, session: &str, path: &Path) -> Vec<BackupEntry> {
         let key = canonicalize_key(path);
-        match self.read_stack_from_db(session, &key) {
-            Some(Ok(stack)) if !stack.is_empty() => return stack,
-            Some(Ok(_)) => {
-                crate::slog_info!(
-                    "backup history DB miss for session {} path {}; falling back to disk",
-                    session,
-                    key.display()
+        let _disk_lock = match self.acquire_stack_disk_lock(session, &key) {
+            Ok(lock) => lock,
+            Err(error) => {
+                crate::slog_warn!(
+                    "backup disk read lock failed for {}: {}",
+                    key.display(),
+                    error
                 );
+                return Vec::new();
             }
+        };
+
+        match self.read_stack_from_disk_unlocked(session, &key) {
+            Ok(Some(stack)) if !stack.is_empty() => return stack,
+            Ok(_) => {}
+            Err(error) => {
+                crate::slog_warn!("backup disk read failed for {}: {}", key.display(), error);
+                return Vec::new();
+            }
+        }
+
+        if let Some(stack) = self.entries.get(session).and_then(|s| s.get(&key)).cloned() {
+            if !stack.is_empty() {
+                return stack;
+            }
+        }
+
+        match self.read_stack_from_db(session, &key) {
+            Some(Ok(stack)) if !stack.is_empty() => stack,
+            Some(Ok(_)) => Vec::new(),
             Some(Err(error)) => {
                 crate::slog_warn!(
-                    "backup history DB lookup failed for session {} path {}; falling back to disk: {}",
+                    "backup history DB lookup failed for session {} path {}: {}",
                     session,
                     key.display(),
                     error
                 );
+                Vec::new()
             }
-            None => {
-                crate::slog_info!(
-                    "backup history DB unavailable for session {} path {}; falling back to disk",
-                    session,
-                    key.display()
-                );
-            }
+            None => Vec::new(),
         }
-
-        self.entries
-            .get(session)
-            .and_then(|s| s.get(&key))
-            .cloned()
-            .or_else(|| self.read_stack_from_disk(session, &key))
-            .unwrap_or_default()
     }
 
     /// Return the number of on-disk backup entries for `(session, file)`.
@@ -750,6 +842,7 @@ impl BackupStore {
                 for (key, head) in db_heads {
                     heads_by_path.insert(key, head);
                 }
+                self.merge_disk_stack_heads(session, &mut heads_by_path);
             }
             Some(Ok(_)) => {
                 crate::slog_info!(
@@ -854,32 +947,6 @@ impl BackupStore {
     }
 
     fn latest_head_for_key(&self, session: &str, key: &Path) -> Option<BackupEntryHead> {
-        match self.read_stack_heads_from_db(session, key) {
-            Some(Ok(stack)) if !stack.is_empty() => return stack.last().cloned(),
-            Some(Ok(_)) => {
-                crate::slog_info!(
-                    "backup preview DB miss for session {} path {}; falling back to disk",
-                    session,
-                    key.display()
-                );
-            }
-            Some(Err(error)) => {
-                crate::slog_warn!(
-                    "backup preview DB lookup failed for session {} path {}; falling back to disk: {}",
-                    session,
-                    key.display(),
-                    error
-                );
-            }
-            None => {
-                crate::slog_info!(
-                    "backup preview DB unavailable for session {} path {}; falling back to disk",
-                    session,
-                    key.display()
-                );
-            }
-        }
-
         self.entries
             .get(session)
             .and_then(|files| files.get(key))
@@ -888,6 +955,19 @@ impl BackupStore {
             .or_else(|| {
                 self.read_stack_heads_from_disk(session, key)
                     .and_then(|stack| stack.last().cloned())
+            })
+            .or_else(|| match self.read_stack_heads_from_db(session, key) {
+                Some(Ok(stack)) if !stack.is_empty() => stack.last().cloned(),
+                Some(Err(error)) => {
+                    crate::slog_warn!(
+                        "backup preview DB lookup failed for session {} path {}: {}",
+                        session,
+                        key.display(),
+                        error
+                    );
+                    None
+                }
+                _ => None,
             })
     }
 
@@ -1142,9 +1222,21 @@ impl BackupStore {
             }
 
             if remove_key {
-                self.remove_disk_backups(session, &key);
+                if let Err(error) = self.remove_disk_backups(session, &key) {
+                    crate::slog_warn!(
+                        "failed to remove backup stack for {} during operation discard: {}",
+                        key.display(),
+                        error
+                    );
+                }
             } else if let Some(stack) = remaining_stack {
-                self.write_snapshot_to_disk(session, &key, &stack);
+                if let Err(error) = self.write_snapshot_to_disk(session, &key, &stack) {
+                    crate::slog_warn!(
+                        "failed to persist backup stack for {} during operation discard: {}",
+                        key.display(),
+                        error
+                    );
+                }
             }
         }
 
@@ -1168,7 +1260,7 @@ impl BackupStore {
 
     // ---- Internal helpers ----
 
-    fn do_restore(
+    fn do_restore_locked(
         &mut self,
         session: &str,
         key: &Path,
@@ -1216,7 +1308,7 @@ impl BackupStore {
             if session_entries.is_empty() {
                 self.entries.remove(session);
             }
-            self.remove_disk_backups(session, key);
+            self.remove_disk_backups_locked(session, key)?;
         } else {
             let stack_clone = self
                 .entries
@@ -1224,13 +1316,13 @@ impl BackupStore {
                 .and_then(|s| s.get(key))
                 .cloned()
                 .unwrap_or_default();
-            self.write_snapshot_to_disk(session, key, &stack_clone);
+            self.write_snapshot_to_disk_locked(session, key, &stack_clone)?;
         }
 
         Ok((entry, None))
     }
 
-    fn commit_restored_backup(&mut self, session: &str, key: &Path) {
+    fn commit_restored_backup_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
         let mut remove_key = false;
         let mut remove_session = false;
         let mut remaining_stack = None;
@@ -1256,10 +1348,12 @@ impl BackupStore {
         }
 
         if remove_key {
-            self.remove_disk_backups(session, key);
+            self.remove_disk_backups_locked(session, key)?;
         } else if let Some(stack) = remaining_stack {
-            self.write_snapshot_to_disk(session, key, &stack);
+            self.write_snapshot_to_disk_locked(session, key, &stack)?;
         }
+
+        Ok(())
     }
 
     fn check_external_modification(
@@ -1594,7 +1688,7 @@ impl BackupStore {
                     if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
                         if let (Some(path_str), Some(count)) = (
                             meta.get("path").and_then(|v| v.as_str()),
-                            meta.get("count").and_then(|v| v.as_u64()),
+                            meta_entry_count(&meta).map(|count| count as u64),
                         ) {
                             let key = PathBuf::from(path_str);
                             if !is_loadable_backup_path(&key, &path_dir) {
@@ -1658,9 +1752,110 @@ impl BackupStore {
         parsed.get("last_accessed").and_then(|v| v.as_u64())
     }
 
-    fn load_from_disk_if_needed(&mut self, session: &str, key: &Path) -> bool {
-        let Some(entries) = self.read_stack_from_disk(session, key) else {
-            return false;
+    fn should_snapshot_path(&self, path: &Path) -> Result<bool, AftError> {
+        if !self.policy.enabled {
+            return Ok(false);
+        }
+        let Some(max_file_size) = self.policy.max_file_size else {
+            return Ok(true);
+        };
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() > max_file_size => Ok(false),
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(AftError::FileNotFound {
+                    path: path.display().to_string(),
+                })
+            }
+            Err(error) => Err(AftError::IoError {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    fn ensure_session_marker(&self, session_dir: &Path, session: &str) -> Result<(), AftError> {
+        let marker = session_dir.join("session.json");
+        if marker.exists() {
+            return Ok(());
+        }
+        let json = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session,
+            "last_accessed": current_timestamp(),
+        });
+        let content = serde_json::to_string_pretty(&json).map_err(|error| AftError::IoError {
+            path: marker.display().to_string(),
+            message: error.to_string(),
+        })?;
+        write_temp_fsync_rename(session_dir, "session.json", content.as_bytes()).map_err(
+            |error| AftError::IoError {
+                path: marker.display().to_string(),
+                message: error.to_string(),
+            },
+        )?;
+        let _ = fsync_dir(session_dir);
+        Ok(())
+    }
+
+    fn acquire_stack_disk_lock(
+        &self,
+        session: &str,
+        key: &Path,
+    ) -> Result<Option<crate::fs_lock::LockGuard>, AftError> {
+        let Some(session_dir) = self.session_dir(session) else {
+            return Ok(None);
+        };
+        let lock_dir = session_dir.join(".locks");
+        std::fs::create_dir_all(&lock_dir).map_err(|error| AftError::IoError {
+            path: lock_dir.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let lock_path = lock_dir.join(format!("{}.lock", Self::path_hash(key)));
+        crate::fs_lock::acquire(&lock_path)
+            .map(Some)
+            .map_err(|error| AftError::IoError {
+                path: lock_path.display().to_string(),
+                message: error.to_string(),
+            })
+    }
+
+    fn acquire_stack_disk_locks(
+        &self,
+        session: &str,
+        keys: &[PathBuf],
+    ) -> Result<Vec<crate::fs_lock::LockGuard>, AftError> {
+        let mut keys = keys.to_vec();
+        keys.sort();
+        keys.dedup();
+        let mut guards = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(guard) = self.acquire_stack_disk_lock(session, &key)? {
+                guards.push(guard);
+            }
+        }
+        Ok(guards)
+    }
+
+    fn load_from_disk_if_needed(&mut self, session: &str, key: &Path) -> Result<bool, AftError> {
+        let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
+        self.load_from_disk_if_needed_locked(session, key)
+    }
+
+    fn load_from_disk_if_needed_locked(
+        &mut self,
+        session: &str,
+        key: &Path,
+    ) -> Result<bool, AftError> {
+        let entries = match self.read_stack_from_disk_unlocked(session, key) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                return Err(AftError::IoError {
+                    path: key.display().to_string(),
+                    message: error,
+                });
+            }
         };
 
         self.update_counter_from_entries(&entries);
@@ -1669,7 +1864,7 @@ impl BackupStore {
             .entry(session.to_string())
             .or_default()
             .insert(key.to_path_buf(), entries);
-        true
+        Ok(true)
     }
 
     /// Ensure the in-memory undo stack for `(session, key)` reflects any prior
@@ -1686,15 +1881,16 @@ impl BackupStore {
     /// `update_counter_from_entries`. Only loads when nothing is in memory yet,
     /// so it never clobbers a stack already mutated in this run and adds at
     /// most one disk read per file per session.
-    fn ensure_stack_hydrated(&mut self, session: &str, key: &Path) {
+    fn ensure_stack_hydrated_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
         let already_in_memory = self
             .entries
             .get(session)
             .and_then(|files| files.get(key))
             .is_some_and(|stack| !stack.is_empty());
         if !already_in_memory {
-            self.load_from_disk_if_needed(session, key);
+            self.load_from_disk_if_needed_locked(session, key)?;
         }
+        Ok(())
     }
 
     fn load_all_disk_backups(&mut self, session: &str) {
@@ -1704,7 +1900,13 @@ impl BackupStore {
             .map(|files| files.keys().cloned().collect())
             .unwrap_or_default();
         for key in disk_keys {
-            self.load_from_disk_if_needed(session, &key);
+            if let Err(error) = self.load_from_disk_if_needed(session, &key) {
+                crate::slog_warn!(
+                    "failed to hydrate backup stack for {}: {}",
+                    key.display(),
+                    error
+                );
+            }
         }
     }
 
@@ -1713,263 +1915,279 @@ impl BackupStore {
         session: &str,
         key: &Path,
     ) -> Option<Vec<BackupEntryHead>> {
-        let disk_meta = match self
-            .disk_index
-            .get(session)
-            .and_then(|s| s.get(key))
-            .cloned()
-        {
-            Some(m) if m.count > 0 => m,
-            _ => return None,
+        let _disk_lock = match self.acquire_stack_disk_lock(session, key) {
+            Ok(lock) => lock,
+            Err(error) => {
+                crate::slog_warn!(
+                    "backup disk head read lock failed for {}: {}",
+                    key.display(),
+                    error
+                );
+                return None;
+            }
         };
-
-        let entry_meta = std::fs::read_to_string(disk_meta.dir.join("meta.json"))
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|meta| meta.get("entries").and_then(|v| v.as_array()).cloned())
-            .unwrap_or_default();
-
-        let mut heads = Vec::new();
-        for i in 0..disk_meta.count {
-            let meta = entry_meta.get(i);
-            let backup_id = meta
-                .and_then(|m| m.get("backup_id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("disk-{}", i));
-            let timestamp = meta
-                .and_then(|m| m.get("timestamp"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let order = meta
-                .and_then(|m| m.get("order"))
-                .and_then(parse_order_value)
-                .unwrap_or_else(|| legacy_entry_order(timestamp, &backup_id));
-            heads.push(BackupEntryHead {
-                order,
-                op_id: meta
-                    .and_then(|m| m.get("op_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-            });
-        }
-
-        if heads.is_empty() {
-            return None;
-        }
-        Some(heads)
-    }
-
-    fn read_stack_from_disk(&self, session: &str, key: &Path) -> Option<Vec<BackupEntry>> {
-        let disk_meta = match self
-            .disk_index
-            .get(session)
-            .and_then(|s| s.get(key))
-            .cloned()
-        {
-            Some(m) if m.count > 0 => m,
-            _ => return None,
-        };
-
-        let mut entries = Vec::new();
-        let entry_meta = std::fs::read_to_string(disk_meta.dir.join("meta.json"))
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|meta| meta.get("entries").and_then(|v| v.as_array()).cloned())
-            .unwrap_or_default();
-
-        for i in 0..disk_meta.count {
-            let meta = entry_meta.get(i);
-            let kind = match meta.and_then(|m| m.get("kind")).and_then(|v| v.as_str()) {
-                Some("tombstone") => BackupEntryKind::Tombstone,
-                Some("symlink") => BackupEntryKind::Symlink,
-                _ => BackupEntryKind::Content,
-            };
-            let content_bytes = match kind {
-                BackupEntryKind::Content | BackupEntryKind::Symlink => {
-                    let bak_path = disk_meta.dir.join(format!("{}.bak", i));
-                    match std::fs::read(&bak_path) {
-                        Ok(content) => content,
-                        Err(_) => continue,
-                    }
-                }
-                BackupEntryKind::Tombstone => Vec::new(),
-            };
-            let link_target = if kind == BackupEntryKind::Symlink {
-                meta.and_then(|m| m.get("link_target"))
-                    .and_then(|v| v.as_str())
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        Some(PathBuf::from(
-                            String::from_utf8_lossy(&content_bytes).into_owned(),
-                        ))
-                    })
-            } else {
+        match self.read_stack_heads_from_disk_unlocked(session, key) {
+            Ok(heads) => heads,
+            Err(error) => {
+                crate::slog_warn!(
+                    "backup disk head read failed for {}: {}",
+                    key.display(),
+                    error
+                );
                 None
-            };
-            let content = match kind {
-                BackupEntryKind::Content => String::from_utf8_lossy(&content_bytes).into_owned(),
-                BackupEntryKind::Symlink => link_target
-                    .as_ref()
-                    .map(|target| target.display().to_string())
-                    .unwrap_or_default(),
-                BackupEntryKind::Tombstone => String::new(),
-            };
-            let backup_id = meta
-                .and_then(|m| m.get("backup_id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("disk-{}", i));
-            let timestamp = meta
-                .and_then(|m| m.get("timestamp"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let order = meta
-                .and_then(|m| m.get("order"))
-                .and_then(parse_order_value)
-                .unwrap_or_else(|| legacy_entry_order(timestamp, &backup_id));
-            entries.push(BackupEntry {
-                backup_id,
-                content,
-                content_bytes,
-                timestamp,
-                order,
-                description: meta
-                    .and_then(|m| m.get("description"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("restored from disk")
-                    .to_string(),
-                op_id: meta
-                    .and_then(|m| m.get("op_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                kind,
-                mode: meta
-                    .and_then(|m| m.get("mode"))
-                    .and_then(|v| v.as_u64())
-                    .and_then(|mode| u32::try_from(mode).ok()),
-                link_target,
-                created_dirs: meta
-                    .and_then(|m| m.get("created_dirs"))
-                    .and_then(|v| v.as_array())
-                    .map(|dirs| {
-                        dirs.iter()
-                            .filter_map(|dir| dir.as_str())
-                            .map(PathBuf::from)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            });
-        }
-
-        if entries.is_empty() {
-            return None;
-        }
-        Some(entries)
-    }
-
-    fn write_snapshot_to_disk(&mut self, session: &str, key: &Path, stack: &[BackupEntry]) {
-        let session_dir = match self.session_dir(session) {
-            Some(d) => d,
-            None => return,
-        };
-
-        // Ensure session dir + marker exist.
-        if let Err(e) = std::fs::create_dir_all(&session_dir) {
-            crate::slog_warn!("failed to create session dir: {}", e);
-            return;
-        }
-        let marker = session_dir.join("session.json");
-        if !marker.exists() {
-            let json = serde_json::json!({
-                "schema_version": SCHEMA_VERSION,
-                "session_id": session,
-                "last_accessed": current_timestamp(),
-            });
-            if let Ok(s) = serde_json::to_string_pretty(&json) {
-                let _ = std::fs::write(&marker, s);
             }
         }
+    }
+
+    fn read_stack_heads_from_disk_unlocked(
+        &self,
+        session: &str,
+        key: &Path,
+    ) -> Result<Option<Vec<BackupEntryHead>>, String> {
+        let Some((disk_meta, meta)) = self.read_disk_meta_value(session, key)? else {
+            return Ok(None);
+        };
+        if disk_meta.count == 0 {
+            return Ok(None);
+        }
+
+        let heads = if is_v2_meta(&meta) {
+            let entries = meta_entries(&meta)?;
+            for entry in entries {
+                self.validate_v2_content_reference(&disk_meta.dir, entry)?;
+            }
+            entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| backup_head_from_meta(Some(entry), i))
+                .collect::<Vec<_>>()
+        } else {
+            let entries = meta.get("entries").and_then(|value| value.as_array());
+            (0..disk_meta.count)
+                .map(|i| backup_head_from_meta(entries.and_then(|entries| entries.get(i)), i))
+                .collect::<Vec<_>>()
+        };
+
+        Ok((!heads.is_empty()).then_some(heads))
+    }
+
+    fn read_stack_from_disk_unlocked(
+        &self,
+        session: &str,
+        key: &Path,
+    ) -> Result<Option<Vec<BackupEntry>>, String> {
+        let Some((disk_meta, meta)) = self.read_disk_meta_value(session, key)? else {
+            return Ok(None);
+        };
+        if disk_meta.count == 0 {
+            return Ok(None);
+        }
+
+        let entries = if is_v2_meta(&meta) {
+            meta_entries(&meta)?
+                .iter()
+                .enumerate()
+                .map(|(i, entry_meta)| self.entry_from_v2_meta(&disk_meta.dir, entry_meta, i))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let entries = meta.get("entries").and_then(|value| value.as_array());
+            let mut loaded = Vec::new();
+            for i in 0..disk_meta.count {
+                let entry_meta = entries.and_then(|entries| entries.get(i));
+                if let Some(entry) = legacy_entry_from_meta(&disk_meta.dir, entry_meta, i) {
+                    loaded.push(entry);
+                }
+            }
+            loaded
+        };
+
+        Ok((!entries.is_empty()).then_some(entries))
+    }
+
+    fn read_disk_meta_value(
+        &self,
+        session: &str,
+        key: &Path,
+    ) -> Result<Option<(DiskMeta, serde_json::Value)>, String> {
+        let Some(disk_meta) = self.disk_meta_for_stack(session, key) else {
+            return Ok(None);
+        };
+        let meta_path = disk_meta.dir.join("meta.json");
+        let content = std::fs::read_to_string(&meta_path)
+            .map_err(|error| format!("failed to read {}: {}", meta_path.display(), error))?;
+        let meta = serde_json::from_str::<serde_json::Value>(&content)
+            .map_err(|error| format!("failed to parse {}: {}", meta_path.display(), error))?;
+        Ok(Some((disk_meta, meta)))
+    }
+
+    fn disk_meta_for_stack(&self, session: &str, key: &Path) -> Option<DiskMeta> {
+        if let Some(meta) = self
+            .disk_index
+            .get(session)
+            .and_then(|files| files.get(key))
+            .cloned()
+            .filter(|meta| meta.count > 0)
+        {
+            return Some(meta);
+        }
+
+        let dir = self.session_dir(session)?.join(Self::path_hash(key));
+        let meta_path = dir.join("meta.json");
+        let content = std::fs::read_to_string(meta_path).ok()?;
+        let meta = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+        let path_str = meta.get("path").and_then(|value| value.as_str())?;
+        let stored_key = PathBuf::from(path_str);
+        if stored_key != key || !is_loadable_backup_path(&stored_key, &dir) {
+            return None;
+        }
+        let count = meta_entry_count(&meta)?;
+        (count > 0).then_some(DiskMeta { dir, count })
+    }
+
+    fn validate_v2_content_reference(
+        &self,
+        dir: &Path,
+        entry_meta: &serde_json::Value,
+    ) -> Result<(), String> {
+        let kind = entry_kind_from_meta(Some(entry_meta));
+        if matches!(kind, BackupEntryKind::Tombstone) {
+            return Ok(());
+        }
+        let content_path = content_path_from_meta(entry_meta)?;
+        let path = dir.join(content_path);
+        if !path.is_file() {
+            return Err(format!(
+                "v2 backup meta references missing content file {}",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn entry_from_v2_meta(
+        &self,
+        dir: &Path,
+        entry_meta: &serde_json::Value,
+        index: usize,
+    ) -> Result<BackupEntry, String> {
+        let kind = entry_kind_from_meta(Some(entry_meta));
+        let content_bytes = match kind {
+            BackupEntryKind::Content | BackupEntryKind::Symlink => {
+                let content_path = content_path_from_meta(entry_meta)?;
+                let path = dir.join(content_path);
+                std::fs::read(&path).map_err(|error| {
+                    format!(
+                        "failed to read v2 backup content {}: {}",
+                        path.display(),
+                        error
+                    )
+                })?
+            }
+            BackupEntryKind::Tombstone => Vec::new(),
+        };
+        Ok(entry_from_meta(
+            Some(entry_meta),
+            index,
+            kind,
+            content_bytes,
+        ))
+    }
+
+    fn write_snapshot_to_disk(
+        &mut self,
+        session: &str,
+        key: &Path,
+        stack: &[BackupEntry],
+    ) -> Result<(), AftError> {
+        let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
+        self.write_snapshot_to_disk_locked(session, key, stack)
+    }
+
+    fn write_snapshot_to_disk_locked(
+        &mut self,
+        session: &str,
+        key: &Path,
+        stack: &[BackupEntry],
+    ) -> Result<(), AftError> {
+        let Some(session_dir) = self.session_dir(session) else {
+            return Ok(());
+        };
+
+        std::fs::create_dir_all(&session_dir).map_err(|error| AftError::IoError {
+            path: session_dir.display().to_string(),
+            message: error.to_string(),
+        })?;
+        self.ensure_session_marker(&session_dir, session)?;
 
         let hash = Self::path_hash(key);
         let dir = session_dir.join(&hash);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            crate::slog_warn!("failed to create backup dir: {}", e);
-            return;
-        }
+        std::fs::create_dir_all(&dir).map_err(|error| AftError::IoError {
+            path: dir.display().to_string(),
+            message: error.to_string(),
+        })?;
 
-        for (i, entry) in stack.iter().enumerate() {
-            let bak_path = dir.join(format!("{}.bak", i));
-            let tmp_path = dir.join(format!("{}.bak.tmp", i));
-            match entry.kind {
-                BackupEntryKind::Content => {
-                    if std::fs::write(&tmp_path, &entry.content_bytes).is_ok() {
-                        let _ = std::fs::rename(&tmp_path, &bak_path);
+        let max_depth = self.policy.max_depth;
+        let retained_start = stack.len().saturating_sub(max_depth);
+        let retained = &stack[retained_start..];
+        let mut referenced_content = HashSet::new();
+        let mut wrote_content = false;
+
+        for entry in retained {
+            if let Some(content_path) = content_filename_for_entry(entry) {
+                referenced_content.insert(content_path.clone());
+                let final_path = dir.join(&content_path);
+                if final_path.exists() {
+                    continue;
+                }
+                let bytes = content_bytes_for_disk(entry);
+                write_temp_fsync_rename(&dir, &content_path, &bytes).map_err(|error| {
+                    AftError::IoError {
+                        path: final_path.display().to_string(),
+                        message: error.to_string(),
                     }
-                }
-                BackupEntryKind::Symlink => {
-                    let target = entry
-                        .link_target
-                        .as_ref()
-                        .map(|target| target.as_os_str().to_string_lossy().as_bytes().to_vec())
-                        .unwrap_or_default();
-                    if std::fs::write(&tmp_path, target).is_ok() {
-                        let _ = std::fs::rename(&tmp_path, &bak_path);
-                    }
-                }
-                BackupEntryKind::Tombstone => {
-                    let _ = std::fs::remove_file(&bak_path);
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
+                })?;
+                wrote_content = true;
             }
         }
-
-        // Clean up extra .bak files if stack shrank.
-        for i in stack.len()..MAX_UNDO_DEPTH {
-            let old = dir.join(format!("{}.bak", i));
-            if old.exists() {
-                let _ = std::fs::remove_file(&old);
-            }
+        if wrote_content {
+            fsync_dir(&dir).map_err(|error| AftError::IoError {
+                path: dir.display().to_string(),
+                message: error.to_string(),
+            })?;
         }
 
-        let entries: Vec<serde_json::Value> = stack
-            .iter()
-            .map(|entry| {
-                serde_json::json!({
-                    "backup_id": entry.backup_id,
-                    "timestamp": entry.timestamp,
-                    "order": entry.order.to_string(),
-                    "description": entry.description,
-                    "op_id": entry.op_id,
-                    "kind": match entry.kind {
-                        BackupEntryKind::Content => "content",
-                        BackupEntryKind::Symlink => "symlink",
-                        BackupEntryKind::Tombstone => "tombstone",
-                    },
-                    "mode": entry.mode,
-                    "link_target": entry.link_target.as_ref().map(|target| target.display().to_string()),
-                    "created_dirs": entry
-                        .created_dirs
-                        .iter()
-                        .map(|dir| dir.display().to_string())
-                        .collect::<Vec<_>>(),
-                })
-            })
-            .collect();
+        let entries: Vec<serde_json::Value> = retained.iter().map(entry_meta_json).collect();
         let meta = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
+            "format_version": V2_FORMAT_VERSION,
             "session_id": session,
             "path": key.display().to_string(),
-            "count": stack.len(),
+            "count": retained.len(),
             "entries": entries,
         });
-        let meta_path = dir.join("meta.json");
-        let meta_tmp = dir.join("meta.json.tmp");
-        if let Ok(content) = serde_json::to_string_pretty(&meta) {
-            if std::fs::write(&meta_tmp, &content).is_ok() {
-                let _ = std::fs::rename(&meta_tmp, &meta_path);
+        let meta_content =
+            serde_json::to_string_pretty(&meta).map_err(|error| AftError::IoError {
+                path: dir.join("meta.json").display().to_string(),
+                message: error.to_string(),
+            })?;
+        write_temp_fsync_rename(&dir, "meta.json", meta_content.as_bytes()).map_err(|error| {
+            AftError::IoError {
+                path: dir.join("meta.json").display().to_string(),
+                message: error.to_string(),
             }
-        }
+        })?;
+        fsync_dir(&dir).map_err(|error| AftError::IoError {
+            path: dir.display().to_string(),
+            message: error.to_string(),
+        })?;
+
+        prune_unreferenced_backup_files(&dir, &referenced_content).map_err(|error| {
+            AftError::IoError {
+                path: dir.display().to_string(),
+                message: error.to_string(),
+            }
+        })?;
+        let _ = fsync_dir(&dir);
 
         // Keep the in-memory disk_index in sync so tracked_files() and
         // disk_history_count() immediately reflect what we just wrote.
@@ -1980,10 +2198,11 @@ impl BackupStore {
                 key.to_path_buf(),
                 DiskMeta {
                     dir: dir.clone(),
-                    count: stack.len(),
+                    count: retained.len(),
                 },
             );
-        self.dual_write_stack_to_db(session, key, &dir, stack);
+        self.dual_write_stack_to_db(session, key, &dir, retained);
+        Ok(())
     }
 
     fn dual_write_stack_to_db(&self, session: &str, key: &Path, dir: &Path, stack: &[BackupEntry]) {
@@ -2035,13 +2254,9 @@ impl BackupStore {
         let write_result = (|| -> rusqlite::Result<()> {
             let tx = conn.unchecked_transaction()?;
             crate::db::backups::delete_backups_for_path(&tx, &harness, session, &path_hash)?;
-            for (index, entry) in stack.iter().enumerate() {
-                let backup_path = match entry.kind {
-                    BackupEntryKind::Content | BackupEntryKind::Symlink => {
-                        Some(dir.join(format!("{}.bak", index)).display().to_string())
-                    }
-                    BackupEntryKind::Tombstone => Some(dir.join("meta.json").display().to_string()),
-                };
+            for entry in stack {
+                let backup_path = content_filename_for_entry(entry)
+                    .map(|filename| dir.join(filename).display().to_string());
                 let row = entry.to_backup_row(
                     &harness,
                     session,
@@ -2063,16 +2278,31 @@ impl BackupStore {
         }
     }
 
-    fn remove_disk_backups(&mut self, session: &str, key: &Path) {
+    fn remove_disk_backups(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
+        let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
+        self.remove_disk_backups_locked(session, key)
+    }
+
+    fn remove_disk_backups_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
         self.remove_db_backups(session, key);
         let removed = self.disk_index.get_mut(session).and_then(|s| s.remove(key));
         if let Some(meta) = removed {
-            let _ = std::fs::remove_dir_all(&meta.dir);
+            if let Err(error) = std::fs::remove_dir_all(&meta.dir) {
+                return Err(AftError::IoError {
+                    path: meta.dir.display().to_string(),
+                    message: error.to_string(),
+                });
+            }
         } else if let Some(session_dir) = self.session_dir(session) {
             let hash = Self::path_hash(key);
             let dir = session_dir.join(&hash);
             if dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
+                if let Err(error) = std::fs::remove_dir_all(&dir) {
+                    return Err(AftError::IoError {
+                        path: dir.display().to_string(),
+                        message: error.to_string(),
+                    });
+                }
             }
         }
 
@@ -2086,6 +2316,7 @@ impl BackupStore {
         if empty {
             self.disk_index.remove(session);
         }
+        Ok(())
     }
 
     fn remove_db_backups(&self, session: &str, key: &Path) {
@@ -2587,6 +2818,303 @@ fn parse_order_value(value: &serde_json::Value) -> Option<u128> {
         .or_else(|| value.as_u64().map(u128::from))
 }
 
+fn is_v2_meta(meta: &serde_json::Value) -> bool {
+    meta.get("format_version").and_then(|value| value.as_str()) == Some(V2_FORMAT_VERSION)
+}
+
+fn meta_entries(meta: &serde_json::Value) -> Result<&Vec<serde_json::Value>, String> {
+    meta.get("entries")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "backup meta missing entries array".to_string())
+}
+
+fn meta_entry_count(meta: &serde_json::Value) -> Option<usize> {
+    if is_v2_meta(meta) {
+        return meta
+            .get("entries")
+            .and_then(|value| value.as_array())
+            .map(Vec::len);
+    }
+    meta.get("count")
+        .and_then(|value| value.as_u64())
+        .and_then(|count| usize::try_from(count).ok())
+        .or_else(|| {
+            meta.get("entries")
+                .and_then(|value| value.as_array())
+                .map(Vec::len)
+        })
+}
+
+fn entry_kind_from_meta(entry_meta: Option<&serde_json::Value>) -> BackupEntryKind {
+    match entry_meta
+        .and_then(|meta| meta.get("kind"))
+        .and_then(|value| value.as_str())
+    {
+        Some("tombstone") => BackupEntryKind::Tombstone,
+        Some("symlink") => BackupEntryKind::Symlink,
+        _ => BackupEntryKind::Content,
+    }
+}
+
+fn backup_head_from_meta(entry_meta: Option<&serde_json::Value>, index: usize) -> BackupEntryHead {
+    let backup_id = entry_backup_id(entry_meta, index);
+    let timestamp = entry_meta
+        .and_then(|meta| meta.get("timestamp"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let order = entry_meta
+        .and_then(|meta| meta.get("order"))
+        .and_then(parse_order_value)
+        .unwrap_or_else(|| legacy_entry_order(timestamp, &backup_id));
+    BackupEntryHead {
+        order,
+        op_id: entry_meta
+            .and_then(|meta| meta.get("op_id"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }
+}
+
+fn entry_backup_id(entry_meta: Option<&serde_json::Value>, index: usize) -> String {
+    entry_meta
+        .and_then(|meta| meta.get("backup_id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("disk-{}", index))
+}
+
+fn entry_from_meta(
+    entry_meta: Option<&serde_json::Value>,
+    index: usize,
+    kind: BackupEntryKind,
+    content_bytes: Vec<u8>,
+) -> BackupEntry {
+    let backup_id = entry_backup_id(entry_meta, index);
+    let timestamp = entry_meta
+        .and_then(|meta| meta.get("timestamp"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let order = entry_meta
+        .and_then(|meta| meta.get("order"))
+        .and_then(parse_order_value)
+        .unwrap_or_else(|| legacy_entry_order(timestamp, &backup_id));
+    let link_target = if kind == BackupEntryKind::Symlink {
+        entry_meta
+            .and_then(|meta| meta.get("link_target"))
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+            .or_else(|| {
+                Some(PathBuf::from(
+                    String::from_utf8_lossy(&content_bytes).into_owned(),
+                ))
+            })
+    } else {
+        None
+    };
+    let content = match kind {
+        BackupEntryKind::Content => String::from_utf8_lossy(&content_bytes).into_owned(),
+        BackupEntryKind::Symlink => link_target
+            .as_ref()
+            .map(|target| target.display().to_string())
+            .unwrap_or_default(),
+        BackupEntryKind::Tombstone => String::new(),
+    };
+    BackupEntry {
+        backup_id,
+        content,
+        content_bytes,
+        timestamp,
+        order,
+        description: entry_meta
+            .and_then(|meta| meta.get("description"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("restored from disk")
+            .to_string(),
+        op_id: entry_meta
+            .and_then(|meta| meta.get("op_id"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        kind,
+        mode: entry_meta
+            .and_then(|meta| meta.get("mode"))
+            .and_then(|value| value.as_u64())
+            .and_then(|mode| u32::try_from(mode).ok()),
+        link_target,
+        created_dirs: entry_meta
+            .and_then(|meta| meta.get("created_dirs"))
+            .and_then(|value| value.as_array())
+            .map(|dirs| {
+                dirs.iter()
+                    .filter_map(|dir| dir.as_str())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn legacy_entry_from_meta(
+    dir: &Path,
+    entry_meta: Option<&serde_json::Value>,
+    index: usize,
+) -> Option<BackupEntry> {
+    let kind = entry_kind_from_meta(entry_meta);
+    let content_bytes = match kind {
+        BackupEntryKind::Content | BackupEntryKind::Symlink => {
+            std::fs::read(dir.join(format!("{}.bak", index))).ok()?
+        }
+        BackupEntryKind::Tombstone => Vec::new(),
+    };
+    Some(entry_from_meta(entry_meta, index, kind, content_bytes))
+}
+
+fn content_path_from_meta(entry_meta: &serde_json::Value) -> Result<&str, String> {
+    let value = entry_meta
+        .get("content_path")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "v2 backup entry missing content_path".to_string())?;
+    let path = Path::new(value);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(value),
+        _ => Err(format!("invalid backup content_path '{value}'")),
+    }
+}
+
+fn sanitize_backup_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn content_filename_for_entry(entry: &BackupEntry) -> Option<String> {
+    match entry.kind {
+        BackupEntryKind::Content | BackupEntryKind::Symlink => Some(format!(
+            "bak_{}_{}.bak",
+            entry.order,
+            sanitize_backup_id(&entry.backup_id)
+        )),
+        BackupEntryKind::Tombstone => None,
+    }
+}
+
+fn content_bytes_for_disk(entry: &BackupEntry) -> Vec<u8> {
+    match entry.kind {
+        BackupEntryKind::Content => entry.content_bytes.clone(),
+        BackupEntryKind::Symlink => entry
+            .link_target
+            .as_ref()
+            .map(|target| target.as_os_str().to_string_lossy().as_bytes().to_vec())
+            .unwrap_or_default(),
+        BackupEntryKind::Tombstone => Vec::new(),
+    }
+}
+
+fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
+    serde_json::json!({
+        "backup_id": entry.backup_id,
+        "timestamp": entry.timestamp,
+        "order": entry.order.to_string(),
+        "description": entry.description,
+        "op_id": entry.op_id,
+        "kind": match entry.kind {
+            BackupEntryKind::Content => "content",
+            BackupEntryKind::Symlink => "symlink",
+            BackupEntryKind::Tombstone => "tombstone",
+        },
+        "content_path": content_filename_for_entry(entry),
+        "mode": entry.mode,
+        "link_target": entry.link_target.as_ref().map(|target| target.display().to_string()),
+        "created_dirs": entry
+            .created_dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn trim_stack_to_depth(stack: &mut Vec<BackupEntry>, max_depth: usize) {
+    if max_depth == 0 {
+        stack.clear();
+        return;
+    }
+    while stack.len() > max_depth {
+        stack.remove(0);
+    }
+}
+
+fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std::io::Result<()> {
+    let tmp_name = format!(
+        ".{}.{}.{}.tmp",
+        final_name,
+        std::process::id(),
+        current_timestamp_nanos()
+    );
+    let tmp_path = dir.join(tmp_name);
+    let final_path = dir.join(final_name);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+    replace_file(&tmp_path, &final_path)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.exists() {
+        std::fs::remove_file(to)?;
+    }
+    std::fs::rename(from, to)
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn prune_unreferenced_backup_files(
+    dir: &Path,
+    referenced: &HashSet<String>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let is_backup_content = (name.starts_with("bak_") && name.ends_with(".bak"))
+            || legacy_numeric_backup_name(name);
+        let is_temp = name.ends_with(".tmp") || name.contains(".tmp.");
+        if is_temp || (is_backup_content && !referenced.contains(name)) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn legacy_numeric_backup_name(name: &str) -> bool {
+    name.strip_suffix(".bak")
+        .is_some_and(|stem| !stem.is_empty() && stem.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 fn is_loadable_backup_path(key: &Path, path_dir: &Path) -> bool {
     if !key.is_absolute()
         || key
@@ -2639,6 +3167,7 @@ mod tests {
 
         let id = store
             .snapshot(DEFAULT_SESSION_ID, &path, "before edit")
+            .unwrap()
             .unwrap();
         assert!(id.starts_with("backup-"));
 
@@ -2817,6 +3346,7 @@ mod tests {
             store.set_storage_dir(dir.clone(), 72);
             let id = store
                 .snapshot(DEFAULT_SESSION_ID, &file_path, "edit 1")
+                .unwrap()
                 .unwrap();
             fs::write(&file_path, "v1").unwrap();
             id
@@ -2829,6 +3359,7 @@ mod tests {
             store.set_storage_dir(dir.clone(), 72);
             let id = store
                 .snapshot(DEFAULT_SESSION_ID, &file_path, "edit 2")
+                .unwrap()
                 .unwrap();
             fs::write(&file_path, "v2").unwrap();
             id
@@ -3107,12 +3638,15 @@ mod tests {
         let op_id = "op-atomic-restore-01";
         let id_a = store
             .snapshot_with_op(DEFAULT_SESSION_ID, &path_a, "a", Some(op_id))
+            .unwrap()
             .unwrap();
         let id_b = store
             .snapshot_with_op(DEFAULT_SESSION_ID, &path_b, "b", Some(op_id))
+            .unwrap()
             .unwrap();
         let id_c = store
             .snapshot_with_op(DEFAULT_SESSION_ID, &path_c, "c", Some(op_id))
+            .unwrap()
             .unwrap();
         fs::write(&path_a, "a-modified").unwrap();
         fs::write(&path_b, "b-modified").unwrap();
@@ -3261,7 +3795,9 @@ mod tests {
 
         let mut store = BackupStore::new();
         store.set_storage_dir(dir.clone(), 72);
-        assert!(store.load_from_disk_if_needed(DEFAULT_SESSION_ID, &key));
+        assert!(store
+            .load_from_disk_if_needed(DEFAULT_SESSION_ID, &key)
+            .unwrap());
         let history = store.history(DEFAULT_SESSION_ID, &file_path);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_id, None);
@@ -3304,6 +3840,7 @@ mod tests {
         let mut store = BackupStore::new();
         let id = store
             .snapshot_op_tombstone(DEFAULT_SESSION_ID, "op-create", &path, "created")
+            .unwrap()
             .unwrap();
 
         let (entry, _) = store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
@@ -3389,5 +3926,200 @@ mod tests {
         assert_eq!(restored.restored.len(), 1);
         assert_eq!(fs::read_to_string(&path_a).unwrap(), "a2");
         assert_eq!(fs::read_to_string(&path_b).unwrap(), "b1");
+    }
+
+    #[test]
+    fn append_only_v2_adds_one_content_file_at_steady_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append_only.txt");
+        fs::write(&path, "v0").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.path().to_path_buf(), 72);
+
+        for i in 0..MAX_UNDO_DEPTH {
+            store
+                .snapshot(DEFAULT_SESSION_ID, &path, "push")
+                .unwrap()
+                .unwrap();
+            fs::write(&path, format!("v{}", i + 1)).unwrap();
+        }
+
+        let key = canonicalize_key(&path);
+        let stack_dir = store
+            .session_dir(DEFAULT_SESSION_ID)
+            .unwrap()
+            .join(BackupStore::path_hash(&key));
+        let before = backup_content_names(&stack_dir);
+        assert_eq!(before.len(), MAX_UNDO_DEPTH);
+
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path, "steady push")
+            .unwrap()
+            .unwrap();
+        let after = backup_content_names(&stack_dir);
+        assert_eq!(after.len(), MAX_UNDO_DEPTH);
+        assert_eq!(after.difference(&before).count(), 1);
+        assert_eq!(before.difference(&after).count(), 1);
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(stack_dir.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            meta.get("format_version").and_then(|v| v.as_str()),
+            Some("v2")
+        );
+        assert!(meta_entries(&meta)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.get("content_path").and_then(|v| v.as_str()).is_some()));
+    }
+
+    #[test]
+    fn legacy_stack_migrates_to_v2_on_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.txt");
+        fs::write(&path, "current").unwrap();
+        let key = canonicalize_key(&path);
+        let session_dir = dir
+            .path()
+            .join("backups")
+            .join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        let stack_dir = session_dir.join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&stack_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": DEFAULT_SESSION_ID,
+                "last_accessed": current_timestamp(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(stack_dir.join("0.bak"), "legacy").unwrap();
+        fs::write(
+            stack_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": DEFAULT_SESSION_ID,
+                "path": key.display().to_string(),
+                "count": 1,
+                "entries": [{
+                    "backup_id": "backup-0",
+                    "timestamp": current_timestamp(),
+                    "order": "1",
+                    "description": "legacy",
+                    "kind": "content",
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.path().to_path_buf(), 72);
+        assert_eq!(
+            store.history(DEFAULT_SESSION_ID, &path)[0].content,
+            "legacy"
+        );
+
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path, "migrate")
+            .unwrap()
+            .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(stack_dir.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            meta.get("format_version").and_then(|v| v.as_str()),
+            Some("v2")
+        );
+        assert!(!stack_dir.join("0.bak").exists());
+        assert_eq!(backup_content_names(&stack_dir).len(), 2);
+    }
+
+    #[test]
+    fn v2_missing_content_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-content.txt");
+        fs::write(&path, "current").unwrap();
+        let key = canonicalize_key(&path);
+        let session_dir = dir
+            .path()
+            .join("backups")
+            .join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        let stack_dir = session_dir.join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&stack_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": DEFAULT_SESSION_ID,
+                "last_accessed": current_timestamp(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            stack_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "format_version": "v2",
+                "session_id": DEFAULT_SESSION_ID,
+                "path": key.display().to_string(),
+                "count": 1,
+                "entries": [{
+                    "backup_id": "backup-0",
+                    "timestamp": current_timestamp(),
+                    "order": "1",
+                    "description": "missing",
+                    "kind": "content",
+                    "content_path": "bak_1_backup-0.bak",
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.path().to_path_buf(), 72);
+        let error = store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap_err();
+        assert_eq!(error.code(), "io_error");
+    }
+
+    #[test]
+    fn v2_orphan_files_are_ignored_then_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan.txt");
+        fs::write(&path, "v0").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.path().to_path_buf(), 72);
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path, "first")
+            .unwrap()
+            .unwrap();
+        let key = canonicalize_key(&path);
+        let stack_dir = store
+            .session_dir(DEFAULT_SESSION_ID)
+            .unwrap()
+            .join(BackupStore::path_hash(&key));
+        fs::write(stack_dir.join("bak_999_orphan.bak"), "orphan").unwrap();
+
+        assert_eq!(store.history(DEFAULT_SESSION_ID, &path).len(), 1);
+        fs::write(&path, "v1").unwrap();
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path, "second")
+            .unwrap()
+            .unwrap();
+        assert!(!stack_dir.join("bak_999_orphan.bak").exists());
+    }
+
+    fn backup_content_names(dir: &Path) -> HashSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|name| name.starts_with("bak_") && name.ends_with(".bak"))
+            .collect()
     }
 }

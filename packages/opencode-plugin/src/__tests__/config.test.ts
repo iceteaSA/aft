@@ -181,6 +181,27 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Cannot convert a symbol to a string");
   });
 
+  test("honors user backup config and ignores project backup config", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ backup: { enabled: false, max_depth: 7, max_file_size: 1024 } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ backup: { enabled: true, max_depth: 1 } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(config.backup).toEqual({ enabled: false, max_depth: 7, max_file_size: 1024 });
+    expect(result.stderr).toContain("Ignoring backup from project config");
+  });
+
   test("keeps valid sections when invalid config values are present", () => {
     const fixture = createConfigFixture();
     writeFileSync(

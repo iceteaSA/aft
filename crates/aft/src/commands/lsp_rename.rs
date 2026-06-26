@@ -32,6 +32,12 @@ struct FileChange {
     edits: usize,
 }
 
+struct RenameRollback {
+    checkpoint_name: String,
+    op_id: String,
+    files: Vec<PathBuf>,
+}
+
 /// Handle the `lsp_rename` command.
 /// Renames a symbol across the workspace via LSP, applying all changes atomically.
 ///
@@ -205,14 +211,17 @@ fn apply_workspace_edit(
         ));
     }
 
-    let snapshotted = snapshot_affected_files(&file_changes, session, ctx, &op_id)
+    let rollback = snapshot_affected_files(&file_changes, session, ctx, &op_id)
         .map_err(|err| Response::error(req_id, "lsp_error", format!("rename failed: {err}")))?;
     let result = apply_collected_changes(&file_changes, ctx);
 
     match result {
-        Ok(changes) => Ok(changes),
+        Ok(changes) => {
+            delete_rename_checkpoint(ctx, session, &rollback.checkpoint_name);
+            Ok(changes)
+        }
         Err(err) => {
-            rollback_rename(ctx, session, &snapshotted);
+            rollback_rename(ctx, session, &rollback);
             Err(Response::error(
                 req_id,
                 "lsp_error",
@@ -306,20 +315,67 @@ fn snapshot_affected_files(
     session: &str,
     ctx: &AppContext,
     op_id: &str,
-) -> Result<Vec<PathBuf>, LspError> {
-    let mut backup = ctx.backup().lock();
-    let mut snapshotted = Vec::with_capacity(file_changes.len());
-
-    for path in file_changes.keys() {
-        backup
-            .snapshot_with_op(session, path, "lsp_rename", Some(op_id))
+) -> Result<RenameRollback, LspError> {
+    let files = file_changes.keys().cloned().collect::<Vec<_>>();
+    let checkpoint_name = format!("lsp_rename:{op_id}");
+    {
+        let backup = ctx.backup().lock();
+        let mut checkpoint = ctx.checkpoint().lock();
+        checkpoint
+            .create(session, &checkpoint_name, files.clone(), &backup)
             .map_err(|err| {
-                LspError::NotFound(format!("failed to snapshot '{}': {err}", path.display()))
+                LspError::NotFound(format!(
+                    "failed to create rollback checkpoint '{}': {err}",
+                    checkpoint_name
+                ))
             })?;
-        snapshotted.push(path.clone());
     }
 
-    Ok(snapshotted)
+    let snapshot_result = (|| -> Result<(), LspError> {
+        let mut backup = ctx.backup().lock();
+        for path in &files {
+            backup
+                .snapshot_with_op(session, path, "lsp_rename", Some(op_id))
+                .map_err(|err| {
+                    LspError::NotFound(format!("failed to snapshot '{}': {err}", path.display()))
+                })?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = snapshot_result {
+        delete_rename_checkpoint(ctx, session, &checkpoint_name);
+        return Err(error);
+    }
+
+    Ok(RenameRollback {
+        checkpoint_name,
+        op_id: op_id.to_string(),
+        files,
+    })
+}
+
+fn rollback_rename(ctx: &AppContext, session: &str, rollback: &RenameRollback) {
+    let restored = ctx
+        .checkpoint()
+        .lock()
+        .restore(session, &rollback.checkpoint_name)
+        .is_ok();
+    if restored {
+        ctx.backup()
+            .lock()
+            .discard_operation_entries(session, &rollback.op_id);
+        for path in rollback.files.iter().rev() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                ctx.lsp_notify_file_changed(path, &content);
+            }
+        }
+        delete_rename_checkpoint(ctx, session, &rollback.checkpoint_name);
+    }
+}
+
+fn delete_rename_checkpoint(ctx: &AppContext, session: &str, checkpoint_name: &str) {
+    ctx.checkpoint().lock().delete(session, checkpoint_name);
 }
 
 fn apply_collected_changes(
@@ -436,13 +492,4 @@ fn utf16_column_to_byte(line: &str, character: u32) -> usize {
     }
 
     line.len()
-}
-
-fn rollback_rename(ctx: &AppContext, session: &str, snapshotted: &[PathBuf]) {
-    for path in snapshotted.iter().rev() {
-        let restored = ctx.backup().lock().restore_latest(session, path);
-        if let Ok((entry, _)) = restored {
-            ctx.lsp_notify_file_changed(path, &entry.content);
-        }
-    }
 }

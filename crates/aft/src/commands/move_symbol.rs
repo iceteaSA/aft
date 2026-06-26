@@ -454,7 +454,8 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 "move_symbol: pre-move backup",
                 Some(&op_id),
             ) {
-                Ok(id) => backup_ids.push(id),
+                Ok(Some(id)) => backup_ids.push(id),
+                Ok(None) => {}
                 Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
             }
         }
@@ -465,7 +466,8 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 dest_path,
                 "move_symbol: destination file created during move",
             ) {
-                Ok(id) => backup_ids.push(id),
+                Ok(Some(id)) => backup_ids.push(id),
+                Ok(None) => {}
                 Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
             }
         }

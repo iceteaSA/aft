@@ -306,7 +306,7 @@ pub fn auto_backup(
         let mut store = ctx.backup().lock();
         store.snapshot_with_op(session, path, description, op_id)?
     }; // borrow dropped here
-    Ok(Some(backup_id))
+    Ok(backup_id)
 }
 
 /// Post-format excerpt of the region(s) the formatter reflowed, so the agent

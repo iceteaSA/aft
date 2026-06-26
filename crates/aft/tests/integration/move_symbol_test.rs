@@ -55,6 +55,19 @@ fn configure(aft: &mut AftProcess, root: &str) {
     );
 }
 
+fn configure_with_backup_disabled(aft: &mut AftProcess, root: &str) {
+    let resp = aft.send(&format!(
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{},"config":[{{"tier":"user","source":"test","doc":{}}}]}}"#,
+        crate::helpers::json_string(&root),
+        crate::helpers::json_string(&r#"{ "backup": { "enabled": false } }"#.to_string())
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "configure should succeed: {:?}",
+        resp
+    );
+}
+
 fn write_file(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
     std::fs::write(path, content).expect("write file");
@@ -205,7 +218,7 @@ fn move_symbol_rolled_back_dest_does_not_lose_symbol() {
     write_file(&dest, "export const existing = 1;\n");
 
     let mut aft = AftProcess::spawn();
-    configure(&mut aft, &root);
+    configure_with_backup_disabled(&mut aft, &root);
     let resp = aft.send(&format!(
         r#"{{"id":"rollback-dest","command":"move_symbol","file":{},"symbol":"Foo","destination":{}}}"#,
         crate::helpers::json_string(&src.display()),

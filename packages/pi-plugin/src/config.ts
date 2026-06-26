@@ -92,6 +92,12 @@ export interface InspectConfig {
   };
 }
 
+export interface BackupConfig {
+  enabled?: boolean;
+  max_depth?: number;
+  max_file_size?: number;
+}
+
 export interface LspConfig {
   servers?: Record<string, Omit<LspServerConfig, "id">>;
   disabled?: string[];
@@ -181,6 +187,8 @@ export interface AftConfig {
   callgraph_chunk_size?: number;
   /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
   inspect?: InspectConfig;
+  /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
+  backup?: BackupConfig;
   /**
    * Bash tool family (hoist + rewrite + compress + background execution).
    * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -477,6 +485,12 @@ const InspectConfigSchema = z.object({
     .optional(),
 });
 
+const BackupConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  max_depth: z.number().int().positive().optional(),
+  max_file_size: z.number().int().positive().optional(),
+});
+
 export const AftConfigSchema = z
   .object({
     /**
@@ -504,6 +518,7 @@ export const AftConfigSchema = z
     callgraph_store: z.boolean().optional(),
     callgraph_chunk_size: z.number().optional(),
     inspect: InspectConfigSchema.optional(),
+    backup: BackupConfigSchema.optional(),
     /**
      * Bash tool family (hoist + rewrite + compress + background execution).
      * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -610,6 +625,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
+  if (config.backup !== undefined) overrides.backup = config.backup;
 
   return overrides;
 }
@@ -1142,6 +1158,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "formatter"/"checker" handled separately — deep-merged.
   // "semantic"/"lsp" handled separately — strict field-level merge.
   // "inspect" handled separately — deep-merged.
+  // "backup" — USER ONLY (project config cannot disable or shrink undo backups).
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
@@ -1163,11 +1180,16 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.restrict_to_project_root !== undefined) stripped.push("restrict_to_project_root");
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.bridge !== undefined) stripped.push("bridge");
+  if (override.backup !== undefined) stripped.push("backup");
+  if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;
 }
 
 function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
-  const disabledTools = [...(base.disabled_tools ?? []), ...(override.disabled_tools ?? [])];
+  const disabledTools = [
+    ...(base.disabled_tools ?? []),
+    ...(override.disabled_tools ?? []).filter((tool: string) => tool !== "aft_safety"),
+  ];
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);

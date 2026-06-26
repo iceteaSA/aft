@@ -149,11 +149,14 @@ export function renderImportResult(
 }
 
 export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void {
+  const organizeRecovery =
+    ctx.config.backup?.enabled === false
+      ? "Backup capture is disabled by user config; review broad cleanup changes before proceeding."
+      : "Use aft_safety checkpoint/undo before broad cleanup.";
   pi.registerTool({
     name: "aft_import",
     label: "import",
-    description:
-      "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, Vue. Ops: `add`, `remove`, `organize`. Use aft_safety checkpoint/undo before broad cleanup.",
+    description: `Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, Vue. Ops: \`add\`, \`remove\`, \`organize\`. ${organizeRecovery}`,
     parameters: ImportParams,
     async execute(
       _toolCallId: string,

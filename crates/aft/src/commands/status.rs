@@ -195,9 +195,22 @@ impl AppContext {
         // Per-session undo/checkpoint counts (issue #14 — one shared bridge serves
         // many sessions; surface both the global footprint and the current
         // session's own slice so `/aft-status` can split them in the UI).
-        let checkpoint_total = self.checkpoint().lock().total_count();
-        let session_checkpoints = self.checkpoint().lock().list(session_id).len();
-        let session_tracked_files = self.backup().lock().tracked_files(session_id).len();
+        let backups_enabled = config.backup.enabled.unwrap_or(true);
+        let checkpoint_total = if backups_enabled {
+            self.checkpoint().lock().total_count()
+        } else {
+            0
+        };
+        let session_checkpoints = if backups_enabled {
+            self.checkpoint().lock().list(session_id).len()
+        } else {
+            0
+        };
+        let session_tracked_files = if backups_enabled {
+            self.backup().lock().tracked_files(session_id).len()
+        } else {
+            0
+        };
         let compression = self.compression_stats_for_session(session_id);
 
         // Degraded-mode reasons recorded by `handle_configure` when the
@@ -240,6 +253,7 @@ impl AppContext {
                 "search_index": config.search_index,
                 "semantic_search": config.semantic_search,
                 "callgraph_store": config.callgraph_store,
+                "backup": backups_enabled,
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,

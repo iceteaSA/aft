@@ -90,6 +90,7 @@ fn backups_dual_write_backup_save_writes_both_disk_and_db_row() {
 
     let backup_id = store
         .snapshot_with_op(SESSION, &file, "before edit", Some("op-save"))
+        .unwrap()
         .unwrap();
 
     assert_eq!(store.disk_history_count(SESSION, &file), 1);

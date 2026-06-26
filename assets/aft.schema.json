@@ -202,6 +202,28 @@
       "additionalProperties": false,
       "description": "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect."
     },
+    "backup": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch for agent-facing undo backups. User-only; project config is ignored."
+        },
+        "max_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 20,
+          "description": "Per-file undo stack depth. User-only; project config is ignored."
+        },
+        "max_file_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Skip backup capture for files larger than this many bytes; edits still proceed. User-only; project config is ignored."
+        }
+      },
+      "additionalProperties": false
+    },
     "bash": {
       "oneOf": [
         {

@@ -426,11 +426,14 @@ export function registerHoistedTools(
   }
 
   if (surface.hoistWrite) {
+    const writeBackupText =
+      ctx.config.backup?.enabled === false
+        ? "Backup capture is disabled by user config."
+        : "Existing files are backed up before overwriting (undo via aft_safety).";
     pi.registerTool<typeof WriteParams, FileMutationDetails>({
       name: "write",
       label: "write",
-      description:
-        "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety) and auto-formatted when the project has a formatter configured. Uses `filePath` (not `path`). For partial edits, use the `edit` tool.",
+      description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`filePath\` (not \`path\`). For partial edits, use the \`edit\` tool.`,
       promptSnippet: "Create or overwrite files (uses filePath; auto-formats)",
       promptGuidelines: ["Use write only for new files or complete rewrites."],
       parameters: WriteParams,

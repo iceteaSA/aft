@@ -7,6 +7,24 @@ use serde_json::json;
 
 use super::helpers::AftProcess;
 
+fn configure_with_backup_disabled(aft: &mut AftProcess, root: &std::path::Path) {
+    let resp = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": [{
+                "tier": "user",
+                "source": "test",
+                "doc": r#"{ "backup": { "enabled": false } }"#,
+            }],
+        })
+        .to_string(),
+    );
+    assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+}
+
 #[test]
 fn edit_match_glob_rolls_back_prior_files_when_later_write_fails() {
     let dir = tempfile::tempdir().unwrap();
@@ -24,6 +42,7 @@ fn edit_match_glob_rolls_back_prior_files_when_later_write_fails() {
     fs::set_permissions(&b, readonly).unwrap();
 
     let mut aft = AftProcess::spawn();
+    configure_with_backup_disabled(&mut aft, root);
     let req = json!({
         "id": "glob-rollback-write-failure",
         "command": "edit_match",
@@ -67,6 +86,7 @@ fn edit_match_glob_rolls_back_when_any_file_becomes_syntax_invalid() {
     fs::write(&c, original_c).unwrap();
 
     let mut aft = AftProcess::spawn();
+    configure_with_backup_disabled(&mut aft, root);
     let req = json!({
         "id": "glob-rollback-syntax-failure",
         "command": "edit_match",
@@ -97,7 +117,7 @@ fn edit_match_glob_rolls_back_when_any_file_becomes_syntax_invalid() {
         undo["success"], false,
         "glob rollback should discard operation undo entries: {undo:?}"
     );
-    assert_eq!(undo["code"], "no_undo_history");
+    assert_eq!(undo["code"], "backups_disabled");
 
     let status = aft.shutdown();
     assert!(status.success());

@@ -11,7 +11,9 @@ use serde::de;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
-use crate::config::{Config, InspectConfig, SemanticBackend, SemanticBackendConfig, UserServerDef};
+use crate::config::{
+    BackupConfig, Config, InspectConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
+};
 
 const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 15_000;
 const FOREGROUND_WAIT_WINDOW_MIN_MS: u64 = 5_000;
@@ -82,6 +84,7 @@ pub struct RawAftConfig {
     #[serde(deserialize_with = "deserialize_opt_usize")]
     pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
+    pub backup: Option<RawBackup>,
     pub bash: Option<RawBash>,
     pub experimental: Option<RawExperimental>,
     pub lsp: Option<RawLsp>,
@@ -400,6 +403,16 @@ pub struct RawBridge {
     pub hang_threshold: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawBackup {
+    pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    pub max_depth: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    pub max_file_size: Option<u64>,
+}
+
 /// Resolve raw user/project config tiers into the flat core [`Config`].
 ///
 /// Empty input is NOT special-cased: no config file is equivalent to an empty
@@ -567,6 +580,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.inspect.is_some() {
         base.inspect = override_config.inspect;
     }
+    if override_config.backup.is_some() {
+        base.backup = override_config.backup;
+    }
     if override_config.bash.is_some() {
         base.bash = override_config.bash;
     }
@@ -664,7 +680,15 @@ fn merge_disabled_tools(base: &mut Option<Vec<String>>, override_tools: Option<V
     };
     let mut merged = Vec::new();
     let mut seen = HashSet::new();
-    for tool in base.iter().flatten().chain(override_tools.iter()) {
+    for tool in base.iter().flatten() {
+        if seen.insert(tool.clone()) {
+            merged.push(tool.clone());
+        }
+    }
+    for tool in override_tools
+        .iter()
+        .filter(|tool| tool.as_str() != "aft_safety")
+    {
         if seen.insert(tool.clone()) {
             merged.push(tool.clone());
         }
@@ -888,6 +912,16 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.bridge.is_some() {
         push_drop(dropped, "bridge", tier, USER_ONLY_REASON);
     }
+    if raw.backup.is_some() {
+        push_drop(dropped, "backup", tier, USER_ONLY_REASON);
+    }
+    if raw
+        .disabled_tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|tool| tool == "aft_safety"))
+    {
+        push_drop(dropped, "disabled_tools.aft_safety", tier, USER_ONLY_REASON);
+    }
 
     if let Some(semantic) = &raw.semantic {
         if semantic.backend.is_some() {
@@ -983,6 +1017,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     }
     config.semantic = resolve_semantic_config(raw.semantic.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
+    config.backup = resolve_backup_config(raw.backup.as_ref());
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config);
 }
@@ -1024,6 +1059,22 @@ fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
         inspect.enabled = enabled;
     }
     inspect
+}
+
+fn resolve_backup_config(raw: Option<&RawBackup>) -> BackupConfig {
+    let mut backup = BackupConfig::default();
+    if let Some(raw) = raw {
+        if raw.enabled.is_some() {
+            backup.enabled = raw.enabled;
+        }
+        if raw.max_depth.is_some() {
+            backup.max_depth = raw.max_depth;
+        }
+        if raw.max_file_size.is_some() {
+            backup.max_file_size = raw.max_file_size;
+        }
+    }
+    backup
 }
 
 fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {

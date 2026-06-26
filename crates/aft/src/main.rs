@@ -482,6 +482,16 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "outline" => aft::commands::outline::handle_outline(&req, ctx),
         "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
+        "undo" | "undo_preview" | "edit_history" | "checkpoint" | "checkpoint_paths"
+        | "restore_checkpoint" | "list_checkpoints"
+            if ctx.config().backup.enabled == Some(false) =>
+        {
+            Response::error(
+                &req.id,
+                "backups_disabled",
+                "backups disabled by user config",
+            )
+        }
         "undo" => aft::commands::undo::handle_undo(&req, ctx),
         "undo_preview" => aft::commands::undo::handle_undo_preview(&req, ctx),
         "edit_history" => aft::commands::edit_history::handle_edit_history(&req, ctx),
@@ -679,8 +689,8 @@ mod signal_handler_tests {
 
 #[cfg(test)]
 mod watcher_filter_tests {
-    use super::{dispatch_panic_response, write_push_frame_or_request_shutdown};
-    use aft::config::Config;
+    use super::{dispatch, dispatch_panic_response, write_push_frame_or_request_shutdown};
+    use aft::config::{BackupConfig, Config};
     use aft::context::{
         AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
         SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
@@ -690,7 +700,7 @@ mod watcher_filter_tests {
     use aft::lsp::registry::ServerKind;
     use aft::lsp::roots::ServerKey;
     use aft::parser::TreeSitterProvider;
-    use aft::protocol::{ConfigureWarningsFrame, PushFrame, Response};
+    use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use aft::response_finalize::attach_status_bar;
     use aft::runtime_drain::{
         drain_semantic_refresh_events, drain_watcher_events,
@@ -1094,6 +1104,42 @@ mod watcher_filter_tests {
             .as_str()
             .unwrap()
             .contains("command 'db_get_state' panicked: boom"));
+    }
+
+    #[test]
+    fn dispatch_rejects_agent_safety_commands_when_backups_disabled() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+        config.backup = BackupConfig {
+            enabled: Some(false),
+            ..BackupConfig::default()
+        };
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+        for command in [
+            "undo",
+            "undo_preview",
+            "edit_history",
+            "checkpoint",
+            "checkpoint_paths",
+            "restore_checkpoint",
+            "list_checkpoints",
+        ] {
+            let response = dispatch(
+                RawRequest {
+                    id: command.to_string(),
+                    command: command.to_string(),
+                    params: serde_json::json!({}),
+                    session_id: None,
+                    lsp_hints: None,
+                },
+                &ctx,
+            );
+            assert!(!response.success, "{command} unexpectedly succeeded");
+            assert_eq!(response.data["code"], "backups_disabled");
+        }
     }
 
     #[test]

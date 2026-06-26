@@ -91,6 +91,24 @@ impl Default for InspectConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackupConfig {
+    pub enabled: Option<bool>,
+    pub max_depth: Option<usize>,
+    pub max_file_size: Option<u64>,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Some(true),
+            max_depth: Some(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
+            max_file_size: None,
+        }
+    }
+}
+
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 impl Config {
@@ -162,6 +180,7 @@ pub struct Config {
     pub search_index_max_file_size: u64,
     pub semantic: SemanticBackendConfig,
     pub inspect: InspectConfig,
+    pub backup: BackupConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
@@ -239,6 +258,7 @@ impl Default for Config {
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
             inspect: InspectConfig::default(),
+            backup: BackupConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),

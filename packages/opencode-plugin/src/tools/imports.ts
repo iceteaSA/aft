@@ -15,6 +15,10 @@ const z = tool.schema;
  * Tool definitions for import management commands: add_import, remove_import, organize_imports.
  */
 export function importTools(ctx: PluginContext): Record<string, ToolDefinition> {
+  const organizeRecovery =
+    ctx.config.backup?.enabled === false
+      ? "Backup capture is disabled by user config; review broad cleanup changes before proceeding."
+      : "Use aft_safety checkpoint/undo for recovery before broad cleanup.";
   return {
     aft_import: {
       description:
@@ -22,7 +26,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "Ops:\n" +
         "- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n" +
         "- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n" +
-        "- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'filePath'. Use aft_safety checkpoint/undo for recovery before broad cleanup.",
+        `- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'filePath'. ${organizeRecovery}`,
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {

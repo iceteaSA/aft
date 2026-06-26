@@ -117,13 +117,17 @@ export function renderFsResult(
 }
 
 export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: FsSurface): void {
+  const backupsDisabled = ctx.config.backup?.enabled === false;
   if (surface.delete) {
     pi.registerTool({
       name: "aft_delete",
       label: "delete",
       description:
-        "Delete one or more files (or directories) with backup. Each file is backed up before deletion — use `aft_safety undo` to recover any of them. " +
-        "For directories, every file inside is individually backed up before removal. Directory deletion requires recursive: true. " +
+        "Delete one or more files (or directories). " +
+        (backupsDisabled
+          ? "Backup capture is disabled by user config, so this tool does not create undo snapshots. "
+          : "Each file is backed up before deletion — use `aft_safety undo` to recover any of them. For directories, every file inside is individually backed up before removal. ") +
+        "Directory deletion requires recursive: true. " +
         "Returns { success, complete, deleted, skipped_files }: partial success is allowed; files that fail are reported in skipped_files.",
       parameters: DeleteParams,
       async execute(
@@ -201,7 +205,11 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
       name: "aft_move",
       label: "move",
       description:
-        "Move or rename a file with backup. Creates parent directories for the destination automatically. This operates on files at the OS level — to relocate a code symbol between files, use `aft_refactor` with op='move' instead.",
+        "Move or rename a file. " +
+        (backupsDisabled
+          ? "Backup capture is disabled by user config. "
+          : "Creates an undo backup before moving. ") +
+        "Creates parent directories for the destination automatically. This operates on files at the OS level — to relocate a code symbol between files, use `aft_refactor` with op='move' instead.",
       parameters: MoveParams,
       async execute(
         _toolCallId: string,

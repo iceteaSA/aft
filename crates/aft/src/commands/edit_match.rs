@@ -215,7 +215,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             path.as_path(),
             "edit_match append: file created by append",
         ) {
-            Ok(id) => Some(id),
+            Ok(id) => id,
             Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
         }
     };

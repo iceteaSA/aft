@@ -866,7 +866,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       (aftConfig.hoist_builtin_tools !== false ? hoistedTools(ctx) : aftPrefixedTools(ctx))),
     ...readingTools(ctx),
 
-    ...safetyTools(ctx),
+    ...(aftConfig.backup?.enabled === false ? {} : safetyTools(ctx)),
     // aft_import: recommended+
     ...(surface !== "minimal" && importTools(ctx)),
     ...navigationTools(ctx),

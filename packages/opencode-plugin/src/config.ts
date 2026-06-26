@@ -229,6 +229,15 @@ const InspectConfigSchema = z.object({
     .optional(),
 });
 
+const BackupConfigSchema = z.object({
+  /** Master switch for agent-facing undo backups. Defaults to true. */
+  enabled: z.boolean().optional(),
+  /** Per-file undo stack depth. Defaults to 20. */
+  max_depth: z.number().int().positive().optional(),
+  /** Skip backup capture for files larger than this many bytes; edits still proceed. */
+  max_file_size: z.number().int().positive().optional(),
+});
+
 export const AftConfigSchema = z
   .object({
     /**
@@ -303,6 +312,8 @@ export const AftConfigSchema = z
     callgraph_chunk_size: z.number().optional(),
     /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
     inspect: InspectConfigSchema.optional(),
+    /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
+    backup: BackupConfigSchema.optional(),
     /**
      * Bash tool family (hoist + rewrite + compress + background execution).
      * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -470,6 +481,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
+  if (config.backup !== undefined) overrides.backup = config.backup;
 
   return overrides;
 }
@@ -1242,6 +1254,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "formatter"/"checker" handled separately — deep-merged.
   // "semantic"/"lsp" handled separately — strict field-level merge.
   // "inspect" handled separately — deep-merged.
+  // "backup" — USER ONLY (project config cannot disable or shrink undo backups).
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "storage_dir" — USER ONLY (controls where AFT writes).
@@ -1266,6 +1279,8 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.auto_update !== undefined) stripped.push("auto_update");
   if (override.bridge !== undefined) stripped.push("bridge");
+  if (override.backup !== undefined) stripped.push("backup");
+  if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;
 }
 
@@ -1274,7 +1289,10 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   // disabled_tools governs WHICH AFT TOOLS the agent sees — a hostile repo
   // disabling tools is a mild annoyance, not a security boundary, so the
   // union is acceptable here.
-  const disabledTools = [...(base.disabled_tools ?? []), ...(override.disabled_tools ?? [])];
+  const disabledTools = [
+    ...(base.disabled_tools ?? []),
+    ...(override.disabled_tools ?? []).filter((tool: string) => tool !== "aft_safety"),
+  ];
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
