@@ -277,7 +277,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(response.success).toBe(true);
     expect(String(response.output_preview)).toContain("Untracked files:");
     expect(String(response.output_preview)).toContain("untracked_file_with_long_name_0.txt");
-  });
+    // Heavy subprocess test (git init + 50 file writes + git status through the
+    // bridge). Bun's default 5s per-test budget is too tight on a loaded Windows
+    // CI runner (~5x slower), where this has timed out; give it generous headroom.
+  }, 30_000);
 
   test("compressed false opts out of git status compression", async () => {
     const h = await harness({ experimental_bash_compress: true });
@@ -290,7 +293,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     expect(response.success).toBe(true);
     expect(String(response.output_preview)).toContain("raw_14.txt");
-  });
+  }, 30_000);
 
   test("background spawn returns task_id immediately", async () => {
     const h = await harness({ experimental_bash_background: true });
