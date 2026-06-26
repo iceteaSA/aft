@@ -14,7 +14,7 @@ opencode-aft/
 │   ├── pi-plugin/             # Pi coding-agent plugin (@cortexkit/aft-pi)
 │   └── npm/                   # Platform-specific npm binary packages
 ├── tests/                     # Cross-platform test infrastructure
-│   ├── docker/                # Docker-based end-to-end tests (Linux)
+│   ├── docker/                # Docker-based end-to-end tests (Linux) and interactive setup sandbox
 │   ├── macos-e2e/             # macOS end-to-end tests
 │   ├── pi-rpc/                # Pi RPC protocol tests
 │   └── windows-e2e/           # Windows end-to-end tests
@@ -41,6 +41,11 @@ opencode-aft/
 - Purpose: Ship a standalone tokenizer for Claude API token counting.
 - Contains: `src/` Rust source, `benches/` benchmarks, `tests/` tests, `examples/`
 - Key files: `crates/aft-tokenizer/src/lib.rs`, `crates/aft-tokenizer/src/claude.rs`
+
+**`crates/aft/src/callgraph_store/`:**
+- Purpose: Build and maintain the workspace-wide SQLite database of call dependencies.
+- Contains: Generation-based SQLite store builders, watchers, table schemas, queries, and dead code projections.
+- Key files: `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/callgraph_store/dead_code_projection.rs`
 
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
@@ -100,8 +105,7 @@ opencode-aft/
 **`packages/pi-plugin/`:**
 - Purpose: Ship the Pi coding-agent facing package that resolves the binary and registers tools.
 - Contains: `src/` TypeScript sources, `src/tools/` tool definitions, `src/commands/` Pi-specific commands, `src/dialogs/` Pi dialog handlers, `src/shared/` shared utilities, `__tests__/` unit and e2e tests
-- Key files: `packages/pi-plugin/src/index.ts`, `packages/pi-plugin/src/config.ts`, `packages/pi-plugin/src/types.ts`, `packages/pi-p
-lugin/src/tools/hoisted.ts`
+- Key files: `packages/pi-plugin/src/index.ts`, `packages/pi-plugin/src/config.ts`, `packages/pi-plugin/src/types.ts`, `packages/pi-plugin/src/tools/hoisted.ts`
 
 **`packages/pi-plugin/src/tools/`:**
 - Purpose: Group Pi tool definitions by capability area.
@@ -115,8 +119,9 @@ lugin/src/tools/hoisted.ts`
 
 **`benchmarks/`:**
 - Purpose: Run benchmark scenarios for search, compression, and retrieval performance.
-- Contains: Benchmark source files, configs, cached results, corpora data, package manifests
+- Contains: Benchmark source files, configs, cached results, corpora data, package manifests, and trigram index A/B latency comparison tools.
 - Key subdirectories: `benchmarks/src/`, `benchmarks/aft-search/`, `benchmarks/codegraph-replication/`, `benchmarks/codegraph-vs-aft-agent/`, `benchmarks/codegraph-vs-aft-retrieval/`, `benchmarks/compression-tokens/`
+- Key files: `benchmarks/trigram-ab-latency.py`
 
 **`scripts/`:**
 - Purpose: Automate release, validation, and version synchronization tasks.
@@ -125,8 +130,8 @@ lugin/src/tools/hoisted.ts`
 
 **`tests/`:**
 - Purpose: Host cross-platform end-to-end test suites.
-- Contains: Docker-based Linux e2e tests, macOS e2e tests, Pi RPC protocol tests, Windows e2e tests
-- Key files: `tests/docker/fixtures/`, `tests/macos-e2e/`, `tests/pi-rpc/`, `tests/windows-e2e/`
+- Contains: Docker-based Linux e2e tests, macOS e2e tests, Pi RPC protocol tests, Windows e2e tests, and interactive setup/doctor sandboxes.
+- Key files: `tests/docker/fixtures/`, `tests/macos-e2e/`, `tests/pi-rpc/`, `tests/windows-e2e/`, `tests/docker/Dockerfile.setup-sandbox`
 
 **`crates/aft/tests/`:**
 - Purpose: Host Rust integration tests and test infrastructure.
@@ -137,7 +142,7 @@ lugin/src/tools/hoisted.ts`
 
 **Entry Points:** `packages/opencode-plugin/src/index.ts` -- register OpenCode plugin tools; `packages/pi-plugin/src/index.ts` -- register Pi plugin tools; `packages/aft-cli/src/index.ts` -- unified CLI dispatcher; `packages/aft-bridge/src/index.ts` -- shared bridge module exports; `crates/aft/src/main.rs` -- start the Rust request loop; `crates/aft/src/cli/` -- warmup and storage-migration subcommands; `.github/workflows/release.yml` -- drive tagged release publishing.
 
-**Configuration:** `package.json` -- define Bun workspace scripts; `Cargo.toml` -- define the Rust workspace; `packages/opencode-plugin/src/config.ts` -- parse user and project AFT config for OpenCode; `packages/pi-plugin/src/config.ts` -- parse user and project AFT config for Pi; `crates/aft/src/config.rs` -- parse the shared Rust-side config (semantic backend, LSP servers, bash compression, etc.).
+**Configuration:** `package.json` -- define Bun workspace scripts; `Cargo.toml` -- define the Rust workspace; `packages/opencode-plugin/src/config.ts` -- parse user and project AFT config for OpenCode; `packages/pi-plugin/src/config.ts` -- parse user and project AFT config for Pi; `crates/aft/src/config.rs` -- parse the shared Rust-side config (semantic backend, LSP servers, bash compression, etc.). User-level AFT settings reside in the unified CortexKit location `~/.config/cortexkit/aft.jsonc`, and project-level overrides reside in `<project_root>/.cortexkit/aft.jsonc`.
 
 **Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners; `crates/aft/src/format.rs` -- formatter detection and execution; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
 
