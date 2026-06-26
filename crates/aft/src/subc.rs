@@ -31,9 +31,8 @@ use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
 use crate::runtime_drain;
 
 use subc_protocol::manifest::{
-    Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
-    IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool,
-    TrustTier,
+    Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
+    ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
 };
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
@@ -898,10 +897,13 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     // ModuleHello: register as a tool provider. control_ops:None = full baseline.
+    // Echo the one-time launch nonce the daemon injected via SUBC_LAUNCH_NONCE so a
+    // reserved module_id's HELLO is accepted; absent for non-reserved/self-connect.
     let hello = ModuleHelloBody {
         manifest: build_manifest(),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
+        launch_nonce: std::env::var("SUBC_LAUNCH_NONCE").ok(),
     };
     let hello_frame = Frame::build(
         FrameType::Hello,
@@ -2321,11 +2323,6 @@ fn build_manifest() -> ModuleManifest {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
                 owns_schema: true,
-            },
-            config: ConfigBinding {
-                source: ConfigSource::SubcMediated,
-                tiers: vec!["user".to_string(), "project".to_string()],
-                expansion: std::collections::BTreeMap::new(),
             },
             vault_grants: Vec::new(),
             identity: IdentityBinding {

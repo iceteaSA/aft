@@ -1436,6 +1436,7 @@ async fn drive_s1_rejection_daemon(
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
+                storage: None,
             })
             .expect("hello ack body"),
         )
@@ -1454,11 +1455,6 @@ async fn drive_s1_rejection_daemon(
             harness: "mcp:generic".to_string(),
             session: "s1-session".to_string(),
         },
-        config: vec![user_config_tier(json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
-        }))],
     };
     send_frame(
         &mut stream,
@@ -1558,6 +1554,7 @@ async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
+                storage: None,
             })
             .expect("hello ack body"),
         )
@@ -2798,7 +2795,6 @@ async fn send_route_bind_with_session_and_doc(
             harness: "opencode".to_string(),
             session: session.to_string(),
         },
-        config: vec![user_config_tier(doc)],
     };
     send_frame(
         stream,
@@ -3893,14 +3889,6 @@ async fn poll_callers_until_ready(
 
 fn is_callgraph_building(response: &Value) -> bool {
     response.get("code").and_then(Value::as_str) == Some("callgraph_building")
-}
-
-fn user_config_tier(doc: Value) -> subc_protocol::session::ConfigTier {
-    subc_protocol::session::ConfigTier {
-        tier: "user".to_string(),
-        source: "/tmp/aft-subc-bridge-test-user.jsonc".to_string(),
-        doc: doc.to_string(),
-    }
 }
 
 fn control_flags() -> Flags {
