@@ -235,3 +235,36 @@ fn zoom_format_matches_typescript_golden_fixtures() {
         failures.join("\n\n")
     );
 }
+
+#[test]
+fn refactor_format_matches_typescript_golden_fixtures() {
+    let root = fixtures_root();
+    let mut cases: Vec<PathBuf> = fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read fixtures dir {}: {e}", root.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("aft_refactor_"))
+        })
+        .collect();
+    cases.sort();
+
+    assert!(
+        cases.len() >= 3,
+        "expected >=3 aft_refactor format parity fixtures, found {}",
+        cases.len()
+    );
+
+    let failures = cases
+        .iter()
+        .filter_map(|dir| assert_case(dir))
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "{} aft_refactor format parity mismatch(es):\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}

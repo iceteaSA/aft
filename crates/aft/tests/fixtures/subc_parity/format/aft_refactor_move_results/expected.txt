@@ -1,0 +1,5 @@
+moved symbol run
+files modified 2
+consumers updated 1
+  ↳ <PROJECT_ROOT>/src/main.ts
+  ↳ ~/aft-refactor-home.ts

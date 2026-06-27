@@ -23,6 +23,7 @@ import { inspectTools } from "../packages/opencode-plugin/src/tools/inspect.ts";
 import { importTools } from "../packages/opencode-plugin/src/tools/imports.ts";
 import { navigationTools } from "../packages/opencode-plugin/src/tools/navigation.ts";
 import { readingTools } from "../packages/opencode-plugin/src/tools/reading.ts";
+import { refactoringTools } from "../packages/opencode-plugin/src/tools/refactoring.ts";
 import { searchTools } from "../packages/opencode-plugin/src/tools/search.ts";
 import { semanticTools } from "../packages/opencode-plugin/src/tools/semantic.ts";
 import type { PluginContext } from "../packages/opencode-plugin/src/types.ts";
@@ -50,7 +51,8 @@ type BareToolName =
   | "conflicts"
   | "ast_search"
   | "ast_replace"
-  | "aft_import";
+  | "aft_import"
+  | "aft_refactor";
 
 interface BridgeCall {
   command: string;
@@ -61,8 +63,10 @@ interface TranslateCase {
   name: string;
   tool_name: BareToolName;
   agent_args: Record<string, unknown>;
+  input_agent_args?: Record<string, unknown>;
   diagnostics_on_edit?: boolean;
   expected_error?: string;
+  lsp_symbols?: Array<Record<string, unknown>>;
 }
 
 interface FormatCase {
@@ -148,10 +152,31 @@ function translateAftImportToolCall(rawArgs: Record<string, unknown>): BridgeCal
   return { command, params };
 }
 
+function translateAftRefactorToolCall(rawArgs: Record<string, unknown>): BridgeCall {
+  const op = rawArgs.op;
+  const command = op === "move" ? "move_symbol" : op === "extract" ? "extract_function" : "inline_symbol";
+  const params: Record<string, unknown> = { file: rawArgs.filePath };
+  if (op === "move") {
+    if (rawArgs.symbol !== undefined) params.symbol = rawArgs.symbol;
+    if (rawArgs.destination !== undefined) params.destination = rawArgs.destination;
+    if (rawArgs.scope !== undefined) params.scope = rawArgs.scope;
+  } else if (op === "extract") {
+    if (rawArgs.name !== undefined) params.name = rawArgs.name;
+    if (rawArgs.startLine !== undefined) params.start_line = rawArgs.startLine;
+    if (typeof rawArgs.endLine === "number") params.end_line = rawArgs.endLine + 1;
+  } else if (op === "inline") {
+    if (rawArgs.symbol !== undefined) params.symbol = rawArgs.symbol;
+    if (rawArgs.callSiteLine !== undefined) params.call_site_line = rawArgs.callSiteLine;
+  }
+  if (rawArgs.lsp_hints !== undefined) params.lsp_hints = rawArgs.lsp_hints;
+  return { command, params };
+}
+
 function makeCtx(
   calls: BridgeCall[],
   responseForCall: (command: string, params: Record<string, unknown>) => Record<string, unknown>,
   diagnosticsOnEdit = false,
+  lspSymbols: Array<Record<string, unknown>> = [],
 ): PluginContext {
   return {
     pool: {
@@ -171,13 +196,25 @@ function makeCtx(
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
+            if (name === "aft_refactor") {
+              const translated = translateAftRefactorToolCall(rawArgs);
+              calls.push(translated);
+              return responseForCall(translated.command, translated.params);
+            }
             const command = name === "conflicts" ? "git_conflicts" : name;
             calls.push({ command, params: rawArgs });
             return responseForCall(command, rawArgs);
           },
         }) as unknown as ReturnType<BridgePool["getBridge"]>,
     } as unknown as BridgePool,
-    client: { lsp: {}, find: {} } as PluginContext["client"],
+    client: {
+      lsp: {
+        status: async () => ({ data: lspSymbols.length > 0 ? [{ status: "connected" }] : [] }),
+      },
+      find: {
+        symbols: async () => ({ data: lspSymbols }),
+      },
+    } as unknown as PluginContext["client"],
     config: {
       hoist_builtin_tools: true,
       lsp: { diagnostics_on_edit: diagnosticsOnEdit },
@@ -207,6 +244,7 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     ast_search: ast.ast_grep_search ?? ast.aft_ast_search,
     ast_replace: ast.ast_grep_replace ?? ast.aft_ast_replace,
     aft_import: importTools(ctx).aft_import,
+    aft_refactor: refactoringTools(ctx).aft_refactor,
   };
 }
 
@@ -282,7 +320,12 @@ async function captureTranslateCase(caseDef: TranslateCase): Promise<void> {
     return;
   }
 
-  const ctx = makeCtx(calls, successForTranslate, caseDef.diagnostics_on_edit ?? false);
+  const ctx = makeCtx(
+    calls,
+    successForTranslate,
+    caseDef.diagnostics_on_edit ?? false,
+    caseDef.lsp_symbols ?? [],
+  );
   const def = tools(ctx)[caseDef.tool_name];
   if (!def) throw new Error(`missing tool ${caseDef.tool_name}`);
 
@@ -310,9 +353,9 @@ function writeTranslateCase(caseDef: TranslateCase, expected: unknown): void {
   const dir = join(FIXTURES_ROOT, "translate", caseDef.name);
   mkdirSync(dir, { recursive: true });
   writeJson(join(dir, "input.json"), {
-    tool_name: caseDef.tool_name,
-    agent_args: replaceStablePaths(caseDef.agent_args),
-    project_root: PROJECT_ROOT_TOKEN,
+      tool_name: caseDef.tool_name,
+      agent_args: replaceStablePaths(caseDef.input_agent_args ?? caseDef.agent_args),
+      project_root: PROJECT_ROOT_TOKEN,
     ...(caseDef.diagnostics_on_edit === undefined
       ? {}
       : { diagnostics_on_edit: caseDef.diagnostics_on_edit }),
@@ -399,6 +442,19 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "aft_import_organize_translate", tool_name: "aft_import", agent_args: { op: "organize", filePath: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "aft_import_add_missing_module", tool_name: "aft_import", expected_error: "'module' is required for 'add' op", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "aft_import_missing_file_path", tool_name: "aft_import", expected_error: "aft_import: missing required param 'filePath'", agent_args: { op: "organize" } },
+  { name: "aft_refactor_move_translate_full", tool_name: "aft_refactor", agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts`, scope: "exports" } },
+  { name: "aft_refactor_extract_translate", tool_name: "aft_refactor", agent_args: { op: "extract", filePath: `${PROJECT_ROOT}/src/main.ts`, name: "computeValue", startLine: 2, endLine: 4 } },
+  { name: "aft_refactor_inline_translate", tool_name: "aft_refactor", agent_args: { op: "inline", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "helper", callSiteLine: 6 } },
+  { name: "aft_refactor_missing_symbol_for_move", tool_name: "aft_refactor", expected_error: "'symbol' is required for 'move' op", agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, destination: `${PROJECT_ROOT}/src/moved.ts` } },
+  { name: "aft_refactor_missing_name_for_extract", tool_name: "aft_refactor", expected_error: "'name' is required for 'extract' op", agent_args: { op: "extract", filePath: `${PROJECT_ROOT}/src/main.ts`, startLine: 2, endLine: 4 } },
+  { name: "aft_refactor_missing_filePath", tool_name: "aft_refactor", expected_error: "aft_refactor: missing required param 'filePath'", agent_args: { op: "move", symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts` } },
+  {
+    name: "aft_refactor_lsp_hints_passthrough",
+    tool_name: "aft_refactor",
+    agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts` },
+    input_agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts`, lsp_hints: { symbols: [{ name: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 4, kind: "function" }] } },
+    lsp_symbols: [{ name: "run", kind: 12, location: { uri: `file://${PROJECT_ROOT}/src/main.ts`, range: { start: { line: 4 } } } }],
+  },
   { name: "search_default", tool_name: "search", agent_args: { query: "value" } },
   { name: "search_include_tests", tool_name: "search", agent_args: { query: "fixtures", topK: 7, includeTests: true } },
   { name: "search_whitespace_error", tool_name: "search", agent_args: { query: "   " } },

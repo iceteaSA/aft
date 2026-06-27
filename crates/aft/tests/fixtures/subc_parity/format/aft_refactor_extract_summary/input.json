@@ -1,0 +1,21 @@
+{
+  "tool_name": "aft_refactor",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "name": "computeBase",
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "parameters": ["items", "prefix"],
+    "return_type": "number"
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "extract",
+      "filePath": "<PROJECT_ROOT>/src/main.ts",
+      "name": "fallbackName",
+      "startLine": 2,
+      "endLine": 4
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

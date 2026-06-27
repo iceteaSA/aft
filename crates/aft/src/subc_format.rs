@@ -28,6 +28,10 @@ pub struct FormatContext {
     pub import_remove_name: Option<String>,
     pub import_file_arg: Option<String>,
     pub import_module_arg: Option<String>,
+    pub refactor_op: Option<String>,
+    pub refactor_symbol_arg: Option<String>,
+    pub refactor_name_arg: Option<String>,
+    pub refactor_file_arg: Option<String>,
 }
 
 impl Default for FormatContext {
@@ -43,6 +47,10 @@ impl Default for FormatContext {
             import_remove_name: None,
             import_file_arg: None,
             import_module_arg: None,
+            refactor_op: None,
+            refactor_symbol_arg: None,
+            refactor_name_arg: None,
+            refactor_file_arg: None,
         }
     }
 }
@@ -62,6 +70,10 @@ impl FormatContext {
             import_remove_name: import_string_arg_for_call(bare_name, arguments, "removeName"),
             import_file_arg: import_string_arg_for_call(bare_name, arguments, "filePath"),
             import_module_arg: import_string_arg_for_call(bare_name, arguments, "module"),
+            refactor_op: refactor_string_arg_for_call(bare_name, arguments, "op"),
+            refactor_symbol_arg: refactor_string_arg_for_call(bare_name, arguments, "symbol"),
+            refactor_name_arg: refactor_string_arg_for_call(bare_name, arguments, "name"),
+            refactor_file_arg: refactor_string_arg_for_call(bare_name, arguments, "filePath"),
         }
     }
 }
@@ -158,6 +170,17 @@ fn import_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> 
         .map(str::to_string)
 }
 
+fn refactor_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Option<String> {
+    if bare_name != "aft_refactor" {
+        return None;
+    }
+    arguments
+        .as_object()
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn coerce_boolean(value: &Value) -> bool {
     match value {
         Value::Bool(value) => *value,
@@ -192,6 +215,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "ast_search"
             | "ast_replace"
             | "aft_import"
+            | "aft_refactor"
     )
 }
 
@@ -243,6 +267,7 @@ pub fn format_response_with_context(
         "ast_search" => format_ast_search(data),
         "ast_replace" => format_ast_replace(data, ctx.ast_dry_run),
         "aft_import" => format_import(data, ctx),
+        "aft_refactor" => format_refactor(data, ctx),
         _ => unreachable!("core agent tools are exhaustive"),
     }
 }
@@ -356,6 +381,114 @@ fn format_import(data: &Value, ctx: &FormatContext) -> String {
             .join("\n")
         }
         _ => "No import result.".to_string(),
+    }
+}
+
+fn format_refactor(data: &Value, ctx: &FormatContext) -> String {
+    let Some(response) = data.as_object() else {
+        return "No refactor result.".to_string();
+    };
+
+    match ctx.refactor_op.as_deref() {
+        Some("move") => {
+            let results = response
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_object)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let files_modified = import_number_field(response, "files_modified")
+                .unwrap_or_else(|| results.len().to_string());
+            let consumers_updated = import_number_field(response, "consumers_updated")
+                .unwrap_or_else(|| "0".to_string());
+            let files = if results.is_empty() {
+                "No files reported.".to_string()
+            } else {
+                results
+                    .iter()
+                    .map(|entry| {
+                        let file = entry
+                            .get("file")
+                            .and_then(Value::as_str)
+                            .unwrap_or("(unknown file)");
+                        format!("  ↳ {}", shorten_path(file))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
+            [
+                format!(
+                    "moved symbol {}",
+                    ctx.refactor_symbol_arg
+                        .clone()
+                        .unwrap_or_else(|| "(symbol)".to_string())
+                ),
+                format!("files modified {files_modified}"),
+                format!("consumers updated {consumers_updated}"),
+                files,
+            ]
+            .join("\n")
+        }
+        Some("extract") => {
+            let name = import_string_field(response, "name")
+                .or_else(|| ctx.refactor_name_arg.clone())
+                .unwrap_or_else(|| "(function)".to_string());
+            let file = import_string_field(response, "file")
+                .or_else(|| ctx.refactor_file_arg.clone())
+                .unwrap_or_default();
+            let parameters = response
+                .get("parameters")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    let joined = items
+                        .iter()
+                        .map(value_to_plain_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if joined.is_empty() {
+                        "none".to_string()
+                    } else {
+                        joined
+                    }
+                })
+                .unwrap_or_else(|| "none".to_string());
+            let return_type = import_string_field(response, "return_type")
+                .unwrap_or_else(|| "unknown".to_string());
+
+            [
+                format!("extracted {name}"),
+                format!("file {}", shorten_path(&file)),
+                format!("params {parameters}"),
+                format!("return type {return_type}"),
+            ]
+            .join("\n")
+        }
+        Some("inline") => {
+            let symbol = import_string_field(response, "symbol")
+                .or_else(|| ctx.refactor_symbol_arg.clone())
+                .unwrap_or_else(|| "(symbol)".to_string());
+            let file = import_string_field(response, "file")
+                .or_else(|| ctx.refactor_file_arg.clone())
+                .unwrap_or_default();
+            let context = import_string_field(response, "call_context")
+                .unwrap_or_else(|| "unknown".to_string());
+            let substitutions =
+                import_number_field(response, "substitutions").unwrap_or_else(|| "0".to_string());
+
+            [
+                format!("inlined {symbol}"),
+                format!("file {}", shorten_path(&file)),
+                format!("context {context}"),
+                format!("substitutions {substitutions}"),
+            ]
+            .join("\n")
+        }
+        _ => "No refactor result.".to_string(),
     }
 }
 

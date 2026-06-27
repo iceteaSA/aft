@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "aft_refactor: missing required param 'filePath'"
+  }
+}

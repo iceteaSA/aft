@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { queryLspHints } from "../lsp.js";
 import type { PluginContext } from "../types.js";
 import {
-  callBridge,
+  callToolCall,
   coerceOptionalInt,
   isEmptyParam,
   optionalInt,
@@ -61,8 +61,8 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
           "1-based start line — required for 'extract' op",
         ),
-        // endLine is inclusive from the agent's perspective; the execute function adds +1
-        // because the Rust backend expects exclusive end. This is intentional — do not document.
+        // The endLine value supplied to this tool is inclusive; the lower-level
+        // extract implementation expects the line immediately after the range.
         endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
           "1-based end line (inclusive) — required for 'extract' op",
         ),
@@ -136,32 +136,27 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         const permissionError = await askEditPermission(context, patterns, metadata);
         if (permissionError) return permissionDeniedResponse(permissionError);
 
-        const commandMap: Record<string, string> = {
-          move: "move_symbol",
-          extract: "extract_function",
-          inline: "inline_symbol",
-        };
-        const params: Record<string, unknown> = { file: filePath };
+        const rawArgs: Record<string, unknown> = { op, filePath };
 
         switch (op) {
           case "move":
-            params.symbol = args.symbol;
-            params.destination = destination;
-            if (args.scope !== undefined) params.scope = args.scope;
+            rawArgs.symbol = args.symbol;
+            rawArgs.destination = destination;
+            if (args.scope !== undefined) rawArgs.scope = args.scope;
             break;
           case "extract":
-            params.name = args.name;
             if (startLine === undefined || endLine === undefined) {
               throw new Error("'startLine' and 'endLine' are required for 'extract' op");
             }
-            params.start_line = startLine;
-            // Tool callers provide an inclusive endLine, while the refactoring backend expects
-            // the first line after the selected range.
-            params.end_line = endLine + 1;
+            rawArgs.name = args.name;
+            // Forward the inclusive endLine value directly; the receiving
+            // implementation adds 1 to make the exclusive end line it needs.
+            rawArgs.startLine = startLine;
+            rawArgs.endLine = endLine;
             break;
           case "inline":
-            params.symbol = args.symbol;
-            params.call_site_line = callSiteLine;
+            rawArgs.symbol = args.symbol;
+            rawArgs.callSiteLine = callSiteLine;
             break;
         }
 
@@ -171,13 +166,13 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           undefined,
           context.sessionID,
         );
-        if (hints) params.lsp_hints = hints;
+        if (hints) rawArgs.lsp_hints = hints;
 
-        const response = await callBridge(ctx, context, commandMap[op], params);
+        const response = await callToolCall(ctx, context, "aft_refactor", rawArgs);
         if (response.success === false) {
           throw new Error((response.message as string) || `${op} failed`);
         }
-        return JSON.stringify(response);
+        return response.text;
       },
     },
   };

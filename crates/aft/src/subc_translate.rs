@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Translated {
     pub command: String,
@@ -196,6 +198,7 @@ pub fn subc_translate_with_context(
         "ast_search" => translate_ast_search(agent_args),
         "ast_replace" => translate_ast_replace(agent_args),
         "aft_import" => translate_import(agent_args),
+        "aft_refactor" => translate_refactor(agent_args),
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
@@ -671,6 +674,92 @@ fn translate_import(args: &Value) -> Result<Translated, TranslateError> {
     insert_present_renamed(&mut out, &map_in, "typeOnly", "type_only");
     insert_present_renamed(&mut out, &map_in, "removeName", "name");
     insert_present_renamed(&mut out, &map_in, "validate", "validate");
+
+    Ok(Translated {
+        command: command.into(),
+        args: out,
+    })
+}
+
+fn translate_refactor(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let op = map_in
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_request("aft_refactor: missing required param 'op'"))?;
+    let command = match op {
+        "move" => "move_symbol",
+        "extract" => "extract_function",
+        "inline" => "inline_symbol",
+        other => {
+            return Err(invalid_request(format!(
+                "aft_refactor: invalid op {other:?}; expected 'move', 'extract', or 'inline'"
+            )));
+        }
+    };
+
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("aft_refactor: missing required param 'filePath'"))?;
+
+    if matches!(op, "move" | "inline") && map_in.get("symbol").is_none_or(is_empty_param) {
+        return Err(invalid_request(format!(
+            "'symbol' is required for '{op}' op"
+        )));
+    }
+    if op == "move" && map_in.get("destination").is_none_or(is_empty_param) {
+        return Err(invalid_request("'destination' is required for 'move' op"));
+    }
+
+    let mut out = Map::new();
+    out.insert("file".to_string(), Value::String(file_path.to_string()));
+
+    match op {
+        "move" => {
+            insert_present_renamed(&mut out, &map_in, "symbol", "symbol");
+            insert_present_renamed(&mut out, &map_in, "destination", "destination");
+            insert_present_renamed(&mut out, &map_in, "scope", "scope");
+        }
+        "extract" => {
+            if map_in.get("name").is_none_or(is_empty_param) {
+                return Err(invalid_request("'name' is required for 'extract' op"));
+            }
+            let start_line = coerce_optional_int_result(
+                map_in.get("startLine"),
+                "startLine",
+                1,
+                MAX_SAFE_INTEGER,
+            )?
+            .ok_or_else(|| invalid_request("'startLine' is required for 'extract' op"))?;
+            let end_line =
+                coerce_optional_int_result(map_in.get("endLine"), "endLine", 1, MAX_SAFE_INTEGER)?
+                    .ok_or_else(|| invalid_request("'endLine' is required for 'extract' op"))?;
+
+            insert_present_renamed(&mut out, &map_in, "name", "name");
+            out.insert("start_line".to_string(), Value::Number(start_line.into()));
+            out.insert("end_line".to_string(), Value::Number((end_line + 1).into()));
+        }
+        "inline" => {
+            let call_site_line = coerce_optional_int_result(
+                map_in.get("callSiteLine"),
+                "callSiteLine",
+                1,
+                MAX_SAFE_INTEGER,
+            )?
+            .ok_or_else(|| invalid_request("'callSiteLine' is required for 'inline' op"))?;
+
+            insert_present_renamed(&mut out, &map_in, "symbol", "symbol");
+            out.insert(
+                "call_site_line".to_string(),
+                Value::Number(call_site_line.into()),
+            );
+        }
+        _ => unreachable!("validated refactor op"),
+    }
+
+    insert_present_renamed(&mut out, &map_in, "lsp_hints", "lsp_hints");
 
     Ok(Translated {
         command: command.into(),

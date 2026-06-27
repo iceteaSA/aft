@@ -1,0 +1,9 @@
+{
+  "args": {
+    "end_line": 5,
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "name": "computeValue",
+    "start_line": 2
+  },
+  "command": "extract_function"
+}

@@ -1,0 +1,20 @@
+{
+  "tool_name": "aft_refactor",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "symbol": "helper",
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "call_context": "assignment",
+    "substitutions": 2
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "inline",
+      "filePath": "<PROJECT_ROOT>/src/main.ts",
+      "symbol": "helper",
+      "callSiteLine": 8
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

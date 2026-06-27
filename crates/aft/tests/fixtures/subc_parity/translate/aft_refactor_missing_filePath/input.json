@@ -1,0 +1,9 @@
+{
+  "agent_args": {
+    "destination": "<PROJECT_ROOT>/src/moved.ts",
+    "op": "move",
+    "symbol": "run"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "aft_refactor"
+}

@@ -1,0 +1,4 @@
+inlined helper
+file <PROJECT_ROOT>/src/main.ts
+context assignment
+substitutions 2

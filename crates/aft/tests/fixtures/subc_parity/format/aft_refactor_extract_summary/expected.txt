@@ -1,0 +1,4 @@
+extracted computeBase
+file <PROJECT_ROOT>/src/main.ts
+params items, prefix
+return type number

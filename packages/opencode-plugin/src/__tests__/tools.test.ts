@@ -377,7 +377,7 @@ describe("move_symbol round-trip", () => {
 
       // Move formatDate from service.ts to utils.ts
       const refTools = refactoringTools(createPluginContext(pool));
-      const moveResult = JSON.parse(
+      const moveResult = toolResultText(
         await refTools.aft_refactor.execute(
           {
             op: "move",
@@ -389,12 +389,10 @@ describe("move_symbol round-trip", () => {
         ),
       );
 
-      expect(moveResult.success).toBe(true);
-      expect(moveResult.files_modified).toBeGreaterThanOrEqual(2);
-
-      // Verify response structure includes expected diagnostic fields
-      expect(moveResult.consumers_updated).toBeDefined();
-      expect(moveResult.checkpoint_name).toBeDefined();
+      expect(moveResult).toContain("moved symbol formatDate");
+      expect(moveResult).toContain("files modified");
+      expect(moveResult).toContain("consumers updated");
+      expect(moveResult.trim().startsWith("{")).toBe(false);
 
       // Verify symbol was actually moved on disk
       const sourceContent = await readFile(sourceFile, "utf-8");
@@ -454,7 +452,7 @@ describe("extract_function round-trip", () => {
 
       // Extract lines 1-3 (the filtering and mapping logic)
       const refTools = refactoringTools(createPluginContext(pool));
-      const result = JSON.parse(
+      const result = toolResultText(
         await refTools.aft_refactor.execute(
           {
             op: "extract",
@@ -467,10 +465,10 @@ describe("extract_function round-trip", () => {
         ),
       );
 
-      expect(result.success).toBe(true);
-      expect(Array.isArray(result.parameters)).toBe(true);
-      expect(result.parameters.length).toBeGreaterThan(0);
-      expect(result.return_type).toBeDefined();
+      expect(result).toContain("extracted filterAndMap");
+      expect(result).toContain("params ");
+      expect(result).toContain("return type ");
+      expect(result.trim().startsWith("{")).toBe(false);
       const content = await readFile(filePath, "utf-8");
       expect(content).toContain("function filterAndMap");
     },
@@ -521,7 +519,7 @@ describe("inline_symbol round-trip", () => {
 
       // Inline helper at line 6 (const result = helper(10, 20)) — 1-based
       const refTools = refactoringTools(createPluginContext(pool));
-      const result = JSON.parse(
+      const result = toolResultText(
         await refTools.aft_refactor.execute(
           {
             op: "inline",
@@ -533,10 +531,10 @@ describe("inline_symbol round-trip", () => {
         ),
       );
 
-      expect(result.success).toBe(true);
-      expect(result.symbol).toBe("helper");
-      expect(result.call_context).toBe("assignment");
-      expect(result.substitutions).toBeGreaterThan(0);
+      expect(result).toContain("inlined helper");
+      expect(result).toContain("context assignment");
+      expect(result).toContain("substitutions ");
+      expect(result.trim().startsWith("{")).toBe(false);
 
       // Verify file was modified
       const content = await readFile(filePath, "utf-8");

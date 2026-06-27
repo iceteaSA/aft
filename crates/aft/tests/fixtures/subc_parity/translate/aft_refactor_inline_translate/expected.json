@@ -1,0 +1,8 @@
+{
+  "args": {
+    "call_site_line": 6,
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "symbol": "helper"
+  },
+  "command": "inline_symbol"
+}

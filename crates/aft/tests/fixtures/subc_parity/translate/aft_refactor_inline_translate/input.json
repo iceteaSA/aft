@@ -1,0 +1,10 @@
+{
+  "agent_args": {
+    "callSiteLine": 6,
+    "filePath": "<PROJECT_ROOT>/src/main.ts",
+    "op": "inline",
+    "symbol": "helper"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "aft_refactor"
+}
