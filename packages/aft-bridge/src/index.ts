@@ -113,7 +113,7 @@ export {
 } from "./paths.js";
 // --- platform helpers ---
 export { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
-export type { PoolOptions } from "./pool.js";
+export type { BridgeToolCallRuntime, PoolOptions } from "./pool.js";
 export { BridgePool, HomeProjectRootError, isHomeDirectoryRoot } from "./pool.js";
 // --- project-root identity (single canonicalizer; mirrors cortexkit-paths) ---
 export { canonicalizeProjectRoot, projectRootKeyHash } from "./project-identity.js";
@@ -147,6 +147,12 @@ export {
 // --- shared agent-facing tool formatting ---
 export type { ReadFooterOptions } from "./tool-format.js";
 export { formatBridgeErrorMessage, formatReadFooter } from "./tool-format.js";
+export type {
+  AftTransport,
+  AftTransportOptions,
+  ToolCallArguments,
+  ToolCallResult,
+} from "./transport.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
 export type {
   RustZoomBatchEntry,

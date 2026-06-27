@@ -1,10 +1,12 @@
 /// <reference path="../bun-test.d.ts" />
+
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
+
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
 import { astTools } from "../tools/ast.js";
 import { createBashTool } from "../tools/bash.js";
@@ -115,12 +117,46 @@ function recordingAsk(
 }
 
 async function makeProjectAndExternalDirs(): Promise<{ project: string; external: string }> {
-  tmpRoot = await mkdtemp(path.join(tmpdir(), "aft-permission-audit-"));
+  tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-permission-audit-")));
   const project = path.join(tmpRoot, "project");
   const external = path.join(tmpRoot, "external");
   await mkdir(project, { recursive: true });
   await mkdir(external, { recursive: true });
   return { project, external };
+}
+
+async function makeCanonicalizationDirs(): Promise<{
+  project: string;
+  external: string;
+  inRootTarget: string;
+}> {
+  tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-permission-canon-")));
+  const project = path.join(tmpRoot, "project");
+  const external = path.join(tmpRoot, "external");
+  const inRootTarget = path.join(project, "real-target");
+  await mkdir(inRootTarget, { recursive: true });
+  await mkdir(external, { recursive: true });
+  return { project, external, inRootTarget };
+}
+
+async function createDirectoryLink(target: string, linkPath: string): Promise<void> {
+  await symlink(target, linkPath, process.platform === "win32" ? "junction" : "dir");
+}
+
+async function externalAskCallsFor(project: string, target: string): Promise<AskCall[]> {
+  const askCalls: AskCall[] = [];
+  const context = createSdkContext(project, recordingAsk(askCalls));
+  const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool);
+
+  const result = await assertExternalDirectoryPermission(ctx, context, target);
+
+  expect(result).toBeUndefined();
+  return askCalls.filter((call) => call.permission === "external_directory");
+}
+
+function expectExternalAsk(calls: AskCall[]): void {
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.permission).toBe("external_directory");
 }
 
 function parsePermissionDenied(raw: string): Record<string, unknown> {
@@ -338,6 +374,76 @@ describe("permission audit regressions", () => {
     });
     expect(bridgeRoots[0]).toBe(project);
   });
+
+  test("external_directory ask is skipped for an in-root real file", async () => {
+    const { project } = await makeCanonicalizationDirs();
+    const target = path.join(project, "real-target", "file.txt");
+    await writeFile(target, "inside\n");
+
+    const externalAsks = await externalAskCallsFor(project, target);
+
+    expect(externalAsks).toHaveLength(0);
+  });
+
+  test("external_directory ask fires for an in-root symlink to an outside target", async () => {
+    const { project, external } = await makeCanonicalizationDirs();
+    const linkPath = path.join(project, "link-outside");
+    const target = path.join(linkPath, "secret.txt");
+    await writeFile(path.join(external, "secret.txt"), "outside\n");
+    await createDirectoryLink(external, linkPath);
+
+    const externalAsks = await externalAskCallsFor(project, target);
+
+    expectExternalAsk(externalAsks);
+  });
+
+  test("external_directory ask is skipped for an in-root symlink to an in-root target", async () => {
+    const { project, inRootTarget } = await makeCanonicalizationDirs();
+    const linkPath = path.join(project, "link-inside");
+    const target = path.join(linkPath, "safe.txt");
+    await writeFile(path.join(inRootTarget, "safe.txt"), "inside\n");
+    await createDirectoryLink(inRootTarget, linkPath);
+
+    const externalAsks = await externalAskCallsFor(project, target);
+
+    expect(externalAsks).toHaveLength(0);
+  });
+
+  test("external_directory ask fires for a nonexistent write under a symlinked-outside parent", async () => {
+    const { project, external } = await makeCanonicalizationDirs();
+    const linkPath = path.join(project, "link-outside");
+    await createDirectoryLink(external, linkPath);
+
+    const externalAsks = await externalAskCallsFor(project, path.join(linkPath, "new-file.txt"));
+
+    expectExternalAsk(externalAsks);
+  });
+
+  test("external_directory ask fires for a plain outside-root path", async () => {
+    const { project, external } = await makeCanonicalizationDirs();
+    const target = path.join(external, "plain.txt");
+    await writeFile(target, "outside\n");
+
+    const externalAsks = await externalAskCallsFor(project, target);
+
+    expectExternalAsk(externalAsks);
+  });
+
+  test("external_directory ask expands ~/ before containment", async () => {
+    const { project } = await makeCanonicalizationDirs();
+
+    const externalAsks = await externalAskCallsFor(
+      project,
+      "~/aft-permission-home-target-for-test.txt",
+    );
+
+    expectExternalAsk(externalAsks);
+    const filepath = externalAsks[0]?.metadata?.filepath;
+    expect(typeof filepath).toBe("string");
+    expect((filepath as string).startsWith(path.join(project, "~"))).toBe(false);
+    expect(filepath).toContain("aft-permission-home-target-for-test.txt");
+  });
+
   windowsTest("containsPath rejects Windows cross-drive targets as external", async () => {
     const askCalls: AskCall[] = [];
     const context = createSdkContext("C:\\repo", recordingAsk(askCalls));

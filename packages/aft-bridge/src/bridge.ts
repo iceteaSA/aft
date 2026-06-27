@@ -8,6 +8,7 @@ import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
 import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
+import type { ToolCallArguments, ToolCallResult } from "./transport.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
@@ -551,6 +552,24 @@ export class BinaryBridge {
     options?: SendOptions,
   ): Promise<Record<string, unknown>> {
     return this.sendWithVersionMismatchRetry(command, params, options, true);
+  }
+
+  /**
+   * Dispatch an agent tool through the server-side `tool_call` command.
+   *
+   * The Rust command returns the direct leaf response plus one `text` field;
+   * status_bar/bg_completions and every other sidecar stay top-level so the
+   * existing plugin ingest/capture path sees the same raw response shape.
+   */
+  async toolCall(
+    sessionId: string | undefined,
+    name: string,
+    rawArgs: ToolCallArguments = {},
+    options?: SendOptions,
+  ): Promise<ToolCallResult> {
+    const params: Record<string, unknown> = { name, arguments: rawArgs };
+    if (sessionId) params.session_id = sessionId;
+    return (await this.send("tool_call", params, options)) as ToolCallResult;
   }
 
   private async sendWithVersionMismatchRetry(

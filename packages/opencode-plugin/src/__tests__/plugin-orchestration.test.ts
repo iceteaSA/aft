@@ -2,7 +2,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -165,8 +165,8 @@ describe("Lane G plugin orchestration regressions", () => {
   });
 
   test("glob external permission treats existing outside file as file scope", async () => {
-    const project = mkdtempSync(join(tmpdir(), "aft-glob-project-"));
-    const outside = mkdtempSync(join(tmpdir(), "aft-glob-outside-"));
+    const project = realpathSync(mkdtempSync(join(tmpdir(), "aft-glob-project-")));
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "aft-glob-outside-")));
     const outsideFile = join(outside, "one.ts");
     writeFileSync(outsideFile, "export const one = 1;\n");
     const asks: Array<Record<string, unknown>> = [];

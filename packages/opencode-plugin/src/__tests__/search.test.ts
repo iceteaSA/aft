@@ -226,7 +226,7 @@ describe("searchTools", () => {
   });
 
   test("grep checks external permission per parsed multi-path fragment", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = fs.realpathSync(fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-")));
     try {
       const project = path.join(tmpRoot, "project");
       const inside = path.join(project, "src");

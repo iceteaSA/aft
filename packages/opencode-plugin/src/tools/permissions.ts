@@ -1,9 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
+
 import { sendIgnoredMessage } from "../shared/ignored-message.js";
 import type { PluginContext } from "../types.js";
-import { projectRootFor } from "./_shared.js";
+import { expandTilde, projectRootFor } from "./_shared.js";
 
 const UNSUPPORTED_ASK_HOST =
   "AFT requires OpenCode 1.15.5 or newer for permission asks; please upgrade OpenCode";
@@ -71,7 +72,8 @@ export async function runAsk(maybe: Promise<void>): Promise<void> {
 }
 
 export function resolveAbsolutePath(context: ToolContext, target: string): string {
-  return path.isAbsolute(target) ? target : path.resolve(projectRootFor(context), target);
+  const expanded = expandTilde(target);
+  return path.isAbsolute(expanded) ? expanded : path.resolve(projectRootFor(context), expanded);
 }
 
 export function resolveRelativePattern(context: ToolContext, target: string): string {
@@ -160,24 +162,40 @@ function windowsPath(p: string): string {
 }
 
 /**
- * Normalize a path so containsPath() comparisons and external_directory
- * glob construction work consistently on Windows.
+ * Resolve symlinks before containsPath() comparisons on every platform.
  *
- * Mirrors `AppFileSystem.normalizePath` in opencode core: on Windows,
- * applies POSIX→Windows drive translation, resolves to absolute, then
- * `realpathSync.native` to follow symlinks and canonicalize the drive
- * letter case. Falls back to the resolved path when the target doesn't
- * exist (writes to new files have to ask permission BEFORE creating).
- *
- * No-op on non-Windows so macOS/Linux behavior is unchanged.
+ * Existing targets are canonicalized directly. For not-yet-created write
+ * targets, walk upward until an existing parent can be realpath'd, then rejoin
+ * the missing tail; this catches writes through a symlinked parent directory.
+ * Windows drive/path normalization is applied before realpath so drive-form
+ * variants still compare consistently. This helper is total: permission checks
+ * must degrade to a lexical absolute path instead of throwing.
  */
 function normalizePath(p: string): string {
-  if (process.platform !== "win32") return p;
   const resolved = path.resolve(windowsPath(p));
   try {
     return fs.realpathSync.native(resolved);
   } catch {
-    return resolved;
+    return normalizeNearestExistingParent(resolved);
+  }
+}
+
+function normalizeNearestExistingParent(resolved: string): string {
+  const missingTail: string[] = [];
+  let current = resolved;
+
+  while (true) {
+    try {
+      const realParent = fs.realpathSync.native(current);
+      return missingTail.length === 0
+        ? realParent
+        : path.join(realParent, ...missingTail.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return resolved;
+      missingTail.push(path.basename(current));
+      current = parent;
+    }
   }
 }
 
@@ -192,7 +210,7 @@ function normalizePath(p: string): string {
  *   `~/projects/*`      → `~/projects/*`  (`~` is expanded by opencode's matcher)
  *   `C:\some\dir\*`     → `C:\some\dir\*` (drive case canonicalized via realpath of the dir part)
  *
- * No-op on non-Windows.
+ * Non-Windows callers build patterns from an already-canonical parent path.
  */
 function normalizePathPattern(p: string): string {
   if (process.platform !== "win32") return p;
@@ -234,9 +252,9 @@ export async function assertExternalDirectoryPermission(
   if (!target) return undefined;
 
   const resolved = resolveAbsolutePath(context, target);
-  // Windows: realpath + drive-case normalize so containsPath comparisons line
-  // up regardless of how the agent typed the path (`C:/...` vs `/c/...` vs
-  // `/cygdrive/c/...`). No-op on macOS/Linux.
+  // `tool_call` trusts this plugin-side permission decision. The Rust default
+  // validator may keep lexical path strings, so canonicalize containment here
+  // and assert the ask decision rather than plugin/server string equality.
   const absoluteTarget = normalizePath(resolved);
 
   const root = projectRootFor(context);

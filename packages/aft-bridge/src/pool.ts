@@ -1,8 +1,10 @@
 import { homedir } from "node:os";
+
 import { error, getActiveLogger, log } from "./active-logger.js";
-import { BinaryBridge, type BridgeOptions } from "./bridge.js";
+import { BinaryBridge, type BridgeOptions, type BridgeRequestOptions } from "./bridge.js";
 import type { Logger, LogMeta } from "./logger.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
+import type { ToolCallArguments, ToolCallResult } from "./transport.js";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // evict idle bridges after 30 minutes
 const DEFAULT_MAX_POOL_SIZE = 8;
@@ -66,6 +68,10 @@ export function isHomeDirectoryRoot(normalizedKey: string): boolean {
 interface PoolEntry {
   bridge: BinaryBridge;
   lastUsed: number;
+}
+
+export interface BridgeToolCallRuntime {
+  sessionID?: string;
 }
 
 export interface PoolOptions extends BridgeOptions {
@@ -233,6 +239,16 @@ export class BridgePool {
     const bridge = new BinaryBridge(this.binaryPath, key, this.bridgeOptions, mergedOverrides);
     this.bridges.set(key, { bridge, lastUsed: Date.now() });
     return bridge;
+  }
+
+  async toolCall(
+    projectRoot: string,
+    runtime: BridgeToolCallRuntime,
+    name: string,
+    rawArgs: ToolCallArguments = {},
+    options?: BridgeRequestOptions,
+  ): Promise<ToolCallResult> {
+    return this.getBridge(projectRoot).toolCall(runtime.sessionID, name, rawArgs, options);
   }
 
   /** Shut down idle bridges that haven't been used within the timeout. */
