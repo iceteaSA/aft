@@ -28,6 +28,7 @@ use crate::executor::{Executor, Lane};
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
 use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
+use crate::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome, ToolCallResult};
 use crate::runtime_drain;
 
 use subc_protocol::manifest::{
@@ -1891,123 +1892,93 @@ async fn handle_tool_call(
     );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
-    let project_root = identity.project_root.as_path();
     let diagnostics_on_edit = live_roots
         .get(&identity.root)
         .map(|meta| meta.diagnostics_on_edit)
         .unwrap_or(false);
-    let translate_context = crate::subc_translate::TranslateContext {
+
+    // A non-core name is NOT in the tool manifest. AFT fails closed and
+    // does not trust subc to enforce the manifest: rejecting here is the
+    // defense-in-depth backstop that prevents a forwarded native command
+    // (e.g. `configure`, which would reach handle_configure and bypass
+    // the RouteBind config-trust cap) from ever reaching dispatch. Only
+    // the integration-test harness (run_subc_mode_for_test) opens this to
+    // drive synthetic native commands through the executor.
+    if !is_subc_agent_core_tool(&call.name) && !allow_native_passthrough {
+        log::warn!(
+            "subc tool call: rejecting non-manifest tool name {:?} on route {} (fail-closed)",
+            call.name,
+            frame.header.channel
+        );
+        let response = Response::error(
+            request_id.clone(),
+            "unknown_tool",
+            format!("tool {:?} is not in the AFT tool manifest", call.name),
+        );
+        let text = crate::subc_format::format_response_with_context(
+            &bare_name,
+            &response,
+            &format_context,
+        );
+        let result = ToolCallResult { text, response };
+        let response_frame = build_tool_response_frame(
+            frame.header.ver,
+            frame.header.channel,
+            frame.header.corr,
+            frame.header.flags,
+            &result,
+        )?;
+        return send_frame(tx, response_frame).await;
+    }
+
+    let lane = command_lane(&bare_name);
+    let tool_call_context = ToolCallContext {
+        project_root: identity.project_root.clone(),
+        session_id: Some(identity.session.clone()),
+        request_id: request_id.clone(),
         diagnostics_on_edit,
     };
-    let (command, translated_args) = match crate::subc_translate::subc_translate_with_context(
-        &call.name,
-        &call.arguments,
-        project_root,
-        translate_context,
-    ) {
-        Ok(t) => (t.command, t.args),
-        // A core agent tool that fails translation is a real client error
-        // (e.g. `edit` with no resolvable mode) — surface it, never guess.
-        Err(err) if is_subc_agent_core_tool(&call.name) => {
-            let response = Response::error(request_id.clone(), err.code, err.message);
-            let response_frame = build_tool_response_frame(
-                frame.header.ver,
-                frame.header.channel,
-                frame.header.corr,
-                frame.header.flags,
-                &bare_name,
-                &format_context,
-                &response,
-            )?;
-            return send_frame(tx, response_frame).await;
-        }
-        // A non-core name is NOT in the tool manifest. AFT fails closed and
-        // does not trust subc to enforce the manifest: rejecting here is the
-        // defense-in-depth backstop that prevents a forwarded native command
-        // (e.g. `configure`, which would reach handle_configure and bypass
-        // the RouteBind config-trust cap) from ever reaching dispatch. Only
-        // the integration-test harness (run_subc_mode_for_test) opens this to
-        // drive synthetic native commands through the executor.
-        Err(_) if !allow_native_passthrough => {
-            log::warn!(
-                "subc tool call: rejecting non-manifest tool name {:?} on route {} (fail-closed)",
-                call.name,
-                frame.header.channel
-            );
-            let response = Response::error(
-                request_id.clone(),
-                "unknown_tool",
-                format!("tool {:?} is not in the AFT tool manifest", call.name),
-            );
-            let response_frame = build_tool_response_frame(
-                frame.header.ver,
-                frame.header.channel,
-                frame.header.corr,
-                frame.header.flags,
-                &bare_name,
-                &format_context,
-                &response,
-            )?;
-            return send_frame(tx, response_frame).await;
-        }
-        // Test-only: non-core names are native commands (the integration-test
-        // synthetic tools) — pass them through verbatim.
-        Err(_) => {
-            let map = call.arguments.as_object().cloned().unwrap_or_default();
-            (call.name.clone(), map)
-        }
-    };
-
-    let lane = command_lane(&command);
-    let command_for_finalize = command.clone();
-    let session_for_finalize = identity.session.clone();
-    let mut map = translated_args;
-    map.insert("id".to_string(), json!(request_id.clone()));
-    map.insert("command".to_string(), json!(command));
-    map.insert("session_id".to_string(), json!(identity.session.clone()));
-
-    let raw_req = match serde_json::from_value::<RawRequest>(Value::Object(map)) {
-        Ok(req) => req,
-        Err(error) => {
-            let response = Response::error(
-                request_id.clone(),
-                "invalid_request",
-                format!("failed to build request from tool call: {error}"),
-            );
-            let response_frame = build_tool_response_frame(
-                frame.header.ver,
-                frame.header.channel,
-                frame.header.corr,
-                frame.header.flags,
-                &bare_name,
-                &format_context,
-                &response,
-            )?;
-            return send_frame(tx, response_frame).await;
-        }
-    };
-
+    let arguments_for_run = call.arguments.clone();
+    let bare_name_for_run = bare_name.clone();
     let bare_name_for_frame = bare_name.clone();
+    let bare_name_for_finalize = bare_name.clone();
+    let session_for_log = identity.session.clone();
+    let session_for_finalize = identity.session.clone();
     let format_context_for_frame = format_context;
+    let (text_tx, text_rx) = oneshot::channel::<String>();
     let rx = executor.submit_async(
         identity.root,
         lane,
         request_id.clone(),
         Box::new(move |ctx| {
-            log_ctx::with_session(Some(session_for_finalize.clone()), || {
-                let mut response = dispatch(raw_req, ctx);
-                crate::response_finalize::attach_bg_completions(
-                    &mut response,
+            log_ctx::with_session(Some(session_for_log.clone()), || {
+                let dispatch_with_finalize = |raw_req: RawRequest, app_ctx: &AppContext| {
+                    let mut response = dispatch(raw_req, app_ctx);
+                    crate::response_finalize::attach_bg_completions(
+                        &mut response,
+                        app_ctx,
+                        &session_for_finalize,
+                        &bare_name_for_finalize,
+                    );
+                    crate::response_finalize::attach_status_bar(
+                        &mut response,
+                        app_ctx,
+                        &bare_name_for_finalize,
+                    );
+                    response
+                };
+                match run_tool_call(
+                    &bare_name_for_run,
+                    &arguments_for_run,
+                    &tool_call_context,
                     ctx,
-                    &session_for_finalize,
-                    &command_for_finalize,
-                );
-                crate::response_finalize::attach_status_bar(
-                    &mut response,
-                    ctx,
-                    &command_for_finalize,
-                );
-                response
+                    &dispatch_with_finalize,
+                ) {
+                    ToolCallOutcome::Unary(result) => {
+                        let _ = text_tx.send(result.text);
+                        result.response
+                    }
+                }
             })
         }),
     );
@@ -2020,16 +1991,16 @@ async fn handle_tool_call(
     let is_mutating = lane == Lane::Mutating;
     tokio::spawn(async move {
         let response = await_executor_response(rx, request_id.clone()).await;
-        let fatal = is_mutating && response_is_internal_error(&response);
-        match build_tool_response_frame(
-            ver,
-            route_channel,
-            corr,
-            flags,
-            &bare_name_for_frame,
-            &format_context_for_frame,
-            &response,
-        ) {
+        let text = text_rx.await.unwrap_or_else(|_| {
+            crate::subc_format::format_response_with_context(
+                &bare_name_for_frame,
+                &response,
+                &format_context_for_frame,
+            )
+        });
+        let result = ToolCallResult { text, response };
+        let fatal = is_mutating && response_is_internal_error(&result.response);
+        match build_tool_response_frame(ver, route_channel, corr, flags, &result) {
             Ok(response_frame) => {
                 let _ = completion_tx.send(response_frame).await;
             }
@@ -2095,15 +2066,11 @@ fn build_tool_response_frame(
     route_channel: u16,
     corr: u64,
     flags: Flags,
-    bare_name: &str,
-    format_context: &crate::subc_format::FormatContext,
-    response: &Response,
+    result: &ToolCallResult,
 ) -> Result<Frame, SubcError> {
-    let text =
-        crate::subc_format::format_response_with_context(bare_name, response, format_context);
-    let is_error = !response.success;
+    let is_error = !result.response.success;
     let result = json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": [{ "type": "text", "text": result.text.as_str() }],
         "isError": is_error,
     });
     let body = serde_json::to_vec(&result).map_err(SubcError::Json)?;

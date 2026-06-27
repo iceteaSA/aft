@@ -87,6 +87,7 @@ pub mod pattern_compile;
 pub mod protocol;
 pub mod query_shape;
 pub mod response_finalize;
+pub mod run_tool_call;
 pub mod runtime_drain;
 pub mod runtime_registry;
 pub mod search_index;
