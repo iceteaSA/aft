@@ -1,0 +1,35 @@
+{
+  "tool_name": "callgraph",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "depth_limited": true,
+    "hops": [
+      {
+        "variable": "value",
+        "flow_type": "origin",
+        "symbol": "run",
+        "file": "<PROJECT_ROOT>/src/main.ts",
+        "line": 2
+      },
+      {
+        "variable": "input",
+        "flow_type": "param",
+        "symbol": "helper",
+        "file": "<PROJECT_ROOT>/src/helper.ts",
+        "line": 7,
+        "approximate": true,
+        "resolved_by": "name_match"
+      }
+    ]
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "trace_data",
+      "filePath": "src/main.ts",
+      "symbol": "run",
+      "expression": "value"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

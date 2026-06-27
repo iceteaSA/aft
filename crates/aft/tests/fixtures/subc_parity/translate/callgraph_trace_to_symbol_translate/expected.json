@@ -1,0 +1,10 @@
+{
+  "args": {
+    "depth": 6,
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "symbol": "handler",
+    "toFile": "<PROJECT_ROOT>/src/main.ts",
+    "toSymbol": "leaf"
+  },
+  "command": "trace_to_symbol"
+}

@@ -1,0 +1,4 @@
+run [<PROJECT_ROOT>/src/main.ts:1]
+  ↳ helper [<PROJECT_ROOT>/src/helper.ts:4] ~
+    ↳ external [<PROJECT_ROOT>/src/helper.ts:5] [unresolved]
+(depth limited, 1 truncated)

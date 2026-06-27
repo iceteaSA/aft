@@ -1,11 +1,10 @@
-import { coerceBoolean, formatCallgraphSections } from "@cortexkit/aft-bridge";
+import { coerceBoolean } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import {
-  callBridge,
+  callToolCall,
   coerceOptionalInt,
-  formatBridgeErrorMessage,
   isEmptyParam,
   optionalInt,
   resolvePathArg,
@@ -110,20 +109,22 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           if (denial) return permissionDeniedResponse(denial);
         }
 
-        const params: Record<string, unknown> = {
-          file: filePath,
+        const rawArgs: Record<string, unknown> = {
+          op: args.op,
+          filePath: args.filePath,
           symbol: args.symbol,
         };
         const depth = coerceOptionalInt(args.depth, "depth", 1, Number.MAX_SAFE_INTEGER);
-        if (depth !== undefined) params.depth = depth;
-        if (!isEmptyParam(args.expression)) params.expression = args.expression;
-        if (!isEmptyParam(args.toSymbol)) params.toSymbol = args.toSymbol;
-        if (toFile !== undefined) params.toFile = toFile;
+        if (depth !== undefined) rawArgs.depth = depth;
+        if (!isEmptyParam(args.expression)) rawArgs.expression = args.expression;
+        if (!isEmptyParam(args.toSymbol)) rawArgs.toSymbol = args.toSymbol;
+        if (!isEmptyParam(args.toFile)) rawArgs.toFile = args.toFile;
         if (!isEmptyParam(args.includeTests))
-          params.include_tests = coerceBoolean(args.includeTests);
-        const response = await callBridge(ctx, context, args.op as string, params);
+          rawArgs.includeTests = coerceBoolean(args.includeTests);
+        if (!isEmptyParam(args.includeUnresolved))
+          rawArgs.includeUnresolved = coerceBoolean(args.includeUnresolved);
+        const response = await callToolCall(ctx, context, "callgraph", rawArgs);
         if (response.success === false) {
-          const message = formatBridgeErrorMessage(args.op as string, response, params);
           const code = typeof response.code === "string" ? response.code : "";
           // Read-only navigation negatives ("symbol isn't here", "no path between
           // them", "store still building") are legitimate answers, not failures —
@@ -131,13 +132,11 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           // errors (invalid_request, boundary violations, anything unknown) still
           // throw so they surface as errors.
           if (CALLGRAPH_SOFT_CODES.has(code)) {
-            return message;
+            return response.text;
           }
-          throw new Error(message);
+          throw new Error(response.text || response.message || "callgraph failed");
         }
-        return formatCallgraphSections(args.op as string, response, undefined, {
-          includeUnresolved: coerceBoolean(args.includeUnresolved),
-        }).join("\n");
+        return response.text;
       },
     },
   };

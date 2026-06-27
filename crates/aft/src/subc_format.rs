@@ -1,6 +1,7 @@
 //! Agent-facing text formatters for subc-mode tool results (parity with TS plugins).
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::protocol::Response;
 use crate::subc_translate::resolve_path_from_project_root;
@@ -15,10 +16,12 @@ pub enum OutlineMode {
     DirectoryJson,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatContext {
     pub agent_specified_range: bool,
     pub outline_mode: OutlineMode,
+    pub callgraph_op: Option<String>,
+    pub callgraph_include_unresolved: bool,
 }
 
 impl Default for FormatContext {
@@ -26,6 +29,8 @@ impl Default for FormatContext {
         Self {
             agent_specified_range: false,
             outline_mode: OutlineMode::Text,
+            callgraph_op: None,
+            callgraph_include_unresolved: false,
         }
     }
 }
@@ -35,6 +40,10 @@ impl FormatContext {
         Self {
             agent_specified_range: agent_specified_read_range(arguments),
             outline_mode: outline_mode_for_call(bare_name, arguments, project_root),
+            callgraph_op: callgraph_op_for_call(bare_name, arguments),
+            callgraph_include_unresolved: callgraph_include_unresolved_for_call(
+                bare_name, arguments,
+            ),
         }
     }
 }
@@ -76,10 +85,52 @@ fn outline_mode_for_call(bare_name: &str, arguments: &Value, project_root: &Path
     }
 }
 
+fn callgraph_op_for_call(bare_name: &str, arguments: &Value) -> Option<String> {
+    if bare_name != "callgraph" {
+        return None;
+    }
+    arguments
+        .as_object()
+        .and_then(|obj| obj.get("op"))
+        .and_then(Value::as_str)
+        .filter(|op| !op.is_empty())
+        .map(str::to_string)
+}
+
+fn callgraph_include_unresolved_for_call(bare_name: &str, arguments: &Value) -> bool {
+    if bare_name != "callgraph" {
+        return false;
+    }
+    arguments
+        .as_object()
+        .and_then(|obj| obj.get("includeUnresolved"))
+        .is_some_and(coerce_boolean)
+}
+
+fn coerce_boolean(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::Number(num) => num.as_i64() == Some(1) || num.as_u64() == Some(1),
+        Value::String(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1"
+        }
+        _ => false,
+    }
+}
+
 fn is_core_agent_tool(bare_name: &str) -> bool {
     matches!(
         bare_name,
-        "status" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect"
+        "status"
+            | "read"
+            | "write"
+            | "edit"
+            | "grep"
+            | "search"
+            | "outline"
+            | "inspect"
+            | "callgraph"
     )
 }
 
@@ -108,7 +159,7 @@ pub fn format_response_with_context(
 
     let data = &response.data;
     if !response.success {
-        return format_error(bare_name, data);
+        return format_error(bare_name, data, ctx);
     }
 
     match bare_name {
@@ -120,12 +171,20 @@ pub fn format_response_with_context(
         "outline" => format_outline(response, ctx.outline_mode),
         "inspect" => format_inspect(response),
         "status" => format_status(data),
+        "callgraph" => format_callgraph(
+            ctx.callgraph_op.as_deref().unwrap_or("callgraph"),
+            data,
+            ctx.callgraph_include_unresolved,
+        ),
         _ => unreachable!("core agent tools are exhaustive"),
     }
 }
 
 // Mirrors per-tool OpenCode wrapper error handling in packages/opencode-plugin/src/tools/*.ts.
-fn format_error(bare_name: &str, data: &Value) -> String {
+fn format_error(bare_name: &str, data: &Value, ctx: &FormatContext) -> String {
+    if bare_name == "callgraph" {
+        return format_callgraph_error(ctx.callgraph_op.as_deref().unwrap_or("callgraph"), data);
+    }
     let code = data
         .get("code")
         .and_then(Value::as_str)
@@ -855,6 +914,615 @@ fn format_diagnostic_location(d: &serde_json::Map<String, Value>) -> String {
         (Some(line), None) => format!("{file}:{line}"),
         (Some(line), Some(col)) => format!("{file}:{line}:{col}"),
     }
+}
+
+const UNRESOLVED_SUMMARY_NAME_LIMIT: usize = 10;
+
+pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: bool) -> String {
+    let Some(record) = response_data.as_object() else {
+        return "No navigation result.".to_string();
+    };
+
+    let sections = match op {
+        "call_tree" => format_call_tree_sections(record, include_unresolved),
+        "callers" => format_callers_sections(record),
+        "trace_to_symbol" => format_trace_to_symbol_sections(record),
+        "trace_to" => format_trace_to_sections(record),
+        "impact" => format_impact_sections(record),
+        _ => format_trace_data_sections(record),
+    };
+    sections.join("\n")
+}
+
+fn format_callgraph_error(command: &str, data: &Value) -> String {
+    let code = data
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let message = data
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("callgraph failed");
+
+    if matches!(
+        code,
+        Some("ambiguous_target") | Some("target_symbol_not_in_file")
+    ) {
+        let candidates = callgraph_candidates(data);
+        if !candidates.is_empty() {
+            let symbol =
+                callgraph_error_symbol(data).or_else(|| symbol_from_callgraph_message(message));
+            let target = symbol
+                .map(|symbol| format!("multiple symbols named \"{symbol}\""))
+                .unwrap_or_else(|| strip_terminal_punctuation(message));
+            let action = if code == Some("ambiguous_target") {
+                "Pass toFile to disambiguate"
+            } else {
+                "Try one of these files for toFile"
+            };
+            let mut lines = vec![format!(
+                "{command}: {} — {target}. {action}:",
+                code.unwrap_or_default()
+            )];
+            lines.extend(
+                candidates
+                    .into_iter()
+                    .map(|candidate| format!("  - {candidate}")),
+            );
+            return lines.join("\n");
+        }
+    }
+
+    let Some(code) = code else {
+        return message.to_string();
+    };
+    let mut lines = vec![format!("{command}: {code} — {message}")];
+    if let Some(extras) = collect_callgraph_error_extras(data) {
+        lines.push(format!("data: {extras}"));
+    }
+    lines.join("\n")
+}
+
+fn callgraph_candidates(data: &Value) -> Vec<String> {
+    data.get("candidates")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            data.get("data")
+                .and_then(Value::as_object)
+                .and_then(|nested| nested.get("candidates"))
+                .and_then(Value::as_array)
+        })
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|candidate| {
+                    let candidate = candidate.as_object()?;
+                    let file = string_field(candidate, "file")?;
+                    let line = number_field(candidate, "line");
+                    Some(match line {
+                        Some(line) => format!("{file}:{line}"),
+                        None => file.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn callgraph_error_symbol(data: &Value) -> Option<String> {
+    data.get("symbol")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            data.get("data")
+                .and_then(Value::as_object)
+                .and_then(|nested| nested.get("symbol"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
+}
+
+fn symbol_from_callgraph_message(message: &str) -> Option<String> {
+    extract_between(message, "target symbol '", "'")
+        .or_else(|| extract_between(message, "multiple symbols named \"", "\""))
+}
+
+fn extract_between(message: &str, prefix: &str, suffix: &str) -> Option<String> {
+    let start = message.find(prefix)? + prefix.len();
+    let rest = &message[start..];
+    let end = rest.find(suffix)?;
+    let value = &rest[..end];
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn strip_terminal_punctuation(message: &str) -> String {
+    message.trim_end_matches(['.', '!', '?']).to_string()
+}
+
+fn collect_callgraph_error_extras(data: &Value) -> Option<String> {
+    let obj = data.as_object()?;
+    let mut extras = serde_json::Map::new();
+    for (key, value) in obj {
+        if matches!(
+            key.as_str(),
+            "id" | "success" | "code" | "message" | "data" | "status_bar" | "bg_completions"
+        ) {
+            continue;
+        }
+        extras.insert(key.clone(), value.clone());
+    }
+    if extras.is_empty() {
+        data.get("data").map(stringify_json_pretty)
+    } else {
+        if let Some(nested) = data.get("data") {
+            extras.insert("data".to_string(), nested.clone());
+        }
+        Some(stringify_json_pretty(&Value::Object(extras)))
+    }
+}
+
+fn stringify_json_pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn format_call_tree_sections(
+    record: &serde_json::Map<String, Value>,
+    include_unresolved: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    render_call_tree_node(record, 0, &mut lines, include_unresolved);
+    let warning = depth_warning(record, "depth_limited", "truncated");
+    if !warning.is_empty() {
+        lines.push(warning);
+    }
+    if lines.is_empty() {
+        vec!["No call tree available.".to_string()]
+    } else {
+        lines
+    }
+}
+
+fn render_call_tree_node(
+    node: &serde_json::Map<String, Value>,
+    depth: usize,
+    lines: &mut Vec<String>,
+    include_unresolved: bool,
+) {
+    let name = string_field(node, "name").unwrap_or("(unknown)");
+    let file = shorten_path(string_field(node, "file").unwrap_or("(unknown file)"));
+    let line = number_field(node, "line");
+    let unresolved = if node.get("resolved").and_then(Value::as_bool) == Some(false) {
+        " [unresolved]"
+    } else {
+        ""
+    };
+    let name_match = name_match_edge_marker(node);
+    let location = match line {
+        Some(line) => format!("[{file}:{line}]"),
+        None => format!("[{file}]"),
+    };
+    lines.push(tree_line(
+        depth,
+        &format!("{name} {location}{unresolved}{name_match}"),
+    ));
+
+    let children = records_field(node, "children");
+    if include_unresolved {
+        for child in children {
+            render_call_tree_node(child, depth + 1, lines, include_unresolved);
+        }
+        return;
+    }
+
+    let unresolved_indices = children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, child)| is_unresolved_leaf(child).then_some(index))
+        .collect::<Vec<_>>();
+    if unresolved_indices.is_empty() {
+        for child in children {
+            render_call_tree_node(child, depth + 1, lines, include_unresolved);
+        }
+        return;
+    }
+
+    let mut summary_inserted = false;
+    for (index, child) in children.iter().enumerate() {
+        if unresolved_indices.contains(&index) {
+            if !summary_inserted {
+                let unresolved_leaves = unresolved_indices
+                    .iter()
+                    .filter_map(|idx| children.get(*idx).copied())
+                    .collect::<Vec<_>>();
+                lines.push(tree_line(
+                    depth + 1,
+                    &unresolved_summary_text(&unresolved_leaves),
+                ));
+                summary_inserted = true;
+            }
+            continue;
+        }
+        render_call_tree_node(child, depth + 1, lines, include_unresolved);
+    }
+}
+
+fn is_unresolved_leaf(node: &serde_json::Map<String, Value>) -> bool {
+    node.get("resolved").and_then(Value::as_bool) == Some(false)
+        && records_field(node, "children").is_empty()
+}
+
+fn unresolved_summary_text(nodes: &[&serde_json::Map<String, Value>]) -> String {
+    let mut distinct_names = Vec::new();
+    for node in nodes {
+        let name = string_field(node, "name").unwrap_or("(unknown)");
+        if !distinct_names.iter().any(|seen| seen == name) {
+            distinct_names.push(name.to_string());
+        }
+    }
+
+    let displayed = distinct_names
+        .iter()
+        .take(UNRESOLVED_SUMMARY_NAME_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let hidden = distinct_names.len().saturating_sub(displayed.len());
+    let names = if hidden > 0 {
+        format!("{}, … (+{hidden} more)", displayed.join(", "))
+    } else {
+        displayed.join(", ")
+    };
+    let noun = if nodes.len() == 1 { "call" } else { "calls" };
+    format!("+ {} unresolved external {noun}: {names}", nodes.len())
+}
+
+fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let groups = records_field(record, "callers");
+    let warning = depth_warning(record, "depth_limited", "truncated");
+    let hub_summary = hub_summary_line(record);
+    let total = number_field(record, "total_callers").unwrap_or(0);
+    let mut sections = vec![join_non_empty(&[
+        Some(format!(
+            "{total} caller{}",
+            if total == 1 { "" } else { "s" }
+        )),
+        Some(format!(
+            "{} file group{}",
+            groups.len(),
+            if groups.len() == 1 { "" } else { "s" }
+        )),
+        (!warning.is_empty()).then_some(warning),
+    ])];
+    if let Some(summary) = hub_summary {
+        sections.push(summary);
+    }
+    for group in groups {
+        sections.push(render_callers_group_lines(group).join("\n"));
+    }
+    sections
+}
+
+fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<String> {
+    let file = shorten_path(string_field(group, "file").unwrap_or("(unknown file)"));
+    let mut lines = vec![file];
+    let callers = records_field(group, "callers");
+    let mut by_symbol_provenance: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for caller in callers {
+        let symbol = string_field(caller, "symbol").unwrap_or("(unknown)");
+        let provenance = if string_field(caller, "resolved_by") == Some("name_match") {
+            "name_match"
+        } else {
+            "exact"
+        };
+        let key = format!("{symbol}\0{provenance}");
+        let bucket = by_symbol_provenance.entry(key).or_default();
+        if let Some(line) = number_field(caller, "line") {
+            bucket.push(line);
+        }
+    }
+    for (key, mut line_nums) in by_symbol_provenance {
+        let symbol = key.split('\0').next().unwrap_or("(unknown)");
+        let is_name_match = key.ends_with("\0name_match");
+        line_nums.sort_unstable();
+        let line_part = if line_nums.is_empty() {
+            "?".to_string()
+        } else {
+            line_nums
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let marker = if is_name_match { " ~" } else { "" };
+        lines.push(format!("  ↳ {symbol}:{line_part}{marker}"));
+    }
+    lines
+}
+
+fn format_trace_to_symbol_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let path = records_field(record, "path");
+    let complete = record.get("complete").and_then(Value::as_bool);
+    let reason = string_field(record, "reason");
+    if path.is_empty() {
+        let prefix = if complete == Some(false) {
+            "No complete path"
+        } else {
+            "No path"
+        };
+        return vec![match reason {
+            Some(reason) => format!("{prefix} ({reason})"),
+            None => prefix.to_string(),
+        }];
+    }
+
+    let mut lines = vec![format!(
+        "{} hop{}",
+        path.len(),
+        if path.len() == 1 { "" } else { "s" }
+    )];
+    for (index, hop) in path.iter().enumerate() {
+        let symbol = string_field(hop, "symbol").unwrap_or("(unknown)");
+        let file = shorten_path(string_field(hop, "file").unwrap_or("(unknown file)"));
+        let line = number_field(hop, "line");
+        let name_match = name_match_edge_marker(hop);
+        let location = match line {
+            Some(line) => format!("[{file}:{line}]"),
+            None => format!("[{file}]"),
+        };
+        lines.push(tree_line(
+            index + 1,
+            &format!("{symbol} {location}{name_match}"),
+        ));
+    }
+    lines
+}
+
+fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let paths = records_field(record, "paths");
+    let warning = depth_warning(record, "max_depth_reached", "truncated_paths");
+    let hub_summary = hub_summary_line(record);
+    let total_paths = number_field(record, "total_paths").unwrap_or(paths.len() as i64);
+    let entry_points = number_field(record, "entry_points_found").unwrap_or(0);
+    let mut sections = vec![join_non_empty(&[
+        Some(format!(
+            "{total_paths} path{}",
+            if total_paths == 1 { "" } else { "s" }
+        )),
+        Some(format!(
+            "{entry_points} entry point{}",
+            if entry_points == 1 { "" } else { "s" }
+        )),
+        (!warning.is_empty()).then_some(warning),
+    ])];
+    if let Some(summary) = hub_summary {
+        sections.push(summary);
+    }
+    if paths.is_empty() {
+        sections.push("No entry paths found.".to_string());
+    }
+    for (index, path) in paths.iter().enumerate() {
+        let mut lines = Vec::new();
+        render_trace_path(path, index, &mut lines);
+        sections.push(lines.join("\n"));
+    }
+    sections
+}
+
+fn render_trace_path(path: &serde_json::Map<String, Value>, index: usize, lines: &mut Vec<String>) {
+    lines.push(format!("Path {}", index + 1));
+    for (hop_index, hop) in records_field(path, "hops").iter().enumerate() {
+        let symbol = string_field(hop, "symbol").unwrap_or("(unknown)");
+        let file = shorten_path(string_field(hop, "file").unwrap_or("(unknown file)"));
+        let line = number_field(hop, "line");
+        let entry = if hop.get("is_entry_point").and_then(Value::as_bool) == Some(true) {
+            " [entry]"
+        } else {
+            ""
+        };
+        let name_match = name_match_edge_marker(hop);
+        let location = match line {
+            Some(line) => format!("[{file}:{line}]"),
+            None => format!("[{file}]"),
+        };
+        lines.push(tree_line(
+            hop_index + 1,
+            &format!("{symbol}{entry} {location}{name_match}"),
+        ));
+    }
+}
+
+fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let callers = records_field(record, "callers");
+    let warning = depth_warning(record, "depth_limited", "truncated");
+    let hub_summary = hub_summary_line(record);
+    let total_affected = number_field(record, "total_affected").unwrap_or(callers.len() as i64);
+    let affected_files = number_field(record, "affected_files").unwrap_or(0);
+    let mut sections = vec![join_non_empty(&[
+        Some(format!(
+            "{total_affected} affected call site{}",
+            if total_affected == 1 { "" } else { "s" }
+        )),
+        Some(format!(
+            "{affected_files} file{}",
+            if affected_files == 1 { "" } else { "s" }
+        )),
+        (!warning.is_empty()).then_some(warning),
+    ])];
+    if let Some(summary) = hub_summary {
+        sections.push(summary);
+    }
+    if callers.is_empty() {
+        sections.push("No impacted callers found.".to_string());
+    }
+    for caller in callers {
+        let file = shorten_path(string_field(caller, "caller_file").unwrap_or("(unknown file)"));
+        let symbol = string_field(caller, "caller_symbol").unwrap_or("(unknown)");
+        let line = number_field(caller, "line").unwrap_or(0);
+        let entry = if caller.get("is_entry_point").and_then(Value::as_bool) == Some(true) {
+            " [entry]"
+        } else {
+            ""
+        };
+        let name_match = name_match_edge_marker(caller);
+        let expression = string_field(caller, "call_expression");
+        let params = caller
+            .get("parameters")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(value_to_plain_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let mut lines = vec![
+            format!("{file}:{line}"),
+            format!("  ↳ {symbol}{entry}{name_match}"),
+        ];
+        if let Some(expression) = expression {
+            lines.push(format!("  {expression}"));
+        }
+        if !params.is_empty() {
+            lines.push(format!("  params: {params}"));
+        }
+        sections.push(lines.join("\n"));
+    }
+    sections
+}
+
+fn format_trace_data_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let hops = records_field(record, "hops");
+    let mut sections = vec![join_non_empty(&[
+        Some(format!(
+            "{} hop{}",
+            hops.len(),
+            if hops.len() == 1 { "" } else { "s" }
+        )),
+        (record.get("depth_limited").and_then(Value::as_bool) == Some(true))
+            .then_some("(depth limited)".to_string()),
+    ])];
+    if hops.is_empty() {
+        sections.push("No data-flow hops found.".to_string());
+    }
+    for (index, hop) in hops.iter().enumerate() {
+        let file = shorten_path(string_field(hop, "file").unwrap_or("(unknown file)"));
+        let symbol = string_field(hop, "symbol").unwrap_or("(unknown)");
+        let variable = string_field(hop, "variable").unwrap_or("(unknown)");
+        let line = number_field(hop, "line").unwrap_or(0);
+        let approximate = if hop.get("approximate").and_then(Value::as_bool) == Some(true) {
+            " [approx]"
+        } else {
+            ""
+        };
+        let name_match = name_match_edge_marker(hop);
+        let flow_type = string_field(hop, "flow_type").unwrap_or("flow");
+        sections.push(tree_line(
+            index,
+            &format!("{variable} {flow_type} {symbol} [{file}:{line}]{approximate}{name_match}"),
+        ));
+    }
+    sections
+}
+
+fn records_field<'a>(
+    record: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Vec<&'a serde_json::Map<String, Value>> {
+    record
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_object).collect())
+        .unwrap_or_default()
+}
+
+fn string_field<'a>(record: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
+    record.get(key).and_then(Value::as_str)
+}
+
+fn number_field(record: &serde_json::Map<String, Value>, key: &str) -> Option<i64> {
+    let value = record.get(key)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+}
+
+fn shorten_path(path: &str) -> String {
+    let Some(home) = home_dir() else {
+        return path.to_string();
+    };
+    let home = home.to_string_lossy().to_string();
+    if path.starts_with(&home) {
+        format!("~{}", &path[home.len()..])
+    } else {
+        path.to_string()
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn tree_line(depth: usize, text: &str) -> String {
+    format!(
+        "{}{}{}",
+        "  ".repeat(depth),
+        if depth == 0 { "" } else { "↳ " },
+        text
+    )
+}
+
+fn name_match_edge_marker(record: &serde_json::Map<String, Value>) -> &'static str {
+    if string_field(record, "resolved_by") == Some("name_match") {
+        " ~"
+    } else {
+        ""
+    }
+}
+
+fn depth_warning(
+    response: &serde_json::Map<String, Value>,
+    depth_field: &str,
+    truncated_field: &str,
+) -> String {
+    let limited = response.get(depth_field).and_then(Value::as_bool);
+    let truncated = number_field(response, truncated_field).unwrap_or(0);
+    if limited != Some(true) && truncated == 0 {
+        return String::new();
+    }
+    let detail = if truncated > 0 {
+        format!(", {truncated} truncated")
+    } else {
+        String::new()
+    };
+    format!("(depth limited{detail})")
+}
+
+fn hub_summary_line(response: &serde_json::Map<String, Value>) -> Option<String> {
+    response
+        .get("hub_summary")
+        .and_then(Value::as_object)
+        .and_then(|summary| string_field(summary, "message"))
+        .map(str::to_string)
+}
+
+fn join_non_empty(parts: &[Option<String>]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| part.as_deref())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn value_to_plain_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 // Status has no TypeScript wrapper; this mirrors the subc bare status fallback.

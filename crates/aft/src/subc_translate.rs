@@ -182,10 +182,105 @@ pub fn subc_translate_with_context(
         "search" => translate_search(agent_args),
         "outline" => translate_outline(agent_args, project_root),
         "inspect" => translate_inspect(agent_args, project_root),
+        "callgraph" => translate_callgraph(agent_args, project_root),
         other => Err(invalid_request(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
     }
+}
+
+fn coerce_boolean(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::Number(num) => num.as_i64() == Some(1) || num.as_u64() == Some(1),
+        Value::String(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1"
+        }
+        _ => false,
+    }
+}
+
+fn translate_callgraph(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let op = map_in
+        .get("op")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("'op' is required"))?;
+    if !matches!(
+        op,
+        "call_tree" | "callers" | "trace_to" | "trace_to_symbol" | "impact" | "trace_data"
+    ) {
+        return Err(invalid_request(format!("callgraph: invalid op '{op}'")));
+    }
+
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("'filePath' is required"))?;
+    let symbol = map_in
+        .get("symbol")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("'symbol' is required"))?;
+
+    if op == "trace_data" && map_in.get("expression").is_none_or(is_empty_param) {
+        return Err(invalid_request(
+            "'expression' is required for 'trace_data' op",
+        ));
+    }
+    if op == "trace_to_symbol" && map_in.get("toSymbol").is_none_or(is_empty_param) {
+        return Err(invalid_request(
+            "'toSymbol' is required for 'trace_to_symbol' op",
+        ));
+    }
+
+    let mut out = Map::new();
+    insert_resolved_file(&mut out, project_root, file_path);
+    out.insert("symbol".to_string(), Value::String(symbol.to_string()));
+
+    if let Some(depth) =
+        coerce_optional_int_result(map_in.get("depth"), "depth", 1, 9_007_199_254_740_991)?
+    {
+        out.insert("depth".to_string(), Value::Number(depth.into()));
+    }
+    if let Some(expression) = map_in.get("expression") {
+        if !is_empty_param(expression) {
+            out.insert("expression".to_string(), expression.clone());
+        }
+    }
+    if let Some(to_symbol) = map_in.get("toSymbol") {
+        if !is_empty_param(to_symbol) {
+            out.insert("toSymbol".to_string(), to_symbol.clone());
+        }
+    }
+    if let Some(to_file) = map_in.get("toFile") {
+        if !is_empty_param(to_file) {
+            let to_file = to_file
+                .as_str()
+                .ok_or_else(|| invalid_request("'toFile' must be a string"))?;
+            let resolved = resolve_path_from_project_root(project_root, to_file);
+            out.insert(
+                "toFile".to_string(),
+                Value::String(resolved.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    if let Some(include_tests) = map_in.get("includeTests") {
+        if !is_empty_param(include_tests) {
+            out.insert(
+                "include_tests".to_string(),
+                Value::Bool(coerce_boolean(include_tests)),
+            );
+        }
+    }
+
+    Ok(Translated {
+        command: op.to_string(),
+        args: out,
+    })
 }
 
 fn insert_common_mutation_flags(out: &mut Map<String, Value>, ctx: TranslateContext) {

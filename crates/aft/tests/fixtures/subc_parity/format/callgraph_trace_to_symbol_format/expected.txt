@@ -1,0 +1,4 @@
+3 hops
+  ↳ run [<PROJECT_ROOT>/src/main.ts:1]
+    ↳ middle [<PROJECT_ROOT>/src/middle.ts:8] ~
+      ↳ leaf [<PROJECT_ROOT>/src/leaf.ts:3]

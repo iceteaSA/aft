@@ -1,0 +1,8 @@
+{
+  "args": {
+    "depth": 5,
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "symbol": "run"
+  },
+  "command": "impact"
+}

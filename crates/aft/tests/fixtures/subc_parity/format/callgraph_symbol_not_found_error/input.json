@@ -1,0 +1,17 @@
+{
+  "tool_name": "callgraph",
+  "native_response_json": {
+    "id": "1",
+    "success": false,
+    "code": "symbol_not_found",
+    "message": "callers: symbol 'missing' not found"
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "callers",
+      "filePath": "src/main.ts",
+      "symbol": "missing"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

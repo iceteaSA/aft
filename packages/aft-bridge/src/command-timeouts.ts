@@ -14,6 +14,7 @@
  */
 export const LONG_RUNNING_COMMAND_TIMEOUT_MS: Record<string, number> = {
   callers: 60_000,
+  callgraph: 60_000,
   trace_to: 60_000,
   trace_to_symbol: 60_000,
   trace_data: 60_000,

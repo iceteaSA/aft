@@ -22,6 +22,10 @@ function makeMockBridge(
       calls.push({ command, params });
       return handler(command, params);
     },
+    async toolCall(_sessionId: string | undefined, name: string, rawArgs: Record<string, unknown>) {
+      calls.push({ command: name, params: rawArgs });
+      return handler(name, rawArgs);
+    },
   } as unknown as BinaryBridge;
   return { bridge, calls };
 }
@@ -64,6 +68,7 @@ describe("aft_callgraph OpenCode adapter", () => {
   test("success path dispatches to the selected op and maps filePath to file", async () => {
     const { bridge, calls } = makeMockBridge((command, params) => ({
       success: true,
+      text: "1 affected call site · 1 file",
       command,
       params,
     }));
@@ -84,9 +89,10 @@ describe("aft_callgraph OpenCode adapter", () => {
     expect(raw as string).not.toContain('"success"');
     expect(calls).toHaveLength(1);
     expect(calls[0]).toEqual({
-      command: "impact",
+      command: "callgraph",
       params: {
-        file: "/repo/src/app.ts",
+        op: "impact",
+        filePath: "src/app.ts",
         symbol: "run",
         depth: 4,
       },
@@ -94,18 +100,13 @@ describe("aft_callgraph OpenCode adapter", () => {
   });
 
   test("includeUnresolved is exposed and controls call_tree formatting only", async () => {
-    const payload = {
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
       success: true,
-      name: "run",
-      file: "/repo/src/app.ts",
-      line: 1,
-      children: [
-        { name: "len", file: "/repo/src/app.ts", line: 2, resolved: false, children: [] },
-        { name: "Some", file: "/repo/src/app.ts", line: 3, resolved: false, children: [] },
-        { name: "project", file: "/repo/src/project.ts", line: 4, resolved: true, children: [] },
-      ],
-    };
-    const { bridge, calls } = makeMockBridge(() => payload);
+      text:
+        params.includeUnresolved === true
+          ? "len [/repo/src/app.ts:2] [unresolved]\nSome [/repo/src/app.ts:3] [unresolved]"
+          : "+ 2 unresolved external calls: len, Some\nproject [/repo/src/project.ts:4]",
+    }));
     const tools = navigationTools(makePluginContext(bridge));
 
     expect(Object.hasOwn(tools.aft_callgraph.args, "includeUnresolved")).toBe(true);
@@ -128,7 +129,7 @@ describe("aft_callgraph OpenCode adapter", () => {
     expect(expanded).not.toContain("unresolved external calls");
     expect(calls).toHaveLength(2);
     expect(calls[0].params).not.toHaveProperty("includeUnresolved");
-    expect(calls[1].params).not.toHaveProperty("includeUnresolved");
+    expect(calls[1].params).toHaveProperty("includeUnresolved", true);
   });
 
   test("trace_to_symbol ambiguous_target errors include candidates (Rust top-level shape)", async () => {
@@ -139,6 +140,7 @@ describe("aft_callgraph OpenCode adapter", () => {
       success: false,
       code: "ambiguous_target",
       message: 'multiple symbols named "target"',
+      text: 'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toFile to disambiguate:\n  - file1.rs:42\n  - file2.rs:78',
       candidates: [
         { file: "file1.rs", line: 42, symbol: "target" },
         { file: "file2.rs", line: 78, symbol: "target" },
@@ -169,6 +171,7 @@ describe("aft_callgraph OpenCode adapter", () => {
       success: false,
       code: "ambiguous_target",
       message: 'multiple symbols named "target"',
+      text: 'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toFile to disambiguate:\n  - file1.rs:42',
       data: {
         candidates: [{ file: "file1.rs", line: 42 }],
       },
@@ -197,6 +200,7 @@ describe("aft_callgraph OpenCode adapter", () => {
       success: false,
       code: "target_symbol_not_in_file",
       message: "trace_to_symbol: target symbol 'foo' is not defined in toFile: wrong.rs",
+      text: 'trace_to_symbol: target_symbol_not_in_file — multiple symbols named "foo". Try one of these files for toFile:\n  - right1.rs:12\n  - right2.rs:99',
       candidates: [
         { file: "right1.rs", line: 12 },
         { file: "right2.rs", line: 99 },
@@ -230,6 +234,7 @@ describe("aft_callgraph OpenCode adapter", () => {
       success: false,
       code: "internal",
       message: "resolver crashed",
+      text: 'callers: internal — resolver crashed\ndata: {\n  "file": "src/app.ts",\n  "symbol": "run"\n}',
       file: "src/app.ts",
       symbol: "run",
     }));
@@ -260,6 +265,7 @@ describe("aft_callgraph OpenCode adapter", () => {
         success: false,
         code,
         message: `${code} happened`,
+        text: `callers: ${code} — ${code} happened`,
         file: "src/app.ts",
         symbol: "run",
       }));

@@ -1,0 +1,7 @@
+3 callers · 2 file groups · (depth limited, 2 truncated)
+Showing first 20 callers; 7 omitted high-fan-in callers.
+<PROJECT_ROOT>/src/main.ts
+  ↳ fallback:30 ~
+  ↳ run:9, 12
+~/aft-callgraph-home.ts
+  ↳ homeCaller:5

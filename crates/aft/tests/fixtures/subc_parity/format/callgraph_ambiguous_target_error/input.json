@@ -1,0 +1,30 @@
+{
+  "tool_name": "callgraph",
+  "native_response_json": {
+    "id": "1",
+    "success": false,
+    "code": "ambiguous_target",
+    "message": "trace_to_symbol: target symbol 'leaf' exists in multiple files; pass 'toFile' to disambiguate",
+    "candidates": [
+      {
+        "file": "<PROJECT_ROOT>/src/leaf.ts",
+        "line": 3,
+        "symbol": "leaf"
+      },
+      {
+        "file": "<PROJECT_ROOT>/src/other_leaf.ts",
+        "line": 9,
+        "symbol": "leaf"
+      }
+    ]
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "trace_to_symbol",
+      "filePath": "src/main.ts",
+      "symbol": "run",
+      "toSymbol": "leaf"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

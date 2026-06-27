@@ -1,0 +1,3 @@
+2 hops · (depth limited)
+value origin run [<PROJECT_ROOT>/src/main.ts:2]
+  ↳ input param helper [<PROJECT_ROOT>/src/helper.ts:7] [approx] ~

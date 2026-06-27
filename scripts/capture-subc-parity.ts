@@ -7,16 +7,18 @@
  * and args sent through callBridge(); format fixtures feed a native response
  * back through the same handlers and record the agent-facing output text.
  *
- * Usage: bun run scripts/capture-subc-parity.ts
+ * Usage: bun run scripts/capture-subc-parity.ts [--only fixture-name-substring]
  */
 
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { createReadTool, hoistedTools } from "../packages/opencode-plugin/src/tools/hoisted.ts";
 import { inspectTools } from "../packages/opencode-plugin/src/tools/inspect.ts";
+import { navigationTools } from "../packages/opencode-plugin/src/tools/navigation.ts";
 import { readingTools } from "../packages/opencode-plugin/src/tools/reading.ts";
 import { searchTools } from "../packages/opencode-plugin/src/tools/search.ts";
 import { semanticTools } from "../packages/opencode-plugin/src/tools/semantic.ts";
@@ -27,8 +29,10 @@ const FIXTURES_ROOT = join(REPO_ROOT, "crates/aft/tests/fixtures/subc_parity");
 const RAW_PROJECT_ROOT = "/tmp/aft-subc-parity/project";
 let PROJECT_ROOT = RAW_PROJECT_ROOT;
 const PROJECT_ROOT_TOKEN = "<PROJECT_ROOT>";
+const HOME_ROOT = homedir();
+const HOME_ROOT_TOKEN = "<HOME>";
 
-type BareToolName = "status" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect";
+type BareToolName = "status" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect" | "callgraph";
 
 interface BridgeCall {
   command: string;
@@ -76,13 +80,21 @@ function writeJson(path: string, value: unknown, sorted = true): void {
   writeFileSync(path, `${JSON.stringify(sorted ? sortKeysDeep(value) : value, null, 2)}\n`, "utf-8");
 }
 
-function replaceProjectRoot(value: unknown): unknown {
-  if (typeof value === "string") return value.split(PROJECT_ROOT).join(PROJECT_ROOT_TOKEN);
+function replaceStablePaths(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value
+      .split(PROJECT_ROOT)
+      .join(PROJECT_ROOT_TOKEN)
+      .split(RAW_PROJECT_ROOT)
+      .join(PROJECT_ROOT_TOKEN)
+      .split(HOME_ROOT)
+      .join(HOME_ROOT_TOKEN);
+  }
   if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map(replaceProjectRoot);
+  if (Array.isArray(value)) return value.map(replaceStablePaths);
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    out[key] = replaceProjectRoot(entry);
+    out[key] = replaceStablePaths(entry);
   }
   return out;
 }
@@ -131,6 +143,7 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     search: semanticTools(ctx).aft_search,
     outline: readingTools(ctx).aft_outline,
     inspect: inspectTools(ctx).aft_inspect,
+    callgraph: navigationTools(ctx).aft_callgraph,
   };
 }
 
@@ -187,7 +200,7 @@ function writeTranslateCase(caseDef: TranslateCase, expected: unknown): void {
       ? {}
       : { diagnostics_on_edit: caseDef.diagnostics_on_edit }),
   });
-  writeJson(join(dir, "expected.json"), replaceProjectRoot(expected));
+  writeJson(join(dir, "expected.json"), replaceStablePaths(expected));
 }
 
 async function captureFormatCase(caseDef: FormatCase): Promise<void> {
@@ -217,15 +230,15 @@ async function captureFormatCase(caseDef: FormatCase): Promise<void> {
     join(dir, "input.json"),
     {
       tool_name: caseDef.tool_name,
-      native_response_json: caseDef.native_response_json,
+      native_response_json: replaceStablePaths(caseDef.native_response_json),
       ctx: {
-        agent_args: caseDef.agent_args,
+        agent_args: replaceStablePaths(caseDef.agent_args),
         project_root: PROJECT_ROOT_TOKEN,
       },
     },
     false,
   );
-  writeFileSync(join(dir, "expected.txt"), expected.split(PROJECT_ROOT).join(PROJECT_ROOT_TOKEN), "utf-8");
+  writeFileSync(join(dir, "expected.txt"), replaceStablePaths(expected) as string, "utf-8");
 }
 
 function formatStatus(response: Record<string, unknown>): string {
@@ -257,6 +270,12 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "outline_array_files", tool_name: "outline", agent_args: { target: ["src", "docs"], files: true } },
   { name: "outline_directory_json_mode", tool_name: "outline", agent_args: { target: "src" } },
   { name: "outline_directory_include_tests", tool_name: "outline", agent_args: { target: "src", includeTests: true } },
+  { name: "callgraph_callers_translate", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "run", depth: 2, includeTests: true } },
+  { name: "callgraph_call_tree_translate", tool_name: "callgraph", agent_args: { op: "call_tree", filePath: "src/main.ts", symbol: "run", depth: 3 } },
+  { name: "callgraph_trace_to_translate", tool_name: "callgraph", agent_args: { op: "trace_to", filePath: "src/main.ts", symbol: "handler", depth: 4, includeTests: false } },
+  { name: "callgraph_trace_to_symbol_translate", tool_name: "callgraph", agent_args: { op: "trace_to_symbol", filePath: "src/main.ts", symbol: "handler", toSymbol: "leaf", toFile: "src/main.ts", depth: 6 } },
+  { name: "callgraph_impact_translate", tool_name: "callgraph", agent_args: { op: "impact", filePath: "src/main.ts", symbol: "run", depth: 5 } },
+  { name: "callgraph_trace_data_translate", tool_name: "callgraph", agent_args: { op: "trace_data", filePath: "src/main.ts", symbol: "run", expression: "value", depth: 2 } },
 ];
 
 const FORMAT_CASES: FormatCase[] = [
@@ -282,19 +301,44 @@ const FORMAT_CASES: FormatCase[] = [
   { name: "inspect_no_text_fallback", tool_name: "inspect", agent_args: {}, native_response_json: { id: "1", success: true, summary: { diagnostics: { errors: 0, warnings: 1, info: 0, hints: 0 } } } },
   { name: "inspect_duplicate_guard", tool_name: "inspect", agent_args: {}, native_response_json: { id: "1", success: true, text: "summary\nDiagnostics: already rendered", summary: { diagnostics: { errors: 1, warnings: 0, info: 0, hints: 0 } } } },
   { name: "edit_error_message_only", tool_name: "edit", agent_args: { filePath: "src/main.ts", oldString: "x", newString: "y" }, native_response_json: { id: "1", success: false, code: "invalid_request", message: "edit failed clearly" } },
+  { name: "callgraph_callers_format", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "leaf" }, native_response_json: { id: "1", success: true, total_callers: 3, depth_limited: true, truncated: 2, hub_summary: { message: "Showing first 20 callers; 7 omitted high-fan-in callers." }, callers: [{ file: `${PROJECT_ROOT}/src/main.ts`, callers: [{ symbol: "run", line: 12 }, { symbol: "run", line: 9 }, { symbol: "fallback", line: 30, resolved_by: "name_match" }] }, { file: `${HOME_ROOT}/aft-callgraph-home.ts`, callers: [{ symbol: "homeCaller", line: 5 }] }] } },
+  { name: "callgraph_call_tree_format", tool_name: "callgraph", agent_args: { op: "call_tree", filePath: "src/main.ts", symbol: "run", includeUnresolved: true }, native_response_json: { id: "1", success: true, name: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 1, depth_limited: true, truncated: 1, children: [{ name: "helper", file: `${PROJECT_ROOT}/src/helper.ts`, line: 4, resolved_by: "name_match", children: [{ name: "external", file: `${PROJECT_ROOT}/src/helper.ts`, line: 5, resolved: false, children: [] }] }] } },
+  { name: "callgraph_call_tree_unresolved_collapse", tool_name: "callgraph", agent_args: { op: "call_tree", filePath: "src/main.ts", symbol: "run" }, native_response_json: { id: "1", success: true, name: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 1, children: [{ name: "alpha", file: `${PROJECT_ROOT}/src/main.ts`, line: 2, resolved: false, children: [] }, { name: "beta", file: `${PROJECT_ROOT}/src/main.ts`, line: 3, resolved: false, children: [] }, { name: "gamma", file: `${PROJECT_ROOT}/src/main.ts`, line: 4, resolved: false, children: [] }, { name: "delta", file: `${PROJECT_ROOT}/src/main.ts`, line: 5, resolved: false, children: [] }, { name: "epsilon", file: `${PROJECT_ROOT}/src/main.ts`, line: 6, resolved: false, children: [] }, { name: "zeta", file: `${PROJECT_ROOT}/src/main.ts`, line: 7, resolved: false, children: [] }, { name: "eta", file: `${PROJECT_ROOT}/src/main.ts`, line: 8, resolved: false, children: [] }, { name: "theta", file: `${PROJECT_ROOT}/src/main.ts`, line: 9, resolved: false, children: [] }, { name: "iota", file: `${PROJECT_ROOT}/src/main.ts`, line: 10, resolved: false, children: [] }, { name: "kappa", file: `${PROJECT_ROOT}/src/main.ts`, line: 11, resolved: false, children: [] }, { name: "lambda", file: `${PROJECT_ROOT}/src/main.ts`, line: 12, resolved: false, children: [] }, { name: "project", file: `${PROJECT_ROOT}/src/project.ts`, line: 13, resolved: true, children: [] }] } },
+  { name: "callgraph_trace_to_symbol_format", tool_name: "callgraph", agent_args: { op: "trace_to_symbol", filePath: "src/main.ts", symbol: "run", toSymbol: "leaf" }, native_response_json: { id: "1", success: true, complete: true, path: [{ symbol: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 1 }, { symbol: "middle", file: `${PROJECT_ROOT}/src/middle.ts`, line: 8, resolved_by: "name_match" }, { symbol: "leaf", file: `${PROJECT_ROOT}/src/leaf.ts`, line: 3 }] } },
+  { name: "callgraph_trace_to_format", tool_name: "callgraph", agent_args: { op: "trace_to", filePath: "src/main.ts", symbol: "leaf" }, native_response_json: { id: "1", success: true, total_paths: 2, entry_points_found: 1, max_depth_reached: true, truncated_paths: 1, hub_summary: { message: "Showing first 20 paths; 3 omitted high-fan-in paths." }, paths: [{ hops: [{ symbol: "entry", file: `${PROJECT_ROOT}/src/entry.ts`, line: 1, is_entry_point: true }, { symbol: "leaf", file: `${PROJECT_ROOT}/src/main.ts`, line: 20, resolved_by: "name_match" }] }] } },
+  { name: "callgraph_impact_format", tool_name: "callgraph", agent_args: { op: "impact", filePath: "src/main.ts", symbol: "run" }, native_response_json: { id: "1", success: true, total_affected: 2, affected_files: 1, depth_limited: false, hub_summary: { message: "Showing first 20 impacted call sites; 4 omitted high-fan-in callers." }, callers: [{ caller_file: `${PROJECT_ROOT}/src/main.ts`, caller_symbol: "entry", line: 10, is_entry_point: true, call_expression: "run(value)", parameters: ["value: string", "flag?: boolean"], resolved_by: "name_match" }] } },
+  { name: "callgraph_trace_data_format", tool_name: "callgraph", agent_args: { op: "trace_data", filePath: "src/main.ts", symbol: "run", expression: "value" }, native_response_json: { id: "1", success: true, depth_limited: true, hops: [{ variable: "value", flow_type: "origin", symbol: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 2 }, { variable: "input", flow_type: "param", symbol: "helper", file: `${PROJECT_ROOT}/src/helper.ts`, line: 7, approximate: true, resolved_by: "name_match" }] } },
+  { name: "callgraph_symbol_not_found_error", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "missing" }, native_response_json: { id: "1", success: false, code: "symbol_not_found", message: "callers: symbol 'missing' not found" } },
+  { name: "callgraph_ambiguous_target_error", tool_name: "callgraph", agent_args: { op: "trace_to_symbol", filePath: "src/main.ts", symbol: "run", toSymbol: "leaf" }, native_response_json: { id: "1", success: false, code: "ambiguous_target", message: "trace_to_symbol: target symbol 'leaf' exists in multiple files; pass 'toFile' to disambiguate", candidates: [{ file: `${PROJECT_ROOT}/src/leaf.ts`, line: 3, symbol: "leaf" }, { file: `${PROJECT_ROOT}/src/other_leaf.ts`, line: 9, symbol: "leaf" }] } },
+  { name: "callgraph_building_error", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "run" }, native_response_json: { id: "1", success: false, code: "callgraph_building", message: "callers: call graph is still building" } },
 ];
 
 setupProjectRoot();
-rmSync(FIXTURES_ROOT, { recursive: true, force: true });
+const onlyIndex = process.argv.indexOf("--only");
+const onlyFilter = onlyIndex >= 0 ? process.argv[onlyIndex + 1] : undefined;
+if (onlyIndex >= 0 && (!onlyFilter || onlyFilter.startsWith("--"))) {
+  throw new Error("--only requires a fixture-name substring");
+}
+
+if (!onlyFilter) {
+  rmSync(FIXTURES_ROOT, { recursive: true, force: true });
+}
 mkdirSync(FIXTURES_ROOT, { recursive: true });
 
-for (const caseDef of TRANSLATE_CASES) {
+const translateCases = onlyFilter
+  ? TRANSLATE_CASES.filter((caseDef) => caseDef.name.includes(onlyFilter))
+  : TRANSLATE_CASES;
+const formatCases = onlyFilter
+  ? FORMAT_CASES.filter((caseDef) => caseDef.name.includes(onlyFilter))
+  : FORMAT_CASES;
+
+for (const caseDef of translateCases) {
   await captureTranslateCase(caseDef);
 }
-for (const caseDef of FORMAT_CASES) {
+for (const caseDef of formatCases) {
   await captureFormatCase(caseDef);
 }
 
 console.log(
-  `Wrote ${TRANSLATE_CASES.length} translate cases and ${FORMAT_CASES.length} format cases under ${FIXTURES_ROOT}`,
+  `Wrote ${translateCases.length} translate cases and ${formatCases.length} format cases under ${FIXTURES_ROOT}`,
 );

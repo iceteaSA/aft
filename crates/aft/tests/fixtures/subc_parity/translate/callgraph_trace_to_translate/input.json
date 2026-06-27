@@ -1,0 +1,11 @@
+{
+  "agent_args": {
+    "depth": 4,
+    "filePath": "src/main.ts",
+    "includeTests": false,
+    "op": "trace_to",
+    "symbol": "handler"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "callgraph"
+}

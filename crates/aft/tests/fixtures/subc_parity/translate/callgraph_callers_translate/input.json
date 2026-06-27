@@ -1,0 +1,11 @@
+{
+  "agent_args": {
+    "depth": 2,
+    "filePath": "src/main.ts",
+    "includeTests": true,
+    "op": "callers",
+    "symbol": "run"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "callgraph"
+}

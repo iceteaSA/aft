@@ -1,0 +1,6 @@
+2 affected call sites · 1 file
+Showing first 20 impacted call sites; 4 omitted high-fan-in callers.
+<PROJECT_ROOT>/src/main.ts:10
+  ↳ entry [entry] ~
+  run(value)
+  params: value: string, flag?: boolean

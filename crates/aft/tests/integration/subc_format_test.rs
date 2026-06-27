@@ -17,6 +17,7 @@ use serde_json::Value;
 
 static PROJECT_FIXTURE: Once = Once::new();
 const PROJECT_ROOT_TOKEN: &str = "<PROJECT_ROOT>";
+const HOME_ROOT_TOKEN: &str = "<HOME>";
 
 #[derive(Debug, Deserialize)]
 struct FormatFixture {
@@ -65,6 +66,34 @@ fn replace_project_root(text: String, project_root: &Path) -> String {
     )
 }
 
+fn expand_stable_path_tokens(value: Value, project_root: &Path) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| expand_stable_path_tokens(item, project_root))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                out.insert(key, expand_stable_path_tokens(value, project_root));
+            }
+            Value::Object(out)
+        }
+        Value::String(s) => {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default();
+            Value::String(
+                s.replace(PROJECT_ROOT_TOKEN, &project_root.to_string_lossy())
+                    .replace(HOME_ROOT_TOKEN, &home),
+            )
+        }
+        other => other,
+    }
+}
+
 fn response_from_flattened(value: Value) -> Response {
     let obj = value
         .as_object()
@@ -95,8 +124,10 @@ fn assert_case(dir: &Path) -> Option<String> {
     let project_root = project_root_for_input(&input.ctx.project_root);
     setup_project_fixture(&project_root);
 
-    let response = response_from_flattened(input.native_response_json);
-    let ctx = FormatContext::from_tool_call(&input.tool_name, &input.ctx.agent_args, &project_root);
+    let native_response_json = expand_stable_path_tokens(input.native_response_json, &project_root);
+    let agent_args = expand_stable_path_tokens(input.ctx.agent_args, &project_root);
+    let response = response_from_flattened(native_response_json);
+    let ctx = FormatContext::from_tool_call(&input.tool_name, &agent_args, &project_root);
     let actual = replace_project_root(
         format_response_with_context(&input.tool_name, &response, &ctx),
         &project_root,
@@ -134,6 +165,39 @@ fn subc_format_matches_typescript_golden_fixtures() {
     assert!(
         failures.is_empty(),
         "{} format parity mismatch(es):\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+fn callgraph_format_matches_typescript_golden_fixtures() {
+    let root = fixtures_root();
+    let mut cases: Vec<PathBuf> = fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read fixtures dir {}: {e}", root.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("callgraph_"))
+        })
+        .collect();
+    cases.sort();
+
+    assert!(
+        cases.len() >= 10,
+        "expected >=10 callgraph format parity fixtures, found {}",
+        cases.len()
+    );
+
+    let failures = cases
+        .iter()
+        .filter_map(|dir| assert_case(dir))
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "{} callgraph format parity mismatch(es):\n\n{}",
         failures.len(),
         failures.join("\n\n")
     );

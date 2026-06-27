@@ -1,0 +1,40 @@
+{
+  "tool_name": "callgraph",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "total_paths": 2,
+    "entry_points_found": 1,
+    "max_depth_reached": true,
+    "truncated_paths": 1,
+    "hub_summary": {
+      "message": "Showing first 20 paths; 3 omitted high-fan-in paths."
+    },
+    "paths": [
+      {
+        "hops": [
+          {
+            "symbol": "entry",
+            "file": "<PROJECT_ROOT>/src/entry.ts",
+            "line": 1,
+            "is_entry_point": true
+          },
+          {
+            "symbol": "leaf",
+            "file": "<PROJECT_ROOT>/src/main.ts",
+            "line": 20,
+            "resolved_by": "name_match"
+          }
+        ]
+      }
+    ]
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "trace_to",
+      "filePath": "src/main.ts",
+      "symbol": "leaf"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "tool_name": "callgraph",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "total_affected": 2,
+    "affected_files": 1,
+    "depth_limited": false,
+    "hub_summary": {
+      "message": "Showing first 20 impacted call sites; 4 omitted high-fan-in callers."
+    },
+    "callers": [
+      {
+        "caller_file": "<PROJECT_ROOT>/src/main.ts",
+        "caller_symbol": "entry",
+        "line": 10,
+        "is_entry_point": true,
+        "call_expression": "run(value)",
+        "parameters": [
+          "value: string",
+          "flag?: boolean"
+        ],
+        "resolved_by": "name_match"
+      }
+    ]
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "impact",
+      "filePath": "src/main.ts",
+      "symbol": "run"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}
