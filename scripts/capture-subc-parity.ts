@@ -100,11 +100,12 @@ function replaceStablePaths(value: unknown): unknown {
 }
 
 function makeRuntime(): Parameters<ToolDefinition["execute"]>[1] {
-  return {
+  const runtime = {
     directory: PROJECT_ROOT,
     worktree: PROJECT_ROOT,
     ask: async () => undefined,
-  } as Parameters<ToolDefinition["execute"]>[1];
+  };
+  return runtime as unknown as Parameters<ToolDefinition["execute"]>[1];
 }
 
 function makeCtx(
@@ -156,6 +157,57 @@ function successForTranslate(command: string, params: Record<string, unknown>): 
   return { id: "translate", success: true, text: "" };
 }
 
+function zoomTargetEntries(agentArgs: Record<string, unknown>): Array<{ filePath: string; symbol: string }> | undefined {
+  const rawTargets = agentArgs.targets;
+  const targets = Array.isArray(rawTargets) ? rawTargets : rawTargets ? [rawTargets] : undefined;
+  if (!targets) return undefined;
+  return targets.map((entry) => {
+    const obj = entry as { filePath?: unknown; symbol?: unknown };
+    return { filePath: String(obj.filePath ?? ""), symbol: String(obj.symbol ?? "") };
+  });
+}
+
+function expectedZoomMultiTargetTranslate(
+  caseDef: TranslateCase,
+  calls: BridgeCall[],
+): Record<string, unknown> | undefined {
+  if (caseDef.tool_name !== "zoom") return undefined;
+  const targets = zoomTargetEntries(caseDef.agent_args);
+  if (!targets || targets.length === 0) return undefined;
+
+  const zoomCalls = calls.filter((call) => call.command === "zoom" && call.params.preview !== true);
+  if (zoomCalls.length !== targets.length) {
+    throw new Error(
+      `zoom multi-target case ${caseDef.name} expected ${targets.length} zoom calls, got ${zoomCalls.length}`,
+    );
+  }
+
+  const args: Record<string, unknown> = {
+    targets: targets.map((target, index) => ({
+      file: zoomCalls[index]?.params.file,
+      symbol: zoomCalls[index]?.params.symbol,
+      target_label: target.filePath,
+    })),
+  };
+  const firstParams = zoomCalls[0]?.params ?? {};
+  if (firstParams.context_lines !== undefined) args.context_lines = firstParams.context_lines;
+  if (firstParams.callgraph === true) args.callgraph = true;
+  return { command: "zoom", args };
+}
+
+function zoomMultiTargetResponses(
+  response: Record<string, unknown>,
+): Array<Record<string, unknown>> | undefined {
+  const targets = response.targets;
+  if (!Array.isArray(targets)) return undefined;
+  return targets.map((entry) => {
+    const response = (entry as { response?: unknown }).response;
+    return response && typeof response === "object" && !Array.isArray(response)
+      ? (response as Record<string, unknown>)
+      : { success: false, message: "missing zoom response" };
+  });
+}
+
 async function captureTranslateCase(caseDef: TranslateCase): Promise<void> {
   const calls: BridgeCall[] = [];
   if (caseDef.expected_error) {
@@ -176,9 +228,12 @@ async function captureTranslateCase(caseDef: TranslateCase): Promise<void> {
   let expected: unknown;
   try {
     await def.execute(caseDef.agent_args, makeRuntime());
-    const finalCall = [...calls].reverse().find((call) => call.params.preview !== true) ?? calls.at(-1);
-    if (!finalCall) throw new Error(`tool ${caseDef.tool_name} did not call bridge`);
-    expected = { command: finalCall.command, args: finalCall.params };
+    expected = expectedZoomMultiTargetTranslate(caseDef, calls);
+    if (!expected) {
+      const finalCall = [...calls].reverse().find((call) => call.params.preview !== true) ?? calls.at(-1);
+      if (!finalCall) throw new Error(`tool ${caseDef.tool_name} did not call bridge`);
+      expected = { command: finalCall.command, args: finalCall.params };
+    }
   } catch (error) {
     expected = {
       error: {
@@ -210,9 +265,14 @@ async function captureFormatCase(caseDef: FormatCase): Promise<void> {
     expected = formatStatus(caseDef.native_response_json);
   } else {
     const calls: BridgeCall[] = [];
-    const ctx = makeCtx(calls, (_command, params) => {
+    const multiTargetResponses = zoomMultiTargetResponses(caseDef.native_response_json);
+    let multiTargetIndex = 0;
+    const ctx = makeCtx(calls, (command, params) => {
       if (params.preview === true) {
         return { id: "preview", success: true, diff: { before: "old\n", after: "new\n" } };
+      }
+      if (caseDef.tool_name === "zoom" && command === "zoom" && multiTargetResponses) {
+        return multiTargetResponses[multiTargetIndex++] ?? { success: false, message: "missing zoom response" };
       }
       return caseDef.native_response_json;
     });
@@ -274,6 +334,9 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "zoom_url_translate", tool_name: "zoom", agent_args: { url: "https://example.com/doc", symbols: "Features", contextLines: 2 } },
   { name: "zoom_single_symbol_translate", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run", contextLines: 2, callgraph: true } },
   { name: "zoom_multi_symbol_batch_translate", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: ["run", "missing"] } },
+  { name: "zoom_multitarget_all_success_translate", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "docs/guide.md", symbol: "Guide" }], contextLines: 2, callgraph: true } },
+  { name: "zoom_multitarget_partial_translate", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "docs/guide.md", symbol: "missing" }] } },
+  { name: "zoom_multitarget_file_error_translate", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "missing.ts", symbol: "run" }] } },
   { name: "zoom_line_range_translate", tool_name: "zoom", agent_args: { filePath: "src/main.ts", startLine: 2, endLine: 3, contextLines: 1 } },
   { name: "callgraph_callers_translate", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "run", depth: 2, includeTests: true } },
   { name: "callgraph_call_tree_translate", tool_name: "callgraph", agent_args: { op: "call_tree", filePath: "src/main.ts", symbol: "run", depth: 3 } },
@@ -309,6 +372,9 @@ const FORMAT_CASES: FormatCase[] = [
   { name: "zoom_url_format", tool_name: "zoom", agent_args: { url: "https://example.com/doc", symbols: "Features" }, native_response_json: { id: "1", success: true, name: "Features", kind: "heading", range: { start_line: 5, end_line: 7 }, content: "## Features\n\nFeature details live here.", context_before: ["Intro paragraph for the document.", ""], context_after: ["### Fast Path"], annotations: { calls_out: [], called_by: [] } } },
   { name: "zoom_single_symbol_callgraph_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run", callgraph: true }, native_response_json: { id: "1", success: true, name: "run", kind: "function", range: { start_line: 10, end_line: 12 }, content: "function run() {\n  helper();\n}", context_before: ["const value = 1;"], context_after: ["run();"], annotations: { calls_out: [{ name: "helper", line: 11, extra_count: 2 }], called_by: [{ name: "main", line: 20 }] } } },
   { name: "zoom_multi_symbol_batch_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run missing" }, native_response_json: { id: "1", success: true, complete: false, symbols: [{ name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { name: "missing", response: { id: "missing", success: false, code: "symbol_not_found", message: "symbol 'missing' not found" } }] } },
+  { name: "zoom_multitarget_all_success_format", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "docs/guide.md", symbol: "Guide" }], callgraph: true }, native_response_json: { id: "1", success: true, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  helper();\n}", context_before: [], context_after: [], annotations: { calls_out: [{ name: "helper", line: 2 }], called_by: [] } } }, { targetLabel: "docs/guide.md", name: "Guide", response: { id: "guide", success: true, name: "Guide", kind: "heading", range: { start_line: 5, end_line: 6 }, content: "## Guide\nDetails.", context_before: ["# parity"], context_after: [], annotations: { calls_out: [], called_by: [] } } }] } },
+  { name: "zoom_multitarget_partial_format", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "docs/guide.md", symbol: "missing" }] }, native_response_json: { id: "1", success: true, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { targetLabel: "docs/guide.md", name: "missing", response: { id: "missing", success: false, code: "symbol_not_found", message: "symbol 'missing' not found" } }] } },
+  { name: "zoom_multitarget_file_error_format", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "missing.ts", symbol: "run" }] }, native_response_json: { id: "1", success: true, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { targetLabel: "missing.ts", name: "run", response: { id: "missing-file", success: false, code: "file_not_found", message: "file not found: <PROJECT_ROOT>/missing.ts" } }] } },
   { name: "zoom_line_range_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", startLine: 2, endLine: 3 }, native_response_json: { id: "1", success: true, name: "lines 2-3", kind: "lines", range: { start_line: 2, end_line: 3 }, content: "line two\nline three", context_before: ["line one"], context_after: ["line four"], annotations: { calls_out: [], called_by: [] } } },
   { name: "zoom_large_container_member_menu_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "BigContainer" }, native_response_json: { id: "1", success: true, name: "BigContainer", kind: "class", range: { start_line: 1, end_line: 200 }, content: "class BigContainer (2 members) — member-signature menu; zoom a member for its body\nBigContainer\n  .BigContainer.methodOne(): number\n  .BigContainer.methodTwo(): void", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } },
   { name: "zoom_ambiguous_name_candidates_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run" }, native_response_json: { id: "1", success: true, name: "run", kind: "ambiguous_symbol", content: "symbol 'run' is ambiguous (2 candidates) — zoom a qualified name for its body\n- run() — function run(): void\n- Worker.run() — method run(): Promise<void>", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] }, candidates: [{ name: "run", qualified_name: "run", kind: "function", signature: "run(): void" }, { name: "run", qualified_name: "Worker.run", kind: "method", signature: "run(): Promise<void>" }] } },

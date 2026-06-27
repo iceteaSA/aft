@@ -1,0 +1,19 @@
+{
+  "args": {
+    "callgraph": true,
+    "context_lines": 2,
+    "targets": [
+      {
+        "file": "<PROJECT_ROOT>/src/main.ts",
+        "symbol": "run",
+        "target_label": "src/main.ts"
+      },
+      {
+        "file": "<PROJECT_ROOT>/docs/guide.md",
+        "symbol": "Guide",
+        "target_label": "docs/guide.md"
+      }
+    ]
+  },
+  "command": "zoom"
+}

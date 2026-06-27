@@ -107,6 +107,82 @@ fn tool_call_matches_direct_spine_envelopes() {
 }
 
 #[test]
+fn known_tool_translate_errors_surface_as_invalid_request() {
+    let mut aft = AftProcess::spawn();
+    for (label, name, arguments, expected_message) in [
+        (
+            "callgraph-missing-op",
+            "callgraph",
+            json!({}),
+            "'op' is required",
+        ),
+        (
+            "zoom-mutually-exclusive-targets",
+            "zoom",
+            json!({"filePath": "src/main.ts", "url": "https://example.com/doc", "symbols": "run"}),
+            "Provide exactly ONE of 'filePath' or 'url'",
+        ),
+    ] {
+        let response = send_json(
+            &mut aft,
+            json!({
+                "id": format!("tool-call-{label}"),
+                "command": "tool_call",
+                "session_id": SESSION_ID,
+                "name": name,
+                "arguments": arguments,
+            }),
+        );
+        assert_eq!(response["success"], false, "expected failure: {response:#}");
+        assert_eq!(
+            response["code"], "invalid_request",
+            "translation errors for known tools must not fall through to raw dispatch: {response:#}"
+        );
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected_message),
+            "message should include {expected_message:?}: {response:#}"
+        );
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn unsupported_translate_tools_still_raw_dispatch_native_commands() {
+    let project = tempfile::tempdir().expect("tool_call configure temp project");
+    let mut aft = AftProcess::spawn();
+    let response = send_json(
+        &mut aft,
+        json!({
+            "id": "tool-call-native-configure",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "configure",
+            "arguments": {
+                "project_root": project.path().to_string_lossy(),
+                "harness": "opencode",
+                "config": crate::helpers::user_config(json!({
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))
+            }
+        }),
+    );
+    assert_eq!(
+        response["success"], true,
+        "configure raw dispatch failed: {response:#}"
+    );
+    assert!(
+        response["text"].is_string(),
+        "raw-dispatched native tool_call should still carry rendered text: {response:#}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn tool_call_rejects_missing_or_invalid_name() {
     let mut aft = AftProcess::spawn();
     for request in [
@@ -187,6 +263,17 @@ fn parity_cases() -> Vec<ParityCase> {
             tool: "zoom",
             arguments: json!({"filePath": "docs/zoom.md", "startLine": 1, "endLine": 3}),
         },
+        ParityCase {
+            label: "zoom_multi_target_all_success",
+            tool: "zoom",
+            arguments: json!({
+                "targets": [
+                    {"filePath": "src/zoom.ts", "symbol": "helper"},
+                    {"filePath": "src/zoom_other.ts", "symbol": "otherHelper"}
+                ],
+                "callgraph": true
+            }),
+        },
     ]
 }
 
@@ -210,6 +297,11 @@ fn create_fixture_project(root: &Path) {
         "export function helper(): string {\n  return 'ok';\n}\n\nexport function caller(): string {\n  return helper();\n}\n",
     )
     .expect("write zoom fixture");
+    fs::write(
+        root.join("src/zoom_other.ts"),
+        "export function otherHelper(): string {\n  return 'other';\n}\n",
+    )
+    .expect("write zoom multi-target fixture");
     fs::write(root.join("docs/zoom.md"), "# Zoom Doc\n\nIntro line\n")
         .expect("write zoom docs fixture");
 }

@@ -1,0 +1,9 @@
+Incomplete zoom results: one or more symbols failed.
+
+src/main.ts:1-3 [function run]
+
+1: function run() {
+2:   return 1;
+3: }
+
+Symbol "run" not found in missing.ts: file not found: <PROJECT_ROOT>/missing.ts

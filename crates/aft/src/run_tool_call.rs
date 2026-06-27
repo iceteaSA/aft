@@ -59,7 +59,10 @@ pub fn run_tool_call(
         translate_context,
     ) {
         Ok(translated) => (translated.command, translated.args),
-        Err(err) if is_subc_agent_core_tool(bare_name) => {
+        // Return validation errors from the translation step immediately. Only
+        // the special unsupported_tool error can fall through, allowing native
+        // NDJSON commands such as configure/undo to reach dispatch unchanged.
+        Err(err) if err.code != "unsupported_tool" => {
             let response = Response::error(ctx.request_id.clone(), err.code, err.message);
             return ToolCallOutcome::Unary(tool_call_result_from_response(
                 bare_name,
@@ -123,11 +126,4 @@ fn tool_call_result_from_response(
     let text =
         crate::subc_format::format_response_with_context(bare_name, &response, format_context);
     ToolCallResult { text, response }
-}
-
-fn is_subc_agent_core_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "status" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect"
-    )
 }

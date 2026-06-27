@@ -29,6 +29,13 @@ fn invalid_request(message: impl Into<String>) -> TranslateError {
     }
 }
 
+fn unsupported_tool(message: impl Into<String>) -> TranslateError {
+    TranslateError {
+        code: "unsupported_tool",
+        message: message.into(),
+    }
+}
+
 fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -184,7 +191,7 @@ pub fn subc_translate_with_context(
         "zoom" => translate_zoom(agent_args, project_root),
         "inspect" => translate_inspect(agent_args, project_root),
         "callgraph" => translate_callgraph(agent_args, project_root),
-        other => Err(invalid_request(format!(
+        other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
     }
@@ -761,11 +768,142 @@ fn translate_outline(args: &Value, project_root: &Path) -> Result<Translated, Tr
     })
 }
 
+fn zoom_target_entry_is_empty(entry: &Value) -> bool {
+    let Some(obj) = entry.as_object() else {
+        return true;
+    };
+    let file_path_empty = obj
+        .get("filePath")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty);
+    let symbol_empty = obj
+        .get("symbol")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty);
+    file_path_empty && symbol_empty
+}
+
+fn zoom_targets_provided(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    if is_empty_param(value) {
+        return false;
+    }
+    match value {
+        Value::Array(items) => !items.iter().all(zoom_target_entry_is_empty),
+        Value::Object(_) => !zoom_target_entry_is_empty(value),
+        _ => false,
+    }
+}
+
+fn translate_zoom_targets(
+    targets_value: &Value,
+    project_root: &Path,
+) -> Result<Vec<Value>, TranslateError> {
+    let target_values: Vec<&Value> = match targets_value {
+        Value::Array(items) => items.iter().collect(),
+        Value::Object(_) => vec![targets_value],
+        _ => {
+            return Err(invalid_request(
+                "'targets' must be a non-empty object or array",
+            ))
+        }
+    };
+
+    if target_values.is_empty() {
+        return Err(invalid_request(
+            "'targets' must be a non-empty object or array",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(target_values.len());
+    for (index, target) in target_values.into_iter().enumerate() {
+        let obj = target.as_object();
+        let file_path = obj
+            .and_then(|obj| obj.get("filePath"))
+            .and_then(Value::as_str)
+            .filter(|file_path| !file_path.is_empty())
+            .ok_or_else(|| {
+                invalid_request(format!(
+                    "targets[{index}].filePath must be a non-empty string"
+                ))
+            })?;
+        let symbol = obj
+            .and_then(|obj| obj.get("symbol"))
+            .and_then(Value::as_str)
+            .filter(|symbol| !symbol.is_empty())
+            .ok_or_else(|| {
+                invalid_request(format!(
+                    "targets[{index}].symbol must be a non-empty string"
+                ))
+            })?;
+        let resolved = resolve_path_from_project_root(project_root, file_path);
+        let mut target_out = Map::new();
+        target_out.insert(
+            "file".to_string(),
+            Value::String(resolved.to_string_lossy().into_owned()),
+        );
+        target_out.insert("symbol".to_string(), Value::String(symbol.to_string()));
+        target_out.insert(
+            "target_label".to_string(),
+            Value::String(file_path.to_string()),
+        );
+        out.push(Value::Object(target_out));
+    }
+    Ok(out)
+}
+
 fn translate_zoom(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
 
-    if map_in.contains_key("targets") {
-        return Err(invalid_request("zoom targets handled separately"));
+    let has_targets = zoom_targets_provided(map_in.get("targets"));
+    let has_file_path = map_in
+        .get("filePath")
+        .is_some_and(|value| !is_empty_param(value));
+    let has_url = map_in
+        .get("url")
+        .is_some_and(|value| !is_empty_param(value));
+    let has_symbols = map_in
+        .get("symbols")
+        .is_some_and(|value| !is_empty_param(value));
+
+    let mut out = Map::new();
+
+    if has_targets {
+        if has_file_path || has_url || has_symbols {
+            return Err(invalid_request(
+                "'targets' is mutually exclusive with 'filePath', 'url', and 'symbols'",
+            ));
+        }
+        let targets_value = map_in
+            .get("targets")
+            .expect("has_targets implies a targets value exists");
+        out.insert(
+            "targets".to_string(),
+            Value::Array(translate_zoom_targets(targets_value, project_root)?),
+        );
+
+        if let Some(context_lines) = coerce_optional_int_result(
+            map_in.get("contextLines"),
+            "contextLines",
+            1,
+            9_007_199_254_740_991,
+        )? {
+            out.insert(
+                "context_lines".to_string(),
+                Value::Number(context_lines.into()),
+            );
+        }
+
+        if map_in.get("callgraph").is_some_and(coerce_boolean) {
+            out.insert("callgraph".to_string(), Value::Bool(true));
+        }
+
+        return Ok(Translated {
+            command: "zoom".into(),
+            args: out,
+        });
     }
 
     let file_path = map_in
@@ -791,7 +929,6 @@ fn translate_zoom(args: &Value, project_root: &Path) -> Result<Translated, Trans
         _ => {}
     }
 
-    let mut out = Map::new();
     if let Some(url) = url {
         out.insert("file".to_string(), Value::String(url.to_string()));
     } else if let Some(file_path) = file_path {

@@ -1,14 +1,8 @@
-import {
-  coerceBoolean,
-  coerceTargetParam,
-  formatZoomMultiTargetResult,
-  formatZoomText,
-} from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceTargetParam, formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import {
-  callBridge,
   callToolCall,
   coerceOptionalInt,
   isEmptyParam,
@@ -294,26 +288,15 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           );
           if (permissionDenied) return permissionDeniedResponse(permissionDenied);
 
-          const responses = await Promise.all(
-            targets.map((t, index) => {
-              const params: Record<string, unknown> = {
-                file: resolvedTargets[index],
-                symbol: t.symbol,
-              };
-              if (contextLines !== undefined) params.context_lines = contextLines;
-              if (wantCallgraph) params.callgraph = true;
-              return callBridge(ctx, context, "zoom", params).catch((err) => ({
-                success: false,
-                message: err instanceof Error ? err.message : String(err),
-              }));
-            }),
-          );
-          const entries = targets.map((t, i) => ({
-            targetLabel: t.filePath,
-            name: t.symbol,
-            response: responses[i] ?? { success: false, message: "missing zoom response" },
-          }));
-          return withMeta(formatZoomMultiTargetResult(entries).text);
+          const rawArgs: Record<string, unknown> = { targets };
+          if (contextLines !== undefined) rawArgs.contextLines = contextLines;
+          if (wantCallgraph) rawArgs.callgraph = true;
+
+          const response = await callToolCall(ctx, context, "zoom", rawArgs);
+          if (response.success === false) {
+            throw new Error(response.text || response.message || "zoom failed");
+          }
+          return withMeta(response.text);
         }
 
         if (!hasFilePath && !hasUrl) {

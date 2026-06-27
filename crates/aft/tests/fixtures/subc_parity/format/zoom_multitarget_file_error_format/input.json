@@ -1,0 +1,55 @@
+{
+  "tool_name": "zoom",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "targets": [
+      {
+        "targetLabel": "src/main.ts",
+        "name": "run",
+        "response": {
+          "id": "run",
+          "success": true,
+          "name": "run",
+          "kind": "function",
+          "range": {
+            "start_line": 1,
+            "end_line": 3
+          },
+          "content": "function run() {\n  return 1;\n}",
+          "context_before": [],
+          "context_after": [],
+          "annotations": {
+            "calls_out": [],
+            "called_by": []
+          }
+        }
+      },
+      {
+        "targetLabel": "missing.ts",
+        "name": "run",
+        "response": {
+          "id": "missing-file",
+          "success": false,
+          "code": "file_not_found",
+          "message": "file not found: <PROJECT_ROOT>/missing.ts"
+        }
+      }
+    ]
+  },
+  "ctx": {
+    "agent_args": {
+      "targets": [
+        {
+          "filePath": "src/main.ts",
+          "symbol": "run"
+        },
+        {
+          "filePath": "missing.ts",
+          "symbol": "run"
+        }
+      ]
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

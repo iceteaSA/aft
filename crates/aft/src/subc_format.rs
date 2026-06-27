@@ -134,6 +134,10 @@ fn coerce_boolean(value: &Value) -> bool {
     }
 }
 
+// Return true for tools whose text output is formatted on the server for the
+// agent. This list is larger than the subc manifest in subc.rs because zoom and
+// callgraph are routed through NDJSON tool_call today, but their responses still
+// need Rust formatting here.
 fn is_core_agent_tool(bare_name: &str) -> bool {
     matches!(
         bare_name,
@@ -764,11 +768,60 @@ fn format_outline_text(data: &Value) -> String {
 // Format zoom responses as plain text so direct calls and server-side calls
 // produce identical output.
 fn format_zoom(data: &Value, ctx: &FormatContext) -> String {
+    if let Some(entries) = data.get("targets").and_then(Value::as_array) {
+        return format_zoom_multi_target_result(entries);
+    }
+
     let target_label = ctx.zoom_target_label.as_deref().unwrap_or("(no target)");
     if let Some((names, responses)) = unwrap_rust_zoom_batch_envelope(data) {
         return format_zoom_batch_result(target_label, &names, &responses);
     }
     format_zoom_text(target_label, data)
+}
+
+fn format_zoom_multi_target_result(entries: &[Value]) -> String {
+    let rendered = entries
+        .iter()
+        .map(|entry| {
+            let target_label = entry
+                .get("targetLabel")
+                .and_then(Value::as_str)
+                .filter(|label| !label.is_empty())
+                .unwrap_or("(no target)");
+            let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+            let response = entry.get("response");
+            if response
+                .and_then(|response| response.get("success"))
+                .and_then(Value::as_bool)
+                == Some(false)
+            {
+                let message = response
+                    .and_then(|response| response.get("message"))
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or("zoom failed");
+                return (
+                    false,
+                    format!("Symbol \"{name}\" not found in {target_label}: {message}"),
+                );
+            }
+            match response {
+                Some(response) => (true, format_zoom_text(target_label, response)),
+                None => (
+                    false,
+                    format!("Symbol \"{name}\" not found in {target_label}: missing zoom response"),
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let complete = rendered.iter().all(|(success, _)| *success);
+    let mut sections = Vec::new();
+    if !complete {
+        sections.push("Incomplete zoom results: one or more symbols failed.".to_string());
+    }
+    sections.extend(rendered.into_iter().map(|(_, content)| content));
+    sections.join("\n\n")
 }
 
 fn unwrap_rust_zoom_batch_envelope(data: &Value) -> Option<(Vec<String>, Vec<Value>)> {

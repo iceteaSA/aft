@@ -208,19 +208,20 @@ describe("reading tool adapters", () => {
     });
   });
 
-  test("aft_zoom targets array fans out one zoom request per entry across different files", async () => {
+  test("aft_zoom targets array forwards one native-leaf tool_call across different files", async () => {
     const root = await tempProject();
-    const { sendCalls, tools } = createMockReadingHarness((_command, params) => {
-      const file = params.file as string;
-      const symbol = params.symbol as string;
-      return {
-        success: true,
-        name: symbol,
-        kind: "function",
-        range: { start_line: 10, end_line: 20 },
-        content: `// body of ${symbol} from ${file}\n`,
-      };
-    });
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
+      success: true,
+      text: [
+        "src/a.ts:10-20 [function foo]",
+        "",
+        "10: // body of foo",
+        "",
+        "src/b.ts:10-20 [function bar]",
+        "",
+        "10: // body of bar",
+      ].join("\n"),
+    }));
 
     const result = toolResultText(
       await tools.aft_zoom.execute(
@@ -234,34 +235,38 @@ describe("reading tool adapters", () => {
       ),
     );
 
-    expect(sendCalls).toHaveLength(2);
-    expect(sendCalls[0]?.command).toBe("zoom");
-    expect(sendCalls[0]?.params).toMatchObject({ file: join(root, "src/a.ts"), symbol: "foo" });
-    expect(sendCalls[1]?.command).toBe("zoom");
-    expect(sendCalls[1]?.params).toMatchObject({ file: join(root, "src/b.ts"), symbol: "bar" });
+    expect(sendCalls).toHaveLength(0);
+    expect(toolCallCalls).toEqual([
+      {
+        sessionId: "reading-session",
+        name: "zoom",
+        rawArgs: {
+          targets: [
+            { filePath: "src/a.ts", symbol: "foo" },
+            { filePath: "src/b.ts", symbol: "bar" },
+          ],
+        },
+      },
+    ]);
     // Each section uses its OWN filePath as the header label, not a shared one.
     expect(result).toContain("src/a.ts:10-20 [function foo]");
     expect(result).toContain("src/b.ts:10-20 [function bar]");
   });
 
-  test("aft_zoom targets renders per-entry failure with the right file label", async () => {
+  test("aft_zoom targets returns server-rendered per-entry failure text", async () => {
     const root = await tempProject();
-    const { tools } = createMockReadingHarness((_command, params) => {
-      if (params.symbol === "missing") {
-        return {
-          success: false,
-          code: "symbol_not_found",
-          message: "symbol 'missing' not found",
-        };
-      }
-      return {
-        success: true,
-        name: params.symbol as string,
-        kind: "function",
-        range: { start_line: 1, end_line: 2 },
-        content: "ok\n",
-      };
-    });
+    const { toolCallCalls, tools } = createMockReadingHarness(() => ({
+      success: true,
+      text: [
+        "Incomplete zoom results: one or more symbols failed.",
+        "",
+        "src/a.ts:1-2 [function ok]",
+        "",
+        "1: ok",
+        "",
+        `Symbol "missing" not found in src/b.ts: symbol 'missing' not found`,
+      ].join("\n"),
+    }));
 
     const text = toolResultText(
       await tools.aft_zoom.execute(
@@ -275,6 +280,7 @@ describe("reading tool adapters", () => {
       ),
     );
 
+    expect(toolCallCalls).toHaveLength(1);
     expect(text).toContain("Incomplete zoom results");
     expect(text).toContain('Symbol "missing" not found in src/b.ts:');
     expect(text).toContain("src/a.ts:1-2 [function ok]");
@@ -282,7 +288,7 @@ describe("reading tool adapters", () => {
 
   test("aft_zoom targets is mutually exclusive with filePath/symbols/url", async () => {
     const root = await tempProject();
-    const { sendCalls, tools } = createMockReadingHarness(() => ({ success: true }));
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({ success: true }));
 
     await expect(
       tools.aft_zoom.execute(
@@ -295,6 +301,7 @@ describe("reading tool adapters", () => {
       ),
     ).rejects.toThrow(/mutually exclusive/);
     expect(sendCalls).toHaveLength(0);
+    expect(toolCallCalls).toHaveLength(0);
   });
 
   test("aft_zoom treats empty-content targets shapes as not provided (GPT empty-param regression)", async () => {
@@ -447,7 +454,7 @@ describe("reading tool adapters", () => {
 
   test("aft_zoom targets rejects empty filePath/symbol entries", async () => {
     const root = await tempProject();
-    const { sendCalls, tools } = createMockReadingHarness(() => ({ success: true }));
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({ success: true }));
 
     await expect(
       tools.aft_zoom.execute(
@@ -464,6 +471,7 @@ describe("reading tool adapters", () => {
     ).rejects.toThrow(/targets\[0\]\.filePath/);
 
     expect(sendCalls).toHaveLength(0);
+    expect(toolCallCalls).toHaveLength(0);
   });
 
   test("aft_zoom threads callgraph true to all zoom request shapes and omits it by default", async () => {
@@ -490,10 +498,13 @@ describe("reading tool adapters", () => {
       createMockSdkContext(root),
     );
 
-    expect(sendCalls.map((call) => call.params)).toEqual([
-      expect.objectContaining({ file: join(root, "src/a.ts"), symbol: "foo", callgraph: true }),
-    ]);
+    expect(sendCalls).toHaveLength(0);
     expect(toolCallCalls).toEqual([
+      {
+        sessionId: "reading-session",
+        name: "zoom",
+        rawArgs: { targets: [{ filePath: "src/a.ts", symbol: "foo" }], callgraph: true },
+      },
       {
         sessionId: "reading-session",
         name: "zoom",

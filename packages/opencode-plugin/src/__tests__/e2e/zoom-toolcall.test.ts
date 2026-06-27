@@ -196,7 +196,7 @@ maybeDescribe("e2e aft_zoom tool_call cutover", () => {
     ).rejects.toThrow("symbol 'missingSymbol' not found");
   });
 
-  test("cross-file targets stay on the callBridge multi-target path", async () => {
+  test("cross-file targets return all-success server-rendered text through tool_call", async () => {
     const h = await harness();
 
     const output = await runZoom(h, {
@@ -208,5 +208,37 @@ maybeDescribe("e2e aft_zoom tool_call cutover", () => {
 
     expect(output).toContain("sample.ts:15-17 [function funcA]");
     expect(output).toContain("barrel.ts:15-17 [function funcA]");
+  });
+
+  test("cross-file targets return incomplete text for partial failures", async () => {
+    const h = await harness();
+
+    const output = await runZoom(h, {
+      targets: [
+        { filePath: "sample.ts", symbol: "funcA" },
+        { filePath: "barrel.ts", symbol: "missingSymbol" },
+      ],
+    });
+
+    expect(output).toContain("Incomplete zoom results: one or more symbols failed.");
+    expect(output).toContain("sample.ts:15-17 [function funcA]");
+    expect(output).toContain('Symbol "missingSymbol" not found in barrel.ts:');
+  });
+
+  test("cross-file targets can include callgraph annotations", async () => {
+    const h = await harness();
+
+    const output = await runZoom(h, {
+      targets: [
+        { filePath: "sample.ts", symbol: "funcB" },
+        { filePath: "barrel.ts", symbol: "funcA" },
+      ],
+      callgraph: true,
+    });
+
+    expect(output).toContain("sample.ts:19-21 [function funcB]");
+    expect(output).toContain("barrel.ts:15-17 [function funcA]");
+    expect(output).toContain("──── calls_out");
+    expect(output).toContain("normalize (line 20)");
   });
 });

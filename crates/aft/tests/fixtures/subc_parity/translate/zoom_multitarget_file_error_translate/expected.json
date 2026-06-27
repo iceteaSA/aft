@@ -1,0 +1,17 @@
+{
+  "args": {
+    "targets": [
+      {
+        "file": "<PROJECT_ROOT>/src/main.ts",
+        "symbol": "run",
+        "target_label": "src/main.ts"
+      },
+      {
+        "file": "<PROJECT_ROOT>/missing.ts",
+        "symbol": "run",
+        "target_label": "missing.ts"
+      }
+    ]
+  },
+  "command": "zoom"
+}

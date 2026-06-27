@@ -103,12 +103,150 @@ fn resolve_file_or_url(
     ctx.validate_path(&req.id, Path::new(file))
 }
 
+fn zoom_one_target_response(
+    req: &RawRequest,
+    ctx: &AppContext,
+    file: &str,
+    symbol: &str,
+    context_lines: usize,
+    include_callgraph: bool,
+) -> Response {
+    let path = match resolve_file_or_url(req, ctx, file) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    if !path.exists() {
+        return Response::error(
+            &req.id,
+            "file_not_found",
+            format!("file not found: {}", file),
+        );
+    }
+
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) => {
+            return Response::error(&req.id, "file_not_found", format!("{}: {}", file, error));
+        }
+    };
+    let lines: Vec<String> = source.lines().map(|line| line.to_string()).collect();
+
+    zoom_one_symbol(
+        req,
+        ctx,
+        &path,
+        file,
+        &source,
+        &lines,
+        symbol,
+        context_lines,
+        include_callgraph,
+    )
+}
+
+fn serialize_zoom_target_response(req: &RawRequest, response: Response) -> serde_json::Value {
+    serde_json::to_value(&response).unwrap_or_else(|error| {
+        serde_json::to_value(Response::error(
+            &req.id,
+            "internal_error",
+            format!("zoom: failed to serialize target response: {error}"),
+        ))
+        .expect("serializing Response::error should not fail")
+    })
+}
+
+fn handle_zoom_targets(
+    req: &RawRequest,
+    ctx: &AppContext,
+    targets: &[serde_json::Value],
+    context_lines: usize,
+    include_callgraph: bool,
+) -> Response {
+    if targets.is_empty() {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "zoom: 'targets' must be a non-empty array",
+        );
+    }
+
+    let mut entries = Vec::with_capacity(targets.len());
+    for (index, target) in targets.iter().enumerate() {
+        let obj = target.as_object();
+        let Some(file) = obj
+            .and_then(|obj| obj.get("file"))
+            .and_then(|value| value.as_str())
+            .filter(|file| !file.is_empty())
+        else {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("zoom: targets[{index}].file must be a non-empty string"),
+            );
+        };
+        let Some(symbol) = obj
+            .and_then(|obj| obj.get("symbol"))
+            .and_then(|value| value.as_str())
+            .filter(|symbol| !symbol.is_empty())
+        else {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("zoom: targets[{index}].symbol must be a non-empty string"),
+            );
+        };
+        let target_label = obj
+            .and_then(|obj| obj.get("target_label").or_else(|| obj.get("targetLabel")))
+            .and_then(|value| value.as_str())
+            .filter(|label| !label.is_empty())
+            .unwrap_or(file);
+
+        let response =
+            zoom_one_target_response(req, ctx, file, symbol, context_lines, include_callgraph);
+        entries.push(serde_json::json!({
+            "targetLabel": target_label,
+            "name": symbol,
+            "response": serialize_zoom_target_response(req, response),
+        }));
+    }
+
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "targets": entries,
+        }),
+    )
+}
+
 /// Handle a `zoom` request.
 ///
-/// Expects `file`, `symbol` (or `symbols`) in request params, optional `context_lines` (default 3).
-/// Resolves the symbol, extracts body + context, walks AST for call annotations.
-/// For code files, a whitespace-separated `symbol`/`symbols` string is split into multiple lookups.
+/// Expects either `file` plus `symbol`/`symbols`, or a cross-file `targets` array,
+/// with optional `context_lines` (default 3). Resolves the symbol, extracts body +
+/// context, and walks ASTs for call annotations. For code files, a whitespace-separated
+/// top-level `symbol`/`symbols` string is split into multiple same-file lookups.
 pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
+    let context_lines = req
+        .params
+        .get("context_lines")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3) as usize;
+    let include_callgraph = req
+        .params
+        .get("callgraph")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if let Some(targets_value) = req.params.get("targets") {
+        let Some(targets) = targets_value.as_array() else {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "zoom: 'targets' must be a non-empty array",
+            );
+        };
+        return handle_zoom_targets(req, ctx, targets, context_lines, include_callgraph);
+    }
+
     let file = match req
         .params
         .get("file")
@@ -124,17 +262,6 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-
-    let context_lines = req
-        .params
-        .get("context_lines")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3) as usize;
-    let include_callgraph = req
-        .params
-        .get("callgraph")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     let start_line = req
         .params
