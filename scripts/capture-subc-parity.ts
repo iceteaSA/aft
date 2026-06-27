@@ -256,6 +256,7 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "outline_url_files_mode", tool_name: "outline", agent_args: { target: "https://example.com/doc", files: true } },
   { name: "outline_array_files", tool_name: "outline", agent_args: { target: ["src", "docs"], files: true } },
   { name: "outline_directory_json_mode", tool_name: "outline", agent_args: { target: "src" } },
+  { name: "outline_directory_include_tests", tool_name: "outline", agent_args: { target: "src", includeTests: true } },
 ];
 
 const FORMAT_CASES: FormatCase[] = [

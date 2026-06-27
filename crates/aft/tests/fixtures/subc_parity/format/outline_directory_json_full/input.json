@@ -1,0 +1,18 @@
+{
+  "tool_name": "outline",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "collection_truncated": false,
+    "complete": true,
+    "skipped_files": [],
+    "text": "src/main.ts\n  fn main",
+    "walk_truncated": false
+  },
+  "ctx": {
+    "agent_args": {
+      "target": "src"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

@@ -5,6 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { inspectTools } from "../../tools/inspect.js";
+import { readingTools } from "../../tools/reading.js";
 import { searchTools } from "../../tools/search.js";
 import { semanticTools } from "../../tools/semantic.js";
 import type { PluginContext } from "../../types.js";
@@ -55,12 +56,27 @@ async function createFixtureProject(harness: E2EHarness): Promise<void> {
       [
         "export const toolCallGrepMarker = 'tool_call_grep_marker';",
         "export const toolCallSearchMarker = 'tool_call_search_marker';",
+        "export function toolCallOutlineFunction(input: string): string {",
+        "  return input;",
+        "}",
+        "export class ToolCallOutlineService {",
+        "  run(): void {}",
+        "}",
         "// TODO cutover inspect marker",
         "",
       ].join("\n"),
       "utf8",
     ),
-    writeFile(harness.path("src", "other.ts"), "export const unrelated = true;\n", "utf8"),
+    writeFile(
+      harness.path("src", "other.ts"),
+      "export function toolCallOutlineOther(): boolean { return true; }\n",
+      "utf8",
+    ),
+    writeFile(
+      harness.path("src", "hit.test.ts"),
+      "export function toolCallOutlineTestOnly(): void {}\n",
+      "utf8",
+    ),
   ]);
 }
 
@@ -137,6 +153,86 @@ maybeDescribe("e2e read-only spine tool_call cutover", () => {
     );
 
     expect(output).toContain("TODOs: 1");
-    expect(output).toContain("src/hit.ts:3 TODO cutover inspect marker");
+    expect(output).toContain("src/hit.ts:9 TODO cutover inspect marker");
+  });
+
+  test("aft_outline returns single-file Text output through tool_call", async () => {
+    const h = await harness();
+    const tools = readingTools(createPluginContext(h));
+
+    const output = await tools.aft_outline.execute({ target: "src/hit.ts" }, createToolContext(h));
+
+    expect(output).toContain("hit.ts");
+    expect(output).toContain("toolCallOutlineFunction");
+    expect(output).toContain("ToolCallOutlineService");
+  });
+
+  test("aft_outline returns structured directory JSON through tool_call", async () => {
+    const h = await harness();
+    const tools = readingTools(createPluginContext(h));
+
+    const output = await tools.aft_outline.execute({ target: "src" }, createToolContext(h));
+    const parsed = JSON.parse(output) as {
+      success?: boolean;
+      complete?: boolean;
+      text?: string;
+      skipped_files?: unknown[];
+    };
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.complete).toBe(true);
+    expect(parsed.text).toContain("src/");
+    expect(parsed.text).toContain("hit.ts");
+    expect(parsed.text).toContain("toolCallOutlineFunction");
+    expect(parsed.text).not.toContain("hit.test.ts");
+    expect(parsed.skipped_files).toEqual([]);
+  });
+
+  test("aft_outline files:true returns the server-rendered files tree through tool_call", async () => {
+    const h = await harness();
+    const tools = readingTools(createPluginContext(h));
+
+    const output = await tools.aft_outline.execute(
+      { target: "src", files: true },
+      createToolContext(h),
+    );
+
+    expect(output).toContain("typescript");
+    expect(output).toContain("hit.ts");
+    expect(output).toContain("other.ts");
+    expect(output).toContain("hit.test.ts");
+  });
+
+  test("aft_outline returns multi-file Text output for array targets through tool_call", async () => {
+    const h = await harness();
+    const tools = readingTools(createPluginContext(h));
+
+    const output = await tools.aft_outline.execute(
+      { target: ["src/hit.ts", "src/other.ts"] },
+      createToolContext(h),
+    );
+
+    expect(output).toContain("src/");
+    expect(output).toContain("hit.ts");
+    expect(output).toContain("toolCallOutlineFunction");
+    expect(output).toContain("other.ts");
+    expect(output).toContain("toolCallOutlineOther");
+  });
+
+  test("aft_outline includeTests controls directory test-file visibility through tool_call", async () => {
+    const h = await harness();
+    const tools = readingTools(createPluginContext(h));
+
+    const withoutTests = JSON.parse(
+      await tools.aft_outline.execute({ target: "src" }, createToolContext(h)),
+    ) as { text?: string };
+    const withTests = JSON.parse(
+      await tools.aft_outline.execute({ target: "src", includeTests: true }, createToolContext(h)),
+    ) as { text?: string };
+
+    expect(withoutTests.text).not.toContain("hit.test.ts");
+    expect(withoutTests.text).not.toContain("toolCallOutlineTestOnly");
+    expect(withTests.text).toContain("hit.test.ts");
+    expect(withTests.text).toContain("toolCallOutlineTestOnly");
   });
 });

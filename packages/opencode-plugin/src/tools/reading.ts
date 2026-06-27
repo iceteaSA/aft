@@ -10,6 +10,7 @@ import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import {
   callBridge,
+  callToolCall,
   coerceOptionalInt,
   isEmptyParam,
   optionalInt,
@@ -104,140 +105,50 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         const filesMode = coerceBoolean(args.files);
         const hasIncludeTests = !isEmptyParam(args.includeTests);
         const includeTests = coerceBoolean(args.includeTests);
-        const hasUrl =
-          typeof target === "string" &&
-          (target.startsWith("http://") || target.startsWith("https://"));
-        const isArray = Array.isArray(target) && target.length > 0;
+        const rawArgs: Record<string, unknown> = {
+          target,
+          ...(filesMode ? { files: true } : {}),
+          ...(hasIncludeTests ? { includeTests } : {}),
+        };
 
-        if (filesMode) {
-          if (Array.isArray(target)) {
-            if (target.length === 0) {
-              throw new Error("'target' must be a non-empty string or array of strings");
-            }
-            const resolvedTargets = await Promise.all(
-              target.map((entry) => resolvePathArg(ctx, context, entry)),
-            );
-            const permissionDenied = await assertPathExternalPermissions(
-              ctx,
-              context,
-              resolvedTargets,
-              "directory",
-            );
-            if (permissionDenied) return permissionDeniedResponse(permissionDenied);
-
-            const response = await callBridge(ctx, context, "outline", {
-              target: resolvedTargets,
-              files: true,
-            });
-            if (response.success === false) {
-              throw new Error((response.message as string) || "outline failed");
-            }
-            return formatOutlineFilesText(response);
-          }
-
-          if (typeof target !== "string" || target.length === 0) {
+        if (Array.isArray(target)) {
+          if (target.length === 0) {
             throw new Error("'target' must be a non-empty string or array of strings");
           }
-
-          const resolvedPath = await resolvePathArg(ctx, context, target);
-
-          let isDirectory = false;
-          try {
-            const { stat } = await import("node:fs/promises");
-            const st = await stat(resolvedPath);
-            isDirectory = st.isDirectory();
-          } catch {
-            // Let Rust report missing paths with its structured error shape.
-          }
-
-          const permissionDenied = await assertPathExternalPermissions(
-            ctx,
-            context,
-            resolvedPath,
-            isDirectory ? "directory" : "file",
-          );
-          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
-
-          const params = isDirectory
-            ? { directory: resolvedPath, files: true }
-            : { file: resolvedPath, files: true };
-          const response = await callBridge(ctx, context, "outline", params);
-          if (response.success === false) {
-            throw new Error((response.message as string) || "outline failed");
-          }
-          return formatOutlineFilesText(response);
-        }
-
-        // URL mode: pass through to Rust; Rust fetches, validates, and caches.
-        if (hasUrl) {
-          const response = await callBridge(ctx, context, "outline", { file: target });
-          if (response.success === false) {
-            throw new Error((response.message as string) || "outline failed");
-          }
-          return formatOutlineText(response);
-        }
-
-        // Multi-file mode
-        if (isArray) {
           const resolvedTargets = await Promise.all(
-            (target as string[]).map((entry) => resolvePathArg(ctx, context, entry)),
+            target.map((entry) => resolvePathArg(ctx, context, entry)),
           );
           const permissionDenied = await assertPathExternalPermissions(
             ctx,
             context,
             resolvedTargets,
+            filesMode ? "directory" : "file",
           );
           if (permissionDenied) return permissionDeniedResponse(permissionDenied);
-
-          const response = await callBridge(ctx, context, "outline", {
-            files: resolvedTargets,
-          });
-          if (response.success === false) {
-            throw new Error((response.message as string) || "outline failed");
+        } else {
+          if (typeof target !== "string" || target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
           }
-          return formatOutlineText(response);
-        }
 
-        // String mode: stat to disambiguate file vs directory
-        if (typeof target !== "string" || target.length === 0) {
-          throw new Error("'target' must be a non-empty string or array of strings");
-        }
-
-        const resolvedTarget = await resolvePathArg(ctx, context, target);
-        let isDirectory = false;
-        try {
-          const { stat } = await import("node:fs/promises");
-          const st = await stat(resolvedTarget);
-          isDirectory = st.isDirectory();
-        } catch {
-          // Path doesn't exist locally — fall through to single-file mode and
-          // let Rust report the real error with its preferred shape.
-        }
-
-        const permissionDenied = await assertPathExternalPermissions(
-          ctx,
-          context,
-          resolvedTarget,
-          isDirectory ? "directory" : "file",
-        );
-        if (permissionDenied) return permissionDeniedResponse(permissionDenied);
-
-        if (isDirectory) {
-          const response = await callBridge(ctx, context, "outline", {
-            directory: resolvedTarget,
-            ...(hasIncludeTests ? { includeTests } : {}),
-          });
-          if (response.success === false) {
-            throw new Error((response.message as string) || "outline failed");
+          const hasUrl =
+            !filesMode && (target.startsWith("http://") || target.startsWith("https://"));
+          if (!hasUrl) {
+            const resolvedTarget = await resolvePathArg(ctx, context, target);
+            const permissionDenied = await assertPathExternalPermissions(
+              ctx,
+              context,
+              resolvedTarget,
+              await permissionKindForPath(resolvedTarget),
+            );
+            if (permissionDenied) return permissionDeniedResponse(permissionDenied);
           }
-          return JSON.stringify(response, null, 2);
         }
 
-        const response = await callBridge(ctx, context, "outline", { file: resolvedTarget });
+        const response = await callToolCall(ctx, context, "outline", rawArgs);
         if (response.success === false) {
           throw new Error((response.message as string) || "outline failed");
         }
-        return formatOutlineText(response);
+        return response.text;
       },
     },
 
@@ -521,18 +432,18 @@ export function formatZoomBatchResult(
   return { complete, symbols: entries, text: sections.join("\n\n") };
 }
 
-/**
- * Format an outline response into agent-readable text, appending honest skip
- * reporting when files were intentionally skipped (parse error, unsupported
- * language, file not found, too large). Without this, agents only see the tree
- * and assume all input files were processed.
- */
-interface SkippedOutlineFile {
-  file: string;
-  reason: string;
+async function permissionKindForPath(resolvedPath: string): Promise<"file" | "directory"> {
+  try {
+    const { stat } = await import("node:fs/promises");
+    const st = await stat(resolvedPath);
+    return st.isDirectory() ? "directory" : "file";
+  } catch {
+    // If stat fails, keep the tool call moving so the server can report the
+    // real path error. Use a file label because a missing path cannot be a
+    // directory that the permission prompt could grant.
+    return "file";
+  }
 }
-
-const MAX_UNCHECKED_FILES_IN_FOOTER = 10;
 
 async function assertPathExternalPermissions(
   ctx: PluginContext,
@@ -554,60 +465,4 @@ async function assertPathExternalPermissions(
   }
 
   return undefined;
-}
-
-function formatOutlineText(response: Record<string, unknown>): string {
-  const text = (response.text as string | undefined) ?? "";
-  const skipped = response.skipped_files as SkippedOutlineFile[] | undefined;
-  if (!skipped || skipped.length === 0) {
-    return text;
-  }
-  const lines = skipped.map(({ file, reason }) => `  ${file} — ${reason}`).join("\n");
-  const header = text.length > 0 ? `${text}\n\n` : "";
-  return `${header}Skipped ${skipped.length} file(s):\n${lines}`;
-}
-
-export function formatOutlineFilesText(response: Record<string, unknown>): string {
-  const text = formatOutlineText(response);
-  const uncheckedFiles = Array.isArray(response.unchecked_files)
-    ? response.unchecked_files.filter(
-        (file): file is string => typeof file === "string" && file.length > 0,
-      )
-    : [];
-  const isPartial =
-    response.complete === false || response.walk_truncated === true || uncheckedFiles.length > 0;
-
-  if (!isPartial) {
-    return text;
-  }
-
-  const footer: string[] = [];
-  if (response.walk_truncated === true) {
-    const uncheckedCount = uncheckedFiles.length;
-    const suffix =
-      uncheckedCount > 0
-        ? ` ${uncheckedCount} additional files in this directory were not indexed.`
-        : " Some files in this directory were not indexed.";
-    footer.push(`⚠ Partial result: walk truncated at 200 files.${suffix}`);
-  } else {
-    const suffix =
-      uncheckedFiles.length > 0
-        ? ` ${uncheckedFiles.length} files in this directory were not indexed.`
-        : " Some files in this directory were not indexed.";
-    footer.push(`⚠ Partial result:${suffix}`);
-  }
-
-  if (uncheckedFiles.length > 0) {
-    footer.push("Unchecked files:");
-    footer.push(
-      ...uncheckedFiles.slice(0, MAX_UNCHECKED_FILES_IN_FOOTER).map((file) => `  ${file}`),
-    );
-    const remaining = uncheckedFiles.length - MAX_UNCHECKED_FILES_IN_FOOTER;
-    if (remaining > 0) {
-      footer.push(`  ... +${remaining} more`);
-    }
-  }
-
-  const header = text.length > 0 ? `${text}\n\n` : "";
-  return `${header}${footer.join("\n")}`;
 }

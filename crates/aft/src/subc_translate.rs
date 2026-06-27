@@ -570,6 +570,13 @@ fn translate_outline(args: &Value, project_root: &Path) -> Result<Translated, Tr
     }
 
     let mut out = Map::new();
+    if let Some(include_tests) = map_in
+        .get("includeTests")
+        .or_else(|| map_in.get("include_tests"))
+        .and_then(Value::as_bool)
+    {
+        out.insert("includeTests".to_string(), Value::Bool(include_tests));
+    }
 
     if let Some(arr) = target.as_array() {
         if arr.is_empty() {

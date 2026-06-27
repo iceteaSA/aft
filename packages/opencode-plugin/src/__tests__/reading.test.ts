@@ -15,6 +15,11 @@ import { noopAsk, toolResultText } from "./test-helpers";
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
+type ToolCallCall = {
+  sessionId: string | undefined;
+  name: string;
+  rawArgs: Record<string, unknown>;
+};
 type AskCall = {
   permission?: string;
   patterns?: string[];
@@ -75,10 +80,19 @@ function createMockReadingHarness(
   ) => Promise<BridgeResponse> | BridgeResponse,
 ) {
   const sendCalls: SendCall[] = [];
+  const toolCallCalls: ToolCallCall[] = [];
   const bridge = {
     send: async (command: string, params: Record<string, unknown>) => {
       sendCalls.push({ command, params });
       return await sendImpl(command, params);
+    },
+    toolCall: async (
+      sessionId: string | undefined,
+      name: string,
+      rawArgs: Record<string, unknown> = {},
+    ) => {
+      toolCallCalls.push({ sessionId, name, rawArgs });
+      return await sendImpl(name, rawArgs);
     },
   };
   const pool = {
@@ -87,6 +101,7 @@ function createMockReadingHarness(
 
   return {
     sendCalls,
+    toolCallCalls,
     tools: readingTools(createPluginContext(pool)),
   };
 }
@@ -96,16 +111,22 @@ afterEach(async () => {
 });
 
 describe("reading tool adapters", () => {
-  test("aft_outline files:true appends a walk-cap footer after the file table", async () => {
+  test("aft_outline files:true forwards raw target through tool_call and returns server text", async () => {
     const root = await tempProject();
     await mkdir(join(root, "src"));
-    const uncheckedFiles = Array.from({ length: 12 }, (_, index) => `src/overflow-${index + 1}.ts`);
-    const { sendCalls, tools } = createMockReadingHarness(() => ({
+    const serverText = [
+      "path | language | symbols",
+      "",
+      "⚠ Partial result: walk truncated at 200 files. 12 additional files in this directory were not indexed.",
+      "Unchecked files:",
+      "  src/overflow-1.ts",
+    ].join("\n");
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
       success: true,
-      text: "path | language | symbols",
+      text: serverText,
       complete: false,
       walk_truncated: true,
-      unchecked_files: uncheckedFiles,
+      unchecked_files: ["src/overflow-1.ts"],
     }));
 
     const output = await tools.aft_outline.execute(
@@ -113,16 +134,15 @@ describe("reading tool adapters", () => {
       createMockSdkContext(root),
     );
 
-    expect(sendCalls[0]?.params).toMatchObject({ directory: join(root, "src"), files: true });
-    expect(output).toContain("path | language | symbols");
-    expect(output).toContain(
-      "⚠ Partial result: walk truncated at 200 files. 12 additional files in this directory were not indexed.",
-    );
-    expect(output).toContain("Unchecked files:");
-    expect(output).toContain("src/overflow-1.ts");
-    expect(output).toContain("src/overflow-10.ts");
-    expect(output).not.toContain("src/overflow-11.ts");
-    expect(output).toContain("... +2 more");
+    expect(sendCalls).toEqual([]);
+    expect(toolCallCalls).toEqual([
+      {
+        sessionId: "reading-session",
+        name: "outline",
+        rawArgs: { target: "src", files: true },
+      },
+    ]);
+    expect(output).toBe(serverText);
   });
 
   test("aft_outline files:true asks external_directory for an out-of-project directory", async () => {
@@ -132,7 +152,7 @@ describe("reading tool adapters", () => {
     await mkdir(project, { recursive: true });
     await mkdir(external, { recursive: true });
     const askCalls: AskCall[] = [];
-    const { sendCalls, tools } = createMockReadingHarness(() => ({
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
       success: true,
       text: "external files",
     }));
@@ -146,7 +166,12 @@ describe("reading tool adapters", () => {
     expect(externalAsks).toHaveLength(1);
     expect(externalAsks[0]?.patterns).toEqual([join(external, "*").replaceAll("\\", "/")]);
     expect(externalAsks[0]?.metadata?.filepath).toBe(external);
-    expect(sendCalls[0]?.params).toMatchObject({ directory: external, files: true });
+    expect(sendCalls).toEqual([]);
+    expect(toolCallCalls[0]).toMatchObject({
+      sessionId: "reading-session",
+      name: "outline",
+      rawArgs: { target: external, files: true },
+    });
   });
 
   test("aft_outline files:true target arrays ask once per unique external target", async () => {
@@ -159,7 +184,7 @@ describe("reading tool adapters", () => {
     await mkdir(first, { recursive: true });
     await mkdir(second, { recursive: true });
     const askCalls: AskCall[] = [];
-    const { sendCalls, tools } = createMockReadingHarness(() => ({
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
       success: true,
       text: "external files",
     }));
@@ -175,7 +200,12 @@ describe("reading tool adapters", () => {
       join(first, "*").replaceAll("\\", "/"),
       join(second, "*").replaceAll("\\", "/"),
     ]);
-    expect(sendCalls[0]?.params).toMatchObject({ target: [first, second], files: true });
+    expect(sendCalls).toEqual([]);
+    expect(toolCallCalls[0]).toMatchObject({
+      sessionId: "reading-session",
+      name: "outline",
+      rawArgs: { target: [first, second], files: true },
+    });
   });
 
   test("aft_zoom targets array fans out one zoom request per entry across different files", async () => {
