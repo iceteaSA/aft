@@ -54,6 +54,14 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Agent-facing DISPLAY paths (relativePath, movePath, diff headers) are
+/// forward-slash normalized so they are stable across platforms — matching the
+/// rest of AFT's tools (e.g. outline's `path_to_slash`). Without this, Windows
+/// emits `nested\dest.txt` and breaks the cross-platform display contract.
+fn display_slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn command_params(req: &RawRequest) -> &Value {
     req.params
         .get("params")
@@ -103,15 +111,15 @@ fn normalize_resolved_path(path: PathBuf) -> PathBuf {
 fn relative_path(abs: &Path, root: Option<&Path>) -> String {
     if let Some(root) = root {
         if let Ok(rel) = abs.strip_prefix(root) {
-            return path_string(rel);
+            return display_slash(rel);
         }
         if let Ok(canonical_root) = fs::canonicalize(root) {
             if let Ok(rel) = abs.strip_prefix(canonical_root) {
-                return path_string(rel);
+                return display_slash(rel);
             }
         }
     }
-    path_string(abs)
+    display_slash(abs)
 }
 
 fn resolve_path(req: &RawRequest, ctx: &AppContext, path: &str) -> Result<ResolvedPath, Response> {
@@ -412,7 +420,7 @@ fn build_preview_response(
                 }
                 let after = ensure_trailing_newline(contents);
                 patches.push(edit::build_unified_diff(
-                    &path_string(&resolved_hunk.source.abs),
+                    &display_slash(&resolved_hunk.source.abs),
                     "",
                     &after,
                 ));
@@ -429,7 +437,7 @@ fn build_preview_response(
                     Err(error) => return Response::error(&req.id, "invalid_request", error),
                 };
                 patches.push(edit::build_unified_diff(
-                    &path_string(&resolved_hunk.source.abs),
+                    &display_slash(&resolved_hunk.source.abs),
                     &before,
                     "",
                 ));
@@ -468,7 +476,7 @@ fn build_preview_response(
                     .as_ref()
                     .unwrap_or(&resolved_hunk.source);
                 patches.push(edit::build_unified_diff(
-                    &path_string(&target.abs),
+                    &display_slash(&target.abs),
                     &before,
                     &after,
                 ));
@@ -793,7 +801,7 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
         .into_iter()
         .map(|(_, entry)| {
             let patch = edit::build_unified_diff(
-                &path_string(&entry.display_path),
+                &display_slash(&entry.display_path),
                 &entry.before,
                 &entry.after,
             );
@@ -817,7 +825,7 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
                 "deletions": entry.deletions,
             });
             if let Some(move_path) = entry.move_path {
-                value["movePath"] = json!(path_string(&move_path));
+                value["movePath"] = json!(display_slash(&move_path));
             }
             value
         })
