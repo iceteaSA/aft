@@ -1403,6 +1403,62 @@ impl BackupStore {
         }
     }
 
+    pub(crate) fn discard_latest_operation_entry_for_path(
+        &mut self,
+        session: &str,
+        op_id: &str,
+        path: &Path,
+    ) {
+        let key = canonicalize_key(path);
+        let mut remove_key = false;
+        let mut remaining_stack = None;
+
+        if let Some(session_entries) = self.entries.get_mut(session) {
+            if let Some(stack) = session_entries.get_mut(&key) {
+                if stack
+                    .last()
+                    .is_some_and(|entry| entry.op_id.as_deref() == Some(op_id))
+                {
+                    stack.pop();
+                    if stack.is_empty() {
+                        remove_key = true;
+                    } else {
+                        remaining_stack = Some(stack.clone());
+                    }
+                }
+            }
+            if remove_key {
+                session_entries.remove(&key);
+            }
+        }
+
+        if remove_key {
+            if let Err(error) = self.remove_disk_backups(session, &key) {
+                crate::slog_warn!(
+                    "failed to remove backup stack for {} during single-entry discard: {}",
+                    key.display(),
+                    error
+                );
+            }
+        } else if let Some(stack) = remaining_stack {
+            if let Err(error) = self.write_snapshot_to_disk(session, &key, &stack) {
+                crate::slog_warn!(
+                    "failed to persist backup stack for {} during single-entry discard: {}",
+                    key.display(),
+                    error
+                );
+            }
+        }
+
+        if self
+            .entries
+            .get(session)
+            .is_some_and(|session_entries| session_entries.is_empty())
+        {
+            self.entries.remove(session);
+        }
+    }
+
     fn touch_session(&mut self, session: &str) {
         let now = current_timestamp();
         self.session_meta

@@ -1,4 +1,5 @@
 pub mod add_import;
+pub mod apply_patch;
 pub mod ast_replace;
 pub mod ast_scope;
 pub mod ast_search;

@@ -516,6 +516,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             aft::commands::restore_checkpoint::handle_restore_checkpoint(&req, ctx)
         }
         "list_checkpoints" => aft::commands::list_checkpoints::handle_list_checkpoints(&req, ctx),
+        "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, ctx),
         "write" => aft::commands::write::handle_write(&req, ctx),
         "delete_file" => aft::commands::delete_file::handle_delete_file(&req, ctx),
         "move_file" => aft::commands::move_file::handle_move_file(&req, ctx),
