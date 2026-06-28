@@ -113,8 +113,17 @@ impl PersistentCancelSignal {
     }
 
     async fn cancelled(&self) {
+        // `enable()` REGISTERS this waiter before we read the flag, closing the
+        // lost-wakeup window: `notify_waiters()` only wakes already-registered
+        // waiters and stores no permit, so without enable() a `cancel()` firing
+        // between the flag read and `.await` would be missed and the future
+        // would park forever (cancel() fires only once). With enable(), a cancel
+        // racing the flag read still wakes the registered waiter. The loop is a
+        // belt-and-suspenders re-check on spurious wakeups.
         loop {
             let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_cancelled() {
                 return;
             }
@@ -3839,6 +3848,29 @@ mod tests {
             &completed_tasks,
             &long_running_frame("other-task", 200)
         ));
+    }
+
+    #[tokio::test]
+    async fn persistent_cancel_resolves_when_fired_before_await() {
+        // The lost-wakeup guard: cancel() fires exactly once via notify_waiters()
+        // (no stored permit). A waiter that registers AFTER the cancel must still
+        // observe it via the flag; a waiter racing the cancel must still be woken.
+        let signal = PersistentCancelSignal::new();
+        signal.cancel();
+        // Fired before we ever call cancelled() — must return immediately, not park.
+        tokio::time::timeout(Duration::from_secs(1), signal.cancelled())
+            .await
+            .expect("cancelled() must resolve when cancel fired beforehand");
+
+        // A fresh signal cancelled concurrently with an in-flight cancelled().
+        let racing = PersistentCancelSignal::new();
+        let racing_for_task = racing.clone();
+        let waiter = tokio::spawn(async move { racing_for_task.cancelled().await });
+        racing.cancel();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled() must resolve when cancel races the await")
+            .expect("waiter task panicked");
     }
 
     #[tokio::test]
