@@ -152,6 +152,35 @@ fn bridge_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
+    let key = "AFT_TEST_FOREGROUND_WAIT_MS";
+    let previous = std::env::var_os(key);
+    std::env::set_var(key, ms.to_string());
+    EnvVarGuard { key, previous }
+}
+
+fn set_test_force_bash_promote_error() -> EnvVarGuard {
+    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
+    let previous = std::env::var_os(key);
+    std::env::set_var(key, "1");
+    EnvVarGuard { key, previous }
+}
+
 fn install_bridge_state(state: Arc<BridgeState>) {
     let mut guard = bridge_state_slot()
         .lock()
@@ -1302,6 +1331,92 @@ fn subc_bridge_callgraph_maintenance_is_per_root() {
     );
 }
 
+#[test]
+fn subc_bridge_bash_fast_foreground_returns_terminal_response() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_fast_foreground_returns_terminal_response",
+        Duration::from_secs(30),
+        drive_bash_fast_foreground_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_promotes_after_wait_window_and_remains_tracked() {
+    let _wait_guard = set_test_foreground_wait_ms(200);
+    run_subc_bridge_test(
+        "subc_bridge_bash_promotes_after_wait_window_and_remains_tracked",
+        Duration::from_secs(30),
+        drive_bash_promotion_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_block_to_completion_waits_for_terminal() {
+    let _wait_guard = set_test_foreground_wait_ms(100);
+    run_subc_bridge_test(
+        "subc_bridge_bash_block_to_completion_waits_for_terminal",
+        Duration::from_secs(30),
+        drive_bash_block_to_completion_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_background_returns_launch_text() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_background_returns_launch_text",
+        Duration::from_secs(30),
+        drive_bash_background_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_nonzero_exit_renders_exit_code() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_nonzero_exit_renders_exit_code",
+        Duration::from_secs(30),
+        drive_bash_nonzero_exit_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_wait_holds_no_executor_lane() {
+    let _wait_guard = set_test_foreground_wait_ms(5_000);
+    run_subc_bridge_test(
+        "subc_bridge_bash_wait_holds_no_executor_lane",
+        Duration::from_secs(45),
+        drive_bash_lane_nonoccupancy_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_route_close_cancels_deferred_wait() {
+    let _wait_guard = set_test_foreground_wait_ms(5_000);
+    run_subc_bridge_test(
+        "subc_bridge_bash_route_close_cancels_deferred_wait",
+        Duration::from_secs(45),
+        drive_bash_route_close_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
+    let _wait_guard = set_test_foreground_wait_ms(200);
+    let _promote_error_guard = set_test_force_bash_promote_error();
+    run_subc_bridge_test(
+        "subc_bridge_bash_promote_failure_is_normal_tool_error",
+        Duration::from_secs(45),
+        drive_bash_promote_failure_daemon,
+        |_, _, _| {},
+    );
+}
+
 /// Flips true if the S1 attacker's `configure` payload ever reaches `dispatch`.
 /// It must stay false: a forwarded non-manifest `configure` must be rejected by
 /// the fail-closed gate BEFORE building a RawRequest, so the attacker's tiers
@@ -1598,6 +1713,335 @@ async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
             .expect("goodbye frame"),
     )
     .await;
+}
+
+async fn drive_bash_fast_foreground_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        100,
+        "bash",
+        json!({
+            "command": "printf 'subc-fast\\n'",
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "fast bash response").await;
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 100);
+    assert!(!tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(text.contains("subc-fast"), "unexpected bash text: {text:?}");
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(250),
+        "extra fast bash response",
+    )
+    .await;
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_promotion_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        101,
+        "bash",
+        json!({
+            "command": "sleep 2; printf 'promoted-done\\n'",
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "promoted bash response").await;
+    assert_eq!(frame.header.corr, 101);
+    assert!(!tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(
+        text.contains("promoted to background"),
+        "expected promotion text, got {text:?}"
+    );
+    let task_id = extract_bash_task_id(&text);
+    send_tool_call(
+        &mut stream,
+        1,
+        102,
+        "bash_status",
+        json!({ "params": { "task_id": task_id } }),
+    )
+    .await;
+    let status = read_frame_timeout(&mut stream, "promoted bash status").await;
+    assert_eq!(status.header.corr, 102);
+    let response = tool_response_json(&status);
+    assert_eq!(response["success"].as_bool(), Some(true));
+    assert_eq!(response["task_id"].as_str(), Some(task_id.as_str()));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_block_to_completion_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let started = Instant::now();
+    send_tool_call(
+        &mut stream,
+        1,
+        103,
+        "bash",
+        json!({
+            "command": "sleep 1; printf 'block-done\\n'",
+            "foreground_orchestrate": true,
+            "block_to_completion": true,
+            "timeout": 5_000,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "block-to-completion bash response").await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "block_to_completion returned too early after {elapsed:?}"
+    );
+    assert_eq!(frame.header.corr, 103);
+    assert!(!tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(
+        text.contains("block-done"),
+        "unexpected bash text: {text:?}"
+    );
+    assert!(!text.contains("promoted to background"));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_background_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        104,
+        "bash",
+        json!({
+            "command": "sleep 1; printf 'background-done\\n'",
+            "background": true,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "background bash response").await;
+    assert_eq!(frame.header.corr, 104);
+    assert!(!tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(
+        text.contains("Background task started"),
+        "unexpected background launch text: {text:?}"
+    );
+    let task_id = extract_bash_task_id(&text);
+    send_tool_call(
+        &mut stream,
+        1,
+        105,
+        "bash_status",
+        json!({ "params": { "task_id": task_id } }),
+    )
+    .await;
+    let status = read_frame_timeout(&mut stream, "background bash status").await;
+    let response = tool_response_json(&status);
+    assert_eq!(response["success"].as_bool(), Some(true));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_nonzero_exit_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        106,
+        "bash",
+        json!({
+            "command": "printf 'subc-fail\\n'; exit 7",
+            "foreground_orchestrate": true,
+            "block_to_completion": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "nonzero bash response").await;
+    assert_eq!(frame.header.corr, 106);
+    assert!(!tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(text.contains("subc-fail"), "unexpected bash text: {text:?}");
+    assert!(
+        text.contains("[exit code: 7]"),
+        "missing exit code in {text:?}"
+    );
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_lane_nonoccupancy_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        107,
+        "bash",
+        json!({
+            "command": "sleep 2; printf 'lane-done\\n'",
+            "foreground_orchestrate": true,
+            "block_to_completion": true,
+            "timeout": 5_000,
+            "compressed": false,
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = Instant::now();
+    send_tool_call(&mut stream, 1, 108, "echo", json!({ "case": "fast" })).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        109,
+        "subc_test_emit_status",
+        json!({ "marker": "lane-mutating", "seq": 1 }),
+    )
+    .await;
+    let first = read_frame_within(
+        &mut stream,
+        Duration::from_secs(1),
+        "lane nonoccupancy response",
+    )
+    .await
+    .expect("first lane nonoccupancy response");
+    let second = read_frame_within(
+        &mut stream,
+        Duration::from_secs(1),
+        "lane nonoccupancy response",
+    )
+    .await
+    .expect("second lane nonoccupancy response");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "lane work was blocked for {elapsed:?}"
+    );
+    assert_eq!(
+        HashSet::from([first.header.corr, second.header.corr]),
+        HashSet::from([108, 109]),
+        "pure-read and mutating tool calls should both beat the pending bash final response"
+    );
+    assert!(
+        !tool_result_is_error(&first),
+        "first lane response corr {} failed: {}",
+        first.header.corr,
+        tool_result_text(&first)
+    );
+    assert!(
+        !tool_result_is_error(&second),
+        "second lane response corr {} failed: {}",
+        second.header.corr,
+        tool_result_text(&second)
+    );
+    let bash = read_frame_timeout(&mut stream, "lane bash final response").await;
+    assert_eq!(bash.header.corr, 107);
+    let text = tool_result_text(&bash);
+    assert!(text.contains("lane-done"), "unexpected bash text: {text:?}");
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_route_close_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        110,
+        "bash",
+        json!({
+            "command": "sleep 5; printf 'closed-route-done\\n'",
+            "foreground_orchestrate": true,
+            "block_to_completion": true,
+            "timeout": 10_000,
+            "compressed": false,
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Goodbye, control_flags(), 1, 111, Vec::new())
+            .expect("route goodbye frame"),
+    )
+    .await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(500),
+        "closed route deferred bash response",
+    )
+    .await;
+    send_route_bind(&mut stream, 1, 112, &root1).await;
+    expect_route_bind_ack(&mut stream, 112).await;
+    send_tool_call(&mut stream, 1, 113, "echo", json!({ "case": "fast" })).await;
+    let frame = read_frame_timeout(&mut stream, "post-route-close response").await;
+    assert_eq!(frame.header.corr, 113);
+    assert_eq!(tool_response_json(&frame)["success"].as_bool(), Some(true));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_routes_1_and_4(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        114,
+        "bash",
+        json!({
+            "command": "sleep 2; printf 'promote-failure-done\\n'",
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "promote failure bash response").await;
+    assert_eq!(frame.header.corr, 114);
+    assert!(tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(
+        text.contains("forced subc bash promote failure"),
+        "expected promote failure text, got {text:?}"
+    );
+    send_tool_call(&mut stream, 4, 115, "echo", json!({ "case": "fast" })).await;
+    let alive = read_frame_timeout(&mut stream, "post-promote-failure response").await;
+    assert_eq!(alive.header.channel, 4);
+    assert_eq!(alive.header.corr, 115);
+    assert_eq!(tool_response_json(&alive)["success"].as_bool(), Some(true));
+    send_connection_goodbye(&mut stream).await;
 }
 
 async fn drive_core_routing_daemon(input: FakeDaemonInput) {
@@ -2864,6 +3308,72 @@ async fn read_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str) -> 
             return frame;
         }
     }
+}
+
+async fn read_frame_within(
+    stream: &mut tokio::net::TcpStream,
+    timeout: Duration,
+    label: &str,
+) -> Option<Frame> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = match tokio::time::timeout(remaining, read_frame(stream)).await {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) => panic!("EOF waiting for {label}"),
+            Ok(Err(error)) => panic!("read frame for {label}: {error}"),
+            Err(_) => return None,
+        };
+        if frame.header.ty != FrameType::Push {
+            return Some(frame);
+        }
+    }
+}
+
+async fn assert_no_response_frame_within(
+    stream: &mut tokio::net::TcpStream,
+    timeout: Duration,
+    label: &str,
+) {
+    if let Some(frame) = read_frame_within(stream, timeout, label).await {
+        panic!(
+            "unexpected non-push frame while waiting for {label}: {:?}",
+            frame.header
+        );
+    }
+}
+
+fn tool_result_body(frame: &Frame) -> Value {
+    serde_json::from_slice(&frame.body).expect("tool result body")
+}
+
+fn tool_result_text(frame: &Frame) -> String {
+    let body = tool_result_body(frame);
+    body["content"][0]["text"]
+        .as_str()
+        .expect("tool result text")
+        .to_string()
+}
+
+fn tool_result_is_error(frame: &Frame) -> bool {
+    tool_result_body(frame)["isError"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+fn extract_bash_task_id(text: &str) -> String {
+    let start = text
+        .find("bash-")
+        .unwrap_or_else(|| panic!("no bash task id in {text:?}"));
+    let tail = &text[start..];
+    let end = tail
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .unwrap_or(tail.len());
+    tail[..end].to_string()
 }
 
 async fn expect_route_bind_ack(stream: &mut tokio::net::TcpStream, corr: u64) {

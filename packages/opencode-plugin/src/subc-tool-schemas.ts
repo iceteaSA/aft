@@ -6,6 +6,8 @@
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+
+import { createBashTool } from "./tools/bash.js";
 import { createReadTool, hoistedTools } from "./tools/hoisted.js";
 import { inspectTools } from "./tools/inspect.js";
 import { readingTools } from "./tools/reading.js";
@@ -22,6 +24,7 @@ const STATUS_SCHEMA = {
 } as const;
 
 const BARE_TOOL_ORDER = [
+  "bash",
   "edit",
   "grep",
   "inspect",
@@ -59,6 +62,7 @@ function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
  */
 export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, unknown>> {
   const ctx = makeSubcSchemaStubCtx();
+  const bash = createBashTool(ctx);
   const read = createReadTool(ctx);
   const { write, edit } = hoistedTools(ctx);
   if (!write || !edit) {
@@ -73,8 +77,21 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
   const outline = readingTools(ctx).aft_outline;
   const inspect = inspectTools(ctx).aft_inspect;
 
+  const bashSchema = argsToJsonSchema(bash);
+  const bashProperties = (bashSchema.properties ??= {}) as Record<string, unknown>;
+  bashProperties.foreground_orchestrate = {
+    type: "boolean",
+    description: "Consumer-set flag enabling server-side foreground orchestration.",
+  };
+  bashProperties.block_to_completion = {
+    type: "boolean",
+    description:
+      "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting.",
+  };
+
   return {
     status: { ...STATUS_SCHEMA },
+    bash: bashSchema,
     read: argsToJsonSchema(read),
     write: argsToJsonSchema(write),
     edit: argsToJsonSchema(edit),

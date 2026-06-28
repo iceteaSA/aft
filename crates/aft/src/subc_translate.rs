@@ -180,6 +180,7 @@ pub fn subc_translate_with_context(
     ctx: TranslateContext,
 ) -> Result<Translated, TranslateError> {
     match bare_name {
+        "bash" => translate_bash(agent_args, project_root),
         "status" => Ok(Translated {
             command: "status".into(),
             args: Map::new(),
@@ -219,6 +220,122 @@ fn coerce_boolean(value: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn translate_bash(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = args
+        .as_object()
+        .and_then(|obj| obj.get("params"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| agent_args_map(args));
+    let command = map_in
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_request("'command' is required"))?;
+
+    let mut out = Map::new();
+    out.insert("command".to_string(), Value::String(command.to_string()));
+
+    if let Some(timeout) =
+        coerce_optional_int_result(map_in.get("timeout"), "timeout", 1, MAX_SAFE_INTEGER)?
+    {
+        out.insert("timeout".to_string(), Value::Number(timeout.into()));
+    }
+
+    if let Some(workdir) = map_in
+        .get("workdir")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        let resolved = resolve_path_from_project_root(project_root, workdir);
+        out.insert(
+            "workdir".to_string(),
+            Value::String(resolved.to_string_lossy().into_owned()),
+        );
+    }
+
+    if let Some(description) = map_in
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        out.insert(
+            "description".to_string(),
+            Value::String(description.to_string()),
+        );
+    }
+
+    let background = map_in.get("background").is_some_and(coerce_boolean);
+    let pty = map_in.get("pty").is_some_and(coerce_boolean);
+    out.insert("background".to_string(), Value::Bool(background));
+    out.insert("pty".to_string(), Value::Bool(pty));
+    out.insert(
+        "notify_on_completion".to_string(),
+        Value::Bool(background || pty),
+    );
+
+    if let Some(rows) = coerce_optional_int_result(
+        map_in.get("ptyRows").or_else(|| map_in.get("pty_rows")),
+        "ptyRows",
+        1,
+        60,
+    )? {
+        out.insert("pty_rows".to_string(), Value::Number(rows.into()));
+    }
+    if let Some(cols) = coerce_optional_int_result(
+        map_in.get("ptyCols").or_else(|| map_in.get("pty_cols")),
+        "ptyCols",
+        1,
+        140,
+    )? {
+        out.insert("pty_cols".to_string(), Value::Number(cols.into()));
+    }
+
+    if let Some(compressed) = map_in.get("compressed") {
+        out.insert(
+            "compressed".to_string(),
+            Value::Bool(coerce_boolean(compressed)),
+        );
+    }
+
+    let foreground_orchestrate = map_in
+        .get("foreground_orchestrate")
+        .map(coerce_boolean)
+        .unwrap_or(true);
+    let block_to_completion = map_in
+        .get("block_to_completion")
+        .map(coerce_boolean)
+        .unwrap_or(false);
+    out.insert(
+        "foreground_orchestrate".to_string(),
+        Value::Bool(foreground_orchestrate),
+    );
+    out.insert(
+        "block_to_completion".to_string(),
+        Value::Bool(block_to_completion),
+    );
+
+    if let Some(permissions_granted) = map_in.get("permissions_granted") {
+        out.insert(
+            "permissions_granted".to_string(),
+            permissions_granted.clone(),
+        );
+    }
+    if let Some(permissions_requested) = map_in.get("permissions_requested") {
+        out.insert(
+            "permissions_requested".to_string(),
+            Value::Bool(coerce_boolean(permissions_requested)),
+        );
+    }
+    if let Some(env) = map_in.get("env") {
+        out.insert("env".to_string(), env.clone());
+    }
+
+    Ok(Translated {
+        command: "bash".into(),
+        args: out,
+    })
 }
 
 fn translate_callgraph(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {

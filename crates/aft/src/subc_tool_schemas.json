@@ -1,4 +1,63 @@
 {
+  "bash": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "command": {
+        "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+        "type": "string"
+      },
+      "timeout": {
+        "description": "Hard kill cap in milliseconds (positive integer). When omitted, the task can run up to 30 minutes. Foreground bash returns inline if the command finishes within ~8s (configurable via bash.foreground_wait_window_ms); otherwise it's automatically promoted to background and a completion reminder is delivered when the task actually finishes.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 9007199254740991
+      },
+      "workdir": {
+        "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+        "type": "string"
+      },
+      "description": {
+        "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+        "type": "string"
+      },
+      "background": {
+        "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+        "type": "boolean"
+      },
+      "compressed": {
+        "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+        "type": "boolean"
+      },
+      "pty": {
+        "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+        "type": "boolean"
+      },
+      "ptyRows": {
+        "description": "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 60
+      },
+      "ptyCols": {
+        "description": "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 140
+      },
+      "foreground_orchestrate": {
+        "type": "boolean",
+        "description": "Consumer-set flag enabling server-side foreground orchestration."
+      },
+      "block_to_completion": {
+        "type": "boolean",
+        "description": "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting."
+      }
+    },
+    "required": [
+      "command"
+    ]
+  },
   "edit": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",

@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,11 @@ const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 /// long-running reminders that arrive after their reliable completion event.
 const COMPLETED_TASK_SUPPRESSION_MAX: usize = 4096;
 
+/// Bash foreground orchestration polls detached tasks with short read-lane jobs.
+/// The sleep between polls is outside the executor so no read or write worker is
+/// pinned while a foreground command is still running.
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 type RouteChannel = u32;
 type PushEnvelope = (ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(ReplayKey, PushFrame)>>;
@@ -76,11 +82,89 @@ struct PushSenders {
     reliable_tx: mpsc::UnboundedSender<PushEnvelope>,
 }
 
+#[derive(Clone)]
+struct PersistentCancelSignal {
+    inner: Arc<PersistentCancelInner>,
+}
+
+struct PersistentCancelInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl PersistentCancelSignal {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(PersistentCancelInner {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BashWaitCancel {
+    connection: PersistentCancelSignal,
+    route: PersistentCancelSignal,
+}
+
+impl BashWaitCancel {
+    async fn cancelled(&self) {
+        tokio::select! {
+            _ = self.connection.cancelled() => {}
+            _ = self.route.cancelled() => {}
+        }
+    }
+}
+
+struct RouteBashCancel {
+    token: PersistentCancelSignal,
+    active_waits: usize,
+}
+
+struct BashDeferredCompletion {
+    channel: u16,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    root: ProjectRootId,
+    request_id: String,
+    result: Option<ToolCallResult>,
+    spawn_fatal: bool,
+}
+
 #[derive(Debug)]
+/// Per-root route metadata owned by the subc loop. The `active_bash_waits` field
+/// counts detached bash processes that are still being observed for this root.
+/// Any future logic that evicts roots based on idle time must not evict a root
+/// while this count is greater than zero, because a foreground bash response may
+/// still arrive later.
 struct RootMeta {
     maintenance_pending: bool,
     last_touched: Instant,
     diagnostics_on_edit: bool,
+    active_bash_waits: usize,
 }
 
 #[derive(Debug)]
@@ -160,6 +244,7 @@ impl RootMeta {
             maintenance_pending: false,
             last_touched: now,
             diagnostics_on_edit: false,
+            active_bash_waits: 0,
         }
     }
 
@@ -946,6 +1031,8 @@ where
     let shutdown = Arc::new(Notify::new());
     let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<(ProjectRootId, Response)>(256);
+    let (bash_deferred_tx, mut bash_deferred_rx) = mpsc::channel::<BashDeferredCompletion>(256);
+    let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
         mpsc::channel::<RouteBindCompletion>(256);
     let (lossy_tx, mut lossy_rx) = mpsc::channel::<PushEnvelope>(1024);
@@ -954,6 +1041,7 @@ where
         lossy_tx,
         reliable_tx,
     };
+    let connection_cancel = PersistentCancelSignal::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut session_identity: HashMap<(ProjectRootId, String), String> = HashMap::new();
@@ -962,6 +1050,7 @@ where
     let mut completed_tasks = CompletedTaskIds::default();
     let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
     let mut pending_binds: HashMap<RouteChannel, PendingBind> = HashMap::new();
+    let mut route_bash_cancels: HashMap<RouteChannel, RouteBashCancel> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
         tokio::select! {
@@ -1002,6 +1091,9 @@ where
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel);
+                        if let Some(cancel) = route_bash_cancels.remove(&channel) {
+                            cancel.token.cancel();
+                        }
                         if let Some(pending) = pending_binds.get_mut(&channel) {
                             pending.cancelled = true;
                             log::debug!(
@@ -1078,6 +1170,10 @@ where
                             &mut live_roots,
                             &executor,
                             &shutdown,
+                            &connection_cancel,
+                            &bash_deferred_tx,
+                            &bash_poll_touch_tx,
+                            &mut route_bash_cancels,
                             dispatch,
                             allow_native_passthrough,
                         )
@@ -1170,6 +1266,25 @@ where
                     break Err(error);
                 }
             }
+            Some(done) = bash_deferred_rx.recv() => {
+                if let Err(error) = handle_bash_deferred_completion(
+                    &writer_tx,
+                    done,
+                    &routes,
+                    &mut live_roots,
+                    &mut route_bash_cancels,
+                    &shutdown,
+                )
+                .await
+                {
+                    break Err(error);
+                }
+            }
+            Some(root_id) = bash_poll_touch_rx.recv() => {
+                if let Some(meta) = live_roots.get_mut(&root_id) {
+                    meta.touch();
+                }
+            }
             Some((root_id, response)) = maintenance_rx.recv() => {
                 if let Some(meta) = live_roots.get_mut(&root_id) {
                     meta.maintenance_pending = false;
@@ -1210,6 +1325,7 @@ where
 
     // The reader task may be parked on `read_frame`; abort it (we are done with
     // the connection) and flush the writer.
+    connection_cancel.cancel();
     reader_task.abort();
     drop(writer_tx);
     let writer_result = finish_writer_task(writer_task).await;
@@ -1852,6 +1968,10 @@ async fn handle_tool_call(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
+    connection_cancel: &PersistentCancelSignal,
+    bash_deferred_tx: &mpsc::Sender<BashDeferredCompletion>,
+    bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    route_bash_cancels: &mut HashMap<RouteChannel, RouteBashCancel>,
     dispatch: DispatchFn,
     allow_native_passthrough: bool,
 ) -> Result<(), SubcError> {
@@ -1929,6 +2049,45 @@ async fn handle_tool_call(
             &result,
         )?;
         return send_frame(tx, response_frame).await;
+    }
+
+    if bare_name == "bash" {
+        let meta = live_roots
+            .entry(identity.root.clone())
+            .or_insert_with(|| RootMeta::new(Instant::now()));
+        meta.active_bash_waits = meta.active_bash_waits.saturating_add(1);
+        meta.touch();
+
+        let route_cancel = route_bash_cancels
+            .entry(route_id)
+            .or_insert_with(|| RouteBashCancel {
+                token: PersistentCancelSignal::new(),
+                active_waits: 0,
+            });
+        route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
+        let cancel = BashWaitCancel {
+            connection: connection_cancel.clone(),
+            route: route_cancel.token.clone(),
+        };
+
+        submit_deferred_bash(
+            executor,
+            bash_deferred_tx,
+            bash_poll_touch_tx,
+            dispatch,
+            identity.root,
+            identity.project_root,
+            identity.session,
+            request_id,
+            frame.header.channel,
+            frame.header.corr,
+            frame.header.flags,
+            frame.header.ver,
+            call.arguments,
+            format_context,
+            cancel,
+        );
+        return Ok(());
     }
 
     let lane = command_lane(&bare_name);
@@ -2018,6 +2177,670 @@ async fn handle_tool_call(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BashTranslatedSettings {
+    background: bool,
+    pty: bool,
+    block_to_completion: bool,
+    timeout: Option<u64>,
+}
+
+enum BashSpawnControl {
+    Immediate {
+        spawn_fatal: bool,
+    },
+    Foreground {
+        task_id: String,
+        session_id: String,
+        project_root: Option<PathBuf>,
+        storage_dir: PathBuf,
+        deadline: Instant,
+        block_to_completion: bool,
+        timeout: Option<u64>,
+        wait_window_ms: u64,
+    },
+}
+
+enum BashPollControl {
+    Done,
+    Promote,
+    Wait,
+}
+
+fn bash_settings_from_translated(args: &serde_json::Map<String, Value>) -> BashTranslatedSettings {
+    BashTranslatedSettings {
+        background: args
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        pty: args.get("pty").and_then(Value::as_bool).unwrap_or(false),
+        block_to_completion: args
+            .get("block_to_completion")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        timeout: args.get("timeout").and_then(Value::as_u64),
+    }
+}
+
+fn finalized_bash_result(
+    mut response: Response,
+    ctx: &AppContext,
+    session_id: &str,
+    format_context: &crate::subc_format::FormatContext,
+) -> ToolCallResult {
+    crate::response_finalize::finalize_response(&mut response, ctx, session_id, "bash");
+    bash_result_from_response(response, format_context)
+}
+
+fn bash_result_from_response(
+    response: Response,
+    format_context: &crate::subc_format::FormatContext,
+) -> ToolCallResult {
+    let text = crate::subc_format::format_response_with_context("bash", &response, format_context);
+    ToolCallResult { text, response }
+}
+
+fn bash_background_launch_response(request_id: &str, task_id: &str, is_pty: bool) -> Response {
+    Response::success(
+        request_id,
+        json!({
+            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty),
+            "task_id": task_id,
+            "status": "running",
+            "mode": if is_pty { "pty" } else { "pipes" },
+        }),
+    )
+}
+
+fn finish_bash_spawn_immediate(
+    response: Response,
+    spawn_fatal: bool,
+    ctx: &AppContext,
+    session_id: &str,
+    format_context: &crate::subc_format::FormatContext,
+    text_tx: &mut Option<oneshot::Sender<String>>,
+    control_tx: &mut Option<oneshot::Sender<BashSpawnControl>>,
+) -> Response {
+    let result = finalized_bash_result(response, ctx, session_id, format_context);
+    let ToolCallResult { text, response } = result;
+    if let Some(tx) = text_tx.take() {
+        let _ = tx.send(text);
+    }
+    if let Some(tx) = control_tx.take() {
+        let _ = tx.send(BashSpawnControl::Immediate { spawn_fatal });
+    }
+    response
+}
+
+fn finish_bash_poll_done(
+    response: Response,
+    ctx: &AppContext,
+    session_id: &str,
+    format_context: &crate::subc_format::FormatContext,
+    text_tx: &mut Option<oneshot::Sender<String>>,
+    control_tx: &mut Option<oneshot::Sender<BashPollControl>>,
+) -> Response {
+    let result = finalized_bash_result(response, ctx, session_id, format_context);
+    let ToolCallResult { text, response } = result;
+    if let Some(tx) = text_tx.take() {
+        let _ = tx.send(text);
+    }
+    if let Some(tx) = control_tx.take() {
+        let _ = tx.send(BashPollControl::Done);
+    }
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_deferred_bash(
+    executor: &Arc<Executor>,
+    completion_tx: &mpsc::Sender<BashDeferredCompletion>,
+    poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    dispatch: DispatchFn,
+    root: ProjectRootId,
+    project_root: PathBuf,
+    session_id: String,
+    request_id: String,
+    route_channel: u16,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    arguments: Value,
+    format_context: crate::subc_format::FormatContext,
+    cancel: BashWaitCancel,
+) {
+    let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
+    let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
+    let root_for_spawn = root.clone();
+    let request_id_for_spawn = request_id.clone();
+    let session_for_spawn = session_id.clone();
+    let project_root_for_spawn = project_root.clone();
+    let format_context_for_spawn = format_context.clone();
+    let spawn_rx = executor.submit_async(
+        root_for_spawn,
+        Lane::Mutating,
+        request_id.clone(),
+        Box::new(move |ctx| {
+            log_ctx::with_session(Some(session_for_spawn.clone()), || {
+                let mut spawn_text_tx = Some(spawn_text_tx);
+                let mut spawn_control_tx = Some(spawn_control_tx);
+
+                let translated = match crate::subc_translate::subc_translate(
+                    "bash",
+                    &arguments,
+                    &project_root_for_spawn,
+                ) {
+                    Ok(translated) => translated,
+                    Err(error) => {
+                        let response = Response::error(
+                            request_id_for_spawn.clone(),
+                            error.code,
+                            error.message,
+                        );
+                        return finish_bash_spawn_immediate(
+                            response,
+                            false,
+                            ctx,
+                            &session_for_spawn,
+                            &format_context_for_spawn,
+                            &mut spawn_text_tx,
+                            &mut spawn_control_tx,
+                        );
+                    }
+                };
+                let settings = bash_settings_from_translated(&translated.args);
+                let raw_req = RawRequest {
+                    id: request_id_for_spawn.clone(),
+                    command: "bash".to_string(),
+                    lsp_hints: None,
+                    session_id: Some(session_for_spawn.clone()),
+                    params: Value::Object(translated.args),
+                };
+                let response = dispatch(raw_req, ctx);
+                let spawn_fatal = response_is_internal_error(&response);
+                if !response.success {
+                    return finish_bash_spawn_immediate(
+                        response,
+                        spawn_fatal,
+                        ctx,
+                        &session_for_spawn,
+                        &format_context_for_spawn,
+                        &mut spawn_text_tx,
+                        &mut spawn_control_tx,
+                    );
+                }
+
+                let Some(task_id) = response
+                    .data
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                else {
+                    return finish_bash_spawn_immediate(
+                        response,
+                        false,
+                        ctx,
+                        &session_for_spawn,
+                        &format_context_for_spawn,
+                        &mut spawn_text_tx,
+                        &mut spawn_control_tx,
+                    );
+                };
+                if response.data.get("status").and_then(Value::as_str) != Some("running") {
+                    return finish_bash_spawn_immediate(
+                        response,
+                        false,
+                        ctx,
+                        &session_for_spawn,
+                        &format_context_for_spawn,
+                        &mut spawn_text_tx,
+                        &mut spawn_control_tx,
+                    );
+                }
+
+                let mode = response
+                    .data
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pipes");
+                let is_pty = mode == "pty" || settings.pty;
+                if is_pty || settings.background {
+                    let response =
+                        bash_background_launch_response(&request_id_for_spawn, &task_id, is_pty);
+                    return finish_bash_spawn_immediate(
+                        response,
+                        false,
+                        ctx,
+                        &session_for_spawn,
+                        &format_context_for_spawn,
+                        &mut spawn_text_tx,
+                        &mut spawn_control_tx,
+                    );
+                }
+
+                let wait_window_ms =
+                    crate::commands::bash_orchestrate::resolve_foreground_wait_window_ms(
+                        ctx.config().foreground_wait_window_ms,
+                    );
+                let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
+                let storage_dir =
+                    crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+                let project_root = ctx.config().project_root.clone();
+                if let Some(tx) = spawn_control_tx.take() {
+                    let _ = tx.send(BashSpawnControl::Foreground {
+                        task_id,
+                        session_id: session_for_spawn.clone(),
+                        project_root,
+                        storage_dir,
+                        deadline,
+                        block_to_completion: settings.block_to_completion,
+                        timeout: settings.timeout,
+                        wait_window_ms,
+                    });
+                }
+                response
+            })
+        }),
+    );
+
+    let executor = Arc::clone(executor);
+    let completion_tx = completion_tx.clone();
+    let poll_touch_tx = poll_touch_tx.clone();
+    let root_for_task = root.clone();
+    tokio::spawn(async move {
+        let spawn_response = await_executor_response(spawn_rx, request_id.clone()).await;
+        let spawn_control = spawn_control_rx.await;
+        match spawn_control {
+            Ok(BashSpawnControl::Immediate { spawn_fatal }) => {
+                let text = spawn_text_rx.await.unwrap_or_else(|_| {
+                    crate::subc_format::format_response_with_context(
+                        "bash",
+                        &spawn_response,
+                        &format_context,
+                    )
+                });
+                let result = ToolCallResult {
+                    text,
+                    response: spawn_response,
+                };
+                send_bash_deferred_completion(
+                    &completion_tx,
+                    route_channel,
+                    corr,
+                    flags,
+                    ver,
+                    root_for_task,
+                    request_id,
+                    Some(result),
+                    spawn_fatal,
+                )
+                .await;
+            }
+            Ok(BashSpawnControl::Foreground {
+                task_id,
+                session_id,
+                project_root,
+                storage_dir,
+                deadline,
+                block_to_completion,
+                timeout,
+                wait_window_ms,
+            }) => {
+                run_deferred_bash_wait(
+                    executor,
+                    completion_tx,
+                    poll_touch_tx,
+                    route_channel,
+                    corr,
+                    flags,
+                    ver,
+                    root_for_task,
+                    request_id,
+                    task_id,
+                    session_id,
+                    project_root,
+                    storage_dir,
+                    deadline,
+                    block_to_completion,
+                    timeout,
+                    wait_window_ms,
+                    format_context,
+                    cancel,
+                )
+                .await;
+            }
+            Err(_) => {
+                let spawn_fatal = response_is_internal_error(&spawn_response);
+                let result = bash_result_from_response(spawn_response, &format_context);
+                send_bash_deferred_completion(
+                    &completion_tx,
+                    route_channel,
+                    corr,
+                    flags,
+                    ver,
+                    root_for_task,
+                    request_id,
+                    Some(result),
+                    spawn_fatal,
+                )
+                .await;
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_deferred_bash_wait(
+    executor: Arc<Executor>,
+    completion_tx: mpsc::Sender<BashDeferredCompletion>,
+    poll_touch_tx: mpsc::Sender<ProjectRootId>,
+    route_channel: u16,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    root: ProjectRootId,
+    request_id: String,
+    task_id: String,
+    session_id: String,
+    project_root: Option<PathBuf>,
+    storage_dir: PathBuf,
+    deadline: Instant,
+    block_to_completion: bool,
+    timeout: Option<u64>,
+    wait_window_ms: u64,
+    format_context: crate::subc_format::FormatContext,
+    cancel: BashWaitCancel,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                send_bash_deferred_completion(
+                    &completion_tx,
+                    route_channel,
+                    corr,
+                    flags,
+                    ver,
+                    root,
+                    request_id,
+                    None,
+                    false,
+                )
+                .await;
+                break;
+            }
+            _ = tokio::time::sleep(PENDING_POLL_INTERVAL) => {
+                let (poll_control_tx, poll_control_rx) = oneshot::channel::<BashPollControl>();
+                let (poll_text_tx, poll_text_rx) = oneshot::channel::<String>();
+                let root_for_poll = root.clone();
+                let request_id_for_poll = request_id.clone();
+                let task_id_for_poll = task_id.clone();
+                let session_for_poll = session_id.clone();
+                let storage_for_poll = storage_dir.clone();
+                let project_root_for_poll = project_root.clone();
+                let format_context_for_poll = format_context.clone();
+                let poll_rx = executor.submit_async(
+                    root_for_poll,
+                    Lane::PureRead,
+                    request_id.clone(),
+                    Box::new(move |ctx| {
+                        log_ctx::with_session(Some(session_for_poll.clone()), || {
+                            let mut poll_text_tx = Some(poll_text_tx);
+                            let mut poll_control_tx = Some(poll_control_tx);
+
+                            let Some(snapshot) = crate::commands::bash_orchestrate::poll_bash_status(
+                                ctx,
+                                &task_id_for_poll,
+                                &session_for_poll,
+                                project_root_for_poll.as_deref(),
+                                &storage_for_poll,
+                                crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES,
+                            ) else {
+                                return finish_bash_poll_done(
+                                    crate::commands::bash_orchestrate::task_not_found_response(
+                                        &request_id_for_poll,
+                                        &task_id_for_poll,
+                                    ),
+                                    ctx,
+                                    &session_for_poll,
+                                    &format_context_for_poll,
+                                    &mut poll_text_tx,
+                                    &mut poll_control_tx,
+                                );
+                            };
+
+                            match crate::commands::bash_orchestrate::decide_bash_step(
+                                snapshot,
+                                deadline,
+                                block_to_completion,
+                                Instant::now(),
+                                &request_id_for_poll,
+                            ) {
+                                crate::commands::bash_orchestrate::BashStep::Done(response) => {
+                                    finish_bash_poll_done(
+                                        response,
+                                        ctx,
+                                        &session_for_poll,
+                                        &format_context_for_poll,
+                                        &mut poll_text_tx,
+                                        &mut poll_control_tx,
+                                    )
+                                }
+                                crate::commands::bash_orchestrate::BashStep::Promote => {
+                                    if let Some(tx) = poll_control_tx.take() {
+                                        let _ = tx.send(BashPollControl::Promote);
+                                    }
+                                    Response::success(
+                                        request_id_for_poll,
+                                        json!({ "subc_bash_step": "promote" }),
+                                    )
+                                }
+                                crate::commands::bash_orchestrate::BashStep::Wait => {
+                                    if let Some(tx) = poll_control_tx.take() {
+                                        let _ = tx.send(BashPollControl::Wait);
+                                    }
+                                    Response::success(
+                                        request_id_for_poll,
+                                        json!({ "subc_bash_step": "wait" }),
+                                    )
+                                }
+                            }
+                        })
+                    }),
+                );
+                let poll_response = await_executor_response(poll_rx, request_id.clone()).await;
+                let _ = poll_touch_tx.send(root.clone()).await;
+                match poll_control_rx.await.unwrap_or(BashPollControl::Done) {
+                    BashPollControl::Done => {
+                        let text = poll_text_rx.await.unwrap_or_else(|_| {
+                            crate::subc_format::format_response_with_context(
+                                "bash",
+                                &poll_response,
+                                &format_context,
+                            )
+                        });
+                        let result = ToolCallResult {
+                            text,
+                            response: poll_response,
+                        };
+                        send_bash_deferred_completion(
+                            &completion_tx,
+                            route_channel,
+                            corr,
+                            flags,
+                            ver,
+                            root,
+                            request_id,
+                            Some(result),
+                            false,
+                        )
+                        .await;
+                        break;
+                    }
+                    BashPollControl::Promote => {
+                        let result = submit_bash_promote(
+                            &executor,
+                            root.clone(),
+                            request_id.clone(),
+                            task_id.clone(),
+                            session_id.clone(),
+                            timeout,
+                            wait_window_ms,
+                            format_context.clone(),
+                        )
+                        .await;
+                        send_bash_deferred_completion(
+                            &completion_tx,
+                            route_channel,
+                            corr,
+                            flags,
+                            ver,
+                            root,
+                            request_id,
+                            Some(result),
+                            false,
+                        )
+                        .await;
+                        break;
+                    }
+                    BashPollControl::Wait => {}
+                }
+            }
+        }
+    }
+}
+
+async fn submit_bash_promote(
+    executor: &Arc<Executor>,
+    root: ProjectRootId,
+    request_id: String,
+    task_id: String,
+    session_id: String,
+    timeout: Option<u64>,
+    wait_window_ms: u64,
+    format_context: crate::subc_format::FormatContext,
+) -> ToolCallResult {
+    let (text_tx, text_rx) = oneshot::channel::<String>();
+    let request_id_for_promote = request_id.clone();
+    let task_id_for_promote = task_id.clone();
+    let session_for_promote = session_id.clone();
+    let format_context_for_promote = format_context.clone();
+    let promote_rx = executor.submit_async(
+        root,
+        Lane::Mutating,
+        request_id.clone(),
+        Box::new(move |ctx| {
+            log_ctx::with_session(Some(session_for_promote.clone()), || {
+                let response =
+                    if std::env::var_os("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR").is_some() {
+                        Response::error(
+                            &request_id_for_promote,
+                            "execution_failed",
+                            "forced subc bash promote failure",
+                        )
+                    } else {
+                        crate::commands::bash_orchestrate::promote_bash(
+                            ctx,
+                            &task_id_for_promote,
+                            &session_for_promote,
+                            ctx.config().project_root.as_deref(),
+                            timeout,
+                            wait_window_ms,
+                            &request_id_for_promote,
+                        )
+                    };
+                let result = finalized_bash_result(
+                    response,
+                    ctx,
+                    &session_for_promote,
+                    &format_context_for_promote,
+                );
+                let ToolCallResult { text, response } = result;
+                let _ = text_tx.send(text);
+                response
+            })
+        }),
+    );
+    let response = await_executor_response(promote_rx, request_id).await;
+    let text = text_rx.await.unwrap_or_else(|_| {
+        crate::subc_format::format_response_with_context("bash", &response, &format_context)
+    });
+    ToolCallResult { text, response }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_bash_deferred_completion(
+    completion_tx: &mpsc::Sender<BashDeferredCompletion>,
+    channel: u16,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    root: ProjectRootId,
+    request_id: String,
+    result: Option<ToolCallResult>,
+    spawn_fatal: bool,
+) {
+    let _ = completion_tx
+        .send(BashDeferredCompletion {
+            channel,
+            corr,
+            flags,
+            ver,
+            root,
+            request_id,
+            result,
+            spawn_fatal,
+        })
+        .await;
+}
+
+async fn handle_bash_deferred_completion(
+    tx: &mpsc::Sender<Frame>,
+    done: BashDeferredCompletion,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+) -> Result<(), SubcError> {
+    if let Some(meta) = live_roots.get_mut(&done.root) {
+        meta.active_bash_waits = meta.active_bash_waits.saturating_sub(1);
+        meta.touch();
+    }
+    let route_id = route_key(done.channel);
+    let remove_route_cancel = if let Some(cancel) = route_bash_cancels.get_mut(&route_id) {
+        cancel.active_waits = cancel.active_waits.saturating_sub(1);
+        cancel.active_waits == 0
+    } else {
+        false
+    };
+    if remove_route_cancel {
+        route_bash_cancels.remove(&route_id);
+    }
+
+    if let Some(result) = done.result {
+        if routes.contains_key(&route_id) {
+            let frame =
+                build_tool_response_frame(done.ver, done.channel, done.corr, done.flags, &result)?;
+            send_frame(tx, frame).await?;
+        } else {
+            log::debug!(
+                "subc attach: dropping deferred bash response {} for unbound route {}",
+                done.request_id,
+                done.channel
+            );
+        }
+    } else {
+        log::debug!(
+            "subc attach: deferred bash wait {} cancelled before delivery on route {}",
+            done.request_id,
+            done.channel
+        );
+    }
+
+    if done.spawn_fatal {
+        signal_fatal_teardown(tx, Some(done.channel), done.ver, done.corr, shutdown).await;
+    }
+    Ok(())
+}
 fn submit_maintenance_drain(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
@@ -2144,7 +2967,7 @@ fn response_is_internal_error(response: &Response) -> bool {
 fn is_subc_agent_core_tool(name: &str) -> bool {
     matches!(
         name,
-        "status" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect"
+        "status" | "bash" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect"
     )
 }
 
@@ -2254,10 +3077,10 @@ fn build_manifest() -> ModuleManifest {
     };
     // execution_mode keys on externally-observable side effects, NOT internal
     // ctx mutation: the readers warm AFT's own index/cache/symbol artifacts
-    // (internal), not the user's workspace, so they are Pure. Only edit/write
-    // produce observable file writes -> Mutating. There is no bash tool in this
-    // core, so Unfenceable is unused here (it stays in the enum for bash/other
-    // modules).
+    // (internal), not the user's workspace, so they are Pure. Bash is Mutating
+    // because spawning a detached process changes external state, and edit/write
+    // produce observable file writes. Unfenceable stays unused here because AFT
+    // schedules bash internally and releases the Mutating worker after spawn.
     ModuleManifest {
         module_id: "aft".to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2266,6 +3089,7 @@ fn build_manifest() -> ModuleManifest {
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![
                 tool("status", ExecutionMode::Pure),
+                tool("bash", ExecutionMode::Mutating),
                 tool("read", ExecutionMode::Pure),
                 tool("grep", ExecutionMode::Pure),
                 tool("search", ExecutionMode::Pure),

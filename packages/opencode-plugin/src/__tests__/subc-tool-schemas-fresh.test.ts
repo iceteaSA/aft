@@ -16,7 +16,7 @@ describe("subc tool schemas artifact", () => {
     expect(fresh).toBe(committed);
   });
 
-  test("all 8 bare names present with object schemas", () => {
+  test("all bare names present with object schemas", () => {
     const parsed = JSON.parse(fs.readFileSync(ARTIFACT_PATH, "utf8")) as Record<
       string,
       Record<string, unknown>

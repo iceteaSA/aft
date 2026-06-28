@@ -177,7 +177,7 @@ pub fn build_bash_outcome(
     })
 }
 
-fn poll_bash_status(
+pub(crate) fn poll_bash_status(
     ctx: &AppContext,
     task_id: &str,
     session_id: &str,
@@ -194,13 +194,13 @@ fn poll_bash_status(
     )
 }
 
-enum BashStep {
+pub(crate) enum BashStep {
     Done(Response),
     Promote,
     Wait,
 }
 
-fn task_not_found_response(request_id: &str, task_id: &str) -> Response {
+pub(crate) fn task_not_found_response(request_id: &str, task_id: &str) -> Response {
     Response::error(
         request_id,
         "task_not_found",
@@ -208,7 +208,7 @@ fn task_not_found_response(request_id: &str, task_id: &str) -> Response {
     )
 }
 
-fn decide_bash_step(
+pub(crate) fn decide_bash_step(
     snapshot: BgTaskSnapshot,
     deadline: Instant,
     block_to_completion: bool,
@@ -224,7 +224,7 @@ fn decide_bash_step(
     }
 }
 
-fn promote_bash(
+pub(crate) fn promote_bash(
     ctx: &AppContext,
     task_id: &str,
     session_id: &str,
@@ -300,7 +300,7 @@ fn parse_params(req: &RawRequest) -> Option<BashOrchestrateParams> {
     serde_json::from_value::<BashOrchestrateParams>(raw_params).ok()
 }
 
-fn resolve_foreground_wait_window_ms(configured: u64) -> u64 {
+pub(crate) fn resolve_foreground_wait_window_ms(configured: u64) -> u64 {
     std::env::var(TEST_FOREGROUND_WAIT_ENV)
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
