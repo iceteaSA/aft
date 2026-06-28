@@ -1,0 +1,22 @@
+{
+  "tool_name": "aft_delete",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "complete": true,
+    "deleted": [
+      {
+        "file": "<PROJECT_ROOT>/src/delete-one.ts"
+      }
+    ],
+    "skipped_files": []
+  },
+  "ctx": {
+    "agent_args": {
+      "files": [
+        "<PROJECT_ROOT>/src/delete-one.ts"
+      ]
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

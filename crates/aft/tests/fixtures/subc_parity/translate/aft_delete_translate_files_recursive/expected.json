@@ -1,0 +1,10 @@
+{
+  "args": {
+    "files": [
+      "<PROJECT_ROOT>/src/delete-me.ts",
+      "<PROJECT_ROOT>/docs/delete-me.md"
+    ],
+    "recursive": true
+  },
+  "command": "delete_file"
+}

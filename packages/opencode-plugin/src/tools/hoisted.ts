@@ -1535,7 +1535,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
 
       // Single batched call so every file shares one op_id; one `aft_safety
       // undo` then restores the whole delete atomically.
-      const response = await callBridge(ctx, context, "delete_file", {
+      const response = await callToolCall(ctx, context, "aft_delete", {
         files: absolutePaths,
         recursive,
       });
@@ -1558,12 +1558,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
         );
       }
 
-      return JSON.stringify({
-        success: true,
-        complete: skipped.length === 0,
-        deleted,
-        skipped_files: skipped,
-      });
+      return response.text;
     },
   };
 }
@@ -1620,14 +1615,14 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
         }),
       );
 
-      const result = await callBridge(ctx, context, "move_file", {
-        file: filePath,
-        destination: destPath,
+      const result = await callToolCall(ctx, context, "aft_move", {
+        filePath: args.filePath as string,
+        destination: args.destination as string,
       });
       if (result.success === false) {
         throw new Error((result.message as string) || "move failed");
       }
-      return JSON.stringify(result);
+      return result.text;
     },
   };
 }

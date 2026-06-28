@@ -804,10 +804,11 @@ describe("Hoisted tool execute handlers", () => {
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
-      expect(command).toBe("delete_file");
+      expect(command).toBe("aft_delete");
       const files = (params.files as string[]) ?? [];
       return {
         success: true,
+        text: `Deleted 0/${files.length} file(s)`,
         complete: false,
         deleted: [],
         skipped_files: files.map((file) => ({ file, reason: "Cannot delete protected file" })),
@@ -824,7 +825,7 @@ describe("Hoisted tool execute handlers", () => {
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
-      expect(command).toBe("delete_file");
+      expect(command).toBe("aft_delete");
       return { success: false, message: "bridge delete refused" };
     });
 
@@ -833,12 +834,12 @@ describe("Hoisted tool execute handlers", () => {
     );
   });
 
-  test("delete returns partial-success payload when some files fail", async () => {
+  test("delete returns readable partial-success text when some files fail", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
-      expect(command).toBe("delete_file");
+      expect(command).toBe("aft_delete");
       const files = (params.files as string[]) ?? [];
       const deleted: Array<{ file: string; backup_id: string | null }> = [];
       const skipped: Array<{ file: string; reason: string }> = [];
@@ -851,49 +852,40 @@ describe("Hoisted tool execute handlers", () => {
       }
       return {
         success: true,
+        text: `Deleted ${deleted.length}/${files.length} file(s)`,
         complete: skipped.length === 0,
         deleted,
         skipped_files: skipped,
       };
     });
 
-    const raw = await tools.aft_delete.execute({ files: ["a.ts", "blocked.ts", "c.ts"] }, sdkCtx);
-    const parsed = JSON.parse(raw);
-    expect(parsed.success).toBe(true);
-    expect(parsed.complete).toBe(false);
-    expect(parsed.deleted).toHaveLength(2);
-    expect(parsed.deleted[0]).toContain("a.ts");
-    expect(parsed.deleted[1]).toContain("c.ts");
-    expect(parsed.skipped_files).toEqual([
-      expect.objectContaining({ reason: "permission denied" }),
-    ]);
-    expect(parsed.skipped_files[0].file).toContain("blocked.ts");
+    const result = await tools.aft_delete.execute(
+      { files: ["a.ts", "blocked.ts", "c.ts"] },
+      sdkCtx,
+    );
+    expect(result).toBe("Deleted 2/3 file(s)");
+    expect(result.trim().startsWith("{")).toBe(false);
   });
 
-  test("delete reports complete=true when every file succeeds", async () => {
+  test("delete returns readable text when every file succeeds", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
-      expect(command).toBe("delete_file");
+      expect(command).toBe("aft_delete");
       const files = (params.files as string[]) ?? [];
       return {
         success: true,
+        text: `Deleted ${files.length}/${files.length} file(s)`,
         complete: true,
         deleted: files.map((file) => ({ file, backup_id: null })),
         skipped_files: [],
       };
     });
 
-    const raw = await tools.aft_delete.execute({ files: ["a.ts", "b.ts"] }, sdkCtx);
-    const parsed = JSON.parse(raw);
-    expect(parsed).toEqual({
-      success: true,
-      complete: true,
-      deleted: expect.any(Array),
-      skipped_files: [],
-    });
-    expect(parsed.deleted).toHaveLength(2);
+    const result = await tools.aft_delete.execute({ files: ["a.ts", "b.ts"] }, sdkCtx);
+    expect(result).toBe("Deleted 2/2 file(s)");
+    expect(result.trim().startsWith("{")).toBe(false);
   });
 
   test("move throws the Rust error response when rename fails", async () => {
@@ -901,7 +893,7 @@ describe("Hoisted tool execute handlers", () => {
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
-      expect(command).toBe("move_file");
+      expect(command).toBe("aft_move");
       return { success: false, message: "Destination already exists" };
     });
 

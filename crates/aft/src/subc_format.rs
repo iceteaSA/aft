@@ -32,6 +32,8 @@ pub struct FormatContext {
     pub refactor_symbol_arg: Option<String>,
     pub refactor_name_arg: Option<String>,
     pub refactor_file_arg: Option<String>,
+    pub move_file_arg: Option<String>,
+    pub move_dest_arg: Option<String>,
 }
 
 impl Default for FormatContext {
@@ -51,6 +53,8 @@ impl Default for FormatContext {
             refactor_symbol_arg: None,
             refactor_name_arg: None,
             refactor_file_arg: None,
+            move_file_arg: None,
+            move_dest_arg: None,
         }
     }
 }
@@ -74,6 +78,8 @@ impl FormatContext {
             refactor_symbol_arg: refactor_string_arg_for_call(bare_name, arguments, "symbol"),
             refactor_name_arg: refactor_string_arg_for_call(bare_name, arguments, "name"),
             refactor_file_arg: refactor_string_arg_for_call(bare_name, arguments, "filePath"),
+            move_file_arg: move_string_arg_for_call(bare_name, arguments, "filePath"),
+            move_dest_arg: move_string_arg_for_call(bare_name, arguments, "destination"),
         }
     }
 }
@@ -181,6 +187,17 @@ fn refactor_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -
         .map(str::to_string)
 }
 
+fn move_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Option<String> {
+    if bare_name != "aft_move" {
+        return None;
+    }
+    arguments
+        .as_object()
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn coerce_boolean(value: &Value) -> bool {
     match value {
         Value::Bool(value) => *value,
@@ -214,6 +231,8 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "conflicts"
             | "ast_search"
             | "ast_replace"
+            | "aft_delete"
+            | "aft_move"
             | "aft_import"
             | "aft_refactor"
     )
@@ -266,6 +285,8 @@ pub fn format_response_with_context(
         "conflicts" => data["text"].as_str().unwrap_or_default().to_string(),
         "ast_search" => format_ast_search(data),
         "ast_replace" => format_ast_replace(data, ctx.ast_dry_run),
+        "aft_delete" => format_delete(data),
+        "aft_move" => format_move(data, ctx),
         "aft_import" => format_import(data, ctx),
         "aft_refactor" => format_refactor(data, ctx),
         _ => unreachable!("core agent tools are exhaustive"),
@@ -304,6 +325,57 @@ fn import_file_name(response: &serde_json::Map<String, Value>, ctx: &FormatConte
     import_string_field(response, "file")
         .or_else(|| ctx.import_file_arg.clone())
         .unwrap_or_default()
+}
+
+fn format_delete(data: &Value) -> String {
+    let Some(response) = data.as_object() else {
+        return "Deleted 0/0 file(s)".to_string();
+    };
+    let deleted = response
+        .get("deleted")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let skipped = response
+        .get("skipped_files")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    if deleted.len() == 1 && skipped.is_empty() {
+        let file = deleted[0]
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return format!("Deleted {file}");
+    }
+
+    let total = deleted.len() + skipped.len();
+    format!("Deleted {}/{} file(s)", deleted.len(), total)
+}
+
+fn format_move(data: &Value, ctx: &FormatContext) -> String {
+    let response = data.as_object();
+    let file = ctx
+        .move_file_arg
+        .clone()
+        .or_else(|| {
+            response
+                .and_then(|r| import_string_field(r, "file"))
+                .map(|p| shorten_path(&p))
+        })
+        .unwrap_or_default();
+    let destination = ctx
+        .move_dest_arg
+        .clone()
+        .or_else(|| {
+            response
+                .and_then(|r| import_string_field(r, "destination"))
+                .map(|p| shorten_path(&p))
+        })
+        .unwrap_or_default();
+
+    format!("Moved {file} → {destination}")
 }
 
 fn format_import(data: &Value, ctx: &FormatContext) -> String {

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "delete: 'files' must be a non-empty array of paths"
+  }
+}

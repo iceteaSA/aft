@@ -1,0 +1,1 @@
+Deleted <PROJECT_ROOT>/src/delete-one.ts

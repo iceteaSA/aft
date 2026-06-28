@@ -197,6 +197,8 @@ pub fn subc_translate_with_context(
         "conflicts" => translate_conflicts(agent_args),
         "ast_search" => translate_ast_search(agent_args),
         "ast_replace" => translate_ast_replace(agent_args),
+        "aft_delete" => translate_delete(agent_args, project_root),
+        "aft_move" => translate_move(agent_args, project_root),
         "aft_import" => translate_import(agent_args),
         "aft_refactor" => translate_refactor(agent_args),
         other => Err(unsupported_tool(format!(
@@ -631,6 +633,69 @@ fn insert_present_renamed(
     if let Some(value) = map_in.get(from) {
         out.insert(to.to_string(), value.clone());
     }
+}
+
+fn translate_delete(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let files = map_in
+        .get("files")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| invalid_request("delete: 'files' must be a non-empty array of paths"))?;
+
+    let mut resolved_files = Vec::with_capacity(files.len());
+    for file in files {
+        let file = file
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| invalid_request("delete: 'files' must be a non-empty array of paths"))?;
+        let resolved = resolve_path_from_project_root(project_root, file);
+        resolved_files.push(Value::String(resolved.to_string_lossy().into_owned()));
+    }
+
+    let mut out = Map::new();
+    out.insert("files".to_string(), Value::Array(resolved_files));
+    out.insert(
+        "recursive".to_string(),
+        Value::Bool(map_in.get("recursive").is_some_and(coerce_boolean)),
+    );
+
+    Ok(Translated {
+        command: "delete_file".into(),
+        args: out,
+    })
+}
+
+fn translate_move(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("aft_move: missing required param 'filePath'"))?;
+    let destination = map_in
+        .get("destination")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("aft_move: missing required param 'destination'"))?;
+
+    let file_path = resolve_path_from_project_root(project_root, file_path);
+    let destination = resolve_path_from_project_root(project_root, destination);
+
+    let mut out = Map::new();
+    out.insert(
+        "file".to_string(),
+        Value::String(file_path.to_string_lossy().into_owned()),
+    );
+    out.insert(
+        "destination".to_string(),
+        Value::String(destination.to_string_lossy().into_owned()),
+    );
+
+    Ok(Translated {
+        command: "move_file".into(),
+        args: out,
+    })
 }
 
 fn translate_import(args: &Value) -> Result<Translated, TranslateError> {

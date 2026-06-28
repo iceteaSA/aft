@@ -12,7 +12,7 @@
 
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
@@ -51,6 +51,8 @@ type BareToolName =
   | "conflicts"
   | "ast_search"
   | "ast_replace"
+  | "aft_delete"
+  | "aft_move"
   | "aft_import"
   | "aft_refactor";
 
@@ -172,6 +174,29 @@ function translateAftRefactorToolCall(rawArgs: Record<string, unknown>): BridgeC
   return { command, params };
 }
 
+function resolveProjectPath(raw: unknown): string {
+  const value = String(raw ?? "");
+  return isAbsolute(value) ? value : resolve(PROJECT_ROOT, value);
+}
+
+function translateAftDeleteToolCall(rawArgs: Record<string, unknown>): BridgeCall {
+  const files = Array.isArray(rawArgs.files) ? rawArgs.files.map(resolveProjectPath) : [];
+  return {
+    command: "delete_file",
+    params: { files, recursive: rawArgs.recursive === true },
+  };
+}
+
+function translateAftMoveToolCall(rawArgs: Record<string, unknown>): BridgeCall {
+  return {
+    command: "move_file",
+    params: {
+      file: resolveProjectPath(rawArgs.filePath),
+      destination: resolveProjectPath(rawArgs.destination),
+    },
+  };
+}
+
 function makeCtx(
   calls: BridgeCall[],
   responseForCall: (command: string, params: Record<string, unknown>) => Record<string, unknown>,
@@ -198,6 +223,16 @@ function makeCtx(
             }
             if (name === "aft_refactor") {
               const translated = translateAftRefactorToolCall(rawArgs);
+              calls.push(translated);
+              return responseForCall(translated.command, translated.params);
+            }
+            if (name === "aft_delete") {
+              const translated = translateAftDeleteToolCall(rawArgs);
+              calls.push(translated);
+              return responseForCall(translated.command, translated.params);
+            }
+            if (name === "aft_move") {
+              const translated = translateAftMoveToolCall(rawArgs);
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
@@ -243,6 +278,8 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     conflicts: conflicts.aft_conflicts,
     ast_search: ast.ast_grep_search ?? ast.aft_ast_search,
     ast_replace: ast.ast_grep_replace ?? ast.aft_ast_replace,
+    aft_delete: hoisted.aft_delete,
+    aft_move: hoisted.aft_move,
     aft_import: importTools(ctx).aft_import,
     aft_refactor: refactoringTools(ctx).aft_refactor,
   };
@@ -437,6 +474,9 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "ast_replace_translate_dry_run", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", paths: [`${PROJECT_ROOT}/src`], globs: [TS_INCLUDE_GLOB], dryRun: "true" } },
   { name: "ast_replace_translate_apply_default", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", paths: [], globs: [] } },
   { name: "ast_replace_missing_rewrite", tool_name: "ast_replace", expected_error: "ast_replace: missing required param 'rewrite'", agent_args: { pattern: "console.log($MSG)", lang: "typescript" } },
+  { name: "aft_delete_translate_files_recursive", tool_name: "aft_delete", agent_args: { files: [`${PROJECT_ROOT}/src/delete-me.ts`, `${PROJECT_ROOT}/docs/delete-me.md`], recursive: "true" } },
+  { name: "aft_delete_empty_files", tool_name: "aft_delete", expected_error: "delete: 'files' must be a non-empty array of paths", agent_args: { files: [] } },
+  { name: "aft_move_translate_paths", tool_name: "aft_move", agent_args: { filePath: "src/move-from.ts", destination: "src/move-to.ts" } },
   { name: "aft_import_add_translate_full", tool_name: "aft_import", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", names: ["alpha"], defaultImport: "DefaultImport", namespace: "ns", alias: "Alias", modifiers: ["type"], importKind: "function", typeOnly: true, validate: "syntax" } },
   { name: "aft_import_remove_translate_name", tool_name: "aft_import", agent_args: { op: "remove", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", removeName: "alpha" } },
   { name: "aft_import_organize_translate", tool_name: "aft_import", agent_args: { op: "organize", filePath: `${PROJECT_ROOT}/src/main.ts` } },
