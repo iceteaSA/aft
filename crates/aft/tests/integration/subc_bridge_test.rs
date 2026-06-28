@@ -1900,13 +1900,27 @@ async fn drive_bash_nonzero_exit_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
+    // Run the nonzero exit in a CHILD process per platform. A bare `exit 7`
+    // shell builtin would terminate the Windows PowerShell bg-bash wrapper
+    // (which runs the user command via Invoke-Expression in its own scope)
+    // BEFORE it persists the exit marker, leaving exit_code=null. A child
+    // `cmd /c "...& exit 7"` exits 7 as a native process whose code the
+    // wrapper captures via $LASTEXITCODE — matching the product's own
+    // windows_spawn_writes_exit_marker_for_nonzero_exit (`cmd /c exit N`) and
+    // the cross-platform command helpers in bash_background_test.rs. On Unix
+    // the wrapper already subshells via `{shell} -c`, so the POSIX form is safe.
+    let nonzero_command = if cfg!(windows) {
+        "cmd /c \"echo subc-fail&exit 7\""
+    } else {
+        "printf 'subc-fail\\n'; exit 7"
+    };
     send_tool_call(
         &mut stream,
         1,
         106,
         "bash",
         json!({
-            "command": "printf 'subc-fail\\n'; exit 7",
+            "command": nonzero_command,
             "foreground_orchestrate": true,
             "block_to_completion": true,
             "compressed": false,
