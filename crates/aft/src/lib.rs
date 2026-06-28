@@ -82,6 +82,7 @@ pub mod lsp;
 pub mod lsp_hints;
 pub mod migrate_storage;
 pub mod parser;
+pub mod patch;
 pub mod path_identity;
 pub mod pattern_compile;
 pub mod protocol;
