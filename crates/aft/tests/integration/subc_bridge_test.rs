@@ -1027,7 +1027,31 @@ where
     Fut: Future<Output = ()> + 'static,
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
+    run_subc_bridge_test_with_env(name, watchdog, Vec::new, driver, after);
+}
+
+/// Like [`run_subc_bridge_test`] but installs process-global test env vars
+/// (foreground wait window, forced promote error) AFTER acquiring the serial
+/// guard, so the returned [`EnvVarGuard`]s live entirely inside the
+/// single-test critical section. Setting these env guards in the test body
+/// (before this fn takes the lock) races other bash tests under parallel CI:
+/// two tests can clobber each other's process-global wait window in the gap
+/// between guard creation and lock acquisition, which intermittently flipped
+/// `subc_bridge_bash_promote_failure_is_normal_tool_error` to success.
+fn run_subc_bridge_test_with_env<E, F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    env_setup: E,
+    driver: F,
+    after: A,
+) where
+    E: FnOnce() -> Vec<EnvVarGuard>,
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
     let _serial = bridge_test_serial_guard();
+    let _env_guards = env_setup();
     let state = Arc::new(BridgeState::default());
     install_bridge_state(Arc::clone(&state));
 
@@ -1343,10 +1367,10 @@ fn subc_bridge_bash_fast_foreground_returns_terminal_response() {
 
 #[test]
 fn subc_bridge_bash_promotes_after_wait_window_and_remains_tracked() {
-    let _wait_guard = set_test_foreground_wait_ms(200);
-    run_subc_bridge_test(
+    run_subc_bridge_test_with_env(
         "subc_bridge_bash_promotes_after_wait_window_and_remains_tracked",
         Duration::from_secs(30),
+        || vec![set_test_foreground_wait_ms(200)],
         drive_bash_promotion_daemon,
         |_, _, _| {},
     );
@@ -1354,10 +1378,10 @@ fn subc_bridge_bash_promotes_after_wait_window_and_remains_tracked() {
 
 #[test]
 fn subc_bridge_bash_block_to_completion_waits_for_terminal() {
-    let _wait_guard = set_test_foreground_wait_ms(100);
-    run_subc_bridge_test(
+    run_subc_bridge_test_with_env(
         "subc_bridge_bash_block_to_completion_waits_for_terminal",
         Duration::from_secs(30),
+        || vec![set_test_foreground_wait_ms(100)],
         drive_bash_block_to_completion_daemon,
         |_, _, _| {},
     );
@@ -1385,10 +1409,10 @@ fn subc_bridge_bash_nonzero_exit_renders_exit_code() {
 
 #[test]
 fn subc_bridge_bash_wait_holds_no_executor_lane() {
-    let _wait_guard = set_test_foreground_wait_ms(5_000);
-    run_subc_bridge_test(
+    run_subc_bridge_test_with_env(
         "subc_bridge_bash_wait_holds_no_executor_lane",
         Duration::from_secs(45),
+        || vec![set_test_foreground_wait_ms(5_000)],
         drive_bash_lane_nonoccupancy_daemon,
         |_, _, _| {},
     );
@@ -1396,10 +1420,10 @@ fn subc_bridge_bash_wait_holds_no_executor_lane() {
 
 #[test]
 fn subc_bridge_bash_route_close_cancels_deferred_wait() {
-    let _wait_guard = set_test_foreground_wait_ms(5_000);
-    run_subc_bridge_test(
+    run_subc_bridge_test_with_env(
         "subc_bridge_bash_route_close_cancels_deferred_wait",
         Duration::from_secs(45),
+        || vec![set_test_foreground_wait_ms(5_000)],
         drive_bash_route_close_daemon,
         |_, _, _| {},
     );
@@ -1407,11 +1431,15 @@ fn subc_bridge_bash_route_close_cancels_deferred_wait() {
 
 #[test]
 fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
-    let _wait_guard = set_test_foreground_wait_ms(200);
-    let _promote_error_guard = set_test_force_bash_promote_error();
-    run_subc_bridge_test(
+    run_subc_bridge_test_with_env(
         "subc_bridge_bash_promote_failure_is_normal_tool_error",
         Duration::from_secs(45),
+        || {
+            vec![
+                set_test_foreground_wait_ms(200),
+                set_test_force_bash_promote_error(),
+            ]
+        },
         drive_bash_promote_failure_daemon,
         |_, _, _| {},
     );
