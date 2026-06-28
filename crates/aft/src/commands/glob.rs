@@ -99,6 +99,14 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
         (files, walk_truncated)
     };
+    // Sort before truncation so glob output is deterministic across runs and
+    // machines. The underlying walk yields files in filesystem (inode) order,
+    // which differs between directories and platforms — leaving both the
+    // agent-facing text and the `files` array, and crucially WHICH files
+    // survive the MAX_GLOB_RESULTS cap, non-deterministic. A lexical sort gives
+    // a stable contract for agents and keeps the tool_call/direct parity test
+    // (two independently-walked temp projects) byte-stable.
+    files.sort();
     let total = files.len();
     let result_truncated = total > MAX_GLOB_RESULTS;
     if result_truncated {
