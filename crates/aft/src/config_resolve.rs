@@ -15,7 +15,7 @@ use crate::config::{
     BackupConfig, Config, InspectConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
 };
 
-const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 8_000;
+const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 15_000;
 const FOREGROUND_WAIT_WINDOW_MIN_MS: u64 = 5_000;
 
 // Semantic budget clamps — restored from the deleted configure-time
@@ -1976,6 +1976,17 @@ mod tests {
             result.config.foreground_wait_window_ms,
             FOREGROUND_WAIT_WINDOW_MIN_MS
         );
+
+        // Unset → the default wait-window (matches the plugin's
+        // FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 15_000). This locks the default,
+        // not just the floor, so a future edit can't silently shorten the
+        // server-side promotion window once the plugin orchestrates through Rust.
+        let defaulted = resolve_config(&[tier("user", r#"{ "bash": true }"#)]);
+        assert_eq!(
+            defaulted.config.foreground_wait_window_ms,
+            FOREGROUND_WAIT_WINDOW_DEFAULT_MS
+        );
+        assert_eq!(FOREGROUND_WAIT_WINDOW_DEFAULT_MS, 15_000);
     }
 
     #[test]

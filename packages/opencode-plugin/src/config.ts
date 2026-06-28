@@ -176,7 +176,7 @@ const BashFeaturesSchema = z.object({
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   /**
    * How long foreground bash blocks before auto-promoting the task to
-   * background. Default 8000ms; values below the 5000ms floor are clamped up.
+   * background. Default 15000ms; values below the 5000ms floor are clamped up.
    */
   foreground_wait_window_ms: z.number().int().positive().optional(),
 });
@@ -508,7 +508,7 @@ export interface ResolvedBashConfig {
   long_running_reminder_interval_ms?: number;
   /**
    * Foreground poll window before auto-promotion to background, in ms.
-   * Always resolved: defaults to 8000, floored at 5000.
+   * Always resolved: defaults to 15000, floored at 5000.
    */
   foreground_wait_window_ms: number;
 }
@@ -560,7 +560,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     typeof top === "object" && top !== null ? top.subagent_background === true : false;
 
   // Foreground wait-window: only the object form can set it; clamp to the
-  // 5000ms floor and default to 8000ms when unset.
+  // 5000ms floor and default to 15000ms when unset.
   const rawForegroundWait =
     typeof top === "object" && top !== null ? top.foreground_wait_window_ms : undefined;
   const foregroundWaitWindowMs = Math.max(

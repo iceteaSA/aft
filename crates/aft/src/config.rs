@@ -282,5 +282,5 @@ impl Default for Config {
 }
 
 fn default_foreground_wait_window_ms() -> u64 {
-    8_000
+    15_000
 }
