@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -129,18 +130,39 @@ pub fn build_bash_outcome(
     let session_id_for_poll = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
-        poll_foreground_bash(
+        let Some(snapshot) = poll_bash_status(
             ctx,
-            &request_id_for_poll,
             &task_id_for_poll,
             &session_id_for_poll,
             project_root.as_deref(),
             &storage_dir,
+            RUNNING_OUTPUT_PREVIEW_BYTES,
+        ) else {
+            return Some(task_not_found_response(
+                &request_id_for_poll,
+                &task_id_for_poll,
+            ));
+        };
+
+        match decide_bash_step(
+            snapshot,
             deadline,
             block_to_completion,
-            timeout,
-            wait_window_ms,
-        )
+            Instant::now(),
+            &request_id_for_poll,
+        ) {
+            BashStep::Done(response) => Some(response),
+            BashStep::Promote => Some(promote_bash(
+                ctx,
+                &task_id_for_poll,
+                &session_id_for_poll,
+                project_root.as_deref(),
+                timeout,
+                wait_window_ms,
+                &request_id_for_poll,
+            )),
+            BashStep::Wait => None,
+        }
     });
 
     if let Some(response) = poll(ctx) {
@@ -155,51 +177,69 @@ pub fn build_bash_outcome(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn poll_foreground_bash(
+fn poll_bash_status(
     ctx: &AppContext,
-    request_id: &str,
     task_id: &str,
     session_id: &str,
-    project_root: Option<&std::path::Path>,
-    storage_dir: &std::path::Path,
-    deadline: Instant,
-    block_to_completion: bool,
-    timeout: Option<u64>,
-    wait_window_ms: u64,
-) -> Option<Response> {
-    let snapshot = match ctx.bash_background().status(
+    project_root: Option<&Path>,
+    storage_dir: &Path,
+    preview_bytes: usize,
+) -> Option<BgTaskSnapshot> {
+    ctx.bash_background().status(
         task_id,
         session_id,
         project_root,
         Some(storage_dir),
-        RUNNING_OUTPUT_PREVIEW_BYTES,
-    ) {
-        Some(snapshot) => snapshot,
-        None => {
-            return Some(Response::error(
-                request_id,
-                "task_not_found",
-                format!("background task not found: {task_id}"),
-            ));
-        }
-    };
+        preview_bytes,
+    )
+}
 
+enum BashStep {
+    Done(Response),
+    Promote,
+    Wait,
+}
+
+fn task_not_found_response(request_id: &str, task_id: &str) -> Response {
+    Response::error(
+        request_id,
+        "task_not_found",
+        format!("background task not found: {task_id}"),
+    )
+}
+
+fn decide_bash_step(
+    snapshot: BgTaskSnapshot,
+    deadline: Instant,
+    block_to_completion: bool,
+    now: Instant,
+    request_id: &str,
+) -> BashStep {
     if snapshot.info.status.is_terminal() {
-        return Some(foreground_result_response(request_id, snapshot));
+        BashStep::Done(foreground_result_response(request_id, snapshot))
+    } else if !block_to_completion && now >= deadline {
+        BashStep::Promote
+    } else {
+        BashStep::Wait
     }
+}
 
-    if !block_to_completion && Instant::now() >= deadline {
-        return Some(match ctx.bash_background().promote(task_id, session_id) {
-            Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms),
-            Err(message) if message.contains("not found") => {
-                Response::error(request_id, "task_not_found", message)
-            }
-            Err(message) => Response::error(request_id, "execution_failed", message),
-        });
+fn promote_bash(
+    ctx: &AppContext,
+    task_id: &str,
+    session_id: &str,
+    _project_root: Option<&Path>,
+    timeout: Option<u64>,
+    wait_window_ms: u64,
+    request_id: &str,
+) -> Response {
+    match ctx.bash_background().promote(task_id, session_id) {
+        Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms),
+        Err(message) if message.contains("not found") => {
+            Response::error(request_id, "task_not_found", message)
+        }
+        Err(message) => Response::error(request_id, "execution_failed", message),
     }
-
-    None
 }
 
 fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
@@ -300,6 +340,65 @@ mod tests {
             pty_rows: None,
             pty_cols: None,
             pty_screen: None,
+        }
+    }
+
+    #[test]
+    fn decide_bash_step_returns_done_for_terminal_snapshot_even_at_deadline() {
+        let snapshot = snapshot("done", false, None, BgTaskStatus::Completed, Some(0));
+        let now = Instant::now();
+
+        match decide_bash_step(snapshot, now, false, now, "req-terminal") {
+            BashStep::Done(response) => {
+                assert_eq!(response.id, "req-terminal");
+                assert!(response.success);
+                assert_eq!(response.data["status"], json!("completed"));
+                assert_eq!(response.data["output"], json!("done"));
+            }
+            BashStep::Promote => panic!("terminal snapshot should not promote"),
+            BashStep::Wait => panic!("terminal snapshot should not wait"),
+        }
+    }
+
+    #[test]
+    fn decide_bash_step_promotes_at_deadline_when_not_blocking() {
+        let snapshot = snapshot("running", false, None, BgTaskStatus::Running, None);
+        let now = Instant::now();
+
+        match decide_bash_step(snapshot, now, false, now, "req-promote") {
+            BashStep::Promote => {}
+            BashStep::Done(_) => panic!("running snapshot should not finish"),
+            BashStep::Wait => panic!("deadline should promote when not blocking"),
+        }
+    }
+
+    #[test]
+    fn decide_bash_step_waits_before_deadline() {
+        let snapshot = snapshot("running", false, None, BgTaskStatus::Running, None);
+        let now = Instant::now();
+
+        match decide_bash_step(
+            snapshot,
+            now + Duration::from_millis(1),
+            false,
+            now,
+            "req-wait",
+        ) {
+            BashStep::Wait => {}
+            BashStep::Done(_) => panic!("running snapshot should not finish"),
+            BashStep::Promote => panic!("snapshot should wait before the deadline"),
+        }
+    }
+
+    #[test]
+    fn decide_bash_step_never_promotes_when_blocking_to_completion() {
+        let snapshot = snapshot("running", false, None, BgTaskStatus::Running, None);
+        let now = Instant::now();
+
+        match decide_bash_step(snapshot, now, true, now, "req-block") {
+            BashStep::Wait => {}
+            BashStep::Done(_) => panic!("running snapshot should not finish"),
+            BashStep::Promote => panic!("block_to_completion should suppress promotion"),
         }
     }
 
