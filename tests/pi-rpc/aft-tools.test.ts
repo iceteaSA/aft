@@ -96,6 +96,45 @@ function eventsForTool(
   return events.filter((event) => event.toolName === toolName);
 }
 
+function requestLastUserTextIncludes(request: unknown, text: string): boolean {
+  if (!request || typeof request !== "object" || Array.isArray(request)) return false;
+  const messages = (request as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) return false;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+    if ((message as { role?: unknown }).role !== "user") continue;
+    return JSON.stringify(message).includes(text);
+  }
+  return false;
+}
+
+async function runPromptedTool(
+  client: RpcClient,
+  aimock: Awaited<ReturnType<typeof startAimock>>,
+  seenToolCallIds: Set<string>,
+  toolCall: { name: string; arguments: Record<string, unknown> },
+  message: string,
+): Promise<Record<string, unknown>> {
+  aimock.registerToolCallFixture({
+    predicate: (request) => requestLastUserTextIncludes(request, message),
+    toolCalls: [toolCall],
+    followupText: "Done.",
+  });
+  expect(
+    (await client.sendCommand({ type: "prompt", message, streamingBehavior: "followUp" })).success,
+  ).toBe(true);
+  const event = await client.waitForEvent((candidate) => {
+    if (candidate.type !== "tool_execution_end" || candidate.toolName !== toolCall.name) {
+      return false;
+    }
+    const id = typeof candidate.toolCallId === "string" ? candidate.toolCallId : undefined;
+    return id === undefined || !seenToolCallIds.has(id);
+  }, 60_000);
+  if (typeof event.toolCallId === "string") seenToolCallIds.add(event.toolCallId);
+  return event;
+}
+
 async function withPiTool(
   toolCall: { name: string; arguments: Record<string, unknown> },
   opts: {
@@ -285,6 +324,148 @@ describe("AFT Pi tools (real Pi RPC)", () => {
     const text = resultText(toolEnd);
     expect(text).toContain("TODO");
     expect(text).not.toContain('"summary"');
+  }, 120_000);
+
+  test("aft_safety returns server-rendered text and preserves safety mutations", async () => {
+    const env = createPiIsolatedEnv();
+    const aimock = await startAimock();
+    let client: RpcClient | undefined;
+    try {
+      await enableAllToolSurface(env);
+      await writeFile(join(env.workdir, "checkpoint.txt"), "checkpoint contents\n", "utf8");
+      await writeFile(join(env.workdir, "history-undo.txt"), "undo me\n", "utf8");
+      await writeFile(join(env.workdir, "op-one.txt"), "one\n", "utf8");
+      await writeFile(join(env.workdir, "op-two.txt"), "two\n", "utf8");
+      await writeFile(join(env.workdir, "restore.txt"), "restore me\n", "utf8");
+
+      const spawned = spawnPiRpc({
+        mockProviderURL: aimock.url,
+        aftPluginDir: resolvePiPluginDir(),
+        configDir: env.configDir,
+        workdir: env.workdir,
+      });
+      client = spawned.client;
+      const seenToolCallIds = new Set<string>();
+
+      const checkpoint = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        {
+          name: "aft_safety",
+          arguments: { op: "checkpoint", name: "single-file", filePath: "checkpoint.txt" },
+        },
+        "safety checkpoint single-file",
+      );
+      expect(checkpoint.isError).toBe(false);
+      const checkpointText = resultText(checkpoint);
+      expect(checkpointText).toContain("checkpoint created single-file");
+      expect(checkpointText).not.toContain('"success"');
+
+      const list = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        { name: "aft_safety", arguments: { op: "list" } },
+        "safety list checkpoints",
+      );
+      expect(list.isError).toBe(false);
+      expect(resultText(list)).toContain("1 checkpoint(s)");
+
+      const deleteForHistory = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        { name: "aft_delete", arguments: { files: ["history-undo.txt"] } },
+        "delete history undo file",
+      );
+      expect(deleteForHistory.isError).toBe(false);
+
+      const history = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        { name: "aft_safety", arguments: { op: "history", filePath: "history-undo.txt" } },
+        "safety history file",
+      );
+      expect(history.isError).toBe(false);
+      const historyText = resultText(history);
+      expect(historyText).toContain("history-undo.txt");
+      expect(historyText).toContain("delete_file: pre-delete backup");
+      expect(historyText).not.toContain('"entries"');
+
+      const undoFile = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        { name: "aft_safety", arguments: { op: "undo", filePath: "history-undo.txt" } },
+        "safety undo file",
+      );
+      expect(undoFile.isError).toBe(false);
+      expect(resultText(undoFile)).toContain("restored history-undo.txt");
+      expect(await readFile(join(env.workdir, "history-undo.txt"), "utf8")).toBe("undo me\n");
+
+      const deleteForOperation = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        { name: "aft_delete", arguments: { files: ["op-one.txt", "op-two.txt"] } },
+        "delete operation files",
+      );
+      expect(deleteForOperation.isError).toBe(false);
+
+      const undoOperation = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        { name: "aft_safety", arguments: { op: "undo" } },
+        "safety undo operation",
+      );
+      expect(undoOperation.isError).toBe(false);
+      const undoOperationText = resultText(undoOperation);
+      expect(undoOperationText).toContain("restored operation");
+      expect(undoOperationText).toContain("files 2");
+      expect(await readFile(join(env.workdir, "op-one.txt"), "utf8")).toBe("one\n");
+      expect(await readFile(join(env.workdir, "op-two.txt"), "utf8")).toBe("two\n");
+
+      const checkpointForRestore = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        {
+          name: "aft_safety",
+          arguments: { op: "checkpoint", name: "restore-cp", filePath: "restore.txt" },
+        },
+        "safety checkpoint restore cp",
+      );
+      expect(checkpointForRestore.isError).toBe(false);
+      const deleteForRestore = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        { name: "aft_delete", arguments: { files: ["restore.txt"] } },
+        "delete restore file",
+      );
+      expect(deleteForRestore.isError).toBe(false);
+      expect(existsSync(join(env.workdir, "restore.txt"))).toBe(false);
+
+      const restore = await runPromptedTool(
+        client,
+        aimock,
+        seenToolCallIds,
+        { name: "aft_safety", arguments: { op: "restore", name: "restore-cp" } },
+        "safety restore cp",
+      );
+      expect(restore.isError).toBe(false);
+      const restoreText = resultText(restore);
+      expect(restoreText).toContain("checkpoint restored restore-cp");
+      expect(restoreText).toContain("files 1");
+      expect(await readFile(join(env.workdir, "restore.txt"), "utf8")).toBe("restore me\n");
+    } finally {
+      await client?.close();
+      await aimock.close();
+      await cleanupPiIsolatedEnv(env);
+    }
   }, 120_000);
 
   test("remaining Pi tools use tool_call text and keep disk mutations", async () => {

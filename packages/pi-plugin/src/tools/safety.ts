@@ -7,7 +7,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, callToolCall, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
@@ -226,33 +226,15 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         }
       }
 
-      const commandMap: Record<string, string> = {
-        undo: "undo",
-        history: "edit_history",
-        checkpoint: "checkpoint",
-        restore: "restore_checkpoint",
-        list: "list_checkpoints",
-      };
-      const req: Record<string, unknown> = {};
-      if (params.name) req.name = params.name;
-      if (params.op === "checkpoint") {
-        // For checkpoint, Rust only knows `files`. If the agent passes
-        // `filePath` (a reasonable mistake — the tool schema exposes both),
-        // auto-promote it into a single-entry `files` list rather than
-        // silently dropping it and falling back to the whole tracked-file
-        // set.
-        if (files) {
-          req.files = files;
-        } else if (filePath) {
-          req.files = [filePath];
-        }
-      } else {
-        // undo / history / restore / list all take `file` as-is.
-        if (filePath) req.file = filePath;
-        if (files) req.files = files;
+      const rawArgs: Record<string, unknown> = { op: params.op };
+      if (filePath) rawArgs.filePath = filePath;
+      if (params.name) rawArgs.name = params.name;
+      if (files) rawArgs.files = files;
+      const response = await callToolCall(bridge, "aft_safety", rawArgs, extCtx);
+      if (response.success === false) {
+        throw new Error(response.text || response.message || `${params.op} failed`);
       }
-      const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
-      return textResult(JSON.stringify(response, null, 2));
+      return textResult(response.text, response);
     },
     renderCall(args, theme, context) {
       return renderSafetyCall(args, theme, context);

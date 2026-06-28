@@ -39,7 +39,7 @@ maybeDescribe("aft_safety (real bridge)", () => {
       filePath: "untouched.ts",
     });
     const text = harness.text(result);
-    // Result is JSON stringified — either explicit entries: [] or a no-history shape
+    // Server-rendered text is concise, but empty history still produces a message.
     expect(text.length).toBeGreaterThan(0);
   });
 
@@ -55,8 +55,9 @@ maybeDescribe("aft_safety (real bridge)", () => {
       filePath: "edited.ts",
     });
     const text = harness.text(result);
-    // Rust edit_history returns { file, entries: [...] }
-    expect(text).toContain("entries");
+    expect(text).toContain("edited.ts");
+    expect(text).toContain("edit_match: line1");
+    expect(text).not.toContain('"entries"');
   });
 
   test("edit → undo reverts file content", async () => {
@@ -73,10 +74,9 @@ maybeDescribe("aft_safety (real bridge)", () => {
     expect(await readFile(harness.path("undoable.ts"), "utf8")).toBe("hello\n");
   });
 
-  test("checkpoint promotes filePath to single-entry files[]", async () => {
-    // Regression: Rust `checkpoint` only accepts `files`, not `file`. The plugin
-    // must auto-upgrade `filePath` → `files: [filePath]` rather than silently
-    // dropping it and falling back to the whole tracked-file set.
+  test("checkpoint filePath creates a single-file checkpoint", async () => {
+    // Regression: `filePath` should remain a single-file checkpoint after
+    // server-side tool_call translation rather than falling back to all tracked files.
     await harness.callTool("write", { filePath: "cp-single.ts", content: "hello\n" });
     const result = await harness.callTool("aft_safety", {
       op: "checkpoint",
@@ -84,10 +84,10 @@ maybeDescribe("aft_safety (real bridge)", () => {
       filePath: "cp-single.ts",
     });
     const text = harness.text(result);
-    expect(text).toContain("single-file-cp");
-    expect(text).toContain('"file_count": 1');
-    // Must not have silently omitted our file
-    expect(text).not.toContain('"file_count": 0');
+    expect(text).toContain("checkpoint created single-file-cp");
+    expect(text).toContain("files 1");
+    // Must not have silently omitted our file.
+    expect(text).not.toContain("files 0");
   });
 
   test("checkpoint tolerates deleted files in tracked set", async () => {
@@ -105,8 +105,8 @@ maybeDescribe("aft_safety (real bridge)", () => {
     });
     const text = harness.text(result);
     expect(text).toContain("after-deletion");
-    // cp-keeper.ts survived the snapshot
-    expect(text).toMatch(/"file_count":\s*[1-9]/);
+    // cp-keeper.ts survived the snapshot.
+    expect(text).toMatch(/files\s+[1-9]/);
     // cp-doomed.ts is reported as skipped, not as a hard failure
     expect(text).toContain("skipped");
     expect(text).toContain("cp-doomed.ts");
@@ -158,8 +158,8 @@ maybeDescribe("aft_safety (real bridge)", () => {
     // recent op_id atomically.
     const undoResult = await harness.callTool("aft_safety", { op: "undo" });
     const undoText = harness.text(undoResult);
-    expect(undoText).toContain('"operation": true');
-    expect(undoText).toContain('"restored_count": 3');
+    expect(undoText).toContain("restored operation");
+    expect(undoText).toContain("files 3");
     expect(await readFile(harness.path("op-undo-a.txt"), "utf8")).toBe("content-a\n");
     expect(await readFile(harness.path("op-undo-b.txt"), "utf8")).toBe("content-b\n");
     expect(await readFile(harness.path("op-undo-c.txt"), "utf8")).toBe("content-c\n");
@@ -189,8 +189,8 @@ maybeDescribe("aft_safety (real bridge)", () => {
 
     const undoResult = await harness.callTool("aft_safety", { op: "undo" });
     const undoText = harness.text(undoResult);
-    expect(undoText).toContain('"operation": true');
-    expect(undoText).toContain('"restored_count": 2');
+    expect(undoText).toContain("restored operation");
+    expect(undoText).toContain("files 2");
     // Files AND their parent directories must be restored.
     expect(await readFile(harness.path("op-undo-tree/top.txt"), "utf8")).toBe("top-content\n");
     expect(await readFile(harness.path("op-undo-tree/nested/inner.txt"), "utf8")).toBe(
