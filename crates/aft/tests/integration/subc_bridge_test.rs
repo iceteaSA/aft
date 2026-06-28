@@ -1347,7 +1347,15 @@ fn subc_bridge_l3_coalesces_already_bound_route_burst() {
 fn subc_bridge_lossy_pressure_reliable_completion_still_delivers() {
     run_subc_bridge_test(
         "subc_bridge_lossy_pressure_reliable_completion_still_delivers",
-        Duration::from_secs(45),
+        // This test drives a 2048-frame status BURST (2x the lossy channel
+        // capacity) to exercise the pressure path, then waits through it for the
+        // coalesced latest. Generating + coalescing 2048 frames is genuinely
+        // load-proportional, so the watchdog (and the inner push-wait deadlines
+        // below) carry extra headroom for contended CI runners where the suite
+        // runs ~5x slower (memory: loaded macOS/Windows runner). The inner
+        // expect_*_pushes deadlines are 90s, so the outer watchdog must exceed
+        // them.
+        Duration::from_secs(150),
         drive_lossy_pressure_daemon,
         |_, _, _| {},
     );
@@ -4055,7 +4063,9 @@ async fn expect_route_bind_ack_status_and_bash_completed_pushes(
     task_id: &str,
     expected_channels: HashSet<u16>,
 ) -> (Vec<Value>, Vec<Value>) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // 90s: the lossy-pressure test waits through a 2048-frame burst here; under
+    // contended CI the burst is load-proportionally slow (memory 6987).
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut ack_seen = false;
     let mut status_pushes = Vec::new();
     let mut status_channels = HashSet::new();
@@ -4435,7 +4445,9 @@ async fn expect_status_pushes_for_marker_seq(
     seq: u64,
     expected_channels: HashSet<u16>,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // 90s: waits for the coalesced latest of a 2048-frame burst; load-heavy on
+    // contended CI runners (memory 6987).
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut pushes = Vec::new();
     let mut channels = HashSet::new();
 
@@ -4482,7 +4494,10 @@ async fn expect_status_sentinel_without_marker_before(
     forbidden_marker: &str,
     expected_channels: HashSet<u16>,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // 90s: a longer patience ceiling only matters when frames are slow under
+    // load; it returns early on success, so it's safe for all callers and gives
+    // the lossy-pressure burst path headroom on contended CI (memory 6987).
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut response_seen = false;
     let mut sentinel_pushes = Vec::new();
     let mut sentinel_channels = HashSet::new();
