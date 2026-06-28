@@ -63,10 +63,11 @@ const z = tool.schema;
 export const optionalInt = (min: number, max: number): any =>
   z.number().int().min(min).max(max).optional();
 
-// Bridge transport budget for bash-family calls. Rust bash returns `running`
-// promptly and plugin-side polling handles task lifetime, so transport only
-// covers spawn/control RPC round-trips. Keep this centralized so every
-// bash-family RPC also keeps the shared bridge alive on transport timeout.
+// Baseline bridge transport budget for bash-family control calls. The main
+// orchestrated bash tool overrides this per request because Rust may hold the
+// final response until the foreground wait window or hard-kill cap elapses.
+// Keep this centralized so every bash-family RPC also keeps the shared bridge
+// alive on transport timeout.
 export const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 
 // Re-exported from @cortexkit/aft-bridge — shared runtime coercion,

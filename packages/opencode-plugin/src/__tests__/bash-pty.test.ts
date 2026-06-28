@@ -71,6 +71,8 @@ describe("OpenCode bash PTY layer", () => {
       success: true,
       status: "running",
       task_id: "bash-pty-implied-bg",
+      output:
+        'PTY task started: bash-pty-implied-bg. Use bash_status({ taskId: "bash-pty-implied-bg", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "bash-pty-implied-bg", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.',
     }));
     const bash = createBashTool(pluginCtx);
     // Caller omits background: true — plugin must auto-promote because pty:true

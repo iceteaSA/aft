@@ -11,7 +11,8 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BridgePool } from "@cortexkit/aft-bridge";
+import { type BinaryBridge, BridgePool } from "@cortexkit/aft-bridge";
+import { withEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { registerBashTool } from "../../tools/bash.js";
 import type { PluginContext } from "../../types.js";
 import {
@@ -80,6 +81,21 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
         ...configOverrides,
       }),
     );
+    const bridgeCalls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const patchedBridges = new WeakSet<BinaryBridge>();
+    const originalGetBridge = pool.getBridge.bind(pool);
+    (pool as { getBridge: (projectRoot: string) => BinaryBridge }).getBridge = (projectRoot) => {
+      const bridge = originalGetBridge(projectRoot);
+      if (!patchedBridges.has(bridge)) {
+        const originalSend = bridge.send.bind(bridge);
+        bridge.send = async (command, params = {}, options) => {
+          bridgeCalls.push({ command, params });
+          return await originalSend(command, params, options);
+        };
+        patchedBridges.add(bridge);
+      }
+      return bridge;
+    };
     // Mirror flat `experimental_bash_*` configure overrides back into the
     // nested user-facing config shape that Pi's plugin reads from
     // `ctx.config.experimental.bash.*` to decide whether to register
@@ -121,6 +137,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
       bash: tools.get("bash")!,
       bashStatus: tools.get("bash_status")!,
       bashKill: tools.get("bash_kill")!,
+      bridgeCalls,
     };
   }
 
@@ -138,6 +155,12 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
       extCtx,
     );
     return { output: h.text(result), details: (result.details ?? {}) as BashDetails };
+  }
+
+  function nonConfigureCommands(
+    calls: Array<{ command: string; params: Record<string, unknown> }>,
+  ): string[] {
+    return calls.filter((call) => call.command !== "configure").map((call) => call.command);
   }
 
   async function bridgeBashToTerminal(
@@ -174,21 +197,52 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
   }
 
   test("foreground simple command returns output and exit code", async () => {
-    const { h, bash } = await pluginHarness();
+    const { h, bash, bridgeCalls } = await pluginHarness();
 
     const result = await callBash(bash, h, { command: "echo hello" });
 
     expect(result.output).toBe("hello\n");
     expect(result.details.exit_code).toBe(0);
+    expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
+    expect(bridgeCalls[0].params).toMatchObject({
+      foreground_orchestrate: true,
+      block_to_completion: false,
+    });
   });
 
   test("foreground non-zero exit is a successful tool response", async () => {
-    const { h, bash } = await pluginHarness();
+    const { h, bash, bridgeCalls } = await pluginHarness();
 
     const result = await callBash(bash, h, { command: "false" });
 
     expect(result.output).toBe("\n[exit code: 1]");
     expect(result.details.exit_code).toBe(1);
+    expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
+  });
+
+  test("foreground promotion returns server text without client poll/promote calls", async () => {
+    const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
+
+    const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
+      callBash(bash, h, { command: "sleep 0.2 && echo late" }),
+    );
+
+    expect(result.output).toContain("promoted to background");
+    expect(result.details.task_id).toMatch(/^bash-[a-f0-9]{8}$/);
+    expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
+  });
+
+  test("background true returns server launch text and task id without polling", async () => {
+    const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
+
+    const result = await callBash(bash, h, {
+      command: "sleep 0.2 && echo background-done",
+      background: true,
+    });
+
+    expect(result.output).toContain("Background task started:");
+    expect(result.details.task_id).toMatch(/^bash-[a-f0-9]{8}$/);
+    expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
   });
 
   test("foreground workdir is respected", async () => {

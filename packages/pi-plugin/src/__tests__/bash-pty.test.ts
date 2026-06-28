@@ -75,6 +75,8 @@ describe("Pi bash PTY layer", () => {
       success: true,
       status: "running",
       task_id: "bash-pty-implied-bg",
+      output:
+        'PTY task started: bash-pty-implied-bg. Use bash_status({ taskId: "bash-pty-implied-bg", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "bash-pty-implied-bg", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.',
     }));
     registerBashTool(api(tools), pluginCtx);
     // Caller omits background: true — plugin must auto-promote because pty:true
@@ -95,6 +97,8 @@ describe("Pi bash PTY layer", () => {
       success: true,
       status: "running",
       task_id: "bash-pty",
+      output:
+        'PTY task started: bash-pty. Use bash_status({ taskId: "bash-pty", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "bash-pty", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.',
     }));
     registerBashTool(api(tools), pluginCtx);
     const result = await tools
@@ -109,10 +113,13 @@ describe("Pi bash PTY layer", () => {
 
   test("bash pty dimensions are forwarded when pty:true and silently ignored when pty:false", async () => {
     const tools = new Map<string, MockToolDef>();
-    const { calls, ctx: pluginCtx } = ctx(() => ({
+    const { calls, ctx: pluginCtx } = ctx((_command, params) => ({
       success: true,
       status: "running",
       task_id: "bash-pty-dims",
+      output: params.pty
+        ? 'PTY task started: bash-pty-dims. Use bash_status({ taskId: "bash-pty-dims", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "bash-pty-dims", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.'
+        : "Background task started: bash-pty-dims. A completion reminder will be delivered automatically; don't poll bash_status.",
     }));
     registerBashTool(api(tools), pluginCtx);
 

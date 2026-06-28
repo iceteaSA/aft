@@ -2,12 +2,8 @@ import * as fs from "node:fs/promises";
 import {
   type BridgeRequestOptions,
   coerceBoolean,
-  formatForegroundResult,
-  formatSeconds,
-  isTerminalStatus,
   maybeAppendGrepSearchHint,
   resolveBashKillTimeout,
-  sleep,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -21,18 +17,13 @@ import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
 const METADATA_PREVIEW_LIMIT = 30 * 1024;
-// Foreground polling wait-window: how long the plugin blocks the agent before
-// promoting the task to background and returning. INTENTIONALLY decoupled
-// from the task's own kill cap (`args.timeout`). Council decision:
-// .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
-// The value is resolved per-call from bash config (default 8000ms, floored at
-// 5000ms) via resolveBashConfig().foreground_wait_window_ms.
-const FOREGROUND_POLL_INTERVAL_MS = 100;
-// Default hard-kill cap when caller doesn't pass `args.timeout`. Mirrors the
-// Rust-side `DEFAULT_BG_TIMEOUT` (30 minutes). Used as the subagent foreground
-// poll-window when no explicit timeout was provided — subagents cannot survive
-// background promotion, so we poll until the task is terminal or this cap fires.
+// Default hard timeout of 30 minutes when the caller omits a timeout. This
+// sizes the bridge transport timeout for bash calls where the server blocks
+// until the command completes or is killed.
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
+// The margin gives Rust time to promote or finalize the task and deliver the
+// final response after the server's foreground wait window or hard kill timeout.
+const BASH_TRANSPORT_MARGIN_MS = 10_000;
 
 // Test-only override for the foreground wait window. Production resolves the
 // window from config (floored at 5000ms), but bun caps each test at 5000ms, so
@@ -46,6 +37,17 @@ function resolveForegroundWaitMs(configured: number): number {
     if (Number.isFinite(parsed) && parsed >= 0) return parsed;
   }
   return configured;
+}
+
+function orchestratedTransportTimeoutMs(
+  blockToCompletion: boolean,
+  effectiveTimeout: number | undefined,
+  foregroundWaitMs: number,
+): number {
+  const waitBudget = blockToCompletion
+    ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
+    : foregroundWaitMs;
+  return waitBudget + BASH_TRANSPORT_MARGIN_MS;
 }
 
 /**
@@ -242,9 +244,9 @@ export function createBashTool(
       // subagent terminates after its single response and cannot survive
       // backgrounding: any task_id we returned would be unreachable because
       // the subagent has no chance to call bash_status. So for subagents we
-      // silently treat `background: true` as `false` and extend the
-      // foreground poll window to the task's full hard-kill timeout — the
-      // command still runs to completion, just inline.
+      // silently treat `background: true` as `false` and ask the server to
+      // keep the call inline until the command completes or reaches its
+      // hard-kill timeout.
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       const backgroundDisabled = !bashCfg.background;
       // Coerce at the boundary: stringified pty/background flags (coerceBoolean).
@@ -279,10 +281,11 @@ export function createBashTool(
       const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(args.compressed, true);
+      const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
       const effectiveTimeout =
         effectiveBackground || backgroundDisabled
           ? rawTimeout
-          : resolveBashKillTimeout(rawTimeout, bashCfg.foreground_wait_window_ms);
+          : resolveBashKillTimeout(rawTimeout, foregroundWaitMs);
       // Only log when the gate actually changes behavior (subagent path).
       // The common primary-session foreground case is the overwhelming
       // majority of calls and produces no useful log signal.
@@ -314,9 +317,16 @@ export function createBashTool(
           pty_rows: ptyRows,
           pty_cols: ptyCols,
           permissions_requested: true,
+          foreground_orchestrate: true,
+          block_to_completion: blockToCompletion,
         },
         callBashBridge,
         {
+          transportTimeoutMs: orchestratedTransportTimeoutMs(
+            blockToCompletion,
+            effectiveTimeout,
+            foregroundWaitMs,
+          ),
           onProgress: ({ text }) => {
             accumulatedOutput = preview(accumulatedOutput + text);
             metadata?.({ output: accumulatedOutput, description });
@@ -328,119 +338,28 @@ export function createBashTool(
         throw new Error((data.message as string) || "bash failed");
       }
 
+      const uiTitle = description ?? shortenCommand(command);
       if (data.status === "running" && typeof data.task_id === "string") {
         const taskId = data.task_id;
-        const uiTitle = description ?? shortenCommand(command);
-        if (effectiveBackground) {
-          trackBgTask(context.sessionID, taskId);
-          let startedLine = formatBackgroundLaunch(taskId, requestedPty);
-          if (isSubagent && allowSubagentBg) startedLine += subagentGuidance(taskId);
-          const metadataPayload = { description, output: startedLine, status: "running", taskId };
-          metadata?.(metadataPayload);
-          return { output: startedLine, title: uiTitle, metadata: metadataPayload };
-        }
-
-        // Wait-window is decoupled from `args.timeout`. For primary sessions
-        // with background enabled we always cap the foreground polling window at
-        // foregroundWaitMs so agents get a fast "promoted" response
-        // for unexpectedly long commands. If the agent passed a shorter
-        // explicit `timeout`, honor that — there's no point polling longer
-        // than the task can possibly survive.
-        //
-        // For SUBAGENTS and background-disabled sessions, we extend the poll
-        // window to the task's full hard-kill cap (`args.timeout` if provided,
-        // else the 30-minute default). Those modes must stay inline until the
-        // task reaches a terminal status or its own hard-kill timer fires. The
-        // transport timeout is unaffected because each `bash_status` poll is a
-        // separate short bridge call.
-        //
-        // Schema validation guarantees `args.timeout` is a positive
-        // integer or undefined, so these expressions are well-defined.
-        // effectiveTimeout already folded the sub-window guard (#102): it is
-        // either >= foregroundWaitMs or undefined, so the primary-session
-        // Math.min can no longer collapse the wait window below the configured
-        // value.
-        const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
-        const waitTimeoutMs = blockToCompletion
-          ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
-          : effectiveTimeout !== undefined
-            ? Math.min(effectiveTimeout, foregroundWaitMs)
-            : foregroundWaitMs;
-        const startedAt = Date.now();
-        while (true) {
-          const status = await callBashBridge(ctx, context, "bash_status", { task_id: taskId });
-          if (status.success === false) {
-            throw new Error((status.message as string | undefined) ?? "bash_status failed");
-          }
-          if (isTerminalStatus(status.status)) {
-            const rendered = maybeAppendGrepSearchHint(
-              formatForegroundResult(status),
-              command,
-              aftSearchRegistered,
-              projectRootFor(context),
-            );
-            const metadataPayload = foregroundMetadata(description, status, rendered);
-            metadata?.(metadataPayload);
-            return { output: rendered, title: uiTitle, metadata: metadataPayload };
-          }
-          if (Date.now() - startedAt >= waitTimeoutMs) {
-            if (blockToCompletion) {
-              await sleep(FOREGROUND_POLL_INTERVAL_MS);
-              continue;
-            }
-            const promoted = await callBashBridge(ctx, context, "bash_promote", {
-              task_id: taskId,
-            });
-            if (promoted.success === false) {
-              throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
-            }
-            trackBgTask(context.sessionID, taskId);
-            let message = formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs);
-            if (isSubagent && allowSubagentBg) message += subagentGuidance(taskId);
-            const metadataPayload = { description, output: message, status: "running", taskId };
-            metadata?.(metadataPayload);
-            return { output: message, title: uiTitle, metadata: metadataPayload };
-          }
-          await sleep(FOREGROUND_POLL_INTERVAL_MS);
-        }
+        trackBgTask(context.sessionID, taskId);
+        let rendered = (data.output as string | undefined) ?? "";
+        if (isSubagent && allowSubagentBg) rendered += subagentGuidance(taskId);
+        const metadataPayload = { description, output: rendered, status: "running", taskId };
+        metadata?.(metadataPayload);
+        return { output: rendered, title: uiTitle, metadata: metadataPayload };
       }
 
-      const output = (data.output as string | undefined) ?? "";
-      const metadataOutput = preview(output);
-      const exit = data.exit_code as number | undefined;
-      const truncated = data.truncated as boolean | undefined;
-      const outputPath = data.output_path as string | undefined;
-      const timedOut = data.timed_out === true;
-      const metadataPayload = {
-        description,
-        output: metadataOutput,
-        exit,
-        truncated,
-        ...(outputPath ? { outputPath } : {}),
-      };
-
+      const rendered = maybeAppendGrepSearchHint(
+        (data.output as string | undefined) ?? "",
+        command,
+        aftSearchRegistered,
+        projectRootFor(context),
+      );
+      const metadataPayload = foregroundMetadata(description, data, rendered);
       metadata?.(metadataPayload);
-
-      // Agent-visible output is the raw bash output (matches OpenCode's native
-      // bash contract). Exit code, truncation, output path are UI metadata —
-      // they go through metadata?.() above. We surface the bare minimum the
-      // agent NEEDS to know directly in the text:
-      //   - non-zero exit code (agent must be able to detect command failure)
-      //   - timeout marker (separate signal beyond exit 124)
-      //   - truncation pointer (so agent knows full output exists on disk)
-      let rendered = output;
-      if (truncated && outputPath) {
-        rendered += `\n[output truncated; full output at ${outputPath}]`;
-      }
-      if (timedOut) {
-        rendered += `\n[command timed out]`;
-      }
-      if (typeof exit === "number" && exit !== 0) {
-        rendered += `\n[exit code: ${exit}]`;
-      }
       return {
         output: rendered,
-        title: description ?? shortenCommand(command),
+        title: uiTitle,
         metadata: metadataPayload,
       };
     },
@@ -590,40 +509,21 @@ function subagentGuidance(taskId: string): string {
 NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}", timeoutMs: 60000 }) to wait for completion before returning to the parent. Subagents don't survive turn-end and won't receive the completion reminder.`;
 }
 
-function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
-  if (isPty) {
-    // PTY tasks are inherently interactive — the agent MUST poll bash_status
-    // to see the screen and bash_write to drive the program. The piped-task
-    // "don't poll" copy is wrong for this mode.
-    return `PTY task started: ${taskId}. Use bash_status({ taskId: "${taskId}", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "${taskId}", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.`;
-  }
-  return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
-}
-
-function formatPromotionMessage(
-  taskId: string,
-  timeout: number | undefined,
-  waitWindowMs: number,
-): string {
-  // We waited up to waitWindowMs, or shorter if the agent's explicit timeout
-  // capped us first. Report the actual elapsed wait so the message is
-  // accurate. We do NOT echo the original command back — the agent already
-  // has it in its own tool-call args, and bash_status returns it on demand.
-  const waited = timeout !== undefined ? Math.min(timeout, waitWindowMs) : waitWindowMs;
-  return `Foreground bash didn't finish within ${formatSeconds(waited)} and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ taskId: "${taskId}" }) to inspect output or bash_kill({ taskId: "${taskId}" }) to terminate.`;
-}
-
 function foregroundMetadata(
   description: string | undefined,
   data: Record<string, unknown>,
   rendered: string,
 ): Record<string, unknown> {
   const outputPath = data.output_path as string | undefined;
+  const truncated =
+    typeof data.truncated === "boolean"
+      ? data.truncated
+      : (data.output_truncated as boolean | undefined);
   return {
     description,
     output: preview(rendered),
     exit: data.exit_code as number | undefined,
-    truncated: data.output_truncated as boolean | undefined,
+    truncated,
     ...(outputPath ? { outputPath } : {}),
   };
 }

@@ -3,8 +3,6 @@ import {
   type BinaryBridge,
   type BridgeRequestOptions,
   coerceBoolean,
-  formatForegroundResult,
-  formatSeconds,
   isBridgeTransportTimeout,
   isTerminalStatus,
   maybeAppendConflictsHint,
@@ -42,13 +40,6 @@ import {
   textResult,
 } from "./_shared.js";
 
-// Foreground polling wait-window: how long the plugin blocks the agent before
-// promoting the task to background and returning. INTENTIONALLY decoupled
-// from the task's own kill cap (`params.timeout`). Council decision:
-// .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
-// The value is resolved per-call from bash config (default 8000ms, floored at
-// 5000ms) via resolveBashConfig().foreground_wait_window_ms.
-const FOREGROUND_POLL_INTERVAL_MS = 100;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
 const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -67,12 +58,25 @@ function resolveForegroundWaitMs(configured: number): number {
   }
   return configured;
 }
-// Bridge transport budget for `bash` calls. Rust returns `running` immediately
-// and the plugin polls separately, so transport only needs to cover spawn +
-// protocol round-trip; not a function of params.timeout. See council audit
-// `.alfonso/athena/council-aft-bash-timeout-audit-057818e1583d3883/`.
+// Baseline bridge transport budget for bash-family control calls. The main
+// orchestrated bash tool overrides this per request because Rust may hold the
+// final response until the foreground wait window or hard-kill cap elapses.
 const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
+// The margin gives Rust time to promote or finalize the task and deliver the
+// final response after the server's foreground wait window or hard kill timeout.
+const BASH_TRANSPORT_MARGIN_MS = 10_000;
+
+function orchestratedTransportTimeoutMs(
+  blockToCompletion: boolean,
+  effectiveTimeout: number | undefined,
+  foregroundWaitMs: number,
+): number {
+  const waitBudget = blockToCompletion
+    ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
+    : foregroundWaitMs;
+  return waitBudget + BASH_TRANSPORT_MARGIN_MS;
+}
 
 // Background task completion metadata shape (from Track D)
 interface BgCompletion {
@@ -380,6 +384,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
       const requestedPty = !backgroundDisabled && coerceBoolean(params.pty);
       const effectiveBackground =
         !backgroundDisabled && (coerceBoolean(params.background) || requestedPty);
+      const blockToCompletion = backgroundDisabled;
       // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
       // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
       // FOREGROUND auto-promote path a `timeout` below the foreground wait
@@ -428,14 +433,16 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           pty: requestedPty,
           pty_rows: ptyRows,
           pty_cols: ptyCols,
+          foreground_orchestrate: true,
+          block_to_completion: blockToCompletion,
         },
         extCtx,
         {
-          // Rust bash has its own watchdog that kills the child shell on the
-          // bash-level timeout and returns a normal timed_out response well
-          // before our transport timeout fires. If we hit the transport
-          // deadline anyway it means the response is just late — don't
-          // sacrifice the bridge (and all its warm state) for that.
+          transportTimeoutMs: orchestratedTransportTimeoutMs(
+            blockToCompletion,
+            effectiveTimeout,
+            foregroundWaitMs,
+          ),
           onProgress: ({ text }) => {
             streamed += text;
             // Stream truncated output to avoid overwhelming the UI
@@ -460,67 +467,8 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
 
       const taskId = response.task_id as string | undefined;
       if (response.status === "running" && taskId) {
-        if (effectiveBackground) {
-          trackBgTask(resolveSessionId(extCtx), taskId);
-          return bashResult(formatBackgroundLaunch(taskId, requestedPty), { task_id: taskId });
-        }
-
-        // Wait-window decoupled from params.timeout. With background enabled,
-        // cap polling at foregroundWaitMs so agents get a fast promotion
-        // message for unexpectedly long commands. With background disabled,
-        // keep polling inline until terminal status or the command's hard-kill
-        // timeout. effectiveTimeout already folded the sub-window guard (#102)
-        // for the promote path, so Math.min cannot collapse that window below
-        // the configured value.
-        const waitTimeoutMs = backgroundDisabled
-          ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
-          : effectiveTimeout !== undefined
-            ? Math.min(effectiveTimeout, foregroundWaitMs)
-            : foregroundWaitMs;
-        const startedAt = Date.now();
-        while (true) {
-          const status = await callBashBridge(bridge, "bash_status", { task_id: taskId }, extCtx);
-          if (status.success === false) {
-            throw new Error((status.message as string | undefined) ?? "bash_status failed");
-          }
-          if (isTerminalStatus(status.status)) {
-            return bashResult(
-              withBashHints(
-                formatForegroundResult(status),
-                bridgeCommand,
-                aftSearchRegistered,
-                extCtx.cwd,
-              ),
-              {
-                exit_code: status.exit_code as number | undefined,
-                duration_ms: status.duration_ms as number | undefined,
-                truncated: status.output_truncated as boolean | undefined,
-                output_path: status.output_path as string | undefined,
-                task_id: taskId,
-              },
-            );
-          }
-          if (Date.now() - startedAt >= waitTimeoutMs) {
-            if (backgroundDisabled) {
-              await sleep(FOREGROUND_POLL_INTERVAL_MS);
-              continue;
-            }
-            const promoted = await callBashBridge(
-              bridge,
-              "bash_promote",
-              { task_id: taskId },
-              extCtx,
-            );
-            if (promoted.success === false) {
-              throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
-            }
-            trackBgTask(resolveSessionId(extCtx), taskId);
-            return bashResult(formatPromotionMessage(taskId, effectiveTimeout, foregroundWaitMs), {
-              task_id: taskId,
-            });
-          }
-          await sleep(FOREGROUND_POLL_INTERVAL_MS);
-        }
+        trackBgTask(resolveSessionId(extCtx), taskId);
+        return bashResult((response.output as string | undefined) ?? "", { task_id: taskId });
       }
 
       const details: BashDetails = {
@@ -554,28 +502,6 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
     pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
     pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
   }
-}
-
-function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
-  if (isPty) {
-    // PTY tasks are inherently interactive — the agent MUST poll bash_status
-    // to see the screen and bash_write to drive the program. The piped-task
-    // "don't poll" copy is wrong for this mode.
-    return `PTY task started: ${taskId}. Use bash_status({ task_id: "${taskId}", output_mode: "screen" }) to see the visible terminal, bash_write({ task_id: "${taskId}", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.`;
-  }
-  return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
-}
-
-function formatPromotionMessage(
-  taskId: string,
-  timeout: number | undefined,
-  waitWindowMs: number,
-): string {
-  // Reports actual elapsed wait, not the user's full kill cap. The agent
-  // already has the original command in its tool-call args; bash_status
-  // returns it on demand if a downstream tool ever needs it.
-  const waited = timeout !== undefined ? Math.min(timeout, waitWindowMs) : waitWindowMs;
-  return `Foreground bash didn't finish within ${formatSeconds(waited)} and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ task_id: "${taskId}" }) to inspect output or bash_kill({ task_id: "${taskId}" }) to terminate.`;
 }
 
 /**

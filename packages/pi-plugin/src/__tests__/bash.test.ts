@@ -301,17 +301,19 @@ describe("bash tool adapter", () => {
     expect(callArgs[1].compressed).toBe(false);
   });
 
-  test("background bash forwards user kill cap and uses 30s baseline transport budget", async () => {
-    // Post-v0.20+ the Rust `bash` call returns `running` immediately, so
-    // transport timeout is bounded by spawn + protocol round-trip, not the
-    // task budget. A 40s `timeout` still propagates as the task kill cap
-    // but transport stays at the 30s baseline.
+  test("background bash forwards user kill cap and uses wait-aware transport budget", async () => {
+    // The main bash call is handled through server orchestration, so the
+    // transport budget comes from the foreground wait window plus margin even
+    // when an explicit background call returns immediately. The user-supplied
+    // 40s timeout is still sent as the child-process kill cap.
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const { bridge, calls } = makeTrackableMockBridge({
       status: "running",
       task_id: "bash-123",
       duration_ms: 5,
+      output:
+        "Background task started: bash-123. A completion reminder will be delivered automatically; don't poll bash_status.",
     });
     const ctx = makeMockContext(bridge);
 
@@ -335,14 +337,15 @@ describe("bash tool adapter", () => {
       notify_on_completion: true,
       compressed: false,
     });
-    // 30s baseline: wait-window (5s) + overhead (5s) is below the floor.
-    expect(callArgs[2].transportTimeoutMs).toBe(30_000);
+    // The transport timeout is the default foreground wait window (15s) plus a
+    // 10s margin for transport finalization.
+    expect(callArgs[2].transportTimeoutMs).toBe(25_000);
     expect(callArgs[2].keepBridgeOnTimeout).toBe(true);
     expect(result.content[0].text).toContain("Background task started: bash-123");
     expect(result.details.task_id).toBe("bash-123");
   });
 
-  test("foreground running command polls to completion and returns inline output", async () => {
+  test("foreground command returns server-orchestrated inline output without client polling", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
@@ -353,14 +356,14 @@ describe("bash tool adapter", () => {
         options?: Record<string, unknown>,
       ) => {
         calls.push([command, params, options]);
-        if (command === "bash") return { success: true, status: "running", task_id: "task-inline" };
         return {
           success: true,
           status: "completed",
+          task_id: "task-inline",
           exit_code: 0,
           duration_ms: 100,
-          output_preview: "done",
-          output_truncated: false,
+          output: "done",
+          truncated: false,
         };
       },
     } as unknown as BinaryBridge;
@@ -378,29 +381,30 @@ describe("bash tool adapter", () => {
     )) as { content: Array<{ text: string }> };
 
     expect(result.content[0].text).toBe("done");
-    expect(calls.map((call) => (call as [string])[0])).toEqual(["bash", "bash_status"]);
-    for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
-      expect(call[2].keepBridgeOnTimeout).toBe(true);
-      expect(call[2].transportTimeoutMs).toBe(30_000);
-    }
-    expect((calls[0] as [string, Record<string, unknown>])[1].notify_on_completion).toBe(false);
+    expect(calls.map((call) => (call as [string])[0])).toEqual(["bash"]);
+    const bashCall = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
+    expect(bashCall[1]).toMatchObject({
+      notify_on_completion: false,
+      foreground_orchestrate: true,
+      block_to_completion: false,
+    });
+    expect(bashCall[2].keepBridgeOnTimeout).toBe(true);
+    expect(bashCall[2].transportTimeoutMs).toBe(25_000);
   });
 
   test("foreground leading grep appends aft_search hint", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const bridge = {
-      send: async (command: string) => {
-        if (command === "bash") return { success: true, status: "running", task_id: "task-grep" };
-        return {
-          success: true,
-          status: "completed",
-          exit_code: 0,
-          duration_ms: 100,
-          output_preview: "src/file.ts:1:x",
-          output_truncated: false,
-        };
-      },
+      send: async () => ({
+        success: true,
+        status: "completed",
+        task_id: "task-grep",
+        exit_code: 0,
+        duration_ms: 100,
+        output: "src/file.ts:1:x",
+        truncated: false,
+      }),
     } as unknown as BinaryBridge;
     const ctx = makeMockContext(bridge);
 
@@ -421,17 +425,15 @@ describe("bash tool adapter", () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const bridge = {
-      send: async (command: string) => {
-        if (command === "bash") return { success: true, status: "running", task_id: "task-filter" };
-        return {
-          success: true,
-          status: "completed",
-          exit_code: 0,
-          duration_ms: 100,
-          output_preview: "failure details",
-          output_truncated: false,
-        };
-      },
+      send: async () => ({
+        success: true,
+        status: "completed",
+        task_id: "task-filter",
+        exit_code: 0,
+        duration_ms: 100,
+        output: "failure details",
+        truncated: false,
+      }),
     } as unknown as BinaryBridge;
     const ctx = makeMockContext(bridge);
 
@@ -447,7 +449,7 @@ describe("bash tool adapter", () => {
     expect(result.content[0].text).not.toContain("DO NOT search code by running grep/rg in bash");
   });
 
-  test("foreground running command promotes to background after timeout", async () => {
+  test("foreground promotion returns server message without client poll/promote calls", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
@@ -458,10 +460,12 @@ describe("bash tool adapter", () => {
         options?: Record<string, unknown>,
       ) => {
         calls.push([command, params, options]);
-        if (command === "bash")
-          return { success: true, status: "running", task_id: "task-promote" };
-        if (command === "bash_status") return { success: true, status: "running" };
-        return { success: true, task_id: "task-promote", promoted: true };
+        return {
+          success: true,
+          status: "running",
+          task_id: "task-promote",
+          output: `Foreground bash didn't finish within 0.1s and was promoted to background: task-promote. A completion reminder will be delivered automatically; use bash_status({ taskId: "task-promote" }) to inspect output or bash_kill({ taskId: "task-promote" }) to terminate.`,
+        };
       },
     } as unknown as BinaryBridge;
     const ctx = makeMockContext(bridge);
@@ -469,10 +473,6 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    // 50ms foreground wait: first status poll (~0ms elapsed) keeps polling, the
-    // second (~100ms after a poll-interval sleep) crosses the window and
-    // promotes — exactly two status calls. Production floors the window at 5s;
-    // bun caps tests at 5s, so this seam exercises the promote path fast.
     process.env.AFT_TEST_FOREGROUND_WAIT_MS = "50";
     let result: { content: Array<{ text: string }> };
     try {
@@ -484,23 +484,18 @@ describe("bash tool adapter", () => {
     }
 
     expect(result.content[0].text).toContain("promoted to background: task-promote");
-    expect(calls.map((call) => (call as [string])[0])).toEqual([
-      "bash",
-      "bash_status",
-      "bash_status",
-      "bash_promote",
-    ]);
-    for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
-      expect(call[2].keepBridgeOnTimeout).toBe(true);
-      expect(call[2].transportTimeoutMs).toBe(30_000);
-    }
+    expect(calls.map((call) => (call as [string])[0])).toEqual(["bash"]);
+    const bashCall = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
+    expect(bashCall[1].foreground_orchestrate).toBe(true);
+    expect(bashCall[1].block_to_completion).toBe(false);
+    expect(bashCall[2].keepBridgeOnTimeout).toBe(true);
+    expect(bashCall[2].transportTimeoutMs).toBe(10_050);
   });
 
-  test("background disabled foreground command polls to completion without promotion", async () => {
+  test("background disabled foreground command is block-to-completion on the server", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
-    let statusCalls = 0;
     const bridge = {
       send: async (
         command: string,
@@ -508,20 +503,15 @@ describe("bash tool adapter", () => {
         options?: Record<string, unknown>,
       ) => {
         calls.push([command, params, options]);
-        if (command === "bash") return { success: true, status: "running", task_id: "task-no-bg" };
-        if (command === "bash_status") {
-          statusCalls += 1;
-          if (statusCalls === 1) return { success: true, status: "running" };
-          return {
-            success: true,
-            status: "completed",
-            exit_code: 0,
-            duration_ms: 125,
-            output_preview: "finished without background",
-            output_truncated: false,
-          };
-        }
-        throw new Error(`unexpected bridge command: ${command}`);
+        return {
+          success: true,
+          status: "completed",
+          task_id: "task-no-bg",
+          exit_code: 0,
+          duration_ms: 125,
+          output: "finished without background",
+          truncated: false,
+        };
       },
     } as unknown as BinaryBridge;
     const ctx = makeMockContext(bridge, { bash: { background: false } } as PluginContext["config"]);
@@ -539,17 +529,16 @@ describe("bash tool adapter", () => {
       )) as { content: Array<{ text: string }> };
 
     expect(result.content[0].text).toBe("finished without background");
-    expect(calls.map((call) => (call as [string])[0])).toEqual([
-      "bash",
-      "bash_status",
-      "bash_status",
-    ]);
+    expect(calls.map((call) => (call as [string])[0])).toEqual(["bash"]);
     expect(calls.find((call) => (call as [string])[0] === "bash_promote")).toBeUndefined();
-    const bashParams = (calls[0] as [string, Record<string, unknown>])[1];
+    const bashCall = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
+    const bashParams = bashCall[1];
     expect(bashParams.background).toBe(false);
     expect(bashParams.notify_on_completion).toBe(false);
     expect(bashParams.pty).toBe(false);
     expect(bashParams.timeout).toBe(25);
+    expect(bashParams.block_to_completion).toBe(true);
+    expect(bashCall[2].transportTimeoutMs).toBe(10_025);
   });
 
   test("async bash_watch registration does not add synthetic outstanding task", async () => {

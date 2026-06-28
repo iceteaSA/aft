@@ -3,8 +3,9 @@
 import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BridgePool } from "@cortexkit/aft-bridge";
+import { type BinaryBridge, BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { withEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { createBashTool } from "../../tools/bash.js";
 import type { PluginContext } from "../../types.js";
 import { mockAsk, noopAsk } from "../test-helpers";
@@ -94,12 +95,27 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       { timeoutMs: 20_000 },
       configureParamsFromLegacyOverrides({
         restrict_to_project_root: true,
-        bash_permissions: true,
+        bash_permissions: false,
         storage_dir: join(h.tempDir, ".aft-storage"),
         harness: "opencode",
         ...configOverrides,
       }),
     );
+    const bridgeCalls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const patchedBridges = new WeakSet<BinaryBridge>();
+    const originalGetBridge = pool.getBridge.bind(pool);
+    (pool as { getBridge: (projectRoot: string) => BinaryBridge }).getBridge = (projectRoot) => {
+      const bridge = originalGetBridge(projectRoot);
+      if (!patchedBridges.has(bridge)) {
+        const originalSend = bridge.send.bind(bridge);
+        bridge.send = async (command, params = {}, options) => {
+          bridgeCalls.push({ command, params });
+          return await originalSend(command, params, options);
+        };
+        patchedBridges.add(bridge);
+      }
+      return bridge;
+    };
     const ctx: PluginContext = {
       pool,
       client: {} as PluginContext["client"],
@@ -114,7 +130,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
         await cleanup.call(h);
       },
     });
-    return { h, bash, pool };
+    return { h, bash, pool, bridgeCalls };
   }
 
   async function callPluginBash(
@@ -142,6 +158,21 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     return { output, metadata: lastMetadata };
   }
 
+  function nonConfigureCommands(
+    calls: Array<{ command: string; params: Record<string, unknown> }>,
+  ): string[] {
+    return calls.filter((call) => call.command !== "configure").map((call) => call.command);
+  }
+
+  function expectNoClientPollOrPromote(
+    calls: Array<{ command: string; params: Record<string, unknown> }>,
+  ): void {
+    const commands = nonConfigureCommands(calls);
+    expect(commands).toContain("bash");
+    expect(commands).not.toContain("bash_status");
+    expect(commands).not.toContain("bash_promote");
+  }
+
   async function bridgeBashToTerminal(
     h: E2EHarness,
     args: Record<string, unknown>,
@@ -160,7 +191,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   }
 
   test("foreground returns raw output text (not a JSON envelope)", async () => {
-    const { h, bash } = await pluginHarness();
+    const { h, bash, bridgeCalls } = await pluginHarness();
 
     const result = await callPluginBash(bash, h, { command: "echo hello" });
 
@@ -170,10 +201,15 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(eol(result.output)).toBe("hello\n");
     // Exit code, truncation, etc. land in metadata for the UI.
     expect(result.metadata.exit).toBe(0);
+    expectNoClientPollOrPromote(bridgeCalls);
+    expect(bridgeCalls[0].params).toMatchObject({
+      foreground_orchestrate: true,
+      block_to_completion: false,
+    });
   });
 
   test("non-zero exit appends [exit code: N] to agent-visible output", async () => {
-    const { h, bash } = await pluginHarness();
+    const { h, bash, bridgeCalls } = await pluginHarness();
 
     const result = await callPluginBash(bash, h, { command: "false" });
 
@@ -181,6 +217,32 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     // because metadata is UI-only and not echoed back to the model.
     expect(result.output).toBe("\n[exit code: 1]");
     expect(result.metadata.exit).toBe(1);
+    expectNoClientPollOrPromote(bridgeCalls);
+  });
+
+  test("foreground promotion returns server text and does not call bash_status or bash_promote", async () => {
+    const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
+
+    const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
+      callPluginBash(bash, h, { command: "sleep 0.2 && echo late" }),
+    );
+
+    expect(result.output).toContain("promoted to background");
+    expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{8}$/);
+    expectNoClientPollOrPromote(bridgeCalls);
+  });
+
+  test("background true returns server launch text and task id without polling", async () => {
+    const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
+
+    const result = await callPluginBash(bash, h, {
+      command: "sleep 0.2 && echo background-done",
+      background: true,
+    });
+
+    expect(result.output).toContain("Background task started:");
+    expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{8}$/);
+    expectNoClientPollOrPromote(bridgeCalls);
   });
 
   skipOnWindows("workdir is respected", async () => {
@@ -372,7 +434,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   });
 
   test("permission ask round-trip invokes OpenCode ctx.ask", async () => {
-    const { h, bash } = await pluginHarness();
+    const { h, bash, bridgeCalls } = await pluginHarness({ bash_permissions: true });
     const ask = mockAsk();
 
     const result = await callPluginBash(bash, h, { command: "git status" }, { ask });
@@ -387,6 +449,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       patterns: ["git status"],
       always: ["git status *"],
     });
+    expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash", "bash"]);
   });
 
   // ─────────────────────────────────────────────────────────────────────────

@@ -179,10 +179,13 @@ describe("OpenCode bash adapter", () => {
   });
 
   test("pty dimensions are forwarded when pty:true and silently ignored when pty:false", async () => {
-    const { calls, tool: bash } = createHarness(() => ({
+    const { calls, tool: bash } = createHarness((_command, params) => ({
       success: true,
       status: "running",
       task_id: "bash-pty-dims",
+      output: params.pty
+        ? 'PTY task started: bash-pty-dims. Use bash_status({ taskId: "bash-pty-dims", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "bash-pty-dims", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.'
+        : "Background task started: bash-pty-dims. A completion reminder will be delivered automatically; don't poll bash_status.",
     }));
 
     // pty:false + ptyRows passed defensively: should NOT throw, dims silently ignored
@@ -337,14 +340,12 @@ describe("OpenCode bash adapter", () => {
     expect(calls[0].params.compressed).toBe(false);
   });
 
-  test("transport timeout is bounded by wait-window, not user-supplied task budget", async () => {
-    // After the v0.20+ foreground-as-polled-background architecture, the
-    // Rust `bash` call returns a `running` status immediately — it does NOT
-    // block until the child exits. The transport timeout therefore covers
-    // only spawn + protocol round-trip, not the full task budget. A user
-    // asking for `timeout: 600_000` (10-minute kill cap) still gets the
-    // 30s baseline transport budget because the bridge call returns fast
-    // and the long task survives in the background after promotion.
+  test("transport timeout is sized to the server-side foreground wait, not user task budget", async () => {
+    // The server is responsible for waiting on bash commands and promoting
+    // background ones to completion. A user-supplied timeout such as 600_000
+    // is sent to the child process as its kill deadline, but the bridge
+    // transport timeout only needs to cover the server's foreground wait window
+    // plus a small margin for finalization.
     const { calls, tool: bash } = createHarness(() => ({
       success: true,
       output: "built",
@@ -359,9 +360,9 @@ describe("OpenCode bash adapter", () => {
     expect(calls).toHaveLength(1);
     // The user's kill cap still propagates to Rust as the task timeout.
     expect(calls[0].params.timeout).toBe(600_000);
-    // But transport timeout is the 30s baseline — wait-window (5s) plus
-    // overhead (5s) is well below the floor.
-    expect(calls[0].options?.transportTimeoutMs).toBe(30_000);
+    // The transport timeout is the default foreground wait window (15s) plus a
+    // 10s margin for transport finalization.
+    expect(calls[0].options?.transportTimeoutMs).toBe(25_000);
     expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
   });
 
@@ -390,6 +391,8 @@ describe("OpenCode bash adapter", () => {
       success: true,
       task_id: "task-bg",
       status: "running",
+      output:
+        "Background task started: task-bg. A completion reminder will be delivered automatically; don't poll bash_status.",
     }));
 
     bashText(
@@ -453,7 +456,7 @@ describe("OpenCode bash adapter", () => {
   test("truncation pointer and exit code are appended to agent-visible output, full payload stored as metadata", async () => {
     const { tool: bash } = createHarness(() => ({
       success: true,
-      output: "done",
+      output: "done\n[output truncated; full output at /tmp/bash-output.txt]",
       exit_code: 0,
       truncated: true,
       output_path: "/tmp/bash-output.txt",
@@ -473,7 +476,7 @@ describe("OpenCode bash adapter", () => {
     expect(stored.title).toBe("Echo done");
     expect(stored.metadata).toEqual({
       description: "Echo done",
-      output: "done",
+      output: "done\n[output truncated; full output at /tmp/bash-output.txt]",
       exit: 0,
       truncated: true,
       outputPath: "/tmp/bash-output.txt",
@@ -483,7 +486,7 @@ describe("OpenCode bash adapter", () => {
   test("non-zero exit code is appended to agent-visible output", async () => {
     const { tool: bash } = createHarness(() => ({
       success: true,
-      output: "command failed\n",
+      output: "command failed\n\n[exit code: 2]",
       exit_code: 2,
       truncated: false,
     }));
@@ -498,6 +501,8 @@ describe("OpenCode bash adapter", () => {
       success: true,
       status: "running",
       task_id: "task-xyz",
+      output:
+        "Background task started: task-xyz. A completion reminder will be delivered automatically; don't poll bash_status.",
     }));
 
     const stored = (await bash.execute(
@@ -524,43 +529,41 @@ describe("OpenCode bash adapter", () => {
     });
   });
 
-  test("foreground running task polls to terminal status and returns inline output", async () => {
-    const { calls, tool: bash } = createHarness((command) => {
-      if (command === "bash") return { success: true, status: "running", task_id: "task-inline" };
-      return {
-        success: true,
-        status: "completed",
-        exit_code: 0,
-        duration_ms: 100,
-        output_preview: "done",
-        output_truncated: false,
-      };
-    });
+  test("foreground command returns server-orchestrated inline output without client polling", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      status: "completed",
+      task_id: "task-inline",
+      exit_code: 0,
+      duration_ms: 100,
+      output: "done",
+      truncated: false,
+    }));
 
     const output = bashText(await bash.execute({ command: "printf done" }, createMockSdkContext()));
 
     expect(output).toBe("done");
-    expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status"]);
-    for (const call of calls) {
-      expect(call.options?.keepBridgeOnTimeout).toBe(true);
-      expect(call.options?.transportTimeoutMs).toBe(30_000);
-    }
-    expect(calls[0].params.notify_on_completion).toBe(false);
+    expect(calls.map((call) => call.command)).toEqual(["bash"]);
+    expect(calls[0].params).toMatchObject({
+      notify_on_completion: false,
+      foreground_orchestrate: true,
+      block_to_completion: false,
+    });
+    expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
+    expect(calls[0].options?.transportTimeoutMs).toBe(25_000);
   });
 
   test("foreground leading grep appends aft_search hint", async () => {
     const { tool: bash } = createHarness(
-      (command) => {
-        if (command === "bash") return { success: true, status: "running", task_id: "task-grep" };
-        return {
-          success: true,
-          status: "completed",
-          exit_code: 0,
-          duration_ms: 100,
-          output_preview: "src/file.ts:1:x",
-          output_truncated: false,
-        };
-      },
+      () => ({
+        success: true,
+        status: "completed",
+        task_id: "task-grep",
+        exit_code: 0,
+        duration_ms: 100,
+        output: "src/file.ts:1:x",
+        truncated: false,
+      }),
       undefined,
       true,
     );
@@ -576,17 +579,15 @@ describe("OpenCode bash adapter", () => {
 
   test("foreground filtering grep does not append code-search hint", async () => {
     const { tool: bash } = createHarness(
-      (command) => {
-        if (command === "bash") return { success: true, status: "running", task_id: "task-filter" };
-        return {
-          success: true,
-          status: "completed",
-          exit_code: 0,
-          duration_ms: 100,
-          output_preview: "failure details",
-          output_truncated: false,
-        };
-      },
+      () => ({
+        success: true,
+        status: "completed",
+        task_id: "task-filter",
+        exit_code: 0,
+        duration_ms: 100,
+        output: "failure details",
+        truncated: false,
+      }),
       undefined,
       true,
     );
@@ -599,15 +600,14 @@ describe("OpenCode bash adapter", () => {
     expect(output).not.toContain("DO NOT search code by running grep/rg in bash");
   });
 
-  test("foreground running task promotes to background after wait timeout", async () => {
-    const { calls, tool: bash } = createHarness((command) => {
-      if (command === "bash") return { success: true, status: "running", task_id: "task-promote" };
-      if (command === "bash_status") return { success: true, status: "running" };
-      return { success: true, task_id: "task-promote", promoted: true };
-    });
+  test("foreground promotion returns server message without client poll/promote calls", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      status: "running",
+      task_id: "task-promote",
+      output: `Foreground bash didn't finish within 0s and was promoted to background: task-promote. A completion reminder will be delivered automatically; use bash_status({ taskId: "task-promote" }) to inspect output or bash_kill({ taskId: "task-promote" }) to terminate.`,
+    }));
 
-    // Force a 0ms foreground wait so the promote path fires after the first
-    // status poll (production floors the window at 5s; bun caps tests at 5s).
     const output = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "0" }, async () =>
       bashText(
         await bash.execute(
@@ -618,34 +618,24 @@ describe("OpenCode bash adapter", () => {
     );
 
     expect(output).toContain("promoted to background: task-promote");
-    expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status", "bash_promote"]);
-    for (const call of calls) {
-      expect(call.options?.keepBridgeOnTimeout).toBe(true);
-      expect(call.options?.transportTimeoutMs).toBe(30_000);
-    }
+    expect(calls.map((call) => call.command)).toEqual(["bash"]);
+    expect(calls[0].params.foreground_orchestrate).toBe(true);
+    expect(calls[0].params.block_to_completion).toBe(false);
+    expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
+    expect(calls[0].options?.transportTimeoutMs).toBe(10_000);
   });
 
-  test("background disabled foreground task polls to completion without promotion", async () => {
-    let statusCalls = 0;
+  test("background disabled foreground task is block-to-completion on the server", async () => {
     const { calls, tool: bash } = createHarness(
-      (command) => {
-        if (command === "bash") {
-          return { success: true, status: "running", task_id: "task-no-bg" };
-        }
-        if (command === "bash_status") {
-          statusCalls += 1;
-          if (statusCalls === 1) return { success: true, status: "running" };
-          return {
-            success: true,
-            status: "completed",
-            exit_code: 0,
-            duration_ms: 125,
-            output_preview: "finished without background",
-            output_truncated: false,
-          };
-        }
-        throw new Error(`unexpected bridge command: ${command}`);
-      },
+      () => ({
+        success: true,
+        status: "completed",
+        task_id: "task-no-bg",
+        exit_code: 0,
+        duration_ms: 125,
+        output: "finished without background",
+        truncated: false,
+      }),
       undefined,
       false,
       { bash: { background: false } } as PluginContext["config"],
@@ -659,12 +649,14 @@ describe("OpenCode bash adapter", () => {
     );
 
     expect(output).toBe("finished without background");
-    expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status", "bash_status"]);
+    expect(calls.map((call) => call.command)).toEqual(["bash"]);
     expect(calls.find((call) => call.command === "bash_promote")).toBeUndefined();
     expect(calls[0].params.background).toBe(false);
     expect(calls[0].params.notify_on_completion).toBe(false);
     expect(calls[0].params.pty).toBe(false);
     expect(calls[0].params.timeout).toBe(25);
+    expect(calls[0].params.block_to_completion).toBe(true);
+    expect(calls[0].options?.transportTimeoutMs).toBe(10_025);
   });
 
   test("explicit background spawn enables completion notifications", async () => {
@@ -672,6 +664,8 @@ describe("OpenCode bash adapter", () => {
       success: true,
       status: "running",
       task_id: "task-notify",
+      output:
+        "Background task started: task-notify. A completion reminder will be delivered automatically; don't poll bash_status.",
     }));
 
     const output = bashText(
@@ -1216,8 +1210,9 @@ describe("bash_status tool", () => {
 //      the subagent terminates after its single response, so we run the
 //      command inline instead. The subagent gets actual output, not a dead
 //      task_id.
-//   2. Extends the foreground poll window to the task's full hard-kill timeout
-//      so the bash call stays inline until terminal regardless of duration.
+// The subagent client sends block_to_completion so the server keeps the
+// bash call inline until the command reaches a terminal state, regardless of
+// how long it takes.
 // =============================================================================
 
 function createSubagentClient(parentID: string = "ses_parent_xyz"): any {
@@ -1265,25 +1260,16 @@ function createSubagentHarness(
 }
 
 describe("OpenCode bash adapter — subagent gating", () => {
-  test("subagent + background: true is silently converted to foreground (bridge sees background=false)", async () => {
+  test("subagent + background: true is silently converted to server block-to-completion", async () => {
     _resetSubagentCacheForTest();
-    // Simulate a task that completes on the 2nd bash_status poll.
-    let statusCalls = 0;
-    const { calls, tool: bash } = createSubagentHarness((command) => {
-      if (command === "bash") return { success: true, status: "running", task_id: "bash-conv" };
-      if (command === "bash_status") {
-        statusCalls += 1;
-        if (statusCalls < 2) return { success: true, status: "running" };
-        return {
-          success: true,
-          status: "completed",
-          exit_code: 0,
-          output_preview: "converted output",
-          output_truncated: false,
-        };
-      }
-      return { success: true };
-    });
+    const { calls, tool: bash } = createSubagentHarness(() => ({
+      success: true,
+      status: "completed",
+      task_id: "bash-conv",
+      exit_code: 0,
+      output: "converted output",
+      truncated: false,
+    }));
     const result = bashText(
       await bash.execute(
         { command: "sleep 30", background: true, timeout: 30_000 },
@@ -1301,30 +1287,24 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(bashCall).toBeDefined();
     expect(bashCall?.params.background).toBe(false);
     expect(bashCall?.params.notify_on_completion).toBe(false);
-    // Subagents must never call bash_promote even when caller requested
-    // background:true — the conversion happens upstream of promotion.
+    expect(bashCall?.params.block_to_completion).toBe(true);
+    // Subagents must not make client-side bash_status or bash_promote calls
+    // even if the caller asked for background:true. The server owns waiting for
+    // the command to reach a terminal state.
+    expect(calls.map((c) => c.command)).toEqual(["bash"]);
     expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
   });
 
-  test("subagent forced foreground does not promote after its poll deadline", async () => {
+  test("subagent forced foreground does not ask the client to promote", async () => {
     _resetSubagentCacheForTest();
-    let statusCalls = 0;
-    const { calls, tool: bash } = createSubagentHarness((command) => {
-      if (command === "bash")
-        return { success: true, status: "running", task_id: "bash-no-promote" };
-      if (command === "bash_status") {
-        statusCalls += 1;
-        if (statusCalls === 1) return { success: true, status: "running" };
-        return {
-          success: true,
-          status: "completed",
-          exit_code: 0,
-          output_preview: "finished inline",
-          output_truncated: false,
-        };
-      }
-      return { success: true };
-    });
+    const { calls, tool: bash } = createSubagentHarness(() => ({
+      success: true,
+      status: "completed",
+      task_id: "bash-no-promote",
+      exit_code: 0,
+      output: "finished inline",
+      truncated: false,
+    }));
 
     const result = bashText(
       await bash.execute(
@@ -1334,31 +1314,21 @@ describe("OpenCode bash adapter — subagent gating", () => {
     );
 
     expect(result as string).toContain("finished inline");
-    expect(calls.map((c) => c.command)).toEqual(["bash", "bash_status", "bash_status"]);
+    expect(calls.map((c) => c.command)).toEqual(["bash"]);
+    expect(calls[0].params.block_to_completion).toBe(true);
     expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
   });
 
-  test("subagent + foreground polls until terminal without promoting to background", async () => {
+  test("subagent + foreground delegates inline waiting to the server", async () => {
     _resetSubagentCacheForTest();
-    // Simulate a task that completes on the 3rd bash_status poll (~300ms in).
-    // Foreground primary sessions would promote at 5s; subagents must keep
-    // polling until terminal regardless of duration.
-    let statusCalls = 0;
-    const { calls, tool: bash } = createSubagentHarness((command) => {
-      if (command === "bash") return { success: true, status: "running", task_id: "bash-sub" };
-      if (command === "bash_status") {
-        statusCalls += 1;
-        if (statusCalls < 3) return { success: true, status: "running" };
-        return {
-          success: true,
-          status: "completed",
-          exit_code: 0,
-          output: "ok",
-          truncated: false,
-        };
-      }
-      return { success: true };
-    });
+    const { calls, tool: bash } = createSubagentHarness(() => ({
+      success: true,
+      status: "completed",
+      task_id: "bash-sub",
+      exit_code: 0,
+      output: "ok",
+      truncated: false,
+    }));
     const result = bashText(
       await bash.execute(
         { command: "fast-test", timeout: 30_000 },
@@ -1367,31 +1337,29 @@ describe("OpenCode bash adapter — subagent gating", () => {
     );
     expect(typeof result).toBe("string");
     expect(result as string).not.toContain("promoted to background");
-    // bash_status should have been polled until terminal
-    expect(calls.filter((c) => c.command === "bash_status").length).toBeGreaterThanOrEqual(3);
+    expect(calls.map((c) => c.command)).toEqual(["bash"]);
+    expect(calls[0].params.block_to_completion).toBe(true);
     // bash_promote should NEVER have been called for a subagent
     expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
   });
 
-  test("subagent + foreground without explicit timeout uses 30-minute default poll window", async () => {
+  test("subagent + foreground without explicit timeout sizes transport to the hard cap", async () => {
     _resetSubagentCacheForTest();
-    // We can't actually wait 30 minutes, but we can verify the code path
-    // does NOT call bash_promote when the task is still running and no
-    // explicit timeout was passed. (Test runs a fast termination so the
-    // wait window is never hit.)
-    const { calls, tool: bash } = createSubagentHarness((command) => {
-      if (command === "bash") return { success: true, status: "running", task_id: "bash-sub2" };
-      if (command === "bash_status") {
-        return { success: true, status: "completed", exit_code: 0, output: "ok", truncated: false };
-      }
-      return { success: true };
-    });
+    const { calls, tool: bash } = createSubagentHarness(() => ({
+      success: true,
+      status: "completed",
+      task_id: "bash-sub2",
+      exit_code: 0,
+      output: "ok",
+      truncated: false,
+    }));
     bashText(
       await bash.execute(
-        { command: "fast-test" }, // no timeout — should use DEFAULT_HARD_TIMEOUT_MS
+        { command: "fast-test" }, // No user timeout, so bridge timeout is 30 minutes plus 10s margin.
         createMockSdkContext({ sessionID: "ses_subagent_c" }),
       ),
     );
+    expect(calls[0].options?.transportTimeoutMs).toBe(30 * 60 * 1000 + 10_000);
     expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
   });
 
@@ -1399,7 +1367,14 @@ describe("OpenCode bash adapter — subagent gating", () => {
     _resetSubagentCacheForTest();
     // No client.session.get → resolveIsSubagent returns false → primary path.
     const { calls, tool: bash } = createHarness((command) => {
-      if (command === "bash") return { success: true, status: "running", task_id: "bash-bg" };
+      if (command === "bash")
+        return {
+          success: true,
+          status: "running",
+          task_id: "bash-bg",
+          output:
+            "Background task started: bash-bg. A completion reminder will be delivered automatically; don't poll bash_status.",
+        };
       return { success: true };
     });
     const result = bashText(
@@ -1423,7 +1398,13 @@ describe("OpenCode bash adapter — subagent gating", () => {
         getBridge: () => ({
           send: async (command: string) => {
             if (command === "bash")
-              return { success: true, status: "running", task_id: "bash-err" };
+              return {
+                success: true,
+                status: "running",
+                task_id: "bash-err",
+                output:
+                  "Background task started: bash-err. A completion reminder will be delivered automatically; don't poll bash_status.",
+              };
             return { success: true };
           },
         }),
@@ -1457,7 +1438,14 @@ describe("OpenCode bash adapter — subagent gating", () => {
     _resetSubagentCacheForTest();
     const { calls, tool: bash } = createSubagentHarness(
       (command) => {
-        if (command === "bash") return { success: true, status: "running", task_id: "bash-sub-bg" };
+        if (command === "bash")
+          return {
+            success: true,
+            status: "running",
+            task_id: "bash-sub-bg",
+            output:
+              "Background task started: bash-sub-bg. A completion reminder will be delivered automatically; don't poll bash_status.",
+          };
         return { success: true };
       },
       undefined,
@@ -1478,12 +1466,12 @@ describe("OpenCode bash adapter — subagent gating", () => {
   test("subagent auto-promotion with subagent_background true includes guidance", async () => {
     _resetSubagentCacheForTest();
     const { calls, tool: bash } = createSubagentHarness(
-      (command) => {
-        if (command === "bash")
-          return { success: true, status: "running", task_id: "bash-sub-promote" };
-        if (command === "bash_status") return { success: true, status: "running" };
-        return { success: true, promoted: true };
-      },
+      () => ({
+        success: true,
+        status: "running",
+        task_id: "bash-sub-promote",
+        output: `Foreground bash didn't finish within 0s and was promoted to background: bash-sub-promote. A completion reminder will be delivered automatically; use bash_status({ taskId: "bash-sub-promote" }) to inspect output or bash_kill({ taskId: "bash-sub-promote" }) to terminate.`,
+      }),
       undefined,
       { bash: { subagent_background: true } } as PluginContext["config"],
     );
@@ -1499,7 +1487,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(result as string).toContain(
       'bash_watch({ taskId: "bash-sub-promote", timeoutMs: 60000 })',
     );
-    expect(calls.map((c) => c.command)).toEqual(["bash", "bash_status", "bash_promote"]);
+    expect(calls.map((c) => c.command)).toEqual(["bash"]);
   });
 });
 

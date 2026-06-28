@@ -81,6 +81,86 @@ async function pollBashStatus(client: RpcClient, taskId: string): Promise<Record
 }
 
 describe("background bash lifecycle (real Pi RPC)", () => {
+  test("foreground bash returns inline output", async () => {
+    const env = createPiIsolatedEnv();
+    const aimock = await startAimock();
+    let client: RpcClient | undefined;
+    try {
+      await enableAftBash(env);
+      aimock.registerToolCallFixture({
+        predicate: (request) => latestUserText(request).includes("Run a foreground echo."),
+        toolCalls: [{ name: "bash", arguments: { command: "echo pi-inline" } }],
+        followupText: "Ran.",
+      });
+
+      const spawned = spawnPiRpc({
+        mockProviderURL: aimock.url,
+        aftPluginDir: resolvePiPluginDir(),
+        configDir: env.configDir,
+        workdir: env.workdir,
+      });
+      client = spawned.client;
+
+      expect(
+        (await client.sendCommand({ type: "prompt", message: "Run a foreground echo." })).success,
+      ).toBe(true);
+      const bashEnd = await client.waitForEvent(
+        (event) => event.type === "tool_execution_end" && event.toolName === "bash",
+        90_000,
+      );
+      expect(bashEnd.isError).toBe(false);
+      expect(resultText(bashEnd)).toContain("pi-inline");
+      expect(resultDetails(bashEnd).exit_code).toBe(0);
+    } finally {
+      await client?.close();
+      await aimock.close();
+      await cleanupPiIsolatedEnv(env);
+    }
+  }, 120_000);
+
+  test("foreground bash promotion returns a background task id", async () => {
+    const env = createPiIsolatedEnv();
+    const aimock = await startAimock();
+    let client: RpcClient | undefined;
+    const oldWait = process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+    try {
+      await enableAftBash(env);
+      aimock.registerToolCallFixture({
+        predicate: (request) => latestUserText(request).includes("Run a slow foreground command."),
+        toolCalls: [{ name: "bash", arguments: { command: "sleep 0.2 && echo late" } }],
+        followupText: "Started.",
+      });
+      process.env.AFT_TEST_FOREGROUND_WAIT_MS = "25";
+      const spawned = spawnPiRpc({
+        mockProviderURL: aimock.url,
+        aftPluginDir: resolvePiPluginDir(),
+        configDir: env.configDir,
+        workdir: env.workdir,
+      });
+      client = spawned.client;
+      if (oldWait === undefined) delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+      else process.env.AFT_TEST_FOREGROUND_WAIT_MS = oldWait;
+
+      expect(
+        (await client.sendCommand({ type: "prompt", message: "Run a slow foreground command." }))
+          .success,
+      ).toBe(true);
+      const bashEnd = await client.waitForEvent(
+        (event) => event.type === "tool_execution_end" && event.toolName === "bash",
+        90_000,
+      );
+      expect(bashEnd.isError).toBe(false);
+      expect(resultText(bashEnd)).toContain("promoted to background");
+      expect(resultDetails(bashEnd).task_id).toEqual(expect.stringMatching(BASH_TASK_ID));
+    } finally {
+      if (oldWait === undefined) delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
+      else process.env.AFT_TEST_FOREGROUND_WAIT_MS = oldWait;
+      await client?.close();
+      await aimock.close();
+      await cleanupPiIsolatedEnv(env);
+    }
+  }, 120_000);
+
   test("background spawn returns a bash slug and bash_status reaches completed", async () => {
     const env = createPiIsolatedEnv();
     const aimock = await startAimock();
