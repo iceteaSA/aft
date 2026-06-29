@@ -20,6 +20,7 @@
 import {
   type BindIdentity,
   connectionFileExists,
+  isConsumerReconnectTransient,
   type RequestOptions,
   type RouteTarget,
   SubcCallError,
@@ -303,14 +304,25 @@ export class SubcTransportPool implements AftTransportPool {
     try {
       return await client.request(channel, body, { timeoutMs, onProgress });
     } catch (err) {
-      if (err instanceof SubcCallError) {
-        // The route (and possibly the connection) is dead. Drop the cached
-        // channel; if the client itself is the casualty, drop it too so the next
-        // call reconnects. Do NOT retry here — surface as a tool error.
-        this.routes.delete(identityKey(identity));
-        if (err.kind === "not_sent" || err.kind === "outcome_unknown") {
-          this.dropClient(client);
-        }
+      // The raw `request()` path does NOT classify failures into SubcCallError
+      // (that is only the managed `call()` path); it rejects with a base SubcError
+      // (timeout / route GOODBYE / daemon Error frame) or a socket error
+      // (closed / reset / refused / pre-send write failure). So distinguishing a
+      // dead CONNECTION from a dead ROUTE must use the library's own classifier
+      // `isConsumerReconnectTransient`, NOT `instanceof SubcCallError`.
+      //
+      // Any request failure makes the cached route suspect → drop it so the next
+      // call re-opens. Drop the shared CLIENT only when the failure signals a dead
+      // connection (transient: socket closed/reset/refused, or a not_sent pre-send
+      // write failure). A plain timeout or route GOODBYE is a NON-transient
+      // SubcError → the connection is presumed alive, so keep the client (this is
+      // the Q1 "keep on outcome_unknown" decision: a lost response does not prove
+      // the client is dead; a genuinely dead client surfaces on the NEXT call as a
+      // transient socket error and is dropped then). NEVER auto-retry here — the
+      // failed call is surfaced to the agent, mutation-safe by construction.
+      this.routes.delete(identityKey(identity));
+      if (isConsumerReconnectTransient(err)) {
+        this.dropClient(client);
       }
       throw err;
     }

@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { type BindIdentity, type RouteTarget, SubcCallError } from "@cortexkit/subc-client";
+import {
+  type BindIdentity,
+  type RouteTarget,
+  SocketClosedError,
+  SubcCallError,
+  SubcError,
+} from "@cortexkit/subc-client";
 
 import { type SubcClientLike, SubcTransportPool } from "../subc-transport.js";
 
@@ -151,39 +157,94 @@ describe("SubcTransport.toolCall", () => {
 });
 
 describe("SubcTransport Rd reconnect", () => {
-  test("a not_sent transport error drops the channel AND client; next call reconnects", async () => {
+  // The raw request() path rejects with REAL error types — base SubcError
+  // (timeout / route GOODBYE / daemon Error frame) or a socket error (closed /
+  // reset / pre-send write failure) — and NEVER a managed SubcCallError. These
+  // tests use those real types so the `isConsumerReconnectTransient` classifier
+  // is exercised exactly as it will be in production (a prior version faked
+  // SubcCallError, which the classifier treats as transient and so masked the
+  // wrong-instanceof bug).
+
+  test("a dead-socket error (transient) drops the channel AND client; next call reconnects", async () => {
     let calls = 0;
-    const client = new FakeClient(async () => {
+    let madeClients = 0;
+    const onRequest = async (): Promise<unknown> => {
       calls += 1;
-      if (calls === 1) throw new SubcCallError("not_sent", "socket closed before send");
+      if (calls === 1) throw new SocketClosedError("subc socket closed");
       return envelope({ id: "r", success: true, text: "recovered" });
+    };
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        return new FakeClient(onRequest);
+      },
     });
-    const { pool } = poolWith(client);
     const t = pool.getBridge("/work/proj");
 
     // First call surfaces the transport error (Rd never auto-retries).
-    await expect(t.toolCall("s", "read", {})).rejects.toBeInstanceOf(SubcCallError);
-    // The dead client was closed.
-    expect(client.closed).toBe(1);
+    await expect(t.toolCall("s", "read", {})).rejects.toBeInstanceOf(SocketClosedError);
 
-    // Second call reconnects (new client from the factory) and re-opens the route.
+    // Second call reconnects (a NEW client from the factory) and recovers.
     const result = await t.toolCall("s", "read", {});
     expect(result.text).toBe("recovered");
+    expect(madeClients).toBe(2); // the dead client was dropped, a fresh one connected
   });
 
-  test("an outcome_unknown error is surfaced and NEVER auto-retried (mutation-safe)", async () => {
+  test("a not-queued write failure (transient, not_sent-equivalent) drops the client", async () => {
+    // SubcWriteNotQueuedError is the raw-path analog of `not_sent`: bytes never
+    // left the local socket. isConsumerReconnectTransient classifies it transient.
     let calls = 0;
+    let madeClients = 0;
+    const notQueued = Object.assign(new Error("write not queued"), { code: "EPIPE" });
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        return new FakeClient(async () => {
+          calls += 1;
+          if (calls === 1) throw notQueued; // EPIPE -> transient
+          return envelope({ id: "r", success: true, text: "ok" });
+        });
+      },
+    });
+    const t = pool.getBridge("/work/proj");
+    await expect(t.toolCall("s", "read", {})).rejects.toBe(notQueued);
+    await t.toolCall("s", "read", {});
+    expect(madeClients).toBe(2);
+  });
+
+  test("a plain timeout (non-transient SubcError) KEEPS the client, drops only the route", async () => {
+    // Q1: a lost/late response does NOT prove the connection is dead. Keep the
+    // client (no reconnect); the route is re-opened on the next call. Mutation-
+    // safe: the error is surfaced, never auto-retried.
+    let calls = 0;
+    let madeClients = 0;
     const client = new FakeClient(async () => {
       calls += 1;
-      throw new SubcCallError("outcome_unknown", "ack lost after send");
+      if (calls === 1) throw new SubcError("request on channel 1 timed out after 30000ms");
+      return envelope({ id: "r", success: true, text: "second" });
     });
-    const { pool } = poolWith(client);
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        return client;
+      },
+    });
+    const t = pool.getBridge("/work/proj");
 
-    await expect(pool.getBridge("/work/proj").toolCall("s", "edit", {})).rejects.toBeInstanceOf(
-      SubcCallError,
-    );
-    // Exactly one underlying request — no transparent retry of a mutating call.
-    expect(calls).toBe(1);
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    expect(client.closed).toBe(0); // client kept alive
+    // The route was dropped, so the next call re-opens it on the SAME client.
+    const result = await t.toolCall("s", "edit", {});
+    expect(result.text).toBe("second");
+    expect(madeClients).toBe(1); // never reconnected
+    expect(client.routeOpens.length).toBe(2); // route re-opened
+    expect(calls).toBe(2); // exactly two underlying requests — no auto-retry
   });
 });
 
