@@ -50,7 +50,7 @@ opencode-aft/
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
 - Contains: ~60 command-specific request parsing and response generation modules
-- Key files: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
+- Key files: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/apply_patch.rs`, `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
 
 **`crates/aft/src/compress/`:**
 - Purpose: Provide tiered output compression for hoisted bash commands.
@@ -81,6 +81,11 @@ opencode-aft/
 - Purpose: Provide persistent SQLite-backed storage for backups, bash tasks, compression events, and state.
 - Contains: Database modules for each storage domain
 - Key files: `crates/aft/src/db/mod.rs`, `crates/aft/src/db/backups.rs`, `crates/aft/src/db/bash_tasks.rs`, `crates/aft/src/db/compression_events.rs`, `crates/aft/src/db/state.rs`
+
+**`crates/aft/src/patch/`:**
+- Purpose: Implement patch parsing, sequence matching, fuzzy hunk matching, and update execution.
+- Contains: Mod, parser, sequence matcher, and update chunk appliers
+- Key files: `crates/aft/src/patch/mod.rs`, `crates/aft/src/patch/parser.rs`, `crates/aft/src/patch/matcher.rs`, `crates/aft/src/patch/apply.rs`
 
 **`packages/aft-bridge/`:**
 - Purpose: Ship the shared bridge transport layer used by both OpenCode and Pi plugins.
@@ -144,7 +149,7 @@ opencode-aft/
 
 **Configuration:** `package.json` -- define Bun workspace scripts; `Cargo.toml` -- define the Rust workspace; `packages/opencode-plugin/src/config.ts` -- parse user and project AFT config for OpenCode; `packages/pi-plugin/src/config.ts` -- parse user and project AFT config for Pi; `crates/aft/src/config.rs` -- parse the shared Rust-side config (semantic backend, LSP servers, bash compression, etc.). User-level AFT settings reside in the unified CortexKit location `~/.config/cortexkit/aft.jsonc`, and project-level overrides reside in `<project_root>/.cortexkit/aft.jsonc`.
 
-**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/backup.rs` -- manage sessionized backup stores, policies, and stack-level disk locks; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners; `crates/aft/src/format.rs` -- formatter detection and execution; `crates/aft/src/run_tool_call.rs` -- execute tool calls with translation and formatting; `crates/aft/src/subc_translate.rs` -- translate tool arguments to internal command parameters; `crates/aft/src/subc_format.rs` -- format/render agent-facing text on the server; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
+**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/backup.rs` -- manage sessionized backup stores, policies, and stack-level disk locks; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners; `crates/aft/src/format.rs` -- formatter detection and execution; `crates/aft/src/run_tool_call.rs` -- execute tool calls with translation and formatting; `crates/aft/src/subc_translate.rs` -- translate tool arguments to internal command parameters; `crates/aft/src/subc_format.rs` -- format/render agent-facing text on the server; `crates/aft/src/pty_render.rs` -- render raw PTY bytes with vt100 parsing; `crates/aft/src/response_finalize.rs` -- finalize protocol responses with completions and status bars; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
 
 **Tests:** `packages/opencode-plugin/src/__tests__/` -- plugin unit and e2e tests; `packages/pi-plugin/src/__tests__/` -- Pi plugin unit and e2e tests; `packages/aft-cli/src/__tests__/` -- CLI command tests; `packages/aft-bridge/src/__tests__/` -- bridge transport tests; `crates/aft/tests/integration/` -- Rust integration tests; `crates/aft/tests/semantic_test.rs` -- semantic index tests; `tests/docker/` -- Docker e2e; `tests/macos-e2e/` -- macOS e2e; `tests/windows-e2e/` -- Windows e2e; `tests/pi-rpc/` -- Pi RPC tests.
 
@@ -171,6 +176,8 @@ opencode-aft/
 **New CLI command:** `packages/aft-cli/src/commands/[command].ts` -- add command handler and wire it into `packages/aft-cli/src/index.ts`.
 
 **New Rust command handler:** `crates/aft/src/commands/[command_name].rs` -- expose the handler from `crates/aft/src/commands/mod.rs` and dispatch it from `crates/aft/src/main.rs`.
+
+**New patch parser/matching code:** `crates/aft/src/patch/[module].rs` -- implement parsing or sequence matching logic and expose it via `crates/aft/src/patch/mod.rs`.
 
 **New shared Rust engine code:** `crates/aft/src/[domain].rs` -- keep reusable parser, formatter, import, search, or analysis logic outside command handlers.
 

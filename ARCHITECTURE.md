@@ -9,7 +9,7 @@
 - Use `packages/aft-bridge/src/bridge.ts` and `packages/aft-bridge/src/pool.ts` as the shared transport layer, isolating one `aft` process per project root.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular, with `crates/aft/src/commands/tool_call.rs` acting as the single endpoint for tool invocation routing.
-- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
+- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
 
 ## Layers
 
@@ -58,21 +58,21 @@
 **Protocol and command layer:**
 - Purpose: Accept NDJSON requests, route tool calls via the unified `tool_call` command, and dispatch them to focused command handlers.
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`
-- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, server-rendered agent-facing text formatting, and standalone command handlers for read/write/edit/outline/zoom/bash/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
+- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, server-rendered agent-facing text formatting, and standalone command handlers for read/write/edit/apply_patch/delete_file/move_file/outline/zoom/bash/bash_orchestrate/bash_status/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
 - Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
 **Analysis and mutation engine layer:**
 - Purpose: Parse code, compute call graphs, apply edits, format files, manage imports, index code semantically, and search with trigram indexes.
-- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/callgraph_store/dead_code_projection.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`
-- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, semantic embedding index (covering Java, Kotlin, Scala, Swift, Ruby, PHP, Lua, Perl, R, and other supported languages), disk-backed trigram search index, disk-backed symbol cache, persisted SQLite callgraph store builder, AST-grep integration
-- Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes, ONNX Runtime (optional), fastembed / OpenAI-compatible / Ollama backends (optional)
+- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/callgraph_store/dead_code_projection.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`
+- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, semantic embedding index (covering Java, Kotlin, Scala, Swift, Ruby, PHP, Lua, Perl, R, and other supported languages), disk-backed trigram search index, disk-backed symbol cache, persisted SQLite callgraph store builder, AST-grep integration, patch parsing (Add, Delete, and Update hunks) and matching engine, vt100 terminal rendering for PTY screen snapshots
+- Depends on: tree-sitter grammars, ast-grep, vt100, external formatter and checker processes, ONNX Runtime (optional), fastembed / OpenAI-compatible / Ollama backends (optional)
 - Used by: `crates/aft/src/commands/*.rs`
 
 **State and diagnostics layer:**
 - Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
-- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`
-- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels
+- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/response_finalize.rs`
+- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels, and main-loop pending responses registry
 - Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `db/` and `callgraph_store/`), `serde`
 - Used by: All command handlers through `AppContext`
 
@@ -82,7 +82,7 @@
 
 1. Register tool definitions and config-driven surface selection -- `packages/opencode-plugin/src/index.ts` or `packages/pi-plugin/src/index.ts`
 2. Get a session bridge and send a unified `tool_call` command carrying the bare tool name and arguments over NDJSON -- `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/bridge.ts`
-3. Dispatch the request to the `tool_call` handler in Rust, which translates it to the target command, executes the handler, formats/renders the agent-facing output text on the server, and returns the response -- `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`, and individual command handlers under `crates/aft/src/commands/`
+3. Dispatch the request to the `tool_call` handler in Rust, which translates it to the target command (via `crates/aft/src/subc_translate.rs`) and executes it. For deferred tasks like foreground bash orchestration, the request is registered in the main-loop pending registry (`crates/aft/src/main.rs`). The execution outcome is processed through the server-side text formatter (`crates/aft/src/subc_format.rs`) and a pending response finalizer seam (`crates/aft/src/response_finalize.rs`) which attaches background completions and status bar updates before returning the response envelope.
 
 **Edit pipeline:**
 
@@ -116,7 +116,7 @@
 
 1. Rewrite high-level commands (cat to read, grep to grep tool) -- `crates/aft/src/bash_rewrite/`
 2. Scan for dangerous commands and prompt for permission -- `crates/aft/src/bash_permissions/`
-3. Execute foreground, background, or PTY modes -- `crates/aft/src/bash_background/`
+3. Execute foreground, background, or PTY modes. Foreground bash executions are orchestrated with a wait window (defaulting to 15s, clamped to config) and deferred to background tasks if they exceed the budget, polling state and optionally rendering PTY screens with vt100 parsing -- `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_status.rs`, `crates/aft/src/pty_render.rs`, `crates/aft/src/bash_background/`
 4. Compress output through the tiered compressor -- `crates/aft/src/compress/`
 
 **Binary resolution flow:**
@@ -188,6 +188,21 @@
 - Purpose: Reduce hoisted-bash output to relevant tokens.
 - Location: `crates/aft/src/compress/` (multiple modules), `crates/aft/src/compress/mod.rs`
 - Pattern: Trait-based dispatch with per-command Rust modules, output-shape sniffers, package-manager modules, declarative TOML filters, and a generic fallback
+
+**PendingResponses:**
+- Purpose: Hold and poll deferred or orchestrated requests in the main loop.
+- Location: `crates/aft/src/response_finalize.rs`, `crates/aft/src/main.rs`
+- Pattern: Vector-backed pending queue that polls registered completion steps and runs the finalizer seam before writing responses.
+
+**PatchEngine:**
+- Purpose: Parse, match, and apply unified file diffs/patches.
+- Location: `crates/aft/src/patch/` (including `mod.rs`, `parser.rs`, `matcher.rs`, `apply.rs`)
+- Pattern: AST/line-based parser that maps update/create/delete hunks to target files, matches fuzzy sequences, and executes atomic writes with rollback support.
+
+**PtyRenderer:**
+- Purpose: Render raw PTY output bytes into a readable screen.
+- Location: `crates/aft/src/pty_render.rs`
+- Pattern: vt100 terminal state parser that outputs clean, grid-aligned text for screen snapshots.
 
 **Harness:**
 - Purpose: Represent the coding-agent harness (OpenCode or Pi) for config and CLI dispatch.
