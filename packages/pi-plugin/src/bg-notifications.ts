@@ -387,10 +387,27 @@ export async function handleTurnEndBgCompletions(
   await triggerWakeIfPending(drainContext, false, true);
 }
 
+/**
+ * Subc bg_events wake entrypoint (forced unconditional drain). The subc nudge is
+ * payload-less and only fires while the module holds pending completions
+ * (re-armed until acked), so it always means "drain me now" — even for a task
+ * this process never tracked (prior session / already-cleared outstanding entry),
+ * which the gated drain in {@link triggerWakeIfPending} would skip, leaving the
+ * module to re-arm and nudge forever. See the OpenCode twin for the full
+ * rationale.
+ */
+export async function handleSubcBgEventsNudge(
+  drainContext: DrainContext & { runtime: SendUserMessageRuntime },
+): Promise<void> {
+  stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
+  await triggerWakeIfPending(drainContext, false, true, true);
+}
+
 async function triggerWakeIfPending(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
   skipDrain: boolean,
   includeDeferredCompletions = true,
+  forceDrain = false,
 ): Promise<void> {
   // Note: previously bailed on `isActive()` (bridge.hasPendingRequests())
   // to defer wakes until the bridge was idle. That was wrong: the bridge
@@ -403,7 +420,10 @@ async function triggerWakeIfPending(
   // Mirrors the OpenCode fix.
   const state = stateFor(drainContext.sessionID);
 
-  if (!skipDrain && (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)) {
+  if (
+    !skipDrain &&
+    (forceDrain || state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)
+  ) {
     await drainCompletions(drainContext);
   }
   routeExplicitControlCompletions(state);

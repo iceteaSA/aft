@@ -447,10 +447,30 @@ export async function handleIdleBgCompletions(
   await triggerWakeIfPending(drainContext, false, true);
 }
 
+/**
+ * Subc bg_events wake entrypoint. Over subc, an idle-completion WAKE is a thin
+ * payload-less nudge: the module only nudges while it holds pending completions
+ * (re-armed each tick until acked), so a nudge ALWAYS means "drain me now". This
+ * differs from {@link handleIdleBgCompletions}, whose drain is GATED — once
+ * `forcedDrainCompleted` is set and nothing is locally outstanding, it skips the
+ * drain. A subc completion can be for a task this process never tracked (a prior
+ * session, or one whose outstanding entry was already cleared), so the gated
+ * drain would skip it and the module would re-arm and nudge forever. This path
+ * forces an UNCONDITIONAL drain so the completion is fetched, delivered, and
+ * acked (which makes the module's CLEAR fire and the nudges stop).
+ */
+export async function handleSubcBgEventsNudge(
+  drainContext: DrainContext & { client: unknown },
+): Promise<void> {
+  stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
+  await triggerWakeIfPending(drainContext, false, true, true);
+}
+
 async function triggerWakeIfPending(
   drainContext: DrainContext & { client: unknown },
   skipDrain: boolean,
   includeDeferredCompletions = true,
+  forceDrain = false,
 ): Promise<void> {
   // Note: previously bailed on `isActive()` (bridge.hasPendingRequests())
   // to defer wakes until the bridge was idle. That was wrong:
@@ -464,7 +484,10 @@ async function triggerWakeIfPending(
   // the completion or the next session.idle clears the deferral.
   const state = stateFor(drainContext.sessionID);
 
-  if (!skipDrain && (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)) {
+  if (
+    !skipDrain &&
+    (forceDrain || state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)
+  ) {
     await drainCompletions(drainContext);
   }
   routeExplicitControlCompletions(state);

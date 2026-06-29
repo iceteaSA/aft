@@ -31,7 +31,8 @@
 
 import { createRequire } from "node:module";
 import {
-  BridgePool,
+  type AftTransportPool,
+  createAftTransportPool,
   ensureBinary,
   ensureOnnxRuntime,
   ensureStorageMigrated,
@@ -48,6 +49,7 @@ import {
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
+  handleSubcBgEventsNudge,
   handleTurnEndBgCompletions,
 } from "./bg-notifications.js";
 import { registerStatusCommand } from "./commands/aft-status.js";
@@ -598,7 +600,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  let pool: BridgePool;
+  let pool: AftTransportPool;
   const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
     onBashPatternMatch: (frame: BashPatternMatchPayload, bridge: BridgePendingState) => void;
@@ -663,7 +665,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       );
     },
   };
-  pool = new BridgePool(binaryPath, poolOptions, configOverrides);
+  // SINGLE transport injection point (B-FINAL S4): standalone NDJSON bridge
+  // (default) OR the subc daemon, selected by the USER-tier subc.connection_file.
+  // Fails loud if subc is selected but its connection file is absent.
+  pool = await createAftTransportPool({
+    harness: "pi",
+    binaryPath,
+    poolOptions,
+    configOverrides,
+    subcConnectionFile: config.subc?.connection_file,
+    onBgEventsNudge: (projectRoot, session) => {
+      void handleSubcBgEventsNudge({
+        ctx,
+        directory: projectRoot,
+        sessionID: session,
+        runtime: pi,
+      });
+    },
+  });
   pool.setConfigureOverride("harness", "pi");
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer steers there (vs the grep tool). Set before the eager

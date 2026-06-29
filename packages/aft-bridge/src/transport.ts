@@ -62,6 +62,13 @@ export interface AftTransportPool {
   setConfigureOverride(key: string, value: unknown): void;
   replaceBinary(path: string): Promise<string>;
   shutdown(): Promise<void>;
+  /**
+   * Release any per-session transport state for `(projectRoot, session)` on
+   * session end. Standalone (BridgePool) is a no-op — its bridges are per-project
+   * and session state lives Rust-side. Subc tears down the session's tool + bg
+   * routes. Idempotent.
+   */
+  closeSession(projectRoot: string, session: string): Promise<void>;
 }
 
 export interface AftTransport<ToolCallContext = string | undefined> {

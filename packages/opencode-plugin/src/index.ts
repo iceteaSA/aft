@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import {
-  BridgePool,
+  createAftTransportPool,
   ensureBinary,
   ensureOnnxRuntime,
   ensureStorageMigrated,
@@ -21,6 +21,7 @@ import {
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
+  handleSubcBgEventsNudge,
 } from "./bg-notifications.js";
 import {
   buildConfigTierConfigureParams,
@@ -564,7 +565,26 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       );
     },
   };
-  const pool = new BridgePool(binaryPath, poolOptions, configOverrides);
+  // SINGLE transport injection point (B-FINAL S4): standalone NDJSON bridge
+  // (default) OR the subc daemon, selected by the USER-tier subc.connection_file.
+  // Everything downstream is transport-agnostic behind AftTransportPool. Fails
+  // loud if subc is selected but its connection file is absent (no silent
+  // standalone downgrade).
+  const pool = await createAftTransportPool({
+    harness: "opencode",
+    binaryPath,
+    poolOptions,
+    configOverrides,
+    subcConnectionFile: aftConfig.subc?.connection_file,
+    onBgEventsNudge: (projectRoot, session) => {
+      void handleSubcBgEventsNudge({
+        ctx,
+        directory: projectRoot,
+        sessionID: session,
+        client: input.client,
+      });
+    },
+  });
   pool.setConfigureOverride("harness", "opencode");
   const ctx: PluginContext = {
     pool,
@@ -1008,6 +1028,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       if ((eventType === "session.deleted" || eventType === "session.shutdown") && sessionID) {
         inspectTier2Idle.clear(sessionID);
         clearStatusBarSession(sessionID);
+        // Release this session's transport routes (subc: tool + bg_events;
+        // standalone: no-op). Best-effort — never block the event hook.
+        void pool.closeSession(input.directory, sessionID).catch(() => {});
         return;
       }
       if (eventType !== "session.idle") return;

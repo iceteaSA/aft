@@ -294,6 +294,15 @@ export class BridgePool implements AftTransportPool {
     }
   }
 
+  /**
+   * No-op for the standalone transport: bridges are per-project (shared across a
+   * project's sessions), and per-session state (undo/checkpoint/bash) lives
+   * Rust-side keyed by session_id — there is nothing session-scoped to tear down
+   * on the plugin side. Present to satisfy {@link AftTransportPool} so the subc
+   * pool's per-session route teardown is callable transport-agnostically.
+   */
+  async closeSession(_projectRoot: string, _session: string): Promise<void> {}
+
   /** Shut down all bridges and stop the cleanup timer. */
   async shutdown(): Promise<void> {
     if (this.cleanupTimer) {

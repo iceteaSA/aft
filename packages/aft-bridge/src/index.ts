@@ -115,7 +115,6 @@ export {
 export { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 export type { BridgeToolCallRuntime, PoolOptions } from "./pool.js";
 export { BridgePool, HomeProjectRootError, isHomeDirectoryRoot } from "./pool.js";
-export { SubcTransportPool, type SubcTransportPoolOptions } from "./subc-transport.js";
 // --- project-root identity (single canonicalizer; mirrors cortexkit-paths) ---
 export { canonicalizeProjectRoot, projectRootKeyHash } from "./project-identity.js";
 // --- wire contract ---
@@ -145,6 +144,7 @@ export {
   shouldEmitStatusBar,
   statusBarLine,
 } from "./status-bar.js";
+export { SubcTransportPool, type SubcTransportPoolOptions } from "./subc-transport.js";
 // --- shared agent-facing tool formatting ---
 export type { ReadFooterOptions } from "./tool-format.js";
 export { formatBridgeErrorMessage, formatReadFooter } from "./tool-format.js";
@@ -157,6 +157,10 @@ export type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
+export {
+  type AftTransportFactoryOptions,
+  createAftTransportPool,
+} from "./transport-factory.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
 export type {
   RustZoomBatchEntry,
