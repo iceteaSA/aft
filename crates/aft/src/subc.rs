@@ -2033,7 +2033,10 @@ async fn handle_tool_call(
     // the RouteBind config-trust cap) from ever reaching dispatch. Only
     // the integration-test harness (run_subc_mode_for_test) opens this to
     // drive synthetic native commands through the executor.
-    if !is_subc_agent_core_tool(&call.name) && !allow_native_passthrough {
+    if !is_subc_agent_core_tool(&call.name)
+        && !is_subc_native_plumbing_tool(&call.name)
+        && !allow_native_passthrough
+    {
         log::warn!(
             "subc tool call: rejecting non-manifest tool name {:?} on route {} (fail-closed)",
             call.name,
@@ -3031,6 +3034,27 @@ fn is_subc_agent_core_tool(name: &str) -> bool {
             | "refactor"
             | "safety"
     )
+}
+
+/// Internal bg-completion plumbing commands the harness consumer (NOT the agent)
+/// invokes over a bound route to drain and acknowledge background-bash
+/// completions for its session. These are NOT agent-facing tools — they carry no
+/// agent surface and never reach the model — so they're not in the manifest /
+/// `is_subc_agent_core_tool`, but the plugin's bg-notification drain/ack path
+/// (bg-notifications.ts: `bridge.send("bash_drain_completions"|"bash_ack_completions")`)
+/// must reach dispatch over subc, otherwise an idle agent can never drain a
+/// completion the wake lane nudges it about.
+///
+/// This is a DELIBERATELY TIGHT allowlist (exactly these two names), kept
+/// separate from the agent core-tool gate so it cannot widen the fail-closed
+/// backstop in `handle_tool_call`. Both are session-scoped (the bind session is
+/// reinjected by `run_tool_call`, overriding any body `session_id`) and touch
+/// only the per-session completion registry — they carry NO config/trust surface,
+/// so admitting them does not reopen the `configure`-bypass hole the gate exists
+/// to close. Lanes are already assigned: `bash_drain_completions` = PureRead,
+/// `bash_ack_completions` = Mutating (see `command_lane`).
+fn is_subc_native_plumbing_tool(name: &str) -> bool {
+    matches!(name, "bash_drain_completions" | "bash_ack_completions")
 }
 
 fn command_lane(command: &str) -> Lane {
@@ -4089,6 +4113,33 @@ mod tests {
     fn subc_agent_lanes_classify_new_read_tools() {
         assert_eq!(command_lane("callgraph"), Lane::HeavyInit);
         assert_eq!(command_lane("conflicts"), Lane::PureRead);
+    }
+
+    #[test]
+    fn native_plumbing_allowlist_admits_exactly_drain_and_ack() {
+        // BC2: the route gate admits a name when it's an agent core tool OR a
+        // native plumbing command. These two carry no agent surface and no
+        // config/trust surface, so they're admitted to dispatch over a bound
+        // route while everything else (notably `configure`) stays fail-closed.
+        assert!(is_subc_native_plumbing_tool("bash_drain_completions"));
+        assert!(is_subc_native_plumbing_tool("bash_ack_completions"));
+
+        // The allowlist is TIGHT — it must not admit the config-bypass vector
+        // the fail-closed gate exists to block, nor any other native command.
+        assert!(!is_subc_native_plumbing_tool("configure"));
+        assert!(!is_subc_native_plumbing_tool("bash"));
+        assert!(!is_subc_native_plumbing_tool("bash_kill"));
+        assert!(!is_subc_native_plumbing_tool("db_set_state"));
+        assert!(!is_subc_native_plumbing_tool("undo"));
+
+        // The plumbing commands are NOT agent-facing tools — they must stay out
+        // of the manifest gate so they never reach the model surface.
+        assert!(!is_subc_agent_core_tool("bash_drain_completions"));
+        assert!(!is_subc_agent_core_tool("bash_ack_completions"));
+
+        // Lanes are already assigned (pre-existing): drain reads, ack mutates.
+        assert_eq!(command_lane("bash_drain_completions"), Lane::PureRead);
+        assert_eq!(command_lane("bash_ack_completions"), Lane::Mutating);
     }
 
     #[test]
