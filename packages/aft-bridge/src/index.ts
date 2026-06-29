@@ -115,6 +115,7 @@ export {
 export { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 export type { BridgeToolCallRuntime, PoolOptions } from "./pool.js";
 export { BridgePool, HomeProjectRootError, isHomeDirectoryRoot } from "./pool.js";
+export { SubcTransportPool, type SubcTransportPoolOptions } from "./subc-transport.js";
 // --- project-root identity (single canonicalizer; mirrors cortexkit-paths) ---
 export { canonicalizeProjectRoot, projectRootKeyHash } from "./project-identity.js";
 // --- wire contract ---

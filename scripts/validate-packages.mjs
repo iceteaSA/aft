@@ -204,6 +204,39 @@ if (cli) {
   if (cli.version) platformVersions.push({ name: label, version: cli.version });
 }
 
+// --- Publish-safety: no unpublishable protocols in published `dependencies` ---
+//
+// Published packages must never carry a `file:`/`workspace:`/`link:` dependency
+// or an unpublished internal source dep (e.g. @cortexkit/subc-client) in their
+// runtime `dependencies` — npm consumers would fail to install it. Such deps are
+// allowed ONLY as devDependencies (bundled into the dist at the consumer's build
+// time). aft-bridge depends on @cortexkit/subc-client this way for the subc
+// transport: it is a path devDependency that `bun build` inlines into each
+// published plugin dist, never a published runtime dependency.
+for (const { label, pkg } of [
+  { label: "@cortexkit/aft-bridge", pkg: bridge },
+  { label: "@cortexkit/aft-opencode", pkg: core },
+  { label: "@cortexkit/aft-pi", pkg: pi },
+  { label: "@cortexkit/aft", pkg: cli },
+]) {
+  if (!pkg) continue;
+  const deps = pkg.dependencies || {};
+  for (const [depName, depSpec] of Object.entries(deps)) {
+    if (typeof depSpec === "string" && /^(file:|workspace:|link:)/.test(depSpec)) {
+      fail(
+        label,
+        `dependencies['${depName}'] uses unpublishable protocol '${depSpec}' (move to devDependencies + bundle)`,
+      );
+    }
+    if (depName === "@cortexkit/subc-client") {
+      fail(
+        label,
+        "@cortexkit/subc-client must be a devDependency (bundled), never a published runtime dependency",
+      );
+    }
+  }
+}
+
 // --- Version alignment ---
 
 if (platformVersions.length > 1) {
