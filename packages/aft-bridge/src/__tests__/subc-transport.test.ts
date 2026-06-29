@@ -10,10 +10,52 @@ import {
 
 import { type SubcClientLike, SubcTransportPool } from "../subc-transport.js";
 
-/** Records every routeOpen/request so a test can assert caching + bodies. */
+/** A controllable held-open subscription handle. */
+class FakeSubscription {
+  unsubscribed = 0;
+  private resolveClosed!: () => void;
+  private rejectClosed!: (err: Error) => void;
+  readonly closed: Promise<void>;
+
+  constructor(
+    readonly channel: number,
+    readonly onEvent: (event: Uint8Array) => void,
+  ) {
+    this.closed = new Promise<void>((resolve, reject) => {
+      this.resolveClosed = resolve;
+      this.rejectClosed = reject;
+    });
+    // Swallow the rejection if nobody is awaiting yet (the loop attaches its own).
+    this.closed.catch(() => undefined);
+  }
+
+  /** Fire a bg_events nudge to the subscriber. */
+  emit(): void {
+    this.onEvent(new TextEncoder().encode(JSON.stringify({ op: "bg_events" })));
+  }
+
+  /** Simulate a socket drop / route GOODBYE — the loop should resubscribe. */
+  drop(): void {
+    this.rejectClosed(new Error("subscription dropped"));
+  }
+
+  /** Simulate an intentional StreamEnd — the loop should NOT resubscribe. */
+  end(): void {
+    this.resolveClosed();
+  }
+
+  unsubscribe(): void {
+    this.unsubscribed += 1;
+    this.resolveClosed();
+  }
+}
+
+/** Records every routeOpen/request/subscribe so a test can assert caching + bodies. */
 class FakeClient implements SubcClientLike {
   routeOpens: BindIdentity[] = [];
   requests: { channel: number; body: unknown }[] = [];
+  subscriptions: FakeSubscription[] = [];
+  closedRoutes: number[] = [];
   closed = 0;
   private nextChannel = 1;
 
@@ -29,9 +71,28 @@ class FakeClient implements SubcClientLike {
     return this.onRequest(channel, body);
   }
 
+  subscribe(
+    channel: number,
+    _body: unknown,
+    onEvent: (event: Uint8Array) => void,
+  ): FakeSubscription {
+    const sub = new FakeSubscription(channel, onEvent);
+    this.subscriptions.push(sub);
+    return sub;
+  }
+
+  async closeRouteChannel(channel: number): Promise<void> {
+    this.closedRoutes.push(channel);
+  }
+
   close(): void {
     this.closed += 1;
   }
+}
+
+/** Yield to the microtask/timer queue so the bg loop can advance. */
+async function tick(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function poolWith(
@@ -274,6 +335,124 @@ describe("SubcTransport.send", () => {
       name: "bash_drain_completions",
       arguments: { session_id: "sess-Z" },
     });
+  });
+});
+
+describe("SubcTransport bg_events subscription (S3)", () => {
+  function bgPool(client: FakeClient): {
+    pool: SubcTransportPool;
+    nudges: { root: string; session: string }[];
+  } {
+    const nudges: { root: string; session: string }[] = [];
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      onBgEventsNudge: (root, session) => nudges.push({ root, session }),
+      bgBackoffSleep: async () => undefined, // no real delay in tests
+    });
+    return { pool, nudges };
+  }
+
+  test("opens a dedicated bg subscription on a DISTINCT channel after the first tool call", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool } = bgPool(client);
+
+    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await tick();
+
+    // Two route.opens: the tool route + the dedicated bg_events route.
+    expect(client.routeOpens.length).toBe(2);
+    expect(client.subscriptions.length).toBe(1);
+    // The bg subscription rides a DIFFERENT channel from the tool request.
+    const toolChannel = client.requests[0]?.channel;
+    expect(client.subscriptions[0]?.channel).not.toBe(toolChannel);
+  });
+
+  test("a nudge AND the initial (re)subscribe both fire onBgEventsNudge (forced-drain trigger)", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool, nudges } = bgPool(client);
+
+    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await tick();
+    // Immediate replay nudge on subscribe.
+    expect(nudges.length).toBe(1);
+
+    // A wake nudge from the module drives another drain.
+    client.subscriptions[0]?.emit();
+    expect(nudges.length).toBe(2);
+    expect(nudges[1]).toEqual({ root: pool.getBridge("/work/proj").getCwd(), session: "sess-1" });
+  });
+
+  test("is idempotent — one subscription per session even across many tool calls", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool } = bgPool(client);
+    const t = pool.getBridge("/work/proj");
+
+    await t.toolCall("sess-1", "read", {});
+    await tick();
+    await t.toolCall("sess-1", "grep", {});
+    await t.toolCall("sess-1", "edit", {});
+    await tick();
+
+    expect(client.subscriptions.length).toBe(1); // never re-subscribed for the same session
+  });
+
+  test("INDEPENDENT reconnect: a dropped subscription resubscribes + re-drains with NO tool call (idle-stranding fix)", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool, nudges } = bgPool(client);
+
+    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await tick();
+    expect(nudges.length).toBe(1); // initial subscribe replay
+    const firstSub = client.subscriptions[0];
+
+    // Socket drop — NO tool call follows (idle agent). The loop must resubscribe.
+    firstSub?.drop();
+    await tick();
+    await tick();
+
+    expect(client.subscriptions.length).toBe(2); // resubscribed independently
+    // The resubscribe fired another forced-drain replay (recovers a completion
+    // that landed while disconnected).
+    expect(nudges.length).toBe(2);
+  });
+
+  test("StreamEnd (intentional close) does NOT resubscribe", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool } = bgPool(client);
+
+    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await tick();
+    client.subscriptions[0]?.end(); // StreamEnd
+    await tick();
+    await tick();
+
+    expect(client.subscriptions.length).toBe(1); // no resubscribe on a clean end
+  });
+
+  test("closeSession stops the subscription and closes both routes", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool } = bgPool(client);
+
+    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await tick();
+    await pool.closeSession("/work/proj", "sess-1");
+
+    expect(client.subscriptions[0]?.unsubscribed).toBe(1);
+    // Both the bg route and the tool route were closed.
+    expect(client.closedRoutes.length).toBe(2);
+  });
+
+  test("no bg subscription is opened when onBgEventsNudge is not configured", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool } = poolWith(client); // no onBgEventsNudge
+
+    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await tick();
+
+    expect(client.subscriptions.length).toBe(0);
+    expect(client.routeOpens.length).toBe(1); // tool route only
   });
 });
 
