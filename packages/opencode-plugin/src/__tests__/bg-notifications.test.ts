@@ -1033,6 +1033,50 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
   });
 
+  test("R2-T3: a permanently-unacked delivered task is never redelivered across many drains", async () => {
+    // The task is delivered, but EVERY ack fails (transport down). The daemon
+    // keeps returning it on each forced drain. The fix must keep re-acking (never
+    // redelivering) for as long as the daemon holds it — a prior time-based TTL
+    // would have evicted it and let a later drain redeliver.
+    trackBgTask("s1", "task-1");
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions") {
+        return { success: true, bg_completions: [completion("task-1", "npm test")] };
+      }
+      return { success: false, message: "ack down" }; // every ack fails
+    });
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+    const client = makeClient(promptAsync);
+    const drainCtx = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    await handleIdleBgCompletions(drainCtx);
+    await waitForMockCallCount(promptAsync, 1);
+    await sleep(50);
+
+    // Many forced drains while ack stays down — the daemon keeps returning task-1.
+    for (let i = 0; i < 5; i++) {
+      await handleSubcBgEventsNudge(drainCtx);
+      await sleep(20);
+    }
+
+    // Still exactly ONE delivery — re-acked every time, never redelivered.
+    expect(promptAsync.mock.calls.length).toBe(1);
+    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(true);
+
+    // Now the daemon DROPS it (drain returns empty, e.g. it was acked out-of-band):
+    // reconciliation forgets it.
+    send.mockImplementation(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [] }
+        : { success: true, acked_task_ids: [] },
+    );
+    await handleSubcBgEventsNudge(drainCtx);
+    await sleep(20);
+    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
+  });
+
   test("delivery FAILURE re-pends the completion (redeliverable, not stuck in-flight)", async () => {
     trackBgTask("s1", "task-1");
     const promptAsync = mock(async () => {

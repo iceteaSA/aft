@@ -90,16 +90,22 @@ type SessionBgState = {
    * Task IDs DELIVERED to the agent but whose `bash_ack_completions` has not yet
    * confirmed (Rust still holds them and, over subc, re-nudges). Ingest skips them
    * for fresh delivery AND a forced drain RE-ACKs them (the self-terminating close
-   * of the re-nudge loop, C-#3). Maps task_id → insertedAt for TTL pruning.
+   * of the re-nudge loop, C-#3). Removed by DAEMON RECONCILIATION, not a timer: a
+   * forced drain that no longer returns a task proves the daemon dropped it
+   * (R2-T3 — a time TTL could evict a still-held task and reopen the
+   * double-deliver). Insertion-ordered for the FIFO OOM backstop cap.
    */
-  deliveredAwaitingAckTaskIds: Map<string, number>;
+  deliveredAwaitingAckTaskIds: Set<string>;
   lastSeenAt: number;
 };
 
 const CONSUMED_TASKIDS_CAP = 256;
-/** Cap + TTL for deliveredAwaitingAckTaskIds (defensive; entries normally clear in ms). */
-const DELIVERED_AWAITING_ACK_CAP = 1024;
-const DELIVERED_AWAITING_ACK_TTL_MS = 5 * 60 * 1000;
+/**
+ * Pure OOM backstop for deliveredAwaitingAckTaskIds (drain reconciliation is the
+ * real bound — this should never realistically fire). Set far above any plausible
+ * in-flight set; evicting a still-held entry could reopen the double-deliver.
+ */
+const DELIVERED_AWAITING_ACK_CAP = 4096;
 
 type TextContent = { type: "text"; text: string; textSignature?: string };
 type ImageContent = { type: "image"; data: string; mimeType: string };
@@ -576,11 +582,12 @@ async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Pr
       return;
     }
     state.forcedDrainCompleted = true;
-    // C-#3: re-ack any drained completion still awaiting ack (delivered but its
-    // ack never confirmed, so the module kept re-nudging + re-surfacing it). The
-    // ingest below skips these for fresh delivery, so this only retries the ack —
-    // never double-delivers. Re-acking lets Rust drop it and the nudges stop.
-    const reackTaskIds = collectAwaitingAckTaskIds(state, response.bg_completions);
+    // C-#3 / R2-T3: reconcile awaiting-ack against the drain snapshot (daemon
+    // truth). A task the drain still returns is held unacked → re-ack (stops the
+    // nudges, self-terminating); one it no longer returns was dropped daemon-side
+    // → reconcile forgets it. Ingest skips awaiting-ack tasks, so re-ack never
+    // double-delivers.
+    const reackTaskIds = reconcileAwaitingAck(state, response.bg_completions);
     ingestDrainedBgCompletions(sessionID, response.bg_completions);
     if (reackTaskIds.length > 0) {
       const reacked = await ackCompletions(
@@ -792,7 +799,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       consumedTaskIds: new Set(),
       consumedTaskOrder: [],
       deliveringTaskIds: new Set(),
-      deliveredAwaitingAckTaskIds: new Map(),
+      deliveredAwaitingAckTaskIds: new Set(),
       lastSeenAt: now,
     };
     sessionBgStates.set(key, state);
@@ -914,13 +921,16 @@ function markDelivering(state: SessionBgState, taskIds: readonly string[]): void
 }
 
 /** Delivery succeeded: move from in-flight to delivered-awaiting-ack (before ack). */
-function markDeliveredAwaitingAck(state: SessionBgState, taskIds: readonly string[]): void {
-  const now = Date.now();
+function markDeliveredAwaitingAck(
+  state: SessionBgState,
+  taskIds: readonly string[],
+  sessionID?: string,
+): void {
   for (const id of taskIds) {
     state.deliveringTaskIds.delete(id);
-    state.deliveredAwaitingAckTaskIds.set(id, now);
+    state.deliveredAwaitingAckTaskIds.add(id);
   }
-  pruneDeliveredAwaitingAck(state, now);
+  capDeliveredAwaitingAck(state, sessionID);
 }
 
 /** Delivery failed before it departed: return ids to redeliverable (clear in-flight). */
@@ -934,30 +944,38 @@ function confirmAcked(state: SessionBgState, taskIds: readonly string[]): void {
 }
 
 /**
- * Of the just-drained completions, which task ids are delivered-awaiting-ack —
- * i.e. were already delivered and need a RE-ACK (not a redelivery) so the module
- * stops re-nudging (C-#3). Read-only; the caller acks then confirms.
+ * Reconcile the awaiting-ack set against a forced drain's snapshot (R2-T3, daemon
+ * is source of truth). A task the drain STILL returns is held unacked → RE-ACK
+ * (C-#3 close); a task the drain does NOT return was already dropped daemon-side
+ * → forget. Returns ids to re-ack; the caller acks then confirms. Replaces a
+ * timer eviction that could drop a still-held task and reopen the double-deliver.
  */
-function collectAwaitingAckTaskIds(state: SessionBgState, completions: unknown): string[] {
-  if (!Array.isArray(completions)) return [];
-  const ids: string[] = [];
-  for (const completion of completions) {
-    if (!isBgCompletion(completion)) continue;
-    if (state.deliveredAwaitingAckTaskIds.has(completion.task_id)) ids.push(completion.task_id);
+function reconcileAwaitingAck(state: SessionBgState, completions: unknown): string[] {
+  if (state.deliveredAwaitingAckTaskIds.size === 0) return [];
+  const drainedIds = new Set<string>();
+  if (Array.isArray(completions)) {
+    for (const completion of completions) {
+      if (isBgCompletion(completion)) drainedIds.add(completion.task_id);
+    }
   }
-  return ids;
+  const reack: string[] = [];
+  for (const id of [...state.deliveredAwaitingAckTaskIds]) {
+    if (drainedIds.has(id)) reack.push(id);
+    else state.deliveredAwaitingAckTaskIds.delete(id); // daemon no longer holds it
+  }
+  return reack;
 }
 
-/** TTL + cap prune so a permanently-failing ack can't grow the set unbounded. */
-function pruneDeliveredAwaitingAck(state: SessionBgState, now: number): void {
-  const cutoff = now - DELIVERED_AWAITING_ACK_TTL_MS;
-  for (const [id, at] of state.deliveredAwaitingAckTaskIds) {
-    if (at < cutoff) state.deliveredAwaitingAckTaskIds.delete(id);
-  }
+/** Pure OOM backstop: reconciliation is the real bound, so this should never fire. */
+function capDeliveredAwaitingAck(state: SessionBgState, sessionID?: string): void {
   while (state.deliveredAwaitingAckTaskIds.size > DELIVERED_AWAITING_ACK_CAP) {
-    const oldest = state.deliveredAwaitingAckTaskIds.keys().next().value;
+    const oldest = state.deliveredAwaitingAckTaskIds.values().next().value;
     if (oldest === undefined) break;
     state.deliveredAwaitingAckTaskIds.delete(oldest);
+    sessionWarn(
+      sessionID ?? "",
+      `${LOG_PREFIX} deliveredAwaitingAckTaskIds exceeded ${DELIVERED_AWAITING_ACK_CAP}; evicting ${oldest}`,
+    );
   }
 }
 

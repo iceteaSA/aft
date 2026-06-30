@@ -628,6 +628,8 @@ export class SubcTransportPool implements AftTransportPool {
           throw new SubcCallError("terminal", "subc transport is shutting down");
         }
         this.client = client;
+        // Fresh client generation starts with a clean failure budget (R2-T2).
+        this.transportFailures = 0;
         return client;
       })
       .catch((err) => {
@@ -654,7 +656,11 @@ export class SubcTransportPool implements AftTransportPool {
         // freshly-minted channel so it doesn't leak daemon-side.
         if (entry.closed || this.client !== client) {
           safeCloseRoute(client, channel);
-          this.routes.delete(key);
+          // Guarded delete (R2-T1): a teardown + a concurrent re-open for this
+          // identity may have already installed a NEWER entry under `key`. Only
+          // remove OUR stale entry, never a successor's (an unconditional delete
+          // would orphan the newer route — untrackable, leaked daemon-side).
+          if (this.routes.get(key) === entry) this.routes.delete(key);
           throw new RouteTornDownError("subc route opened after teardown");
         }
         entry.channel = channel;
@@ -697,6 +703,12 @@ export class SubcTransportPool implements AftTransportPool {
     if (this.client === client) {
       this.client = null;
       this.routes.clear();
+      // The half-open failure counter is per-client-generation: a dropped client
+      // resets it so the NEXT client starts fresh (R2-T2). Without this, failures
+      // accrued on a client dropped via another path (e.g. a bg-subscription
+      // transient drop) would carry over and trip the backstop on a healthy new
+      // client after a single failure.
+      this.transportFailures = 0;
       try {
         client.close();
       } catch {

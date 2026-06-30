@@ -387,6 +387,81 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
     expect(client.closedRoutes.length).toBe(1);
   });
 
+  test("R2-T1: a stale opener resolving after closeSession does not delete a newer route", async () => {
+    // call A opens (gated) → closeSession tombstones A's entry → call B opens a
+    // fresh route → A resolves, self-closes, and must NOT delete B's entry.
+    let releaseA!: () => void;
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    client.routeOpenGate = new Promise<void>((r) => {
+      releaseA = r;
+    });
+    const { pool } = poolWith(client);
+    const t = pool.getBridge("/work/proj");
+
+    const callA = t.toolCall("sess-1", "read", {}).catch((e) => e);
+    await tick(); // A's routeOpen is now gated
+    await pool.closeSession("/work/proj", "sess-1"); // tombstone A
+
+    // call B (same identity) opens a fresh route and succeeds.
+    client.routeOpenGate = null; // B opens immediately
+    const resB = await t.toolCall("sess-1", "grep", {});
+    expect(resB.success).toBe(true);
+
+    // Now A resolves — it must self-close its own channel and leave B's intact.
+    releaseA();
+    await callA;
+
+    // B's route is still tracked: a follow-up call reuses it (no new routeOpen).
+    const openCountBefore = client.routeOpens.length;
+    await t.toolCall("sess-1", "outline", {});
+    expect(client.routeOpens.length).toBe(openCountBefore); // B's entry survived
+  });
+
+  test("R2-T2: the half-open counter does not carry across client generations", async () => {
+    // Client A: 2 non-transient timeouts (counter=2), then a TRANSIENT socket drop
+    // (replaces A with B). B's first non-transient timeout must NOT trip the
+    // backstop — the counter resets on the client swap, so B is kept and recovers.
+    let madeClients = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        const idx = madeClients;
+        let calls = 0;
+        return new FakeClient(async () => {
+          calls += 1;
+          if (idx === 1) {
+            // client A: two non-transient timeouts, then a transient socket death
+            if (calls <= 2) throw new SubcError("A timed out");
+            throw new SocketClosedError("A socket closed"); // transient → drop A
+          }
+          // client B: first call non-transient timeout, then succeeds
+          if (calls === 1) throw new SubcError("B timed out");
+          return envelope({ id: "r", success: true, text: "B-ok" });
+        });
+      },
+    });
+    const t = pool.getBridge("/work/proj");
+
+    // Two non-transient timeouts on A → counter = 2 (A kept, not yet 3).
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    expect(madeClients).toBe(1);
+
+    // Third call hits A's transient socket death → A dropped, counter reset.
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SocketClosedError);
+
+    // B's first call is a non-transient timeout — if the counter had carried A's
+    // 2, this would be the 3rd and drop B. It must NOT: B is kept.
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    expect(madeClients).toBe(2); // still B, not a 3rd client
+    // B then succeeds — proving B survived its first failure (no carryover).
+    const res = await t.toolCall("s", "edit", {});
+    expect(res.text).toBe("B-ok");
+    expect(madeClients).toBe(2);
+  });
+
   test("a transient routeOpen failure drops the client so the next call reconnects", async () => {
     let madeClients = 0;
     const pool = new SubcTransportPool({
