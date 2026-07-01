@@ -317,16 +317,16 @@ export async function assertExternalDirectoryPermission(
   }
 }
 
+type SearchPermissionId = "grep" | "aft_search";
+
 /**
- * Trigger OpenCode's host-side `grep` permission check.
- *
- * Mirrors `opencode/src/tool/grep.ts` shape exactly so users with
- * `"permission": { "grep": { "*": "ask" } }` (or "deny") see the same
- * prompt regardless of whether they're using AFT's hoisted `grep` or
- * OpenCode's built-in.
+ * Trigger an OpenCode host-side search permission check using grep-compatible
+ * pattern, always, and metadata fields. The permission id is a parameter so
+ * aft_search can be governed independently from the raw grep tool.
  */
-export async function askGrepPermission(
+async function askSearchPatternPermission(
   context: ToolContext,
+  permission: SearchPermissionId,
   pattern: string,
   metadata: { path?: string; include?: string } = {},
 ): Promise<string | undefined> {
@@ -334,7 +334,7 @@ export async function askGrepPermission(
   try {
     await runAsk(
       context.ask({
-        permission: "grep",
+        permission,
         patterns: [pattern],
         always: ["*"],
         metadata: { pattern, ...metadata },
@@ -345,8 +345,38 @@ export async function askGrepPermission(
     if (error instanceof Error && error.message) {
       return error.message;
     }
-    return "Permission denied (grep).";
+    return `Permission denied (${permission}).`;
   }
+}
+
+/**
+ * Trigger the host OpenCode permission check for grep.
+ *
+ * Uses the same request shape as OpenCode's built-in grep tool so a user's
+ * `"permission": { "grep": { "*": "ask" } }` (or "deny") setting behaves
+ * the same for the plugin-provided grep tool and OpenCode's native grep tool.
+ */
+export async function askGrepPermission(
+  context: ToolContext,
+  pattern: string,
+  metadata: { path?: string; include?: string } = {},
+): Promise<string | undefined> {
+  return askSearchPatternPermission(context, "grep", pattern, metadata);
+}
+
+/**
+ * Trigger the host OpenCode permission check for aft_search.
+ *
+ * Passes the same pattern value and metadata as askGrepPermission but registers
+ * under the `aft_search` permission id so rules targeting only `grep` do not
+ * apply.
+ */
+export async function askSearchPermission(
+  context: ToolContext,
+  pattern: string,
+  metadata: { path?: string; include?: string } = {},
+): Promise<string | undefined> {
+  return askSearchPatternPermission(context, "aft_search", pattern, metadata);
 }
 
 /**

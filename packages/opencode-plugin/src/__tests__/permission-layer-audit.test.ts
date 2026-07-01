@@ -18,6 +18,7 @@ import {
 } from "../tools/permissions.js";
 import { safetyTools } from "../tools/safety.js";
 import { searchTools } from "../tools/search.js";
+import { semanticTools } from "../tools/semantic.js";
 import type { PluginContext } from "../types.js";
 
 type BridgeResponse = Record<string, unknown>;
@@ -277,6 +278,54 @@ describe("permission audit regressions", () => {
       "git status *",
       "/tmp/aft-empty-always/*",
     ]);
+  });
+
+  test("aft_search permission is independent from grep deny rules", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const denyGrep = { permission: "grep", message: "grep denied by policy" };
+
+    const searchAskCalls: AskCall[] = [];
+    const { calls: searchCalls, tools: semantic } = createHarness(semanticTools, () => ({
+      success: true,
+      text: "search ok",
+    }));
+
+    const searchOutput = await semantic.aft_search.execute(
+      { query: "TODO", hint: "literal" },
+      createSdkContext(project, recordingAsk(searchAskCalls, denyGrep)),
+    );
+
+    expect(searchOutput).toBe("search ok");
+    expect(searchAskCalls).toHaveLength(1);
+    expect(searchAskCalls[0]).toEqual({
+      permission: "aft_search",
+      patterns: ["TODO"],
+      always: ["*"],
+      metadata: { pattern: "TODO" },
+    });
+    expect(searchCalls).toEqual([
+      { command: "search", params: { query: "TODO", hint: "literal" } },
+    ]);
+
+    const grepAskCalls: AskCall[] = [];
+    const { calls: grepCalls, tools: grepSearch } = createHarness(searchTools, () => ({
+      success: true,
+      text: "grep ok",
+    }));
+
+    const grepOutput = await grepSearch.grep.execute(
+      { pattern: "TODO" },
+      createSdkContext(project, recordingAsk(grepAskCalls, denyGrep)),
+    );
+
+    const denied = parsePermissionDenied(grepOutput);
+    expect(denied.message).toBe("grep denied by policy");
+    expect(grepAskCalls).toHaveLength(1);
+    expect(grepAskCalls[0]?.permission).toBe("grep");
+    expect(grepAskCalls[0]?.patterns).toEqual(["TODO"]);
+    expect(grepAskCalls[0]?.always).toEqual(["*"]);
+    expect(grepAskCalls[0]?.metadata).toEqual(expect.objectContaining({ pattern: "TODO" }));
+    expect(grepCalls).toEqual([]);
   });
 
   test("aft_import rejects empty module sentinels before bridge dispatch", async () => {

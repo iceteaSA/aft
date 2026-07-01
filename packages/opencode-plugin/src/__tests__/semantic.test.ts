@@ -232,7 +232,7 @@ describe("semanticTools", () => {
     );
   });
 
-  test("asks grep permission for regex literal and auto hints but not semantic", async () => {
+  test("asks aft_search permission for regex literal and auto hints but not semantic", async () => {
     for (const hint of ["regex", "literal", "auto"] as const) {
       const ask = mockAsk();
       const sdkCtx = createMockSdkContext("/tmp/project", ask);

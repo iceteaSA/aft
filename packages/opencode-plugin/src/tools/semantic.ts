@@ -2,7 +2,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import { callToolCall, coerceOptionalInt, isEmptyParam, optionalInt } from "./_shared.js";
-import { askGrepPermission, permissionDeniedResponse } from "./permissions.js";
+import { askSearchPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
 
@@ -59,10 +59,11 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       const query = args.query;
       const hint = typeof args.hint === "string" ? args.hint : undefined;
 
-      // Match grep permission behavior for every mode that might inspect file contents.
-      // This intentionally over-asks for auto/NL queries but never under-asks for regex/literal.
+      // For non-semantic hints, call askSearchPermission before executing the
+      // search. This uses the aft_search permission id so rules targeting only
+      // the built-in grep tool do not block this tool.
       if (hint !== "semantic") {
-        const denied = await askGrepPermission(context, query);
+        const denied = await askSearchPermission(context, query);
         if (denied) return permissionDeniedResponse(denied);
       }
 
