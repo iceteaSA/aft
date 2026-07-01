@@ -6,6 +6,3 @@ description = "Compact Helm output; cap long status or template output."
 max_lines = 150
 keep = "tail"
 
-[shortcircuit]
-when = '\A\s*\z'
-replacement = "helm: ok"

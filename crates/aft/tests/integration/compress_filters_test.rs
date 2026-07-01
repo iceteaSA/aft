@@ -177,11 +177,24 @@ fn xcodebuild_filter() {
 }
 
 #[test]
-fn make_shortcircuit_only_matches_empty_body() {
+fn builtin_filters_never_fabricate_output_for_empty_input() {
+    // Empty output must stay empty: synthesizing text the tool never printed
+    // (e.g. "kubectl: no resources found" for a successful empty `kubectl exec`)
+    // misleads the agent about what actually happened. Only shortcircuits that
+    // summarize CONTENT the output really contained are allowed.
+    for (name, _) in ALL.iter() {
+        let filter = load_filter(name);
+        let out = apply_filter(&filter, "").text;
+        assert_eq!(
+            out, "",
+            "builtin filter {name} fabricated output for empty input: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn make_filter_preserves_inner_blank_lines() {
     let filter = load_filter("make");
-
-    assert_eq!(apply_filter(&filter, ""), "make: ok");
-
     let with_inner_blank = apply_filter(&filter, "error\n\nhint");
     assert_eq!(with_inner_blank, "error\n\nhint");
 }

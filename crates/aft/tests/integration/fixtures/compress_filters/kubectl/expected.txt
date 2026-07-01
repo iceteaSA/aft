@@ -1,1 +1,0 @@
-kubectl: no resources found

@@ -19,6 +19,3 @@ line_max = 500
 max_lines = 80
 keep = "tail"
 
-[shortcircuit]
-when = '\A\s*\z'
-replacement = "make: ok"
