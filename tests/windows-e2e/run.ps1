@@ -571,7 +571,7 @@ function Invoke-AftBgBashScenario {
         if (-not $spawnResponse.success) { throw "background spawn failed: $($spawnResponse | ConvertTo-Json -Compress)" }
 
         $taskId = [string]$spawnResponse.task_id
-        if ($taskId -notmatch '^bash-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
+        if ($taskId -notmatch '^bash-[0-9a-f]{16}$') { throw "bad task id format: $taskId" }
 
         $statusResponse = Wait-ForTerminalStatus -Process $proc -TaskId $taskId -TimeoutSec $WaitSeconds
 
@@ -674,7 +674,7 @@ function Invoke-AftNdjsonScenario {
         if (-not $spawnResponse.success) { throw "background spawn failed: $($spawnResponse | ConvertTo-Json -Compress)" }
 
         $taskId = [string]$spawnResponse.task_id
-        if ($taskId -notmatch '^bash-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
+        if ($taskId -notmatch '^bash-[0-9a-f]{16}$') { throw "bad task id format: $taskId" }
 
         $statusResponse = Wait-ForTerminalStatus -Process $proc -TaskId $taskId -TimeoutSec 10
         if ($statusResponse.status -ne "completed") { throw "expected completed status, got: $($statusResponse | ConvertTo-Json -Compress)" }
