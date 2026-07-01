@@ -26,10 +26,10 @@
  */
 
 import { readFileSync } from "node:fs";
-// Import the LOCAL client source, not the published package: consumer_identity
-// support postdates the published 0.1.0, which silently drops the option (the
-// bind then goes out identity-less and gets stamped `direct`).
-import { SubcClient } from "../../../../subconscious/clients/subc-client/src/index.ts";
+// Requires @cortexkit/subc-client >=0.2.0: earlier versions predate
+// consumer_identity and silently drop the option (the bind then goes out
+// identity-less and gets stamped `direct`).
+import { SubcClient } from "@cortexkit/subc-client";
 
 const CONNECTION_FILE = process.argv[2] ?? "/tmp/subc-principal-rig/runtime/subc-connection.json";
 const NONCE_FILE = process.argv[3] ?? "/tmp/subc-principal-rig/runtime/subc-mcp.nonce";

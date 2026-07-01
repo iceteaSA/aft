@@ -24,7 +24,7 @@
         "undici": "^7.25.0",
       },
       "devDependencies": {
-        "@cortexkit/subc-client": "^0.1.0",
+        "@cortexkit/subc-client": "^0.2.0",
         "@types/node": "^22.0.0",
         "typescript": "^5.8.0",
       },
@@ -280,7 +280,7 @@
 
     "@cortexkit/aft-win32-x64": ["@cortexkit/aft-win32-x64@0.42.0", "", { "os": "win32", "cpu": "x64", "bin": { "aft": "bin/aft.exe" } }, "sha512-0bvPwgzM/nl9XWiSPeBoaUBN5aP/SVZwWBw/HsRJQmxW9bTw0GJwHVCKOzmM9Rd5/xcMloAc0fX2O/tNiBD6Ww=="],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.1.0", "", {}, "sha512-zty6LH/veC8BvZQW9UlDQ0ezDEMEoF2sSCDT69Na9Dnbw03tZibwCX1PNyh4WatSKOc3ICQhU4XuXoI8SbHnxg=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.2.0", "", {}, "sha512-ylX/9DUGD9zhIHVUNuVjLoHVOUcb/3AYgIK2X3p8L7aKnxXEmn0XNUaNXNm6l+/529bWQeOLOz+BxBI3qCi+0w=="],
 
     "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@0.80.2", "", { "dependencies": { "@earendil-works/pi-ai": "^0.80.2", "ignore": "7.0.5", "typebox": "1.1.38", "yaml": "2.9.0" } }, "sha512-BF9WPhixIFjT6Kp3Iz3H6ugkU+4AWotM8py96XE5pIK0arJbQKMWbR+dXSWWDEmR5yc/aFQODnuyowOEzMGO7Q=="],
 
