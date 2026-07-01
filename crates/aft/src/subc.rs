@@ -38,7 +38,7 @@ use subc_protocol::manifest::{
 };
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
-    ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION,
+    ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -163,6 +163,48 @@ struct BashDeferredCompletion {
     fatal: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindTrust {
+    FirstParty,
+    Untrusted,
+}
+
+impl BindTrust {
+    fn allows_bash_observation(self) -> bool {
+        matches!(self, Self::FirstParty)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FirstParty => "first_party",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+pub(crate) fn trust_for_principal(principal: &Option<Principal>) -> BindTrust {
+    match principal {
+        Some(Principal::Direct) => BindTrust::FirstParty,
+        Some(Principal::Reserved { module_id })
+            if module_id == "llm-runner" || module_id == "aft" =>
+        {
+            BindTrust::FirstParty
+        }
+        Some(Principal::Reserved { .. }) | Some(Principal::Unverified) | None => {
+            BindTrust::Untrusted
+        }
+    }
+}
+
+fn principal_label(principal: &Option<Principal>) -> String {
+    match principal {
+        Some(Principal::Direct) => "direct".to_string(),
+        Some(Principal::Reserved { module_id }) => format!("reserved:{module_id}"),
+        Some(Principal::Unverified) => "unverified".to_string(),
+        None => "absent".to_string(),
+    }
+}
+
 #[derive(Debug)]
 /// Per-root route metadata owned by the subc loop. The `active_bash_waits` field
 /// counts detached bash processes that are still being observed for this root.
@@ -202,6 +244,13 @@ struct RouteIdentity {
     project_root: PathBuf,
     harness: String,
     session: String,
+    trust: BindTrust,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedSessionIdentity {
+    harness: String,
+    trust: BindTrust,
 }
 
 #[derive(Clone, Copy)]
@@ -354,30 +403,45 @@ fn end_bg_subscription(
 }
 
 fn remember_session_identity(
-    session_identity: &mut HashMap<(ProjectRootId, String), String>,
+    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     identity: &RouteIdentity,
 ) {
+    let key = (identity.root.clone(), identity.session.clone());
+    if matches!(identity.trust, BindTrust::Untrusted)
+        && session_identity
+            .get(&key)
+            .is_some_and(|retained| matches!(retained.trust, BindTrust::FirstParty))
+    {
+        return;
+    }
+
     // Retained after route Goodbye so reliable session-scoped frames emitted while
     // the session is detached can still be keyed by the full (root,harness,session)
-    // replay triple. The idle-TTL actor reaper is responsible for pruning stale
-    // identities/buffers once an actor is evicted.
+    // replay triple. Untrusted binds never overwrite a retained first-party
+    // session identity, because bash completion replay is an observation channel.
     session_identity.insert(
-        (identity.root.clone(), identity.session.clone()),
-        identity.harness.clone(),
+        key,
+        RetainedSessionIdentity {
+            harness: identity.harness.clone(),
+            trust: identity.trust,
+        },
     );
 }
 
 fn replay_key_for_session(
-    session_identity: &HashMap<(ProjectRootId, String), String>,
+    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     root: &ProjectRootId,
     session: &str,
-) -> Option<ReplayKey> {
-    let harness = session_identity.get(&(root.clone(), session.to_string()))?;
-    Some(ReplayKey {
-        root: root.clone(),
-        harness: harness.clone(),
-        session: session.to_string(),
-    })
+) -> Option<(ReplayKey, BindTrust)> {
+    let retained = session_identity.get(&(root.clone(), session.to_string()))?;
+    Some((
+        ReplayKey {
+            root: root.clone(),
+            harness: retained.harness.clone(),
+            session: session.to_string(),
+        },
+        retained.trust,
+    ))
 }
 
 fn frame_session(frame: &PushFrame) -> Option<&str> {
@@ -397,6 +461,15 @@ fn frame_is_reliable(frame: &PushFrame) -> bool {
         PushFrame::BashCompleted(_)
             | PushFrame::BashPatternMatch(_)
             | PushFrame::ConfigureWarnings(_)
+    )
+}
+
+fn frame_is_bash_observation(frame: &PushFrame) -> bool {
+    matches!(
+        frame,
+        PushFrame::BashCompleted(_)
+            | PushFrame::BashLongRunning(_)
+            | PushFrame::BashPatternMatch(_)
     )
 }
 
@@ -715,6 +788,7 @@ fn replay_buffered_push_frames(
     channel: RouteChannel,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     key: &ReplayKey,
+    trust: BindTrust,
 ) -> usize {
     let mut sent = 0;
     let remove_empty;
@@ -725,6 +799,9 @@ fn replay_buffered_push_frames(
         };
 
         while let Some(frame) = queue.pop_front() {
+            if frame_is_bash_observation(&frame) && !trust.allows_bash_observation() {
+                continue;
+            }
             match try_send_push_frame(writer_tx, channel, &frame) {
                 PushSendOutcome::Sent => sent += 1,
                 PushSendOutcome::Backpressure => {
@@ -816,21 +893,28 @@ fn matching_route_channels(
     };
 
     let session = frame_session(frame);
+    let bash_observation = frame_is_bash_observation(frame);
     channels
         .iter()
         .copied()
-        .filter(|channel| match session {
-            Some(session) => routes
-                .get(channel)
-                .is_some_and(|identity| identity.session == session),
-            None => true,
+        .filter(|channel| {
+            let Some(identity) = routes.get(channel) else {
+                return !bash_observation && session.is_none();
+            };
+            if bash_observation && !identity.trust.allows_bash_observation() {
+                return false;
+            }
+            match session {
+                Some(session) => identity.session == session,
+                None => true,
+            }
         })
         .collect()
 }
 
 fn buffer_detached_reliable_push_frame(
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
-    session_identity: &HashMap<(ProjectRootId, String), String>,
+    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     root: &ProjectRootId,
     frame: &PushFrame,
 ) {
@@ -842,7 +926,10 @@ fn buffer_detached_reliable_push_frame(
         return;
     };
 
-    if let Some(key) = replay_key_for_session(session_identity, root, session) {
+    if let Some((key, trust)) = replay_key_for_session(session_identity, root, session) {
+        if frame_is_bash_observation(frame) && !trust.allows_bash_observation() {
+            return;
+        }
         buffer_push_frame(push_buffer, key, frame.clone());
     } else {
         log::warn!(
@@ -897,7 +984,7 @@ fn fan_out_reliable_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    session_identity: &HashMap<(ProjectRootId, String), String>,
+    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     root: &ProjectRootId,
@@ -954,7 +1041,7 @@ fn process_reliable_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    session_identity: &HashMap<(ProjectRootId, String), String>,
+    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     completed_tasks: &mut CompletedTaskIds,
@@ -1216,7 +1303,8 @@ where
     let mut bg_wake_pending: HashSet<RouteChannel> = HashSet::new();
     let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
-    let mut session_identity: HashMap<(ProjectRootId, String), String> = HashMap::new();
+    let mut session_identity: HashMap<(ProjectRootId, String), RetainedSessionIdentity> =
+        HashMap::new();
     let mut push_buffer: HashMap<ReplayKey, VecDeque<PushFrame>> = HashMap::new();
     let mut retry_buffer: RetryBuffer = HashMap::new();
     let mut completed_tasks = CompletedTaskIds::default();
@@ -1671,7 +1759,7 @@ async fn handle_route_bind_completion(
     completion: RouteBindCompletion,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    session_identity: &mut HashMap<(ProjectRootId, String), String>,
+    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
@@ -1769,6 +1857,7 @@ async fn handle_route_bind_completion(
 
     remember_session_identity(session_identity, &completion.identity);
     let replay_key = ReplayKey::from_identity(&completion.identity);
+    let bind_trust = completion.identity.trust;
     insert_route_channel(routes, root_channels, route_id, completion.identity);
     live_roots
         .entry(completion.bind_root_id.clone())
@@ -1793,7 +1882,7 @@ async fn handle_route_bind_completion(
     )
     .map_err(SubcError::FrameBuild)?;
     send_frame(tx, response).await?;
-    let replayed = replay_buffered_push_frames(tx, route_id, push_buffer, &replay_key);
+    let replayed = replay_buffered_push_frames(tx, route_id, push_buffer, &replay_key, bind_trust);
     if replayed > 0 {
         log::debug!(
             "subc attach: replayed {} buffered Push frame(s) to route {} root {} harness {} session {}",
@@ -1835,11 +1924,7 @@ async fn handle_control_request(
             route_channel,
             target: _,
             identity,
-            // Any wire-relayed `config` field is ignored via `..`: AFT reads config
-            // from CortexKit files, never the wire. `..` keeps this tolerant whether
-            // the protocol version still carries the field or has dropped it, so a
-            // protocol field-removal cannot break this destructure either way.
-            ..
+            principal,
         } => {
             let route_id = route_key(route_channel);
             if pending_binds.contains_key(&route_id) {
@@ -1871,6 +1956,13 @@ async fn handle_control_request(
             let bind_project_root = identity.project_root.clone();
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
+            let bind_trust = trust_for_principal(&principal);
+            log::info!(
+                "subc attach: route {} principal={} trust={}",
+                route_channel,
+                principal_label(&principal),
+                bind_trust.label()
+            );
 
             // Config is single-per-project, read by AFT directly from the
             // CortexKit config files (user: ~/.config/cortexkit/aft.jsonc,
@@ -1918,6 +2010,7 @@ async fn handle_control_request(
                 project_root: PathBuf::from(&bind_project_root),
                 harness: bind_harness.clone(),
                 session: bind_session.clone(),
+                trust: bind_trust,
             };
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
@@ -2271,6 +2364,12 @@ async fn handle_tool_call(
         if let Some(old_sub) = bg_subs.get(&route_id).copied() {
             let _ = try_send_bg_stream_end(tx, route_id, &old_sub);
         }
+        if !identity.trust.allows_bash_observation() {
+            bg_subs.remove(&route_id);
+            bg_wake_pending.remove(&route_id);
+            remove_bg_subscription_index(bg_sub_by_session, route_id, Some(&identity));
+            return Ok(());
+        }
         bg_subs.insert(
             route_id,
             BgSub {
@@ -2299,10 +2398,29 @@ async fn handle_tool_call(
     );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
+    let bind_trust = identity.trust;
     let diagnostics_on_edit = live_roots
         .get(&identity.root)
         .map(|meta| meta.diagnostics_on_edit)
         .unwrap_or(false);
+
+    if matches!(bind_trust, BindTrust::Untrusted) && is_bash_family_tool(&bare_name) {
+        let response = bash_denied_untrusted_response(request_id.clone());
+        let text = crate::subc_format::format_response_with_context(
+            &bare_name,
+            &response,
+            &format_context,
+        );
+        let result = ToolCallResult { text, response };
+        let response_frame = build_tool_response_frame(
+            frame.header.ver,
+            frame.header.channel,
+            frame.header.corr,
+            frame.header.flags,
+            &result,
+        )?;
+        return send_frame(tx, response_frame).await;
+    }
 
     // A non-core name is NOT in the tool manifest. AFT fails closed and
     // does not trust subc to enforce the manifest: rejecting here is the
@@ -2376,6 +2494,7 @@ async fn handle_tool_call(
             call.arguments,
             format_context,
             cancel,
+            bind_trust,
         );
         return Ok(());
     }
@@ -2394,6 +2513,7 @@ async fn handle_tool_call(
     let bare_name_for_finalize = bare_name.clone();
     let session_for_log = identity.session.clone();
     let session_for_finalize = identity.session.clone();
+    let request_id_for_force = request_id.clone();
     let format_context_for_frame = format_context;
     let (text_tx, text_rx) = oneshot::channel::<String>();
     let rx = executor.submit_async(
@@ -2402,27 +2522,35 @@ async fn handle_tool_call(
         request_id.clone(),
         Box::new(move |ctx| {
             log_ctx::with_session(Some(session_for_log.clone()), || {
-                let dispatch_with_finalize = |raw_req: RawRequest, app_ctx: &AppContext| {
-                    let mut response = dispatch(raw_req, app_ctx);
-                    crate::response_finalize::finalize_response(
-                        &mut response,
-                        app_ctx,
-                        &session_for_finalize,
-                        &bare_name_for_finalize,
-                    );
-                    response
-                };
-                match run_tool_call(
-                    &bare_name_for_run,
-                    &arguments_for_run,
-                    &tool_call_context,
-                    ctx,
-                    &dispatch_with_finalize,
-                ) {
-                    ToolCallOutcome::Unary(result) => {
-                        let _ = text_tx.send(result.text);
-                        result.response
+                let run = || {
+                    let dispatch_with_finalize = |raw_req: RawRequest, app_ctx: &AppContext| {
+                        let mut response = dispatch(raw_req, app_ctx);
+                        crate::response_finalize::finalize_response_with_bg_completions(
+                            &mut response,
+                            app_ctx,
+                            &session_for_finalize,
+                            &bare_name_for_finalize,
+                            bind_trust.allows_bash_observation(),
+                        );
+                        response
+                    };
+                    match run_tool_call(
+                        &bare_name_for_run,
+                        &arguments_for_run,
+                        &tool_call_context,
+                        ctx,
+                        &dispatch_with_finalize,
+                    ) {
+                        ToolCallOutcome::Unary(result) => {
+                            let _ = text_tx.send(result.text);
+                            result.response
+                        }
                     }
+                };
+                if matches!(bind_trust, BindTrust::Untrusted) {
+                    ctx.with_force_restrict(&request_id_for_force, run)
+                } else {
+                    run()
                 }
             })
         }),
@@ -2514,8 +2642,15 @@ fn finalized_bash_result(
     ctx: &AppContext,
     session_id: &str,
     format_context: &crate::subc_format::FormatContext,
+    allow_bg_completions: bool,
 ) -> ToolCallResult {
-    crate::response_finalize::finalize_response(&mut response, ctx, session_id, "bash");
+    crate::response_finalize::finalize_response_with_bg_completions(
+        &mut response,
+        ctx,
+        session_id,
+        "bash",
+        allow_bg_completions,
+    );
     bash_result_from_response(response, format_context)
 }
 
@@ -2546,8 +2681,15 @@ fn finish_bash_spawn_immediate(
     format_context: &crate::subc_format::FormatContext,
     text_tx: &mut Option<oneshot::Sender<String>>,
     control_tx: &mut Option<oneshot::Sender<BashSpawnControl>>,
+    allow_bg_completions: bool,
 ) -> Response {
-    let result = finalized_bash_result(response, ctx, session_id, format_context);
+    let result = finalized_bash_result(
+        response,
+        ctx,
+        session_id,
+        format_context,
+        allow_bg_completions,
+    );
     let ToolCallResult { text, response } = result;
     if let Some(tx) = text_tx.take() {
         let _ = tx.send(text);
@@ -2566,7 +2708,7 @@ fn finish_bash_poll_done(
     text_tx: &mut Option<oneshot::Sender<String>>,
     control_tx: &mut Option<oneshot::Sender<BashPollControl>>,
 ) -> Response {
-    let result = finalized_bash_result(response, ctx, session_id, format_context);
+    let result = finalized_bash_result(response, ctx, session_id, format_context, true);
     let ToolCallResult { text, response } = result;
     if let Some(tx) = text_tx.take() {
         let _ = tx.send(text);
@@ -2594,6 +2736,7 @@ fn submit_deferred_bash(
     arguments: Value,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
+    bind_trust: BindTrust,
 ) {
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
     let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
@@ -2610,6 +2753,19 @@ fn submit_deferred_bash(
             log_ctx::with_session(Some(session_for_spawn.clone()), || {
                 let mut spawn_text_tx = Some(spawn_text_tx);
                 let mut spawn_control_tx = Some(spawn_control_tx);
+
+                if matches!(bind_trust, BindTrust::Untrusted) {
+                    let response = bash_denied_untrusted_response(request_id_for_spawn.clone());
+                    return finish_bash_spawn_immediate(
+                        response,
+                        ctx,
+                        &session_for_spawn,
+                        &format_context_for_spawn,
+                        &mut spawn_text_tx,
+                        &mut spawn_control_tx,
+                        false,
+                    );
+                }
 
                 let translated = match crate::subc_translate::subc_translate(
                     "bash",
@@ -2630,6 +2786,7 @@ fn submit_deferred_bash(
                             &format_context_for_spawn,
                             &mut spawn_text_tx,
                             &mut spawn_control_tx,
+                            true,
                         );
                     }
                 };
@@ -2650,6 +2807,7 @@ fn submit_deferred_bash(
                         &format_context_for_spawn,
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
+                        true,
                     );
                 }
 
@@ -2666,6 +2824,7 @@ fn submit_deferred_bash(
                         &format_context_for_spawn,
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
+                        true,
                     );
                 };
                 if response.data.get("status").and_then(Value::as_str) != Some("running") {
@@ -2676,6 +2835,7 @@ fn submit_deferred_bash(
                         &format_context_for_spawn,
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
+                        true,
                     );
                 }
 
@@ -2695,6 +2855,7 @@ fn submit_deferred_bash(
                         &format_context_for_spawn,
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
+                        true,
                     );
                 }
 
@@ -3040,6 +3201,7 @@ async fn submit_bash_promote(
                     ctx,
                     &session_for_promote,
                     &format_context_for_promote,
+                    true,
                 );
                 let ToolCallResult { text, response } = result;
                 let _ = text_tx.send(text);
@@ -3299,6 +3461,18 @@ fn response_message(response: &Response, fallback: &str) -> String {
 
 fn response_is_fatal_panic(response: &Response) -> bool {
     !response.success && response.data.get("code").and_then(Value::as_str) == Some("actor_fatal")
+}
+
+fn bash_denied_untrusted_response(request_id: impl Into<String>) -> Response {
+    Response::error(
+        request_id.into(),
+        "bash_denied_untrusted",
+        "remote/MCP-facade binds cannot run shell commands",
+    )
+}
+
+fn is_bash_family_tool(name: &str) -> bool {
+    name == "bash" || name.starts_with("bash_")
 }
 
 fn is_subc_agent_core_tool(name: &str) -> bool {
@@ -3614,11 +3788,20 @@ mod tests {
     }
 
     fn route_identity(root: &ProjectRootId, session_id: &str) -> RouteIdentity {
+        route_identity_with_trust(root, session_id, BindTrust::FirstParty)
+    }
+
+    fn route_identity_with_trust(
+        root: &ProjectRootId,
+        session_id: &str,
+        trust: BindTrust,
+    ) -> RouteIdentity {
         RouteIdentity {
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
             harness: "opencode".to_string(),
             session: session_id.to_string(),
+            trust,
         }
     }
 
@@ -3645,6 +3828,43 @@ mod tests {
         body.get("task_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
+    }
+
+    #[test]
+    fn trust_for_principal_matrix() {
+        assert_eq!(
+            trust_for_principal(&Some(Principal::Direct)),
+            BindTrust::FirstParty
+        );
+        assert_eq!(
+            trust_for_principal(&Some(Principal::Reserved {
+                module_id: "llm-runner".to_string(),
+            })),
+            BindTrust::FirstParty
+        );
+        assert_eq!(
+            trust_for_principal(&Some(Principal::Reserved {
+                module_id: "aft".to_string(),
+            })),
+            BindTrust::FirstParty
+        );
+        assert_eq!(
+            trust_for_principal(&Some(Principal::Reserved {
+                module_id: "subc-mcp".to_string(),
+            })),
+            BindTrust::Untrusted
+        );
+        assert_eq!(
+            trust_for_principal(&Some(Principal::Reserved {
+                module_id: "anything-unknown".to_string(),
+            })),
+            BindTrust::Untrusted
+        );
+        assert_eq!(
+            trust_for_principal(&Some(Principal::Unverified)),
+            BindTrust::Untrusted
+        );
+        assert_eq!(trust_for_principal(&None), BindTrust::Untrusted);
     }
 
     #[test]
@@ -3799,8 +4019,13 @@ mod tests {
         buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
         buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-b"));
 
-        let replayed =
-            replay_buffered_push_frames(&writer_tx, route_key(3), &mut push_buffer, &key);
+        let replayed = replay_buffered_push_frames(
+            &writer_tx,
+            route_key(3),
+            &mut push_buffer,
+            &key,
+            BindTrust::FirstParty,
+        );
 
         assert_eq!(replayed, 2);
         assert!(!push_buffer.contains_key(&key));
@@ -3811,6 +4036,31 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&frame.body).expect("push body");
             assert_eq!(body["task_id"].as_str(), Some(expected_task));
         }
+        assert!(writer_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn replay_buffered_push_frames_skips_bash_for_untrusted_route() {
+        let (_root_dir, root) = test_root("subc-buffer-replay-untrusted-root");
+        let key = ReplayKey {
+            root,
+            harness: "mcp".to_string(),
+            session: "session-1".to_string(),
+        };
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(4);
+        let mut push_buffer = HashMap::new();
+        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
+
+        let replayed = replay_buffered_push_frames(
+            &writer_tx,
+            route_key(3),
+            &mut push_buffer,
+            &key,
+            BindTrust::Untrusted,
+        );
+
+        assert_eq!(replayed, 0);
+        assert!(!push_buffer.contains_key(&key));
         assert!(writer_rx.try_recv().is_err());
     }
 
@@ -4124,7 +4374,13 @@ mod tests {
         }
 
         assert_eq!(
-            replay_buffered_push_frames(&writer_tx, route_key(4), &mut push_buffer, &key),
+            replay_buffered_push_frames(
+                &writer_tx,
+                route_key(4),
+                &mut push_buffer,
+                &key,
+                BindTrust::FirstParty
+            ),
             1
         );
         assert_eq!(push_buffer.get(&key).map(VecDeque::len), Some(2));
@@ -4140,7 +4396,13 @@ mod tests {
         assert_eq!(push_frame_task_id(&first).as_deref(), Some("replay-1"));
 
         assert_eq!(
-            replay_buffered_push_frames(&writer_tx, route_key(4), &mut push_buffer, &key),
+            replay_buffered_push_frames(
+                &writer_tx,
+                route_key(4),
+                &mut push_buffer,
+                &key,
+                BindTrust::FirstParty
+            ),
             2
         );
         let second = writer_rx.try_recv().expect("second replayed push");
@@ -4198,7 +4460,13 @@ mod tests {
             completion_frame("closed-replay"),
         );
         assert_eq!(
-            replay_buffered_push_frames(&writer_tx, route_key(4), &mut push_buffer, &key),
+            replay_buffered_push_frames(
+                &writer_tx,
+                route_key(4),
+                &mut push_buffer,
+                &key,
+                BindTrust::FirstParty
+            ),
             0
         );
         assert!(!push_buffer.contains_key(&key));

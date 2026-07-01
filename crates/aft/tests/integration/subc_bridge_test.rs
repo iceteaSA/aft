@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
-    BindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
-    RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
+    Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 use subc_transport::{authenticate_server, read_frame, write_frame};
@@ -938,6 +938,17 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             let session = req.session().to_string();
             Response::success(req.id, json!({ "transport_session": session }))
         }
+        "subc_test_validate_path" => {
+            let Some(path) = req.params.get("path").and_then(Value::as_str) else {
+                return Response::error(req.id, "invalid_request", "missing path");
+            };
+            match ctx.validate_path(&req.id, std::path::Path::new(path)) {
+                Ok(validated) => {
+                    Response::success(req.id, json!({ "path": validated.to_string_lossy() }))
+                }
+                Err(response) => response,
+            }
+        }
         "subc_test_emit_status" => {
             let marker = req
                 .params
@@ -1411,6 +1422,26 @@ fn subc_bridge_bg_events_idle_completion_wake_lane() {
 }
 
 #[test]
+fn subc_bridge_principal_trust_enforces_restrict_and_bash_deny() {
+    run_subc_bridge_test(
+        "subc_bridge_principal_trust_enforces_restrict_and_bash_deny",
+        Duration::from_secs(60),
+        drive_principal_trust_enforcement_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_untrusted_bind_cannot_observe_trusted_bash() {
+    run_subc_bridge_test(
+        "subc_bridge_untrusted_bind_cannot_observe_trusted_bash",
+        Duration::from_secs(90),
+        drive_cross_bind_trust_isolation_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_reliable_replay_and_lossy_drop_for_detached_session() {
     run_subc_bridge_test(
         "subc_bridge_reliable_replay_and_lossy_drop_for_detached_session",
@@ -1765,6 +1796,7 @@ async fn drive_s1_rejection_daemon(
             harness: "mcp:generic".to_string(),
             session: "s1-session".to_string(),
         },
+        principal: Some(Principal::Direct),
     };
     send_frame(
         &mut stream,
@@ -3425,6 +3457,400 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+fn minimal_bind_doc() -> Value {
+    json!({
+        "callgraph_store": false,
+        "search_index": false,
+        "semantic_search": false,
+    })
+}
+
+fn subc_mcp_principal() -> Principal {
+    Principal::Reserved {
+        module_id: "subc-mcp".to_string(),
+    }
+}
+
+async fn bind_route_with_principal(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    root: &std::path::Path,
+    harness: &str,
+    session: &str,
+    principal: Option<Principal>,
+) {
+    send_route_bind_with_harness_session_principal_and_doc(
+        stream,
+        route_channel,
+        corr,
+        root,
+        harness,
+        session,
+        principal,
+        minimal_bind_doc(),
+    )
+    .await;
+    expect_route_bind_ack(stream, corr).await;
+}
+
+fn assert_tool_success(response: &Value, label: &str) {
+    assert_eq!(
+        response["success"].as_bool(),
+        Some(true),
+        "{label} should succeed: {response:?}"
+    );
+}
+
+fn assert_tool_error_code(response: &Value, code: &str, label: &str) {
+    assert_eq!(
+        response["success"].as_bool(),
+        Some(false),
+        "{label} should fail: {response:?}"
+    );
+    assert_eq!(
+        response["code"].as_str(),
+        Some(code),
+        "{label} returned wrong error: {response:?}"
+    );
+}
+
+async fn call_tool_frame(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    label: &str,
+) -> Frame {
+    send_tool_call(stream, channel, corr, name, arguments).await;
+    let frame = read_frame_timeout(stream, label).await;
+    assert_eq!(
+        frame.header.channel, channel,
+        "unexpected channel for {label}"
+    );
+    assert_eq!(frame.header.corr, corr, "unexpected corr for {label}");
+    frame
+}
+
+async fn call_tool_response(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    label: &str,
+) -> Value {
+    let frame = call_tool_frame(stream, channel, corr, name, arguments, label).await;
+    tool_response_json(&frame)
+}
+
+async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        ..
+    } = open_fake_daemon_session(input).await;
+    let trusted_outside = root2.join("trusted-direct-outside.txt");
+    let untrusted_outside = root2.join("untrusted-outside.txt");
+    let untrusted_inside = root1.join("untrusted-inside.txt");
+
+    // Anti-spoof: a client-claimed mcp:* harness remains trusted when the
+    // daemon-stamped principal is Direct.
+    bind_route_with_principal(
+        &mut stream,
+        1,
+        101,
+        &root1,
+        "mcp:evil",
+        "direct-session",
+        Some(Principal::Direct),
+    )
+    .await;
+    let trusted_write = call_tool_frame(
+        &mut stream,
+        1,
+        102,
+        "write",
+        json!({ "filePath": trusted_outside.to_string_lossy(), "content": "trusted outside\n" }),
+        "trusted direct out-of-root write",
+    )
+    .await;
+    assert!(
+        !tool_result_is_error(&trusted_write),
+        "trusted direct out-of-root write should succeed: {:?}",
+        tool_result_text(&trusted_write)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&trusted_outside).expect("trusted outside write exists"),
+        "trusted outside\n"
+    );
+    send_tool_call(
+        &mut stream,
+        1,
+        103,
+        "bash",
+        json!({ "params": { "command": "printf trusted-principal", "timeout": 5000 } }),
+    )
+    .await;
+    let trusted_bash = read_frame_timeout(&mut stream, "trusted direct bash").await;
+    assert_eq!(trusted_bash.header.channel, 1);
+    assert_eq!(trusted_bash.header.corr, 103);
+    assert!(
+        !tool_result_is_error(&trusted_bash),
+        "trusted direct bash should reach spawn: {:?}",
+        tool_result_text(&trusted_bash)
+    );
+
+    // Anti-spoof in the other direction: a runner harness is untrusted when the
+    // daemon-stamped principal is the MCP facade id.
+    bind_route_with_principal(
+        &mut stream,
+        2,
+        201,
+        &root1,
+        "runner",
+        "facade-session",
+        Some(subc_mcp_principal()),
+    )
+    .await;
+    let untrusted_in_root = call_tool_frame(
+        &mut stream,
+        2,
+        202,
+        "write",
+        json!({ "filePath": untrusted_inside.to_string_lossy(), "content": "untrusted inside\n" }),
+        "untrusted in-root write",
+    )
+    .await;
+    assert!(
+        !tool_result_is_error(&untrusted_in_root),
+        "untrusted in-root write should succeed: {:?}",
+        tool_result_text(&untrusted_in_root)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&untrusted_inside).expect("untrusted inside write exists"),
+        "untrusted inside\n"
+    );
+
+    let untrusted_out_root = call_tool_frame(
+        &mut stream,
+        2,
+        203,
+        "write",
+        json!({ "filePath": untrusted_outside.to_string_lossy(), "content": "blocked\n" }),
+        "untrusted out-of-root write",
+    )
+    .await;
+    assert!(tool_result_is_error(&untrusted_out_root));
+    assert!(
+        tool_result_text(&untrusted_out_root).contains("outside the project root"),
+        "untrusted out-of-root write should mention containment: {:?}",
+        tool_result_text(&untrusted_out_root)
+    );
+    let validate_out_root = call_tool_response(
+        &mut stream,
+        2,
+        204,
+        "subc_test_validate_path",
+        json!({ "path": untrusted_outside.to_string_lossy() }),
+        "untrusted out-of-root validate_path",
+    )
+    .await;
+    assert_tool_error_code(
+        &validate_out_root,
+        "path_outside_root",
+        "untrusted out-of-root validate_path",
+    );
+
+    for (corr, name, args) in [
+        (
+            205,
+            "bash",
+            json!({ "params": { "command": "printf denied", "timeout": 5000 } }),
+        ),
+        (
+            206,
+            "bash_status",
+            json!({ "params": { "task_id": "bash-denied" } }),
+        ),
+        (207, "bash_drain_completions", json!({})),
+        (
+            208,
+            "bash_ack_completions",
+            json!({ "task_ids": ["bash-denied"] }),
+        ),
+    ] {
+        let denied = call_tool_response(
+            &mut stream,
+            2,
+            corr,
+            name,
+            args,
+            "untrusted bash-family deny",
+        )
+        .await;
+        assert_tool_error_code(&denied, "bash_denied_untrusted", name);
+    }
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_cross_bind_trust_isolation_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        ..
+    } = open_fake_daemon_session(input).await;
+    let trusted_outside = root2.join("trusted-cross-bind-outside.txt");
+    let untrusted_outside = root2.join("untrusted-cross-bind-outside.txt");
+
+    bind_route_with_principal(
+        &mut stream,
+        1,
+        301,
+        &root1,
+        "opencode",
+        "shared-session",
+        Some(Principal::Direct),
+    )
+    .await;
+    bind_route_with_principal(
+        &mut stream,
+        2,
+        302,
+        &root1,
+        "runner",
+        "shared-session",
+        Some(subc_mcp_principal()),
+    )
+    .await;
+
+    let trusted_write = call_tool_frame(
+        &mut stream,
+        1,
+        303,
+        "write",
+        json!({ "filePath": trusted_outside.to_string_lossy(), "content": "trusted unaffected\n" }),
+        "trusted cross-bind out-of-root write",
+    )
+    .await;
+    assert!(
+        !tool_result_is_error(&trusted_write),
+        "trusted cross-bind write should succeed: {:?}",
+        tool_result_text(&trusted_write)
+    );
+    let untrusted_write = call_tool_frame(
+        &mut stream,
+        2,
+        304,
+        "write",
+        json!({ "filePath": untrusted_outside.to_string_lossy(), "content": "blocked\n" }),
+        "untrusted cross-bind out-of-root write",
+    )
+    .await;
+    assert!(tool_result_is_error(&untrusted_write));
+    assert!(tool_result_text(&untrusted_write).contains("outside the project root"));
+
+    send_bg_events_subscribe(&mut stream, 2, 305).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        306,
+        "subc_test_emit_bash_completed",
+        json!({ "task_id": "trusted-push-isolation" }),
+    )
+    .await;
+    let pushes = expect_bash_completed_pushes_for_tool(
+        &mut stream,
+        306,
+        "trusted-push-isolation",
+        HashSet::from([1]),
+    )
+    .await;
+    assert_eq!(pushes.len(), 1);
+    assert_no_bg_event_for(
+        &mut stream,
+        2,
+        305,
+        Duration::from_millis(400),
+        "untrusted bg_events subscription must stay silent",
+    )
+    .await;
+
+    let bash_started = call_tool_response(
+        &mut stream,
+        1,
+        307,
+        "bash",
+        json!({
+            "params": {
+                "command": "sleep 0.2; printf cross-bind-completion",
+                "background": true,
+                "timeout": 5000,
+            },
+        }),
+        "trusted background bash",
+    )
+    .await;
+    assert_tool_success(&bash_started, "trusted background bash");
+    let task_id = bash_started["task_id"]
+        .as_str()
+        .expect("trusted background task id")
+        .to_string();
+    wait_for_bash_completion_without_bg_event(&mut stream, 1, 308, &task_id, 2, 305).await;
+    settle_until_bg_completion(&mut stream, 1, 4300, &task_id).await;
+
+    let denied_drain = call_tool_response(
+        &mut stream,
+        2,
+        4400,
+        "bash_drain_completions",
+        json!({}),
+        "untrusted drain denied",
+    )
+    .await;
+    assert_tool_error_code(
+        &denied_drain,
+        "bash_denied_untrusted",
+        "untrusted drain denied",
+    );
+
+    let trusted_after_drain = call_tool_response(
+        &mut stream,
+        1,
+        4401,
+        "echo",
+        json!({ "case": "fast" }),
+        "trusted completion still available",
+    )
+    .await;
+    assert_tool_success(&trusted_after_drain, "trusted completion still available");
+    assert_bg_completion_matching(&trusted_after_drain, &task_id, "cross-bind-completion");
+
+    let untrusted_after_completion = call_tool_response(
+        &mut stream,
+        2,
+        4402,
+        "echo",
+        json!({ "case": "fast" }),
+        "untrusted finalizer skips completions",
+    )
+    .await;
+    assert_tool_success(
+        &untrusted_after_completion,
+        "untrusted finalizer skips completions",
+    );
+    assert!(
+        untrusted_after_completion.get("bg_completions").is_none(),
+        "untrusted response must not observe trusted bg completions: {untrusted_after_completion:?}"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_detached_session_replay_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream,
@@ -3979,6 +4405,30 @@ async fn send_route_bind_with_session_and_doc(
     session: &str,
     doc: Value,
 ) {
+    send_route_bind_with_harness_session_principal_and_doc(
+        stream,
+        route_channel,
+        corr,
+        root,
+        "opencode",
+        session,
+        Some(Principal::Direct),
+        doc,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_route_bind_with_harness_session_principal_and_doc(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    root: &std::path::Path,
+    harness: &str,
+    session: &str,
+    principal: Option<Principal>,
+    doc: Value,
+) {
     // Config is read by AFT from <root>/.cortexkit/aft.jsonc, NOT from the wire
     // (the wire `config` is ignored since the unification). Write the bind's doc
     // (real config fields + any subc_test_* directives the fake dispatch reads)
@@ -4001,9 +4451,10 @@ async fn send_route_bind_with_session_and_doc(
         },
         identity: BindIdentity {
             project_root: root.to_path_buf(),
-            harness: "opencode".to_string(),
+            harness: harness.to_string(),
             session: session.to_string(),
         },
+        principal,
     };
     send_frame(
         stream,

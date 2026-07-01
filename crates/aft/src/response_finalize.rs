@@ -8,7 +8,19 @@ pub fn finalize_response(
     session_id: &str,
     attach_command: &str,
 ) {
-    attach_bg_completions(response, ctx, session_id, attach_command);
+    finalize_response_with_bg_completions(response, ctx, session_id, attach_command, true);
+}
+
+pub fn finalize_response_with_bg_completions(
+    response: &mut Response,
+    ctx: &AppContext,
+    session_id: &str,
+    attach_command: &str,
+    allow_bg_completions: bool,
+) {
+    if allow_bg_completions {
+        attach_bg_completions(response, ctx, session_id, attach_command);
+    }
     attach_status_bar(response, ctx, attach_command);
 }
 

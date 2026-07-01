@@ -583,6 +583,7 @@ pub struct AppContext {
     backup: parking_lot::Mutex<BackupStore>,
     checkpoint: parking_lot::Mutex<CheckpointStore>,
     config: RwLock<Arc<Config>>,
+    force_restrict_requests: parking_lot::Mutex<BTreeMap<String, usize>>,
     pub harness: parking_lot::Mutex<Option<Harness>>,
     canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
     is_worktree_bridge: parking_lot::Mutex<bool>,
@@ -683,6 +684,22 @@ pub struct AppContext {
         parking_lot::Mutex<crate::lsp::tsconfig_membership::TsconfigMembershipCache>,
 }
 
+/// RAII guard for a server-owned request-scoped path-restriction override.
+///
+/// Guards are refcounted by request id so duplicated ids over-restrict until the
+/// last worker exits, rather than letting one completion disable another
+/// in-flight request's containment.
+pub struct ForceRestrictGuard<'a> {
+    ctx: &'a AppContext,
+    req_id: String,
+}
+
+impl Drop for ForceRestrictGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.release_force_restrict(&self.req_id);
+    }
+}
+
 impl Drop for AppContext {
     fn drop(&mut self) {
         if let Some(runtime) = self.watcher_thread.get_mut().take() {
@@ -768,6 +785,7 @@ impl AppContext {
             backup: parking_lot::Mutex::new(BackupStore::new()),
             checkpoint: parking_lot::Mutex::new(CheckpointStore::new()),
             config: RwLock::new(Arc::new(config)),
+            force_restrict_requests: parking_lot::Mutex::new(BTreeMap::new()),
             harness: parking_lot::Mutex::new(None),
             canonical_cache_root: parking_lot::Mutex::new(None),
             is_worktree_bridge: parking_lot::Mutex::new(false),
@@ -1341,6 +1359,35 @@ impl AppContext {
         let mut next = self.config().as_ref().clone();
         update(&mut next);
         self.set_config(next);
+    }
+
+    pub fn force_restrict_guard(&self, req_id: &str) -> ForceRestrictGuard<'_> {
+        let mut requests = self.force_restrict_requests.lock();
+        *requests.entry(req_id.to_string()).or_insert(0) += 1;
+        ForceRestrictGuard {
+            ctx: self,
+            req_id: req_id.to_string(),
+        }
+    }
+
+    pub fn with_force_restrict<R>(&self, req_id: &str, f: impl FnOnce() -> R) -> R {
+        let _guard = self.force_restrict_guard(req_id);
+        f()
+    }
+
+    pub fn request_force_restrict(&self, req_id: &str) -> bool {
+        self.force_restrict_requests.lock().contains_key(req_id)
+    }
+
+    fn release_force_restrict(&self, req_id: &str) {
+        let mut requests = self.force_restrict_requests.lock();
+        match requests.get_mut(req_id) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                requests.remove(req_id);
+            }
+            None => {}
+        }
     }
 
     pub fn set_harness(&self, harness: Harness) {
@@ -2699,12 +2746,22 @@ impl AppContext {
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let config = self.config();
-        // When restrict_to_project_root is false (default), allow all paths
-        if !config.restrict_to_project_root {
+        let force_restrict = self.request_force_restrict(req_id);
+        let enforce = config.restrict_to_project_root || force_restrict;
+        // When no restriction is configured or forced (the default standalone
+        // path), preserve the historical passthrough behavior exactly.
+        if !enforce {
             return Ok(path.to_path_buf());
         }
         let root = match &config.project_root {
             Some(r) => r.clone(),
+            None if force_restrict => {
+                return Err(crate::protocol::Response::error(
+                    req_id,
+                    "path_outside_root",
+                    "project root is required when path restriction is forced",
+                ));
+            }
             None => return Ok(path.to_path_buf()), // No root configured, allow all
         };
         drop(config);
@@ -2766,6 +2823,105 @@ impl AppContext {
             "local_entries": entries,
             "warm_entries": 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod force_restrict_tests {
+    use super::*;
+    use crate::language::StubProvider;
+    use tempfile::TempDir;
+
+    fn test_context(project_root: Option<PathBuf>, restrict_to_project_root: bool) -> AppContext {
+        AppContext::new(
+            Box::new(StubProvider),
+            Config {
+                project_root,
+                restrict_to_project_root,
+                ..Config::default()
+            },
+        )
+    }
+
+    #[test]
+    fn standalone_validate_path_parity_without_force_restrict() {
+        let root = TempDir::new().expect("root tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let outside_path = outside.path().join("outside.txt");
+
+        let unrestricted = test_context(Some(root.path().to_path_buf()), false);
+        assert_eq!(
+            unrestricted
+                .validate_path("standalone-unrestricted", &outside_path)
+                .expect("unrestricted standalone validates"),
+            outside_path
+        );
+
+        let restricted = test_context(Some(root.path().to_path_buf()), true);
+        let err = restricted
+            .validate_path("standalone-restricted", &outside_path)
+            .expect_err("restricted standalone rejects outside root");
+        assert_eq!(
+            serde_json::to_value(err).unwrap()["code"],
+            "path_outside_root"
+        );
+    }
+
+    #[test]
+    fn force_restrict_guard_refcounts_duplicate_request_ids() {
+        let root = TempDir::new().expect("root tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let outside_path = outside.path().join("outside.txt");
+        let ctx = test_context(Some(root.path().to_path_buf()), false);
+
+        assert!(ctx.validate_path("dup", &outside_path).is_ok());
+        let guard1 = ctx.force_restrict_guard("dup");
+        let guard2 = ctx.force_restrict_guard("dup");
+        assert!(ctx.validate_path("dup", &outside_path).is_err());
+        drop(guard1);
+        assert!(
+            ctx.validate_path("dup", &outside_path).is_err(),
+            "duplicate guard must keep the request over-restricted"
+        );
+        drop(guard2);
+        assert!(ctx.validate_path("dup", &outside_path).is_ok());
+    }
+
+    #[test]
+    fn with_force_restrict_cleans_up_after_normal_completion_and_panic() {
+        let root = TempDir::new().expect("root tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let outside_path = outside.path().join("outside.txt");
+        let ctx = test_context(Some(root.path().to_path_buf()), false);
+
+        ctx.with_force_restrict("normal", || {
+            assert!(ctx.validate_path("normal", &outside_path).is_err());
+        });
+        assert!(!ctx.request_force_restrict("normal"));
+        assert!(ctx.validate_path("normal", &outside_path).is_ok());
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.with_force_restrict("panic", || {
+                assert!(ctx.validate_path("panic", &outside_path).is_err());
+                panic!("intentional force-restrict cleanup panic");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(!ctx.request_force_restrict("panic"));
+        assert!(ctx.validate_path("panic", &outside_path).is_ok());
+    }
+
+    #[test]
+    fn forced_restrict_without_project_root_fails_closed() {
+        let ctx = test_context(None, false);
+        let _guard = ctx.force_restrict_guard("missing-root");
+        let err = ctx
+            .validate_path("missing-root", Path::new("relative.txt"))
+            .expect_err("forced restriction without a root must fail closed");
+        assert_eq!(
+            serde_json::to_value(err).unwrap()["code"],
+            "path_outside_root"
+        );
     }
 }
 
