@@ -1,7 +1,9 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
@@ -18,8 +20,42 @@ import {
 } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
-const isCI = process.env.CI === "true";
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
+
+// The semantic lane needs ONNX Runtime. The real plugin resolves it via
+// ensureOnnxRuntime and threads `_ort_dylib_dir` into configure; this harness
+// must do the same or the bridge's bare dlopen fails and the lane reports
+// "unavailable" on every machine. Probe the standard cached locations only
+// (never download): when a local ORT exists the ready-path assertions below
+// become a REAL end-to-end check of the semantic lane; when it doesn't, the
+// test honestly asserts the degraded contract instead of a state the harness
+// cannot reach.
+function findLocalOrtDir(): string | undefined {
+  const libName =
+    process.platform === "darwin"
+      ? "libonnxruntime.dylib"
+      : process.platform === "win32"
+        ? "onnxruntime.dll"
+        : "libonnxruntime.so";
+  const dataHome =
+    process.env.XDG_DATA_HOME ??
+    (process.platform === "win32"
+      ? (process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"))
+      : join(homedir(), ".local", "share"));
+  const ortRoot = join(dataHome, "cortexkit", "aft", "onnxruntime");
+  try {
+    for (const version of readdirSync(ortRoot)) {
+      for (const dir of [join(ortRoot, version), join(ortRoot, version, "lib")]) {
+        if (existsSync(join(dir, libName))) return dir;
+      }
+    }
+  } catch {
+    // No cached ORT — semantic lane will be unavailable; degraded contract applies.
+  }
+  return undefined;
+}
+
+const localOrtDir = findLocalOrtDir();
 
 function createMockClient(): any {
   return {
@@ -85,6 +121,9 @@ maybeDescribe("e2e semantic search tool", () => {
         semantic_search: options?.experimentalSemanticSearch ?? false,
         storage_dir: join(harness.tempDir, ".storage"),
         harness: "opencode",
+        ...(options?.experimentalSemanticSearch && localOrtDir
+          ? { _ort_dylib_dir: localOrtDir }
+          : {}),
       }),
     );
     pools.push(pool);
@@ -125,25 +164,39 @@ maybeDescribe("e2e semantic search tool", () => {
   test("aft_search with a valid query returns formatted text", async () => {
     const { tools, sdkCtx } = await createToolHarness({ experimentalSemanticSearch: true });
 
-    const output = await tools.aft_search.execute(
-      { query: "request authentication handler" },
-      sdkCtx,
-    );
+    const classify = (text: string) => ({
+      isBuilding:
+        text.includes("building") || text.includes("not ready") || text.includes("not_ready"),
+      isUnavailable:
+        text.includes("unavailable") ||
+        text.includes("ONNX") ||
+        text.includes("not found") ||
+        text.includes("not enabled"),
+      isDisabled: text.includes("disabled") || text.includes("not enabled"),
+    });
 
+    const runQuery = () =>
+      tools.aft_search.execute(
+        { query: "request authentication handler" },
+        sdkCtx,
+      ) as Promise<string>;
+
+    let output = await runQuery();
     expect(typeof output).toBe("string");
     expect(output.length).toBeGreaterThan(0);
 
-    const isBuilding =
-      output.includes("building") || output.includes("not ready") || output.includes("not_ready");
-    const isUnavailable =
-      output.includes("unavailable") ||
-      output.includes("ONNX") ||
-      output.includes("not found") ||
-      output.includes("not enabled");
-    const isDisabled = output.includes("disabled") || output.includes("not enabled");
-
-    if (isCI) {
-      expect(isBuilding || isUnavailable || isDisabled).toBe(false);
+    if (localOrtDir) {
+      // ORT is threaded, so "unavailable" would be a REAL regression here. The
+      // cold index may still be building on the first call — poll briefly for
+      // readiness, then assert the full ready-path contract.
+      const deadline = Date.now() + 30_000;
+      let state = classify(output);
+      while (state.isBuilding && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        output = await runQuery();
+        state = classify(output);
+      }
+      expect(state.isBuilding || state.isUnavailable || state.isDisabled).toBe(false);
       expect(output).toContain("Found ");
       // The ready path no longer carries an [index: ready] tag (absence == ready,
       // for both the semantic and lexical lanes) — it was per-call token tax.
@@ -152,14 +205,11 @@ maybeDescribe("e2e semantic search tool", () => {
       return;
     }
 
-    if (isBuilding || isUnavailable || isDisabled) {
-      expect(output.length).toBeGreaterThan(0);
-      return;
-    }
-
-    expect(output).toContain("Found ");
-    expect(output).not.toContain("[index: ready]");
-    expect(output).toContain("src/");
+    // No local ORT cache: the semantic lane is unavailable by construction.
+    // Assert the honest degraded contract instead of skipping silently.
+    const state = classify(output);
+    expect(state.isUnavailable || state.isBuilding || state.isDisabled).toBe(true);
+    expect(output).toContain("lexical");
   });
 });
 
