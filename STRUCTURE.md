@@ -89,7 +89,7 @@ opencode-aft/
 
 **`packages/aft-bridge/`:**
 - Purpose: Ship the shared bridge transport layer used by both OpenCode and Pi plugins.
-- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, route caching per session-identity, background event subscriptions, bridge lifecycle management, binary resolution, download, ONNX runtime detection, storage migration, compact formatting, zoom-format rendering
+- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, session lifecycle records caching (`SessionRecord` wrapping route entry and bg subscriptions), background event subscriptions, bridge lifecycle management, binary resolution, download, ONNX runtime detection, storage migration, compact formatting, zoom-format rendering
 - Key files: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/subc-transport.ts`, `packages/aft-bridge/src/transport.ts`, `packages/aft-bridge/src/transport-factory.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`
 
 **`packages/aft-cli/`:**

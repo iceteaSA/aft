@@ -124,8 +124,8 @@
 **Background completion wake flow:**
 
 1. Maintain background subscriptions for completions. Under standalone mode, completion notifications push directly over the bridge process stdout channel. Under subc mode, the plugin maintains a persistent `BgSubscription` over a dedicated second route channel -- `packages/aft-bridge/src/subc-transport.ts`.
-2. When a background task completes, Rust marks the session's background channel wake-pending and emits a coalesced, lossy `{op: "bg_events"}` wake nudge at most once per 250ms tick -- `crates/aft/src/subc.rs`.
-3. The plugin receives the nudge via `onBgEventsNudge` and triggers an unconditional forced-drain (`handleSubcBgEventsNudge`) to fetch, deliver, and ack the completions -- `packages/opencode-plugin/src/bg-notifications.ts`, `packages/pi-plugin/src/bg-notifications.ts`.
+2. When a background task completes, Rust marks the session's background channel wake-pending using an epoch-based tracking mechanism to prevent race conditions during concurrent tool/maintenance execution (i.e. to avoid suppressing wakes armed after a maintenance snapshot). It emits a coalesced, lossy `{op: "bg_events"}` wake nudge at most once per 250ms tick -- `crates/aft/src/subc.rs`.
+3. The plugin receives the nudge via `onBgEventsNudge` and triggers an unconditional forced-drain (`handleSubcBgEventsNudge`) to fetch, deliver, and ack the completions -- `packages/opencode-plugin/src/bg-notifications.ts`, `packages/pi-plugin/src/bg-notifications.ts`. To prevent double-delivery during concurrent tool/forced-drain execution, the plugin maintains two transient per-session task-ID tracking sets: `deliveringTaskIds` (delivery in flight) and `deliveredAwaitingAckTaskIds` (delivered but unacknowledged). Forced drains skip tasks in either set, and automatically re-ack tasks in the awaiting-ack set to terminate subc re-nudge loops. The plugin uses daemon reconciliation (rather than a static time-based TTL) to prune `deliveredAwaitingAckTaskIds`, removing tasks only when they are no longer returned in the daemon's list of outstanding tasks.
 4. If a subc background subscription channel drops, `BgSubscription` drives its own independent reconnect loop to resubscribe without waiting for new tool traffic, retrieving any completions queued while disconnected.
 
 **Binary resolution flow:**
@@ -154,7 +154,7 @@
 **SubcTransportPool:**
 - Purpose: Provide route cache and connection management over the authenticated subc client.
 - Location: `packages/aft-bridge/src/subc-transport.ts`
-- Pattern: Cache tool-provider and background event routes per session identity (`BindIdentity`), handling lazy subscriptions and independent reconnects.
+- Pattern: Cache per-identity session lifecycle records (`SessionRecord`) containing tool route entries, background event subscriptions (`BgSubscription`), closed states, and in-flight request counts. Force single-flight connection/route opening (preventing duplicate channel leaks) and handle safe session teardown by executing synchronous state mutations before any asynchronous transport cleanup to prevent in-flight request resurrection. Feature a client-level half-open backstop that drops/reconnects the client after consecutive non-transient request failures (e.g. timeouts) to recover from silent connection drops.
 
 **BgSubscription:**
 - Purpose: Consume the daemon's held-open `bg_events` wake lane.
@@ -206,7 +206,7 @@
 **BgTaskRegistry:**
 - Purpose: Manage background bash tasks and PTY sessions.
 - Location: `crates/aft/src/bash_background/registry.rs`
-- Pattern: Thread-safe registry with a watchdog thread for output compression, completion notification, and task lifecycle cleanup
+- Pattern: Thread-safe registry with a watchdog thread for output compression, completion notification, and task lifecycle cleanup. Generate unique task IDs using 64-bit entropy (represented as a 16-hex character slug `bash-{16hex}`) to prevent ID reuse collisions during subc delivery de-duplication.
 
 **Compressor:**
 - Purpose: Reduce hoisted-bash output to relevant tokens.
@@ -277,7 +277,7 @@
 
 ## Error Handling
 
-**Strategy:** Return structured Rust `Response::error` payloads from command handlers, convert failed responses into plugin-side exceptions, and restart hung or crashed worker processes in `packages/aft-bridge/src/bridge.ts`.
+**Strategy:** Return structured Rust `Response::error` payloads from command handlers, convert failed responses into plugin-side exceptions, and restart hung or crashed worker processes in `packages/aft-bridge/src/bridge.ts`. Under subc mode, mutating panics return an `actor_fatal` error code which triggers a fatal teardown and client teardown across the daemon connection.
 
 ## Honest Reporting Convention
 
