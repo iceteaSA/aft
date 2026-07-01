@@ -7,6 +7,7 @@ import {
   readSync,
   statSync,
 } from "node:fs";
+import { resolveCortexKitProjectConfigPath } from "@cortexkit/aft-bridge";
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
 import { probeBinaryVersion } from "./binary-probe.js";
@@ -64,6 +65,8 @@ export interface HarnessDiagnostic {
   aftConfig: {
     exists: boolean;
     parseError?: string;
+    enabled: boolean;
+    enabledSource?: string;
     flags: Record<string, unknown>;
   };
   pluginCache: ReturnType<HarnessAdapter["getPluginCacheInfo"]>;
@@ -120,6 +123,20 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
   const configPaths = adapter.detectConfigPaths();
   const aftConfigRead = readJsoncFile(configPaths.aftConfig);
   const aftFlags = (sanitizeValue(aftConfigRead.value ?? {}) as Record<string, unknown>) ?? {};
+  const projectConfigPath = resolveCortexKitProjectConfigPath(process.cwd());
+  const projectConfigRead = readJsoncFile(projectConfigPath);
+  const userEnabled = typeof aftFlags.enabled === "boolean" ? aftFlags.enabled : undefined;
+  const projectEnabled =
+    typeof projectConfigRead.value?.enabled === "boolean"
+      ? projectConfigRead.value.enabled
+      : undefined;
+  const aftEnabled = projectEnabled ?? userEnabled ?? true;
+  const aftEnabledSource =
+    projectEnabled !== undefined
+      ? projectConfigPath
+      : userEnabled !== undefined
+        ? configPaths.aftConfig
+        : undefined;
   const storage = adapter.getStorageDir();
   const logPath = adapter.getLogFile();
   const pluginCache = adapter.getPluginCacheInfo();
@@ -147,8 +164,10 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       : {};
 
   const semanticEnabled =
-    (aftConfigRead.value as Record<string, unknown> | null)?.semantic_search === true ||
-    (aftConfigRead.value as Record<string, unknown> | null)?.experimental_semantic_search === true;
+    aftEnabled &&
+    ((aftConfigRead.value as Record<string, unknown> | null)?.semantic_search === true ||
+      (aftConfigRead.value as Record<string, unknown> | null)?.experimental_semantic_search ===
+        true);
 
   const systemOrtDir = findSystemOnnxRuntime();
   const cachedOrtDir = findCachedOnnxRuntime(storage);
@@ -165,6 +184,8 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
     aftConfig: {
       exists: existsSync(configPaths.aftConfig),
       ...(aftConfigRead.error ? { parseError: aftConfigRead.error } : {}),
+      enabled: aftEnabled,
+      ...(aftEnabledSource ? { enabledSource: aftEnabledSource } : {}),
       flags: aftFlags,
     },
     pluginCache,
@@ -227,6 +248,9 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
     lines.push(`- Host version: ${h.hostVersion ?? "unknown"}`);
     lines.push(`- Plugin registered: ${h.pluginRegistered}`);
     lines.push(`- Plugin version: ${h.pluginCache.cached ?? "not installed"}`);
+    lines.push(
+      `- AFT enabled: ${h.aftConfig.enabled}${h.aftConfig.enabledSource ? ` (from ${h.aftConfig.enabledSource})` : ""}`,
+    );
     lines.push(`- AFT config parse error: ${h.aftConfig.parseError ?? "none"}`);
     lines.push("");
     lines.push("#### Config paths");
@@ -326,7 +350,10 @@ function pluginVersionSkewIssue(
 export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIssue[] {
   const issues: DiagnosticIssue[] = [];
 
-  if (!report.binaryVersion) {
+  const hasEnabledRegisteredHarness = report.harnesses.some(
+    (h) => h.pluginRegistered && h.aftConfig.enabled,
+  );
+  if (!report.binaryVersion && hasEnabledRegisteredHarness) {
     issues.push({
       code: "binary_missing",
       severity: "high",
@@ -370,9 +397,9 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
     }
 
     const skewIssue = pluginVersionSkewIssue(h, report.cliVersion);
-    if (skewIssue) issues.push(skewIssue);
+    if (h.aftConfig.enabled && skewIssue) issues.push(skewIssue);
 
-    if (h.onnxRuntime.required) {
+    if (h.aftConfig.enabled && h.onnxRuntime.required) {
       if (!h.onnxRuntime.cachedPath && !h.onnxRuntime.systemPath) {
         issues.push({
           code: "onnx_missing",

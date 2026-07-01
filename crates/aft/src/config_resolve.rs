@@ -65,6 +65,11 @@ pub struct ResolveResult {
 pub struct RawAftConfig {
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
+    /// Master switch read by the TypeScript plugins before they start AFT.
+    /// The resolver accepts and merges it for validation, but does not copy it
+    /// into `Config`; when this is false the plugin returns before launching the
+    /// Rust process.
+    pub enabled: Option<bool>,
     pub format_on_edit: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
     pub formatter_timeout_secs: Option<u32>,
@@ -532,6 +537,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.schema.is_some() {
         base.schema = override_config.schema;
     }
+    if override_config.enabled.is_some() {
+        base.enabled = override_config.enabled;
+    }
     if override_config.format_on_edit.is_some() {
         base.format_on_edit = override_config.format_on_edit;
     }
@@ -608,6 +616,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
 
 fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     // Project-safe shallow top-level fields.
+    if project.enabled.is_some() {
+        base.enabled = project.enabled;
+    }
     if project.format_on_edit.is_some() {
         base.format_on_edit = project.format_on_edit;
     }

@@ -46,7 +46,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
       aftConfig: join(workDir, "aft.jsonc"),
       aftConfigFormat: "jsonc",
     },
-    aftConfig: { exists: true, flags: {} },
+    aftConfig: { exists: true, enabled: true, flags: {} },
     pluginCache: { path: "/tmp/plugin-cache", exists: false },
     storageDir: {
       path: storageDir,

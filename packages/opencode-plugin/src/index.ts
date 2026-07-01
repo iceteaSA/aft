@@ -243,10 +243,6 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
 const plugin: Plugin = async (input) => initializePluginForDirectory(input);
 
 async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
-  const binaryPath = await findBinary(PLUGIN_VERSION);
-
-  await ensureStorageMigrated({ harness: "opencode", binaryPath, logger: bridgeLogger });
-
   const deliverConfigMigrationWarnings = (directory: string, messages: readonly string[]) => {
     for (const message of messages) {
       void sendWarning({ client: input.client, directory }, message).catch((err) => {
@@ -254,15 +250,46 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       });
     }
   };
+
+  // Load the AFT config before any binary or storage work. This ensures
+  // `enabled: false` makes AFT do nothing except read the config file.
+  let aftConfig = loadAftConfig(input.directory);
+  if (aftConfig.enabled === false) {
+    log(`AFT disabled by config for ${input.directory}`);
+    return { tool: {} };
+  }
+
   deliverConfigMigrationWarnings(
     input.directory,
     migrateAftConfigLocations(input.directory, bridgeLogger).flatMap((result) => result.warnings),
   );
 
   // Load config: ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
-  const aftConfig = loadAftConfig(input.directory);
+  aftConfig = loadAftConfig(input.directory);
   enqueueConfigParseWarnings(input.directory, getConfigLoadErrors());
+  if (aftConfig.enabled === false) {
+    log(`AFT disabled by config for ${input.directory}`);
+    return { tool: {} };
+  }
+
+  const binaryPath = await findBinary(PLUGIN_VERSION);
+
+  await ensureStorageMigrated({ harness: "opencode", binaryPath, logger: bridgeLogger });
   const autoUpdateAbort = new AbortController();
+  const projectEnabledCache = new Map<string, boolean>([[input.directory, true]]);
+  const loggedDisabledProjects = new Set<string>();
+  const isProjectEnabled = (projectRoot: string): boolean => {
+    const cached = projectEnabledCache.get(projectRoot);
+    if (cached !== undefined) return cached;
+    const projectConfig = loadAftConfig(projectRoot);
+    const enabled = projectConfig.enabled !== false;
+    projectEnabledCache.set(projectRoot, enabled);
+    if (!enabled && !loggedDisabledProjects.has(projectRoot)) {
+      loggedDisabledProjects.add(projectRoot);
+      log(`AFT disabled by config for ${projectRoot}`);
+    }
+    return enabled;
+  };
 
   // Build configure params for the Rust binary.
   //
@@ -455,6 +482,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // that project's bridge. See PoolOptions.projectConfigLoader doc.
     projectConfigLoader: (projectRoot) => {
       try {
+        if (!isProjectEnabled(projectRoot)) return {};
         deliverConfigMigrationWarnings(
           projectRoot,
           migrateAftConfigLocations(projectRoot, bridgeLogger).flatMap((result) => result.warnings),
@@ -592,6 +620,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     plugin: (input as { plugin?: PluginContext["plugin"] }).plugin,
     config: aftConfig,
     storageDir: configOverrides.storage_dir as string,
+    isProjectEnabled,
   };
 
   type StatusSubscribableBridge = {
@@ -614,6 +643,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   };
   const originalGetBridge = pool.getBridge.bind(pool);
   pool.getBridge = (projectRoot) => {
+    if (!isProjectEnabled(projectRoot)) {
+      throw new Error(`AFT disabled by config for ${projectRoot}`);
+    }
     const bridge = originalGetBridge(projectRoot);
     subscribeBridgeStatus(bridge);
     return bridge;
@@ -733,6 +765,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       ? await verifySessionDirectory(input.client, realSessionID)
       : null;
     if (verifiedDir) {
+      if (!isProjectEnabled(verifiedDir)) {
+        return {
+          success: true,
+          status: "disabled",
+          message: `AFT disabled by config for ${verifiedDir}`,
+        };
+      }
       bridge = pool.getActiveBridgeForRoot(verifiedDir);
       if (bridge) {
         servedDirectory = verifiedDir;
@@ -1035,6 +1074,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     run: async (sessionID: string): Promise<void> => {
       const sessionDir =
         (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
+      if (!isProjectEnabled(sessionDir)) return;
       const bridge = ctx.pool.getActiveBridgeForRoot(sessionDir) ?? ctx.pool.getBridge(sessionDir);
       const response = await bridge.send("inspect_tier2_run", { session_id: sessionID });
       if (response.success === false) {
@@ -1074,6 +1114,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // for `-s` resumes from another folder.
       const sessionDir =
         (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
+      if (!isProjectEnabled(sessionDir)) return;
       await handleIdleBgCompletions({
         ctx,
         directory: sessionDir,
@@ -1136,6 +1177,14 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       const sessionDir =
         (await getSessionDirectory(input.client, commandInput.sessionID, input.directory)) ??
         input.directory;
+      if (!isProjectEnabled(sessionDir)) {
+        await sendIgnoredMessage(
+          input.client,
+          commandInput.sessionID,
+          `AFT disabled by config for ${sessionDir}`,
+        );
+        throwSentinel(commandInput.command);
+      }
       // Prefer an existing active bridge to get warm index status
       const bridge = ctx.pool.getActiveBridgeForRoot(sessionDir) ?? ctx.pool.getBridge(sessionDir);
       // Cache is session-aware (Rust computes `session` / `compression.session`

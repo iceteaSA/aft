@@ -121,9 +121,21 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
 
   log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
   if (!report.binaryVersion) {
-    log.warn(
-      "  no matching aft binary detected — run `aft doctor --fix` to download, or it will install automatically when an AFT-enabled session makes its first tool call",
+    const hasEnabledRegisteredHarness = report.harnesses.some(
+      (h) => h.pluginRegistered && h.aftConfig.enabled,
     );
+    const hasRegisteredHarness = report.harnesses.some((h) => h.pluginRegistered);
+    if (hasEnabledRegisteredHarness) {
+      log.warn(
+        "  no matching aft binary detected — run `aft doctor --fix` to download, or it will install automatically when an AFT-enabled session makes its first tool call",
+      );
+    } else if (hasRegisteredHarness) {
+      log.info(
+        "  no matching aft binary detected; all registered AFT harnesses are disabled by config",
+      );
+    } else {
+      log.warn("  no matching aft binary detected — run `aft doctor --fix` to download");
+    }
     logUnmatchedBinaryCandidates(report.cliVersion);
   }
   log.info(
@@ -148,6 +160,11 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     log.info(`  host: ${h.hostVersion ?? "unknown version"}`);
     log.info(`  plugin registered: ${h.pluginRegistered ? "yes" : "no"}`);
     log.info(`  plugin version: ${h.pluginCache.cached ?? "not installed"}`);
+    if (!h.aftConfig.enabled) {
+      log.info(
+        `  AFT disabled by config${h.aftConfig.enabledSource ? ` (${h.aftConfig.enabledSource})` : ""}; plugin will stay inert`,
+      );
+    }
     if (!h.pluginRegistered) {
       log.warn("  plugin registration can be fixed with `aft setup` or `aft doctor --fix`");
     }
@@ -406,6 +423,7 @@ function findPluginUpdateTargets(
     // Only OpenCode reinstalls a plugin npm package this way; Pi manages its own
     // packages via `pi install`, handled by the plugin-registration fix.
     if (harness.kind !== "opencode") continue;
+    if (!harness.aftConfig.enabled) continue;
     if (!harness.hostInstalled || !harness.pluginRegistered) continue;
     const cache = harness.pluginCache;
     if (!cache?.exists || !cache.cached || !cache.latest) continue;
@@ -561,7 +579,10 @@ export function buildDoctorFixPlan(
     });
   }
 
-  if (!report.binaryVersion) {
+  const hasEnabledHarness = report.harnesses.some((harness) => {
+    return harness.hostInstalled && harness.aftConfig.enabled;
+  });
+  if (!report.binaryVersion && hasEnabledHarness) {
     const skews = findPluginCliVersionSkews(report);
     items.push({
       kind: "binary",
@@ -573,7 +594,8 @@ export function buildDoctorFixPlan(
   }
 
   for (const harness of report.harnesses) {
-    if (!harness.hostInstalled || !harness.pluginRegistered || harness.storageDir.exists) continue;
+    if (!harness.hostInstalled || !harness.pluginRegistered || !harness.aftConfig.enabled) continue;
+    if (harness.storageDir.exists) continue;
     items.push({
       kind: "storage",
       message: `Will create AFT storage directory at ${harness.storageDir.path}`,

@@ -21,4 +21,6 @@ export interface PluginContext {
   config: AftConfig;
   /** Absolute path to AFT's storage dir (e.g. ~/.local/share/opencode/storage/plugin/aft) */
   storageDir: string;
+  /** Returns false when user and project config merge to `enabled: false` for this project. */
+  isProjectEnabled?: (projectRoot: string) => boolean;
 }

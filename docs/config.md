@@ -23,6 +23,11 @@ The schema is identical across harnesses. Only file location differs.
 
 ```jsonc
 {
+  // Master switch. Default: true. Set false in user config to disable AFT
+  // everywhere, or in project config to disable only that project. Project
+  // config can set true to re-enable over a user-level false.
+  "enabled": true,
+
   // Replace the host harness's built-in tools (read/write/edit/apply_patch/grep/etc.)
   // with AFT-enhanced versions. Default: true. Set to false to use aft_ prefix on all
   // tools instead — useful when you want to keep the harness defaults and access AFT

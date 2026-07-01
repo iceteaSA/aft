@@ -13,7 +13,12 @@ import {
   hasDoctorProblems,
   runDoctor,
 } from "../commands/doctor.js";
-import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
+import {
+  type DiagnosticReport,
+  formatDiagnosticIssuesSection,
+  type HarnessDiagnostic,
+  renderDiagnosticsMarkdown,
+} from "../lib/diagnostics.js";
 
 function makeAdapter(overrides: Partial<HarnessAdapter> = {}): HarnessAdapter {
   const configPaths: HarnessConfigPaths = {
@@ -70,7 +75,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
     hostVersion: "test",
     pluginRegistered: true,
     configPaths,
-    aftConfig: { exists: true, flags: {} },
+    aftConfig: { exists: true, enabled: true, flags: {} },
     pluginCache: { path: "/tmp/aft-test/plugin-cache", exists: false },
     storageDir: { path: "/tmp/aft-test/storage", exists: false, accessible: false, sizesByKey: {} },
     onnxRuntime: {
@@ -321,6 +326,28 @@ describe("doctor problem assessment", () => {
       binaryVersion: null,
     };
     expect(hasDoctorProblems(report)).toBe(true);
+  });
+
+  test("disabled registered harness is surfaced without treating the missing binary as broken", () => {
+    const report = {
+      ...makeReport(
+        makeHarness({
+          pluginRegistered: true,
+          aftConfig: {
+            exists: true,
+            enabled: false,
+            enabledSource: "/tmp/aft-test/aft.jsonc",
+            flags: { enabled: false },
+          },
+        }),
+      ),
+      binaryVersion: null,
+    };
+
+    const markdown = renderDiagnosticsMarkdown(report);
+    expect(markdown).toContain("AFT enabled: false (from /tmp/aft-test/aft.jsonc)");
+    expect(formatDiagnosticIssuesSection(report).join("\n")).not.toContain("No aft binary");
+    expect(hasDoctorProblems(report)).toBe(false);
   });
 
   test("plugin older than the CLI is treated as a high-priority problem", () => {

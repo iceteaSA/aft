@@ -439,23 +439,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
  * Called once per session. Registers tools, commands, and session shutdown hooks.
  */
 export default async function (pi: ExtensionAPI): Promise<void> {
-  log(`AFT extension loading (plugin v${PLUGIN_VERSION})`);
-
-  // Resolve AFT binary. On first run this downloads the platform binary to
-  // ~/.cache/aft/bin/vX.Y.Z/aft. Failures bubble up as an error to Pi's loader.
-  let binaryPath: string;
-  try {
-    binaryPath = await findBinary(PLUGIN_VERSION);
-  } catch (err) {
-    warn(
-      `Failed to resolve AFT binary: ${err instanceof Error ? err.message : String(err)}. ` +
-        "Tools will not be registered.",
-    );
-    return;
-  }
-
-  await ensureStorageMigrated({ harness: "pi", binaryPath, logger: bridgeLogger });
-
   const deliverConfigMigrationWarnings = (messages: readonly string[]) => {
     for (const message of messages) {
       const notify = (pi as { ui?: { notify?: (message: string, type?: "warning") => void } }).ui
@@ -477,13 +460,45 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       }
     }
   };
+
+  const projectRoot = process.cwd();
+  // Load the AFT config before any binary or storage work. This ensures
+  // `enabled: false` makes AFT do nothing except read the config file.
+  let config = loadAftConfig(projectRoot);
+  if (config.enabled === false) {
+    log(`AFT disabled by config for ${projectRoot}`);
+    return;
+  }
+
   deliverConfigMigrationWarnings(
-    migrateAftConfigLocations(process.cwd(), bridgeLogger).flatMap((result) => result.warnings),
+    migrateAftConfigLocations(projectRoot, bridgeLogger).flatMap((result) => result.warnings),
   );
 
   // Load config (user + project).
-  const config = loadAftConfig(process.cwd());
-  enqueueConfigParseWarnings(process.cwd(), getConfigLoadErrors());
+  config = loadAftConfig(projectRoot);
+  enqueueConfigParseWarnings(projectRoot, getConfigLoadErrors());
+  if (config.enabled === false) {
+    log(`AFT disabled by config for ${projectRoot}`);
+    return;
+  }
+
+  log(`AFT extension loading (plugin v${PLUGIN_VERSION})`);
+
+  // Resolve the AFT binary. On first run this downloads the platform binary to
+  // ~/.cache/aft/bin/vX.Y.Z/aft; failures are reported through Pi's plugin loader.
+  let binaryPath: string;
+  try {
+    binaryPath = await findBinary(PLUGIN_VERSION);
+  } catch (err) {
+    warn(
+      `Failed to resolve AFT binary: ${err instanceof Error ? err.message : String(err)}. ` +
+        "Tools will not be registered.",
+    );
+    return;
+  }
+
+  await ensureStorageMigrated({ harness: "pi", binaryPath, logger: bridgeLogger });
+
   const storageDir = resolveCortexKitStorageRoot();
 
   // ONNX runtime for semantic search (optional, best-effort).
@@ -510,7 +525,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Core-domain config flows only through raw tiers; Rust owns merge +
   // trust-boundary stripping. Flat params below are plugin-computed process
   // state and must not be derived from aft.jsonc.
-  const configOverrides = buildConfigTierConfigureParams(process.cwd(), {
+  const configOverrides = buildConfigTierConfigureParams(projectRoot, {
     storage_dir: storageDir,
   });
   // _ort_dylib_dir is patched in asynchronously below once ensureOnnxRuntime
@@ -527,7 +542,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     const lspGraceDays = config.lsp?.grace_days ?? 7;
     const lspVersions = config.lsp?.versions ?? {};
     const lspDisabled = new Set(config.lsp?.disabled ?? []);
-    const projectRoot = process.cwd();
     // When `lsp.auto_install: false`, leave the list empty so the Rust-side
     // `detect_missing_lsp_binaries` loop in configure.rs skips its built-in
     // server walk entirely. Without this gate, users who opted out of

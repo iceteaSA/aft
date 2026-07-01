@@ -8,6 +8,11 @@
     "$schema": {
       "type": "string"
     },
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Master switch for AFT. Set false in user config to disable AFT everywhere, or in project config to disable it only for that project. Project config can set this because turning AFT off is trust-safe."
+    },
     "format_on_edit": {
       "type": "boolean",
       "default": false,

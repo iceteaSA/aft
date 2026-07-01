@@ -40,7 +40,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
       aftConfig: "/tmp/aft-test/aft.jsonc",
       aftConfigFormat: "jsonc",
     },
-    aftConfig: { exists: true, flags: {} },
+    aftConfig: { exists: true, enabled: true, flags: {} },
     pluginCache: { path: "/tmp/aft-test/plugin-cache", exists: false },
     storageDir: { path: "/tmp/aft-test/storage", exists: true, accessible: true, sizesByKey: {} },
     onnxRuntime: {

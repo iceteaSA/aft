@@ -117,6 +117,11 @@ const CASES: ParityCase[] = [
     project: { search_index: true, format_on_edit: false },
   },
   {
+    name: "enabled_plugin_init_only",
+    user: { enabled: false },
+    project: { enabled: true },
+  },
+  {
     name: "drop_restrict",
     user: { restrict_to_project_root: true },
     project: { restrict_to_project_root: false },

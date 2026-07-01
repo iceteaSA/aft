@@ -199,7 +199,11 @@ export async function resolvePathArg(
  * subsequent calls in the same session.
  */
 export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): AftProjectTransport {
-  return ctx.pool.getBridge(projectRootFor(runtime));
+  const projectRoot = projectRootFor(runtime);
+  if (ctx.isProjectEnabled?.(projectRoot) === false) {
+    throw new Error(`AFT disabled by config for ${projectRoot}`);
+  }
+  return ctx.pool.getBridge(projectRoot);
 }
 
 /**

@@ -60,7 +60,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
     hostVersion: "test",
     pluginRegistered: true,
     configPaths: configPaths(kind),
-    aftConfig: { exists: true, flags: {} },
+    aftConfig: { exists: true, enabled: true, flags: {} },
     pluginCache: { path: "/tmp/aft-test/plugin-cache", exists: false },
     storageDir: { path: "/tmp/aft-test/storage", exists: false, accessible: false, sizesByKey: {} },
     onnxRuntime: {
@@ -122,6 +122,25 @@ describe("doctor --fix planning", () => {
       "Will add @cortexkit/aft-opencode@latest to /tmp/aft-test/opencode.jsonc",
       "Will download/cache the aft binary matching CLI v0.30.1",
     ]);
+  });
+
+  test("does not plan binary or plugin updates for a disabled registered harness", () => {
+    const report = makeReport(
+      [
+        makeHarness({
+          aftConfig: { exists: true, enabled: false, flags: { enabled: false } },
+          pluginCache: {
+            path: "/tmp/aft-test/plugin-cache",
+            exists: true,
+            cached: "0.29.0",
+            latest: "0.30.1",
+          },
+        }),
+      ],
+      null,
+    );
+
+    expect(nonSchemaMessages(buildDoctorFixPlan([makeAdapter()], report))).toEqual([]);
   });
 
   test("describes Pi registration as a pi install mutation", () => {

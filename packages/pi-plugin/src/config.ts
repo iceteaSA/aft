@@ -180,6 +180,8 @@ export interface AftConfig {
    * validation. `aft setup` auto-inserts this.
    */
   $schema?: string;
+  /** Master switch for AFT. Default true. Project config may set it because turning AFT off is not a privilege escalation. */
+  enabled?: boolean;
   format_on_edit?: boolean;
   /** Maximum formatter subprocess wallclock seconds. Bounded 1..=600. Default 10. */
   formatter_timeout_secs?: number;
@@ -515,6 +517,8 @@ export const AftConfigSchema = z
      * schema for autocomplete + validation. `aft setup` auto-inserts this.
      */
     $schema: z.string().optional(),
+    /** Master switch for AFT. Default true. Project config may set it because turning AFT off is not a privilege escalation. */
+    enabled: z.boolean().optional(),
     /**
      * Whether to auto-format files after edits. Default: false — formatting can
      * reflow the file under the agent and stale the next edit's context. Opt in
@@ -1153,6 +1157,7 @@ function getProjectLspStrippedKeys(lsp?: LspConfig): string[] {
  * it at configure time. It cannot be set from any aft.jsonc file.)
  */
 const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
+  "enabled",
   "tool_surface",
   // (Pi schema does not currently expose `hoist_builtin_tools`; if added, mark safe.)
   "format_on_edit",

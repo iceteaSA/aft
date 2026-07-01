@@ -67,6 +67,45 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("enabled defaults to true when not configured", () => {
+    const fixture = createConfigFixture();
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as { enabled?: boolean };
+    expect(config.enabled ?? true).toBe(true);
+  });
+
+  test("project enabled false overrides user enabled true", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: true }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: false }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect((JSON.parse(result.stdout) as { enabled?: boolean }).enabled).toBe(false);
+    expect(result.stderr).not.toContain("Ignoring enabled from project config");
+  });
+
+  test("project enabled true overrides user enabled false", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: false }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: true }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect((JSON.parse(result.stdout) as { enabled?: boolean }).enabled).toBe(true);
+    expect(result.stderr).not.toContain("Ignoring enabled from project config");
+  });
+
   test("honors user backup config and ignores project backup config", () => {
     const fixture = createConfigFixture();
     writeFileSync(

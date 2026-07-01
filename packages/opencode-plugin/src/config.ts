@@ -261,6 +261,13 @@ export const AftConfigSchema = z
      */
     $schema: z.string().optional(),
     /**
+     * Master switch for AFT in this config scope. Default: true. Set false in
+     * user config to disable AFT everywhere, or in project config to disable it
+     * only for that project. Project config may set this field because turning
+     * AFT off is not a privilege escalation.
+     */
+    enabled: z.boolean().optional(),
+    /**
      * Whether to auto-format files after edits. Default: false — formatting can
      * reflow the file under the agent and stale the next edit's context. Opt in
      * with `true` if you want AFT to format after edits.
@@ -465,8 +472,8 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
  * one OpenCode/Pi process.
  *
  * **DO NOT** put fields that affect plugin-side tool registration here.
- * `tool_surface`, `disabled_tools`, and `hoist_builtin_tools` lock at plugin
- * init because OpenCode registers tools synchronously when the plugin
+ * `enabled`, `tool_surface`, `disabled_tools`, and `hoist_builtin_tools` lock
+ * at plugin init because OpenCode registers tools synchronously when the plugin
  * function returns. Per-bridge changes to those fields wouldn't take effect.
  */
 export function resolveProjectOverridesForConfigure(config: AftConfig): Record<string, unknown> {
@@ -1244,6 +1251,7 @@ function getProjectLspStrippedKeys(lsp: AftConfig["lsp"]): string[] {
  * it at configure time. It cannot be set from any aft.jsonc file.)
  */
 const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
+  "enabled",
   "tool_surface",
   "hoist_builtin_tools",
   "format_on_edit",
