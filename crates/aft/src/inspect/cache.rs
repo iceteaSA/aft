@@ -124,7 +124,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// and carry non-counted re-export context on canonical findings.
 /// v24: TS/JS verdicts distinguish product references from test-only
 /// references so test-only usage moves out of headline dead/unused counts.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 24;
+/// v25: framework file-based route files execute as roots while only their
+/// framework-called exports are seeded live; manifest-driven route detection
+/// changes dead/unused verdict roll-ups without changing per-file facts.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 25;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1827,7 +1830,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 24);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 25);
     }
 
     #[test]

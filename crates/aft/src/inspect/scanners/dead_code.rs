@@ -494,6 +494,12 @@ fn materialize_dead_code_contributions(
         .iter()
         .map(|file| relative_path(project_root, file))
         .collect::<BTreeSet<_>>();
+    let executable_root_exports_by_file =
+        crate::inspect::entry_points::resolve_entry_points(project_root)
+            .executable_root_exports()
+            .into_iter()
+            .map(|(file, exports)| (relative_path(project_root, &file), exports))
+            .collect::<BTreeMap<_, _>>();
     let attribute_roots_from_snapshot = snapshot
         .entry_point_symbols
         .iter()
@@ -578,6 +584,7 @@ fn materialize_dead_code_contributions(
                 &exports,
                 &internal_calls,
                 &attribute_entry_points,
+                executable_root_exports_by_file.get(&contribution.file),
                 liveness_root_files.contains(&contribution.file),
                 public_api_files.contains(&contribution.file),
             );
@@ -654,7 +661,7 @@ fn oxc_verdicts_by_file(
             }
             Some(FileFacts {
                 file_id: FileId(0),
-                path: normalize_path(&project_root.join(&contribution.file)),
+                path: canonical_or_normalized(&project_root.join(&contribution.file)),
                 content_hash: oxc_facts.content_hash.clone(),
                 exports: oxc_facts.exports.clone(),
                 imports: oxc_facts.imports.clone(),
@@ -674,6 +681,7 @@ fn oxc_verdicts_by_file(
         return BTreeMap::new();
     }
 
+    let entry_points = crate::inspect::entry_points::resolve_entry_points(project_root);
     analyze_file_facts(
         project_root,
         facts,
@@ -683,6 +691,7 @@ fn oxc_verdicts_by_file(
                 .iter()
                 .map(|file| project_root.join(file))
                 .collect(),
+            executable_root_exports: entry_points.executable_root_exports(),
             force_reparse_files: Vec::new(),
             entry_reachability: true,
         },
@@ -2039,6 +2048,7 @@ fn liveness_roots_for_file(
     exports: &[ExportContribution],
     internal_calls: &[InternalCall],
     attribute_entry_points: &BTreeSet<String>,
+    executable_root_exports: Option<&BTreeSet<String>>,
     is_liveness_root_file: bool,
     is_public_api_file: bool,
 ) -> Vec<String> {
@@ -2054,6 +2064,8 @@ fn liveness_roots_for_file(
     roots.insert("<top-level>".to_string());
     if is_public_api_file {
         roots.extend(exports.iter().map(|export| export.symbol.clone()));
+    } else if let Some(executable_root_exports) = executable_root_exports {
+        roots.extend(executable_root_exports.iter().cloned());
     } else {
         roots.extend(
             exports
@@ -2159,12 +2171,18 @@ fn relative_path(project_root: &Path, path: &Path) -> String {
     } else {
         project_root.join(path)
     };
-    let normalized = normalize_path(&absolute);
+    let normalized_root =
+        fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root));
+    let normalized = fs::canonicalize(&absolute).unwrap_or_else(|_| normalize_path(&absolute));
     normalized
-        .strip_prefix(&normalize_path(project_root))
+        .strip_prefix(&normalized_root)
         .unwrap_or(normalized.as_path())
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn canonical_or_normalized(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
 fn normalize_absolute(project_root: &Path, path: &Path) -> PathBuf {
@@ -2446,6 +2464,7 @@ mod tests {
     }
 
     fn scan_success_with_oxc(job: InspectJob) -> InspectScanSuccess {
+        let entry_points = crate::inspect::entry_points::resolve_entry_points(&job.project_root);
         let options = AnalyzeOptions {
             entry_points: job
                 .callgraph_snapshot
@@ -2453,6 +2472,7 @@ mod tests {
                 .map(|snapshot| snapshot.entry_points.iter().cloned().collect())
                 .unwrap_or_default(),
             public_api_files: Vec::new(),
+            executable_root_exports: entry_points.executable_root_exports(),
             force_reparse_files: Vec::new(),
             entry_reachability: true,
         };

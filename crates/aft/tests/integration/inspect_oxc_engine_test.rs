@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -497,6 +498,61 @@ fn oxc_engine_public_barrel_reexports_seed_canonical_liveness() {
         LivenessVerdict::Unused,
     );
     assert_verdict(&result, "src/star.ts", "star", LivenessVerdict::Used);
+}
+
+#[test]
+fn oxc_engine_executable_file_roots_seed_only_allowed_exports() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "app/api/route.ts",
+            "import { liveDependency } from './service';
+export function GET() { return liveDependency(); }
+export function privateHelper() { return 0; }
+",
+        ),
+        (
+            "app/api/service.ts",
+            "export function liveDependency() { return 1; }
+export function unusedDependency() { return 0; }
+",
+        ),
+    ]);
+    let route = root.join("app/api/route.ts");
+    let executable_root_exports = BTreeMap::from([(
+        route.clone(),
+        BTreeSet::from(["GET".to_string(), "POST".to_string()]),
+    )]);
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![route],
+            executable_root_exports,
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_verdict(&result, "app/api/route.ts", "GET", LivenessVerdict::Used);
+    assert_verdict(
+        &result,
+        "app/api/route.ts",
+        "privateHelper",
+        LivenessVerdict::Unused,
+    );
+    assert_verdict(
+        &result,
+        "app/api/service.ts",
+        "liveDependency",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "app/api/service.ts",
+        "unusedDependency",
+        LivenessVerdict::Unused,
+    );
 }
 
 #[test]

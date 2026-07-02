@@ -34,6 +34,7 @@ pub(crate) const FACTS_FORMAT_VERSION: u32 = 3;
 pub struct AnalyzeOptions {
     pub entry_points: Vec<PathBuf>,
     pub public_api_files: Vec<PathBuf>,
+    pub executable_root_exports: BTreeMap<PathBuf, BTreeSet<String>>,
     /// Files already proven stale by the inspect freshness layer. These paths
     /// bypass the path metadata fast path so same-size/same-mtime edits are
     /// still re-read and content-hashed before facts are reused.
@@ -289,11 +290,14 @@ fn analyze_preparsed_facts(
     let (resolved_modules, tracker, edges) = resolver.resolve_modules(&facts);
     let entry_points = normalize_option_paths(&options.entry_points);
     let public_api_files = normalize_option_paths(&options.public_api_files);
+    let executable_root_exports =
+        normalize_executable_root_exports(&options.executable_root_exports);
     let file_verdicts = compute_verdicts(
         &project_root,
         &resolved_modules,
         &entry_points,
         &public_api_files,
+        &executable_root_exports,
         options.entry_reachability,
     );
     let resolved_edges = edges
@@ -356,11 +360,34 @@ fn normalize_input_path(project_root: &Path, path: &Path) -> PathBuf {
     })
 }
 
+fn normalize_executable_root_exports(
+    roots: &BTreeMap<PathBuf, BTreeSet<String>>,
+) -> BTreeMap<PathBuf, BTreeSet<String>> {
+    let mut normalized = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+    for (path, exports) in roots {
+        normalized
+            .entry(normalize_path(path))
+            .or_default()
+            .extend(exports.iter().cloned());
+        if let Ok(canonical) = fs::canonicalize(path) {
+            normalized
+                .entry(normalize_path(&canonical))
+                .or_default()
+                .extend(exports.iter().cloned());
+        }
+    }
+    normalized
+}
+
 fn normalize_option_paths(paths: &[PathBuf]) -> BTreeSet<PathBuf> {
-    paths
-        .iter()
-        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path)))
-        .collect()
+    let mut normalized = BTreeSet::new();
+    for path in paths {
+        normalized.insert(normalize_path(path));
+        if let Ok(canonical) = fs::canonicalize(path) {
+            normalized.insert(normalize_path(&canonical));
+        }
+    }
+    normalized
 }
 
 fn is_ts_js_file(path: &Path) -> bool {

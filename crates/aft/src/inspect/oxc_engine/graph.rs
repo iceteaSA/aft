@@ -218,10 +218,18 @@ pub fn compute_verdicts(
     modules: &[ResolvedModule],
     entry_points: &BTreeSet<PathBuf>,
     public_api_files: &BTreeSet<PathBuf>,
+    executable_root_exports: &BTreeMap<PathBuf, BTreeSet<String>>,
     entry_reachability: bool,
 ) -> Vec<OxcFileVerdicts> {
-    let mut graph = GraphBuilder::new(project_root, modules, entry_points, public_api_files);
+    let mut graph = GraphBuilder::new(
+        project_root,
+        modules,
+        entry_points,
+        public_api_files,
+        executable_root_exports,
+    );
     graph.apply_root_re_export_seeding();
+    graph.apply_executable_file_root_seeding();
     graph.record_reference_origins();
     if entry_reachability {
         graph.apply_entry_reachability();
@@ -237,6 +245,8 @@ struct GraphBuilder<'a> {
     modules: &'a [ResolvedModule],
     states: Vec<ModuleState>,
     root_modules: BTreeSet<usize>,
+    export_root_modules: BTreeSet<usize>,
+    executable_root_exports: BTreeMap<usize, BTreeSet<String>>,
     forwarding: ForwardingMap,
     reference_origins_by_module: Vec<ReferenceOrigin>,
 }
@@ -247,8 +257,11 @@ impl<'a> GraphBuilder<'a> {
         modules: &'a [ResolvedModule],
         entry_points: &BTreeSet<PathBuf>,
         public_api_files: &BTreeSet<PathBuf>,
+        executable_root_exports: &BTreeMap<PathBuf, BTreeSet<String>>,
     ) -> Self {
         let mut root_modules = BTreeSet::new();
+        let mut export_root_modules = BTreeSet::new();
+        let mut executable_roots_by_module = BTreeMap::new();
         let states = modules
             .iter()
             .map(|module| {
@@ -269,14 +282,21 @@ impl<'a> GraphBuilder<'a> {
                     path: module.facts.path.clone(),
                     exports,
                 };
-                if entry_points.contains(&module.facts.path)
-                    || public_api_files.contains(&module.facts.path)
-                {
-                    root_modules.insert(module.facts.file_id.0);
+                let module_id = module.facts.file_id.0;
+                let executable_exports = executable_root_exports.get(&module.facts.path);
+                let exports_everything = public_api_files.contains(&module.facts.path)
+                    || (entry_points.contains(&module.facts.path) && executable_exports.is_none());
+                if exports_everything {
+                    root_modules.insert(module_id);
+                    export_root_modules.insert(module_id);
                     let origin = ReferenceOrigin::NonTest;
                     for export in &mut state.exports {
                         mark_used(export, "entry_point", &origin);
                     }
+                }
+                if let Some(exports) = executable_exports {
+                    root_modules.insert(module_id);
+                    executable_roots_by_module.insert(module_id, exports.clone());
                 }
                 state
             })
@@ -290,6 +310,8 @@ impl<'a> GraphBuilder<'a> {
             modules,
             states,
             root_modules,
+            export_root_modules,
+            executable_root_exports: executable_roots_by_module,
             forwarding,
             reference_origins_by_module,
         };
@@ -440,7 +462,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn apply_root_re_export_seeding(&mut self) {
-        let roots = self.root_modules.iter().copied().collect::<Vec<_>>();
+        let roots = self.export_root_modules.iter().copied().collect::<Vec<_>>();
         for root in roots {
             let mut newly_live_modules = BTreeSet::new();
             let mut visited_files = BTreeSet::new();
@@ -454,6 +476,32 @@ impl<'a> GraphBuilder<'a> {
                     &mut newly_live_modules,
                 );
             }
+        }
+    }
+
+    fn apply_executable_file_root_seeding(&mut self) {
+        let roots = self
+            .executable_root_exports
+            .iter()
+            .map(|(file_id, exports)| (*file_id, exports.clone()))
+            .collect::<Vec<_>>();
+        let origin = ReferenceOrigin::NonTest;
+        for (root, exports) in roots {
+            let mut newly_live_modules = BTreeSet::new();
+            for export_name in exports {
+                let mut visited = BTreeSet::new();
+                let resolution = self.resolve_export_name(FileId(root), &export_name, &mut visited);
+                if resolution.is_empty() {
+                    continue;
+                }
+                self.mark_resolution_used_or_uncertain(
+                    resolution,
+                    "entry_point",
+                    &origin,
+                    &mut newly_live_modules,
+                );
+            }
+            self.root_modules.extend(newly_live_modules);
         }
     }
 

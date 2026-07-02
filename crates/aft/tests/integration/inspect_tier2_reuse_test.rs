@@ -208,6 +208,137 @@ fn aggregate_contains_symbol(
         })
 }
 
+#[test]
+fn inspect_dead_code_framework_route_exports_are_live_but_route_helpers_remain_dead() {
+    struct Case {
+        name: &'static str,
+        package_json: &'static str,
+        route_file: &'static str,
+        route_source: &'static str,
+        live_symbol: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "next",
+            package_json: r#"{ "dependencies": { "next": "latest" } }"#,
+            route_file: "app/api/route.ts",
+            route_source: "import { liveDependency } from './service';
+export function GET() { return liveDependency(); }
+export function privateHelper() { return 0; }
+",
+            live_symbol: "GET",
+        },
+        Case {
+            name: "nuxt",
+            package_json: r#"{ "dependencies": { "nuxt": "latest" } }"#,
+            route_file: "server/api/hello.ts",
+            route_source: "import { liveDependency } from './service';
+export default function handler() { return liveDependency(); }
+export function privateHelper() { return 0; }
+",
+            live_symbol: "default",
+        },
+        Case {
+            name: "sveltekit",
+            package_json: r#"{ "devDependencies": { "@sveltejs/kit": "latest" }, "scripts": { "build": "vite build" } }"#,
+            route_file: "src/routes/+server.ts",
+            route_source: "import { liveDependency } from './service';
+export function GET() { return liveDependency(); }
+export function privateHelper() { return 0; }
+",
+            live_symbol: "GET",
+        },
+        Case {
+            name: "remix",
+            package_json: r#"{ "dependencies": { "@remix-run/react": "latest" } }"#,
+            route_file: "app/routes/home.tsx",
+            route_source: "import { liveDependency } from './service';
+export async function loader() { return liveDependency(); }
+export function privateHelper() { return 0; }
+",
+            live_symbol: "loader",
+        },
+        Case {
+            name: "astro",
+            package_json: r#"{ "dependencies": { "astro": "latest" } }"#,
+            route_file: "src/pages/api.ts",
+            route_source: "import { liveDependency } from './service';
+export function GET() { return liveDependency(); }
+export function privateHelper() { return 0; }
+",
+            live_symbol: "GET",
+        },
+    ];
+
+    for case in cases {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir
+            .path()
+            .join(format!("framework-route-{}", case.name));
+        fs::create_dir_all(&root).expect("create project");
+        write_file(&root, "package.json", case.package_json);
+        write_file(&root, case.route_file, case.route_source);
+        let service_file = Path::new(case.route_file)
+            .parent()
+            .expect("route file has parent")
+            .join("service.ts")
+            .to_string_lossy()
+            .replace('\\', "/");
+        write_file(
+            &root,
+            &service_file,
+            "export function liveDependency() { return 1; }\nexport function unusedDependency() { return 0; }\n",
+        );
+
+        let inspect_dir = temp_dir.path().join(format!("inspect-{}", case.name));
+        rebuild_dead_code_callgraph_store(&root, &inspect_dir);
+        let manager = InspectManager::new();
+        let (success, _elapsed) = run_reuse_category(
+            &manager,
+            snapshot(&root, &inspect_dir),
+            InspectCategory::DeadCode,
+        );
+
+        assert!(
+            !aggregate_contains_symbol(&success, case.route_file, case.live_symbol),
+            "{} framework export should be live: {:#?}",
+            case.name,
+            success.aggregate
+        );
+        assert!(
+            !aggregate_contains_symbol(&success, &service_file, "liveDependency"),
+            "{} route dependency should be reachable from the framework export: {:#?}",
+            case.name,
+            success.aggregate
+        );
+        assert!(
+            aggregate_contains_symbol(&success, case.route_file, "privateHelper"),
+            "{} non-framework route helper export should remain dead-checkable: {:#?}",
+            case.name,
+            success.aggregate
+        );
+
+        let (unused_success, _elapsed) = run_reuse_category(
+            &manager,
+            snapshot(&root, &inspect_dir),
+            InspectCategory::UnusedExports,
+        );
+        assert!(
+            !aggregate_contains_symbol(&unused_success, case.route_file, case.live_symbol),
+            "{} framework export should be live for unused_exports: {:#?}",
+            case.name,
+            unused_success.aggregate
+        );
+        assert!(
+            aggregate_contains_symbol(&unused_success, case.route_file, "privateHelper"),
+            "{} non-framework route helper export should remain unused-checkable: {:#?}",
+            case.name,
+            unused_success.aggregate
+        );
+    }
+}
+
 fn cycle_items(success: &InspectScanSuccess) -> Vec<Value> {
     success.aggregate["items"]
         .as_array()
@@ -1490,6 +1621,54 @@ testOnly();
         },
         &["package.json"],
     );
+
+    assert_dead_code_incremental_matches_cold(
+        "framework_route_file_changed",
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"dependencies":{"next":"latest"}}"#,
+            );
+            write_file(
+                root,
+                "app/api/route.ts",
+                "export function GET() { return 1; }\nexport function privateHelper() { return 0; }\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "app/api/route.ts",
+                "export function GET() { return 2; }\nexport function privateHelper() { return 0; }\nexport function newDeadHelper() { return 0; }\n",
+            );
+        },
+        &["app/api/route.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "framework_route_manifest_changed",
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"devDependencies":{"next":"latest"},"scripts":{"docs":"vitepress dev"}}"#,
+            );
+            write_file(
+                root,
+                "app/api/route.ts",
+                "export function GET() { return 1; }\nexport function privateHelper() { return 0; }\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"devDependencies":{"next":"latest"},"scripts":{"build":"next build"}}"#,
+            );
+        },
+        &["package.json"],
+    );
 }
 
 #[test]
@@ -1519,6 +1698,56 @@ fn inspect_dead_code_twice_cold_is_deterministic() {
     );
 
     let inspect_b = temp_dir.path().join("dead-cold-b/inspect");
+    rebuild_dead_code_callgraph_store(&root, &inspect_b);
+    let manager_b = InspectManager::new();
+    let (cold_b, _elapsed_b) = run_reuse_category(
+        &manager_b,
+        snapshot(&root, &inspect_b),
+        InspectCategory::DeadCode,
+    );
+
+    assert_eq!(cold_a.aggregate, cold_b.aggregate);
+    assert_eq!(
+        contribution_payloads(&root, &cold_a),
+        contribution_payloads(&root, &cold_b)
+    );
+    assert_eq!(
+        aggregate_item_symbols(&cold_a),
+        aggregate_item_symbols(&cold_b)
+    );
+}
+
+#[test]
+fn inspect_dead_code_framework_routes_twice_cold_is_deterministic() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("dead-code-route-twice-cold");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "package.json",
+        r#"{"dependencies":{"next":"latest"}}"#,
+    );
+    write_file(
+        &root,
+        "app/api/route.ts",
+        "import { live } from './service';\nexport function GET() { live(); }\nexport function privateHelper() {}\n",
+    );
+    write_file(
+        &root,
+        "app/api/service.ts",
+        "export function live() {}\nexport function unused() {}\n",
+    );
+
+    let inspect_a = temp_dir.path().join("route-cold-a/inspect");
+    rebuild_dead_code_callgraph_store(&root, &inspect_a);
+    let manager_a = InspectManager::new();
+    let (cold_a, _elapsed_a) = run_reuse_category(
+        &manager_a,
+        snapshot(&root, &inspect_a),
+        InspectCategory::DeadCode,
+    );
+
+    let inspect_b = temp_dir.path().join("route-cold-b/inspect");
     rebuild_dead_code_callgraph_store(&root, &inspect_b);
     let manager_b = InspectManager::new();
     let (cold_b, _elapsed_b) = run_reuse_category(

@@ -1,9 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use globset::{Glob, GlobSetBuilder};
 use serde_json::Value;
 
+use super::frameworks::{detected_route_frameworks, Framework};
 use super::job::normalize_path;
 
 const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
@@ -12,6 +14,7 @@ const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", 
 pub(crate) struct EntryPointSet {
     liveness_root_files: BTreeSet<PathBuf>,
     public_api_files: BTreeSet<PathBuf>,
+    executable_root_exports: BTreeMap<PathBuf, BTreeSet<String>>,
     warnings: Vec<String>,
 }
 
@@ -39,6 +42,10 @@ impl EntryPointSet {
         self.public_api_files.iter().cloned().collect()
     }
 
+    pub(crate) fn executable_root_exports(&self) -> BTreeMap<PathBuf, BTreeSet<String>> {
+        self.executable_root_exports.clone()
+    }
+
     pub(crate) fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -51,6 +58,15 @@ impl EntryPointSet {
         let path = snapshot_path(path);
         self.liveness_root_files.insert(path.clone());
         self.public_api_files.insert(path);
+    }
+
+    fn insert_executable_root_exports(&mut self, path: &Path, exports: BTreeSet<String>) {
+        let path = snapshot_path(path);
+        self.liveness_root_files.insert(path.clone());
+        self.executable_root_exports
+            .entry(path)
+            .or_default()
+            .extend(exports);
     }
 
     fn warn(&mut self, message: String) {
@@ -352,6 +368,99 @@ fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut Ent
             collect_script_entry_points(package_dir, command, entry_points);
         }
     }
+
+    collect_framework_route_entry_points(package_dir, &value, entry_points);
+}
+
+fn collect_framework_route_entry_points(
+    package_dir: &Path,
+    manifest: &Value,
+    entry_points: &mut EntryPointSet,
+) {
+    for framework in detected_route_frameworks(manifest) {
+        collect_framework_route_files(package_dir, framework, entry_points);
+    }
+}
+
+fn collect_framework_route_files(
+    package_dir: &Path,
+    framework: Framework,
+    entry_points: &mut EntryPointSet,
+) {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in framework.route_globs() {
+        match Glob::new(pattern) {
+            Ok(glob) => {
+                builder.add(glob);
+            }
+            Err(error) => {
+                entry_points.warn(format!(
+                    "failed to compile framework route glob {pattern:?}: {error}"
+                ));
+                return;
+            }
+        }
+    }
+    let globset = match builder.build() {
+        Ok(globset) => globset,
+        Err(error) => {
+            entry_points.warn(format!("failed to compile framework route globs: {error}"));
+            return;
+        }
+    };
+
+    let package_dir = snapshot_path(package_dir);
+    for path in framework_route_walk_files(&package_dir) {
+        let relative = path
+            .strip_prefix(&package_dir)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if globset.is_match(&relative) {
+            entry_points
+                .insert_executable_root_exports(&path, framework.framework_called_exports());
+        }
+    }
+}
+
+fn framework_route_walk_files(package_dir: &Path) -> Vec<PathBuf> {
+    let package_dir = snapshot_path(package_dir);
+    let mut builder = ignore::WalkBuilder::new(&package_dir);
+    let package_root = package_dir.clone();
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .add_custom_ignore_filename(".aftignore")
+        .filter_entry(move |entry| {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+            {
+                return true;
+            }
+            if should_skip_manifest_dir(entry.path()) {
+                return false;
+            }
+            let path = snapshot_path(entry.path());
+            path == package_root || !path.join("package.json").is_file()
+        });
+
+    let mut files = builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+        })
+        .map(|entry| snapshot_path(&entry.into_path()))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// Extract local source files referenced by an npm `scripts` command (e.g.
@@ -809,6 +918,119 @@ mod tests {
         assert!(!entry_points.is_liveness_root_file(&root.join("src/does-not-exist.ts")));
         // Script roots are liveness roots, not public-API surfaces.
         assert!(!entry_points.is_public_api_file(&root.join("src/runner.ts")));
+    }
+
+    #[test]
+    fn framework_route_files_are_executable_roots_not_public_api() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let files = [
+            "app/api/route.ts",
+            "server/api/hello.ts",
+            "src/routes/+server.ts",
+            "app/routes/home.tsx",
+            "src/pages/api.ts",
+        ];
+        for file in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().expect("route parent")).unwrap();
+            std::fs::write(path, "export const GET = () => null;\n").unwrap();
+        }
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+                "dependencies": {
+                    "next": "latest",
+                    "nuxt": "latest",
+                    "@remix-run/react": "latest",
+                    "astro": "latest"
+                },
+                "devDependencies": { "@sveltejs/kit": "latest" },
+                "scripts": { "dev": "vite dev" }
+            }"#,
+        )
+        .unwrap();
+
+        let entry_points = resolve_entry_points(root);
+        let executable_roots = entry_points.executable_root_exports();
+        for file in files {
+            let path = root.join(file);
+            assert!(
+                entry_points.is_liveness_root_file(&path),
+                "{file} should execute as a framework route root"
+            );
+            assert!(
+                !entry_points.is_public_api_file(&path),
+                "{file} should not become a public API file"
+            );
+            assert!(
+                executable_roots
+                    .get(&snapshot_path(&path))
+                    .is_some_and(|exports| exports.contains("GET") || exports.contains("default")),
+                "{file} should carry a framework export allowlist: {executable_roots:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn framework_route_dev_dependency_requires_matching_script() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let route = root.join("app/api/route.ts");
+        std::fs::create_dir_all(route.parent().expect("route parent")).unwrap();
+        std::fs::write(&route, "export const GET = () => null;\n").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "devDependencies": { "next": "latest" }, "scripts": { "docs": "vitepress dev" } }"#,
+        )
+        .unwrap();
+
+        let without_script = resolve_entry_points(root);
+        assert!(
+            !without_script.is_liveness_root_file(&route),
+            "devDependency-only Next without a next script must not create route roots"
+        );
+
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "devDependencies": { "next": "latest" }, "scripts": { "build": "next build" } }"#,
+        )
+        .unwrap();
+        let with_script = resolve_entry_points(root);
+        assert!(
+            with_script.is_liveness_root_file(&route),
+            "devDependency-only Next with a next script should create route roots"
+        );
+    }
+
+    #[test]
+    fn framework_route_walk_stops_at_nested_package_json() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let root_route = root.join("app/api/route.ts");
+        let nested_route = root.join("packages/docs/app/api/route.ts");
+        for route in [&root_route, &nested_route] {
+            std::fs::create_dir_all(route.parent().expect("route parent")).unwrap();
+            std::fs::write(route, "export const GET = () => null;\n").unwrap();
+        }
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "dependencies": { "next": "latest" } }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("packages/docs")).unwrap();
+        std::fs::write(
+            root.join("packages/docs/package.json"),
+            r#"{ "private": true }"#,
+        )
+        .unwrap();
+
+        let entry_points = resolve_entry_points(root);
+        assert!(entry_points.is_liveness_root_file(&root_route));
+        assert!(
+            !entry_points.is_liveness_root_file(&nested_route),
+            "a parent framework package must not claim route files owned by a nested package"
+        );
     }
 
     #[test]

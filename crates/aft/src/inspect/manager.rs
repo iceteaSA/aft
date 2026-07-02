@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -435,6 +436,7 @@ impl InspectManager {
         let options = AnalyzeOptions {
             entry_points,
             public_api_files: public_api_entries.public_api_files(),
+            executable_root_exports: public_api_entries.executable_root_exports(),
             force_reparse_files: force_reparse_files.to_vec(),
             entry_reachability: job.category == InspectCategory::DeadCode,
         };
@@ -1983,7 +1985,7 @@ fn roll_up_unused_exports_contributions(
         return roll_up_unused_exports_oxc_contributions(job, &parsed, drill_down_limit);
     }
 
-    let (public_api_entries, package_warnings) = unused_public_api_entries(&job.project_root);
+    let (public_api_files, package_warnings) = unused_public_api_entries(&job.project_root);
     let mut imported_by: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut uncertain_by: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for scan in &parsed {
@@ -2014,7 +2016,7 @@ fn roll_up_unused_exports_contributions(
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
     for scan in &parsed {
-        if public_api_entries.contains(&scan.file) {
+        if public_api_files.contains(&scan.file) {
             continue;
         }
         // Mirror the fresh-scan path: fixtures/corpora/mock data are consumed
@@ -2130,15 +2132,15 @@ fn roll_up_unused_exports_oxc_contributions(
     parsed: &[UnusedExportsContribution],
     drill_down_limit: Option<usize>,
 ) -> Value {
-    let (public_api_entries, package_warnings) = unused_public_api_entries(&job.project_root);
+    let (public_api_files, package_warnings) = unused_public_api_entries(&job.project_root);
     let facts = parsed
         .iter()
         .filter_map(|scan| {
             let oxc_facts = scan.oxc_facts.as_ref()?;
-            let path = normalize_path(&job.project_root.join(&scan.file));
+            let path = job.project_root.join(&scan.file);
             Some(FileFacts {
                 file_id: FileId(0),
-                path,
+                path: fs::canonicalize(&path).unwrap_or_else(|_| normalize_path(&path)),
                 content_hash: oxc_facts.content_hash.clone(),
                 exports: oxc_facts.exports.clone(),
                 imports: oxc_facts.imports.clone(),
@@ -2154,13 +2156,14 @@ fn roll_up_unused_exports_oxc_contributions(
             })
         })
         .collect::<Vec<_>>();
+    let entry_point_set = super::entry_points::resolve_entry_points(&job.project_root);
     let oxc_result = analyze_file_facts(
         &job.project_root,
         facts,
         AnalyzeOptions {
             entry_points: Vec::new(),
-            public_api_files: super::entry_points::resolve_entry_points(&job.project_root)
-                .public_api_files(),
+            public_api_files: entry_point_set.public_api_files(),
+            executable_root_exports: entry_point_set.executable_root_exports(),
             force_reparse_files: Vec::new(),
             entry_reachability: false,
         },
@@ -2175,7 +2178,7 @@ fn roll_up_unused_exports_oxc_contributions(
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
     for file in &oxc_result.files {
-        if public_api_entries.contains(&file.relative_file)
+        if public_api_files.contains(&file.relative_file)
             || super::job::is_test_support_file(&file.relative_file)
         {
             continue;
