@@ -208,6 +208,71 @@ fn aggregate_contains_symbol(
         })
 }
 
+fn aggregate_item<'a>(
+    success: &'a InspectScanSuccess,
+    file: &str,
+    symbol: &str,
+) -> Option<&'a Value> {
+    success.aggregate["items"].as_array()?.iter().find(|item| {
+        item["file"]
+            .as_str()
+            .is_some_and(|item_file| item_file.replace('\\', "/").ends_with(file))
+            && item["symbol"] == symbol
+    })
+}
+
+fn assert_reexport_context(item: &Value, file: &str, exported_name: &str) {
+    let contexts = item["also_reexported"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing also_reexported context on item: {item:#?}"));
+    assert!(
+        contexts.iter().any(|context| {
+            context["file"]
+                .as_str()
+                .is_some_and(|context_file| context_file.replace('\\', "/").ends_with(file))
+                && context["exported_name"] == exported_name
+        }),
+        "missing re-export context {file}:{exported_name} in {contexts:#?}"
+    );
+}
+
+#[test]
+fn inspect_unused_exports_oxc_reexport_alias_reports_canonical_once_with_context() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("unused-reexport-context");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "src/target.ts",
+        "export const forwarded = 1;\nexport const localOnly = 2;\n",
+    );
+    write_file(
+        &root,
+        "src/barrel.ts",
+        "export { forwarded } from './target';\n",
+    );
+
+    let manager = InspectManager::new();
+    let (success, _elapsed) = run_reuse_category(
+        &manager,
+        snapshot(&root, &temp_dir.path().join("unused-inspect")),
+        InspectCategory::UnusedExports,
+    );
+
+    assert!(
+        aggregate_item(&success, "src/barrel.ts", "forwarded").is_none(),
+        "barrel forwarding binding should not be counted: {:#?}",
+        success.aggregate["items"]
+    );
+    let item = aggregate_item(&success, "src/target.ts", "forwarded").unwrap_or_else(|| {
+        panic!(
+            "canonical target export should be reported: {:#?}",
+            success.aggregate
+        )
+    });
+    assert_reexport_context(item, "src/barrel.ts", "forwarded");
+}
+
 #[test]
 fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
     let (temp_dir, root, mutated_file) = build_fixture();
@@ -979,6 +1044,58 @@ fn inspect_dead_code_incremental_facts_invariants_match_cold() {
     );
 
     assert_dead_code_incremental_matches_cold(
+        "ts_barrel_forward_changed",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/main.ts"}"#);
+            write_file(
+                root,
+                "src/target.ts",
+                "export const live = 1;\nexport const spare = 2;\n",
+            );
+            write_file(root, "src/barrel.ts", "export { live } from './target';\n");
+            write_file(
+                root,
+                "src/main.ts",
+                "import { live } from './barrel';\nexport function main() { return live; }\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/barrel.ts",
+                "export { live, spare as renamedSpare } from './target';\n",
+            );
+        },
+        &["src/barrel.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "ts_barrel_importer_changed",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/main.ts"}"#);
+            write_file(
+                root,
+                "src/target.ts",
+                "export const live = 1;\nexport const spare = 2;\n",
+            );
+            write_file(root, "src/barrel.ts", "export { live } from './target';\n");
+            write_file(
+                root,
+                "src/main.ts",
+                "import { live } from './barrel';\nexport function main() { return live; }\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/main.ts",
+                "import { live } from './target';\nexport function main() { return live; }\n",
+            );
+        },
+        &["src/main.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
         "rust_last_importer_removed",
         |root| {
             write_file(
@@ -1324,6 +1441,54 @@ console.log(named, def, star, ns);
 export const added = 2;
 export default function def() { return named + added; }
 ",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "barrel_forward_changed",
+        |root| {
+            write_file(
+                root,
+                "src/target.ts",
+                "export const live = 1;\nexport const spare = 2;\n",
+            );
+            write_file(root, "src/barrel.ts", "export { live } from './target';\n");
+            write_file(
+                root,
+                "src/use.ts",
+                "import { live } from './barrel';\nconsole.log(live);\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/barrel.ts",
+                "export { live, spare as renamedSpare } from './target';\n",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "barrel_importer_changed",
+        |root| {
+            write_file(
+                root,
+                "src/target.ts",
+                "export const live = 1;\nexport const spare = 2;\n",
+            );
+            write_file(root, "src/barrel.ts", "export { live } from './target';\n");
+            write_file(
+                root,
+                "src/use.ts",
+                "import { live } from './barrel';\nconsole.log(live);\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/use.ts",
+                "import { live } from './target';\nconsole.log(live);\n",
             );
         },
     );

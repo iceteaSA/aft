@@ -143,6 +143,13 @@ pub enum LivenessVerdict {
     Uncertain,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OxcReExportContext {
+    pub file: String,
+    pub line: u32,
+    pub exported_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OxcExportVerdict {
     pub symbol: String,
@@ -151,6 +158,8 @@ pub struct OxcExportVerdict {
     pub verdict: LivenessVerdict,
     pub reason: String,
     pub provenance: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_reexported: Vec<OxcReExportContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -16,8 +16,8 @@ use crate::inspect::job::{
 };
 use crate::inspect::oxc_engine::{
     analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
-    ImportFact, LivenessVerdict, OxcEngineResult, OxcFileVerdicts, ReExportFact, ReExportKind,
-    FACTS_FORMAT_VERSION, OXC_PROVENANCE,
+    ImportFact, LivenessVerdict, OxcEngineResult, OxcFileVerdicts, OxcReExportContext,
+    ReExportFact, ReExportKind, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
@@ -250,6 +250,7 @@ fn fallback_export_contributions_by_file(
                 verdict: None,
                 reason: None,
                 provenance: None,
+                also_reexported: Vec::new(),
             });
     }
     by_file
@@ -370,6 +371,7 @@ fn oxc_fact_export_contributions(facts: &FileFacts) -> Vec<ExportContribution> {
             verdict: None,
             reason: None,
             provenance: None,
+            also_reexported: Vec::new(),
         })
         .collect()
 }
@@ -386,6 +388,7 @@ fn oxc_export_contributions(file: &OxcFileVerdicts) -> Vec<ExportContribution> {
             verdict: Some(export.verdict),
             reason: Some(export.reason.clone()),
             provenance: Some(export.provenance.clone()),
+            also_reexported: export.also_reexported.clone(),
         })
         .collect()
 }
@@ -693,14 +696,16 @@ fn aggregate_materialized_dead_code_contributions(
                     LivenessVerdict::Uncertain => {
                         uncertain_count += 1;
                         if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
-                            uncertain_items.push(json!({
+                            let mut item = json!({
                                 "file": contribution.file,
                                 "symbol": export.symbol,
                                 "kind": export.kind,
                                 "line": export.line,
                                 "reason": export.reason.as_deref().unwrap_or("oxc_uncertain"),
                                 "provenance": export.provenance.as_deref().unwrap_or(OXC_PROVENANCE),
-                            }));
+                            });
+                            add_reexport_contexts(&mut item, &export.also_reexported);
+                            uncertain_items.push(item);
                         }
                         continue;
                     }
@@ -738,6 +743,7 @@ fn aggregate_materialized_dead_code_contributions(
             if let Some(provenance) = &export.provenance {
                 item["provenance"] = json!(provenance);
             }
+            add_reexport_contexts(&mut item, &export.also_reexported);
             dead_items.push(item);
         }
     }
@@ -766,6 +772,12 @@ fn aggregate_materialized_dead_code_contributions(
         aggregate["skipped_files"] = Value::Array(skipped_files);
     }
     aggregate
+}
+
+fn add_reexport_contexts(item: &mut Value, contexts: &[OxcReExportContext]) {
+    if !contexts.is_empty() {
+        item["also_reexported"] = json!(contexts);
+    }
 }
 
 fn export_uses_oxc(export: &ExportContribution) -> bool {
@@ -2164,6 +2176,8 @@ struct ExportContribution {
     reason: Option<String>,
     #[serde(default)]
     provenance: Option<String>,
+    #[serde(default)]
+    also_reexported: Vec<OxcReExportContext>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

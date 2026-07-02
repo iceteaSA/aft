@@ -1,16 +1,18 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::resolver::ResolvedModule;
+use super::resolver::{ResolvedImport, ResolvedModule};
 use super::types::{
-    ExportFact, ExportName, FileId, ImportKind, LivenessVerdict, OxcExportVerdict, OxcFileVerdicts,
-    ReExportKind, OXC_PROVENANCE,
+    ExportFact, FileId, ImportKind, LivenessVerdict, OxcExportVerdict, OxcFileVerdicts,
+    OxcReExportContext, ReExportKind, OXC_PROVENANCE,
 };
 
 #[derive(Debug, Clone)]
 struct ExportState {
     fact: ExportFact,
     status: ExportStatus,
+    also_reexported: Vec<ReExportContextRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,142 @@ struct ModuleState {
     exports: Vec<ExportState>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SymbolKey {
+    file_id: FileId,
+    name: String,
+}
+
+impl SymbolKey {
+    fn new(file_id: FileId, name: impl Into<String>) -> Self {
+        Self {
+            file_id,
+            name: name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ReExportContextRef {
+    file_id: FileId,
+    line: u32,
+    exported_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct NamedForward {
+    source: FileId,
+    imported_name: String,
+    context: ReExportContextRef,
+}
+
+#[derive(Debug, Clone)]
+struct StarForward {
+    source: FileId,
+    line: u32,
+}
+
+#[derive(Debug, Clone)]
+struct NamespaceForward {
+    source: FileId,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ForwardingMap {
+    named: BTreeMap<SymbolKey, Vec<NamedForward>>,
+    star: BTreeMap<usize, Vec<StarForward>>,
+    namespace: BTreeMap<SymbolKey, Vec<NamespaceForward>>,
+}
+
+impl ForwardingMap {
+    fn new(modules: &[ResolvedModule]) -> Self {
+        let mut map = Self::default();
+        for module in modules {
+            let from = module.facts.file_id;
+            for re_export in &module.re_exports {
+                let Some(source) = re_export.target else {
+                    continue;
+                };
+                match re_export.fact.kind {
+                    ReExportKind::Named => {
+                        let Some(exported_name) = re_export.fact.exported_name.clone() else {
+                            continue;
+                        };
+                        let Some(imported_name) = re_export.fact.imported_name.clone() else {
+                            continue;
+                        };
+                        map.named
+                            .entry(SymbolKey::new(from, exported_name.clone()))
+                            .or_default()
+                            .push(NamedForward {
+                                source,
+                                imported_name,
+                                context: ReExportContextRef {
+                                    file_id: from,
+                                    line: re_export.fact.line,
+                                    exported_name,
+                                },
+                            });
+                    }
+                    ReExportKind::Star => {
+                        map.star.entry(from.0).or_default().push(StarForward {
+                            source,
+                            line: re_export.fact.line,
+                        });
+                    }
+                    ReExportKind::Namespace => {
+                        let Some(exported_name) = re_export.fact.exported_name.clone() else {
+                            continue;
+                        };
+                        map.namespace
+                            .entry(SymbolKey::new(from, exported_name.clone()))
+                            .or_default()
+                            .push(NamespaceForward { source });
+                    }
+                }
+            }
+        }
+        map
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResolutionSet {
+    canonical: BTreeSet<SymbolKey>,
+    namespace_targets: BTreeSet<FileId>,
+}
+
+impl ResolutionSet {
+    fn canonical(symbol: SymbolKey) -> Self {
+        let mut set = Self::default();
+        set.canonical.insert(symbol);
+        set
+    }
+
+    fn namespace(target: FileId) -> Self {
+        let mut set = Self::default();
+        set.namespace_targets.insert(target);
+        set
+    }
+
+    fn merge(&mut self, other: ResolutionSet) {
+        self.canonical.extend(other.canonical);
+        self.namespace_targets.extend(other.namespace_targets);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.canonical.is_empty() && self.namespace_targets.is_empty()
+    }
+
+    fn single_canonical(&self) -> Option<&SymbolKey> {
+        if self.namespace_targets.is_empty() && self.canonical.len() == 1 {
+            self.canonical.iter().next()
+        } else {
+            None
+        }
+    }
+}
+
 pub fn compute_verdicts(
     project_root: &Path,
     modules: &[ResolvedModule],
@@ -44,12 +182,12 @@ pub fn compute_verdicts(
     entry_reachability: bool,
 ) -> Vec<OxcFileVerdicts> {
     let mut graph = GraphBuilder::new(modules, entry_points, public_api_files);
+    graph.apply_root_re_export_seeding();
     if entry_reachability {
         graph.apply_entry_reachability();
     } else {
         graph.apply_same_file_references();
         graph.apply_imports();
-        graph.apply_re_exports();
         graph.apply_dynamic_imports();
     }
     graph.into_verdicts(project_root)
@@ -59,6 +197,7 @@ struct GraphBuilder<'a> {
     modules: &'a [ResolvedModule],
     states: Vec<ModuleState>,
     root_modules: BTreeSet<usize>,
+    forwarding: ForwardingMap,
 }
 
 impl<'a> GraphBuilder<'a> {
@@ -71,7 +210,7 @@ impl<'a> GraphBuilder<'a> {
         let states = modules
             .iter()
             .map(|module| {
-                let mut exports = module
+                let exports = module
                     .facts
                     .exports
                     .iter()
@@ -79,36 +218,9 @@ impl<'a> GraphBuilder<'a> {
                     .map(|fact| ExportState {
                         fact,
                         status: ExportStatus::Unused,
+                        also_reexported: Vec::new(),
                     })
                     .collect::<Vec<_>>();
-
-                for re_export in &module.re_exports {
-                    match re_export.fact.kind {
-                        ReExportKind::Named => {
-                            if let Some(exported_name) = &re_export.fact.exported_name {
-                                push_synthetic_export(
-                                    &mut exports,
-                                    ExportName::Named(exported_name.clone()),
-                                    "re_export",
-                                    re_export.fact.is_type_only,
-                                    re_export.fact.line,
-                                );
-                            }
-                        }
-                        ReExportKind::Namespace => {
-                            if let Some(exported_name) = &re_export.fact.exported_name {
-                                push_synthetic_export(
-                                    &mut exports,
-                                    ExportName::Named(exported_name.clone()),
-                                    "namespace",
-                                    re_export.fact.is_type_only,
-                                    re_export.fact.line,
-                                );
-                            }
-                        }
-                        ReExportKind::Star => {}
-                    }
-                }
 
                 let mut state = ModuleState {
                     path: module.facts.path.clone(),
@@ -125,10 +237,58 @@ impl<'a> GraphBuilder<'a> {
                 state
             })
             .collect::<Vec<_>>();
-        Self {
+        let forwarding = ForwardingMap::new(modules);
+        let mut graph = Self {
             modules,
             states,
             root_modules,
+            forwarding,
+        };
+        graph.attach_reexport_contexts();
+        graph
+    }
+
+    fn attach_reexport_contexts(&mut self) {
+        let mut by_canonical: BTreeMap<SymbolKey, BTreeSet<ReExportContextRef>> = BTreeMap::new();
+
+        for forwards in self.forwarding.named.values() {
+            for forward in forwards {
+                let mut visited = BTreeSet::new();
+                let resolution =
+                    self.resolve_export_name(forward.source, &forward.imported_name, &mut visited);
+                for canonical in resolution.canonical {
+                    by_canonical
+                        .entry(canonical)
+                        .or_default()
+                        .insert(forward.context.clone());
+                }
+            }
+        }
+
+        for (from_file, stars) in &self.forwarding.star {
+            for star in stars {
+                let mut visited_files = BTreeSet::new();
+                let visible =
+                    self.visible_export_resolutions(star.source, false, &mut visited_files);
+                for (exported_name, resolution) in visible {
+                    for canonical in resolution.canonical {
+                        by_canonical
+                            .entry(canonical)
+                            .or_default()
+                            .insert(ReExportContextRef {
+                                file_id: FileId(*from_file),
+                                line: star.line,
+                                exported_name: exported_name.clone(),
+                            });
+                    }
+                }
+            }
+        }
+
+        for (canonical, contexts) in by_canonical {
+            if let Some(export) = self.export_state_mut(&canonical) {
+                export.also_reexported = contexts.into_iter().collect();
+            }
         }
     }
 
@@ -165,6 +325,22 @@ impl<'a> GraphBuilder<'a> {
                 && mark_used(export, "same_file_value_reference")
             {
                 newly_live_modules.insert(idx);
+            }
+        }
+    }
+
+    fn apply_root_re_export_seeding(&mut self) {
+        let roots = self.root_modules.iter().copied().collect::<Vec<_>>();
+        for root in roots {
+            let mut newly_live_modules = BTreeSet::new();
+            let mut visited_files = BTreeSet::new();
+            let visible = self.visible_export_resolutions(FileId(root), true, &mut visited_files);
+            for resolution in visible.values() {
+                self.mark_resolution_used_or_uncertain(
+                    resolution.clone(),
+                    "entry_point",
+                    &mut newly_live_modules,
+                );
             }
         }
     }
@@ -230,91 +406,6 @@ impl<'a> GraphBuilder<'a> {
                 enqueue_newly_live_modules(newly_live_modules, &mut live_modules, &mut queue);
             }
 
-            for re_export in &module.re_exports {
-                let Some(target) = re_export.target else {
-                    continue;
-                };
-                match re_export.fact.kind {
-                    ReExportKind::Named => {
-                        let exported_name = re_export.fact.exported_name.as_deref();
-                        let exported_is_live = exported_name.is_some_and(|name| {
-                            self.export_status(module.facts.file_id, name)
-                                .is_some_and(|status| {
-                                    matches!(
-                                        status,
-                                        ExportStatus::Used(_) | ExportStatus::Uncertain(_)
-                                    )
-                                })
-                        });
-                        if exported_is_live {
-                            if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
-                                let mut visited = BTreeSet::new();
-                                let mut newly_live_modules = BTreeSet::new();
-                                self.mark_imported_name_collect(
-                                    target,
-                                    imported_name,
-                                    "re_export",
-                                    &mut visited,
-                                    &mut newly_live_modules,
-                                );
-                                enqueue_module(target, &mut live_modules, &mut queue);
-                                enqueue_newly_live_modules(
-                                    newly_live_modules,
-                                    &mut live_modules,
-                                    &mut queue,
-                                );
-                            }
-                        }
-                    }
-                    ReExportKind::Star => {
-                        if self.root_modules.contains(&module_idx) {
-                            let mut visited = BTreeSet::new();
-                            let mut newly_live_modules = BTreeSet::new();
-                            self.mark_all_uncertain_collect(
-                                target,
-                                "wildcard_import",
-                                &mut visited,
-                                &mut newly_live_modules,
-                            );
-                            enqueue_module(target, &mut live_modules, &mut queue);
-                            enqueue_newly_live_modules(
-                                newly_live_modules,
-                                &mut live_modules,
-                                &mut queue,
-                            );
-                        }
-                    }
-                    ReExportKind::Namespace => {
-                        let exported_name = re_export.fact.exported_name.as_deref();
-                        let namespace_is_live = exported_name.is_some_and(|name| {
-                            self.export_status(module.facts.file_id, name)
-                                .is_some_and(|status| {
-                                    matches!(
-                                        status,
-                                        ExportStatus::Used(_) | ExportStatus::Uncertain(_)
-                                    )
-                                })
-                        });
-                        if namespace_is_live {
-                            let mut visited = BTreeSet::new();
-                            let mut newly_live_modules = BTreeSet::new();
-                            self.mark_all_uncertain_collect(
-                                target,
-                                "namespace_import",
-                                &mut visited,
-                                &mut newly_live_modules,
-                            );
-                            enqueue_module(target, &mut live_modules, &mut queue);
-                            enqueue_newly_live_modules(
-                                newly_live_modules,
-                                &mut live_modules,
-                                &mut queue,
-                            );
-                        }
-                    }
-                }
-            }
-
             for dynamic in &module.dynamic_imports {
                 if dynamic.fact.is_literal {
                     if let Some(target) = dynamic.target {
@@ -368,44 +459,6 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
-    fn apply_re_exports(&mut self) {
-        for module in self.modules {
-            for re_export in &module.re_exports {
-                let Some(target) = re_export.target else {
-                    continue;
-                };
-                match re_export.fact.kind {
-                    ReExportKind::Named => {
-                        if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
-                            let mut visited = BTreeSet::new();
-                            self.mark_imported_name(
-                                target,
-                                imported_name,
-                                "re_export",
-                                &mut visited,
-                            );
-                        }
-                    }
-                    ReExportKind::Star => {
-                        let mut visited = BTreeSet::new();
-                        self.mark_all_uncertain(target, "wildcard_import", &mut visited);
-                    }
-                    ReExportKind::Namespace => {
-                        let exported_name = re_export.fact.exported_name.as_deref();
-                        let namespace_is_used = exported_name.is_some_and(|name| {
-                            self.export_status(module.facts.file_id, name)
-                                .is_some_and(|status| matches!(status, ExportStatus::Used(_)))
-                        });
-                        if namespace_is_used {
-                            let mut visited = BTreeSet::new();
-                            self.mark_all_uncertain(target, "namespace_import", &mut visited);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn apply_dynamic_imports(&mut self) {
         let mut literal_targets = Vec::new();
         for module in self.modules {
@@ -442,123 +495,8 @@ impl<'a> GraphBuilder<'a> {
         visited: &mut BTreeSet<(usize, String)>,
         newly_live_modules: &mut BTreeSet<usize>,
     ) {
-        if !visited.insert((target.0, name.to_string())) {
-            return;
-        }
-        if let Some(state) = self.states.get_mut(target.0) {
-            for export in state
-                .exports
-                .iter_mut()
-                .filter(|export| export.fact.name.matches_str(name))
-            {
-                if mark_used(export, reason) {
-                    newly_live_modules.insert(target.0);
-                }
-            }
-        }
-
-        let Some(module) = self.modules.get(target.0) else {
-            return;
-        };
-        let re_exports = module.re_exports.clone();
-        for re_export in re_exports {
-            let Some(source) = re_export.target else {
-                continue;
-            };
-            match re_export.fact.kind {
-                ReExportKind::Named => {
-                    if re_export.fact.exported_name.as_deref() == Some(name) {
-                        if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
-                            self.mark_imported_name_collect(
-                                source,
-                                imported_name,
-                                "re_export",
-                                visited,
-                                newly_live_modules,
-                            );
-                        }
-                    }
-                }
-                ReExportKind::Star => {
-                    self.mark_imported_name_collect(
-                        source,
-                        name,
-                        "re_export",
-                        visited,
-                        newly_live_modules,
-                    );
-                }
-                ReExportKind::Namespace => {
-                    if re_export.fact.exported_name.as_deref() == Some(name) {
-                        let mut uncertain_visited = BTreeSet::new();
-                        self.mark_all_uncertain_collect(
-                            source,
-                            "namespace_import",
-                            &mut uncertain_visited,
-                            newly_live_modules,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn mark_imported_name_uncertain_collect(
-        &mut self,
-        target: FileId,
-        name: &str,
-        reason: &str,
-        visited: &mut BTreeSet<(usize, String)>,
-        newly_live_modules: &mut BTreeSet<usize>,
-    ) {
-        if !visited.insert((target.0, name.to_string())) {
-            return;
-        }
-        if let Some(state) = self.states.get_mut(target.0) {
-            for export in state
-                .exports
-                .iter_mut()
-                .filter(|export| export.fact.name.matches_str(name))
-            {
-                if mark_uncertain(export, reason) {
-                    newly_live_modules.insert(target.0);
-                }
-            }
-        }
-        let Some(module) = self.modules.get(target.0) else {
-            return;
-        };
-        let re_exports = module.re_exports.clone();
-        for re_export in re_exports {
-            let Some(source) = re_export.target else {
-                continue;
-            };
-            match re_export.fact.kind {
-                ReExportKind::Named => {
-                    if re_export.fact.exported_name.as_deref() == Some(name) {
-                        if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
-                            self.mark_imported_name_uncertain_collect(
-                                source,
-                                imported_name,
-                                reason,
-                                visited,
-                                newly_live_modules,
-                            );
-                        }
-                    }
-                }
-                ReExportKind::Star => {
-                    self.mark_imported_name_uncertain_collect(
-                        source,
-                        name,
-                        reason,
-                        visited,
-                        newly_live_modules,
-                    );
-                }
-                ReExportKind::Namespace => {}
-            }
-        }
+        let resolution = self.resolve_export_name(target, name, visited);
+        self.mark_resolution_used_or_uncertain(resolution, reason, newly_live_modules);
     }
 
     fn mark_all_uncertain(&mut self, target: FileId, reason: &str, visited: &mut BTreeSet<usize>) {
@@ -576,53 +514,252 @@ impl<'a> GraphBuilder<'a> {
         if !visited.insert(target.0) {
             return;
         }
-        if let Some(state) = self.states.get_mut(target.0) {
-            for export in &mut state.exports {
-                if mark_uncertain(export, reason) {
-                    newly_live_modules.insert(target.0);
-                }
-            }
+        let mut visible_visited = BTreeSet::new();
+        let visible = self.visible_export_resolutions(target, true, &mut visible_visited);
+        for resolution in visible.values() {
+            self.mark_resolution_uncertain_with_namespace_visited(
+                resolution.clone(),
+                reason,
+                newly_live_modules,
+                visited,
+            );
         }
-        let Some(module) = self.modules.get(target.0) else {
+    }
+
+    fn mark_resolution_used_or_uncertain(
+        &mut self,
+        resolution: ResolutionSet,
+        reason: &str,
+        newly_live_modules: &mut BTreeSet<usize>,
+    ) {
+        if let Some(canonical) = resolution.single_canonical().cloned() {
+            self.mark_canonical_used(&canonical, reason, newly_live_modules);
             return;
-        };
-        let re_exports = module.re_exports.clone();
-        for re_export in re_exports {
-            let Some(source) = re_export.target else {
-                continue;
-            };
-            match re_export.fact.kind {
-                ReExportKind::Star => {
-                    self.mark_all_uncertain_collect(source, reason, visited, newly_live_modules)
-                }
-                ReExportKind::Named => {
-                    if let Some(imported_name) = re_export.fact.imported_name.as_deref() {
-                        let mut name_visited = BTreeSet::new();
-                        self.mark_imported_name_uncertain_collect(
-                            source,
-                            imported_name,
-                            reason,
-                            &mut name_visited,
-                            newly_live_modules,
-                        );
-                    }
-                }
-                ReExportKind::Namespace => {}
+        }
+        self.mark_resolution_uncertain(resolution, reason, newly_live_modules);
+    }
+
+    fn mark_resolution_uncertain(
+        &mut self,
+        resolution: ResolutionSet,
+        reason: &str,
+        newly_live_modules: &mut BTreeSet<usize>,
+    ) {
+        let mut namespace_visited = BTreeSet::new();
+        self.mark_resolution_uncertain_with_namespace_visited(
+            resolution,
+            reason,
+            newly_live_modules,
+            &mut namespace_visited,
+        );
+    }
+
+    fn mark_resolution_uncertain_with_namespace_visited(
+        &mut self,
+        resolution: ResolutionSet,
+        reason: &str,
+        newly_live_modules: &mut BTreeSet<usize>,
+        namespace_visited: &mut BTreeSet<usize>,
+    ) {
+        for canonical in resolution.canonical {
+            self.mark_canonical_uncertain(&canonical, reason, newly_live_modules);
+        }
+        for target in resolution.namespace_targets {
+            self.mark_all_uncertain_collect(
+                target,
+                "namespace_import",
+                namespace_visited,
+                newly_live_modules,
+            );
+        }
+    }
+
+    fn mark_canonical_used(
+        &mut self,
+        canonical: &SymbolKey,
+        reason: &str,
+        newly_live_modules: &mut BTreeSet<usize>,
+    ) {
+        if let Some(export) = self.export_state_mut(canonical) {
+            if mark_used(export, reason) {
+                newly_live_modules.insert(canonical.file_id.0);
             }
         }
     }
 
-    fn export_status(&self, file_id: FileId, name: &str) -> Option<&ExportStatus> {
-        self.states.get(file_id.0).and_then(|state| {
+    fn mark_canonical_uncertain(
+        &mut self,
+        canonical: &SymbolKey,
+        reason: &str,
+        newly_live_modules: &mut BTreeSet<usize>,
+    ) {
+        if let Some(export) = self.export_state_mut(canonical) {
+            if mark_uncertain(export, reason) {
+                newly_live_modules.insert(canonical.file_id.0);
+            }
+        }
+    }
+
+    fn resolve_export_name(
+        &self,
+        target: FileId,
+        name: &str,
+        visited: &mut BTreeSet<(usize, String)>,
+    ) -> ResolutionSet {
+        let key = SymbolKey::new(target, name.to_string());
+        if !visited.insert((target.0, name.to_string())) {
+            return ResolutionSet::default();
+        }
+
+        if self.has_local_export(&key) {
+            return ResolutionSet::canonical(key);
+        }
+
+        let mut resolution = ResolutionSet::default();
+        if let Some(forwards) = self.forwarding.named.get(&key) {
+            for forward in forwards {
+                resolution.merge(self.resolve_export_name(
+                    forward.source,
+                    &forward.imported_name,
+                    visited,
+                ));
+            }
+        }
+
+        if let Some(forwards) = self.forwarding.namespace.get(&key) {
+            for forward in forwards {
+                resolution.merge(ResolutionSet::namespace(forward.source));
+            }
+        }
+
+        if name != "default" {
+            if let Some(stars) = self.forwarding.star.get(&target.0) {
+                for star in stars {
+                    resolution.merge(self.resolve_export_name(star.source, name, visited));
+                }
+            }
+        }
+
+        resolution
+    }
+
+    fn visible_export_resolutions(
+        &self,
+        target: FileId,
+        include_default: bool,
+        visited_files: &mut BTreeSet<usize>,
+    ) -> BTreeMap<String, ResolutionSet> {
+        if !visited_files.insert(target.0) {
+            return BTreeMap::new();
+        }
+
+        let mut visible = BTreeMap::new();
+        let mut explicit_names = BTreeSet::new();
+
+        if let Some(state) = self.states.get(target.0) {
+            for export in &state.exports {
+                let name = export.fact.name.as_symbol();
+                if !include_default && name == "default" {
+                    continue;
+                }
+                explicit_names.insert(name.clone());
+                visible.insert(
+                    name.clone(),
+                    ResolutionSet::canonical(SymbolKey::new(target, name)),
+                );
+            }
+        }
+
+        for (key, forwards) in self.forwarding.named.range(
+            SymbolKey::new(target, String::new())..=SymbolKey::new(target, char::MAX.to_string()),
+        ) {
+            if key.file_id != target {
+                continue;
+            }
+            if !include_default && key.name == "default" {
+                continue;
+            }
+            explicit_names.insert(key.name.clone());
+            let mut resolution = ResolutionSet::default();
+            for forward in forwards {
+                let mut visited = BTreeSet::new();
+                resolution.merge(self.resolve_export_name(
+                    forward.source,
+                    &forward.imported_name,
+                    &mut visited,
+                ));
+            }
+            if !resolution.is_empty() {
+                visible
+                    .entry(key.name.clone())
+                    .or_insert_with(ResolutionSet::default)
+                    .merge(resolution);
+            }
+        }
+
+        for (key, forwards) in self.forwarding.namespace.range(
+            SymbolKey::new(target, String::new())..=SymbolKey::new(target, char::MAX.to_string()),
+        ) {
+            if key.file_id != target {
+                continue;
+            }
+            if !include_default && key.name == "default" {
+                continue;
+            }
+            explicit_names.insert(key.name.clone());
+            let mut resolution = ResolutionSet::default();
+            for forward in forwards {
+                resolution.merge(ResolutionSet::namespace(forward.source));
+            }
+            visible
+                .entry(key.name.clone())
+                .or_insert_with(ResolutionSet::default)
+                .merge(resolution);
+        }
+
+        if let Some(stars) = self.forwarding.star.get(&target.0) {
+            for star in stars {
+                let star_visible =
+                    self.visible_export_resolutions(star.source, false, visited_files);
+                for (name, resolution) in star_visible {
+                    if explicit_names.contains(&name) {
+                        continue;
+                    }
+                    visible
+                        .entry(name)
+                        .or_insert_with(ResolutionSet::default)
+                        .merge(resolution);
+                }
+            }
+        }
+
+        visible
+    }
+
+    fn has_local_export(&self, key: &SymbolKey) -> bool {
+        self.states.get(key.file_id.0).is_some_and(|state| {
             state
                 .exports
                 .iter()
-                .find(|export| export.fact.name.matches_str(name))
-                .map(|export| &export.status)
+                .any(|export| export.fact.name.matches_str(&key.name))
+        })
+    }
+
+    fn export_state_mut(&mut self, key: &SymbolKey) -> Option<&mut ExportState> {
+        self.states.get_mut(key.file_id.0).and_then(|state| {
+            state
+                .exports
+                .iter_mut()
+                .find(|export| export.fact.name.matches_str(&key.name))
         })
     }
 
     fn into_verdicts(self, project_root: &Path) -> Vec<OxcFileVerdicts> {
+        let paths_by_file_id = self
+            .states
+            .iter()
+            .map(|state| state.path.clone())
+            .collect::<Vec<_>>();
         self.states
             .into_iter()
             .map(|state| {
@@ -641,6 +778,20 @@ impl<'a> GraphBuilder<'a> {
                             verdict,
                             reason,
                             provenance: OXC_PROVENANCE.to_string(),
+                            also_reexported: export
+                                .also_reexported
+                                .into_iter()
+                                .filter_map(|context| {
+                                    let file = paths_by_file_id
+                                        .get(context.file_id.0)
+                                        .map(|path| relative_string(project_root, path))?;
+                                    Some(OxcReExportContext {
+                                        file,
+                                        line: context.line,
+                                        exported_name: context.exported_name,
+                                    })
+                                })
+                                .collect(),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -678,10 +829,7 @@ fn enqueue_module_idx(
     }
 }
 
-fn import_binding_is_used(
-    module: &ResolvedModule,
-    import: &super::resolver::ResolvedImport,
-) -> bool {
+fn import_binding_is_used(module: &ResolvedModule, import: &ResolvedImport) -> bool {
     match import.fact.kind {
         ImportKind::SideEffect => false,
         ImportKind::Named | ImportKind::Default | ImportKind::Namespace => import
@@ -690,29 +838,6 @@ fn import_binding_is_used(
             .as_ref()
             .is_some_and(|local| module.facts.used_import_bindings.contains(local)),
     }
-}
-
-fn push_synthetic_export(
-    exports: &mut Vec<ExportState>,
-    name: ExportName,
-    kind: &str,
-    is_type_only: bool,
-    line: u32,
-) {
-    if exports.iter().any(|export| export.fact.name == name) {
-        return;
-    }
-    exports.push(ExportState {
-        fact: ExportFact {
-            name,
-            local_name: None,
-            kind: kind.to_string(),
-            is_type_only,
-            line,
-            declared: true,
-        },
-        status: ExportStatus::Unused,
-    });
 }
 
 fn mark_used(export: &mut ExportState, reason: &str) -> bool {
@@ -739,9 +864,24 @@ fn mark_uncertain(export: &mut ExportState, reason: &str) -> bool {
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {
-    path.strip_prefix(project_root)
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        return path_components_string(relative);
+    }
+
+    let canonical_root =
+        fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical_path
+        .strip_prefix(&canonical_root)
         .unwrap_or(path)
         .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn path_components_string(path: &Path) -> String {
+    path.components()
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")

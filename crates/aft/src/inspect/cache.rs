@@ -113,7 +113,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v19: dead_code entry reachability executes side-effect-only imported modules,
 /// preserving same-file and transitive static-import liveness without marking all
 /// target exports used.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 19;
+/// v20: TS/JS re-export verdicts collapse barrel aliases to canonical exports
+/// and carry non-counted re-export context on canonical findings.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 20;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1710,6 +1712,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 19);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 20);
     }
 }
