@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -331,6 +331,7 @@ pub struct CallgraphSnapshot {
     pub exported_symbols: Vec<CallgraphExport>,
     pub outbound_calls: Vec<CallgraphOutboundCall>,
     pub entry_points: BTreeSet<PathBuf>,
+    pub entry_point_symbols: BTreeMap<PathBuf, BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

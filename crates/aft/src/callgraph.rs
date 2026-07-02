@@ -143,6 +143,9 @@ pub struct SymbolMeta {
     pub line: u32,
     /// 0-based source range of the symbol.
     pub range: Range,
+    /// Attribute that marks the symbol as externally reachable, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_point_attribute: Option<String>,
 }
 
 /// Per-file call data: call sites grouped by containing symbol, plus
@@ -996,18 +999,29 @@ fn build_file_data_from_source_with_lang(
         }
     }
 
+    let rust_attribute_entry_points = if lang == LangId::Rust {
+        crate::parser::rust_attribute_entry_points(&source, root)
+            .into_iter()
+            .map(|entry| (entry.scoped_name, entry.attribute.to_string()))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+
     // Build per-symbol metadata for entry point detection
     let mut symbol_metadata: HashMap<String, SymbolMeta> = symbols
         .iter()
         .map(|s| {
+            let identity = symbol_identity(s);
             (
-                symbol_identity(s),
+                identity.clone(),
                 SymbolMeta {
                     kind: s.kind.clone(),
                     exported: s.exported,
                     signature: s.signature.clone(),
                     line: s.range.start_line + 1,
                     range: s.range.clone(),
+                    entry_point_attribute: rust_attribute_entry_points.get(&identity).cloned(),
                 },
             )
         })
@@ -1021,6 +1035,7 @@ fn build_file_data_from_source_with_lang(
                 signature: Some(first_line_signature(&source, &default_export.node)),
                 line: default_export.node.start_position().row as u32 + 1,
                 range: crate::parser::node_range(&default_export.node),
+                entry_point_attribute: None,
             });
     }
     if calls_by_symbol.contains_key(TOP_LEVEL_SYMBOL) {
@@ -1037,6 +1052,7 @@ fn build_file_data_from_source_with_lang(
                     end_line: 0,
                     end_col: 0,
                 },
+                entry_point_attribute: None,
             });
     }
 
@@ -2688,6 +2704,7 @@ mod tests {
                     end_line: 705,
                     end_col: 0,
                 },
+                entry_point_attribute: None,
             },
         );
         let file_data = FileCallData {

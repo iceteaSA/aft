@@ -1,14 +1,15 @@
 use rusqlite::{params, Connection, OpenFlags};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::inspect::job::{CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot};
 use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
+use crate::symbols::SymbolKind;
 
 use super::{
-    database_ready, CallGraphStoreError, Result, BACKEND_TREESITTER, PROVENANCE_NAME_MATCH,
-    PROVENANCE_TYPE_MATCH, TOP_LEVEL_SYMBOL,
+    database_ready, lang_from_label, CallGraphStoreError, Result, BACKEND_TREESITTER,
+    PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH, TOP_LEVEL_SYMBOL,
 };
 
 pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
@@ -38,6 +39,7 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     let exported_symbols = exported_symbols_from_store(&conn, &mut paths)?;
     let outbound_calls = outbound_calls_from_store(&conn, &mut paths)?;
     let entry_points = entry_points_for_files(&project_root, &files);
+    let entry_point_symbols = entry_point_symbols_from_store(&conn, &mut paths)?;
 
     Ok(CallgraphSnapshot {
         generated_at: Some(SystemTime::now()),
@@ -45,6 +47,7 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
         exported_symbols,
         outbound_calls,
         entry_points,
+        entry_point_symbols,
     })
 }
 
@@ -136,6 +139,51 @@ fn exported_symbols_from_store(
         }
     }
     Ok(exports)
+}
+
+fn entry_point_symbols_from_store(
+    conn: &Connection,
+    paths: &mut SnapshotPathResolver<'_>,
+) -> Result<BTreeMap<PathBuf, BTreeSet<String>>> {
+    let mut statement = conn.prepare(
+        "SELECT n.file_path, n.name, n.scoped_name, n.kind, n.exported, f.lang
+         FROM nodes n
+         JOIN files f ON f.path = n.file_path
+         WHERE n.is_callgraph_entry_point != 0
+         ORDER BY n.file_path, n.start_line, n.name, n.kind, n.id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(EntryPointSymbolRow {
+            file_path: row.get(0)?,
+            name: row.get(1)?,
+            scoped_name: row.get(2)?,
+            kind: row.get(3)?,
+            exported: row.get::<_, i64>(4)? != 0,
+            lang: row.get(5)?,
+        })
+    })?;
+
+    let mut by_file: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    for row in rows {
+        let row = row?;
+        let Some(kind) = symbol_kind_from_label(&row.kind) else {
+            continue;
+        };
+        let Some(lang) = lang_from_label(&row.lang) else {
+            continue;
+        };
+        if crate::callgraph::is_entry_point(&row.scoped_name, &kind, row.exported, lang) {
+            continue;
+        }
+
+        let file = paths.resolve(&row.file_path);
+        let roots = by_file.entry(file).or_default();
+        roots.insert(row.name.clone());
+        if row.scoped_name != row.name {
+            roots.insert(row.scoped_name);
+        }
+    }
+    Ok(by_file)
 }
 
 fn outbound_calls_from_store(
@@ -314,6 +362,32 @@ struct ExportRow {
     line: u32,
     exported: bool,
     is_default_export: bool,
+}
+
+#[derive(Debug)]
+struct EntryPointSymbolRow {
+    file_path: String,
+    name: String,
+    scoped_name: String,
+    kind: String,
+    exported: bool,
+    lang: String,
+}
+
+fn symbol_kind_from_label(label: &str) -> Option<SymbolKind> {
+    match label {
+        "function" => Some(SymbolKind::Function),
+        "class" => Some(SymbolKind::Class),
+        "method" => Some(SymbolKind::Method),
+        "struct" => Some(SymbolKind::Struct),
+        "interface" => Some(SymbolKind::Interface),
+        "enum" => Some(SymbolKind::Enum),
+        "type_alias" => Some(SymbolKind::TypeAlias),
+        "variable" => Some(SymbolKind::Variable),
+        "heading" => Some(SymbolKind::Heading),
+        "file_summary" => Some(SymbolKind::FileSummary),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]

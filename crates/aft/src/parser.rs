@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::SystemTime;
@@ -2387,6 +2387,284 @@ fn rust_mod_scope_chain(node: &Node, source: &str) -> Vec<String> {
 
     scopes.reverse();
     scopes
+}
+
+/// Rust function attributes that expose the function to code outside the Rust
+/// call graph. This list is deliberately conservative: it covers known ABI,
+/// wasm, constructor/destructor, and Tauri command entry points, but it does not
+/// guess route macro shapes from web frameworks.
+pub(crate) const RUST_ENTRY_POINT_ATTRIBUTES: &[&str] = &[
+    "tauri::command",
+    "wasm_bindgen",
+    "no_mangle",
+    "export_name",
+    "ctor",
+    "dtor",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustAttributeEntryPoint {
+    pub name: String,
+    pub scoped_name: String,
+    pub attribute: &'static str,
+}
+
+/// Return Rust functions whose attributes make them external entry points.
+pub(crate) fn rust_attribute_entry_points<'a>(
+    source: &str,
+    root: Node<'a>,
+) -> Vec<RustAttributeEntryPoint> {
+    let bare_command_imported = rust_file_imports_tauri_command(source, root);
+    let mut function_nodes = Vec::new();
+    rust_collect_function_items(root, &mut function_nodes);
+
+    let mut entry_points = BTreeMap::new();
+    for function_node in function_nodes {
+        let Some(attribute) =
+            rust_entry_point_attribute_for_function(source, &function_node, bare_command_imported)
+        else {
+            continue;
+        };
+        let Some((name, scoped_name)) = rust_function_identity(source, &function_node) else {
+            continue;
+        };
+        entry_points
+            .entry(scoped_name.clone())
+            .or_insert(RustAttributeEntryPoint {
+                name,
+                scoped_name,
+                attribute,
+            });
+    }
+
+    entry_points.into_values().collect()
+}
+
+fn rust_collect_function_items<'a>(node: Node<'a>, function_nodes: &mut Vec<Node<'a>>) {
+    if node.kind() == "function_item" {
+        function_nodes.push(node);
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            rust_collect_function_items(cursor.node(), function_nodes);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn rust_function_identity(source: &str, function_node: &Node<'_>) -> Option<(String, String)> {
+    let name_node = function_node.child_by_field_name("name")?;
+    let name = node_text(source, &name_node).to_string();
+    let declaration_list_owner = rust_function_declaration_list_owner(function_node);
+
+    match declaration_list_owner.as_ref().map(Node::kind) {
+        Some("impl_item") => {
+            let scope_name = rust_impl_scope_name(declaration_list_owner.as_ref().unwrap(), source);
+            let scoped_name = if scope_name.is_empty() {
+                name.clone()
+            } else {
+                format!("{scope_name}::{name}")
+            };
+            Some((name, scoped_name))
+        }
+        Some(owner_kind) if owner_kind != "mod_item" => None,
+        _ => {
+            let scope_chain = rust_mod_scope_chain(function_node, source);
+            let scoped_name = if scope_chain.is_empty() {
+                name.clone()
+            } else {
+                format!("{}::{name}", scope_chain.join("::"))
+            };
+            Some((name, scoped_name))
+        }
+    }
+}
+
+fn rust_function_declaration_list_owner<'a>(function_node: &Node<'a>) -> Option<Node<'a>> {
+    function_node
+        .parent()
+        .filter(|parent| parent.kind() == "declaration_list")
+        .and_then(|parent| parent.parent())
+}
+
+fn rust_impl_scope_name(impl_node: &Node, source: &str) -> String {
+    let mut type_names: Vec<String> = Vec::new();
+    let mut child_cursor = impl_node.walk();
+    if child_cursor.goto_first_child() {
+        loop {
+            let child = child_cursor.node();
+            if child.kind() == "type_identifier" || child.kind() == "generic_type" {
+                type_names.push(node_text(source, &child).to_string());
+            }
+            if !child_cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    if type_names.len() >= 2 {
+        format!("{} for {}", type_names[0], type_names[1])
+    } else if type_names.len() == 1 {
+        type_names[0].clone()
+    } else {
+        String::new()
+    }
+}
+
+fn rust_entry_point_attribute_for_function(
+    source: &str,
+    function_node: &Node,
+    bare_command_imported: bool,
+) -> Option<&'static str> {
+    let mut current = *function_node;
+    while let Some(prev) = current.prev_sibling() {
+        let kind = prev.kind();
+        match kind {
+            "attribute_item" => {
+                if let Some(attribute) =
+                    rust_entry_point_attribute_from_node(source, &prev, bare_command_imported)
+                {
+                    return Some(attribute);
+                }
+                current = prev;
+            }
+            "line_comment" if node_text(source, &prev).starts_with("///") => {
+                current = prev;
+            }
+            "block_comment" if node_text(source, &prev).starts_with("/**") => {
+                current = prev;
+            }
+            _ => break,
+        }
+    }
+
+    None
+}
+
+fn rust_entry_point_attribute_from_node(
+    source: &str,
+    attribute_node: &Node,
+    bare_command_imported: bool,
+) -> Option<&'static str> {
+    let text = node_text(source, attribute_node);
+    let path = rust_attribute_path(text)?;
+    rust_entry_point_attribute_for_path(path, bare_command_imported)
+}
+
+fn rust_attribute_path(attribute_text: &str) -> Option<&str> {
+    let inner = attribute_text
+        .trim()
+        .strip_prefix("#[")?
+        .strip_suffix(']')?
+        .trim();
+    let effective = inner
+        .strip_prefix("unsafe(")
+        .and_then(|wrapped| wrapped.strip_suffix(')'))
+        .map(str::trim)
+        .unwrap_or(inner);
+    effective
+        .split(|ch: char| matches!(ch, '(' | '=' | ','))
+        .next()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
+fn rust_entry_point_attribute_for_path(
+    path: &str,
+    bare_command_imported: bool,
+) -> Option<&'static str> {
+    let compact = path
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if compact == "tauri::command" {
+        return Some("tauri::command");
+    }
+    if compact == "command" && bare_command_imported {
+        return Some("tauri::command");
+    }
+
+    let last_segment = compact.rsplit("::").next().unwrap_or(compact.as_str());
+    RUST_ENTRY_POINT_ATTRIBUTES
+        .iter()
+        .copied()
+        .find(|attribute| *attribute != "tauri::command" && *attribute == last_segment)
+}
+
+fn rust_file_imports_tauri_command(source: &str, root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "use_declaration"
+            && rust_use_declaration_imports_tauri_command(node_text(source, &node))
+        {
+            return true;
+        }
+
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                stack.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn rust_use_declaration_imports_tauri_command(use_text: &str) -> bool {
+    let compact = use_text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let Some(use_index) = compact.find("use") else {
+        return false;
+    };
+    let path = compact[use_index + "use".len()..].trim_end_matches(';');
+    if path == "tauri::command" {
+        return true;
+    }
+
+    let Some(inner) = path
+        .strip_prefix("tauri::{")
+        .and_then(|inner| inner.strip_suffix('}'))
+    else {
+        return false;
+    };
+
+    split_rust_use_items(inner)
+        .into_iter()
+        .any(|item| item == "command" || item == "commandascommand")
+}
+
+fn split_rust_use_items(inner: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                items.push(inner[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start <= inner.len() {
+        let tail = inner[start..].trim();
+        if !tail.is_empty() {
+            items.push(tail);
+        }
+    }
+    items
 }
 
 /// Extract symbols from Rust source.

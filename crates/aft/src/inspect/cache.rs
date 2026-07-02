@@ -116,7 +116,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// target exports used.
 /// v20: duplicates aggregate hashes include inspect.duplicates.expected_mirrors,
 /// so changing intentional mirror architecture rules invalidates cached roll-ups.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 20;
+/// v21: Rust dead_code contributions carry attribute-root entry facts for
+/// externally-invoked functions such as Tauri commands and ABI exports.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 21;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1819,7 +1821,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 20);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 21);
     }
 
     #[test]

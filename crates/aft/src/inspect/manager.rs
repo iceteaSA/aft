@@ -3344,6 +3344,7 @@ mod dead_code_projection_tests {
         exported_symbols: BTreeSet<(PathBuf, String, String, u32)>,
         outbound_calls: BTreeSet<(PathBuf, String, String, u32)>,
         entry_points: BTreeSet<PathBuf>,
+        entry_point_symbols: BTreeMap<PathBuf, BTreeSet<String>>,
     }
 
     #[test]
@@ -3390,6 +3391,102 @@ mod dead_code_projection_tests {
         assert_live_item(&projected_aggregate, "src/live.ts", "knownLive");
         assert_live_item(&projected_aggregate, "src/render.ts", "render");
         assert_live_item(&projected_aggregate, "src/other_render.ts", "render");
+    }
+
+    #[test]
+    fn dead_code_projection_rust_attribute_entry_points_are_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_rust_attribute_entry_fixture(dir.path());
+        let root = canonical_root(dir.path());
+        let files = project_files(&root);
+        let store = CallGraphStore::open(root.join(".store-tauri-commands"), root.clone())
+            .expect("open store");
+        store.cold_build(&files).expect("cold build store");
+        let command = store
+            .node_for(Path::new("src/commands.rs"), "get_primers")
+            .expect("command node");
+        assert!(
+            command.is_entry_point,
+            "attribute-rooted commands must be labeled as callgraph entry points"
+        );
+        let private_command = store
+            .node_for(Path::new("src/commands.rs"), "private_command")
+            .expect("private command node");
+        assert!(
+            private_command.is_entry_point,
+            "private attribute-rooted commands must also be callgraph entry points"
+        );
+
+        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        let aggregate = dead_code_aggregate(&root, files, projected);
+        assert_live_item(&aggregate, "src/commands.rs", "get_primers");
+        assert_live_item(&aggregate, "src/db.rs", "helper");
+        assert_live_item(&aggregate, "src/db.rs", "private_helper");
+        assert_live_item(&aggregate, "src/imported.rs", "imported_command");
+        assert_live_item(&aggregate, "src/db.rs", "imported_helper");
+        assert_dead_item(&aggregate, "src/commands.rs", "planted_dead");
+        assert_dead_item(&aggregate, "src/unimported.rs", "false_command");
+        assert_dead_item(&aggregate, "src/db.rs", "false_helper");
+    }
+
+    #[test]
+    fn dead_code_projection_rust_attribute_roots_are_cold_deterministic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_rust_attribute_entry_fixture(dir.path());
+        let root = canonical_root(dir.path());
+        let first = store_projected_snapshot(&root, ".store-tauri-cold-a");
+        let second = store_projected_snapshot(&root, ".store-tauri-cold-b");
+
+        assert_snapshot_parts_eq("rust attribute roots cold", &first, &second);
+    }
+
+    #[test]
+    fn dead_code_projection_rust_attribute_roots_survive_unrelated_incremental_edit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_rust_attribute_entry_fixture(dir.path());
+        let root = canonical_root(dir.path());
+        let files_before = project_files(&root);
+        let incremental_store =
+            CallGraphStore::open(root.join(".store-tauri-incremental"), root.clone())
+                .expect("open incremental store");
+        incremental_store
+            .cold_build(&files_before)
+            .expect("initial cold build");
+
+        write_file(
+            &root.join("src/unrelated.rs"),
+            r#"// unrelated edit should not refresh command attribute facts
+pub fn unrelated() -> u32 { 2 }
+"#,
+        );
+        let stats = incremental_store
+            .refresh_files(&[root.join("src/unrelated.rs")])
+            .expect("refresh unrelated file");
+        assert_eq!(stats.refreshed_own_files, 1);
+        assert_eq!(stats.changed_files, vec!["src/unrelated.rs".to_string()]);
+        assert!(
+            !stats
+                .surface_changed
+                .iter()
+                .any(|file| file == "src/commands.rs"),
+            "unrelated edit must not refresh the command module: {stats:#?}"
+        );
+        let incremental = project_dead_code_snapshot(incremental_store.sqlite_path())
+            .expect("project incremental snapshot");
+
+        let cold_store = CallGraphStore::open(root.join(".store-tauri-cold"), root.clone())
+            .expect("open cold store");
+        cold_store
+            .cold_build(&project_files(&root))
+            .expect("cold rebuild");
+        let cold = project_dead_code_snapshot(cold_store.sqlite_path()).expect("project cold");
+        assert_snapshot_parts_eq("rust attribute roots unrelated edit", &cold, &incremental);
+
+        let aggregate = dead_code_aggregate(&root, project_files(&root), incremental);
+        assert_live_item(&aggregate, "src/commands.rs", "get_primers");
+        assert_live_item(&aggregate, "src/db.rs", "helper");
+        assert_live_item(&aggregate, "src/db.rs", "private_helper");
+        assert_dead_item(&aggregate, "src/commands.rs", "planted_dead");
     }
 
     fn assert_projection_fixture_coverage(root: &Path, snapshot: &CallgraphSnapshot) {
@@ -3623,6 +3720,7 @@ mod dead_code_projection_tests {
                 })
                 .collect(),
             entry_points: snapshot.entry_points.clone(),
+            entry_point_symbols: snapshot.entry_point_symbols.clone(),
         }
     }
 
@@ -3759,6 +3857,75 @@ pub fn rust_entry() {
         write_file(
             &root.join("src/util.rs"),
             r#"pub fn rust_helper() {}
+"#,
+        );
+    }
+
+    fn write_rust_attribute_entry_fixture(root: &Path) {
+        write_file(
+            &root.join("src/main.rs"),
+            r#"mod commands;
+mod db;
+mod imported;
+mod unimported;
+mod unrelated;
+
+fn main() {
+    tauri::generate_handler![commands::get_primers, imported::imported_command];
+}
+"#,
+        );
+        write_file(
+            &root.join("src/commands.rs"),
+            r#"use crate::db;
+
+#[tauri::command]
+pub fn get_primers() -> String {
+    db::helper()
+}
+
+pub fn planted_dead() -> String {
+    "dead".to_string()
+}
+
+#[tauri::command]
+fn private_command() -> String {
+    db::private_helper()
+}
+"#,
+        );
+        write_file(
+            &root.join("src/imported.rs"),
+            r#"use crate::db;
+use tauri::command;
+
+#[command]
+pub fn imported_command() -> String {
+    db::imported_helper()
+}
+"#,
+        );
+        write_file(
+            &root.join("src/unimported.rs"),
+            r#"use crate::db;
+
+#[command]
+pub fn false_command() -> String {
+    db::false_helper()
+}
+"#,
+        );
+        write_file(
+            &root.join("src/db.rs"),
+            r#"pub fn helper() -> String { "live".to_string() }
+pub fn imported_helper() -> String { "live".to_string() }
+pub fn private_helper() -> String { "live".to_string() }
+pub fn false_helper() -> String { "dead".to_string() }
+"#,
+        );
+        write_file(
+            &root.join("src/unrelated.rs"),
+            r#"pub fn unrelated() -> u32 { 1 }
 "#,
         );
     }

@@ -28,7 +28,7 @@ use crate::parser::{detect_language, grammar_for, LangId};
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 1;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 2;
 
 type ExportNode = (String, String);
 type OutboundCallsByCallerFile<'a> = BTreeMap<PathBuf, Vec<&'a CallgraphOutboundCall>>;
@@ -43,6 +43,7 @@ struct ImportedExportLiveness {
 struct FileAnalysis {
     raw_imports: Vec<RawImportContribution>,
     raw_reexports: Vec<RawReexportContribution>,
+    attribute_entry_points: Vec<String>,
     type_ref_names: BTreeSet<String>,
 }
 
@@ -77,15 +78,20 @@ impl DeadCodeFileAnalyzer {
         // Only the legacy non-oxc TS/JS path needs tree-sitter import/re-export facts here.
         let needs_ts_raw_facts = is_ts_js && !has_oxc_file;
         let needs_rust_reexports = matches!(lang, LangId::Rust);
+        let needs_rust_attribute_entry_points = matches!(lang, LangId::Rust);
 
-        if !needs_type_refs && !needs_ts_raw_facts && !needs_rust_reexports {
+        if !needs_type_refs
+            && !needs_ts_raw_facts
+            && !needs_rust_reexports
+            && !needs_rust_attribute_entry_points
+        {
             return FileAnalysis::default();
         }
 
         let Ok(source) = fs::read_to_string(file) else {
             return FileAnalysis::default();
         };
-        let needs_tree = needs_type_refs || needs_ts_raw_facts;
+        let needs_tree = needs_type_refs || needs_ts_raw_facts || needs_rust_attribute_entry_points;
         let tree = needs_tree
             .then(|| self.parse_source(lang, &source))
             .flatten();
@@ -116,9 +122,27 @@ impl DeadCodeFileAnalyzer {
             Vec::new()
         };
 
+        let attribute_entry_points = if needs_rust_attribute_entry_points {
+            tree.as_ref()
+                .map(|tree| {
+                    let mut roots = BTreeSet::new();
+                    for entry in
+                        crate::parser::rust_attribute_entry_points(&source, tree.root_node())
+                    {
+                        roots.insert(entry.name);
+                        roots.insert(entry.scoped_name);
+                    }
+                    roots.into_iter().collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         FileAnalysis {
             raw_imports,
             raw_reexports,
+            attribute_entry_points,
             type_ref_names,
         }
     }
@@ -291,6 +315,7 @@ fn gather_file_contribution(
     let FileAnalysis {
         raw_imports,
         raw_reexports,
+        attribute_entry_points,
         type_ref_names,
     } = file_analyzer.analyze_file(file, oxc_facts.is_some());
 
@@ -318,6 +343,9 @@ fn gather_file_contribution(
     }
     if !raw_reexports.is_empty() {
         payload["raw_reexports"] = json!(raw_reexports);
+    }
+    if !attribute_entry_points.is_empty() {
+        payload["attribute_entry_points"] = json!(attribute_entry_points);
     }
     if let Some(facts) = oxc_facts {
         payload["provenance"] = json!(OXC_PROVENANCE);
@@ -457,6 +485,11 @@ fn materialize_dead_code_contributions(
         .iter()
         .map(|file| relative_path(project_root, file))
         .collect::<BTreeSet<_>>();
+    let attribute_roots_from_snapshot = snapshot
+        .entry_point_symbols
+        .iter()
+        .map(|(file, symbols)| (relative_path(project_root, file), symbols.clone()))
+        .collect::<BTreeMap<_, _>>();
     let (exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
         exported_symbol_indexes_from_contributions(project_root, snapshot, &parsed);
     let outbound_calls_by_caller_file =
@@ -523,10 +556,19 @@ fn materialize_dead_code_contributions(
                 &exported_symbols_by_file,
                 &default_export_symbols_by_file,
             );
+            let mut attribute_entry_points = contribution
+                .attribute_entry_points
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if let Some(snapshot_roots) = attribute_roots_from_snapshot.get(&contribution.file) {
+                attribute_entry_points.extend(snapshot_roots.iter().cloned());
+            }
             let liveness_roots = liveness_roots_for_file(
                 &contribution.file,
                 &exports,
                 &internal_calls,
+                &attribute_entry_points,
                 liveness_root_files.contains(&contribution.file),
                 public_api_files.contains(&contribution.file),
             );
@@ -1925,14 +1967,19 @@ fn liveness_roots_for_file(
     file_name: &str,
     exports: &[ExportContribution],
     internal_calls: &[InternalCall],
+    attribute_entry_points: &BTreeSet<String>,
     is_liveness_root_file: bool,
     is_public_api_file: bool,
 ) -> Vec<String> {
+    let mut roots = attribute_entry_points
+        .iter()
+        .filter_map(|symbol| clean_symbol(symbol))
+        .collect::<BTreeSet<_>>();
+
     if !is_liveness_root_file && !is_public_api_file {
-        return Vec::new();
+        return roots.into_iter().collect();
     }
 
-    let mut roots = BTreeSet::new();
     roots.insert("<top-level>".to_string());
     if is_public_api_file {
         roots.extend(exports.iter().map(|export| export.symbol.clone()));
@@ -2084,6 +2131,8 @@ struct DeadCodeContribution {
     raw_imports: Vec<RawImportContribution>,
     #[serde(default)]
     raw_reexports: Vec<RawReexportContribution>,
+    #[serde(default)]
+    attribute_entry_points: Vec<String>,
     #[serde(default)]
     oxc_facts: Option<OxcFactsContribution>,
     #[serde(default)]
@@ -2268,6 +2317,7 @@ mod tests {
             exported_symbols,
             outbound_calls,
             entry_points,
+            entry_point_symbols: BTreeMap::new(),
         }
     }
 
@@ -2304,6 +2354,18 @@ mod tests {
             .outcome
             .expect("scan succeeds")
             .aggregate
+    }
+
+    fn aggregate_has_item(aggregate: &serde_json::Value, file: &str, symbol: &str) -> bool {
+        aggregate
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|item| {
+                item.get("file").and_then(serde_json::Value::as_str) == Some(file)
+                    && item.get("symbol").and_then(serde_json::Value::as_str) == Some(symbol)
+            })
     }
 
     #[test]
@@ -2485,6 +2547,136 @@ mod tests {
         assert_eq!(aggregate["items"][0]["symbol"], "Widget");
         assert_eq!(aggregate["uncertain_count"], 0);
         assert!(aggregate["uncertain_items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rust_attribute_entry_points_seed_command_liveness() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            (
+                "src/commands.rs",
+                r#"use crate::db;
+
+#[tauri::command]
+pub fn get_primers() -> String {
+    db::helper()
+}
+
+pub fn planted_dead() -> String {
+    "dead".to_string()
+}
+
+#[tauri::command]
+fn private_command() -> String {
+    db::private_helper()
+}
+"#,
+            ),
+            (
+                "src/imported.rs",
+                r#"use crate::db;
+use tauri::command;
+
+#[command]
+pub fn imported_command() -> String {
+    db::imported_helper()
+}
+"#,
+            ),
+            (
+                "src/unimported.rs",
+                r#"use crate::db;
+
+#[command]
+pub fn false_command() -> String {
+    db::false_helper()
+}
+"#,
+            ),
+            (
+                "src/db.rs",
+                r#"pub fn helper() -> String { "live".to_string() }
+pub fn imported_helper() -> String { "live".to_string() }
+pub fn private_helper() -> String { "live".to_string() }
+pub fn false_helper() -> String { "dead".to_string() }
+"#,
+            ),
+        ]);
+        let helper_target = format!("{}::helper", root.join("src/db.rs").display());
+        let imported_helper_target =
+            format!("{}::imported_helper", root.join("src/db.rs").display());
+        let private_helper_target = format!("{}::private_helper", root.join("src/db.rs").display());
+        let false_helper_target = format!("{}::false_helper", root.join("src/db.rs").display());
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(
+                paths,
+                vec![
+                    export(&root, "src/commands.rs", "get_primers", "function"),
+                    export(&root, "src/commands.rs", "planted_dead", "function"),
+                    export(&root, "src/imported.rs", "imported_command", "function"),
+                    export(&root, "src/unimported.rs", "false_command", "function"),
+                    export(&root, "src/db.rs", "helper", "function"),
+                    export(&root, "src/db.rs", "imported_helper", "function"),
+                    export(&root, "src/db.rs", "private_helper", "function"),
+                    export(&root, "src/db.rs", "false_helper", "function"),
+                ],
+                vec![
+                    outbound(&root, "src/commands.rs", "get_primers", &helper_target),
+                    outbound(
+                        &root,
+                        "src/imported.rs",
+                        "imported_command",
+                        &imported_helper_target,
+                    ),
+                    outbound(
+                        &root,
+                        "src/commands.rs",
+                        "private_command",
+                        &private_helper_target,
+                    ),
+                    outbound(
+                        &root,
+                        "src/unimported.rs",
+                        "false_command",
+                        &false_helper_target,
+                    ),
+                ],
+            ),
+        ));
+
+        assert!(!aggregate_has_item(
+            &aggregate,
+            "src/commands.rs",
+            "get_primers"
+        ));
+        assert!(!aggregate_has_item(&aggregate, "src/db.rs", "helper"));
+        assert!(!aggregate_has_item(
+            &aggregate,
+            "src/imported.rs",
+            "imported_command"
+        ));
+        assert!(!aggregate_has_item(
+            &aggregate,
+            "src/db.rs",
+            "imported_helper"
+        ));
+        assert!(!aggregate_has_item(
+            &aggregate,
+            "src/db.rs",
+            "private_helper"
+        ));
+        assert!(aggregate_has_item(
+            &aggregate,
+            "src/commands.rs",
+            "planted_dead"
+        ));
+        assert!(aggregate_has_item(
+            &aggregate,
+            "src/unimported.rs",
+            "false_command"
+        ));
+        assert!(aggregate_has_item(&aggregate, "src/db.rs", "false_helper"));
     }
 
     #[test]

@@ -2392,8 +2392,8 @@ fn schema_fingerprint() -> String {
     // Bump the trailing content-version whenever the BUILD OUTPUT changes (new
     // edge sources, broader call extraction) even if the table SHAPE is
     // unchanged, so existing on-disk stores rebuild and pick up the new edges.
-    // v6 -> v7-lean: file-level dependency rows and structured refs without raw JSON payloads.
-    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v7-lean");
+    // v8-attr-entry: Rust external-entry attributes now set node entry flags.
+    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v8-attr-entry");
     hash_to_hex(blake3::hash(input.as_bytes()))
 }
 
@@ -2948,12 +2948,8 @@ fn build_node_records(
             exported,
             is_default_export,
             is_type_like: is_type_like(&meta.kind),
-            is_callgraph_entry_point: callgraph::is_entry_point(
-                scoped_name,
-                &meta.kind,
-                exported,
-                data.lang,
-            ),
+            is_callgraph_entry_point: meta.entry_point_attribute.is_some()
+                || callgraph::is_entry_point(scoped_name, &meta.kind, exported, data.lang),
         });
     }
 
