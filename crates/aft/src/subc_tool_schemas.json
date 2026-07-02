@@ -485,7 +485,8 @@
           "rust",
           "go",
           "pascal",
-          "r"
+          "r",
+          "objc"
         ]
       },
       "paths": {
@@ -537,7 +538,8 @@
           "rust",
           "go",
           "pascal",
-          "r"
+          "r",
+          "objc"
         ]
       },
       "paths": {
