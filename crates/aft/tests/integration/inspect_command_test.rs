@@ -1856,7 +1856,7 @@ fn inspect_command_dead_code_keeps_same_name_exports_distinct_after_tier2_run() 
 }
 
 #[test]
-fn inspect_command_dead_code_reports_unreachable_cycle_after_tier2_run() {
+fn inspect_command_dead_code_does_not_headline_product_referenced_cycle_after_tier2_run() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -1882,16 +1882,9 @@ fn inspect_command_dead_code_reports_unreachable_cycle_after_tier2_run() {
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let mut items = dead_code_items(&response);
-    items.sort();
-    assert_eq!(response["summary"]["dead_code"]["count"], 2);
-    assert_eq!(
-        items,
-        vec![
-            ("src/a.ts".to_string(), "a".to_string()),
-            ("src/b.ts".to_string(), "b".to_string()),
-        ]
-    );
+    assert_eq!(response["summary"]["dead_code"]["count"], 0);
+    assert_eq!(dead_code_items(&response), Vec::<(String, String)>::new());
+    assert_eq!(response["summary"]["dead_code"]["test_only_count"], 0);
 }
 
 #[test]

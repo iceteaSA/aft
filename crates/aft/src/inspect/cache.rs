@@ -122,7 +122,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// strongly connected module components.
 /// v23: TS/JS re-export verdicts collapse barrel aliases to canonical exports
 /// and carry non-counted re-export context on canonical findings.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 23;
+/// v24: TS/JS verdicts distinguish product references from test-only
+/// references so test-only usage moves out of headline dead/unused counts.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 24;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1825,7 +1827,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 23);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 24);
     }
 
     #[test]

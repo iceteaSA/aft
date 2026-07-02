@@ -521,6 +521,18 @@ fn build_inspect_payload(
                 category.as_str().to_string(),
                 details_for(*category, payload, top_k),
             );
+            if matches!(
+                *category,
+                InspectCategory::DeadCode | InspectCategory::UnusedExports
+            ) {
+                let test_only_detail = test_only_details_for(payload, top_k);
+                if test_only_detail
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+                {
+                    details.insert(format!("{}_test_only", category.as_str()), test_only_detail);
+                }
+            }
         } else if *category == InspectCategory::Diagnostics {
             // Diagnostics detail is always actionable — a bare count ("1 error")
             // can't be fixed without the message + location, and this category
@@ -748,15 +760,70 @@ fn render_symbol_category(
     let suffix = dead_code_language_suffix(section);
     if count == 0 {
         lines.push(format!("{label}: 0"));
+    } else {
+        lines.push(format!("{label}: {count}{suffix}:"));
+        if let Some(items) = category_items(summary, details, key) {
+            for item in items {
+                let file = item.get("file").and_then(Value::as_str).unwrap_or("?");
+                let symbol = item.get("symbol").and_then(Value::as_str).unwrap_or("?");
+                lines.push(format!("  {file}::{symbol}"));
+            }
+        }
+    }
+    render_test_only_usage(lines, summary, details, key);
+}
+
+fn render_test_only_usage(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+    key: &str,
+) {
+    let test_only_count = summary
+        .get(key)
+        .and_then(|section| section.get("test_only_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if test_only_count == 0 {
         return;
     }
-    lines.push(format!("{label}: {count}{suffix}:"));
-    if let Some(items) = category_items(summary, details, key) {
+    lines.push(format!("  test-only usage: {test_only_count}:"));
+    if let Some(items) = test_only_items(summary, details, key) {
         for item in items {
             let file = item.get("file").and_then(Value::as_str).unwrap_or("?");
             let symbol = item.get("symbol").and_then(Value::as_str).unwrap_or("?");
-            lines.push(format!("  {file}::{symbol}"));
+            let used_by = format_used_by_tests(item.get("used_by"));
+            lines.push(format!("    {file}::{symbol} — used by {used_by}"));
         }
+    }
+}
+
+fn test_only_items<'a>(
+    summary: &'a Map<String, Value>,
+    details: &'a Map<String, Value>,
+    key: &str,
+) -> Option<&'a Vec<Value>> {
+    details
+        .get(&format!("{key}_test_only"))
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .or_else(|| {
+            summary
+                .get(key)
+                .and_then(|s| s.get("test_only_top"))
+                .and_then(Value::as_array)
+        })
+}
+
+fn format_used_by_tests(value: Option<&Value>) -> String {
+    let names = value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if names.is_empty() {
+        "test file".to_string()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -1085,14 +1152,18 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
             } else {
                 serde_json::json!({
                     "count": count_from_payload(payload),
+                    "test_only_count": test_only_count_from_payload(payload),
                     "by_language": payload.and_then(|p| p.get("by_language")).cloned().unwrap_or_else(|| serde_json::json!({})),
                     "top": top_preview_from_payload(payload),
+                    "test_only_top": test_only_top_from_payload(payload),
                 })
             }
         }
         InspectCategory::UnusedExports => serde_json::json!({
             "count": count_from_payload(payload),
+            "test_only_count": test_only_count_from_payload(payload),
             "top": top_preview_from_payload(payload),
+            "test_only_top": test_only_top_from_payload(payload),
         }),
         InspectCategory::Duplicates => {
             let mut section = Map::new();
@@ -1213,6 +1284,16 @@ fn details_for(category: InspectCategory, payload: Option<&Value>, top_k: usize)
     }
 }
 
+fn test_only_details_for(payload: Option<&Value>, top_k: usize) -> Value {
+    let Some(payload) = payload else {
+        return serde_json::json!([]);
+    };
+    match payload.get("test_only_items").and_then(Value::as_array) {
+        Some(items) => Value::Array(items.iter().take(top_k).cloned().collect()),
+        None => serde_json::json!([]),
+    }
+}
+
 fn available_count_from_payload(category: InspectCategory, payload: &Value) -> Option<usize> {
     if category == InspectCategory::DeadCode
         && payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
@@ -1238,6 +1319,21 @@ fn count_from_payload(payload: Option<&Value>) -> u64 {
 fn top_preview_from_payload(payload: Option<&Value>) -> Value {
     payload
         .and_then(|payload| payload.get("top"))
+        .filter(|top| top.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
+}
+
+fn test_only_count_from_payload(payload: Option<&Value>) -> u64 {
+    payload
+        .and_then(|payload| payload.get("test_only_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn test_only_top_from_payload(payload: Option<&Value>) -> Value {
+    payload
+        .and_then(|payload| payload.get("test_only_top"))
         .filter(|top| top.is_array())
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]))
@@ -1530,6 +1626,54 @@ mod render_text_tests {
         assert!(
             !text.contains("[AFT"),
             "status bar must be plugin-appended:\n{text}"
+        );
+    }
+
+    #[test]
+    fn renders_test_only_usage_after_headline_items() {
+        let text = render_with_details(
+            serde_json::json!({
+                "dead_code": {
+                    "count": 1,
+                    "top": [ { "file": "src/api.ts", "symbol": "plantedDead" } ],
+                    "test_only_count": 2,
+                    "test_only_top": [
+                        { "file": "src/api.ts", "symbol": "testOnly", "used_by": ["api.test.ts"] },
+                    ],
+                },
+                "unused_exports": {
+                    "count": 0,
+                    "top": [],
+                    "test_only_count": 1,
+                    "test_only_top": [
+                        { "file": "src/barrel-target.ts", "symbol": "throughBarrel", "used_by": ["barrel.test.ts"] },
+                    ],
+                }
+            }),
+            serde_json::json!({
+                "dead_code": [ { "file": "src/api.ts", "symbol": "plantedDead" } ],
+                "dead_code_test_only": [
+                    { "file": "src/api.ts", "symbol": "testOnly", "used_by": ["api.test.ts"] },
+                    { "file": "src/barrel-target.ts", "symbol": "throughBarrel", "used_by": ["barrel.test.ts"] },
+                ],
+            }),
+        );
+
+        assert!(text.contains("Dead code: 1:"), "{text}");
+        assert!(text.contains("  src/api.ts::plantedDead"), "{text}");
+        assert!(text.contains("  test-only usage: 2:"), "{text}");
+        assert!(
+            text.contains("    src/api.ts::testOnly — used by api.test.ts"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    src/barrel-target.ts::throughBarrel — used by barrel.test.ts"),
+            "{text}"
+        );
+        assert!(text.contains("Unused exports: 0"), "{text}");
+        assert!(
+            text.contains("    src/barrel-target.ts::throughBarrel — used by barrel.test.ts"),
+            "{text}"
         );
     }
 

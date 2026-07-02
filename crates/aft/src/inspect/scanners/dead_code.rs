@@ -12,7 +12,7 @@ use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::{
-    is_test_support_file, CALLGRAPH_PROVENANCE_REEXPORT, DISPATCHED_CALLEE_SEPARATOR,
+    is_test_file, is_test_support_file, CALLGRAPH_PROVENANCE_REEXPORT, DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::inspect::oxc_engine::{
     analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
@@ -271,6 +271,8 @@ fn fallback_export_contributions_by_file(
                 line: export.line,
                 is_type_like: is_type_like_kind(&export.kind),
                 is_entry_point: false,
+                has_references: false,
+                test_only_reference_files: Vec::new(),
                 verdict: None,
                 reason: None,
                 provenance: None,
@@ -396,6 +398,8 @@ fn oxc_fact_export_contributions(facts: &FileFacts) -> Vec<ExportContribution> {
             line: export.line,
             is_type_like: export.is_type_only || is_type_like_kind(&export.kind),
             is_entry_point: false,
+            has_references: false,
+            test_only_reference_files: Vec::new(),
             verdict: None,
             reason: None,
             provenance: None,
@@ -413,6 +417,8 @@ fn oxc_export_contributions(file: &OxcFileVerdicts) -> Vec<ExportContribution> {
             line: export.line,
             is_type_like: is_type_like_kind(&export.kind),
             is_entry_point: matches!(export.verdict, LivenessVerdict::Used),
+            has_references: export.has_references,
+            test_only_reference_files: export.test_only_reference_files.clone(),
             verdict: Some(export.verdict),
             reason: Some(export.reason.clone()),
             provenance: Some(export.provenance.clone()),
@@ -721,6 +727,8 @@ fn aggregate_materialized_dead_code_contributions(
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
     let mut dead_items = Vec::new();
+    let mut test_only_count = 0usize;
+    let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items: Vec<serde_json::Value> = Vec::new();
     for contribution in parsed {
@@ -734,7 +742,24 @@ fn aggregate_materialized_dead_code_contributions(
         for export in &contribution.exports {
             if export_uses_oxc(export) {
                 match export.verdict.unwrap_or(LivenessVerdict::Unused) {
-                    LivenessVerdict::Used => continue,
+                    LivenessVerdict::Used => {
+                        if !is_test_file(&contribution.file)
+                            && !export.test_only_reference_files.is_empty()
+                        {
+                            test_only_count += 1;
+                            let mut item = json!({
+                                "file": contribution.file,
+                                "symbol": export.symbol,
+                                "kind": export.kind,
+                                "line": export.line,
+                                "provenance": export.provenance.as_deref().unwrap_or(OXC_PROVENANCE),
+                                "used_by": export.test_only_reference_files,
+                            });
+                            add_reexport_contexts(&mut item, &export.also_reexported);
+                            test_only_items.push(item);
+                        }
+                        continue;
+                    }
                     LivenessVerdict::Uncertain => {
                         uncertain_count += 1;
                         if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
@@ -751,7 +776,27 @@ fn aggregate_materialized_dead_code_contributions(
                         }
                         continue;
                     }
-                    LivenessVerdict::Unused => {}
+                    LivenessVerdict::Unused => {
+                        if !is_test_file(&contribution.file)
+                            && !export.test_only_reference_files.is_empty()
+                        {
+                            test_only_count += 1;
+                            let mut item = json!({
+                                "file": contribution.file,
+                                "symbol": export.symbol,
+                                "kind": export.kind,
+                                "line": export.line,
+                                "provenance": export.provenance.as_deref().unwrap_or(OXC_PROVENANCE),
+                                "used_by": export.test_only_reference_files,
+                            });
+                            add_reexport_contexts(&mut item, &export.also_reexported);
+                            test_only_items.push(item);
+                            continue;
+                        }
+                        if export.has_references {
+                            continue;
+                        }
+                    }
                 }
             } else {
                 let node = (contribution.file.clone(), export.symbol.clone());
@@ -793,14 +838,28 @@ fn aggregate_materialized_dead_code_contributions(
     let dead_items =
         crate::inspect::entry_points::rank_and_truncate_items(dead_items, roles, drill_down_limit);
     let top = crate::inspect::entry_points::top_preview_symbols(&dead_items);
+    let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
+        test_only_items,
+        roles,
+        drill_down_limit,
+    );
+    let test_only_top = test_only_items
+        .iter()
+        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
 
     let (parse_errors, skipped_files) = dead_code_honesty_fields(parsed);
     let mut aggregate = json!({
         "count": count,
         "items": dead_items,
         "top": top,
+        "test_only_count": test_only_count,
+        "test_only_items": test_only_items,
+        "test_only_top": test_only_top,
         "by_language": by_language,
         "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
         "callgraph_available": true,
@@ -2220,6 +2279,10 @@ struct ExportContribution {
     #[serde(default)]
     is_entry_point: bool,
     #[serde(default)]
+    has_references: bool,
+    #[serde(default)]
+    test_only_reference_files: Vec<String>,
+    #[serde(default)]
     verdict: Option<LivenessVerdict>,
     #[serde(default)]
     reason: Option<String>,
@@ -2380,6 +2443,198 @@ mod tests {
                 item.get("file").and_then(serde_json::Value::as_str) == Some(file)
                     && item.get("symbol").and_then(serde_json::Value::as_str) == Some(symbol)
             })
+    }
+
+    fn scan_success_with_oxc(job: InspectJob) -> InspectScanSuccess {
+        let options = AnalyzeOptions {
+            entry_points: job
+                .callgraph_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.entry_points.iter().cloned().collect())
+                .unwrap_or_default(),
+            public_api_files: Vec::new(),
+            force_reparse_files: Vec::new(),
+            entry_reachability: true,
+        };
+        let oxc_result =
+            crate::inspect::oxc_engine::analyze_files(&job.project_root, &job.scope_files, options)
+                .expect("oxc analyze succeeds");
+        run_dead_code_scan_with_oxc(&job, Some(&oxc_result))
+            .outcome
+            .expect("scan succeeds")
+    }
+
+    fn scan_with_oxc(job: InspectJob) -> serde_json::Value {
+        scan_success_with_oxc(job).aggregate
+    }
+
+    fn aggregate_item<'a>(
+        aggregate: &'a serde_json::Value,
+        file: &str,
+        symbol: &str,
+    ) -> Option<&'a serde_json::Value> {
+        aggregate["items"].as_array()?.iter().find(|item| {
+            item["file"].as_str() == Some(file) && item["symbol"].as_str() == Some(symbol)
+        })
+    }
+
+    fn aggregate_test_only_item<'a>(
+        aggregate: &'a serde_json::Value,
+        file: &str,
+        symbol: &str,
+    ) -> Option<&'a serde_json::Value> {
+        aggregate["test_only_items"]
+            .as_array()?
+            .iter()
+            .find(|item| {
+                item["file"].as_str() == Some(file) && item["symbol"].as_str() == Some(symbol)
+            })
+    }
+
+    #[test]
+    fn oxc_dead_code_splits_test_only_references_from_headline() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            ("package.json", r#"{"main":"src/main.ts"}"#),
+            (
+                "src/main.ts",
+                "import { productUsed } from './api';
+export function main() { productUsed(); }
+",
+            ),
+            (
+                "src/api.ts",
+                "export function testOnly() {}
+export function productUsed() {}
+",
+            ),
+            (
+                "src/dead.ts",
+                "export function plantedDead() {}
+",
+            ),
+            (
+                "src/api.test.ts",
+                "import { testOnly } from './api';
+testOnly();
+",
+            ),
+            (
+                "src/barrel-target.ts",
+                "export function throughBarrel() {}
+export function barrelDead() {}
+",
+            ),
+            (
+                "src/barrel.ts",
+                "export { throughBarrel } from './barrel-target';
+",
+            ),
+            (
+                "src/barrel.test.ts",
+                "import { throughBarrel } from './barrel';
+throughBarrel();
+",
+            ),
+        ]);
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let paths = paths
+            .into_iter()
+            .map(|path| fs::canonicalize(path).expect("canonical fixture path"))
+            .collect::<Vec<_>>();
+        let entry_points = BTreeSet::from([root.join("src/main.ts")]);
+        let graph = snapshot_with_entry_points(paths.clone(), Vec::new(), Vec::new(), entry_points);
+
+        let aggregate = scan_with_oxc(job(&root, paths, graph));
+
+        assert_eq!(aggregate["count"], 2, "{aggregate:#}");
+        assert!(aggregate_item(&aggregate, "src/dead.ts", "plantedDead").is_some());
+        assert!(aggregate_item(&aggregate, "src/barrel-target.ts", "barrelDead").is_some());
+        assert!(aggregate_item(&aggregate, "src/api.ts", "testOnly").is_none());
+        assert!(aggregate_item(&aggregate, "src/api.ts", "productUsed").is_none());
+        assert!(aggregate_item(&aggregate, "src/barrel-target.ts", "throughBarrel").is_none());
+
+        assert_eq!(aggregate["test_only_count"], 2, "{aggregate:#}");
+        assert_eq!(
+            aggregate_test_only_item(&aggregate, "src/api.ts", "testOnly")
+                .and_then(|item| item["used_by"].as_array())
+                .and_then(|items| items.first())
+                .and_then(serde_json::Value::as_str),
+            Some("api.test.ts")
+        );
+        assert_eq!(
+            aggregate_test_only_item(&aggregate, "src/barrel-target.ts", "throughBarrel")
+                .and_then(|item| item["used_by"].as_array())
+                .and_then(|items| items.first())
+                .and_then(serde_json::Value::as_str),
+            Some("barrel.test.ts")
+        );
+    }
+
+    #[test]
+    fn oxc_dead_code_test_file_edit_cached_rollup_matches_cold() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            (
+                "src/api.ts",
+                "export function testOnly() {}
+export function plantedDead() {}
+",
+            ),
+            (
+                "src/api.test.ts",
+                "import { testOnly } from './api';
+testOnly();
+",
+            ),
+        ]);
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let paths = paths
+            .into_iter()
+            .map(|path| fs::canonicalize(path).expect("canonical fixture path"))
+            .collect::<Vec<_>>();
+        let graph =
+            snapshot_with_entry_points(paths.clone(), Vec::new(), Vec::new(), BTreeSet::new());
+        let first = scan_success_with_oxc(job(&root, paths.clone(), graph.clone()));
+        assert_eq!(first.aggregate["count"], 1, "{:#}", first.aggregate);
+        assert_eq!(
+            first.aggregate["test_only_count"], 1,
+            "{:#}",
+            first.aggregate
+        );
+
+        fs::write(
+            root.join("src/api.test.ts"),
+            "console.log('import removed');
+",
+        )
+        .expect("edit test file");
+
+        let cold = scan_success_with_oxc(job(&root, paths.clone(), graph.clone()));
+        let changed_test = scan_success_with_oxc(job(
+            &root,
+            vec![root.join("src/api.test.ts")],
+            graph.clone(),
+        ));
+        let mut cached_contributions = first.contributions.clone();
+        for changed in changed_test.contributions {
+            let slot = cached_contributions
+                .iter_mut()
+                .find(|contribution| contribution.file_path == changed.file_path)
+                .expect("cached test contribution exists");
+            *slot = changed;
+        }
+        let roles = crate::inspect::entry_points::resolve_project_roles(&root);
+        let rolled_up = aggregate_dead_code_contributions_with_snapshot(
+            &root,
+            &graph,
+            &cached_contributions,
+            &collect_public_api_files(&root),
+            &roles,
+            Some(MAX_DRILL_DOWN_ITEMS),
+        );
+
+        assert_eq!(rolled_up, cold.aggregate);
+        assert_eq!(rolled_up["count"], 2, "{rolled_up:#}");
+        assert_eq!(rolled_up["test_only_count"], 0, "{rolled_up:#}");
     }
 
     #[test]

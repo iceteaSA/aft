@@ -224,6 +224,72 @@ fn oxc_engine_named_barrel_reexport_chain_marks_consumed_exports_used() {
 }
 
 #[test]
+fn oxc_engine_tracks_test_origin_references_on_canonical_exports() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/api.ts",
+            "export function testOnly() {}
+export function productUsed() {}
+export function plantedDead() {}
+",
+        ),
+        (
+            "src/use.ts",
+            "import { productUsed } from './api';
+productUsed();
+",
+        ),
+        (
+            "src/api.test.ts",
+            "import { testOnly } from './api';
+testOnly();
+",
+        ),
+        (
+            "src/barrel-target.ts",
+            "export function throughBarrel() {}
+",
+        ),
+        (
+            "src/barrel.ts",
+            "export { throughBarrel } from './barrel-target';
+",
+        ),
+        (
+            "src/barrel.test.ts",
+            "import { throughBarrel } from './barrel';
+throughBarrel();
+",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    let test_only = verdict(&result, "src/api.ts", "testOnly");
+    assert_eq!(test_only.verdict, LivenessVerdict::Used);
+    assert_eq!(test_only.test_only_reference_files, vec!["api.test.ts"]);
+    assert!(test_only.has_references);
+
+    let product_used = verdict(&result, "src/api.ts", "productUsed");
+    assert_eq!(product_used.verdict, LivenessVerdict::Used);
+    assert!(product_used.test_only_reference_files.is_empty());
+    assert!(product_used.has_references);
+
+    let planted_dead = verdict(&result, "src/api.ts", "plantedDead");
+    assert_eq!(planted_dead.verdict, LivenessVerdict::Unused);
+    assert!(planted_dead.test_only_reference_files.is_empty());
+    assert!(!planted_dead.has_references);
+
+    let through_barrel = verdict(&result, "src/barrel-target.ts", "throughBarrel");
+    assert_eq!(through_barrel.verdict, LivenessVerdict::Used);
+    assert_eq!(
+        through_barrel.test_only_reference_files,
+        vec!["barrel.test.ts"]
+    );
+    assert!(through_barrel.has_references);
+}
+
+#[test]
 fn oxc_engine_private_barrel_reexport_does_not_emit_binding_or_keep_target_live() {
     let (_temp, root, paths) = fixture_project(&[
         (

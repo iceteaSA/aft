@@ -235,6 +235,32 @@ fn aggregate_item<'a>(
     })
 }
 
+fn aggregate_test_only_item<'a>(
+    success: &'a InspectScanSuccess,
+    file: &str,
+    symbol: &str,
+) -> Option<&'a Value> {
+    success.aggregate["test_only_items"]
+        .as_array()?
+        .iter()
+        .find(|item| {
+            item["file"]
+                .as_str()
+                .is_some_and(|item_file| item_file.replace('\\', "/").ends_with(file))
+                && item["symbol"] == symbol
+        })
+}
+
+fn assert_used_by(item: &Value, basename: &str) {
+    let used_by = item["used_by"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing used_by on item: {item:#?}"));
+    assert!(
+        used_by.iter().any(|value| value.as_str() == Some(basename)),
+        "missing used_by basename {basename} in {used_by:#?}"
+    );
+}
+
 fn assert_reexport_context(item: &Value, file: &str, exported_name: &str) {
     let contexts = item["also_reexported"]
         .as_array()
@@ -285,6 +311,86 @@ fn inspect_unused_exports_oxc_reexport_alias_reports_canonical_once_with_context
         )
     });
     assert_reexport_context(item, "src/barrel.ts", "forwarded");
+}
+
+#[test]
+fn inspect_unused_exports_splits_test_only_references_from_headline() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("unused-test-only-tier");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "src/api.ts",
+        "export function testOnly() {}
+export function productUsed() {}
+export function plantedDead() {}
+",
+    );
+    write_file(
+        &root,
+        "src/use.ts",
+        "import { productUsed } from './api';
+productUsed();
+",
+    );
+    write_file(
+        &root,
+        "src/api.test.ts",
+        "import { testOnly } from './api';
+testOnly();
+",
+    );
+    write_file(
+        &root,
+        "src/barrel-target.ts",
+        "export function throughBarrel() {}
+export function barrelDead() {}
+",
+    );
+    write_file(
+        &root,
+        "src/barrel.ts",
+        "export { throughBarrel } from './barrel-target';
+",
+    );
+    write_file(
+        &root,
+        "src/barrel.test.ts",
+        "import { throughBarrel } from './barrel';
+throughBarrel();
+",
+    );
+
+    let manager = InspectManager::new();
+    let (success, _elapsed) = run_reuse_category(
+        &manager,
+        snapshot(&root, &temp_dir.path().join("unused-test-only-inspect")),
+        InspectCategory::UnusedExports,
+    );
+
+    assert_eq!(success.aggregate["count"], 2, "{:#}", success.aggregate);
+    assert!(
+        aggregate_item(&success, "src/api.ts", "plantedDead").is_some(),
+        "{:#}",
+        success.aggregate
+    );
+    assert!(aggregate_item(&success, "src/barrel-target.ts", "barrelDead").is_some());
+    assert!(aggregate_item(&success, "src/api.ts", "testOnly").is_none());
+    assert!(aggregate_item(&success, "src/api.ts", "productUsed").is_none());
+    assert!(aggregate_item(&success, "src/barrel-target.ts", "throughBarrel").is_none());
+
+    assert_eq!(
+        success.aggregate["test_only_count"], 2,
+        "{:#}",
+        success.aggregate
+    );
+    let test_only = aggregate_test_only_item(&success, "src/api.ts", "testOnly")
+        .unwrap_or_else(|| panic!("missing test-only item: {:#}", success.aggregate));
+    assert_used_by(test_only, "api.test.ts");
+    let through_barrel =
+        aggregate_test_only_item(&success, "src/barrel-target.ts", "throughBarrel")
+            .unwrap_or_else(|| panic!("missing barrel test-only item: {:#}", success.aggregate));
+    assert_used_by(through_barrel, "barrel.test.ts");
 }
 
 #[test]
@@ -1081,6 +1187,42 @@ fn assert_dead_code_incremental_matches_cold<S, E>(
 #[test]
 fn inspect_dead_code_incremental_facts_invariants_match_cold() {
     assert_dead_code_incremental_matches_cold(
+        "ts_test_only_import_removed",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/main.ts"}"#);
+            write_file(
+                root,
+                "src/main.ts",
+                "export function main() {}
+",
+            );
+            write_file(
+                root,
+                "src/api.ts",
+                "export function testOnly() {}
+export function plantedDead() {}
+",
+            );
+            write_file(
+                root,
+                "src/api.test.ts",
+                "import { testOnly } from './api';
+testOnly();
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/api.test.ts",
+                "console.log('import removed');
+",
+            );
+        },
+        &["src/api.test.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
         "ts_last_importer_removed",
         |root| {
             write_file(root, "package.json", r#"{"main":"src/main.ts"}"#);
@@ -1398,6 +1540,34 @@ fn inspect_dead_code_twice_cold_is_deterministic() {
 
 #[test]
 fn inspect_unused_exports_incremental_oxc_invariants_match_cold() {
+    assert_unused_exports_incremental_matches_cold(
+        "test_only_import_removed",
+        |root| {
+            write_file(
+                root,
+                "src/api.ts",
+                "export function testOnly() {}
+export function plantedDead() {}
+",
+            );
+            write_file(
+                root,
+                "src/api.test.ts",
+                "import { testOnly } from './api';
+testOnly();
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/api.test.ts",
+                "console.log('import removed');
+",
+            );
+        },
+    );
+
     assert_unused_exports_incremental_matches_cold(
         "last_importer_removed",
         |root| {

@@ -7,12 +7,51 @@ use super::types::{
     ExportFact, FileId, ImportKind, LivenessVerdict, OxcExportVerdict, OxcFileVerdicts,
     OxcReExportContext, ReExportKind, OXC_PROVENANCE,
 };
+use crate::inspect::job::is_test_file;
 
 #[derive(Debug, Clone)]
 struct ExportState {
     fact: ExportFact,
     status: ExportStatus,
     also_reexported: Vec<ReExportContextRef>,
+    reference_origins: ReferenceOrigins,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReferenceOrigins {
+    test_files: BTreeSet<String>,
+    has_non_test: bool,
+}
+
+impl ReferenceOrigins {
+    fn record(&mut self, origin: &ReferenceOrigin) {
+        match origin {
+            ReferenceOrigin::Test { basename } => {
+                self.test_files.insert(basename.clone());
+            }
+            ReferenceOrigin::NonTest => {
+                self.has_non_test = true;
+            }
+        }
+    }
+
+    fn has_references(&self) -> bool {
+        self.has_non_test || !self.test_files.is_empty()
+    }
+
+    fn test_only_files(&self) -> Vec<String> {
+        if self.has_non_test || self.test_files.is_empty() {
+            Vec::new()
+        } else {
+            self.test_files.iter().cloned().collect()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ReferenceOrigin {
+    Test { basename: String },
+    NonTest,
 }
 
 #[derive(Debug, Clone)]
@@ -181,8 +220,9 @@ pub fn compute_verdicts(
     public_api_files: &BTreeSet<PathBuf>,
     entry_reachability: bool,
 ) -> Vec<OxcFileVerdicts> {
-    let mut graph = GraphBuilder::new(modules, entry_points, public_api_files);
+    let mut graph = GraphBuilder::new(project_root, modules, entry_points, public_api_files);
     graph.apply_root_re_export_seeding();
+    graph.record_reference_origins();
     if entry_reachability {
         graph.apply_entry_reachability();
     } else {
@@ -198,10 +238,12 @@ struct GraphBuilder<'a> {
     states: Vec<ModuleState>,
     root_modules: BTreeSet<usize>,
     forwarding: ForwardingMap,
+    reference_origins_by_module: Vec<ReferenceOrigin>,
 }
 
 impl<'a> GraphBuilder<'a> {
     fn new(
+        project_root: &Path,
         modules: &'a [ResolvedModule],
         entry_points: &BTreeSet<PathBuf>,
         public_api_files: &BTreeSet<PathBuf>,
@@ -219,6 +261,7 @@ impl<'a> GraphBuilder<'a> {
                         fact,
                         status: ExportStatus::Unused,
                         also_reexported: Vec::new(),
+                        reference_origins: ReferenceOrigins::default(),
                     })
                     .collect::<Vec<_>>();
 
@@ -230,19 +273,25 @@ impl<'a> GraphBuilder<'a> {
                     || public_api_files.contains(&module.facts.path)
                 {
                     root_modules.insert(module.facts.file_id.0);
+                    let origin = ReferenceOrigin::NonTest;
                     for export in &mut state.exports {
-                        mark_used(export, "entry_point");
+                        mark_used(export, "entry_point", &origin);
                     }
                 }
                 state
             })
             .collect::<Vec<_>>();
         let forwarding = ForwardingMap::new(modules);
+        let reference_origins_by_module = modules
+            .iter()
+            .map(|module| reference_origin_for_path(project_root, &module.facts.path))
+            .collect();
         let mut graph = Self {
             modules,
             states,
             root_modules,
             forwarding,
+            reference_origins_by_module,
         };
         graph.attach_reexport_contexts();
         graph
@@ -292,6 +341,66 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
+    fn record_reference_origins(&mut self) {
+        for (idx, module) in self.modules.iter().enumerate() {
+            let origin = self.reference_origin_for_module(idx);
+            for import in &module.imports {
+                let Some(target) = import.target else {
+                    continue;
+                };
+                if !import_binding_is_used(module, import) {
+                    continue;
+                }
+                match import.fact.kind {
+                    ImportKind::Named => {
+                        if let Some(name) = import.fact.imported_name.as_deref() {
+                            let mut visited = BTreeSet::new();
+                            self.record_imported_name_reference(
+                                target,
+                                name,
+                                &origin,
+                                &mut visited,
+                            );
+                        }
+                    }
+                    ImportKind::Default => {
+                        let mut visited = BTreeSet::new();
+                        self.record_imported_name_reference(
+                            target,
+                            "default",
+                            &origin,
+                            &mut visited,
+                        );
+                    }
+                    ImportKind::Namespace | ImportKind::SideEffect => {}
+                }
+            }
+        }
+    }
+
+    fn record_imported_name_reference(
+        &mut self,
+        target: FileId,
+        name: &str,
+        origin: &ReferenceOrigin,
+        visited: &mut BTreeSet<(usize, String)>,
+    ) {
+        let resolution = self.resolve_export_name(target, name, visited);
+        self.record_resolution_reference_origin(resolution, origin);
+    }
+
+    fn record_resolution_reference_origin(
+        &mut self,
+        resolution: ResolutionSet,
+        origin: &ReferenceOrigin,
+    ) {
+        for canonical in resolution.canonical {
+            if let Some(export) = self.export_state_mut(&canonical) {
+                export.reference_origins.record(origin);
+            }
+        }
+    }
+
     fn apply_same_file_references(&mut self) {
         for idx in 0..self.modules.len() {
             self.apply_same_file_references_for_module(idx);
@@ -311,6 +420,7 @@ impl<'a> GraphBuilder<'a> {
         let Some(module) = self.modules.get(idx) else {
             return;
         };
+        let origin = self.reference_origin_for_module(idx);
         if module.facts.same_file_value_references.is_empty() {
             return;
         }
@@ -322,7 +432,7 @@ impl<'a> GraphBuilder<'a> {
                 continue;
             };
             if module.facts.same_file_value_references.contains(local_name)
-                && mark_used(export, "same_file_value_reference")
+                && mark_used(export, "same_file_value_reference", &origin)
             {
                 newly_live_modules.insert(idx);
             }
@@ -335,10 +445,12 @@ impl<'a> GraphBuilder<'a> {
             let mut newly_live_modules = BTreeSet::new();
             let mut visited_files = BTreeSet::new();
             let visible = self.visible_export_resolutions(FileId(root), true, &mut visited_files);
+            let origin = ReferenceOrigin::NonTest;
             for resolution in visible.values() {
                 self.mark_resolution_used_or_uncertain(
                     resolution.clone(),
                     "entry_point",
+                    &origin,
                     &mut newly_live_modules,
                 );
             }
@@ -357,6 +469,7 @@ impl<'a> GraphBuilder<'a> {
             let Some(module) = self.modules.get(module_idx).cloned() else {
                 continue;
             };
+            let origin = self.reference_origin_for_module(module_idx);
 
             for import in &module.imports {
                 let Some(target) = import.target else {
@@ -376,6 +489,7 @@ impl<'a> GraphBuilder<'a> {
                                 target,
                                 name,
                                 "import",
+                                &origin,
                                 &mut visited,
                                 &mut newly_live_modules,
                             );
@@ -387,6 +501,7 @@ impl<'a> GraphBuilder<'a> {
                             target,
                             "default",
                             "import",
+                            &origin,
                             &mut visited,
                             &mut newly_live_modules,
                         );
@@ -430,7 +545,8 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn apply_imports(&mut self) {
-        for module in self.modules {
+        for (idx, module) in self.modules.iter().enumerate() {
+            let origin = self.reference_origin_for_module(idx);
             for import in &module.imports {
                 let Some(target) = import.target else {
                     continue;
@@ -442,12 +558,12 @@ impl<'a> GraphBuilder<'a> {
                     ImportKind::Named => {
                         if let Some(name) = import.fact.imported_name.as_deref() {
                             let mut visited = BTreeSet::new();
-                            self.mark_imported_name(target, name, "import", &mut visited);
+                            self.mark_imported_name(target, name, "import", &origin, &mut visited);
                         }
                     }
                     ImportKind::Default => {
                         let mut visited = BTreeSet::new();
-                        self.mark_imported_name(target, "default", "import", &mut visited);
+                        self.mark_imported_name(target, "default", "import", &origin, &mut visited);
                     }
                     ImportKind::Namespace => {
                         let mut visited = BTreeSet::new();
@@ -481,10 +597,18 @@ impl<'a> GraphBuilder<'a> {
         target: FileId,
         name: &str,
         reason: &str,
+        origin: &ReferenceOrigin,
         visited: &mut BTreeSet<(usize, String)>,
     ) {
         let mut newly_live_modules = BTreeSet::new();
-        self.mark_imported_name_collect(target, name, reason, visited, &mut newly_live_modules);
+        self.mark_imported_name_collect(
+            target,
+            name,
+            reason,
+            origin,
+            visited,
+            &mut newly_live_modules,
+        );
     }
 
     fn mark_imported_name_collect(
@@ -492,11 +616,12 @@ impl<'a> GraphBuilder<'a> {
         target: FileId,
         name: &str,
         reason: &str,
+        origin: &ReferenceOrigin,
         visited: &mut BTreeSet<(usize, String)>,
         newly_live_modules: &mut BTreeSet<usize>,
     ) {
         let resolution = self.resolve_export_name(target, name, visited);
-        self.mark_resolution_used_or_uncertain(resolution, reason, newly_live_modules);
+        self.mark_resolution_used_or_uncertain(resolution, reason, origin, newly_live_modules);
     }
 
     fn mark_all_uncertain(&mut self, target: FileId, reason: &str, visited: &mut BTreeSet<usize>) {
@@ -530,10 +655,11 @@ impl<'a> GraphBuilder<'a> {
         &mut self,
         resolution: ResolutionSet,
         reason: &str,
+        origin: &ReferenceOrigin,
         newly_live_modules: &mut BTreeSet<usize>,
     ) {
         if let Some(canonical) = resolution.single_canonical().cloned() {
-            self.mark_canonical_used(&canonical, reason, newly_live_modules);
+            self.mark_canonical_used(&canonical, reason, origin, newly_live_modules);
             return;
         }
         self.mark_resolution_uncertain(resolution, reason, newly_live_modules);
@@ -578,10 +704,11 @@ impl<'a> GraphBuilder<'a> {
         &mut self,
         canonical: &SymbolKey,
         reason: &str,
+        origin: &ReferenceOrigin,
         newly_live_modules: &mut BTreeSet<usize>,
     ) {
         if let Some(export) = self.export_state_mut(canonical) {
-            if mark_used(export, reason) {
+            if mark_used(export, reason, origin) {
                 newly_live_modules.insert(canonical.file_id.0);
             }
         }
@@ -745,6 +872,13 @@ impl<'a> GraphBuilder<'a> {
         })
     }
 
+    fn reference_origin_for_module(&self, idx: usize) -> ReferenceOrigin {
+        self.reference_origins_by_module
+            .get(idx)
+            .cloned()
+            .unwrap_or(ReferenceOrigin::NonTest)
+    }
+
     fn export_state_mut(&mut self, key: &SymbolKey) -> Option<&mut ExportState> {
         self.states.get_mut(key.file_id.0).and_then(|state| {
             state
@@ -778,6 +912,8 @@ impl<'a> GraphBuilder<'a> {
                             verdict,
                             reason,
                             provenance: OXC_PROVENANCE.to_string(),
+                            has_references: export.reference_origins.has_references(),
+                            test_only_reference_files: export.reference_origins.test_only_files(),
                             also_reexported: export
                                 .also_reexported
                                 .into_iter()
@@ -840,7 +976,8 @@ fn import_binding_is_used(module: &ResolvedModule, import: &ResolvedImport) -> b
     }
 }
 
-fn mark_used(export: &mut ExportState, reason: &str) -> bool {
+fn mark_used(export: &mut ExportState, reason: &str, origin: &ReferenceOrigin) -> bool {
+    export.reference_origins.record(origin);
     match export.status {
         ExportStatus::Used(_) => false,
         ExportStatus::Uncertain(_) => {
@@ -860,6 +997,19 @@ fn mark_uncertain(export: &mut ExportState, reason: &str) -> bool {
         true
     } else {
         false
+    }
+}
+
+fn reference_origin_for_path(project_root: &Path, path: &Path) -> ReferenceOrigin {
+    let relative = relative_string(project_root, path);
+    if is_test_file(&relative) {
+        let basename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or(relative);
+        ReferenceOrigin::Test { basename }
+    } else {
+        ReferenceOrigin::NonTest
     }
 }
 

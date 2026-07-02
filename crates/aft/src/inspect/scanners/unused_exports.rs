@@ -10,7 +10,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::cache_freshness;
 use crate::imports::{parse_file_imports, specifier_imported_name, ImportBlock, ImportStatement};
-use crate::inspect::job::is_test_support_file;
+use crate::inspect::job::{is_test_file, is_test_support_file};
 use crate::inspect::oxc_engine::{
     ExportFact, FileFacts, LivenessVerdict, OxcEngineError, OxcEngineResult, FACTS_FORMAT_VERSION,
     OXC_PROVENANCE,
@@ -122,6 +122,8 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
 
     let mut count = 0usize;
     let mut items = Vec::new();
+    let test_only_count = 0usize;
+    let test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
     for scan in &per_file {
@@ -181,6 +183,16 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
         Some(DRILL_DOWN_LIMIT),
     );
     let top = crate::inspect::entry_points::top_preview_symbols(&items);
+    let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
+        test_only_items,
+        &roles,
+        Some(DRILL_DOWN_LIMIT),
+    );
+    let test_only_top = test_only_items
+        .iter()
+        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
 
     let languages_skipped = per_file
         .iter()
@@ -193,7 +205,11 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
         "count": count,
         "items": items,
         "top": top,
+        "test_only_count": test_only_count,
+        "test_only_items": test_only_items,
+        "test_only_top": test_only_top,
         "drill_down_capped": count > DRILL_DOWN_LIMIT,
+        "test_only_drill_down_capped": test_only_count > DRILL_DOWN_LIMIT,
         "scanned_files": per_file.len(),
         "languages_skipped": languages_skipped,
         "uncertain_count": uncertain_count,
@@ -245,6 +261,8 @@ fn run_unused_exports_oxc_scan(
     let mut contributions = Vec::new();
     let mut count = 0usize;
     let mut items = Vec::new();
+    let mut test_only_count = 0usize;
+    let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
 
@@ -268,7 +286,23 @@ fn run_unused_exports_oxc_scan(
 
         for export in &file.exports {
             match export.verdict {
-                LivenessVerdict::Used => {}
+                LivenessVerdict::Used => {
+                    if !is_test_file(&file.relative_file)
+                        && !export.test_only_reference_files.is_empty()
+                    {
+                        test_only_count += 1;
+                        let mut item = json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "provenance": export.provenance,
+                            "used_by": export.test_only_reference_files,
+                        });
+                        add_reexport_contexts(&mut item, &export.also_reexported);
+                        test_only_items.push(item);
+                    }
+                }
                 LivenessVerdict::Uncertain => {
                     uncertain_count += 1;
                     if uncertain_items.len() < DRILL_DOWN_LIMIT {
@@ -285,6 +319,25 @@ fn run_unused_exports_oxc_scan(
                     }
                 }
                 LivenessVerdict::Unused => {
+                    if !is_test_file(&file.relative_file)
+                        && !export.test_only_reference_files.is_empty()
+                    {
+                        test_only_count += 1;
+                        let mut item = json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "provenance": export.provenance,
+                            "used_by": export.test_only_reference_files,
+                        });
+                        add_reexport_contexts(&mut item, &export.also_reexported);
+                        test_only_items.push(item);
+                        continue;
+                    }
+                    if export.has_references {
+                        continue;
+                    }
                     count += 1;
                     let mut item = json!({
                         "file": file.relative_file,
@@ -329,11 +382,25 @@ fn run_unused_exports_oxc_scan(
         Some(DRILL_DOWN_LIMIT),
     );
     let top = crate::inspect::entry_points::top_preview_symbols(&items);
+    let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
+        test_only_items,
+        &roles,
+        Some(DRILL_DOWN_LIMIT),
+    );
+    let test_only_top = test_only_items
+        .iter()
+        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
     let mut aggregate = json!({
         "count": count,
         "items": items,
         "top": top,
+        "test_only_count": test_only_count,
+        "test_only_items": test_only_items,
+        "test_only_top": test_only_top,
         "drill_down_capped": count > DRILL_DOWN_LIMIT,
+        "test_only_drill_down_capped": test_only_count > DRILL_DOWN_LIMIT,
         "scanned_files": contributions.len(),
         "languages_skipped": languages_skipped,
         "uncertain_count": uncertain_count,

@@ -12,7 +12,7 @@ use super::cache::{InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
-    normalize_path, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
+    is_test_file, normalize_path, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
     InspectResult, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
 use super::oxc_engine::LivenessVerdict;
@@ -2009,6 +2009,8 @@ fn roll_up_unused_exports_contributions(
 
     let mut count = 0usize;
     let mut items = Vec::new();
+    let test_only_count = 0usize;
+    let test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
     for scan in &parsed {
@@ -2087,13 +2089,24 @@ fn roll_up_unused_exports_contributions(
     let roles = super::entry_points::resolve_project_roles(&job.project_root);
     let items = super::entry_points::rank_and_truncate_items(items, &roles, drill_down_limit);
     let top = super::entry_points::top_preview_symbols(&items);
+    let test_only_items =
+        super::entry_points::rank_and_truncate_items(test_only_items, &roles, drill_down_limit);
+    let test_only_top = test_only_items
+        .iter()
+        .take(super::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
 
     let (parse_errors, skipped_files) = unused_exports_honesty_fields(&parsed);
     let mut aggregate = json!({
         "count": count,
         "items": items,
         "top": top,
+        "test_only_count": test_only_count,
+        "test_only_items": test_only_items,
+        "test_only_top": test_only_top,
         "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
         "uncertain_count": uncertain_count,
@@ -2157,6 +2170,8 @@ fn roll_up_unused_exports_oxc_contributions(
 
     let mut count = 0usize;
     let mut items = Vec::new();
+    let mut test_only_count = 0usize;
+    let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
     for file in &oxc_result.files {
@@ -2168,7 +2183,23 @@ fn roll_up_unused_exports_oxc_contributions(
 
         for export in &file.exports {
             match export.verdict {
-                LivenessVerdict::Used => {}
+                LivenessVerdict::Used => {
+                    if !is_test_file(&file.relative_file)
+                        && !export.test_only_reference_files.is_empty()
+                    {
+                        test_only_count += 1;
+                        let mut item = json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "provenance": export.provenance,
+                            "used_by": export.test_only_reference_files,
+                        });
+                        add_oxc_reexport_contexts(&mut item, &export.also_reexported);
+                        test_only_items.push(item);
+                    }
+                }
                 LivenessVerdict::Uncertain => {
                     uncertain_count += 1;
                     if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
@@ -2185,6 +2216,25 @@ fn roll_up_unused_exports_oxc_contributions(
                     }
                 }
                 LivenessVerdict::Unused => {
+                    if !is_test_file(&file.relative_file)
+                        && !export.test_only_reference_files.is_empty()
+                    {
+                        test_only_count += 1;
+                        let mut item = json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "provenance": export.provenance,
+                            "used_by": export.test_only_reference_files,
+                        });
+                        add_oxc_reexport_contexts(&mut item, &export.also_reexported);
+                        test_only_items.push(item);
+                        continue;
+                    }
+                    if export.has_references {
+                        continue;
+                    }
                     count += 1;
                     let mut item = json!({
                         "file": file.relative_file,
@@ -2202,6 +2252,13 @@ fn roll_up_unused_exports_oxc_contributions(
 
     let items = super::entry_points::rank_and_truncate_items(items, &roles, drill_down_limit);
     let top = super::entry_points::top_preview_symbols(&items);
+    let test_only_items =
+        super::entry_points::rank_and_truncate_items(test_only_items, &roles, drill_down_limit);
+    let test_only_top = test_only_items
+        .iter()
+        .take(super::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
     let (mut parse_errors, skipped_files) = unused_exports_honesty_fields(parsed);
     for scan in parsed {
         if let Some(oxc_facts) = &scan.oxc_facts {
@@ -2221,7 +2278,11 @@ fn roll_up_unused_exports_oxc_contributions(
         "count": count,
         "items": items,
         "top": top,
+        "test_only_count": test_only_count,
+        "test_only_items": test_only_items,
+        "test_only_top": test_only_top,
         "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
         "uncertain_count": uncertain_count,

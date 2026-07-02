@@ -150,6 +150,10 @@ pub struct OxcReExportContext {
     pub exported_name: String,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OxcExportVerdict {
     pub symbol: String,
@@ -158,6 +162,10 @@ pub struct OxcExportVerdict {
     pub verdict: LivenessVerdict,
     pub reason: String,
     pub provenance: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_references: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_only_reference_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also_reexported: Vec<OxcReExportContext>,
 }
