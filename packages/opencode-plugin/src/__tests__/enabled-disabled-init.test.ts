@@ -57,8 +57,15 @@ describe.serial("OpenCode enabled config toggle", () => {
     expect(surface.tool).toEqual({});
     expect(findBinarySpy).not.toHaveBeenCalled();
     expect(createPoolSpy).not.toHaveBeenCalled();
-    await new Promise((resolve) => setTimeout(resolve, 600));
-    const logText = existsSync(logFile) ? readFileSync(logFile, "utf8") : "";
+    // The logger buffers writes behind a 500ms flush timer, so a fixed sleep
+    // races it under CI load. Poll with a generous deadline instead.
+    const deadline = Date.now() + 10_000;
+    let logText = "";
+    while (Date.now() < deadline) {
+      logText = existsSync(logFile) ? readFileSync(logFile, "utf8") : "";
+      if (logText.includes(`AFT disabled by config for ${projectDir}`)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     expect(logText).toContain(`AFT disabled by config for ${projectDir}`);
   });
 });
