@@ -120,7 +120,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// externally-invoked functions such as Tauri commands and ABI exports.
 /// v22: cycles persists TS/JS resolved import-edge facts and rolls them up into
 /// strongly connected module components.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 22;
+/// v23: TS/JS re-export verdicts collapse barrel aliases to canonical exports
+/// and carry non-counted re-export context on canonical findings.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 23;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1823,7 +1825,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 22);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 23);
     }
 
     #[test]

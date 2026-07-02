@@ -2172,25 +2172,29 @@ fn roll_up_unused_exports_oxc_contributions(
                 LivenessVerdict::Uncertain => {
                     uncertain_count += 1;
                     if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
-                        uncertain_items.push(json!({
+                        let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
                             "kind": export.kind,
                             "line": export.line,
                             "reason": export.reason,
                             "provenance": export.provenance,
-                        }));
+                        });
+                        add_oxc_reexport_contexts(&mut item, &export.also_reexported);
+                        uncertain_items.push(item);
                     }
                 }
                 LivenessVerdict::Unused => {
                     count += 1;
-                    items.push(json!({
+                    let mut item = json!({
                         "file": file.relative_file,
                         "symbol": export.symbol,
                         "kind": export.kind,
                         "line": export.line,
                         "provenance": export.provenance,
-                    }));
+                    });
+                    add_oxc_reexport_contexts(&mut item, &export.also_reexported);
+                    items.push(item);
                 }
             }
         }
@@ -2234,6 +2238,15 @@ fn roll_up_unused_exports_oxc_contributions(
         aggregate["note"] = Value::String(package_warnings.join("; "));
     }
     aggregate
+}
+
+fn add_oxc_reexport_contexts(
+    item: &mut Value,
+    contexts: &[crate::inspect::oxc_engine::OxcReExportContext],
+) {
+    if !contexts.is_empty() {
+        item["also_reexported"] = json!(contexts);
+    }
 }
 
 fn unused_exports_honesty_fields(parsed: &[UnusedExportsContribution]) -> (Vec<Value>, Vec<Value>) {

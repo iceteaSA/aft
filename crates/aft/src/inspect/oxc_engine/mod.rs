@@ -24,8 +24,8 @@ use resolver::{normalize_path, ModuleResolver};
 pub use types::{
     DynamicImportFact, ExportFact, ExportName, FileFacts, FileId, ImportFact, ImportKind,
     LivenessVerdict, OxcEngineError, OxcEngineResult, OxcEngineStats, OxcExportVerdict,
-    OxcFileVerdicts, OxcResolvedEdge, ReExportFact, ReExportKind, ResolverConfigInput,
-    OXC_PROVENANCE,
+    OxcFileVerdicts, OxcReExportContext, OxcResolvedEdge, ReExportFact, ReExportKind,
+    ResolverConfigInput, OXC_PROVENANCE,
 };
 
 pub(crate) const FACTS_FORMAT_VERSION: u32 = 3;

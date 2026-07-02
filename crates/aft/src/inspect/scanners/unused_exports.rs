@@ -272,25 +272,29 @@ fn run_unused_exports_oxc_scan(
                 LivenessVerdict::Uncertain => {
                     uncertain_count += 1;
                     if uncertain_items.len() < DRILL_DOWN_LIMIT {
-                        uncertain_items.push(json!({
+                        let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
                             "kind": export.kind,
                             "line": export.line,
                             "reason": export.reason,
                             "provenance": export.provenance,
-                        }));
+                        });
+                        add_reexport_contexts(&mut item, &export.also_reexported);
+                        uncertain_items.push(item);
                     }
                 }
                 LivenessVerdict::Unused => {
                     count += 1;
-                    items.push(json!({
+                    let mut item = json!({
                         "file": file.relative_file,
                         "symbol": export.symbol,
                         "kind": export.kind,
                         "line": export.line,
                         "provenance": export.provenance,
-                    }));
+                    });
+                    add_reexport_contexts(&mut item, &export.also_reexported);
+                    items.push(item);
                 }
             }
         }
@@ -350,6 +354,15 @@ fn run_unused_exports_oxc_scan(
         aggregate,
     };
     InspectResult::success(job, success, started.elapsed())
+}
+
+fn add_reexport_contexts(
+    item: &mut Value,
+    contexts: &[crate::inspect::oxc_engine::OxcReExportContext],
+) {
+    if !contexts.is_empty() {
+        item["also_reexported"] = json!(contexts);
+    }
 }
 
 fn oxc_unused_exports_contribution(

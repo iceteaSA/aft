@@ -34,6 +34,15 @@ fn analyze(root: &Path, paths: &[PathBuf]) -> OxcEngineResult {
         .expect("oxc analyze succeeds")
 }
 
+fn analyze_with_options(
+    root: &Path,
+    paths: &[PathBuf],
+    options: AnalyzeOptions,
+) -> OxcEngineResult {
+    let mut cache = OxcFactsCache::new();
+    analyze_files_with_cache(root, paths, options, &mut cache).expect("oxc analyze succeeds")
+}
+
 fn verdict<'a>(result: &'a OxcEngineResult, file: &str, symbol: &str) -> &'a OxcExportVerdict {
     result
         .files
@@ -46,12 +55,45 @@ fn verdict<'a>(result: &'a OxcEngineResult, file: &str, symbol: &str) -> &'a Oxc
         .unwrap_or_else(|| panic!("missing export {file}:{symbol}: {:#?}", result.files))
 }
 
+fn assert_no_verdict(result: &OxcEngineResult, file: &str, symbol: &str) {
+    let file_verdicts = result
+        .files
+        .iter()
+        .find(|item| item.relative_file == file)
+        .unwrap_or_else(|| panic!("missing file verdicts for {file}: {:#?}", result.files));
+    assert!(
+        !file_verdicts
+            .exports
+            .iter()
+            .any(|export| export.symbol == symbol),
+        "re-export binding {file}:{symbol} should not be emitted as its own verdict: {:#?}",
+        file_verdicts.exports
+    );
+}
+
 fn assert_verdict(result: &OxcEngineResult, file: &str, symbol: &str, expected: LivenessVerdict) {
     assert_eq!(
         verdict(result, file, symbol).verdict,
         expected,
         "unexpected verdict for {file}:{symbol}: {:#?}",
         verdict(result, file, symbol)
+    );
+}
+
+fn assert_reexport_context(
+    result: &OxcEngineResult,
+    file: &str,
+    symbol: &str,
+    barrel_file: &str,
+    exported_name: &str,
+) {
+    let verdict = verdict(result, file, symbol);
+    assert!(
+        verdict.also_reexported.iter().any(|context| {
+            context.file == barrel_file && context.exported_name == exported_name
+        }),
+        "missing re-export context {barrel_file}:{exported_name} on {file}:{symbol}: {:#?}",
+        verdict.also_reexported
     );
 }
 
@@ -177,6 +219,103 @@ fn oxc_engine_named_barrel_reexport_chain_marks_consumed_exports_used() {
         "deadOne",
         LivenessVerdict::Unused,
     );
+    assert_no_verdict(&result, "src/feature/index.ts", "enforceProjectCap");
+    assert_no_verdict(&result, "src/feature/index.ts", "upsertCommits");
+}
+
+#[test]
+fn oxc_engine_private_barrel_reexport_does_not_emit_binding_or_keep_target_live() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/target.ts",
+            "export const forwarded = 1;\nexport const localOnly = 2;\n",
+        ),
+        ("src/barrel.ts", "export { forwarded } from './target';\n"),
+        ("src/main.ts", "console.log('no barrel consumer');\n"),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_no_verdict(&result, "src/barrel.ts", "forwarded");
+    assert_verdict(
+        &result,
+        "src/target.ts",
+        "forwarded",
+        LivenessVerdict::Unused,
+    );
+    assert_verdict(
+        &result,
+        "src/target.ts",
+        "localOnly",
+        LivenessVerdict::Unused,
+    );
+    assert_reexport_context(
+        &result,
+        "src/target.ts",
+        "forwarded",
+        "src/barrel.ts",
+        "forwarded",
+    );
+}
+
+#[test]
+fn oxc_engine_private_barrel_reexport_does_not_duplicate_direct_submodule_import() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/target.ts",
+            "export const forwarded = 1;\nexport const unused = 2;\n",
+        ),
+        ("src/barrel.ts", "export { forwarded } from './target';\n"),
+        (
+            "src/main.ts",
+            "import { forwarded } from './target';\nconsole.log(forwarded);\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_no_verdict(&result, "src/barrel.ts", "forwarded");
+    assert_verdict(&result, "src/target.ts", "forwarded", LivenessVerdict::Used);
+    assert_verdict(&result, "src/target.ts", "unused", LivenessVerdict::Unused);
+}
+
+#[test]
+fn oxc_engine_renamed_and_default_reexports_collapse_to_canonical_exports() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/target.ts",
+            "export const original = 1;\nexport default function def() { return original; }\n",
+        ),
+        (
+            "src/barrel.ts",
+            "export { original as renamed, default as DefaultThing } from './target';\n",
+        ),
+        (
+            "src/main.ts",
+            "import { renamed, DefaultThing } from './barrel';\nconsole.log(renamed, DefaultThing);\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_no_verdict(&result, "src/barrel.ts", "renamed");
+    assert_no_verdict(&result, "src/barrel.ts", "DefaultThing");
+    assert_verdict(&result, "src/target.ts", "original", LivenessVerdict::Used);
+    assert_verdict(&result, "src/target.ts", "default", LivenessVerdict::Used);
+    assert_reexport_context(
+        &result,
+        "src/target.ts",
+        "original",
+        "src/barrel.ts",
+        "renamed",
+    );
+    assert_reexport_context(
+        &result,
+        "src/target.ts",
+        "default",
+        "src/barrel.ts",
+        "DefaultThing",
+    );
 }
 
 #[test]
@@ -198,6 +337,8 @@ fn oxc_engine_multiline_type_barrel_preserves_type_import_consumption() {
 
     let result = analyze(&root, &paths);
 
+    assert_no_verdict(&result, "src/feature/index.ts", "StoredThing");
+    assert_no_verdict(&result, "src/feature/index.ts", "enforceProjectCap");
     assert_verdict(
         &result,
         "src/feature/storage.ts",
@@ -219,7 +360,7 @@ fn oxc_engine_multiline_type_barrel_preserves_type_import_consumption() {
 }
 
 #[test]
-fn oxc_engine_star_reexport_preserves_wildcard_uncertainty_floor() {
+fn oxc_engine_star_reexport_collapses_named_import_without_wildcard_floor() {
     let (_temp, root, paths) = fixture_project(&[
         (
             "src/feature/storage.ts",
@@ -234,6 +375,7 @@ fn oxc_engine_star_reexport_preserves_wildcard_uncertainty_floor() {
 
     let result = analyze(&root, &paths);
 
+    assert_no_verdict(&result, "src/feature/index.ts", "storage");
     assert_verdict(
         &result,
         "src/feature/storage.ts",
@@ -244,12 +386,97 @@ fn oxc_engine_star_reexport_preserves_wildcard_uncertainty_floor() {
         &result,
         "src/feature/storage.ts",
         "deadOne",
-        LivenessVerdict::Uncertain,
+        LivenessVerdict::Unused,
     );
-    assert_eq!(
-        verdict(&result, "src/feature/storage.ts", "deadOne").reason,
-        "wildcard_import"
+    assert_no_verdict(&result, "src/feature/index.ts", "enforceProjectCap");
+    assert_reexport_context(
+        &result,
+        "src/feature/storage.ts",
+        "deadOne",
+        "src/feature/index.ts",
+        "deadOne",
     );
+}
+
+#[test]
+fn oxc_engine_public_barrel_reexports_seed_canonical_liveness() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/target.ts",
+            "export const named = 1;\nexport const privateOnly = 2;\n",
+        ),
+        ("src/star.ts", "export const star = 1;\n"),
+        (
+            "src/index.ts",
+            "export { named } from './target';\nexport * from './star';\n",
+        ),
+    ]);
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            public_api_files: vec![root.join("src/index.ts")],
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_no_verdict(&result, "src/index.ts", "named");
+    assert_no_verdict(&result, "src/index.ts", "star");
+    assert_verdict(&result, "src/target.ts", "named", LivenessVerdict::Used);
+    assert_verdict(
+        &result,
+        "src/target.ts",
+        "privateOnly",
+        LivenessVerdict::Unused,
+    );
+    assert_verdict(&result, "src/star.ts", "star", LivenessVerdict::Used);
+}
+
+#[test]
+fn oxc_engine_entry_reachability_seeds_public_barrel_reexports() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/target.ts", "export const api = 1;\n"),
+        ("src/index.ts", "export { api } from './target';\n"),
+    ]);
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![root.join("src/index.ts")],
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_no_verdict(&result, "src/index.ts", "api");
+    assert_verdict(&result, "src/target.ts", "api", LivenessVerdict::Used);
+}
+
+#[test]
+fn oxc_engine_star_reexport_cycle_resolves_names_without_hanging() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/a.ts",
+            "export * from './b';\nexport const a = 1;\nexport const unusedA = 2;\n",
+        ),
+        (
+            "src/b.ts",
+            "export * from './a';\nexport const b = 1;\nexport const unusedB = 2;\n",
+        ),
+        (
+            "src/main.ts",
+            "import { a, b } from './a';\nconsole.log(a, b);\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(&result, "src/a.ts", "a", LivenessVerdict::Used);
+    assert_verdict(&result, "src/b.ts", "b", LivenessVerdict::Used);
+    assert_verdict(&result, "src/a.ts", "unusedA", LivenessVerdict::Unused);
+    assert_verdict(&result, "src/b.ts", "unusedB", LivenessVerdict::Unused);
 }
 
 #[test]
