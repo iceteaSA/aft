@@ -6,7 +6,6 @@ use crate::context::AppContext;
 use crate::lsp::diagnostics::StoredDiagnostic;
 use crate::lsp::manager::{PullFileOutcome, ServerAttempt, ServerAttemptResult};
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef};
-use crate::lsp::roots::find_workspace_root;
 use crate::protocol::{RawRequest, Response};
 
 #[derive(Debug, Deserialize)]
@@ -124,7 +123,7 @@ fn inspect_server(
     );
     let workspace_root = match attempt.map(|attempt| &attempt.result) {
         Some(ServerAttemptResult::Ok { server_key }) => Some(server_key.root.clone()),
-        _ => find_workspace_root(canonical, &def.root_markers),
+        _ => def.workspace_root_for_file(canonical),
     };
     let spawn_status = attempt
         .map(|attempt| spawn_status(&attempt.result))

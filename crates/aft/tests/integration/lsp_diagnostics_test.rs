@@ -12,7 +12,7 @@ use aft::config::{Config, UserServerDef};
 use aft::context::AppContext;
 use aft::lsp::child_registry::LspChildRegistry;
 use aft::lsp::client::{LspClient, LspEvent};
-use aft::lsp::diagnostics::DiagnosticSeverity;
+use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use aft::lsp::manager::LspManager;
 use aft::lsp::registry::{is_config_file_path, is_config_file_path_with_custom, ServerKind};
 use aft::lsp::roots::ServerKey;
@@ -175,6 +175,82 @@ fn config_change_type(params: &serde_json::Value, suffix: &str) -> i64 {
         .unwrap_or_else(|| panic!("missing watched-file change for {suffix}: {params}"))
 }
 
+fn pyright_langserver_available() -> bool {
+    which::which("pyright-langserver").is_ok()
+}
+
+fn pyright_extra_paths_workspace() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+    let temp_dir = tempdir().expect("tempdir");
+    let root = temp_dir.path().join("python-app");
+    let src_dir = root.join("src");
+    let lib_dir = root.join("libs").join("fakepkg");
+    let source = src_dir.join("app.py");
+    let source_text = "import fakepkg\n\nVALUE = fakepkg.VALUE\n".to_string();
+
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&lib_dir).expect("create fake package dir");
+    fs::write(
+        root.join("pyrightconfig.json"),
+        r#"{
+  "include": ["src"],
+  "extraPaths": ["libs"],
+  "reportMissingImports": "error"
+}
+"#,
+    )
+    .expect("write pyrightconfig");
+    fs::write(src_dir.join("requirements.txt"), "fakepkg==1.0\n")
+        .expect("write nearer fallback marker");
+    fs::write(lib_dir.join("__init__.py"), "VALUE = 1\n").expect("write fake package");
+    fs::write(&source, &source_text).expect("write source");
+
+    (temp_dir, root, source, source_text)
+}
+
+fn pyright_diagnostics_for(
+    file: &std::path::Path,
+    source_text: &str,
+    config: &Config,
+) -> Vec<StoredDiagnostic> {
+    let mut manager = LspManager::new();
+    let pre_snapshot = manager.snapshot_pre_edit_state(file);
+    let versions = manager
+        .notify_file_changed_versioned(file, source_text, config)
+        .expect("notify pyright file changed");
+    assert!(
+        !versions.is_empty(),
+        "pyright should start for the fixture before diagnostics can be checked"
+    );
+
+    let outcome = manager.wait_for_post_edit_diagnostics(
+        file,
+        config,
+        &versions,
+        &pre_snapshot,
+        Duration::from_secs(20),
+    );
+    assert!(
+        outcome.pending_servers.is_empty(),
+        "timed out waiting for pyright diagnostics: {:?}",
+        outcome.pending_servers
+    );
+    assert!(
+        outcome.exited_servers.is_empty(),
+        "pyright exited before publishing diagnostics: {:?}",
+        outcome.exited_servers
+    );
+    outcome.diagnostics
+}
+
+fn has_fakepkg_missing_import(diagnostics: &[StoredDiagnostic]) -> bool {
+    diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("reportMissingImports")
+            || diag
+                .message
+                .contains("Import \"fakepkg\" could not be resolved")
+    })
+}
+
 fn app_context_with_fake_lsp() -> AppContext {
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
     ctx.lsp()
@@ -228,6 +304,41 @@ sys.stderr.flush()
     }
     #[cfg(not(windows))]
     script
+}
+
+#[test]
+fn pyright_uses_pyrightconfig_extra_paths_above_nearer_requirements_marker() {
+    if !pyright_langserver_available() {
+        eprintln!("skipping pyright extraPaths integration test: pyright-langserver not on PATH");
+        return;
+    }
+
+    let (_temp_dir, root, source, source_text) = pyright_extra_paths_workspace();
+    let default_config = Config {
+        project_root: Some(root.clone()),
+        ..Config::default()
+    };
+    let ignored_config = Config {
+        project_root: Some(root),
+        lsp_servers: vec![UserServerDef {
+            id: "python".to_string(),
+            root_markers: vec!["requirements.txt".to_string()],
+            ..UserServerDef::default()
+        }],
+        ..Config::default()
+    };
+
+    let ignored_diagnostics = pyright_diagnostics_for(&source, &source_text, &ignored_config);
+    assert!(
+        has_fakepkg_missing_import(&ignored_diagnostics),
+        "control should report a missing import when pyrightconfig.json is outside the LSP root; diagnostics: {ignored_diagnostics:?}"
+    );
+
+    let resolved_diagnostics = pyright_diagnostics_for(&source, &source_text, &default_config);
+    assert!(
+        !has_fakepkg_missing_import(&resolved_diagnostics),
+        "pyright should honor pyrightconfig.json extraPaths from the selected workspace root; diagnostics: {resolved_diagnostics:?}"
+    );
 }
 
 #[test]

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::config::{Config, UserServerDef};
+use crate::lsp::roots::find_workspace_root;
 
 /// Resolve an LSP binary name to a full path.
 ///
@@ -177,6 +178,14 @@ pub struct ServerDef {
     pub args: Vec<String>,
     /// Root marker files — presence indicates a workspace root.
     pub root_markers: Vec<String>,
+    /// Higher-priority root markers checked before fallback markers.
+    ///
+    /// Pyright uses this for configuration files because, in language-server
+    /// mode, Pyright looks for pyrightconfig.json and pyproject.toml only in
+    /// the workspace root supplied by the client. A nearer fallback marker like
+    /// requirements.txt must not hide the directory that contains the actual
+    /// Pyright configuration.
+    pub priority_root_markers: Vec<String>,
     /// Extra environment variables for this server process.
     pub env: HashMap<String, String>,
     /// Optional JSON initializationOptions for the initialize request.
@@ -184,6 +193,17 @@ pub struct ServerDef {
 }
 
 impl ServerDef {
+    /// Return the workspace root this server should use for a file.
+    pub fn workspace_root_for_file(&self, file_path: &Path) -> Option<PathBuf> {
+        for marker in &self.priority_root_markers {
+            if let Some(root) = find_workspace_root(file_path, &[marker.as_str()]) {
+                return Some(root);
+            }
+        }
+
+        find_workspace_root(file_path, &self.root_markers)
+    }
+
     /// Check if this server handles a given file extension.
     pub fn matches_extension(&self, ext: &str) -> bool {
         self.extensions
@@ -208,19 +228,20 @@ pub fn builtin_servers() -> Vec<ServerDef> {
             &["--stdio"],
             &["tsconfig.json", "jsconfig.json", "package.json"],
         ),
-        builtin_server(
+        builtin_server_with_priority_roots(
             ServerKind::Python,
             "Pyright",
             &["py", "pyi"],
             "pyright-langserver",
             &["--stdio"],
             &[
+                "pyrightconfig.json",
                 "pyproject.toml",
                 "setup.py",
                 "setup.cfg",
-                "pyrightconfig.json",
                 "requirements.txt",
             ],
+            &["pyrightconfig.json", "pyproject.toml"],
         ),
         builtin_server(
             ServerKind::Rust,
@@ -645,6 +666,11 @@ fn resolved_servers(config: &Config) -> Vec<ServerDef> {
                 } else {
                     user.root_markers.clone()
                 },
+                priority_root_markers: if user.root_markers.is_empty() {
+                    builtin.priority_root_markers.clone()
+                } else {
+                    Vec::new()
+                },
                 env: if user.env.is_empty() {
                     builtin.env.clone()
                 } else {
@@ -758,14 +784,28 @@ fn builtin_server(
         binary: binary.to_string(),
         args: strings(args),
         root_markers: strings(root_markers),
+        priority_root_markers: Vec::new(),
         env: HashMap::new(),
         initialization_options: None,
     }
 }
 
-/// Builder variant of [`builtin_server`] that includes a default
-/// `initializationOptions` payload — used for servers that need server-specific
-/// settings to enable LSP features (e.g., gopls's `pullDiagnostics`).
+/// Builder variant of [`builtin_server`] that checks some markers before
+/// fallback root markers even when the fallback marker is closer to the file.
+fn builtin_server_with_priority_roots(
+    kind: ServerKind,
+    name: &str,
+    extensions: &[&str],
+    binary: &str,
+    args: &[&str],
+    root_markers: &[&str],
+    priority_root_markers: &[&str],
+) -> ServerDef {
+    let mut def = builtin_server(kind, name, extensions, binary, args, root_markers);
+    def.priority_root_markers = strings(priority_root_markers);
+    def
+}
+
 fn builtin_server_with_init(
     kind: ServerKind,
     name: &str,
@@ -792,6 +832,7 @@ fn custom_server(server: &UserServerDef) -> Option<ServerDef> {
         binary: server.binary.clone(),
         args: server.args.clone(),
         root_markers: server.root_markers.clone(),
+        priority_root_markers: Vec::new(),
         env: server.env.clone(),
         initialization_options: server.initialization_options.clone(),
     })
@@ -812,9 +853,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use crate::config::{Config, UserServerDef};
-
     use super::{is_config_file_path, resolve_lsp_binary, servers_for_file, ServerKind};
+    use crate::config::{Config, UserServerDef};
 
     fn matching_kinds(path: &str, config: &Config) -> Vec<ServerKind> {
         servers_for_file(Path::new(path), config)

@@ -24,7 +24,7 @@ use crate::lsp::pull_params::{
     AftWorkspaceDiagnosticRequest,
 };
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef, ServerKind};
-use crate::lsp::roots::{find_workspace_root, ServerKey};
+use crate::lsp::roots::ServerKey;
 use crate::lsp::LspError;
 use crate::slog_error;
 
@@ -331,7 +331,7 @@ impl LspManager {
             let server_id = def.kind.id_str().to_string();
             let server_name = def.name.to_string();
 
-            let Some(root) = find_workspace_root(file_path, &def.root_markers) else {
+            let Some(root) = def.workspace_root_for_file(file_path) else {
                 outcomes.attempts.push(ServerAttempt {
                     server_id,
                     server_name,
@@ -1646,7 +1646,7 @@ impl LspManager {
 
     fn server_key_for_file(&self, file_path: &Path, config: &Config) -> Option<ServerKey> {
         for def in servers_for_file(file_path, config) {
-            let root = find_workspace_root(file_path, &def.root_markers)?;
+            let root = def.workspace_root_for_file(file_path)?;
             let key = ServerKey {
                 kind: def.kind.clone(),
                 root,

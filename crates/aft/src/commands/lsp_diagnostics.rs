@@ -10,7 +10,6 @@ use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{
     EnsureServerOutcomes, PullFileOutcome, PullFileResult, ServerAttemptResult,
 };
-use crate::lsp::roots::find_workspace_root;
 use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
 
@@ -528,7 +527,7 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
             crate::lsp::registry::servers_for_file(&path, &config)
                 .into_iter()
                 .any(|def| {
-                    let Some(root) = find_workspace_root(&path, &def.root_markers) else {
+                    let Some(root) = def.workspace_root_for_file(&path) else {
                         return true;
                     };
                     let key = ServerKey {

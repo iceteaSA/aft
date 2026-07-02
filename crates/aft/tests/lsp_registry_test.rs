@@ -72,6 +72,57 @@ fn test_registry_and_root_combined() {
 }
 
 #[test]
+fn test_pyright_config_root_wins_over_nearer_fallback_marker() {
+    let temp_dir = tempdir().unwrap();
+    let project_root = temp_dir.path().join("python-app");
+    let src_dir = project_root.join("src");
+    let file = src_dir.join("app.py");
+
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(project_root.join("pyrightconfig.json"), "{}\n").unwrap();
+    fs::write(src_dir.join("requirements.txt"), "fakepkg==1.0\n").unwrap();
+    fs::write(&file, "import fakepkg\n").unwrap();
+
+    let config = Config::default();
+    let pyright = servers_for_file(&file, &config)
+        .into_iter()
+        .find(|server| server.kind == ServerKind::Python)
+        .expect("pyright server definition");
+
+    let expected_root = fs::canonicalize(&project_root).unwrap();
+    assert_eq!(pyright.workspace_root_for_file(&file), Some(expected_root));
+}
+
+#[test]
+fn test_pyright_user_root_marker_override_disables_builtin_priority() {
+    let temp_dir = tempdir().unwrap();
+    let project_root = temp_dir.path().join("python-app");
+    let src_dir = project_root.join("src");
+    let file = src_dir.join("app.py");
+
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(project_root.join("pyrightconfig.json"), "{}\n").unwrap();
+    fs::write(src_dir.join("requirements.txt"), "fakepkg==1.0\n").unwrap();
+    fs::write(&file, "import fakepkg\n").unwrap();
+
+    let config = Config {
+        lsp_servers: vec![UserServerDef {
+            id: "python".to_string(),
+            root_markers: vec!["requirements.txt".to_string()],
+            ..UserServerDef::default()
+        }],
+        ..Config::default()
+    };
+    let pyright = servers_for_file(&file, &config)
+        .into_iter()
+        .find(|server| server.kind == ServerKind::Python)
+        .expect("pyright server definition");
+
+    let expected_root = fs::canonicalize(&src_dir).unwrap();
+    assert_eq!(pyright.workspace_root_for_file(&file), Some(expected_root));
+}
+
+#[test]
 fn test_bash_yaml_and_ty_registry_entries() {
     let default_config = Config::default();
     assert_eq!(
