@@ -1,8 +1,8 @@
 /// <reference path="../bun-test.d.ts" />
 
+import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
 
 // The CLI runs under plain Node via npx. Any @cortexkit import that survives
 // bundling resolves the INSTALLED package at runtime; aft-bridge's dist chain
