@@ -63,9 +63,9 @@ opencode-aft/
 - Key files: `crates/aft/src/imports/mod.rs`, `crates/aft/src/imports/java.rs`, `crates/aft/src/imports/csharp.rs`, `crates/aft/src/imports/php.rs`, `crates/aft/src/imports/kotlin.rs`, `crates/aft/src/imports/scala.rs`, `crates/aft/src/imports/swift.rs`, `crates/aft/src/imports/ruby.rs`, `crates/aft/src/imports/lua.rs`, `crates/aft/src/imports/c.rs`, `crates/aft/src/imports/perl.rs`
 
 **`crates/aft/src/inspect/`:**
-- Purpose: Provide codebase-health scanning (dead code, unused exports, duplicates, metrics, TODOs, LSP diagnostics).
-- Contains: Scanner modules for each inspection category
-- Key files: `crates/aft/src/inspect/scanners/dead_code.rs`, `crates/aft/src/inspect/scanners/unused_exports.rs`, `crates/aft/src/inspect/scanners/duplicates.rs`, `crates/aft/src/inspect/scanners/metrics.rs`, `crates/aft/src/inspect/scanners/todos.rs`
+- Purpose: Provide codebase-health scanning (dead code, unused exports, duplicates, import cycles, metrics, TODOs, LSP diagnostics, and framework route entry points).
+- Contains: Scanner modules for each inspection category, entry point detection, and framework routing route maps.
+- Key files: `crates/aft/src/inspect/scanners/dead_code.rs`, `crates/aft/src/inspect/scanners/unused_exports.rs`, `crates/aft/src/inspect/scanners/duplicates.rs`, `crates/aft/src/inspect/scanners/cycles.rs`, `crates/aft/src/inspect/scanners/metrics.rs`, `crates/aft/src/inspect/scanners/todos.rs`, `crates/aft/src/inspect/entry_points.rs`, `crates/aft/src/inspect/frameworks.rs`
 
 **`crates/aft/src/lsp/`:**
 - Purpose: Keep LSP client, transport, registry, and diagnostics state separate from command handlers.
