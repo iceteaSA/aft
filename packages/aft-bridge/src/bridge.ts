@@ -1,4 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -39,6 +41,32 @@ function bashTaskIdFrom(response: Record<string, unknown>): string | undefined {
   const camelCase = response.taskId;
   if (typeof camelCase === "string" && camelCase.length > 0) return camelCase;
   return undefined;
+}
+
+type BinaryFingerprintReader = (binaryPath: string) => string | null | undefined;
+
+function hashBinaryOnDisk(binaryPath: string): string | null {
+  try {
+    return createHash("sha256").update(readFileSync(binaryPath)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+let binaryFingerprintReader: BinaryFingerprintReader = hashBinaryOnDisk;
+
+function readBinaryFingerprint(binaryPath: string): string | null {
+  try {
+    const fingerprint = binaryFingerprintReader(binaryPath);
+    return typeof fingerprint === "string" && fingerprint.length > 0 ? fingerprint : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Test seam: replace the on-disk binary fingerprint reader without fs module mocks. */
+export function __setBinaryFingerprintForTests(impl: BinaryFingerprintReader | null): void {
+  binaryFingerprintReader = impl ?? hashBinaryOnDisk;
 }
 
 // ## Note on TypeScript `as` type assertions
@@ -346,6 +374,12 @@ export class BinaryBridge implements AftProjectTransport {
   private binaryPath: string;
   private cwd: string;
   private process: ChildProcess | null = null;
+  /** Fingerprint of the on-disk binary contents captured when this child spawned. */
+  private spawnedBinaryFingerprint: string | null = null;
+  /** Last idle-window binary refresh check for this live child. */
+  private lastBinaryFingerprintCheckAt = 0;
+  /** Once true, this bridge must not accept new requests and should be drained. */
+  private _retiringDueToBinaryChange = false;
   private pending = new Map<string, PendingRequest>();
   private outstandingBackgroundTaskIds = new Set<string>();
   private nextId = 1;
@@ -517,6 +551,30 @@ export class BinaryBridge implements AftProjectTransport {
     return this.outstandingBackgroundTaskIds.size > 0;
   }
 
+  /**
+   * Idle-window maintenance hook: when the on-disk binary changed since this
+   * child spawned, stop routing new work to this bridge so the pool can let it
+   * drain and retire it.
+   */
+  maybeScheduleRespawnForUpdatedBinary(checkIntervalMs: number, now = Date.now()): boolean {
+    if (this._shuttingDown || this._retiringDueToBinaryChange || !this.isAlive()) return false;
+    if (this.pending.size > 0 || this.outstandingBackgroundTaskIds.size > 0) return false;
+    if (now - this.lastBinaryFingerprintCheckAt < checkIntervalMs) return false;
+    this.lastBinaryFingerprintCheckAt = now;
+
+    const spawnedFingerprint = this.spawnedBinaryFingerprint;
+    if (!spawnedFingerprint) return false;
+
+    const currentFingerprint = readBinaryFingerprint(this.binaryPath);
+    if (!currentFingerprint || currentFingerprint === spawnedFingerprint) return false;
+
+    this._retiringDueToBinaryChange = true;
+    this.logVia(
+      `Binary contents changed on disk for ${this.binaryPath}; retiring this bridge so the next tool call respawns onto the updated binary.`,
+    );
+    return true;
+  }
+
   /** Project root this bridge was spawned/configured for. */
   getCwd(): string {
     return this.cwd;
@@ -590,6 +648,11 @@ export class BinaryBridge implements AftProjectTransport {
     canRetryAfterVersionSwap: boolean,
   ): Promise<Record<string, unknown>> {
     try {
+      if (this._retiringDueToBinaryChange) {
+        throw new Error(
+          `${this.errorPrefix} Bridge is retiring after the on-disk binary changed; retry to respawn on the updated binary`,
+        );
+      }
       if (this._shuttingDown) {
         throw new Error(`${this.errorPrefix} Bridge is shutting down, cannot send "${command}"`);
       }
@@ -919,6 +982,7 @@ export class BinaryBridge implements AftProjectTransport {
   /** Kill the child process and reject all pending requests. */
   async shutdown(): Promise<void> {
     this._shuttingDown = true;
+    this.spawnedBinaryFingerprint = null;
     this.clearRestartResetTimer();
     this.configureWarningClients.clear();
     this.rejectAllPending(new Error(`${this.errorPrefix} Bridge shutting down`));
@@ -989,6 +1053,9 @@ export class BinaryBridge implements AftProjectTransport {
   private async replaceCurrentBinary(newBinaryPath: string): Promise<void> {
     this.binaryPath = newBinaryPath;
     this.configured = false;
+    this.spawnedBinaryFingerprint = null;
+    this.lastBinaryFingerprintCheckAt = 0;
+    this._retiringDueToBinaryChange = false;
     this.clearRestartResetTimer();
     this.rejectAllPending(
       new Error(`${this.errorPrefix} Bridge restarting with updated binary: ${newBinaryPath}`),
@@ -1021,6 +1088,7 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private spawnProcess(triggeringSessionId?: string): void {
+    this._retiringDueToBinaryChange = false;
     // A freshly-spawned process has published no diagnostics yet, so its warm
     // E/W set is empty. Drop the cached status bar from any prior process here
     // (covers initial spawn, crash auto-restart, and version-swap respawn) so a
@@ -1179,6 +1247,8 @@ export class BinaryBridge implements AftProjectTransport {
     });
 
     this.process = child;
+    this.spawnedBinaryFingerprint = readBinaryFingerprint(this.binaryPath);
+    this.lastBinaryFingerprintCheckAt = Date.now();
     this.stdoutBuffer = "";
     this.stdoutReadOffset = 0;
     this.stderrBuffer = "";
@@ -1391,6 +1461,7 @@ export class BinaryBridge implements AftProjectTransport {
 
   private handleTimeout(triggeringSessionId?: string): void {
     this.consecutiveRequestTimeouts = 0;
+    this.spawnedBinaryFingerprint = null;
     // A timed-out request means the child is about to be SIGKILLed. Reject all
     // sibling in-flight requests now instead of leaving them parked until their
     // own independent timers fire.
@@ -1436,6 +1507,7 @@ export class BinaryBridge implements AftProjectTransport {
   private handleCrash(cause?: Error): void {
     const proc = this.process;
     this.process = null;
+    this.spawnedBinaryFingerprint = null;
     if (proc && proc.exitCode === null && !proc.killed) {
       proc.kill("SIGKILL");
     }
@@ -1463,6 +1535,11 @@ export class BinaryBridge implements AftProjectTransport {
         `${this.errorPrefix} Binary crashed (restarts: ${this._restartCount})${cause ? `: ${cause.message}` : ""} (see ${this.getLogFilePathVia()})`,
       ),
     );
+
+    if (this._retiringDueToBinaryChange) {
+      this.logVia("Binary exited while retiring after an on-disk update; skipping auto-restart");
+      return;
+    }
 
     // Auto-restart with exponential backoff
     if (this._restartCount < this.maxRestarts) {

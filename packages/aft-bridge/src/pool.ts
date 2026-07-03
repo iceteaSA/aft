@@ -169,7 +169,9 @@ export class BridgePool implements AftTransportPool {
       childEnv: options.childEnv,
     };
     this.configOverrides = configOverrides;
-    // Skip cleanup timer when idle timeout is Infinity (no-op) to avoid wasted cycles
+    // Reuse the existing idle-window timer for both idle eviction and binary
+    // refresh checks. When idle eviction is disabled, there is no background
+    // maintenance loop.
     if (Number.isFinite(this.idleTimeoutMs)) {
       this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
       this.cleanupTimer.unref(); // don't prevent Node from exiting
@@ -256,12 +258,17 @@ export class BridgePool implements AftTransportPool {
     return this.getBridge(projectRoot).toolCall(runtime.sessionID, name, rawArgs, options);
   }
 
-  /** Shut down idle bridges that haven't been used within the timeout. */
+  /** Periodic pool maintenance: retire updated binaries and evict idle bridges. */
   private cleanup(): void {
     const now = Date.now();
     for (const [dir, entry] of this.bridges) {
       if (entry.bridge.hasPendingRequests() || entry.bridge.hasOutstandingBackgroundTasks())
         continue;
+      if (entry.bridge.maybeScheduleRespawnForUpdatedBinary(CLEANUP_INTERVAL_MS, now)) {
+        this.staleBridges.add(entry.bridge);
+        this.bridges.delete(dir);
+        continue;
+      }
       if (now - entry.lastUsed > this.idleTimeoutMs) {
         entry.bridge.shutdown().catch((err) => this.error("cleanup shutdown failed:", err));
         this.bridges.delete(dir);

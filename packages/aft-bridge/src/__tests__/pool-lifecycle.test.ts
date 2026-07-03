@@ -1,8 +1,8 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { setActiveLogger } from "../active-logger.js";
-import type { BinaryBridge } from "../bridge.js";
+import { __setBinaryFingerprintForTests, type BinaryBridge } from "../bridge.js";
 import type { Logger } from "../logger.js";
 import { BridgePool } from "../pool.js";
 
@@ -57,6 +57,21 @@ function markOutstandingBackgroundTask(bridge: BinaryBridge, taskId: string): vo
   deliverBridgeResponse(bridge, "bash", { success: true, task_id: taskId, status: "running" });
 }
 
+function seedSpawnedBinaryFingerprint(bridge: BinaryBridge, fingerprint: string): void {
+  const internals = bridge as unknown as {
+    process: { exitCode: number | null; killed: boolean } | null;
+    spawnedBinaryFingerprint: string | null;
+    lastBinaryFingerprintCheckAt: number;
+  };
+  internals.process = { exitCode: null, killed: false };
+  internals.spawnedBinaryFingerprint = fingerprint;
+  internals.lastBinaryFingerprintCheckAt = 0;
+}
+
+function isRetiringForBinaryChange(bridge: BinaryBridge): boolean {
+  return (bridge as unknown as { _retiringDueToBinaryChange: boolean })._retiringDueToBinaryChange;
+}
+
 function deliverBashCompletion(
   bridge: BinaryBridge,
   taskId: string,
@@ -75,6 +90,10 @@ function deliverBashCompletion(
 }
 
 describe("BridgePool lifecycle", () => {
+  afterEach(() => {
+    __setBinaryFingerprintForTests(null);
+  });
+
   test("forwards bash pattern match handler into created bridges", () => {
     const onBashPatternMatch = () => {};
     const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity, onBashPatternMatch });
@@ -333,6 +352,100 @@ describe("BridgePool lifecycle", () => {
     expect(pool.size).toBe(3);
   });
 
+  test("cleanup retires a bridge when the on-disk binary hash changes", async () => {
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
+    const bridge = pool.getBridge("/project/hash-change");
+    seedSpawnedBinaryFingerprint(bridge, "spawned-hash");
+    let fingerprintReads = 0;
+    let shutdownCalls = 0;
+    __setBinaryFingerprintForTests(() => {
+      fingerprintReads += 1;
+      return "updated-hash";
+    });
+    (bridge as unknown as { shutdown: () => Promise<void> }).shutdown = async () => {
+      shutdownCalls += 1;
+    };
+
+    (pool as unknown as { cleanup(): void }).cleanup();
+    await Promise.resolve();
+
+    expect(fingerprintReads).toBe(1);
+    expect(shutdownCalls).toBe(1);
+    expect(isRetiringForBinaryChange(bridge)).toBe(true);
+    expect(pool.size).toBe(0);
+  });
+
+  test("cleanup leaves the bridge alone when the on-disk binary hash is unchanged", () => {
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
+    const bridge = pool.getBridge("/project/hash-same");
+    seedSpawnedBinaryFingerprint(bridge, "same-hash");
+    let fingerprintReads = 0;
+    let shutdownCalls = 0;
+    __setBinaryFingerprintForTests(() => {
+      fingerprintReads += 1;
+      return "same-hash";
+    });
+    (bridge as unknown as { shutdown: () => Promise<void> }).shutdown = async () => {
+      shutdownCalls += 1;
+    };
+
+    (pool as unknown as { cleanup(): void }).cleanup();
+
+    expect(fingerprintReads).toBe(1);
+    expect(shutdownCalls).toBe(0);
+    expect(isRetiringForBinaryChange(bridge)).toBe(false);
+    expect(pool.size).toBe(1);
+  });
+
+  test("cleanup ignores unreadable binaries while a rebuild is in flight", () => {
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
+    const bridge = pool.getBridge("/project/hash-unreadable");
+    seedSpawnedBinaryFingerprint(bridge, "spawned-hash");
+    let shutdownCalls = 0;
+    __setBinaryFingerprintForTests(() => null);
+    (bridge as unknown as { shutdown: () => Promise<void> }).shutdown = async () => {
+      shutdownCalls += 1;
+    };
+
+    (pool as unknown as { cleanup(): void }).cleanup();
+
+    expect(shutdownCalls).toBe(0);
+    expect(isRetiringForBinaryChange(bridge)).toBe(false);
+    expect(pool.size).toBe(1);
+  });
+
+  test("cleanup defers binary refresh checks while requests are still in flight", async () => {
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
+    const bridge = pool.getBridge("/project/hash-pending");
+    seedSpawnedBinaryFingerprint(bridge, "spawned-hash");
+    let fingerprintReads = 0;
+    let shutdownCalls = 0;
+    __setBinaryFingerprintForTests(() => {
+      fingerprintReads += 1;
+      return "updated-hash";
+    });
+    (bridge as unknown as { shutdown: () => Promise<void> }).shutdown = async () => {
+      shutdownCalls += 1;
+    };
+    const pending = (bridge as unknown as { pending: Map<string, unknown> }).pending;
+    pending.set("1", {});
+
+    (pool as unknown as { cleanup(): void }).cleanup();
+
+    expect(fingerprintReads).toBe(0);
+    expect(shutdownCalls).toBe(0);
+    expect(pool.size).toBe(1);
+
+    pending.clear();
+    (pool as unknown as { cleanup(): void }).cleanup();
+    await Promise.resolve();
+
+    expect(fingerprintReads).toBe(1);
+    expect(shutdownCalls).toBe(1);
+    expect(isRetiringForBinaryChange(bridge)).toBe(true);
+    expect(pool.size).toBe(0);
+  });
+
   test("constructor logger handles pool logs instead of active singleton", async () => {
     const custom = makeLogger();
     const active = makeLogger();
@@ -342,6 +455,7 @@ describe("BridgePool lifecycle", () => {
     const rejectingBridge = {
       hasPendingRequests: () => false,
       hasOutstandingBackgroundTasks: () => false,
+      maybeScheduleRespawnForUpdatedBinary: () => false,
       shutdown: () => Promise.reject(new Error("boom")),
     };
     (
