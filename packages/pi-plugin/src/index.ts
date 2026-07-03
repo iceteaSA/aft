@@ -189,11 +189,13 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.43.0";
+const ANNOUNCEMENT_VERSION = "0.44.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Model compatibility: read/write/edit now accept filePath as an alias for path, so models that mix the two up no longer fail validation.",
-  'New enabled config toggle: set "enabled": false in a project\'s .cortexkit/aft.jsonc (or your user config) to turn AFT off there entirely.',
-  "Bash compression honesty fix: empty successful output stays empty instead of being replaced with synthesized text like 'kubectl: no resources found'.",
+  "Code Health accuracy overhaul: framework entry points (Tauri commands, Next.js/Nuxt/SvelteKit/Remix/Astro routes, NestJS decorators) are no longer flagged dead, barrel re-exports collapse to their real definition, and test-only usage moves out of the headline counts into its own tier.",
+  "New: import cycle detection for TS/JS (aft_inspect sections: cycles), and expected_mirrors config to suppress intentional duplicate pairs like plugin/pi-plugin parity trees.",
+  "Stale diagnostics fixed: files edited outside AFT (scripts, git) no longer show outdated errors in aft_inspect or the status bar.",
+  "bash wait: true blocks until a long command finishes instead of promoting it to background.",
+  "Objective-C support (.m/.mm): outline, zoom, AST search, and semantic indexing.",
 ];
 
 /**

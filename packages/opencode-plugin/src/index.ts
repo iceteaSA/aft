@@ -200,12 +200,13 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.43.0";
+const ANNOUNCEMENT_VERSION = "0.44.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Fewer permission prompts: system temp paths (/tmp and friends) no longer trigger external-directory asks, and aft_search now has its own permission id so a grep deny rule can't block it.",
-  'New enabled config toggle: set "enabled": false in a project\'s .cortexkit/aft.jsonc (or your user config) to turn AFT off there entirely.',
-  "Bash compression honesty fix: empty successful output stays empty instead of being replaced with synthesized text like 'kubectl: no resources found'.",
-  "TUI sidebar now updates over a push channel instead of polling (lower idle CPU), and AFT no longer re-adds itself to tui.json if you remove it (aft setup re-registers).",
+  "Code Health accuracy overhaul: framework entry points (Tauri commands, Next.js/Nuxt/SvelteKit/Remix/Astro routes, NestJS decorators) are no longer flagged dead, barrel re-exports collapse to their real definition, and test-only usage moves out of the headline counts into its own tier.",
+  "New: import cycle detection for TS/JS (aft_inspect sections: cycles), and expected_mirrors config to suppress intentional duplicate pairs like plugin/pi-plugin parity trees.",
+  "Stale diagnostics fixed: files edited outside AFT (scripts, git) no longer show outdated errors in aft_inspect or the status bar.",
+  "bash wait: true blocks until a long command finishes instead of promoting it to background.",
+  "Objective-C support (.m/.mm): outline, zoom, AST search, and semantic indexing.",
 ];
 
 /**
