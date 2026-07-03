@@ -339,6 +339,183 @@ export function privateHelper() { return 0; }
     }
 }
 
+#[test]
+fn inspect_dead_code_nestjs_decorator_roots_are_binding_aware_and_targeted() {
+    struct Case {
+        name: &'static str,
+        package_json: &'static str,
+        controller_source: &'static str,
+        expected_root: bool,
+        extra_files: &'static [(&'static str, &'static str)],
+        live_dependency_file: Option<&'static str>,
+    }
+
+    let cases = [
+        Case {
+            name: "controller",
+            package_json: r#"{ "dependencies": { "@nestjs/common": "latest" } }"#,
+            controller_source: "import { Controller } from '@nestjs/common';
+import { liveDependency } from './service';
+
+@Controller()
+export class DecoratedEntryPoint {
+  findAll() { return liveDependency(); }
+}
+
+export function deadSibling() { return 0; }
+",
+            expected_root: true,
+            extra_files: &[(
+                "src/service.ts",
+                "export function liveDependency() { return 1; }\nexport function unusedDependency() { return 0; }\n",
+            )],
+            live_dependency_file: Some("src/service.ts"),
+        },
+        Case {
+            name: "aliased-controller",
+            package_json: r#"{ "dependencies": { "@nestjs/common": "latest" } }"#,
+            controller_source: "import { Controller as C } from '@nestjs/common';
+
+@C()
+export class DecoratedEntryPoint {}
+
+export function deadSibling() { return 0; }
+",
+            expected_root: true,
+            extra_files: &[],
+            live_dependency_file: None,
+        },
+        Case {
+            name: "local-controller-name",
+            package_json: r#"{ "dependencies": { "@nestjs/common": "latest" } }"#,
+            controller_source: "import { Controller } from './local-decorators';
+
+@Controller()
+export class DecoratedEntryPoint {}
+
+export function deadSibling() { return 0; }
+",
+            expected_root: false,
+            extra_files: &[(
+                "src/local-decorators.ts",
+                "export function Controller() { return () => undefined; }\n",
+            )],
+            live_dependency_file: None,
+        },
+        Case {
+            name: "dev-dependency-without-nest-script",
+            package_json: r#"{ "devDependencies": { "@nestjs/common": "latest" }, "scripts": { "docs": "vitepress dev" } }"#,
+            controller_source: "import { Controller } from '@nestjs/common';
+
+@Controller()
+export class DecoratedEntryPoint {}
+
+export function deadSibling() { return 0; }
+",
+            expected_root: false,
+            extra_files: &[],
+            live_dependency_file: None,
+        },
+        Case {
+            name: "no-nest-dependency",
+            package_json: r#"{ "dependencies": {} }"#,
+            controller_source: "import { Controller } from '@nestjs/common';
+
+@Controller()
+export class DecoratedEntryPoint {}
+
+export function deadSibling() { return 0; }
+",
+            expected_root: false,
+            extra_files: &[],
+            live_dependency_file: None,
+        },
+        Case {
+            name: "graphql-resolver",
+            package_json: r#"{ "dependencies": { "@nestjs/common": "latest", "@nestjs/graphql": "latest" } }"#,
+            controller_source: "import { Resolver } from '@nestjs/graphql';
+
+@Resolver()
+export class DecoratedEntryPoint {}
+
+export function deadSibling() { return 0; }
+",
+            expected_root: true,
+            extra_files: &[],
+            live_dependency_file: None,
+        },
+    ];
+
+    for case in cases {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir
+            .path()
+            .join(format!("nestjs-decorator-{}", case.name));
+        fs::create_dir_all(&root).expect("create project");
+        write_file(&root, "package.json", case.package_json);
+        let controller_file = "src/app.controller.ts";
+        write_file(&root, controller_file, case.controller_source);
+        for (relative, contents) in case.extra_files {
+            write_file(&root, relative, contents);
+        }
+
+        let inspect_dir = temp_dir.path().join(format!("inspect-{}", case.name));
+        rebuild_dead_code_callgraph_store(&root, &inspect_dir);
+        let manager = InspectManager::new();
+        let (success, _elapsed) = run_reuse_category(
+            &manager,
+            snapshot(&root, &inspect_dir),
+            InspectCategory::DeadCode,
+        );
+        let has_controller_item =
+            aggregate_contains_symbol(&success, controller_file, "DecoratedEntryPoint");
+        assert_eq!(
+            has_controller_item, !case.expected_root,
+            "{} decorator root mismatch: {:#?}",
+            case.name, success.aggregate
+        );
+        assert!(
+            aggregate_contains_symbol(&success, controller_file, "deadSibling"),
+            "{} undecorated sibling export should remain dead-checkable: {:#?}",
+            case.name,
+            success.aggregate
+        );
+        if let Some(file) = case.live_dependency_file {
+            assert!(
+                !aggregate_contains_symbol(&success, file, "liveDependency"),
+                "{} controller method dependency should be reachable: {:#?}",
+                case.name,
+                success.aggregate
+            );
+            assert!(
+                aggregate_contains_symbol(&success, file, "unusedDependency"),
+                "{} unused service export should remain dead-checkable: {:#?}",
+                case.name,
+                success.aggregate
+            );
+        }
+
+        let (unused_success, _elapsed) = run_reuse_category(
+            &manager,
+            snapshot(&root, &inspect_dir),
+            InspectCategory::UnusedExports,
+        );
+        let has_unused_controller_item =
+            aggregate_contains_symbol(&unused_success, controller_file, "DecoratedEntryPoint");
+        assert_eq!(
+            has_unused_controller_item, !case.expected_root,
+            "{} unused_exports decorator root mismatch: {:#?}",
+            case.name, unused_success.aggregate
+        );
+        assert!(
+            aggregate_contains_symbol(&unused_success, controller_file, "deadSibling"),
+            "{} undecorated sibling export should remain unused-checkable: {:#?}",
+            case.name,
+            unused_success.aggregate
+        );
+    }
+}
+
 fn cycle_items(success: &InspectScanSuccess) -> Vec<Value> {
     success.aggregate["items"]
         .as_array()
@@ -1669,6 +1846,70 @@ testOnly();
         },
         &["package.json"],
     );
+
+    assert_dead_code_incremental_matches_cold(
+        "nestjs_decorator_file_changed",
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"dependencies":{"@nestjs/common":"latest"}}"#,
+            );
+            write_file(
+                root,
+                "src/app.controller.ts",
+                "import { Controller } from '@nestjs/common';
+
+@Controller()
+export class AppController {}
+export function privateHelper() { return 0; }
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/app.controller.ts",
+                "import { Controller } from '@nestjs/common';
+
+@Controller()
+export class AppController { list() { return 1; } }
+export function privateHelper() { return 0; }
+export function newDeadHelper() { return 0; }
+",
+            );
+        },
+        &["src/app.controller.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "nestjs_decorator_manifest_changed",
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"devDependencies":{"@nestjs/common":"latest"},"scripts":{"docs":"vitepress dev"}}"#,
+            );
+            write_file(
+                root,
+                "src/app.controller.ts",
+                "import { Controller } from '@nestjs/common';
+
+@Controller()
+export class AppController {}
+export function privateHelper() { return 0; }
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"devDependencies":{"@nestjs/common":"latest"},"scripts":{"start":"nest start"}}"#,
+            );
+        },
+        &["package.json"],
+    );
 }
 
 #[test]
@@ -1748,6 +1989,62 @@ fn inspect_dead_code_framework_routes_twice_cold_is_deterministic() {
     );
 
     let inspect_b = temp_dir.path().join("route-cold-b/inspect");
+    rebuild_dead_code_callgraph_store(&root, &inspect_b);
+    let manager_b = InspectManager::new();
+    let (cold_b, _elapsed_b) = run_reuse_category(
+        &manager_b,
+        snapshot(&root, &inspect_b),
+        InspectCategory::DeadCode,
+    );
+
+    assert_eq!(cold_a.aggregate, cold_b.aggregate);
+    assert_eq!(
+        contribution_payloads(&root, &cold_a),
+        contribution_payloads(&root, &cold_b)
+    );
+    assert_eq!(
+        aggregate_item_symbols(&cold_a),
+        aggregate_item_symbols(&cold_b)
+    );
+}
+
+#[test]
+fn inspect_dead_code_nestjs_decorators_twice_cold_is_deterministic() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("dead-code-nestjs-twice-cold");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "package.json",
+        r#"{"dependencies":{"@nestjs/common":"latest"}}"#,
+    );
+    write_file(
+        &root,
+        "src/app.controller.ts",
+        "import { Controller } from '@nestjs/common';
+import { live } from './service';
+
+@Controller()
+export class AppController { list() { return live(); } }
+export function privateHelper() {}
+",
+    );
+    write_file(
+        &root,
+        "src/service.ts",
+        "export function live() { return 1; }\nexport function unused() { return 0; }\n",
+    );
+
+    let inspect_a = temp_dir.path().join("nestjs-cold-a/inspect");
+    rebuild_dead_code_callgraph_store(&root, &inspect_a);
+    let manager_a = InspectManager::new();
+    let (cold_a, _elapsed_a) = run_reuse_category(
+        &manager_a,
+        snapshot(&root, &inspect_a),
+        InspectCategory::DeadCode,
+    );
+
+    let inspect_b = temp_dir.path().join("nestjs-cold-b/inspect");
     rebuild_dead_code_callgraph_store(&root, &inspect_b);
     let manager_b = InspectManager::new();
     let (cold_b, _elapsed_b) = run_reuse_category(
@@ -2152,6 +2449,68 @@ console.log(x);
                 "export const x = 1;
 export const newOnly = 3;
 ",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "nestjs_decorator_file_changed",
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"dependencies":{"@nestjs/common":"latest"}}"#,
+            );
+            write_file(
+                root,
+                "src/app.controller.ts",
+                "import { Controller } from '@nestjs/common';
+
+@Controller()
+export class AppController {}
+export function privateHelper() { return 0; }
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/app.controller.ts",
+                "import { Controller } from '@nestjs/common';
+
+@Controller()
+export class AppController { list() { return 1; } }
+export function privateHelper() { return 0; }
+export function newUnusedHelper() { return 0; }
+",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "nestjs_decorator_manifest_changed",
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"devDependencies":{"@nestjs/common":"latest"},"scripts":{"docs":"vitepress dev"}}"#,
+            );
+            write_file(
+                root,
+                "src/app.controller.ts",
+                "import { Controller } from '@nestjs/common';
+
+@Controller()
+export class AppController {}
+export function privateHelper() { return 0; }
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "package.json",
+                r#"{"devDependencies":{"@nestjs/common":"latest"},"scripts":{"start":"nest start"}}"#,
             );
         },
     );

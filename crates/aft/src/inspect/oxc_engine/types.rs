@@ -58,6 +58,13 @@ pub enum ReExportKind {
     Namespace,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecoratorFact {
+    pub name: String,
+    pub segments: Vec<String>,
+    pub line: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportFact {
     pub name: ExportName,
@@ -66,6 +73,8 @@ pub struct ExportFact {
     pub is_type_only: bool,
     pub line: u32,
     pub declared: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decorators: Vec<DecoratorFact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

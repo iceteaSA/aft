@@ -9,6 +9,13 @@ pub(crate) enum Framework {
     SvelteKit,
     RemixReactRouter,
     Astro,
+    NestJs,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecoratorSpec {
+    pub(crate) name: &'static str,
+    pub(crate) allowed_source_modules: &'static [&'static str],
 }
 
 impl Framework {
@@ -36,6 +43,7 @@ impl Framework {
                 "app/root.{ts,tsx,js,jsx}",
             ],
             Self::Astro => &["src/pages/**/*.{ts,js}"],
+            Self::NestJs => &[],
         }
     }
 
@@ -74,8 +82,85 @@ impl Framework {
                 "getStaticPaths",
                 "prerender",
             ],
+            Self::NestJs => &[],
         };
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    pub(crate) fn decorator_specs(self) -> &'static [DecoratorSpec] {
+        match self {
+            Self::NestJs => &[
+                DecoratorSpec {
+                    name: "Controller",
+                    allowed_source_modules: &["@nestjs/common"],
+                },
+                DecoratorSpec {
+                    name: "Injectable",
+                    allowed_source_modules: &["@nestjs/common"],
+                },
+                DecoratorSpec {
+                    name: "Module",
+                    allowed_source_modules: &["@nestjs/common"],
+                },
+                DecoratorSpec {
+                    name: "Get",
+                    allowed_source_modules: &["@nestjs/common"],
+                },
+                DecoratorSpec {
+                    name: "Post",
+                    allowed_source_modules: &["@nestjs/common"],
+                },
+                DecoratorSpec {
+                    name: "Put",
+                    allowed_source_modules: &["@nestjs/common"],
+                },
+                DecoratorSpec {
+                    name: "Delete",
+                    allowed_source_modules: &["@nestjs/common"],
+                },
+                DecoratorSpec {
+                    name: "Patch",
+                    allowed_source_modules: &["@nestjs/common"],
+                },
+                DecoratorSpec {
+                    name: "Resolver",
+                    allowed_source_modules: &["@nestjs/graphql"],
+                },
+                DecoratorSpec {
+                    name: "Query",
+                    allowed_source_modules: &["@nestjs/graphql"],
+                },
+                DecoratorSpec {
+                    name: "Mutation",
+                    allowed_source_modules: &["@nestjs/graphql"],
+                },
+                DecoratorSpec {
+                    name: "MessagePattern",
+                    allowed_source_modules: &["@nestjs/microservices"],
+                },
+                DecoratorSpec {
+                    name: "EventPattern",
+                    allowed_source_modules: &["@nestjs/microservices"],
+                },
+                DecoratorSpec {
+                    name: "SubscribeMessage",
+                    allowed_source_modules: &["@nestjs/websockets"],
+                },
+            ],
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn allows_decorator(self, source: &str, decorator: &str) -> bool {
+        self.decorator_specs().iter().any(|spec| {
+            spec.name == decorator
+                && spec.allowed_source_modules.iter().any(|module| {
+                    source == *module
+                        || source
+                            .strip_prefix(*module)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                })
+        })
     }
 
     fn dependency_names(self) -> &'static [&'static str] {
@@ -90,6 +175,12 @@ impl Framework {
                 "@react-router/dev",
             ],
             Self::Astro => &["astro"],
+            Self::NestJs => &[
+                "@nestjs/common",
+                "@nestjs/graphql",
+                "@nestjs/microservices",
+                "@nestjs/websockets",
+            ],
         }
     }
 
@@ -100,6 +191,7 @@ impl Framework {
             Self::SvelteKit => &["svelte-kit", "vite"],
             Self::RemixReactRouter => &["remix", "react-router"],
             Self::Astro => &["astro"],
+            Self::NestJs => &["nest"],
         }
     }
 }
@@ -115,6 +207,13 @@ pub(crate) fn detected_route_frameworks(manifest: &Value) -> BTreeSet<Framework>
     .into_iter()
     .filter(|framework| framework_is_enabled(manifest, *framework))
     .collect()
+}
+
+pub(crate) fn detected_decorator_frameworks(manifest: &Value) -> BTreeSet<Framework> {
+    [Framework::NestJs]
+        .into_iter()
+        .filter(|framework| framework_is_enabled(manifest, *framework))
+        .collect()
 }
 
 fn framework_is_enabled(manifest: &Value, framework: Framework) -> bool {

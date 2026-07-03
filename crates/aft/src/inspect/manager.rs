@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,16 +11,17 @@ use serde_json::{json, Value};
 use super::cache::{InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
+#[cfg(test)]
+use super::job::normalize_path;
 use super::job::{
-    canonicalize_normalized, is_test_file, normalize_path, CallgraphSnapshot, FileContribution,
-    InspectCategory, InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey,
-    JobOutcome, JobScope,
+    is_test_file, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob, InspectResult,
+    InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
 use super::oxc_engine::LivenessVerdict;
 use super::oxc_engine::{
-    analyze_file_facts, analyze_files_with_cache, AnalyzeOptions, DynamicImportFact, ExportFact,
-    FileFacts, FileId, ImportFact, OxcEngineResult, OxcFactsCache, ReExportFact,
-    FACTS_FORMAT_VERSION, OXC_PROVENANCE,
+    analyze_file_facts, analyze_files_with_cache, normalize_input_path, AnalyzeOptions,
+    DynamicImportFact, ExportFact, FileFacts, FileId, ImportFact, OxcEngineResult, OxcFactsCache,
+    ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness};
 use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore, CallGraphStoreError};
@@ -2141,7 +2141,7 @@ fn roll_up_unused_exports_oxc_contributions(
             let path = job.project_root.join(&scan.file);
             Some(FileFacts {
                 file_id: FileId(0),
-                path: canonicalize_normalized(&path),
+                path: normalize_input_path(&job.project_root, &path),
                 content_hash: oxc_facts.content_hash.clone(),
                 exports: oxc_facts.exports.clone(),
                 imports: oxc_facts.imports.clone(),

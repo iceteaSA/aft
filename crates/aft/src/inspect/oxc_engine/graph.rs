@@ -2,11 +2,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::resolver::{ResolvedImport, ResolvedModule};
+use serde_json::Value;
+
+use super::resolver::{normalize_path, ResolvedImport, ResolvedModule};
 use super::types::{
     ExportFact, FileId, ImportKind, LivenessVerdict, OxcExportVerdict, OxcFileVerdicts,
     OxcReExportContext, ReExportKind, OXC_PROVENANCE,
 };
+use crate::inspect::frameworks::{detected_decorator_frameworks, Framework};
 use crate::inspect::job::is_test_file;
 
 #[derive(Debug, Clone)]
@@ -230,6 +233,7 @@ pub fn compute_verdicts(
     );
     graph.apply_root_re_export_seeding();
     graph.apply_executable_file_root_seeding();
+    graph.apply_decorator_entry_point_seeding();
     graph.record_reference_origins();
     if entry_reachability {
         graph.apply_entry_reachability();
@@ -247,6 +251,7 @@ struct GraphBuilder<'a> {
     root_modules: BTreeSet<usize>,
     export_root_modules: BTreeSet<usize>,
     executable_root_exports: BTreeMap<usize, BTreeSet<String>>,
+    decorator_frameworks_by_module: BTreeMap<usize, BTreeSet<Framework>>,
     forwarding: ForwardingMap,
     reference_origins_by_module: Vec<ReferenceOrigin>,
 }
@@ -262,6 +267,8 @@ impl<'a> GraphBuilder<'a> {
         let mut root_modules = BTreeSet::new();
         let mut export_root_modules = BTreeSet::new();
         let mut executable_roots_by_module = BTreeMap::new();
+        let mut decorator_framework_cache = DecoratorFrameworkCache::new(project_root);
+        let mut decorator_frameworks_by_module = BTreeMap::new();
         let states = modules
             .iter()
             .map(|module| {
@@ -298,6 +305,11 @@ impl<'a> GraphBuilder<'a> {
                     root_modules.insert(module_id);
                     executable_roots_by_module.insert(module_id, exports.clone());
                 }
+                let decorator_frameworks =
+                    decorator_framework_cache.frameworks_for_file(&module.facts.path);
+                if !decorator_frameworks.is_empty() {
+                    decorator_frameworks_by_module.insert(module_id, decorator_frameworks);
+                }
                 state
             })
             .collect::<Vec<_>>();
@@ -312,6 +324,7 @@ impl<'a> GraphBuilder<'a> {
             root_modules,
             export_root_modules,
             executable_root_exports: executable_roots_by_module,
+            decorator_frameworks_by_module,
             forwarding,
             reference_origins_by_module,
         };
@@ -497,6 +510,43 @@ impl<'a> GraphBuilder<'a> {
                 self.mark_resolution_used_or_uncertain(
                     resolution,
                     "entry_point",
+                    &origin,
+                    &mut newly_live_modules,
+                );
+            }
+            self.root_modules.extend(newly_live_modules);
+        }
+    }
+
+    fn apply_decorator_entry_point_seeding(&mut self) {
+        let roots = self
+            .decorator_frameworks_by_module
+            .iter()
+            .map(|(file_id, frameworks)| (*file_id, frameworks.clone()))
+            .collect::<Vec<_>>();
+        let origin = ReferenceOrigin::NonTest;
+        for (module_idx, frameworks) in roots {
+            let Some(module) = self.modules.get(module_idx) else {
+                continue;
+            };
+            let export_names = module
+                .facts
+                .exports
+                .iter()
+                .filter(|export| export_has_framework_decorator(export, module, &frameworks))
+                .map(|export| export.name.as_symbol())
+                .collect::<Vec<_>>();
+            let mut newly_live_modules = BTreeSet::new();
+            for export_name in export_names {
+                let mut visited = BTreeSet::new();
+                let resolution =
+                    self.resolve_export_name(FileId(module_idx), &export_name, &mut visited);
+                if resolution.is_empty() {
+                    continue;
+                }
+                self.mark_resolution_used_or_uncertain(
+                    resolution,
+                    "entry_point_decorator",
                     &origin,
                     &mut newly_live_modules,
                 );
@@ -1021,6 +1071,114 @@ fn import_binding_is_used(module: &ResolvedModule, import: &ResolvedImport) -> b
             .local_name
             .as_ref()
             .is_some_and(|local| module.facts.used_import_bindings.contains(local)),
+    }
+}
+
+fn export_has_framework_decorator(
+    export: &ExportFact,
+    module: &ResolvedModule,
+    frameworks: &BTreeSet<Framework>,
+) -> bool {
+    export
+        .decorators
+        .iter()
+        .any(|decorator| decorator_matches_framework(module, &decorator.segments, frameworks))
+}
+
+fn decorator_matches_framework(
+    module: &ResolvedModule,
+    segments: &[String],
+    frameworks: &BTreeSet<Framework>,
+) -> bool {
+    match segments {
+        [local] => module.imports.iter().any(|import| {
+            if import.fact.local_name.as_deref() != Some(local.as_str()) {
+                return false;
+            }
+            let Some(imported_name) = decorator_imported_name(import) else {
+                return false;
+            };
+            frameworks
+                .iter()
+                .any(|framework| framework.allows_decorator(&import.fact.source, imported_name))
+        }),
+        [namespace, member] => module.imports.iter().any(|import| {
+            matches!(import.fact.kind, ImportKind::Namespace)
+                && import.fact.local_name.as_deref() == Some(namespace.as_str())
+                && frameworks
+                    .iter()
+                    .any(|framework| framework.allows_decorator(&import.fact.source, member))
+        }),
+        _ => false,
+    }
+}
+
+fn decorator_imported_name(import: &ResolvedImport) -> Option<&str> {
+    match import.fact.kind {
+        ImportKind::Named => import.fact.imported_name.as_deref(),
+        ImportKind::Default => Some("default"),
+        ImportKind::Namespace | ImportKind::SideEffect => None,
+    }
+}
+
+struct DecoratorFrameworkCache {
+    project_root: PathBuf,
+    by_start_dir: BTreeMap<PathBuf, BTreeSet<Framework>>,
+    by_manifest: BTreeMap<PathBuf, BTreeSet<Framework>>,
+}
+
+impl DecoratorFrameworkCache {
+    fn new(project_root: &Path) -> Self {
+        Self {
+            project_root: normalize_path(project_root),
+            by_start_dir: BTreeMap::new(),
+            by_manifest: BTreeMap::new(),
+        }
+    }
+
+    fn frameworks_for_file(&mut self, file: &Path) -> BTreeSet<Framework> {
+        let file = normalize_path(file);
+        let start_dir = file
+            .parent()
+            .map(normalize_path)
+            .unwrap_or_else(|| self.project_root.clone());
+        if let Some(frameworks) = self.by_start_dir.get(&start_dir) {
+            return frameworks.clone();
+        }
+        let frameworks = if start_dir.starts_with(&self.project_root) {
+            self.nearest_manifest_frameworks(&start_dir)
+        } else {
+            BTreeSet::new()
+        };
+        self.by_start_dir.insert(start_dir, frameworks.clone());
+        frameworks
+    }
+
+    fn nearest_manifest_frameworks(&mut self, start_dir: &Path) -> BTreeSet<Framework> {
+        let mut dir = start_dir.to_path_buf();
+        loop {
+            let manifest = dir.join("package.json");
+            if manifest.is_file() {
+                return self.frameworks_for_manifest(&manifest);
+            }
+            if dir == self.project_root || !dir.pop() || !dir.starts_with(&self.project_root) {
+                return BTreeSet::new();
+            }
+        }
+    }
+
+    fn frameworks_for_manifest(&mut self, manifest: &Path) -> BTreeSet<Framework> {
+        let manifest = normalize_path(manifest);
+        if let Some(frameworks) = self.by_manifest.get(&manifest) {
+            return frameworks.clone();
+        }
+        let frameworks = fs::read(&manifest)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .map(|manifest| detected_decorator_frameworks(&manifest))
+            .unwrap_or_default();
+        self.by_manifest.insert(manifest, frameworks.clone());
+        frameworks
     }
 }
 

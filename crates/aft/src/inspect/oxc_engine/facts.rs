@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use oxc_allocator::Allocator;
@@ -10,8 +10,8 @@ use oxc_span::{SourceType, Span};
 use rustc_hash::FxHashSet;
 
 use super::types::{
-    DynamicImportFact, ExportFact, ExportName, FileFacts, FileId, ImportFact, ImportKind,
-    ReExportFact, ReExportKind,
+    DecoratorFact, DynamicImportFact, ExportFact, ExportName, FileFacts, FileId, ImportFact,
+    ImportKind, ReExportFact, ReExportKind,
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,7 @@ struct Extractor {
     re_exports: Vec<ReExportFact>,
     dynamic_imports: Vec<DynamicImportFact>,
     local_declaration_names: FxHashSet<String>,
+    local_declaration_decorators: BTreeMap<String, Vec<DecoratorFact>>,
     pending_local_export_specifiers: Vec<PendingLocalExportSpecifier>,
     identifier_references: Vec<String>,
     line_index: LineIndex,
@@ -135,6 +136,11 @@ impl Extractor {
             } else {
                 self.exports.push(ExportFact {
                     name: ExportName::Named(spec.exported_name),
+                    decorators: self
+                        .local_declaration_decorators
+                        .get(&spec.local_name)
+                        .cloned()
+                        .unwrap_or_default(),
                     local_name: Some(spec.local_name),
                     kind: "value".to_string(),
                     is_type_only: spec.is_type_only,
@@ -173,17 +179,20 @@ impl Extractor {
                         "function",
                         is_type_only,
                         id.span,
+                        Vec::new(),
                     );
                 }
             }
             Declaration::ClassDeclaration(class) => {
                 if let Some(id) = &class.id {
+                    let decorators = self.decorator_facts(&class.decorators);
                     self.push_named_export(
                         &id.name,
                         Some(id.name.to_string()),
                         "class",
                         is_type_only,
                         id.span,
+                        decorators,
                     );
                 }
             }
@@ -194,6 +203,7 @@ impl Extractor {
                     "type",
                     true,
                     alias.id.span,
+                    Vec::new(),
                 );
             }
             Declaration::TSInterfaceDeclaration(iface) => {
@@ -203,6 +213,7 @@ impl Extractor {
                     "interface",
                     true,
                     iface.id.span,
+                    Vec::new(),
                 );
             }
             Declaration::TSEnumDeclaration(enum_decl) => {
@@ -212,6 +223,7 @@ impl Extractor {
                     "enum",
                     is_type_only,
                     enum_decl.id.span,
+                    Vec::new(),
                 );
             }
             Declaration::TSModuleDeclaration(module) => match &module.id {
@@ -222,6 +234,7 @@ impl Extractor {
                         "namespace",
                         module.declare || is_type_only,
                         id.span,
+                        Vec::new(),
                     );
                 }
                 TSModuleDeclarationName::StringLiteral(lit) => {
@@ -231,6 +244,7 @@ impl Extractor {
                         "namespace",
                         module.declare || is_type_only,
                         lit.span,
+                        Vec::new(),
                     );
                 }
             },
@@ -251,6 +265,7 @@ impl Extractor {
                 kind,
                 is_type_only,
                 id.span,
+                Vec::new(),
             );
         }
     }
@@ -262,6 +277,7 @@ impl Extractor {
         kind: &str,
         is_type_only: bool,
         span: Span,
+        decorators: Vec<DecoratorFact>,
     ) {
         self.exports.push(ExportFact {
             name: ExportName::Named(name.to_string()),
@@ -270,6 +286,7 @@ impl Extractor {
             is_type_only,
             line: self.line_index.line_for_span(span),
             declared: true,
+            decorators,
         });
     }
 
@@ -290,6 +307,11 @@ impl Extractor {
             Declaration::ClassDeclaration(class) => {
                 if let Some(id) = &class.id {
                     self.local_declaration_names.insert(id.name.to_string());
+                    let decorators = self.decorator_facts(&class.decorators);
+                    if !decorators.is_empty() {
+                        self.local_declaration_decorators
+                            .insert(id.name.to_string(), decorators);
+                    }
                 }
             }
             Declaration::TSTypeAliasDeclaration(alias) => {
@@ -314,6 +336,46 @@ impl Extractor {
             },
             _ => {}
         }
+    }
+
+    fn decorator_facts(&self, decorators: &[Decorator<'_>]) -> Vec<DecoratorFact> {
+        decorators
+            .iter()
+            .filter_map(|decorator| {
+                let segments = decorator_callee_segments(&decorator.expression)?;
+                let name = segments.last()?.clone();
+                Some(DecoratorFact {
+                    name,
+                    segments,
+                    line: self.line_index.line_for_span(decorator.span),
+                })
+            })
+            .collect()
+    }
+}
+
+fn decorator_callee_segments(expression: &Expression<'_>) -> Option<Vec<String>> {
+    match expression {
+        Expression::CallExpression(call) => expression_segments(&call.callee),
+        _ => expression_segments(expression),
+    }
+}
+
+fn expression_segments(expression: &Expression<'_>) -> Option<Vec<String>> {
+    match expression {
+        Expression::Identifier(identifier) => Some(vec![identifier.name.to_string()]),
+        Expression::StaticMemberExpression(member) => {
+            let mut segments = expression_segments(&member.object)?;
+            segments.push(member.property.name.to_string());
+            Some(segments)
+        }
+        Expression::ParenthesizedExpression(parenthesized) => {
+            expression_segments(&parenthesized.expression)
+        }
+        Expression::TSInstantiationExpression(instantiation) => {
+            expression_segments(&instantiation.expression)
+        }
+        _ => None,
     }
 }
 
@@ -411,14 +473,18 @@ impl<'a> Visit<'a> for Extractor {
     }
 
     fn visit_export_default_declaration(&mut self, decl: &ExportDefaultDeclaration<'a>) {
-        let (local_name, kind) = match &decl.declaration {
-            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-                (class.id.as_ref().map(|id| id.name.to_string()), "class")
-            }
-            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-                (func.id.as_ref().map(|id| id.name.to_string()), "function")
-            }
-            _ => (None, "default"),
+        let (local_name, kind, decorators) = match &decl.declaration {
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => (
+                class.id.as_ref().map(|id| id.name.to_string()),
+                "class",
+                self.decorator_facts(&class.decorators),
+            ),
+            ExportDefaultDeclarationKind::FunctionDeclaration(func) => (
+                func.id.as_ref().map(|id| id.name.to_string()),
+                "function",
+                Vec::new(),
+            ),
+            _ => (None, "default", Vec::new()),
         };
         self.exports.push(ExportFact {
             name: ExportName::Default,
@@ -427,6 +493,7 @@ impl<'a> Visit<'a> for Extractor {
             is_type_only: false,
             line: self.line_index.line_for_span(decl.span),
             declared: true,
+            decorators,
         });
         walk::walk_export_default_declaration(self, decl);
     }

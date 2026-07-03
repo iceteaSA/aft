@@ -127,7 +127,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v25: framework file-based route files execute as roots while only their
 /// framework-called exports are seeded live; manifest-driven route detection
 /// changes dead/unused verdict roll-ups without changing per-file facts.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 25;
+/// v26: TS/JS per-file facts record exported-symbol decorators, and NestJS
+/// decorator roots change dead/unused verdict roll-ups.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 26;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1830,7 +1832,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 25);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 26);
     }
 
     #[test]

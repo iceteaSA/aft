@@ -556,6 +556,127 @@ export function unusedDependency() { return 0; }
 }
 
 #[test]
+fn oxc_engine_nestjs_decorator_roots_exported_class_only() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/app.controller.ts",
+            "import { Controller } from '@nestjs/common';
+import { liveDependency } from './service';
+
+@Controller()
+export class AppController {
+  findAll() { return liveDependency(); }
+}
+
+export function deadSibling() { return 0; }
+",
+        ),
+        (
+            "src/service.ts",
+            "export function liveDependency() { return 1; }
+export function unusedDependency() { return 0; }
+",
+        ),
+    ]);
+    write_file(
+        &root,
+        "package.json",
+        r#"{ "dependencies": { "@nestjs/common": "latest" } }"#,
+    );
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_verdict(
+        &result,
+        "src/app.controller.ts",
+        "AppController",
+        LivenessVerdict::Used,
+    );
+    assert_eq!(
+        verdict(&result, "src/app.controller.ts", "AppController").reason,
+        "entry_point_decorator"
+    );
+    assert_verdict(
+        &result,
+        "src/app.controller.ts",
+        "deadSibling",
+        LivenessVerdict::Unused,
+    );
+    assert_verdict(
+        &result,
+        "src/service.ts",
+        "liveDependency",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/service.ts",
+        "unusedDependency",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
+fn oxc_engine_nestjs_decorator_import_binding_must_match_allowed_package() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/aliased.ts",
+            "import { Controller as C } from '@nestjs/common';
+
+@C()
+export class AliasedController {}
+",
+        ),
+        (
+            "src/local.ts",
+            "import { Controller } from './local-decorators';
+
+@Controller()
+export class LocalController {}
+",
+        ),
+        (
+            "src/local-decorators.ts",
+            "export function Controller() { return () => undefined; }\n",
+        ),
+    ]);
+    write_file(
+        &root,
+        "package.json",
+        r#"{ "dependencies": { "@nestjs/common": "latest" } }"#,
+    );
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_verdict(
+        &result,
+        "src/aliased.ts",
+        "AliasedController",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/local.ts",
+        "LocalController",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
 fn oxc_engine_entry_reachability_seeds_public_barrel_reexports() {
     let (_temp, root, paths) = fixture_project(&[
         ("src/target.ts", "export const api = 1;\n"),
