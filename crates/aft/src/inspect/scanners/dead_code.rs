@@ -12,8 +12,8 @@ use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::{
-    canonicalize_normalized, is_test_file, is_test_support_file, CALLGRAPH_PROVENANCE_REEXPORT,
-    DISPATCHED_CALLEE_SEPARATOR,
+    canonicalize_normalized, dead_code_skipped_language, is_test_file, is_test_support_file,
+    language_name, CALLGRAPH_PROVENANCE_REEXPORT, DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::inspect::oxc_engine::{
     analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
@@ -307,6 +307,20 @@ fn gather_file_contribution(
     file_analyzer: &mut DeadCodeFileAnalyzer,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
+    if let Some(language) = dead_code_skipped_language(file) {
+        return FileContribution::new(
+            InspectCategory::DeadCode,
+            file.to_path_buf(),
+            collect_freshness(file),
+            json!({
+                "file": file_name,
+                "facts_format_version": DEAD_CODE_FACTS_FORMAT_VERSION,
+                "exports": [],
+                "skipped_languages": [language],
+            }),
+        );
+    }
+
     let oxc_facts = oxc_facts_by_file.get(&file_name);
     let exports = oxc_facts
         .map(oxc_fact_export_contributions)
@@ -446,6 +460,7 @@ pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_jso
         "count": 0,
         "items": [],
         "by_language": {},
+        "languages_skipped": [],
         "drill_down_capped": false,
         "uncertain_count": 0,
         "uncertain_items": [],
@@ -859,7 +874,7 @@ fn aggregate_materialized_dead_code_contributions(
         .cloned()
         .collect::<Vec<_>>();
 
-    let (parse_errors, skipped_files) = dead_code_honesty_fields(parsed);
+    let (parse_errors, skipped_files, languages_skipped) = dead_code_honesty_fields(parsed);
     let mut aggregate = json!({
         "count": count,
         "items": dead_items,
@@ -872,6 +887,7 @@ fn aggregate_materialized_dead_code_contributions(
         "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
+        "languages_skipped": languages_skipped,
         "callgraph_available": true,
         "scanned_files": scanned_files,
         "complete": parse_errors.is_empty() && skipped_files.is_empty(),
@@ -895,11 +911,14 @@ fn export_uses_oxc(export: &ExportContribution) -> bool {
     export.verdict.is_some() || export.provenance.as_deref() == Some(OXC_PROVENANCE)
 }
 
-fn dead_code_honesty_fields(parsed: &[DeadCodeContribution]) -> (Vec<Value>, Vec<Value>) {
+fn dead_code_honesty_fields(
+    parsed: &[DeadCodeContribution],
+) -> (Vec<Value>, Vec<Value>, Vec<String>) {
     let mut parse_error_keys = BTreeSet::new();
     let mut parse_errors = Vec::new();
     let mut skipped_file_keys = BTreeSet::new();
     let mut skipped_files = Vec::new();
+    let mut languages_skipped = BTreeSet::new();
     for contribution in parsed {
         for value in &contribution.parse_errors {
             let key = value.to_string();
@@ -913,8 +932,13 @@ fn dead_code_honesty_fields(parsed: &[DeadCodeContribution]) -> (Vec<Value>, Vec
                 skipped_files.push(value.clone());
             }
         }
+        languages_skipped.extend(contribution.skipped_languages.iter().cloned());
     }
-    (parse_errors, skipped_files)
+    (
+        parse_errors,
+        skipped_files,
+        languages_skipped.into_iter().collect(),
+    )
 }
 
 fn edges_by_source(
@@ -2112,38 +2136,9 @@ pub(crate) fn collect_public_api_files(project_root: &Path) -> BTreeSet<String> 
 }
 
 fn language_for_file(file: &str) -> &'static str {
-    let extension = Path::new(file)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match extension.as_str() {
-        "rs" => "rust",
-        "ts" | "tsx" | "mts" | "cts" => "typescript",
-        "js" | "jsx" | "mjs" | "cjs" => "javascript",
-        "py" => "python",
-        "go" => "go",
-        "c" | "h" => "c",
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
-        "zig" => "zig",
-        "cs" => "csharp",
-        "sh" | "bash" | "zsh" | "fish" => "bash",
-        "html" | "htm" => "html",
-        "md" | "markdown" => "markdown",
-        "sol" => "solidity",
-        "vue" => "vue",
-        "json" => "json",
-        "scala" => "scala",
-        "java" => "java",
-        "rb" => "ruby",
-        "kt" | "kts" => "kotlin",
-        "swift" => "swift",
-        "php" => "php",
-        "lua" => "lua",
-        "pl" | "pm" => "perl",
-        _ => "unknown",
-    }
+    detect_language(Path::new(file))
+        .map(language_name)
+        .unwrap_or("unknown")
 }
 
 fn supports_type_refs(lang: LangId) -> bool {
@@ -2245,6 +2240,8 @@ struct DeadCodeContribution {
     parse_errors: Vec<Value>,
     #[serde(default)]
     skipped_files: Vec<Value>,
+    #[serde(default)]
+    skipped_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

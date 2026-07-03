@@ -224,6 +224,25 @@ fn inspect_unused_exports_non_js_ts_files_contribute_empty_and_are_skipped() {
 }
 
 #[test]
+fn inspect_unused_exports_skips_kotlin_export_like_declarations() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let kotlin_file = write_file(
+        &root.join("src/Sample.kt"),
+        "class UnreferencedService { fun run() = Unit }\n",
+    );
+
+    let success = scan(root, vec![kotlin_file]);
+
+    assert_eq!(success.aggregate["count"], 0);
+    assert!(success.aggregate["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        success.aggregate["languages_skipped"],
+        serde_json::json!(["kotlin"])
+    );
+}
+
+#[test]
 fn inspect_unused_exports_caps_drill_down_after_one_hundred_items() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_freshness::FileFreshness;
 use crate::config::Config;
-use crate::parser::SharedSymbolCache;
+use crate::parser::{LangId, SharedSymbolCache};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -326,6 +326,69 @@ impl InspectJob {
             config: Arc::clone(&self.config),
             symbol_cache: Arc::clone(&self.symbol_cache),
         }
+    }
+}
+
+pub(crate) fn is_js_ts_language(language: LangId) -> bool {
+    matches!(
+        language,
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript
+    )
+}
+
+pub(crate) fn dead_code_supports_language(language: LangId) -> bool {
+    is_js_ts_language(language) || callgraph_store_dead_code_supports_language(language)
+}
+
+pub(crate) fn dead_code_skipped_language(file: &Path) -> Option<&'static str> {
+    let language = crate::parser::detect_language(file)?;
+    (!dead_code_supports_language(language)).then(|| language_name(language))
+}
+
+fn callgraph_store_dead_code_supports_language(language: LangId) -> bool {
+    // Dead-code reachability needs real call edges, not just outline symbols.
+    // Keep this narrower than every language with a tree-sitter grammar: the
+    // store-backed liveness path is trusted only for languages with call-edge
+    // extraction that dead-code consumes, and the call_node_kinds check keeps the
+    // gate tied to the extraction substrate instead of extension names alone.
+    let supported_by_store_liveness = matches!(
+        language,
+        LangId::Rust | LangId::Go | LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp
+    );
+    supported_by_store_liveness && !crate::calls::call_node_kinds(language).is_empty()
+}
+
+pub(crate) fn language_name(language: LangId) -> &'static str {
+    match language {
+        LangId::TypeScript => "typescript",
+        LangId::Tsx => "tsx",
+        LangId::JavaScript => "javascript",
+        LangId::Python => "python",
+        LangId::Rust => "rust",
+        LangId::Go => "go",
+        LangId::C => "c",
+        LangId::Cpp => "cpp",
+        LangId::Zig => "zig",
+        LangId::CSharp => "csharp",
+        LangId::Bash => "bash",
+        LangId::Html => "html",
+        LangId::Markdown => "markdown",
+        LangId::Yaml => "yaml",
+        LangId::Solidity => "solidity",
+        LangId::Scss => "scss",
+        LangId::Vue => "vue",
+        LangId::Json => "json",
+        LangId::Scala => "scala",
+        LangId::Java => "java",
+        LangId::Ruby => "ruby",
+        LangId::Kotlin => "kotlin",
+        LangId::Swift => "swift",
+        LangId::Php => "php",
+        LangId::Lua => "lua",
+        LangId::Perl => "perl",
+        LangId::Pascal => "pascal",
+        LangId::R => "r",
+        LangId::ObjC => "objc",
     }
 }
 

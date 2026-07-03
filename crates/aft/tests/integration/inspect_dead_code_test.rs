@@ -238,6 +238,37 @@ fn inspect_dead_code_reports_exported_uncalled_function() {
 }
 
 #[test]
+fn inspect_dead_code_skips_kotlin_without_dead_verdicts() {
+    let (_temp_dir, root, paths) = fixture_project(&[(
+        "src/Sample.kt",
+        "class UnreferencedService { fun run() = Unit }\n",
+    )]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![export(
+            &root,
+            "src/Sample.kt",
+            "UnreferencedService",
+            "class",
+            1,
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 0);
+    assert_eq!(success.aggregate["by_language"], json!({}));
+    assert!(success.aggregate["items"].as_array().unwrap().is_empty());
+    assert_eq!(success.aggregate["languages_skipped"], json!(["kotlin"]));
+    assert!(success.contributions[0].contribution["exports"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn inspect_dead_code_does_not_report_export_reachable_from_entry_point() {
     let (_temp_dir, root, paths) = fixture_project(&[
         ("src/foo.ts", "export function used() {}\n"),

@@ -758,10 +758,11 @@ fn render_symbol_category(
     }
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
     let suffix = dead_code_language_suffix(section);
+    let skipped_suffix = dead_code_skipped_language_suffix(section);
     if count == 0 {
-        lines.push(format!("{label}: 0"));
+        lines.push(format!("{label}: 0{skipped_suffix}"));
     } else {
-        lines.push(format!("{label}: {count}{suffix}:"));
+        lines.push(format!("{label}: {count}{suffix}{skipped_suffix}:"));
         if let Some(items) = category_items(summary, details, key) {
             for item in items {
                 let file = item.get("file").and_then(Value::as_str).unwrap_or("?");
@@ -846,6 +847,27 @@ fn dead_code_language_suffix(section: &Value) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(" ({rendered})")
+}
+
+fn dead_code_skipped_language_suffix(section: &Value) -> String {
+    let Some(languages) = section.get("languages_skipped").and_then(Value::as_array) else {
+        return String::new();
+    };
+    if languages.is_empty() {
+        return String::new();
+    }
+    let mut languages = languages
+        .iter()
+        .filter_map(Value::as_str)
+        .map(short_lang)
+        .collect::<Vec<_>>();
+    languages.sort_unstable();
+    languages.dedup();
+    if languages.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} not analyzed)", languages.join(", "))
+    }
 }
 
 fn short_lang(lang: &str) -> &str {
@@ -1163,6 +1185,7 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
                     "count": count_from_payload(payload),
                     "test_only_count": test_only_count_from_payload(payload),
                     "by_language": payload.and_then(|p| p.get("by_language")).cloned().unwrap_or_else(|| serde_json::json!({})),
+                    "languages_skipped": payload.and_then(|p| p.get("languages_skipped")).cloned().unwrap_or_else(|| serde_json::json!([])),
                     "top": top_preview_from_payload(payload),
                     "test_only_top": test_only_top_from_payload(payload),
                 })
@@ -1683,6 +1706,23 @@ mod render_text_tests {
         assert!(
             text.contains("    src/barrel-target.ts::throughBarrel — used by barrel.test.ts"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn renders_dead_code_skipped_languages_as_not_analyzed() {
+        let text = render(serde_json::json!({
+            "dead_code": {
+                "count": 0,
+                "by_language": {},
+                "languages_skipped": ["kotlin", "java"],
+                "top": [],
+            }
+        }));
+
+        assert!(
+            text.contains("Dead code: 0 (java, kotlin not analyzed)"),
+            "dead-code skipped language note missing:\n{text}"
         );
     }
 
