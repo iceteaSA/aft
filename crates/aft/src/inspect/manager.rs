@@ -1110,7 +1110,12 @@ impl InspectManager {
         } else {
             false
         };
-        if refresh_dead_code_facts || refresh_unused_exports_facts {
+        let refresh_duplicates_facts = if job.category == InspectCategory::Duplicates {
+            duplicates_contributions_need_fact_refresh(cache, job)?
+        } else {
+            false
+        };
+        if refresh_dead_code_facts || refresh_unused_exports_facts || refresh_duplicates_facts {
             // Raw-facts contributions can be rolled up after manifest/resolver
             // edits without re-reading source. Only legacy verdict-bearing or
             // facts-version-mismatched caches need a one-time full refresh before
@@ -1813,6 +1818,20 @@ fn unused_exports_contributions_need_fact_refresh(
     Ok(contributions
         .iter()
         .any(unused_exports_contribution_needs_fact_refresh))
+}
+
+/// Duplicates contributions written before v0.44 lack the `line_count` field
+/// (serde defaults it to 0), so a cached roll-up computes total_analyzed_lines
+/// as 0 and the summary renders "0.0% of 0 analyzed lines". One full rescan
+/// repopulates the counts; fresh contributions always carry line_count.
+fn duplicates_contributions_need_fact_refresh(
+    cache: &InspectCache,
+    job: &InspectJob,
+) -> Result<bool, String> {
+    let contributions = load_contributions(cache, job)?;
+    Ok(contributions
+        .iter()
+        .any(|contribution| contribution.contribution.get("line_count").is_none()))
 }
 
 fn unused_exports_contribution_needs_fact_refresh(contribution: &FileContribution) -> bool {

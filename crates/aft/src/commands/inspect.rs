@@ -940,9 +940,18 @@ fn render_duplicates_category(
         .and_then(Value::as_u64)
         .unwrap_or(count);
     let suffix = if count > 0 { " (top by cost):" } else { "" };
+    // A zero denominator means analyzed-line counts are missing (pre-v0.44
+    // cached contributions); print no percentage rather than a false "0.0%".
+    let percent_clause = if total_lines > 0 {
+        format!(
+            " ({}% of {total_lines} analyzed lines)",
+            format_percent(percent)
+        )
+    } else {
+        String::new()
+    };
     lines.push(format!(
-        "{label}: {duplicated_lines} duplicated lines ({}% of {total_lines} analyzed lines) across {file_count} files, {group_count} {}{suffix}",
-        format_percent(percent),
+        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{suffix}",
         plural_group(group_count),
     ));
     render_duplicate_suppression(lines, section);
