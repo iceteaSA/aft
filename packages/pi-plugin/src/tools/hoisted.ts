@@ -90,33 +90,6 @@ function modelSupportsImages(extCtx: { model?: { input?: unknown } }): boolean {
 const NON_VISION_IMAGE_NOTE =
   "[Current model does not support images. The image will be omitted from this request.]";
 
-type ConfirmableExtensionContext = {
-  hasUI?: boolean;
-  signal?: AbortSignal;
-  ui?: {
-    confirm?: (title: string, message: string, opts?: { signal?: AbortSignal }) => Promise<boolean>;
-  };
-};
-
-async function assertMutationPermission(
-  extCtx: ConfirmableExtensionContext,
-  action: "edit" | "write",
-  filePath: string,
-  previewDiff: unknown,
-): Promise<void> {
-  if (extCtx.hasUI !== true || typeof extCtx.ui?.confirm !== "function") return;
-  const diff = typeof previewDiff === "string" && previewDiff.trim().length > 0 ? previewDiff : "";
-  const message = diff
-    ? `AFT wants to ${action} ${filePath}.\n\nDiff preview:\n${diff}`
-    : `AFT wants to ${action} ${filePath}.`;
-  const confirmed = await extCtx.ui.confirm(`Allow AFT ${action}?`, message, {
-    signal: extCtx.signal,
-  });
-  if (!confirmed) {
-    throw new Error(`${action}: permission denied`);
-  }
-}
-
 /**
  * Local shape for Pi's render context — the real type is exposed by
  * `@earendil-works/pi-coding-agent`'s internals but not publicly exported.
@@ -558,11 +531,6 @@ export function registerHoistedTools(
           filePath: filePathArg,
           content: params.content,
         };
-        const preview = await callToolCall(bridge, "write", rawArgs, extCtx, { preview: true });
-        if (preview.success === false) {
-          throw new Error(preview.text || preview.message || "write preview failed");
-        }
-        await assertMutationPermission(extCtx, "write", filePath, preview.preview_diff);
         const response = await callToolCall(bridge, "write", rawArgs, extCtx);
         if (response.success === false) {
           throw new Error(response.text || response.message || "write failed");
@@ -625,11 +593,6 @@ export function registerHoistedTools(
         );
         if (occurrence !== undefined) rawArgs.occurrence = occurrence;
 
-        const preview = await callToolCall(bridge, "edit", rawArgs, extCtx, { preview: true });
-        if (preview.success === false) {
-          throw new Error(preview.text || preview.message || "edit preview failed");
-        }
-        await assertMutationPermission(extCtx, "edit", filePath, preview.preview_diff);
         const response = await callToolCall(bridge, "edit", rawArgs, extCtx);
         if (response.success === false) {
           throw new Error(response.text || response.message || "edit failed");

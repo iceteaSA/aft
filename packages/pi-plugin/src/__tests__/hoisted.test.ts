@@ -241,10 +241,9 @@ describe("hoisted tool adapters", () => {
       appendContent: "\nnext",
     });
 
-    expect(calls.map((call) => call.command)).toEqual(["tool_call", "tool_call"]);
-    expect(calls[0].params).toMatchObject({ name: "edit", preview: true });
-    expect(calls[1].params).toMatchObject({ name: "edit" });
-    expect(toolArgs(calls[1])).toEqual({
+    expect(calls.map((call) => call.command)).toEqual(["tool_call"]);
+    expect(calls[0].params).toMatchObject({ name: "edit" });
+    expect(toolArgs(calls[0])).toEqual({
       filePath: "README.md",
       oldString: "ignored",
       newString: "ignored",
@@ -276,7 +275,7 @@ describe("hoisted tool adapters", () => {
       oldString: "before",
       newString: "after",
     });
-    expect(toolArgs(calls[1])).toEqual({
+    expect(toolArgs(calls[0])).toEqual({
       filePath: "alias.ts",
       oldString: "before",
       newString: "after",
@@ -296,7 +295,7 @@ describe("hoisted tool adapters", () => {
       oldString: "before",
       newString: "after",
     });
-    expect(toolArgs(calls[3])).toEqual({
+    expect(toolArgs(calls[1])).toEqual({
       filePath: "canonical.ts",
       oldString: "before",
       newString: "after",
@@ -331,14 +330,14 @@ describe("hoisted tool adapters", () => {
       newString: "after",
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
-    expect(calls.map((call) => call.command)).toEqual(["tool_call", "tool_call"]);
-    expect(calls[0].params).toMatchObject({ name: "edit", preview: true });
-    expect(toolArgs(calls[1])).toMatchObject({
+    expect(calls.map((call) => call.command)).toEqual(["tool_call"]);
+    expect(calls[0].params).toMatchObject({ name: "edit" });
+    expect(toolArgs(calls[0])).toMatchObject({
       filePath: "src/app.ts",
       oldString: "before",
       newString: "after",
     });
-    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
+    expect(toolArgs(calls[0])).not.toHaveProperty("diagnostics");
     expect(result.content[0].text).not.toContain("LSP diagnostics");
     expect(result.details.diagnostics).toBeUndefined();
   });
@@ -370,7 +369,7 @@ describe("hoisted tool adapters", () => {
       newString: "after",
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
-    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
+    expect(toolArgs(calls[0])).not.toHaveProperty("diagnostics");
     expect(result.details.diagnostics).toEqual(diagnostics);
     expect(result.content[0].text).toContain("LSP diagnostics");
     expect(result.content[0].text).toContain("Broken edit");
@@ -573,9 +572,8 @@ describe("hoisted tool adapters", () => {
       content: "export {};\n",
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
-    expect(calls.map((call) => call.command)).toEqual(["tool_call", "tool_call"]);
-    expect(calls[0].params).toMatchObject({ name: "write", preview: true });
-    expect(toolArgs(calls[1])).toEqual({
+    expect(calls.map((call) => call.command)).toEqual(["tool_call"]);
+    expect(toolArgs(calls[0])).toEqual({
       filePath: "src/app.ts",
       content: "export {};\n",
     });
@@ -597,7 +595,7 @@ describe("hoisted tool adapters", () => {
 
     expect(schemaAccepts(writeTool.parameters, { path: "alias.ts", content: "x" })).toBe(true);
     await executeTool(writeTool, { path: "alias.ts", content: "x" });
-    expect(toolArgs(calls[1])).toEqual({ filePath: "alias.ts", content: "x" });
+    expect(toolArgs(calls[0])).toEqual({ filePath: "alias.ts", content: "x" });
 
     expect(
       schemaAccepts(writeTool.parameters, {
@@ -607,7 +605,7 @@ describe("hoisted tool adapters", () => {
       }),
     ).toBe(true);
     await executeTool(writeTool, { filePath: "canonical.ts", path: "alias.ts", content: "x" });
-    expect(toolArgs(calls[3])).toEqual({ filePath: "canonical.ts", content: "x" });
+    expect(toolArgs(calls[1])).toEqual({ filePath: "canonical.ts", content: "x" });
 
     expect(schemaAccepts(writeTool.parameters, { content: "x" })).toBe(false);
     await expect(executeTool(writeTool, { content: "x" })).rejects.toThrow(
@@ -634,7 +632,7 @@ describe("hoisted tool adapters", () => {
       filePath: "src/app.ts",
       content: "export {};\n",
     });
-    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
+    expect(toolArgs(calls[0])).not.toHaveProperty("diagnostics");
 
     // The per-call `diagnostics` param was removed (agents never used it; the
     // status bar + aft_inspect are the agent-facing diagnostics paths). A
@@ -644,7 +642,7 @@ describe("hoisted tool adapters", () => {
       content: "export {};\n",
       diagnostics: false,
     });
-    expect(toolArgs(calls[3])).not.toHaveProperty("diagnostics");
+    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
   });
 
   test("write surfaces LSP payload when diagnostics_on_edit is configured", async () => {
@@ -672,8 +670,8 @@ describe("hoisted tool adapters", () => {
       content: "export {};\n",
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
-    expect(calls.map((call) => call.command)).toEqual(["tool_call", "tool_call"]);
-    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
+    expect(calls.map((call) => call.command)).toEqual(["tool_call"]);
+    expect(toolArgs(calls[0])).not.toHaveProperty("diagnostics");
     expect(result.details.diagnostics).toEqual(diagnostics);
     expect(result.content[0].text).toContain("LSP diagnostics");
     expect(result.content[0].text).toContain("Broken write");
@@ -743,9 +741,8 @@ describe("hoisted tool adapters", () => {
       extCtx as never,
     );
 
-    expect(calls).toHaveLength(2);
-    expect(calls[0].params).toMatchObject({ name: "write", preview: true });
-    expect(toolArgs(calls[1])).toMatchObject({ filePath: externalPath, content: "x" });
+    expect(calls).toHaveLength(1);
+    expect(toolArgs(calls[0])).toMatchObject({ filePath: externalPath, content: "x" });
   });
 
   test("formatReadFooter only hints when Rust clamped an unbounded read", () => {
