@@ -127,12 +127,18 @@ pub struct PreEditSnapshot {
     pub document_version_at_capture: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StaleDiagnosticsMark {
+    pub had_entries: bool,
+    pub changed: bool,
+}
+
 pub fn post_edit_entry_is_fresh(
     entry: &DiagnosticEntry,
     target_version: i32,
     pre: PreEditSnapshot,
 ) -> bool {
-    if entry.epoch <= pre.epoch {
+    if entry.stale || entry.epoch <= pre.epoch {
         return false;
     }
 
@@ -867,6 +873,10 @@ impl LspManager {
             return false;
         };
 
+        if entry.stale {
+            return false;
+        }
+
         let target_version = self
             .documents
             .get(server_key)
@@ -1362,13 +1372,18 @@ impl LspManager {
                 }
             }
             lsp_types::DocumentDiagnosticReport::Unchanged(_unchanged) => {
-                // The server says cache is still valid. That is only usable if
-                // we already have a report for this exact server/file; an
-                // initial `unchanged` response cannot prove freshness.
+                // The server says the previous resultId is still valid for the
+                // current document. That is only usable if we already have a
+                // report for this exact server/file; an initial `unchanged`
+                // response cannot prove freshness. A stale watcher entry is
+                // acceptable here because the pull response itself proves the
+                // cached diagnostics still describe the now-synced file.
                 if self
                     .diagnostics
                     .has_report_for_server_file(key, canonical_path)
                 {
+                    self.diagnostics
+                        .mark_fresh_for_server_file(key, canonical_path);
                     PullFileOutcome::Unchanged
                 } else {
                     PullFileOutcome::RequestFailed {
@@ -1472,6 +1487,37 @@ impl LspManager {
         removed
     }
 
+    /// Mark cached diagnostics for this file stale after a watcher-observed
+    /// external edit. The same path aliases as deletion are checked so canonical
+    /// publish keys are found even when the watcher reports a symlinked path.
+    pub fn mark_diagnostics_stale_for_file(&mut self, file: &Path) -> StaleDiagnosticsMark {
+        let mut candidates = vec![file.to_path_buf()];
+        let normalized = normalize_lookup_path(file);
+        if !candidates.iter().any(|candidate| candidate == &normalized) {
+            candidates.push(normalized.clone());
+        }
+
+        if let (Some(parent), Some(name)) = (file.parent(), file.file_name()) {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                let reconstructed = canonical_parent.join(name);
+                if !candidates
+                    .iter()
+                    .any(|candidate| candidate == &reconstructed)
+                {
+                    candidates.push(reconstructed);
+                }
+            }
+        }
+
+        let mut result = StaleDiagnosticsMark::default();
+        for candidate in candidates {
+            let (had_entries, changed) = self.diagnostics.mark_stale_for_file(&candidate);
+            result.had_entries |= had_entries;
+            result.changed |= changed;
+        }
+        result
+    }
+
     pub fn get_diagnostics_for_directory(&self, dir: &Path) -> Vec<&StoredDiagnostic> {
         let normalized = normalize_lookup_path(dir);
         self.diagnostics.for_directory(&normalized)
@@ -1481,27 +1527,29 @@ impl LspManager {
         self.diagnostics.all()
     }
 
-    /// True if any LSP server has reported diagnostics at least once, including
-    /// an empty report that proves a checked-clean file. This lets callers avoid
+    /// True if any LSP server has a current diagnostic report, including an
+    /// empty report that proves a checked-clean file. This lets callers avoid
     /// treating an empty flattened diagnostic list as trustworthy when no server
-    /// has actually run.
+    /// has actually run or every report was marked stale after an external edit.
     pub fn has_any_diagnostic_reports(&self) -> bool {
-        !self.diagnostics.is_empty()
+        self.diagnostics.has_any_fresh_report()
     }
 
-    /// True if any server has reported for this file, including an empty
-    /// checked-clean report.
+    /// True if any server has a current report for this file, including an
+    /// empty checked-clean report. Watcher-stale reports are excluded because
+    /// they predate an external edit.
     pub fn has_diagnostic_report_for_file(&self, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
-        self.diagnostics.has_any_report_for_file(&normalized)
+        self.diagnostics.has_any_fresh_report_for_file(&normalized)
     }
 
-    /// True if this exact server/file pair has a diagnostic report, including
-    /// an empty checked-clean report.
+    /// True if this exact server/file pair has a current diagnostic report,
+    /// including an empty checked-clean report. Watcher-stale reports are
+    /// excluded because they predate an external edit.
     pub fn has_diagnostic_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
         self.diagnostics
-            .has_report_for_server_file(server, &normalized)
+            .has_fresh_report_for_server_file(server, &normalized)
     }
 
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {

@@ -1423,24 +1423,37 @@ pub fn drain_watcher_events(ctx: &AppContext) {
         }
     }
 
-    // A vanished file's LSP diagnostics would otherwise linger in the warm set
-    // forever (no server republishes for a path that no longer exists),
-    // inflating the error/warning counts in the status bar and `aft_inspect`.
-    // Clear them here so every deletion source is covered (AFT delete, `rm`,
-    // `git checkout`, branch switch) — not just the delete command. The agent
-    // status bar reads E/W live from the warm set on each response, so clearing
-    // the store is sufficient; the next tool call's bar reflects the new count.
+    // Keep LSP diagnostics honest for filesystem changes that bypass AFT's
+    // write/edit tools. Deleted files cannot be republished by a server, so we
+    // still evict them. Existing files with warm diagnostics are marked stale:
+    // stale entries stay in the store for pull resultIds/server coverage, but
+    // status-bar and inspect warm reads hide them until a publish or pull proves
+    // they match the current file contents.
     //
     // Not gated on the trigram `SOURCE_EXTENSIONS` set: any registered LSP
     // server (Bash, YAML, Solidity, Vue, C/C++, custom servers, …) can publish
-    // diagnostics for files outside that set, and gating on it left their
-    // diagnostics stranded after deletion. `clear_for_file` is a cheap no-op
-    // when the store holds nothing for the path, so clearing unconditionally
-    // for every vanished path is safe.
+    // diagnostics for files outside that set. The store checks are cheap no-ops
+    // for paths with no diagnostics.
+    let mut lsp_resync_paths = Vec::new();
     for path in &changed {
-        if !path.exists() && ctx.lsp_clear_diagnostics_for_file(path) {
+        if !path.exists() {
+            if ctx.lsp_clear_diagnostics_for_file(path) {
+                status_changed = true;
+            }
+            continue;
+        }
+
+        let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
+        if stale.changed {
             status_changed = true;
         }
+        if stale.had_entries {
+            lsp_resync_paths.push(path.clone());
+        }
+    }
+
+    for path in &lsp_resync_paths {
+        ctx.lsp_resync_changed_file_for_diagnostics(path);
     }
 
     if !semantic_refresh_paths.is_empty() {

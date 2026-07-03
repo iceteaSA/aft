@@ -391,7 +391,7 @@ fn collect_file_diagnostics_for_servers(
     lsp.diagnostics_store_for_test()
         .entries_for_file(canonical)
         .into_iter()
-        .filter(|(key, _)| proven_servers.contains(*key))
+        .filter(|(key, entry)| proven_servers.contains(*key) && !entry.stale)
         .flat_map(|(_, entry)| entry.diagnostics.iter())
         .filter(|diagnostic| severity_filter.matches(diagnostic.severity))
         .cloned()
@@ -535,7 +535,7 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
                         root,
                     };
                     !lsp.diagnostics_store_for_test()
-                        .has_report_for_server_file(&key, &path)
+                        .has_fresh_report_for_server_file(&key, &path)
                 })
         };
         if missing_any_matching_server {

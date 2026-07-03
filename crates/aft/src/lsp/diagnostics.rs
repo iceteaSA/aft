@@ -59,6 +59,12 @@ pub struct DiagnosticEntry {
     /// alone, which has a race when an old-version publish arrives after
     /// the pre-edit drain. `None` = server didn't tag the publish.
     pub version: Option<i32>,
+    /// True after the filesystem watcher sees this file change outside AFT's
+    /// text sync path and before a publish or pull response proves the cached
+    /// diagnostics still describe the current file contents. Stale entries stay
+    /// in the store so resultIds and server coverage are not lost, but warm
+    /// readers must not count or display them as current diagnostics.
+    pub stale: bool,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -137,6 +143,12 @@ impl DiagnosticsStore {
         self.entries.is_empty()
     }
 
+    /// True if any entry is currently usable, including an empty checked-clean
+    /// report. Watcher-stale entries do not prove current diagnostics.
+    pub fn has_any_fresh_report(&self) -> bool {
+        self.entries.values().any(|entry| !entry.stale)
+    }
+
     /// Replace diagnostics for a `(server_kind, file)` pair using the
     /// server's lifecycle root from the active manager. Empty diagnostics
     /// are preserved as "checked clean" (NOT deleted as before).
@@ -184,6 +196,7 @@ impl DiagnosticsStore {
             epoch: self.next_epoch,
             result_id,
             version,
+            stale: false,
         };
 
         self.last_publish_at_for_file
@@ -220,12 +233,12 @@ impl DiagnosticsStore {
         self.publish(key, file, diagnostics);
     }
 
-    /// Get all diagnostics for a specific file (across all servers).
-    /// Updates LRU position for each touched entry.
+    /// Get current diagnostics for a specific file (across all servers).
+    /// Watcher-stale entries are kept for bookkeeping but are not surfaced.
     pub fn for_file(&self, file: &Path) -> Vec<&StoredDiagnostic> {
         self.entries
             .iter()
-            .filter(|((_, stored_file), _)| stored_file == file)
+            .filter(|((_, stored_file), entry)| stored_file == file && !entry.stale)
             .flat_map(|(_, entry)| entry.diagnostics.iter())
             .collect()
     }
@@ -240,16 +253,31 @@ impl DiagnosticsStore {
             .collect()
     }
 
-    /// True if any server has reported (even an empty result) for this file.
+    /// True if any server has an entry (fresh or stale) for this file.
     pub fn has_any_report_for_file(&self, file: &Path) -> bool {
         self.entries.keys().any(|(_, f)| f == file)
     }
 
-    /// True if this exact server instance has reported (even an empty result)
-    /// for this exact file.
+    /// True if any server has a non-stale report for this file.
+    pub fn has_any_fresh_report_for_file(&self, file: &Path) -> bool {
+        self.entries
+            .iter()
+            .any(|((_, stored_file), entry)| stored_file == file && !entry.stale)
+    }
+
+    /// True if this exact server instance has an entry (fresh or stale) for
+    /// this exact file. Pull diagnostics use stale entries as the previous
+    /// resultId cache when asking the server whether diagnostics are unchanged.
     pub fn has_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
         self.entries
             .contains_key(&(server.clone(), file.to_path_buf()))
+    }
+
+    /// True if this exact server instance has a non-stale report for this file.
+    pub fn has_fresh_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
+        self.entries
+            .get(&(server.clone(), file.to_path_buf()))
+            .is_some_and(|entry| !entry.stale)
     }
 
     /// True if this exact server instance published/replaced diagnostics for
@@ -263,22 +291,25 @@ impl DiagnosticsStore {
     ) -> bool {
         self.last_publish_at_for_file
             .get(&(server.clone(), file.to_path_buf()))
-            .is_some_and(|published_at| *published_at >= since)
+            .is_some_and(|published_at| {
+                *published_at >= since && self.has_fresh_report_for_server_file(server, file)
+            })
     }
 
-    /// Get all diagnostics for files under a directory.
+    /// Get current diagnostics for files under a directory.
     pub fn for_directory(&self, dir: &Path) -> Vec<&StoredDiagnostic> {
         self.entries
             .iter()
-            .filter(|((_, stored_file), _)| stored_file.starts_with(dir))
+            .filter(|((_, stored_file), entry)| stored_file.starts_with(dir) && !entry.stale)
             .flat_map(|(_, entry)| entry.diagnostics.iter())
             .collect()
     }
 
-    /// All stored diagnostics, flattened.
+    /// All current diagnostics, flattened. Watcher-stale entries are hidden.
     pub fn all(&self) -> Vec<&StoredDiagnostic> {
         self.entries
             .values()
+            .filter(|entry| !entry.stale)
             .flat_map(|entry| entry.diagnostics.iter())
             .collect()
     }
@@ -292,6 +323,9 @@ impl DiagnosticsStore {
         let mut errors = 0usize;
         let mut warnings = 0usize;
         for entry in self.entries.values() {
+            if entry.stale {
+                continue;
+            }
             for diagnostic in &entry.diagnostics {
                 match diagnostic.severity {
                     DiagnosticSeverity::Error => errors += 1,
@@ -335,6 +369,9 @@ impl DiagnosticsStore {
         let mut errors = 0usize;
         let mut warnings = 0usize;
         for ((_, file), entry) in &self.entries {
+            if entry.stale {
+                continue;
+            }
             // All diagnostics in an entry share the entry's file, so the keep
             // predicate (the cost center: tsconfig resolution) runs once per
             // (server, file) entry, not once per diagnostic.
@@ -404,6 +441,42 @@ impl DiagnosticsStore {
                 .retain(|(_, stored_file), _| stored_file != file);
         }
         removed
+    }
+
+    /// Mark every cached report for a file stale without evicting it.
+    ///
+    /// This is used for watcher-observed external edits: the previous
+    /// diagnostics may still be useful as a pull `previousResultId`, but warm
+    /// readers must stop counting them until a server publish or pull response
+    /// proves freshness. Returns `(had_entries, changed)` where `changed` is true
+    /// only if at least one previously-fresh entry became stale.
+    pub fn mark_stale_for_file(&mut self, file: &Path) -> (bool, bool) {
+        let mut had_entries = false;
+        let mut changed = false;
+        for ((_, stored_file), entry) in &mut self.entries {
+            if stored_file != file {
+                continue;
+            }
+            had_entries = true;
+            if !entry.stale {
+                entry.stale = true;
+                changed = true;
+            }
+        }
+        (had_entries, changed)
+    }
+
+    /// Mark one cached report fresh after a server response proves it still
+    /// describes the current document (for example a pull `kind: unchanged`).
+    pub fn mark_fresh_for_server_file(&mut self, key: &ServerKey, file: &Path) -> bool {
+        let cache_key = (key.clone(), file.to_path_buf());
+        let Some(entry) = self.entries.get_mut(&cache_key) else {
+            return false;
+        };
+        let changed = entry.stale;
+        entry.stale = false;
+        self.touch_existing(&cache_key);
+        changed
     }
 
     /// Drop all entries for a specific server instance.
@@ -606,6 +679,34 @@ mod tests {
         let file = PathBuf::from("/tmp/never.rs");
         assert!(!store.has_any_report_for_file(&file));
         assert!(store.for_file(&file).is_empty());
+    }
+
+    #[test]
+    fn stale_entries_are_hidden_but_preserved_for_refresh() {
+        let file = PathBuf::from("/tmp/stale.rs");
+        let mut store = DiagnosticsStore::new();
+        let key = server_key(ServerKind::Rust);
+        store.publish(
+            key.clone(),
+            file.clone(),
+            vec![diag("/tmp/stale.rs", 1, "old", DiagnosticSeverity::Error)],
+        );
+
+        let (had_entries, changed) = store.mark_stale_for_file(&file);
+
+        assert!(had_entries);
+        assert!(changed);
+        assert!(store.has_any_report_for_file(&file));
+        assert!(!store.has_any_fresh_report_for_file(&file));
+        assert!(store.for_file(&file).is_empty());
+        assert!(store.all().is_empty());
+        assert_eq!(store.error_warning_counts(), (0, 0));
+        assert_eq!(store.entries_for_file(&file).len(), 1);
+
+        assert!(store.mark_fresh_for_server_file(&key, &file));
+        assert!(store.has_any_fresh_report_for_file(&file));
+        assert_eq!(store.for_file(&file).len(), 1);
+        assert_eq!(store.error_warning_counts(), (1, 0));
     }
 
     #[test]

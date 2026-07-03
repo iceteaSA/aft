@@ -18,6 +18,8 @@ use aft::lsp::registry::{is_config_file_path, is_config_file_path_with_custom, S
 use aft::lsp::roots::ServerKey;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
+use aft::runtime_drain::drain_watcher_events;
+use aft::watcher_filter::WatcherDispatchEvent;
 use lsp_types::FileChangeType;
 use tempfile::tempdir;
 
@@ -1525,6 +1527,86 @@ fn test_ensure_file_open_detects_disk_drift() {
     );
 }
 
+#[test]
+fn watcher_external_edit_hides_stale_diagnostics_and_resyncs_lsp() {
+    let (_temp_dir, root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root),
+            ..Config::default()
+        },
+    );
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+
+    ctx.lsp_notify_file_changed(file, "fn main() { println!(\"before\"); }\n");
+    wait_for_publish(&mut ctx.lsp());
+    let before = {
+        let lsp = ctx.lsp();
+        lsp.get_diagnostics_for_file(file)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(before.len(), 2, "fake server should seed diagnostics");
+
+    fs::write(file, "fn main() { println!(\"external edit\"); }\n").expect("external write");
+
+    let stale_control = {
+        let lsp = ctx.lsp();
+        lsp.get_diagnostics_for_file(file)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        stale_control
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("E0001")),
+        "control: before the watcher runs, the warm store still serves the old diagnostics"
+    );
+
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(vec![file.clone()]))
+        .expect("send watcher event");
+
+    drain_watcher_events(&ctx);
+
+    assert!(
+        ctx.lsp().get_diagnostics_for_file(file).is_empty(),
+        "watcher-stale diagnostics must be hidden until the LSP republishes"
+    );
+
+    let changed_event = collect_event(&mut ctx.lsp(), |event| {
+        matches!(
+            event,
+            LspEvent::Notification { method, .. } if method == "custom/documentChanged"
+        )
+    });
+    assert!(
+        changed_event.is_some(),
+        "watcher should resync the diagnosed file with didChange"
+    );
+
+    let after = {
+        let lsp = ctx.lsp();
+        lsp.get_diagnostics_for_file(file)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        after
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("E0002")),
+        "fresh publish should replace the stale diagnostics: {after:?}"
+    );
+}
+
 // =============================================================================
 // v0.17.3 stale-diagnostics regression tests
 //
@@ -1744,6 +1826,7 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
         epoch: 7,
         result_id: None,
         version: Some(4),
+        stale: false,
     };
 
     let pre_edit = PreEditSnapshot {
@@ -1778,6 +1861,7 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
         epoch: 8,
         result_id: None,
         version: None,
+        stale: false,
     };
 
     let pre_edit = PreEditSnapshot {

@@ -20,7 +20,7 @@ use crate::inspect::{
     InspectCategory, InspectManager, InspectSnapshot, Tier2RefreshScheduler, Tier2TriggerReason,
 };
 use crate::language::LanguageProvider;
-use crate::lsp::manager::LspManager;
+use crate::lsp::manager::{LspManager, StaleDiagnosticsMark};
 use crate::lsp::registry::is_config_file_path_with_custom;
 use crate::parser::{SharedSymbolCache, SymbolCache, TreeSitterProvider};
 use crate::protocol::{
@@ -2442,6 +2442,57 @@ impl AppContext {
     pub fn lsp_clear_diagnostics_for_file(&self, file_path: &Path) -> bool {
         if let Some(mut lsp) = self.lsp_manager.try_lock() {
             lsp.clear_diagnostics_for_file(file_path)
+        } else {
+            false
+        }
+    }
+
+    /// Mark diagnostics stale for a file changed outside AFT's text-sync path.
+    /// Best-effort: a contended LSP lock is skipped and the next watcher event
+    /// or scoped diagnostics pull can reconcile the file.
+    pub fn lsp_mark_diagnostics_stale_for_file(&self, file_path: &Path) -> StaleDiagnosticsMark {
+        if let Some(mut lsp) = self.lsp_manager.try_lock() {
+            lsp.mark_diagnostics_stale_for_file(file_path)
+        } else {
+            StaleDiagnosticsMark::default()
+        }
+    }
+
+    /// Resync a watcher-stale diagnosed file with the active LSP server.
+    ///
+    /// `workspace/didChangeWatchedFiles` tells servers that the filesystem
+    /// changed, but it does not update an already-open document's in-memory text.
+    /// Sending the normal didOpen/didChange path gives push-only servers a chance
+    /// to publish fresh diagnostics and keeps pull-capable servers' document state
+    /// current for the next diagnostic request.
+    pub fn lsp_resync_changed_file_for_diagnostics(&self, file_path: &Path) -> bool {
+        if !file_path.is_file() {
+            return false;
+        }
+
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(content) => content,
+            Err(err) => {
+                crate::slog_warn!(
+                    "skipping LSP resync for {} after external edit: {}",
+                    file_path.display(),
+                    err
+                );
+                return false;
+            }
+        };
+
+        let config = self.config();
+        if let Some(mut lsp) = self.lsp_manager.try_lock() {
+            if let Err(err) = lsp.notify_file_changed(file_path, &content, &config) {
+                crate::slog_warn!(
+                    "LSP resync failed for {} after external edit: {}",
+                    file_path.display(),
+                    err
+                );
+                return false;
+            }
+            true
         } else {
             false
         }
