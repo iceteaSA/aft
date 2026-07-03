@@ -45,6 +45,7 @@ struct FileScan {
     exports: Vec<ExportSymbol>,
     imports: Vec<ImportEdge>,
     skipped_language: Option<&'static str>,
+    generated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,7 +122,9 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
     }
 
     let mut count = 0usize;
-    let mut items = Vec::new();
+    let mut headline_items = Vec::new();
+    let mut generated_count = 0usize;
+    let mut generated_items = Vec::new();
     let test_only_count = 0usize;
     let test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
@@ -164,25 +167,43 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
                 continue;
             }
 
-            count += 1;
-            // Collect uncapped; rank by signal tier and truncate below so
-            // product findings survive the cap over benchmark/tooling noise.
-            items.push(json!({
+            let mut item = json!({
                 "file": scan.relative_file,
                 "symbol": export.symbol,
                 "kind": export.kind,
                 "line": export.line,
-            }));
+            });
+            if scan.generated {
+                item["generated"] = json!(true);
+                generated_count += 1;
+                generated_items.push(item);
+            } else {
+                count += 1;
+                headline_items.push(item);
+            }
         }
     }
 
     let roles = crate::inspect::entry_points::resolve_project_roles(&project_root);
-    let items = crate::inspect::entry_points::rank_and_truncate_items(
-        items,
+    let headline_items = crate::inspect::entry_points::rank_and_truncate_items(
+        headline_items,
         &roles,
         Some(DRILL_DOWN_LIMIT),
     );
-    let top = crate::inspect::entry_points::top_preview_symbols(&items);
+    let generated_items = crate::inspect::entry_points::rank_and_truncate_items(
+        generated_items,
+        &roles,
+        Some(DRILL_DOWN_LIMIT),
+    );
+    let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
+    let mut items = headline_items;
+    items.extend(generated_items.iter().cloned());
+    items.truncate(DRILL_DOWN_LIMIT);
+    let generated_top = generated_items
+        .iter()
+        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
     let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
         test_only_items,
         &roles,
@@ -203,12 +224,17 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
 
     let mut aggregate = json!({
         "count": count,
+        "generated_count": generated_count,
+        "total_count": count + test_only_count + generated_count,
         "items": items,
         "top": top,
+        "generated_items": generated_items,
+        "generated_top": generated_top,
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
-        "drill_down_capped": count > DRILL_DOWN_LIMIT,
+        "drill_down_capped": count + generated_count > DRILL_DOWN_LIMIT,
+        "generated_drill_down_capped": generated_count > DRILL_DOWN_LIMIT,
         "test_only_drill_down_capped": test_only_count > DRILL_DOWN_LIMIT,
         "scanned_files": per_file.len(),
         "languages_skipped": languages_skipped,
@@ -260,7 +286,9 @@ fn run_unused_exports_oxc_scan(
         .collect::<BTreeMap<_, _>>();
     let mut contributions = Vec::new();
     let mut count = 0usize;
-    let mut items = Vec::new();
+    let mut headline_items = Vec::new();
+    let mut generated_count = 0usize;
+    let mut generated_items = Vec::new();
     let mut test_only_count = 0usize;
     let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
@@ -283,6 +311,8 @@ fn run_unused_exports_oxc_scan(
         {
             continue;
         }
+        let generated_file =
+            crate::inspect::generated::is_generated_file(&project_root, &file.file);
 
         for export in &file.exports {
             match export.verdict {
@@ -290,7 +320,6 @@ fn run_unused_exports_oxc_scan(
                     if !is_test_file(&file.relative_file)
                         && !export.test_only_reference_files.is_empty()
                     {
-                        test_only_count += 1;
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -300,7 +329,14 @@ fn run_unused_exports_oxc_scan(
                             "used_by": export.test_only_reference_files,
                         });
                         add_reexport_contexts(&mut item, &export.also_reexported);
-                        test_only_items.push(item);
+                        if generated_file {
+                            item["generated"] = json!(true);
+                            generated_count += 1;
+                            generated_items.push(item);
+                        } else {
+                            test_only_count += 1;
+                            test_only_items.push(item);
+                        }
                     }
                 }
                 LivenessVerdict::Uncertain => {
@@ -322,7 +358,6 @@ fn run_unused_exports_oxc_scan(
                     if !is_test_file(&file.relative_file)
                         && !export.test_only_reference_files.is_empty()
                     {
-                        test_only_count += 1;
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -332,13 +367,19 @@ fn run_unused_exports_oxc_scan(
                             "used_by": export.test_only_reference_files,
                         });
                         add_reexport_contexts(&mut item, &export.also_reexported);
-                        test_only_items.push(item);
+                        if generated_file {
+                            item["generated"] = json!(true);
+                            generated_count += 1;
+                            generated_items.push(item);
+                        } else {
+                            test_only_count += 1;
+                            test_only_items.push(item);
+                        }
                         continue;
                     }
                     if export.has_references {
                         continue;
                     }
-                    count += 1;
                     let mut item = json!({
                         "file": file.relative_file,
                         "symbol": export.symbol,
@@ -347,7 +388,14 @@ fn run_unused_exports_oxc_scan(
                         "provenance": export.provenance,
                     });
                     add_reexport_contexts(&mut item, &export.also_reexported);
-                    items.push(item);
+                    if generated_file {
+                        item["generated"] = json!(true);
+                        generated_count += 1;
+                        generated_items.push(item);
+                    } else {
+                        count += 1;
+                        headline_items.push(item);
+                    }
                 }
             }
         }
@@ -376,12 +424,25 @@ fn run_unused_exports_oxc_scan(
         .collect::<Vec<_>>();
     contributions.extend(non_js_scans.into_iter().map(|scan| scan.contribution));
 
-    let items = crate::inspect::entry_points::rank_and_truncate_items(
-        items,
+    let headline_items = crate::inspect::entry_points::rank_and_truncate_items(
+        headline_items,
         &roles,
         Some(DRILL_DOWN_LIMIT),
     );
-    let top = crate::inspect::entry_points::top_preview_symbols(&items);
+    let generated_items = crate::inspect::entry_points::rank_and_truncate_items(
+        generated_items,
+        &roles,
+        Some(DRILL_DOWN_LIMIT),
+    );
+    let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
+    let mut items = headline_items;
+    items.extend(generated_items.iter().cloned());
+    items.truncate(DRILL_DOWN_LIMIT);
+    let generated_top = generated_items
+        .iter()
+        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
     let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
         test_only_items,
         &roles,
@@ -394,12 +455,17 @@ fn run_unused_exports_oxc_scan(
         .collect::<Vec<_>>();
     let mut aggregate = json!({
         "count": count,
+        "generated_count": generated_count,
+        "total_count": count + test_only_count + generated_count,
         "items": items,
         "top": top,
+        "generated_items": generated_items,
+        "generated_top": generated_top,
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
-        "drill_down_capped": count > DRILL_DOWN_LIMIT,
+        "drill_down_capped": count + generated_count > DRILL_DOWN_LIMIT,
+        "generated_drill_down_capped": generated_count > DRILL_DOWN_LIMIT,
         "test_only_drill_down_capped": test_only_count > DRILL_DOWN_LIMIT,
         "scanned_files": contributions.len(),
         "languages_skipped": languages_skipped,
@@ -463,6 +529,7 @@ fn oxc_unused_exports_contribution(
         value_referenced_import_bindings: &facts.value_referenced_import_bindings,
         parse_error: &facts.parse_error,
     };
+    let generated = crate::inspect::generated::is_generated_file(project_root, &facts.path);
     let mut contribution = json!({
         "file": relative_string(project_root, &facts.path),
         "exports": exports,
@@ -471,6 +538,9 @@ fn oxc_unused_exports_contribution(
         "oxc_facts": facts_payload,
     });
     if let Value::Object(object) = &mut contribution {
+        if generated {
+            object.insert("generated".to_string(), Value::Bool(true));
+        }
         if let Some(parse_errors) = parse_errors {
             object.insert(
                 "parse_errors".to_string(),
@@ -514,7 +584,8 @@ fn oxc_read_error_contribution(
         normalize_path(&project_root.join(&relative_file))
     };
     let freshness = freshness_for_oxc_error_file(&file_path)?;
-    let contribution = json!({
+    let generated = crate::inspect::generated::is_generated_file(project_root, &file_path);
+    let mut contribution = json!({
         "file": relative_file,
         "exports": [],
         "imports": [],
@@ -523,6 +594,9 @@ fn oxc_read_error_contribution(
             "message": error.message,
         }],
     });
+    if generated {
+        contribution["generated"] = json!(true);
+    }
     Some(FileContribution::new(
         InspectCategory::UnusedExports,
         file_path,
@@ -620,6 +694,7 @@ fn suppress_public_api_exports(
         scan.contribution.contribution = contribution_value(
             project_root,
             &scan.relative_file,
+            scan.generated,
             &scan.exports,
             &scan.imports,
         );
@@ -652,13 +727,15 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
         return Some(empty_file_scan(file_path, relative_file, freshness, None));
     };
 
+    let generated = crate::inspect::generated::is_generated_file_from_source(&file_path, &source);
     let exports = extract_exports(&source, &tree);
     let namespace_members = namespace_member_accesses(&source, &tree, &import_block);
     let mut imports =
         import_edges_from_block(&import_block, &file_path, project_root, &namespace_members);
     imports.extend(reexport_edges(&source, &tree, &file_path, project_root));
 
-    let contribution = contribution_value(project_root, &relative_file, &exports, &imports);
+    let contribution =
+        contribution_value(project_root, &relative_file, generated, &exports, &imports);
     Some(FileScan {
         contribution: FileContribution::new(
             InspectCategory::UnusedExports,
@@ -671,6 +748,7 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
         exports,
         imports,
         skipped_language: None,
+        generated,
     })
 }
 
@@ -680,11 +758,15 @@ fn empty_file_scan(
     freshness: cache_freshness::FileFreshness,
     skipped_language: Option<&'static str>,
 ) -> FileScan {
-    let contribution = json!({
+    let generated = crate::inspect::generated::is_generated_file(Path::new(""), &file_path);
+    let mut contribution = json!({
         "file": relative_file,
         "exports": [],
         "imports": [],
     });
+    if generated {
+        contribution["generated"] = json!(true);
+    }
     FileScan {
         contribution: FileContribution::new(
             InspectCategory::UnusedExports,
@@ -697,12 +779,14 @@ fn empty_file_scan(
         exports: Vec::new(),
         imports: Vec::new(),
         skipped_language,
+        generated,
     }
 }
 
 fn contribution_value(
     project_root: &Path,
     relative_file: &str,
+    generated: bool,
     exports: &[ExportSymbol],
     imports: &[ImportEdge],
 ) -> Value {
@@ -730,11 +814,15 @@ fn contribution_value(
         })
         .collect::<Vec<_>>();
 
-    json!({
+    let mut contribution = json!({
         "file": relative_file,
         "exports": exports_json,
         "imports": imports_json,
-    })
+    });
+    if generated {
+        contribution["generated"] = json!(true);
+    }
+    contribution
 }
 
 fn import_edges_from_block(
@@ -1459,6 +1547,124 @@ fn line_number(node: &Node) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{Arc, RwLock};
+
+    use crate::config::Config;
+    use crate::inspect::JobKey;
+    use crate::parser::SymbolCache;
+
+    fn fixture_project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let paths = files
+            .iter()
+            .map(|(relative, contents)| {
+                let path = root.join(relative);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).expect("create parent");
+                }
+                fs::write(&path, contents).expect("write fixture file");
+                path
+            })
+            .collect::<Vec<_>>();
+        (temp_dir, root, paths)
+    }
+
+    fn job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
+        InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::UnusedExports),
+            category: InspectCategory::UnusedExports,
+            scope_files,
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join(".aft-cache").join("inspect"),
+            config: Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            callgraph_snapshot: None,
+        }
+    }
+
+    fn aggregate_item<'a>(
+        aggregate: &'a serde_json::Value,
+        file: &str,
+        symbol: &str,
+    ) -> Option<&'a serde_json::Value> {
+        aggregate["items"].as_array()?.iter().find(|item| {
+            item["file"].as_str() == Some(file) && item["symbol"].as_str() == Some(symbol)
+        })
+    }
+
+    fn aggregate_generated_item<'a>(
+        aggregate: &'a serde_json::Value,
+        file: &str,
+        symbol: &str,
+    ) -> Option<&'a serde_json::Value> {
+        aggregate["generated_items"]
+            .as_array()?
+            .iter()
+            .find(|item| {
+                item["file"].as_str() == Some(file) && item["symbol"].as_str() == Some(symbol)
+            })
+    }
+
+    #[test]
+    fn unused_exports_buckets_generated_exports_below_headline() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            (
+                "src/hand.ts",
+                "export function handUnused() {}
+",
+            ),
+            (
+                "gen/schema_pb.ts",
+                "export function generatedPathUnused() {}
+",
+            ),
+            (
+                "src/banner.ts",
+                "// Code generated by fixture. DO NOT EDIT.
+export function bannerUnused() {}
+",
+            ),
+        ]);
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let paths = paths
+            .into_iter()
+            .map(|path| fs::canonicalize(path).expect("canonical fixture path"))
+            .collect::<Vec<_>>();
+
+        let first = run_unused_exports_scan(&job(&root, paths.clone()))
+            .outcome
+            .expect("scan succeeds")
+            .aggregate;
+        let second = run_unused_exports_scan(&job(&root, paths))
+            .outcome
+            .expect("scan succeeds")
+            .aggregate;
+        assert_eq!(first, second, "twice-cold scan must be deterministic");
+
+        assert_eq!(first["count"], 1, "{first:#}");
+        assert_eq!(first["generated_count"], 2, "{first:#}");
+        assert_eq!(first["total_count"], 3, "{first:#}");
+        assert!(aggregate_item(&first, "src/hand.ts", "handUnused").is_some());
+        assert!(
+            aggregate_generated_item(&first, "gen/schema_pb.ts", "generatedPathUnused").is_some()
+        );
+        assert!(aggregate_generated_item(&first, "src/banner.ts", "bannerUnused").is_some());
+
+        let item_files = first["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .filter_map(|item| item["file"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(item_files.first(), Some(&"src/hand.ts"), "{item_files:?}");
+    }
 
     #[test]
     fn candidate_paths_remaps_js_specifier_to_ts_source() {

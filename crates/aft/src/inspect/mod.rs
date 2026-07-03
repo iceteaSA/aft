@@ -4,6 +4,7 @@ pub mod dispatch;
 mod entry_points;
 mod frameworks;
 pub mod freshness;
+mod generated;
 pub mod job;
 mod manager;
 pub mod oxc_engine;

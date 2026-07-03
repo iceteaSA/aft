@@ -338,6 +338,7 @@ fn gather_file_contribution(
         type_ref_names,
     } = file_analyzer.analyze_file(file, oxc_facts.is_some());
 
+    let generated = crate::inspect::generated::is_generated_file(&job.project_root, file);
     let mut payload = json!({
         "file": file_name,
         "facts_format_version": DEAD_CODE_FACTS_FORMAT_VERSION,
@@ -357,6 +358,9 @@ fn gather_file_contribution(
             .collect::<Vec<_>>(),
     });
 
+    if generated {
+        payload["generated"] = json!(true);
+    }
     if !raw_imports.is_empty() {
         payload["raw_imports"] = json!(raw_imports);
     }
@@ -483,6 +487,7 @@ pub(crate) fn aggregate_dead_code_contributions_with_snapshot(
     let materialized =
         materialize_dead_code_contributions(project_root, snapshot, parsed, public_api_files);
     aggregate_materialized_dead_code_contributions(
+        project_root,
         &materialized,
         public_api_files,
         roles,
@@ -739,6 +744,7 @@ fn sort_dedup_internal_calls(internal_calls: &mut Vec<InternalCall>) {
 }
 
 fn aggregate_materialized_dead_code_contributions(
+    project_root: &Path,
     parsed: &[DeadCodeContribution],
     public_api_files: &BTreeSet<String>,
     roles: &crate::inspect::entry_points::ProjectRoles,
@@ -752,12 +758,19 @@ fn aggregate_materialized_dead_code_contributions(
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
-    let mut dead_items = Vec::new();
+    let mut headline_items = Vec::new();
+    let mut generated_count = 0usize;
+    let mut generated_items = Vec::new();
     let mut test_only_count = 0usize;
     let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items: Vec<serde_json::Value> = Vec::new();
     for contribution in parsed {
+        let generated_file = crate::inspect::generated::is_generated_file_with_cached_hint(
+            project_root,
+            &contribution.file,
+            contribution.generated,
+        );
         // Test-support files (fixtures, corpora, mock data) are consumed by
         // path, never imported, so their exports always look dead. Skip
         // REPORTING them — their edges already kept real code live above.
@@ -772,7 +785,6 @@ fn aggregate_materialized_dead_code_contributions(
                         if !is_test_file(&contribution.file)
                             && !export.test_only_reference_files.is_empty()
                         {
-                            test_only_count += 1;
                             let mut item = json!({
                                 "file": contribution.file,
                                 "symbol": export.symbol,
@@ -782,7 +794,14 @@ fn aggregate_materialized_dead_code_contributions(
                                 "used_by": export.test_only_reference_files,
                             });
                             add_reexport_contexts(&mut item, &export.also_reexported);
-                            test_only_items.push(item);
+                            if generated_file {
+                                item["generated"] = json!(true);
+                                generated_count += 1;
+                                generated_items.push(item);
+                            } else {
+                                test_only_count += 1;
+                                test_only_items.push(item);
+                            }
                         }
                         continue;
                     }
@@ -806,7 +825,6 @@ fn aggregate_materialized_dead_code_contributions(
                         if !is_test_file(&contribution.file)
                             && !export.test_only_reference_files.is_empty()
                         {
-                            test_only_count += 1;
                             let mut item = json!({
                                 "file": contribution.file,
                                 "symbol": export.symbol,
@@ -816,7 +834,14 @@ fn aggregate_materialized_dead_code_contributions(
                                 "used_by": export.test_only_reference_files,
                             });
                             add_reexport_contexts(&mut item, &export.also_reexported);
-                            test_only_items.push(item);
+                            if generated_file {
+                                item["generated"] = json!(true);
+                                generated_count += 1;
+                                generated_items.push(item);
+                            } else {
+                                test_only_count += 1;
+                                test_only_items.push(item);
+                            }
                             continue;
                         }
                         if export.has_references {
@@ -844,13 +869,6 @@ fn aggregate_materialized_dead_code_contributions(
                 }
             }
 
-            count += 1;
-            *by_language
-                .entry(language_for_file(&contribution.file).to_string())
-                .or_default() += 1;
-            // Collect ALL items here; rank by signal tier and truncate below so
-            // product findings survive the cap instead of being eaten by
-            // alphabetically-first benchmark/tooling files.
             let mut item = json!({
                 "file": contribution.file,
                 "symbol": export.symbol,
@@ -861,13 +879,41 @@ fn aggregate_materialized_dead_code_contributions(
                 item["provenance"] = json!(provenance);
             }
             add_reexport_contexts(&mut item, &export.also_reexported);
-            dead_items.push(item);
+            if generated_file {
+                item["generated"] = json!(true);
+                generated_count += 1;
+                generated_items.push(item);
+            } else {
+                count += 1;
+                *by_language
+                    .entry(language_for_file(&contribution.file).to_string())
+                    .or_default() += 1;
+                headline_items.push(item);
+            }
         }
     }
 
-    let dead_items =
-        crate::inspect::entry_points::rank_and_truncate_items(dead_items, roles, drill_down_limit);
-    let top = crate::inspect::entry_points::top_preview_symbols(&dead_items);
+    let headline_items = crate::inspect::entry_points::rank_and_truncate_items(
+        headline_items,
+        roles,
+        drill_down_limit,
+    );
+    let generated_items = crate::inspect::entry_points::rank_and_truncate_items(
+        generated_items,
+        roles,
+        drill_down_limit,
+    );
+    let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
+    let mut dead_items = headline_items;
+    dead_items.extend(generated_items.iter().cloned());
+    if let Some(limit) = drill_down_limit {
+        dead_items.truncate(limit);
+    }
+    let generated_top = generated_items
+        .iter()
+        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
     let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
         test_only_items,
         roles,
@@ -882,13 +928,18 @@ fn aggregate_materialized_dead_code_contributions(
     let (parse_errors, skipped_files, languages_skipped) = dead_code_honesty_fields(parsed);
     let mut aggregate = json!({
         "count": count,
+        "generated_count": generated_count,
+        "total_count": count + test_only_count + generated_count,
         "items": dead_items,
         "top": top,
+        "generated_items": generated_items,
+        "generated_top": generated_top,
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
         "by_language": by_language,
-        "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "drill_down_capped": drill_down_limit.is_some_and(|limit| count + generated_count > limit),
+        "generated_drill_down_capped": drill_down_limit.is_some_and(|limit| generated_count > limit),
         "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
@@ -2310,6 +2361,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[derive(Debug, Clone, Deserialize)]
 struct DeadCodeContribution {
     file: String,
+    #[serde(default)]
+    generated: bool,
     exports: Vec<ExportContribution>,
     #[serde(default)]
     facts_format_version: Option<u32>,
@@ -2597,6 +2650,19 @@ mod tests {
         })
     }
 
+    fn aggregate_generated_item<'a>(
+        aggregate: &'a serde_json::Value,
+        file: &str,
+        symbol: &str,
+    ) -> Option<&'a serde_json::Value> {
+        aggregate["generated_items"]
+            .as_array()?
+            .iter()
+            .find(|item| {
+                item["file"].as_str() == Some(file) && item["symbol"].as_str() == Some(symbol)
+            })
+    }
+
     fn aggregate_test_only_item<'a>(
         aggregate: &'a serde_json::Value,
         file: &str,
@@ -2686,6 +2752,88 @@ throughBarrel();
                 .and_then(|items| items.first())
                 .and_then(serde_json::Value::as_str),
             Some("barrel.test.ts")
+        );
+    }
+
+    #[test]
+    fn oxc_dead_code_buckets_generated_exports_below_headline() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            ("package.json", r#"{"main":"src/main.ts"}"#),
+            (
+                "src/main.ts",
+                "console.log('main');
+",
+            ),
+            (
+                "src/hand.ts",
+                "export function handDead() {}
+",
+            ),
+            (
+                "gen/schema_pb.ts",
+                "export function generatedPathDead() {}
+",
+            ),
+            (
+                "src/banner.ts",
+                "// Code generated by fixture. DO NOT EDIT.
+export function bannerDead() {}
+",
+            ),
+        ]);
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let paths = paths
+            .into_iter()
+            .map(|path| fs::canonicalize(path).expect("canonical fixture path"))
+            .collect::<Vec<_>>();
+        let entry_points = BTreeSet::from([root.join("src/main.ts")]);
+        let graph = snapshot_with_entry_points(paths.clone(), Vec::new(), Vec::new(), entry_points);
+
+        let first = scan_success_with_oxc(job(&root, paths.clone(), graph.clone()));
+        let second = scan_success_with_oxc(job(&root, paths.clone(), graph.clone()));
+        assert_eq!(
+            first.aggregate, second.aggregate,
+            "twice-cold scan must be deterministic"
+        );
+
+        assert_eq!(first.aggregate["count"], 1, "{:#}", first.aggregate);
+        assert_eq!(
+            first.aggregate["generated_count"], 2,
+            "{:#}",
+            first.aggregate
+        );
+        assert_eq!(first.aggregate["total_count"], 3, "{:#}", first.aggregate);
+        assert!(aggregate_item(&first.aggregate, "src/hand.ts", "handDead").is_some());
+        assert!(aggregate_generated_item(
+            &first.aggregate,
+            "gen/schema_pb.ts",
+            "generatedPathDead"
+        )
+        .is_some());
+        assert!(
+            aggregate_generated_item(&first.aggregate, "src/banner.ts", "bannerDead").is_some()
+        );
+
+        let item_files = first.aggregate["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .filter_map(|item| item["file"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(item_files.first(), Some(&"src/hand.ts"), "{item_files:?}");
+
+        let roles = crate::inspect::entry_points::resolve_project_roles(&root);
+        let rolled_up = aggregate_dead_code_contributions_with_snapshot(
+            &root,
+            &graph,
+            &first.contributions,
+            &collect_public_api_files(&root),
+            &roles,
+            Some(MAX_DRILL_DOWN_ITEMS),
+        );
+        assert_eq!(
+            rolled_up, first.aggregate,
+            "cached rollup must match cold aggregate"
         );
     }
 

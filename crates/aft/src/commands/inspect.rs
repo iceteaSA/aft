@@ -533,6 +533,20 @@ fn build_inspect_payload(
                     details.insert(format!("{}_test_only", category.as_str()), test_only_detail);
                 }
             }
+            if matches!(
+                *category,
+                InspectCategory::DeadCode
+                    | InspectCategory::UnusedExports
+                    | InspectCategory::Duplicates
+            ) {
+                let generated_detail = generated_details_for(payload, top_k);
+                if generated_detail
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+                {
+                    details.insert(format!("{}_generated", category.as_str()), generated_detail);
+                }
+            }
         } else if *category == InspectCategory::Diagnostics {
             // Diagnostics detail is always actionable — a bare count ("1 error")
             // can't be fixed without the message + location, and this category
@@ -759,19 +773,63 @@ fn render_symbol_category(
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
     let suffix = dead_code_language_suffix(section);
     let skipped_suffix = dead_code_skipped_language_suffix(section);
+    let generated_suffix = generated_count_suffix(section);
     if count == 0 {
-        lines.push(format!("{label}: 0{skipped_suffix}"));
+        lines.push(format!("{label}: 0{generated_suffix}{skipped_suffix}"));
     } else {
-        lines.push(format!("{label}: {count}{suffix}{skipped_suffix}:"));
+        lines.push(format!(
+            "{label}: {count}{suffix}{generated_suffix}{skipped_suffix}:"
+        ));
         if let Some(items) = category_items(summary, details, key) {
-            for item in items {
+            for item in items.iter().filter(|item| !item_is_generated(item)) {
                 let file = item.get("file").and_then(Value::as_str).unwrap_or("?");
                 let symbol = item.get("symbol").and_then(Value::as_str).unwrap_or("?");
                 lines.push(format!("  {file}::{symbol}"));
             }
         }
     }
+    render_generated_symbol_usage(lines, summary, details, key);
     render_test_only_usage(lines, summary, details, key);
+}
+
+fn generated_count_suffix(section: &Value) -> String {
+    let generated_count = section
+        .get("generated_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if generated_count == 0 {
+        String::new()
+    } else {
+        format!(" (generated: {generated_count})")
+    }
+}
+
+fn item_is_generated(item: &Value) -> bool {
+    item.get("generated").and_then(Value::as_bool) == Some(true)
+}
+
+fn render_generated_symbol_usage(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+    key: &str,
+) {
+    let generated_count = summary
+        .get(key)
+        .and_then(|section| section.get("generated_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if generated_count == 0 {
+        return;
+    }
+    lines.push(format!("  generated: {generated_count}:"));
+    if let Some(items) = generated_items(summary, details, key) {
+        for item in items {
+            let file = item.get("file").and_then(Value::as_str).unwrap_or("?");
+            let symbol = item.get("symbol").and_then(Value::as_str).unwrap_or("?");
+            lines.push(format!("    {file}::{symbol}"));
+        }
+    }
 }
 
 fn render_test_only_usage(
@@ -812,6 +870,23 @@ fn test_only_items<'a>(
             summary
                 .get(key)
                 .and_then(|s| s.get("test_only_top"))
+                .and_then(Value::as_array)
+        })
+}
+
+fn generated_items<'a>(
+    summary: &'a Map<String, Value>,
+    details: &'a Map<String, Value>,
+    key: &str,
+) -> Option<&'a Vec<Value>> {
+    details
+        .get(&format!("{key}_generated"))
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .or_else(|| {
+            summary
+                .get(key)
+                .and_then(|s| s.get("generated_top"))
                 .and_then(Value::as_array)
         })
 }
@@ -906,7 +981,7 @@ fn render_group_category(
     }
     lines.push(format!("{label}: {count} (top by cost):"));
     if let Some(items) = category_items(summary, details, key) {
-        for item in items {
+        for item in items.iter().filter(|item| !item_is_generated(item)) {
             let cost = item.get("cost").and_then(Value::as_u64).unwrap_or(0);
             let files: Vec<&str> = item
                 .get("files")
@@ -934,13 +1009,24 @@ fn render_duplicates_category(
     }
 
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let generated_count = section
+        .get("generated_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let generated_suffix = if generated_count == 0 {
+        String::new()
+    } else {
+        format!(" (generated: {generated_count})")
+    };
     let Some(duplicated_lines) = section.get("duplicated_lines").and_then(Value::as_u64) else {
         if count == 0 {
-            lines.push(format!("{label}: 0"));
+            lines.push(format!("{label}: 0{generated_suffix}"));
+            render_generated_duplicate_usage(lines, summary, details, key);
             return;
         }
-        lines.push(format!("{label}: {count} (top by cost):"));
+        lines.push(format!("{label}: {count}{generated_suffix} (top by cost):"));
         render_duplicate_rows(lines, summary, details, key);
+        render_generated_duplicate_usage(lines, summary, details, key);
         return;
     };
 
@@ -956,11 +1042,7 @@ fn render_duplicates_category(
         .get("duplicated_file_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let group_count = section
-        .get("total_groups")
-        .or_else(|| section.get("groups_count"))
-        .and_then(Value::as_u64)
-        .unwrap_or(count);
+    let group_count = count;
     let suffix = if count > 0 { " (top by cost):" } else { "" };
     // A zero denominator means analyzed-line counts are missing (pre-v0.44
     // cached contributions); print no percentage rather than a false "0.0%".
@@ -973,13 +1055,14 @@ fn render_duplicates_category(
         String::new()
     };
     lines.push(format!(
-        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{suffix}",
+        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{generated_suffix}{suffix}",
         plural_group(group_count),
     ));
     render_duplicate_suppression(lines, section);
     if count > 0 {
         render_duplicate_rows(lines, summary, details, key);
     }
+    render_generated_duplicate_usage(lines, summary, details, key);
 }
 
 fn render_duplicate_rows(
@@ -989,7 +1072,7 @@ fn render_duplicate_rows(
     key: &str,
 ) {
     if let Some(items) = category_items(summary, details, key) {
-        for item in items {
+        for item in items.iter().filter(|item| !item_is_generated(item)) {
             let cost = item.get("cost").and_then(Value::as_u64).unwrap_or(0);
             let files: Vec<&str> = item
                 .get("files")
@@ -1001,6 +1084,34 @@ fn render_duplicate_rows(
                 lines
                     .push("      suggestion: consider extracting into a shared module".to_string());
             }
+        }
+    }
+}
+
+fn render_generated_duplicate_usage(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+    key: &str,
+) {
+    let generated_count = summary
+        .get(key)
+        .and_then(|section| section.get("generated_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if generated_count == 0 {
+        return;
+    }
+    lines.push(format!("  generated: {generated_count}:"));
+    if let Some(items) = generated_items(summary, details, key) {
+        for item in items {
+            let cost = item.get("cost").and_then(Value::as_u64).unwrap_or(0);
+            let files: Vec<&str> = item
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            lines.push(format!("    {cost}  {}", files.join(" == ")));
         }
     }
 }
@@ -1183,18 +1294,24 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
             } else {
                 serde_json::json!({
                     "count": count_from_payload(payload),
+                    "generated_count": generated_count_from_payload(payload),
+                    "total_count": total_count_from_payload(payload),
                     "test_only_count": test_only_count_from_payload(payload),
                     "by_language": payload.and_then(|p| p.get("by_language")).cloned().unwrap_or_else(|| serde_json::json!({})),
                     "languages_skipped": payload.and_then(|p| p.get("languages_skipped")).cloned().unwrap_or_else(|| serde_json::json!([])),
                     "top": top_preview_from_payload(payload),
+                    "generated_top": generated_top_from_payload(payload),
                     "test_only_top": test_only_top_from_payload(payload),
                 })
             }
         }
         InspectCategory::UnusedExports => serde_json::json!({
             "count": count_from_payload(payload),
+            "generated_count": generated_count_from_payload(payload),
+            "total_count": total_count_from_payload(payload),
             "test_only_count": test_only_count_from_payload(payload),
             "top": top_preview_from_payload(payload),
+            "generated_top": generated_top_from_payload(payload),
             "test_only_top": test_only_top_from_payload(payload),
         }),
         InspectCategory::Duplicates => {
@@ -1211,9 +1328,15 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
                     .unwrap_or_else(|| count_from_payload(payload))),
             );
             for key in [
+                "generated_count",
+                "total_count",
                 "duplicated_lines",
                 "duplicated_percent",
                 "duplicated_file_count",
+                "generated_duplicated_lines",
+                "generated_duplicated_file_count",
+                "total_duplicated_lines",
+                "total_duplicated_file_count",
                 "total_analyzed_lines",
                 "suppressed_groups",
                 "mirror_suppressed_groups",
@@ -1224,6 +1347,10 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
                 }
             }
             section.insert("top".to_string(), top_preview_from_payload(payload));
+            section.insert(
+                "generated_top".to_string(),
+                generated_top_from_payload(payload),
+            );
             Value::Object(section)
         }
         InspectCategory::Cycles => serde_json::json!({
@@ -1326,6 +1453,16 @@ fn test_only_details_for(payload: Option<&Value>, top_k: usize) -> Value {
     }
 }
 
+fn generated_details_for(payload: Option<&Value>, top_k: usize) -> Value {
+    let Some(payload) = payload else {
+        return serde_json::json!([]);
+    };
+    match payload.get("generated_items").and_then(Value::as_array) {
+        Some(items) => Value::Array(items.iter().take(top_k).cloned().collect()),
+        None => serde_json::json!([]),
+    }
+}
+
 fn available_count_from_payload(category: InspectCategory, payload: &Value) -> Option<usize> {
     if category == InspectCategory::DeadCode
         && payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
@@ -1363,9 +1500,35 @@ fn test_only_count_from_payload(payload: Option<&Value>) -> u64 {
         .unwrap_or(0)
 }
 
+fn generated_count_from_payload(payload: Option<&Value>) -> u64 {
+    payload
+        .and_then(|payload| payload.get("generated_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn total_count_from_payload(payload: Option<&Value>) -> u64 {
+    payload
+        .and_then(|payload| payload.get("total_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            count_from_payload(payload)
+                + test_only_count_from_payload(payload)
+                + generated_count_from_payload(payload)
+        })
+}
+
 fn test_only_top_from_payload(payload: Option<&Value>) -> Value {
     payload
         .and_then(|payload| payload.get("test_only_top"))
+        .filter(|top| top.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
+}
+
+fn generated_top_from_payload(payload: Option<&Value>) -> Value {
+    payload
+        .and_then(|payload| payload.get("generated_top"))
         .filter(|top| top.is_array())
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]))
@@ -1724,6 +1887,89 @@ mod render_text_tests {
             text.contains("Dead code: 0 (java, kotlin not analyzed)"),
             "dead-code skipped language note missing:\n{text}"
         );
+    }
+
+    #[test]
+    fn renders_generated_usage_after_headline_items() {
+        let text = render_with_details(
+            serde_json::json!({
+                "duplicates": {
+                    "count": 1,
+                    "generated_count": 1,
+                    "total_groups": 2,
+                    "duplicated_lines": 6,
+                    "duplicated_percent": 3.0,
+                    "duplicated_file_count": 2,
+                    "total_analyzed_lines": 200,
+                    "top": [
+                        { "cost": 10, "files": ["src/a.ts:1-3", "src/b.ts:1-3"] },
+                    ],
+                    "generated_top": [
+                        { "cost": 100, "files": ["gen/a.ts:1-9", "gen/b.ts:1-9"], "generated": true },
+                    ],
+                },
+                "dead_code": {
+                    "count": 1,
+                    "generated_count": 2,
+                    "total_count": 3,
+                    "top": [ { "file": "src/hand.ts", "symbol": "handDead" } ],
+                    "generated_top": [
+                        { "file": "gen/schema_pb.ts", "symbol": "generatedPathDead", "generated": true },
+                    ],
+                },
+                "unused_exports": {
+                    "count": 0,
+                    "generated_count": 1,
+                    "total_count": 1,
+                    "top": [],
+                    "generated_top": [
+                        { "file": "src/banner.ts", "symbol": "bannerUnused", "generated": true },
+                    ],
+                }
+            }),
+            serde_json::json!({
+                "duplicates": [
+                    { "cost": 10, "files": ["src/a.ts:1-3", "src/b.ts:1-3"] },
+                    { "cost": 100, "files": ["gen/a.ts:1-9", "gen/b.ts:1-9"], "generated": true },
+                ],
+                "duplicates_generated": [
+                    { "cost": 100, "files": ["gen/a.ts:1-9", "gen/b.ts:1-9"], "generated": true },
+                ],
+                "dead_code": [
+                    { "file": "src/hand.ts", "symbol": "handDead" },
+                    { "file": "gen/schema_pb.ts", "symbol": "generatedPathDead", "generated": true },
+                ],
+                "dead_code_generated": [
+                    { "file": "gen/schema_pb.ts", "symbol": "generatedPathDead", "generated": true },
+                    { "file": "src/banner.ts", "symbol": "bannerDead", "generated": true },
+                ],
+            }),
+        );
+
+        assert!(
+            text.contains("Duplicates: 6 duplicated lines (3.0% of 200 analyzed lines) across 2 files, 1 group (generated: 1) (top by cost):"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  10  src/a.ts:1-3 == src/b.ts:1-3"),
+            "{text}"
+        );
+        assert!(text.contains("  generated: 1:"), "{text}");
+        assert!(
+            text.contains("    100  gen/a.ts:1-9 == gen/b.ts:1-9"),
+            "{text}"
+        );
+
+        assert!(text.contains("Dead code: 1 (generated: 2):"), "{text}");
+        assert!(text.contains("  src/hand.ts::handDead"), "{text}");
+        assert!(
+            text.contains("    gen/schema_pb.ts::generatedPathDead"),
+            "{text}"
+        );
+        assert!(text.contains("    src/banner.ts::bannerDead"), "{text}");
+
+        assert!(text.contains("Unused exports: 0 (generated: 1)"), "{text}");
+        assert!(text.contains("    src/banner.ts::bannerUnused"), "{text}");
     }
 
     #[test]

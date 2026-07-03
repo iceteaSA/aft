@@ -8,7 +8,7 @@ use std::time::Instant;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tree_sitter::{Node, Parser, Tree};
 
 use super::duplicates_classifier::{is_anonymizable, node_cost, AnonymizeAs};
@@ -55,6 +55,7 @@ struct FileScan {
     freshness: cache_freshness::FileFreshness,
     line_count: u32,
     expected_duplicate: bool,
+    generated: bool,
     fragments: Vec<DuplicateFragment>,
 }
 
@@ -64,6 +65,11 @@ struct FragmentOccurrence {
     start_line: u32,
     end_line: u32,
     cost: u32,
+    generated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +80,8 @@ struct DuplicateGroup {
     sample_file: String,
     sample_start_line: u32,
     sample_end_line: u32,
+    #[serde(skip_serializing_if = "is_false")]
+    generated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +91,8 @@ struct DuplicateContribution {
     line_count: u32,
     #[serde(default)]
     expected_duplicate: bool,
+    #[serde(default)]
+    generated: bool,
     fragments: Vec<DuplicateFragment>,
 }
 
@@ -151,6 +161,7 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             freshness,
             line_count: 0,
             expected_duplicate: false,
+            generated: crate::inspect::generated::is_generated_file(Path::new(""), path),
             fragments: Vec::new(),
         });
     };
@@ -163,6 +174,7 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             freshness,
             line_count: 0,
             expected_duplicate: false,
+            generated: crate::inspect::generated::is_generated_file(Path::new(""), path),
             fragments: Vec::new(),
         });
     }
@@ -171,6 +183,7 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
         .map_err(|error| format!("read failed for {}: {error}", path.display()))?;
     let line_count = source_line_count(&source);
     let expected_duplicate = source.contains(EXPECTED_DUPLICATE_MARKER);
+    let generated = crate::inspect::generated::is_generated_file_from_source(path, &source);
     let tree = parse_source(path, lang, &source)?;
     let mut fragments = Vec::new();
     let mut hash_scratch = Vec::new();
@@ -196,6 +209,7 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
         freshness,
         line_count,
         expected_duplicate,
+        generated,
         fragments,
     })
 }
@@ -400,16 +414,20 @@ fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 }
 
 fn file_scan_to_contribution(scan: &FileScan) -> FileContribution {
+    let mut contribution = json!({
+        "file": scan.display_path,
+        "line_count": scan.line_count,
+        "expected_duplicate": scan.expected_duplicate,
+        "fragments": scan.fragments,
+    });
+    if scan.generated {
+        contribution["generated"] = json!(true);
+    }
     FileContribution::new(
         InspectCategory::Duplicates,
         scan.path.clone(),
         scan.freshness,
-        json!({
-            "file": scan.display_path,
-            "line_count": scan.line_count,
-            "expected_duplicate": scan.expected_duplicate,
-            "fragments": scan.fragments,
-        }),
+        contribution,
     )
 }
 
@@ -457,6 +475,10 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
                     start_line: fragment.start_line,
                     end_line: fragment.end_line,
                     cost: fragment.cost,
+                    generated: scan.generated
+                        || crate::inspect::generated::path_has_generated_shape(Path::new(
+                            &scan.file,
+                        )),
                 },
             );
         }
@@ -509,6 +531,7 @@ fn aggregate_file_scans_with_limit(
                     start_line: fragment.start_line,
                     end_line: fragment.end_line,
                     cost: fragment.cost,
+                    generated: scan.generated,
                 },
             );
         }
@@ -592,18 +615,37 @@ fn aggregate_duplicate_occurrences(
         .collect::<Vec<_>>();
 
     groups.sort_by(|left, right| {
-        right
-            .cost
-            .cmp(&left.cost)
+        left.generated
+            .cmp(&right.generated)
+            .then(right.cost.cmp(&left.cost))
             .then(left.sample_file.cmp(&right.sample_file))
             .then(left.sample_start_line.cmp(&right.sample_start_line))
     });
 
     let groups_count = groups.len();
-    let duplicate_stats = duplicate_line_stats(&groups);
+    let headline_groups = groups
+        .iter()
+        .filter(|group| !group.generated)
+        .cloned()
+        .collect::<Vec<_>>();
+    let generated_groups = groups
+        .iter()
+        .filter(|group| group.generated)
+        .cloned()
+        .collect::<Vec<_>>();
+    let count = headline_groups.len();
+    let generated_count = generated_groups.len();
+    let duplicate_stats = duplicate_line_stats(&headline_groups);
+    let all_duplicate_stats = duplicate_line_stats(&groups);
+    let generated_duplicate_stats = duplicate_line_stats(&generated_groups);
     let duplicated_percent =
         duplicate_percent(duplicate_stats.duplicated_lines, total_analyzed_lines);
     let drill_down_capped = drill_down_limit.is_some_and(|limit| groups_count > limit);
+    let generated_drill_down_capped = drill_down_limit.is_some_and(|limit| generated_count > limit);
+    let generated_items = match drill_down_limit {
+        Some(limit) => generated_groups.into_iter().take(limit).collect::<Vec<_>>(),
+        None => generated_groups,
+    };
     let items = match drill_down_limit {
         Some(limit) => groups.into_iter().take(limit).collect::<Vec<_>>(),
         None => groups,
@@ -615,29 +657,37 @@ fn aggregate_duplicate_occurrences(
     let top = items
         .iter()
         .take(TOP_PREVIEW_ITEMS)
-        .map(|group| {
-            json!({
-                "files": group.files,
-                "cost": group.cost,
-                "duplicated_lines": group.duplicated_lines,
-            })
-        })
+        .map(duplicate_top_item)
+        .collect::<Vec<_>>();
+    let generated_top = generated_items
+        .iter()
+        .take(TOP_PREVIEW_ITEMS)
+        .map(duplicate_top_item)
         .collect::<Vec<_>>();
 
     json!({
-        "count": groups_count,
+        "count": count,
+        "generated_count": generated_count,
+        "total_count": groups_count,
         "total_groups": groups_count,
         "groups_count": groups_count,
         "duplicated_lines": duplicate_stats.duplicated_lines,
         "duplicated_percent": duplicated_percent,
         "duplicated_file_count": duplicate_stats.file_count,
+        "generated_duplicated_lines": generated_duplicate_stats.duplicated_lines,
+        "generated_duplicated_file_count": generated_duplicate_stats.file_count,
+        "total_duplicated_lines": all_duplicate_stats.duplicated_lines,
+        "total_duplicated_file_count": all_duplicate_stats.file_count,
         "total_analyzed_lines": total_analyzed_lines,
         "suppressed_groups": suppression.mirror_groups + suppression.marker_groups,
         "mirror_suppressed_groups": suppression.mirror_groups,
         "marker_suppressed_groups": suppression.marker_groups,
         "items": items,
         "top": top,
+        "generated_items": generated_items,
+        "generated_top": generated_top,
         "drill_down_capped": drill_down_capped,
+        "generated_drill_down_capped": generated_drill_down_capped,
         "scanned_files": scanned_files,
         "languages_skipped": languages_skipped,
     })
@@ -707,6 +757,18 @@ fn skipped_languages_from_file_scans(file_scans: &[FileScan]) -> Vec<String> {
         .collect()
 }
 
+fn duplicate_top_item(group: &DuplicateGroup) -> Value {
+    let mut item = json!({
+        "files": group.files,
+        "cost": group.cost,
+        "duplicated_lines": group.duplicated_lines,
+    });
+    if group.generated {
+        item["generated"] = json!(true);
+    }
+    item
+}
+
 fn occurrences_to_group(occurrences: &[FragmentOccurrence]) -> DuplicateGroup {
     let sample = &occurrences[0];
     DuplicateGroup {
@@ -726,6 +788,7 @@ fn occurrences_to_group(occurrences: &[FragmentOccurrence]) -> DuplicateGroup {
         sample_file: sample.file.to_string(),
         sample_start_line: sample.start_line,
         sample_end_line: sample.end_line,
+        generated: occurrences.iter().all(|occurrence| occurrence.generated),
     }
 }
 
@@ -959,13 +1022,23 @@ mod tests {
 
     /// Build a duplicates FileContribution from (start, end, cost, hash) fragments.
     fn contribution(file: &str, fragments: &[(u32, u32, u32, &str)]) -> FileContribution {
-        contribution_with_options(file, 100, false, fragments)
+        contribution_with_generated(file, 100, false, false, fragments)
     }
 
     fn contribution_with_options(
         file: &str,
         line_count: u32,
         expected_duplicate: bool,
+        fragments: &[(u32, u32, u32, &str)],
+    ) -> FileContribution {
+        contribution_with_generated(file, line_count, expected_duplicate, false, fragments)
+    }
+
+    fn contribution_with_generated(
+        file: &str,
+        line_count: u32,
+        expected_duplicate: bool,
+        generated: bool,
         fragments: &[(u32, u32, u32, &str)],
     ) -> FileContribution {
         let frag_json = fragments
@@ -979,21 +1052,45 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        FileContribution::new(
-            InspectCategory::Duplicates,
-            file,
-            freshness(),
-            json!({
-                "file": file,
-                "line_count": line_count,
-                "expected_duplicate": expected_duplicate,
-                "fragments": frag_json,
-            }),
-        )
+        let mut contribution = json!({
+            "file": file,
+            "line_count": line_count,
+            "expected_duplicate": expected_duplicate,
+            "fragments": frag_json,
+        });
+        if generated {
+            contribution["generated"] = json!(true);
+        }
+        FileContribution::new(InspectCategory::Duplicates, file, freshness(), contribution)
     }
 
     fn group_count(aggregate: &serde_json::Value) -> u64 {
         aggregate["count"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn generated_duplicate_groups_sort_below_headline_and_keep_totals() {
+        let aggregate = aggregate_duplicate_contributions_with_limit(
+            &[
+                contribution("src/a.ts", &[(1, 3, 10, "hand")]),
+                contribution("src/b.ts", &[(1, 3, 10, "hand")]),
+                contribution_with_generated("gen/a.ts", 100, false, true, &[(1, 9, 100, "gen")]),
+                contribution_with_generated("gen/b.ts", 100, false, true, &[(1, 9, 100, "gen")]),
+            ],
+            Vec::new(),
+            None,
+            &[],
+        );
+
+        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["generated_count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["total_groups"], 2, "{aggregate:#}");
+        assert_eq!(aggregate["total_count"], 2, "{aggregate:#}");
+        let items = aggregate["items"].as_array().expect("items");
+        assert_eq!(items[0]["files"][0], "src/a.ts:1-3", "{items:#?}");
+        assert_eq!(items[1]["generated"], true, "{items:#?}");
+        assert_eq!(aggregate["top"][0]["files"][0], "src/a.ts:1-3");
+        assert_eq!(aggregate["generated_top"][0]["files"][0], "gen/a.ts:1-9");
     }
 
     #[test]
