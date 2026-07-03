@@ -200,13 +200,13 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.44.0";
+const ANNOUNCEMENT_VERSION = "0.45.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Code Health accuracy overhaul: framework entry points (Tauri commands, Next.js/Nuxt/SvelteKit/Remix/Astro routes, NestJS decorators) are no longer flagged dead, barrel re-exports collapse to their real definition, and test-only usage moves out of the headline counts into its own tier.",
-  "New: import cycle detection for TS/JS (aft_inspect sections: cycles), and expected_mirrors config to suppress intentional duplicate pairs like plugin/pi-plugin parity trees.",
-  "Stale diagnostics fixed: files edited outside AFT (scripts, git) no longer show outdated errors in aft_inspect or the status bar.",
-  "bash wait: true blocks until a long command finishes instead of promoting it to background.",
-  "Objective-C support (.m/.mm): outline, zoom, AST search, and semantic indexing.",
+  "Code Health verified against 12 real repositories: dead code is only reported for languages we can actually analyze (Java/Kotlin now say 'not analyzed' instead of guessing), and generated code (gen/ trees, *_pb.ts, DO NOT EDIT banners) moves out of the headline counts into its own bucket.",
+  "Config files (playwright/eslint/tsup/vitest *.config.ts), Storybook stories, Mocha hooks, and SvelteKit hooks/$lib imports are no longer flagged as dead code.",
+  "Rust module aliases, inline-module calls, and cross-crate pub use re-exports now resolve; Go interface methods (sort.Interface, Bubble Tea) are no longer flagged dead.",
+  "Fixed npx @cortexkit/aft doctor --fix and setup failing to download the binary on fresh installs.",
+  "Bridges now detect an updated aft binary on disk and respawn onto it automatically.",
 ];
 
 /**
