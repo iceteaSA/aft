@@ -973,11 +973,18 @@ impl InspectManager {
             .map(freshness_record_relative_key)
             .collect::<BTreeSet<_>>();
         let force_relative = forced_relative_paths(job, &options.force_rescan_paths);
-        #[cfg(debug_assertions)]
         let cold_cache = cached_relative.is_empty();
+        #[cfg(debug_assertions)]
+        let debug_cold_cache = cold_cache;
 
         let mut updates = Tier2ContributionUpdates::default();
         let mut scan_by_relative = BTreeMap::<String, PathBuf>::new();
+        let mut callgraph_refresh_paths = options
+            .force_rescan_paths
+            .iter()
+            .filter(|path| callgraph_store_indexes_path(path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let mut aggregate_job = job.clone();
 
         for record in cached_records {
@@ -985,12 +992,17 @@ impl InspectManager {
             let relative_path = PathBuf::from(&relative);
             let Some(current_file) = current_by_relative.get(&relative) else {
                 updates.deletes.push(relative_path);
+                insert_callgraph_refresh_path(
+                    &mut callgraph_refresh_paths,
+                    job.project_root.join(&relative),
+                );
                 continue;
             };
 
             if force_relative.contains(&relative) {
                 updates.deletes.push(relative_path);
                 scan_by_relative.insert(relative, current_file.clone());
+                insert_callgraph_refresh_path(&mut callgraph_refresh_paths, current_file.clone());
                 continue;
             }
 
@@ -1007,9 +1019,17 @@ impl InspectManager {
                 ContributionFreshness::Stale => {
                     updates.deletes.push(relative_path);
                     scan_by_relative.insert(relative, current_file.clone());
+                    insert_callgraph_refresh_path(
+                        &mut callgraph_refresh_paths,
+                        current_file.clone(),
+                    );
                 }
                 ContributionFreshness::Deleted => {
                     updates.deletes.push(relative_path);
+                    insert_callgraph_refresh_path(
+                        &mut callgraph_refresh_paths,
+                        job.project_root.join(&record.file_path),
+                    );
                 }
             }
         }
@@ -1017,12 +1037,18 @@ impl InspectManager {
         for (relative, file) in &current_by_relative {
             if !cached_relative.contains(relative) {
                 scan_by_relative.insert(relative.clone(), file.clone());
+                if !cold_cache {
+                    insert_callgraph_refresh_path(&mut callgraph_refresh_paths, file.clone());
+                }
             }
         }
         phases.freshness = phase_started.elapsed();
 
         let mut scan_files = scan_by_relative.into_values().collect::<Vec<_>>();
         let force_reparse_files = scan_files.clone();
+        let callgraph_refresh_files = callgraph_refresh_paths.into_iter().collect::<Vec<_>>();
+        let dead_code_callgraph_refresh =
+            job.category == InspectCategory::DeadCode && !callgraph_refresh_files.is_empty();
         if !scan_files.is_empty() {
             let mut scan_job = job.clone();
             scan_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
@@ -1031,13 +1057,16 @@ impl InspectManager {
                 && scan_job.callgraph_snapshot.is_none()
             {
                 let snapshot_started = Instant::now();
-                scan_job.callgraph_snapshot =
-                    build_tier2_callgraph_snapshot(&scan_job, options.allow_callgraph_cold_build);
+                scan_job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(
+                    &scan_job,
+                    options.allow_callgraph_cold_build,
+                    &callgraph_refresh_files,
+                );
                 phases.snapshot += snapshot_started.elapsed();
             }
             aggregate_job.callgraph_snapshot = scan_job.callgraph_snapshot.clone();
             #[cfg(debug_assertions)]
-            if cold_cache {
+            if debug_cold_cache {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let scan_started = Instant::now();
@@ -1055,7 +1084,7 @@ impl InspectManager {
         let has_updates = !updates.upserts.is_empty()
             || !updates.deletes.is_empty()
             || !updates.metadata_updates.is_empty();
-        if !has_updates {
+        if !has_updates && !dead_code_callgraph_refresh {
             if let Some(aggregate) = cache
                 .get_aggregated_for_config(&job.key, job.config.as_ref())
                 .map_err(|error| error.to_string())?
@@ -1084,20 +1113,22 @@ impl InspectManager {
         };
         phases.db = db_started.elapsed();
 
-        if let Some(aggregate) = cache
-            .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
-            .map_err(|error| error.to_string())?
-        {
-            cache
-                .touch_tier2_last_full_run(job.category)
-                .map_err(|error| error.to_string())?;
-            let contributions = load_contributions(cache, job)?;
-            phases.log(job.category);
-            return Ok(InspectScanSuccess {
-                scanned_files: scan_files,
-                contributions,
-                aggregate,
-            });
+        if !dead_code_callgraph_refresh {
+            if let Some(aggregate) = cache
+                .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
+                .map_err(|error| error.to_string())?
+            {
+                cache
+                    .touch_tier2_last_full_run(job.category)
+                    .map_err(|error| error.to_string())?;
+                let contributions = load_contributions(cache, job)?;
+                phases.log(job.category);
+                return Ok(InspectScanSuccess {
+                    scanned_files: scan_files,
+                    contributions,
+                    aggregate,
+                });
+            }
         }
 
         let refresh_dead_code_facts = if job.category == InspectCategory::DeadCode {
@@ -1129,9 +1160,10 @@ impl InspectManager {
                     && rescan_job.callgraph_snapshot.is_none()
                 {
                     let snapshot_started = Instant::now();
-                    rescan_job.callgraph_snapshot = build_tier2_callgraph_snapshot(
+                    rescan_job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(
                         &rescan_job,
                         options.allow_callgraph_cold_build,
+                        &callgraph_refresh_files,
                     );
                     phases.snapshot += snapshot_started.elapsed();
                 }
@@ -1166,20 +1198,22 @@ impl InspectManager {
                 aggregate_job.callgraph_snapshot = rescan_job.callgraph_snapshot.clone();
                 scan_files = full_scan_files;
 
-                if let Some(aggregate) = cache
-                    .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
-                    .map_err(|error| error.to_string())?
-                {
-                    cache
-                        .touch_tier2_last_full_run(job.category)
-                        .map_err(|error| error.to_string())?;
-                    let contributions = load_contributions(cache, job)?;
-                    phases.log(job.category);
-                    return Ok(InspectScanSuccess {
-                        scanned_files: scan_files,
-                        contributions,
-                        aggregate,
-                    });
+                if !dead_code_callgraph_refresh {
+                    if let Some(aggregate) = cache
+                        .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
+                        .map_err(|error| error.to_string())?
+                    {
+                        cache
+                            .touch_tier2_last_full_run(job.category)
+                            .map_err(|error| error.to_string())?;
+                        let contributions = load_contributions(cache, job)?;
+                        phases.log(job.category);
+                        return Ok(InspectScanSuccess {
+                            scanned_files: scan_files,
+                            contributions,
+                            aggregate,
+                        });
+                    }
                 }
             }
         }
@@ -1188,8 +1222,11 @@ impl InspectManager {
             && aggregate_job.callgraph_snapshot.is_none()
         {
             let snapshot_started = Instant::now();
-            aggregate_job.callgraph_snapshot =
-                build_tier2_callgraph_snapshot(&aggregate_job, options.allow_callgraph_cold_build);
+            aggregate_job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(
+                &aggregate_job,
+                options.allow_callgraph_cold_build,
+                &callgraph_refresh_files,
+            );
             phases.snapshot += snapshot_started.elapsed();
         }
         let rollup_started = Instant::now();
@@ -1600,6 +1637,16 @@ fn current_project_files(project_root: &Path, files: &[PathBuf]) -> BTreeMap<Str
         .collect()
 }
 
+fn insert_callgraph_refresh_path(paths: &mut BTreeSet<PathBuf>, path: PathBuf) {
+    if callgraph_store_indexes_path(&path) {
+        paths.insert(path);
+    }
+}
+
+fn callgraph_store_indexes_path(path: &Path) -> bool {
+    crate::parser::detect_language(path).is_some()
+}
+
 fn tier2_benchmark_logging_enabled() -> bool {
     std::env::var_os("AFT_SETTLE_BENCH_LOG").is_some()
 }
@@ -1653,6 +1700,14 @@ fn build_tier2_callgraph_snapshot(
     job: &InspectJob,
     allow_cold_build: bool,
 ) -> Option<Arc<CallgraphSnapshot>> {
+    build_tier2_callgraph_snapshot_with_refresh(job, allow_cold_build, &[])
+}
+
+fn build_tier2_callgraph_snapshot_with_refresh(
+    job: &InspectJob,
+    allow_cold_build: bool,
+    refresh_paths: &[PathBuf],
+) -> Option<Arc<CallgraphSnapshot>> {
     let started = Instant::now();
     if !job.config.callgraph_store {
         crate::slog_info!(
@@ -1661,7 +1716,8 @@ fn build_tier2_callgraph_snapshot(
         return None;
     }
 
-    let Some(callgraph_dir) = callgraph_store_dir_from_inspect_dir(&job.inspect_dir) else {
+    let callgraph_dirs = callgraph_store_dirs_from_inspect_dir(&job.inspect_dir);
+    if callgraph_dirs.is_empty() {
         crate::slog_info!(
             "tier2 dead_code: inspect_dir has no harness parent ({}); reporting callgraph_unavailable",
             job.inspect_dir.display()
@@ -1669,67 +1725,144 @@ fn build_tier2_callgraph_snapshot(
         return None;
     };
 
-    // Background Tier-2 refresh may repair moved-root metadata by publishing a
-    // one-time cold rebuild. Direct inspect cannot spend its request budget on
-    // that repair path, so it uses the open-only variant and reports
-    // callgraph_unavailable when a rebuild would be required.
-    let store = match if allow_cold_build {
-        CallGraphStore::open_ready_repairing(callgraph_dir.clone(), job.project_root.clone())
-    } else {
-        CallGraphStore::open_ready_no_rebuild(callgraph_dir.clone(), job.project_root.clone())
-    } {
-        Ok(Some(store)) => store,
-        Ok(None) => {
-            crate::slog_info!(
-                "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); reporting callgraph_unavailable",
-                callgraph_dir.display()
-            );
-            return None;
-        }
-        Err(error) => {
-            crate::slog_warn!(
-                "tier2 dead_code: failed to open callgraph store at {}: {}; reporting callgraph_unavailable",
-                callgraph_dir.display(),
-                error
-            );
-            return None;
-        }
-    };
+    for (index, callgraph_dir) in callgraph_dirs.iter().enumerate() {
+        // Background refresh may rebuild call graphs for moved project roots.
+        // Direct inspect cannot trigger that rebuild, so it opens without repair
+        // and reports callgraph_unavailable when a rebuild is needed.
+        let store = match if allow_cold_build {
+            CallGraphStore::open_ready_repairing(callgraph_dir.clone(), job.project_root.clone())
+        } else {
+            CallGraphStore::open_ready_no_rebuild(callgraph_dir.clone(), job.project_root.clone())
+        } {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                crate::slog_info!(
+                    "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
+                    callgraph_dir.display(),
+                    index + 1 < callgraph_dirs.len()
+                );
+                continue;
+            }
+            Err(error) => {
+                crate::slog_warn!(
+                    "tier2 dead_code: failed to open callgraph store at {}: {}; trying fallback={}",
+                    callgraph_dir.display(),
+                    error,
+                    index + 1 < callgraph_dirs.len()
+                );
+                continue;
+            }
+        };
 
-    let snapshot = match project_dead_code_snapshot(store.sqlite_path()) {
-        Ok(snapshot) => snapshot,
-        Err(CallGraphStoreError::Unavailable(message)) => {
+        if !refresh_paths.is_empty() {
+            match store.refresh_files(refresh_paths) {
+                Ok(stats) => {
+                    crate::slog_info!(
+                        "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={}",
+                        callgraph_dir.display(),
+                        refresh_paths.len(),
+                        stats.changed_files.len(),
+                        stats.deleted_files.len(),
+                        stats.refreshed_own_files
+                    );
+                }
+                Err(error) => {
+                    crate::slog_warn!(
+                        "tier2 dead_code: failed to refresh callgraph store at {} before projection: {}",
+                        callgraph_dir.display(),
+                        error
+                    );
+                    if let Err(mark_error) = store.mark_files_stale(refresh_paths) {
+                        crate::slog_warn!(
+                            "tier2 dead_code: failed to mark callgraph store files stale at {} after refresh failure: {}",
+                            callgraph_dir.display(),
+                            mark_error
+                        );
+                    }
+                }
+            }
+        }
+
+        let snapshot = match project_dead_code_snapshot(store.sqlite_path()) {
+            Ok(snapshot) => snapshot,
+            Err(CallGraphStoreError::Unavailable(message)) => {
+                crate::slog_info!(
+                    "tier2 dead_code: callgraph store projection unavailable at {} ({}); trying fallback={}",
+                    callgraph_dir.display(),
+                    message,
+                    index + 1 < callgraph_dirs.len()
+                );
+                continue;
+            }
+            Err(error) => {
+                crate::slog_warn!(
+                    "tier2 dead_code: callgraph store projection failed at {}: {}; trying fallback={}",
+                    callgraph_dir.display(),
+                    error,
+                    index + 1 < callgraph_dirs.len()
+                );
+                continue;
+            }
+        };
+
+        if index > 0 {
             crate::slog_info!(
-                "tier2 dead_code: callgraph store projection unavailable ({}); reporting callgraph_unavailable",
-                message
+                "tier2 dead_code: using ready callgraph store fallback {} for inspect_dir {}",
+                callgraph_dir.display(),
+                job.inspect_dir.display()
             );
-            return None;
         }
-        Err(error) => {
-            crate::slog_warn!(
-                "tier2 dead_code: callgraph store projection failed: {}; reporting callgraph_unavailable",
-                error
-            );
-            return None;
-        }
-    };
+
+        crate::slog_info!(
+            "perf tier2_callgraph_snapshot: source=callgraph_store files={} exports={} edges={} entry_points={} ms={}",
+            snapshot.files.len(),
+            snapshot.exported_symbols.len(),
+            snapshot.outbound_calls.len(),
+            snapshot.entry_points.len(),
+            started.elapsed().as_millis()
+        );
+
+        return Some(Arc::new(snapshot));
+    }
 
     crate::slog_info!(
-        "perf tier2_callgraph_snapshot: source=callgraph_store files={} exports={} edges={} entry_points={} ms={}",
-        snapshot.files.len(),
-        snapshot.exported_symbols.len(),
-        snapshot.outbound_calls.len(),
-        snapshot.entry_points.len(),
-        started.elapsed().as_millis()
+        "tier2 dead_code: no ready callgraph store found for inspect_dir {}; reporting callgraph_unavailable",
+        job.inspect_dir.display()
     );
-
-    Some(Arc::new(snapshot))
+    None
 }
 
 fn callgraph_store_dir_from_inspect_dir(inspect_dir: &Path) -> Option<PathBuf> {
     inspect_dir
         .parent()
         .map(|harness_dir| harness_dir.join("callgraph"))
+}
+
+fn callgraph_store_dirs_from_inspect_dir(inspect_dir: &Path) -> Vec<PathBuf> {
+    let Some(primary) = callgraph_store_dir_from_inspect_dir(inspect_dir) else {
+        return Vec::new();
+    };
+    let mut dirs = vec![primary.clone()];
+
+    let Some(harness_dir) = inspect_dir.parent() else {
+        return dirs;
+    };
+    let Some(storage_dir) = harness_dir.parent() else {
+        return dirs;
+    };
+    let Ok(entries) = std::fs::read_dir(storage_dir) else {
+        return dirs;
+    };
+
+    let mut siblings = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("callgraph"))
+        .filter(|dir| dir != &primary && dir.is_dir())
+        .collect::<Vec<_>>();
+    siblings.sort();
+    siblings.dedup();
+    dirs.extend(siblings);
+    dirs
 }
 
 #[cfg(test)]
@@ -3131,6 +3264,130 @@ mod guard_tests {
 
         assert_eq!(snapshot.files.len(), 3);
         assert_eq!(snapshot.exported_symbols.len(), 3);
+    }
+
+    #[test]
+    fn callgraph_snapshot_uses_ready_sibling_harness_store() {
+        let dir = write_ts_project(3);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let storage_dir = root.join(".aft-cache");
+        let inspect_dir = storage_dir.join("runner").join("inspect");
+        let warm_callgraph_dir = storage_dir.join("opencode").join("callgraph");
+        let store = CallGraphStore::open(warm_callgraph_dir, root.clone()).expect("open store");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        store.cold_build(&files).expect("cold build store");
+
+        let snapshot =
+            build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true), false)
+                .expect("ready sibling store snapshot");
+
+        assert_eq!(snapshot.files.len(), 3);
+        assert_eq!(snapshot.exported_symbols.len(), 3);
+    }
+
+    #[test]
+    fn dead_code_forced_deletion_refreshes_callgraph_store_before_rollup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        write_fixture_file(
+            &root,
+            "package.json",
+            r#"{"name":"dead-code-delete-refresh","type":"module","main":"src/main.ts"}"#,
+            3_100_000_000,
+        );
+        write_fixture_file(
+            &root,
+            "src/main.ts",
+            "export function main() {}\n",
+            3_100_000_001,
+        );
+        write_fixture_file(
+            &root,
+            "src/dead.ts",
+            "export function plantedDead() {}\n",
+            3_100_000_002,
+        );
+
+        let inspect_dir = root.join(".aft-cache").join("opencode").join("inspect");
+        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
+        let project_files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        store.cold_build(&project_files).expect("cold build store");
+        drop(store);
+
+        let config = Arc::new(crate::config::Config {
+            project_root: Some(root.clone()),
+            callgraph_store: true,
+            ..crate::config::Config::default()
+        });
+        let symbol_cache = Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            inspect_dir.clone(),
+            Arc::clone(&config),
+            Arc::clone(&symbol_cache),
+        );
+        let manager = InspectManager::new();
+        let initial_job =
+            manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
+        let initial = manager
+            .tier2_run_with_reuse_job_result_with_options(initial_job, Tier2ReuseOptions::default())
+            .outcome
+            .expect("initial dead_code scan succeeds")
+            .aggregate;
+        assert!(
+            aggregate_has_file_symbol(&initial, "src/dead.ts", "plantedDead"),
+            "initial scan should report the planted dead export: {initial:#}"
+        );
+
+        let deleted = root.join("src/dead.ts");
+        std::fs::remove_file(&deleted).expect("delete dead fixture");
+        let delete_job = manager.tier2_reuse_job(snapshot, InspectCategory::DeadCode, None);
+        let refreshed = manager
+            .tier2_run_with_reuse_job_result_with_options(
+                delete_job,
+                Tier2ReuseOptions::direct(vec![deleted.clone()]),
+            )
+            .outcome
+            .expect("delete refresh dead_code scan succeeds")
+            .aggregate;
+
+        assert_eq!(
+            refreshed
+                .get("callgraph_available")
+                .and_then(Value::as_bool),
+            Some(true),
+            "forced watcher paths must keep the callgraph-backed aggregate available: {refreshed:#}"
+        );
+        assert!(
+            !aggregate_has_file_symbol(&refreshed, "src/dead.ts", "plantedDead"),
+            "delete refresh should remove the planted dead export: {refreshed:#}"
+        );
+
+        let store = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root)
+            .expect("open refreshed store")
+            .expect("refreshed store is ready");
+        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        assert!(
+            projected
+                .files
+                .iter()
+                .all(|file| !file.ends_with("src/dead.ts")),
+            "watcher deletion should be applied to the persisted callgraph store: {:#?}",
+            projected.files
+        );
+    }
+
+    fn aggregate_has_file_symbol(aggregate: &Value, file: &str, symbol: &str) -> bool {
+        aggregate
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("file").and_then(Value::as_str) == Some(file)
+                        && item.get("symbol").and_then(Value::as_str) == Some(symbol)
+                })
+            })
     }
 
     // A scoped payload must not carry the project-wide `by_language` breakdown
