@@ -661,7 +661,7 @@ fn oxc_verdicts_by_file(
             }
             Some(FileFacts {
                 file_id: FileId(0),
-                path: canonical_or_normalized(&project_root.join(&contribution.file)),
+                path: canonical_or_normalized(project_root, &project_root.join(&contribution.file)),
                 content_hash: oxc_facts.content_hash.clone(),
                 exports: oxc_facts.exports.clone(),
                 imports: oxc_facts.imports.clone(),
@@ -2181,8 +2181,13 @@ fn relative_path(project_root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn canonical_or_normalized(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+fn canonical_or_normalized(project_root: &Path, path: &Path) -> PathBuf {
+    // Delegates to the oxc engine's input normalizer so FileFacts paths built
+    // here compare equal to the engine's entry-point/executable-root sets.
+    // Calling fs::canonicalize directly is wrong on Windows: it returns
+    // verbatim (\\?\C:\) paths while those sets are de-verbatimed, and the
+    // membership miss silently drops entry-point liveness.
+    crate::inspect::oxc_engine::normalize_input_path(project_root, path)
 }
 
 fn normalize_absolute(project_root: &Path, path: &Path) -> PathBuf {

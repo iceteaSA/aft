@@ -210,8 +210,11 @@ pub fn analyze_files_with_cache(
     options: AnalyzeOptions,
     cache: &mut OxcFactsCache,
 ) -> Result<OxcEngineResult, String> {
-    let project_root =
-        fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root));
+    // De-verbatim the canonical root (Windows \\?\ form) so strip_prefix
+    // against normalize_path-built module paths keeps working.
+    let project_root = fs::canonicalize(project_root)
+        .map(|canonical| normalize_path(&canonical))
+        .unwrap_or_else(|_| normalize_path(project_root));
     let force_reparse_files = normalize_option_paths(&options.force_reparse_files);
     let normalized_files = normalize_file_set(&project_root, files);
     let files = normalized_files.files;
@@ -251,8 +254,11 @@ pub(crate) fn analyze_file_facts(
     options: AnalyzeOptions,
     skipped_outside_root: Vec<PathBuf>,
 ) -> OxcEngineResult {
-    let project_root =
-        fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root));
+    // Same de-verbatim rule as analyze_files_with_cache: FileFacts paths are
+    // normalize_path-built, so the root they are relativized against must be too.
+    let project_root = fs::canonicalize(project_root)
+        .map(|canonical| normalize_path(&canonical))
+        .unwrap_or_else(|_| normalize_path(project_root));
     analyze_preparsed_facts(
         project_root,
         facts,
@@ -350,14 +356,22 @@ fn normalize_file_set(project_root: &Path, files: &[PathBuf]) -> NormalizedFileS
     normalized
 }
 
-fn normalize_input_path(project_root: &Path, path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| {
-        if path.is_absolute() {
-            normalize_path(path)
-        } else {
-            normalize_path(&project_root.join(path))
-        }
-    })
+pub(crate) fn normalize_input_path(project_root: &Path, path: &Path) -> PathBuf {
+    // Route the canonicalized form through normalize_path too: on Windows,
+    // fs::canonicalize returns verbatim (\\?\C:\) paths, while every set we
+    // compare module paths against (entry_points, public_api_files,
+    // executable_root_exports) is built via normalize_path, which strips the
+    // verbatim prefix. Returning the raw canonical form makes those membership
+    // checks silently miss on Windows only.
+    fs::canonicalize(path)
+        .map(|canonical| normalize_path(&canonical))
+        .unwrap_or_else(|_| {
+            if path.is_absolute() {
+                normalize_path(path)
+            } else {
+                normalize_path(&project_root.join(path))
+            }
+        })
 }
 
 fn normalize_executable_root_exports(
@@ -380,6 +394,9 @@ fn normalize_executable_root_exports(
 }
 
 fn normalize_option_paths(paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+    // Both insertions go through normalize_path (which de-verbatims Windows
+    // \\?\ canonical forms) so membership checks against module paths built by
+    // normalize_input_path always compare like with like.
     let mut normalized = BTreeSet::new();
     for path in paths {
         normalized.insert(normalize_path(path));
