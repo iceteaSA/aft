@@ -425,7 +425,8 @@ impl InspectManager {
             return Ok(None);
         }
 
-        let public_api_entries = super::entry_points::resolve_entry_points(&job.project_root);
+        let public_api_entries =
+            crate::inspect::entry_points::resolve_entry_points(&job.project_root);
         let entry_points = if job.category == InspectCategory::DeadCode {
             job.callgraph_snapshot
                 .as_ref()
@@ -2031,6 +2032,8 @@ fn roll_up_unused_exports_contributions(
 
     let mut count = 0usize;
     let mut items = Vec::new();
+    let mut generated_count = 0usize;
+    let mut generated_items = Vec::new();
     let test_only_count = 0usize;
     let test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
@@ -2044,6 +2047,11 @@ fn roll_up_unused_exports_contributions(
         if super::job::is_test_support_file(&scan.file) {
             continue;
         }
+        let generated_file = super::generated::is_generated_file_with_cached_hint(
+            &job.project_root,
+            &scan.file,
+            scan.generated,
+        );
 
         for export in &scan.exports {
             if export_uses_oxc(export) {
@@ -2093,8 +2101,6 @@ fn roll_up_unused_exports_contributions(
                 }
             }
 
-            count += 1;
-            // Collect uncapped; rank by signal tier and truncate below.
             let mut item = json!({
                 "file": scan.file,
                 "symbol": export.symbol,
@@ -2104,13 +2110,32 @@ fn roll_up_unused_exports_contributions(
             if let Some(provenance) = &export.provenance {
                 item["provenance"] = json!(provenance);
             }
-            items.push(item);
+            if generated_file {
+                item["generated"] = json!(true);
+                generated_count += 1;
+                generated_items.push(item);
+            } else {
+                count += 1;
+                items.push(item);
+            }
         }
     }
 
     let roles = super::entry_points::resolve_project_roles(&job.project_root);
     let items = super::entry_points::rank_and_truncate_items(items, &roles, drill_down_limit);
+    let generated_items =
+        super::entry_points::rank_and_truncate_items(generated_items, &roles, drill_down_limit);
     let top = super::entry_points::top_preview_symbols(&items);
+    let generated_top = generated_items
+        .iter()
+        .take(super::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut all_items = items;
+    all_items.extend(generated_items.iter().cloned());
+    if let Some(limit) = drill_down_limit {
+        all_items.truncate(limit);
+    }
     let test_only_items =
         super::entry_points::rank_and_truncate_items(test_only_items, &roles, drill_down_limit);
     let test_only_top = test_only_items
@@ -2122,12 +2147,17 @@ fn roll_up_unused_exports_contributions(
     let (parse_errors, skipped_files) = unused_exports_honesty_fields(&parsed);
     let mut aggregate = json!({
         "count": count,
-        "items": items,
+        "generated_count": generated_count,
+        "total_count": count + test_only_count + generated_count,
+        "items": all_items,
         "top": top,
+        "generated_items": generated_items,
+        "generated_top": generated_top,
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
-        "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "drill_down_capped": drill_down_limit.is_some_and(|limit| count + generated_count > limit),
+        "generated_drill_down_capped": drill_down_limit.is_some_and(|limit| generated_count > limit),
         "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
@@ -2176,7 +2206,20 @@ fn roll_up_unused_exports_oxc_contributions(
             })
         })
         .collect::<Vec<_>>();
-    let entry_point_set = super::entry_points::resolve_entry_points(&job.project_root);
+    let generated_by_file = parsed
+        .iter()
+        .map(|scan| {
+            (
+                scan.file.clone(),
+                super::generated::is_generated_file_with_cached_hint(
+                    &job.project_root,
+                    &scan.file,
+                    scan.generated,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let entry_point_set = crate::inspect::entry_points::resolve_entry_points(&job.project_root);
     let oxc_result = analyze_file_facts(
         &job.project_root,
         facts,
@@ -2193,6 +2236,8 @@ fn roll_up_unused_exports_oxc_contributions(
 
     let mut count = 0usize;
     let mut items = Vec::new();
+    let mut generated_count = 0usize;
+    let mut generated_items = Vec::new();
     let mut test_only_count = 0usize;
     let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
@@ -2203,6 +2248,15 @@ fn roll_up_unused_exports_oxc_contributions(
         {
             continue;
         }
+        let generated_file = generated_by_file
+            .get(&file.relative_file)
+            .copied()
+            .unwrap_or_else(|| {
+                super::generated::is_generated_file(
+                    &job.project_root,
+                    Path::new(&file.relative_file),
+                )
+            });
 
         for export in &file.exports {
             match export.verdict {
@@ -2210,7 +2264,6 @@ fn roll_up_unused_exports_oxc_contributions(
                     if !is_test_file(&file.relative_file)
                         && !export.test_only_reference_files.is_empty()
                     {
-                        test_only_count += 1;
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -2220,7 +2273,14 @@ fn roll_up_unused_exports_oxc_contributions(
                             "used_by": export.test_only_reference_files,
                         });
                         add_oxc_reexport_contexts(&mut item, &export.also_reexported);
-                        test_only_items.push(item);
+                        if generated_file {
+                            item["generated"] = json!(true);
+                            generated_count += 1;
+                            generated_items.push(item);
+                        } else {
+                            test_only_count += 1;
+                            test_only_items.push(item);
+                        }
                     }
                 }
                 LivenessVerdict::Uncertain => {
@@ -2242,7 +2302,6 @@ fn roll_up_unused_exports_oxc_contributions(
                     if !is_test_file(&file.relative_file)
                         && !export.test_only_reference_files.is_empty()
                     {
-                        test_only_count += 1;
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -2252,13 +2311,19 @@ fn roll_up_unused_exports_oxc_contributions(
                             "used_by": export.test_only_reference_files,
                         });
                         add_oxc_reexport_contexts(&mut item, &export.also_reexported);
-                        test_only_items.push(item);
+                        if generated_file {
+                            item["generated"] = json!(true);
+                            generated_count += 1;
+                            generated_items.push(item);
+                        } else {
+                            test_only_count += 1;
+                            test_only_items.push(item);
+                        }
                         continue;
                     }
                     if export.has_references {
                         continue;
                     }
-                    count += 1;
                     let mut item = json!({
                         "file": file.relative_file,
                         "symbol": export.symbol,
@@ -2267,14 +2332,33 @@ fn roll_up_unused_exports_oxc_contributions(
                         "provenance": export.provenance,
                     });
                     add_oxc_reexport_contexts(&mut item, &export.also_reexported);
-                    items.push(item);
+                    if generated_file {
+                        item["generated"] = json!(true);
+                        generated_count += 1;
+                        generated_items.push(item);
+                    } else {
+                        count += 1;
+                        items.push(item);
+                    }
                 }
             }
         }
     }
 
     let items = super::entry_points::rank_and_truncate_items(items, &roles, drill_down_limit);
+    let generated_items =
+        super::entry_points::rank_and_truncate_items(generated_items, &roles, drill_down_limit);
     let top = super::entry_points::top_preview_symbols(&items);
+    let generated_top = generated_items
+        .iter()
+        .take(super::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut all_items = items;
+    all_items.extend(generated_items.iter().cloned());
+    if let Some(limit) = drill_down_limit {
+        all_items.truncate(limit);
+    }
     let test_only_items =
         super::entry_points::rank_and_truncate_items(test_only_items, &roles, drill_down_limit);
     let test_only_top = test_only_items
@@ -2299,12 +2383,17 @@ fn roll_up_unused_exports_oxc_contributions(
 
     let mut aggregate = json!({
         "count": count,
-        "items": items,
+        "generated_count": generated_count,
+        "total_count": count + test_only_count + generated_count,
+        "items": all_items,
         "top": top,
+        "generated_items": generated_items,
+        "generated_top": generated_top,
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
-        "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "drill_down_capped": drill_down_limit.is_some_and(|limit| count + generated_count > limit),
+        "generated_drill_down_capped": drill_down_limit.is_some_and(|limit| generated_count > limit),
         "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
@@ -2427,6 +2516,8 @@ struct DeadCodeRefreshContribution {
 #[derive(Debug, Clone, Deserialize)]
 struct UnusedExportsContribution {
     file: String,
+    #[serde(default)]
+    generated: bool,
     exports: Vec<ExportContribution>,
     #[serde(default)]
     imports: Vec<ImportContribution>,
@@ -2568,7 +2659,7 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
 }
 
 fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<String>) {
-    let entry_points = super::entry_points::resolve_entry_points(project_root);
+    let entry_points = crate::inspect::entry_points::resolve_entry_points(project_root);
     (
         entry_points.public_api_files_relative(project_root),
         entry_points.warnings().to_vec(),
@@ -3051,6 +3142,105 @@ mod guard_tests {
             symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
             callgraph_snapshot: None,
         }
+    }
+
+    fn generated_unused_exports_fixture() -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let files = [
+            (
+                "src/hand.ts",
+                "export function handUnused() {}
+",
+            ),
+            (
+                "gen/schema_pb.ts",
+                "export function generatedPathUnused() {}
+",
+            ),
+            (
+                "src/banner.ts",
+                "// Code generated by fixture. DO NOT EDIT.
+export function bannerUnused() {}
+",
+            ),
+        ];
+        let paths = files
+            .iter()
+            .map(|(relative, contents)| {
+                let path = root.join(relative);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("create parent");
+                }
+                std::fs::write(&path, contents).expect("write fixture file");
+                std::fs::canonicalize(path).expect("canonical fixture path")
+            })
+            .collect::<Vec<_>>();
+        (
+            dir,
+            std::fs::canonicalize(root).expect("canonical root"),
+            paths,
+        )
+    }
+
+    fn unused_exports_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
+        use crate::config::Config;
+        use crate::parser::SymbolCache;
+        use std::sync::RwLock;
+
+        InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::UnusedExports),
+            category: InspectCategory::UnusedExports,
+            scope_files,
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join(".aft-cache").join("inspect"),
+            config: Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            callgraph_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn unused_exports_oxc_cached_rollup_preserves_generated_split() {
+        let (_dir, root, paths) = generated_unused_exports_fixture();
+        let job = unused_exports_job(&root, paths.clone());
+        let entry_points = crate::inspect::entry_points::resolve_entry_points(&root);
+        let oxc_result = crate::inspect::oxc_engine::analyze_files(
+            &root,
+            &paths,
+            AnalyzeOptions {
+                entry_points: Vec::new(),
+                public_api_files: entry_points.public_api_files(),
+                executable_root_exports: entry_points.executable_root_exports(),
+                force_reparse_files: Vec::new(),
+                entry_reachability: false,
+            },
+        )
+        .expect("oxc analyze succeeds");
+        let fresh = crate::inspect::scanners::unused_exports::run_unused_exports_scan_with_oxc(
+            &job,
+            Some(&oxc_result),
+        )
+        .outcome
+        .expect("fresh scan succeeds");
+
+        let rolled_up = roll_up_unused_exports_contributions(
+            &job,
+            &fresh.contributions,
+            Some(MAX_DRILL_DOWN_ITEMS),
+        );
+
+        assert_eq!(
+            rolled_up, fresh.aggregate,
+            "cached rollup must match fresh scan"
+        );
+        assert_eq!(rolled_up["count"], 1, "{rolled_up:#}");
+        assert_eq!(rolled_up["generated_count"], 2, "{rolled_up:#}");
+        assert_eq!(rolled_up["total_count"], 3, "{rolled_up:#}");
     }
 
     #[test]
