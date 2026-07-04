@@ -1355,13 +1355,17 @@ mod watcher_filter_tests {
 
     /// Run `f` with global git-ignore discovery neutralized.
     ///
-    /// `rebuild_gitignore` loads git's global excludes (the `ignore` crate
-    /// resolves `$XDG_CONFIG_HOME/git/ignore`, falling back to
-    /// `$HOME/.config/git/ignore`). A developer machine commonly has that file,
-    /// so any "no project ignore → None" baseline is only deterministic when
-    /// global discovery is pointed at an empty directory. Pointing
-    /// `XDG_CONFIG_HOME` at a fresh tempdir does that without touching `HOME`.
-    /// Serialized by a process-local mutex; env is restored before use.
+    /// `rebuild_gitignore` loads git's global excludes via the `ignore`
+    /// crate, which discovers them from TWO places: `core.excludesfile` in
+    /// `$HOME/.gitconfig` (or `$XDG_CONFIG_HOME/git/config`), and the default
+    /// `$XDG_CONFIG_HOME/git/ignore` / `$HOME/.config/git/ignore` locations.
+    /// A developer machine commonly has one of these, so any "no project
+    /// ignore → None" baseline is only deterministic when BOTH discovery
+    /// roots point at an empty directory — neutralizing only
+    /// `XDG_CONFIG_HOME` still finds a `~/.gitconfig` `core.excludesfile`.
+    /// Serialized by a process-local mutex (bin tests run in their own
+    /// process, so no cross-crate lock is needed); env is restored before
+    /// the closure result is used.
     fn with_neutralized_global_gitignore<R>(f: impl FnOnce() -> R) -> R {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1370,16 +1374,28 @@ mod watcher_filter_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
-        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
         // SAFETY: serialized by LOCK above; restored immediately after `f`.
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("USERPROFILE", tmp.path());
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         unsafe {
-            match prev {
+            match prev_xdg {
                 Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
             }
         }
         match result {
