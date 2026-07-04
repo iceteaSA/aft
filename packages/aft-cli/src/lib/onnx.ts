@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, isAbsolute, join, resolve, win32 } from "node:path";
 
 export const ONNX_RUNTIME_VERSION = "1.24.4";
@@ -218,19 +218,4 @@ export function isOrtVersionCompatible(version: string): boolean {
   if (!Number.isFinite(major) || !Number.isFinite(minor)) return false;
   if (major !== REQUIRED_ORT_MAJOR) return false;
   return minor >= REQUIRED_ORT_MIN_MINOR;
-}
-
-/** File-stat helper so callers can report age/size of the ONNX dir. */
-export function inspectPathStats(path: string): {
-  exists: boolean;
-  isDir: boolean;
-  isFile: boolean;
-} {
-  if (!existsSync(path)) return { exists: false, isDir: false, isFile: false };
-  try {
-    const st = statSync(path);
-    return { exists: true, isDir: st.isDirectory(), isFile: st.isFile() };
-  } catch {
-    return { exists: false, isDir: false, isFile: false };
-  }
 }

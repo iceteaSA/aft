@@ -3,7 +3,6 @@ import {
   markAnnouncementSeen,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
-import { formatConfigParseFailureMessage } from "./config.js";
 import { log, sessionLog } from "./logger.js";
 
 const WARNING_MARKER = "🔧 AFT: ⚠️";
@@ -188,19 +187,6 @@ export async function deliverConfigureWarnings(
     if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) continue;
 
     await recordWarning(opts.bridge, key);
-  }
-}
-
-export function notifyConfigParseFailures(
-  client: unknown,
-  sessionId: string,
-  errors: readonly { path: string; message: string }[],
-): void {
-  for (const entry of errors) {
-    const text = `${WARNING_MARKER} ${formatConfigParseFailureMessage(entry.path, entry.message)}`;
-    if (!sendIgnoredMessage(client, sessionId, text)) {
-      sessionLog(sessionId, `[aft-pi] ${text}`);
-    }
   }
 }
 

@@ -22,15 +22,6 @@
 export type Platform = "darwin" | "linux" | "win32";
 export type Arch = "x64" | "arm64";
 
-/**
- * Asset name template — receives platform/arch (already mapped to the
- * project's naming convention) and the resolved version, returns the
- * literal asset filename to look for in the release `assets[]`.
- *
- * Returns `null` when this platform/arch combo is unsupported.
- */
-export type AssetTemplate = (platform: Platform, arch: Arch, version: string) => string | null;
-
 export type ArchiveType = "tar.gz" | "tar.xz" | "zip";
 
 export interface GithubServerSpec {

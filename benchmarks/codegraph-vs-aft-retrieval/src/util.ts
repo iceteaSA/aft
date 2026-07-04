@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -82,38 +82,4 @@ export async function ensureGitTarget(
   if (reset.exitCode !== 0) throw new Error(`git reset failed: ${reset.stderr || reset.stdout}`);
   await runCommand(["git", "clean", "-fdx"], repoPath, 2 * 60_000);
   return repoPath;
-}
-
-export function listFiles(root: string, limit = 5): string[] {
-  const out: string[] = [];
-  const ignored = new Set([".git", "node_modules", "target", ".codegraph", ".bench", "results"]);
-  function walk(dir: string): void {
-    if (out.length >= limit) return;
-    let entries: string[];
-    try {
-      entries = readdirSync(dir).sort();
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (ignored.has(entry)) continue;
-      const path = resolve(dir, entry);
-      let stat: ReturnType<typeof statSync>;
-      try {
-        stat = statSync(path);
-      } catch {
-        continue;
-      }
-      if (stat.isDirectory()) walk(path);
-      else if (stat.isFile()) out.push(relative(root, path).replace(/\\/g, "/"));
-      if (out.length >= limit) return;
-    }
-  }
-  walk(root);
-  return out;
-}
-
-export function resetDir(path: string): void {
-  rmSync(path, { recursive: true, force: true });
-  mkdirSync(path, { recursive: true });
 }

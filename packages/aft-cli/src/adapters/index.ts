@@ -17,20 +17,6 @@ export function getAdapter(kind: HarnessKind): HarnessAdapter {
   return found;
 }
 
-/** Adapters whose host binary is on PATH. Order: installed first, then rest. */
-export function getAdaptersPreferInstalled(): HarnessAdapter[] {
-  return [...ALL].sort((a, b) => {
-    const aa = a.isInstalled() ? 0 : 1;
-    const bb = b.isInstalled() ? 0 : 1;
-    return aa - bb;
-  });
-}
-
-/** Adapters that have AFT registered (either via plugin entry or `pi install`). */
-export function getAdaptersWithPluginRegistered(): HarnessAdapter[] {
-  return ALL.filter((a) => a.hasPluginEntry());
-}
-
 /** Adapters whose host is installed, regardless of whether AFT is registered. */
 export function getInstalledAdapters(): HarnessAdapter[] {
   return ALL.filter((a) => a.isInstalled());

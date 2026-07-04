@@ -8,7 +8,6 @@
  * Use cases:
  *   - Feature announcements (new version, new experimental features)
  *   - Warnings (ONNX Runtime not found, stale binary)
- *   - Status updates (semantic search ready, index built)
  *
  * Messages are identified by markers and cleaned up on subsequent startups
  * when no longer relevant (Desktop only — TUI toasts are inherently transient).
@@ -72,9 +71,6 @@ const FEATURE_MARKER = `${AFT_MARKER} New in`;
 
 /** Marker for warnings (ONNX missing, etc.) */
 const WARNING_MARKER = `${AFT_MARKER} ⚠️`;
-
-/** Marker for transient status updates */
-const STATUS_MARKER = `${AFT_MARKER} ✅`;
 
 // --- Desktop state file resolution ---
 
@@ -211,11 +207,10 @@ function getServerAuth(): string | undefined {
   return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
 }
 
-// Both call sites of `getSessionMessages` (the status cleanup path in
-// `sendStatus` and the warning cleanup path in `cleanupWarnings`) scan from
-// the END of the array and break on the first non-AFT user message. They
-// only need a handful of recent messages, so 50 is plenty — typical AFT
-// status/warning chains are 1-5 consecutive messages at the tail.
+// The warning cleanup path scans from the END of the array and breaks on the
+// first non-AFT user message. It only needs a handful of recent messages, so
+// 50 is plenty — typical AFT warning chains are 1-5 consecutive messages at
+// the tail.
 //
 // Bounding is required: without `query.limit`, OpenCode's legacy
 // `/session/{id}/message` endpoint hydrates the ENTIRE session. Sessions
@@ -225,14 +220,14 @@ function getServerAuth(): string | undefined {
 // `client.v2.session.messages` with projected shapes, prefer that with
 // `{ limit: 50, order: "desc" }` — but note v2's projected message shape
 // strips `parts[]`, which the cleanup logic below relies on for marker
-// detection. So v2 may not be drop-in for THIS caller; we'd need v2 to
+// detection. So v2 may not be drop-in for this caller; we would need v2 to
 // expose part content or accept legacy as the only path here.
 export const SESSION_MESSAGES_LIMIT = 50;
 
 /**
  * @internal — exported only so tests can pin the bounded-call contract.
- * Production callers go through `sendStatus` / `cleanupWarnings`, both of
- * which gate on a real `readDesktopState()` before reaching this helper.
+ * Production callers go through `cleanupWarnings`, which gates on a real
+ * `readDesktopState()` before reaching this helper.
  */
 export async function getSessionMessages(
   client: unknown,
@@ -281,7 +276,7 @@ async function sendIgnoredMessage(
     // session's active model/agent for the NEXT real turn.
     //
     // Pin agent AND model/variant from the previous assistant turn for
-    // announcements/status (issue #62). Configure warnings pass
+    // announcements/warnings so the next real turn keeps the previous
     // `{ includeAgent: false }` to skip all context pinning and avoid
     // ModelSwitched / AgentSwitched on the first tool turn.
     const body: Record<string, unknown> = {
@@ -428,56 +423,6 @@ export async function sendWarning(opts: NotificationOptions, message: string): P
   await flushPendingDesktopNotifications(opts, sessionId);
   sessionLog(sessionId, `[aft-plugin] sending warning to session ${sessionId}`);
   await sendIgnoredMessage(opts.client, sessionId, text);
-}
-
-/**
- * Send a transient status notification.
- * Desktop: ignored message when sessionId is explicit, auto-deletes after 3 seconds.
- * TUI: toast with success variant, auto-dismissed by the TUI.
- */
-export async function sendStatus(opts: NotificationOptions, message: string): Promise<void> {
-  if (isTuiMode()) {
-    await showTuiToast(opts.client, "AFT", message, "success", 3000);
-    return;
-  }
-
-  const sessionId = getExplicitSessionId(opts);
-  if (!sessionId) return;
-
-  await flushPendingDesktopNotifications(opts, sessionId);
-  const text = `${STATUS_MARKER} ${message}`;
-  await sendIgnoredMessage(opts.client, sessionId, text);
-
-  // Auto-delete after 3 seconds
-  const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
-  if (!effectiveServerUrl) return;
-
-  setTimeout(async () => {
-    try {
-      const msgs = await getSessionMessages(opts.client, sessionId);
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const msg = msgs[i];
-        const msgId = msg.info?.id;
-        if (!msgId || msg.info?.role !== "user") break;
-        const isOurs =
-          msg.parts?.length &&
-          msg.parts.every(
-            (p) =>
-              p.ignored === true &&
-              p.type === "text" &&
-              typeof p.text === "string" &&
-              p.text.startsWith(STATUS_MARKER),
-          );
-        if (isOurs) {
-          await deleteMessage(effectiveServerUrl, sessionId, msgId);
-        } else {
-          break;
-        }
-      }
-    } catch {
-      // best-effort
-    }
-  }, 3000);
 }
 
 /**

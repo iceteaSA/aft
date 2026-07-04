@@ -88,10 +88,6 @@ const LspServerEntrySchema = z.object({
   initialization_options: z.unknown().optional(),
 });
 
-export const LspServerSchema = LspServerEntrySchema.extend({
-  id: z.string().trim().min(1),
-});
-
 const LspConfigSchema = z.object({
   servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
   disabled: z.array(z.string().trim().min(1)).optional(),
@@ -369,8 +365,6 @@ export const AftConfigSchema = z
   .strict();
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
-
-export type LspServerConfig = z.infer<typeof LspServerSchema>;
 
 export interface ConfigureLspServer {
   id: string;
@@ -995,11 +989,6 @@ let configLoadErrors: ConfigLoadError[] = [];
 /** Errors from the most recent {@link loadAftConfig} call (parse failures only). */
 export function getConfigLoadErrors(): readonly ConfigLoadError[] {
   return configLoadErrors;
-}
-
-/** @internal Test-only reset. */
-export function __resetConfigLoadErrorsForTests(): void {
-  configLoadErrors = [];
 }
 
 export function formatConfigParseFailureMessage(configPath: string, errorMessage: string): string {

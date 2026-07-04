@@ -51,7 +51,3 @@ export interface PluginEntryInfo {
   pinnedVersion: string | null;
   configPath: string;
 }
-
-export type NpmPackageEnvelope = z.infer<typeof NpmPackageEnvelopeSchema>;
-export type OpencodeConfig = z.infer<typeof OpencodeConfigSchema>;
-export type PackageJson = z.infer<typeof PackageJsonSchema>;

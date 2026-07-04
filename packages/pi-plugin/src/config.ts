@@ -397,10 +397,6 @@ const LspServerEntrySchema = z.object({
   initialization_options: z.unknown().optional(),
 });
 
-export const LspServerSchema = LspServerEntrySchema.extend({
-  id: z.string().trim().min(1),
-});
-
 const LspConfigSchema = z.object({
   servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
   disabled: z.array(z.string().trim().min(1)).optional(),
@@ -916,10 +912,6 @@ let configLoadErrors: ConfigLoadError[] = [];
 
 export function getConfigLoadErrors(): readonly ConfigLoadError[] {
   return configLoadErrors;
-}
-
-export function __resetConfigLoadErrorsForTests(): void {
-  configLoadErrors = [];
 }
 
 export function formatConfigParseFailureMessage(configPath: string, errorMessage: string): string {

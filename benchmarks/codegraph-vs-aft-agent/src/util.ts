@@ -4,8 +4,6 @@ import { fileURLToPath } from "node:url";
 
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 export const HARNESS_DIR = resolve(SRC_DIR, "..");
-export const REPO_ROOT = resolve(HARNESS_DIR, "../..");
-
 export function resetDir(path: string): void {
   rmSync(path, { recursive: true, force: true });
   mkdirSync(path, { recursive: true });

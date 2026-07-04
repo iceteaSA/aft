@@ -27,11 +27,7 @@ import type {
 import { canonicalizeProjectRoot, timeoutForCommand } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
-import {
-  getSessionDirectory,
-  getSessionDirectoryCached,
-  warmSessionDirectory,
-} from "../shared/session-directory.js";
+import { getSessionDirectory, getSessionDirectoryCached } from "../shared/session-directory.js";
 import { markBridgeEnd, markBridgeStart } from "../tool-perf.js";
 import type { PluginContext } from "../types.js";
 
@@ -321,14 +317,4 @@ export async function callBashBridge(
     ...options,
     keepBridgeOnTimeout: true,
   });
-}
-
-/**
- * Eagerly warm the session-directory cache for a runtime. Safe to call from
- * synchronous code — the lookup runs in the background and failures are
- * logged. Useful in plugin lifecycle hooks (`chat.message`, etc.) where we
- * want the cache filled before any tool call arrives.
- */
-export function warmSessionDirectoryFromRuntime(ctx: PluginContext, runtime: ToolRuntime): void {
-  warmSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);
 }

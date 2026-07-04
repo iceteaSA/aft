@@ -10,7 +10,6 @@ use ast_grep_core::matcher::PatternError;
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
 use ast_grep_core::Pattern;
 
-use crate::parser::LangId;
 
 /// Supported languages for AST pattern matching via ast-grep.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,39 +90,6 @@ impl LanguageExt for PhpPatternLang {
 }
 
 impl AstGrepLang {
-    /// Convert from the crate's `LangId` enum.
-    pub fn from_lang_id(lang_id: &LangId) -> Option<Self> {
-        match lang_id {
-            LangId::TypeScript => Some(Self::TypeScript),
-            LangId::Tsx => Some(Self::Tsx),
-            LangId::JavaScript => Some(Self::JavaScript),
-            LangId::Python => Some(Self::Python),
-            LangId::Rust => Some(Self::Rust),
-            LangId::Go => Some(Self::Go),
-            LangId::C => Some(Self::C),
-            LangId::Cpp => Some(Self::Cpp),
-            LangId::Zig => Some(Self::Zig),
-            LangId::CSharp => Some(Self::CSharp),
-            LangId::Solidity => Some(Self::Solidity),
-            LangId::Scss => Some(Self::Scss),
-            LangId::Vue => Some(Self::Vue),
-            LangId::Json => Some(Self::Json),
-            LangId::Java => Some(Self::Java),
-            LangId::Ruby => Some(Self::Ruby),
-            LangId::Kotlin => Some(Self::Kotlin),
-            LangId::Swift => Some(Self::Swift),
-            LangId::Php => Some(Self::Php),
-            LangId::Lua => Some(Self::Lua),
-            LangId::Perl => Some(Self::Perl),
-            LangId::Pascal => Some(Self::Pascal),
-            LangId::R => Some(Self::R),
-            LangId::ObjC => Some(Self::ObjC),
-            LangId::Scala => None,
-            LangId::Bash => None, // ast-grep doesn't support Bash
-            // Markdown, CSS, HTML etc. don't have meaningful AST patterns
-            _ => None,
-        }
-    }
 
     /// Parse from a string (case-insensitive).
     pub fn from_str(s: &str) -> Option<Self> {

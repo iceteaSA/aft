@@ -779,13 +779,6 @@ impl CallGraph {
         Ok(&self.data[&canon])
     }
 
-    /// Resolve a user-provided symbol query to the unique scoped symbol identity
-    /// used internally by the call graph.
-    pub fn resolve_symbol_query(&mut self, file: &Path, symbol: &str) -> Result<String, AftError> {
-        let canon = self.canonicalize(file)?;
-        let file_data = self.build_file(&canon)?;
-        resolve_symbol_query_in_data(file_data, &canon, symbol)
-    }
 
     /// Resolve a cross-file call edge.
     ///
@@ -3411,14 +3404,6 @@ function helperB() {}
             "B::run calls should not be overwritten"
         );
 
-        assert!(matches!(
-            graph.resolve_symbol_query(&path, "run"),
-            Err(AftError::AmbiguousSymbol { .. })
-        ));
-        assert_eq!(
-            graph.resolve_symbol_query(&path, "A::run").unwrap(),
-            "A::run"
-        );
     }
 
     // --- extract_parameters ---

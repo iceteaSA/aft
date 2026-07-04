@@ -423,18 +423,6 @@ export async function discoverOutlineFiles(directory: string, maxFiles = 200): P
   return files;
 }
 
-export function fileResultBySuffix(
-  response: Record<string, unknown>,
-  suffix: string,
-): Record<string, unknown> {
-  const files = response.files as Array<Record<string, unknown>> | undefined;
-  const match = files?.find((entry) => String(entry.file).endsWith(suffix));
-  if (!match) {
-    throw new Error(`Missing file result for suffix '${suffix}'`);
-  }
-  return match;
-}
-
 async function resolveAftBinaryPath(candidates: string[]): Promise<string | undefined> {
   for (const candidate of candidates) {
     if (await isExecutable(candidate)) {

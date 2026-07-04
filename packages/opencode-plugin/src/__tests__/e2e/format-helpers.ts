@@ -328,19 +328,6 @@ exit 1
 }
 
 /**
- * Helper: shim that always succeeds without modifying the file. Used to
- * verify the formatted=true path runs even when the formatter is a no-op.
- */
-export function noopFormatterShim(name = "biome"): FakeFormatterShim {
-  return {
-    name,
-    script: `#!/bin/sh
-exit 0
-`,
-  };
-}
-
-/**
  * Helper: shim that exits non-zero with an unrecognized error message —
  * used to verify the generic `error` skip reason still triggers when
  * stderr isn't a known exclusion fingerprint.

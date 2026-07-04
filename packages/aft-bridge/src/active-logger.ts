@@ -87,15 +87,3 @@ export function error(message: string, meta?: LogMeta): void {
     console.error(`[aft-bridge] ERROR: ${message}`);
   }
 }
-
-export function sessionLog(sessionId: string | undefined, message: string): void {
-  log(message, sessionId ? { sessionId } : undefined);
-}
-
-export function sessionWarn(sessionId: string | undefined, message: string): void {
-  warn(message, sessionId ? { sessionId } : undefined);
-}
-
-export function sessionError(sessionId: string | undefined, message: string): void {
-  error(message, sessionId ? { sessionId } : undefined);
-}

@@ -74,12 +74,6 @@ export function renderErrorResult(
   return text;
 }
 
-export function renderTextResult(textValue: string, context: RenderContextLike): Text {
-  const text = reuseText(context.lastComponent);
-  text.setText(textValue ? `\n${textValue}` : "");
-  return text;
-}
-
 export function renderSections(sections: string[], context: RenderContextLike): Container {
   const container = reuseContainer(context.lastComponent);
   container.clear();
@@ -113,20 +107,8 @@ export function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-export function asBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
 export function joinNonEmpty(parts: Array<string | undefined>, separator = " · "): string {
   return parts.filter((part): part is string => Boolean(part && part.length > 0)).join(separator);
-}
-
-export function indentBlock(text: string, spaces = 2): string {
-  const padding = " ".repeat(spaces);
-  return text
-    .split("\n")
-    .map((line) => `${padding}${line}`)
-    .join("\n");
 }
 
 export function formatValue(value: unknown): string {
@@ -153,10 +135,6 @@ export function groupByFile<T>(
     groups.set(file, current);
   });
   return groups;
-}
-
-export function distinctCount(values: Array<string | undefined>): number {
-  return new Set(values.filter((value): value is string => Boolean(value))).size;
 }
 
 export function severityBadge(theme: Theme, severity: string): string {
