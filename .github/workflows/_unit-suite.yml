@@ -71,6 +71,11 @@ jobs:
 
       - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
         run: ./scripts/rust-test-gate.sh
+        env:
+          # The checked-in profile reserves 2 cores for workstation headroom,
+          # which starves ~4-core CI runners. CI runners are otherwise idle,
+          # so use every core.
+          NEXTEST_TEST_THREADS: "num-cpus"
 
       - name: Bun typecheck
         run: bun run typecheck
@@ -143,6 +148,8 @@ jobs:
         run: ./scripts/rust-test-gate.sh
         env:
           AFT_TEST_DIAG: "1"
+          # See the Linux job: full core count on otherwise-idle CI runners.
+          NEXTEST_TEST_THREADS: "num-cpus"
 
       - name: Bun typecheck
         run: bun run typecheck
