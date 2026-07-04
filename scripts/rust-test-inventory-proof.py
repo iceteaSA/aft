@@ -63,7 +63,9 @@ def run_command(command: list[str]) -> str:
         stderr=subprocess.STDOUT,
         text=True,
         check=False,
-        env=os.environ.copy(),
+        # ANSI color wraps cargo's output and silently breaks the line parsers
+        # below when a CI environment exports CARGO_TERM_COLOR=always.
+        env={**os.environ, "CARGO_TERM_COLOR": "never"},
     )
     output = completed.stdout or ""
     filtered_output = "\n".join(
