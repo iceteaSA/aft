@@ -10,7 +10,7 @@
 - Use `packages/aft-bridge/src/transport-factory.ts` to instantiate either `BridgePool` (standalone NDJSON bridge, isolating one `aft` process per project root) or `SubcTransportPool` (daemon-backed transport) satisfying the shared `AftTransportPool` interface.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular, with `crates/aft/src/commands/tool_call.rs` acting as the single endpoint for tool invocation routing.
-- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
+- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/inspect/` (including codebase-health scanners and the `oxc_engine/` liveness solver), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
 
 ## Layers
 
@@ -38,7 +38,7 @@
 **Unified CLI layer:**
 - Purpose: Provide a single `npx @cortexkit/aft` entry point for setup, doctor, and LSP management across all harnesses.
 - Location: `packages/aft-cli/src/index.ts`, `packages/aft-cli/src/commands/`
-- Contains: `setup`, `doctor`, `doctor lsp`, `doctor --fix`, `doctor --clear`, `doctor --issue`; harness auto-detection (OpenCode/Pi) with `--harness` override
+- Contains: `setup`, `doctor`, `doctor lsp`, `doctor --fix`, `doctor --clear`, `doctor --issue`; harness auto-detection (OpenCode/Pi) with `--harness` override; inlines `packages/aft-bridge/` in CLI bundle via literal specifiers to prevent dynamic runtime module resolution errors under `npx`
 - Depends on: `packages/aft-bridge/`, harness adapter config paths
 - Used by: End users via `npx @cortexkit/aft`
 
@@ -65,15 +65,15 @@
 
 **Analysis and mutation engine layer:**
 - Purpose: Parse code, compute call graphs, apply edits, format files, manage imports, index code semantically, and search with trigram indexes.
-- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/callgraph_store/dead_code_projection.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`
-- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, semantic embedding index (covering Java, Kotlin, Scala, Swift, Ruby, PHP, Lua, Perl, R, Objective-C, and other supported languages), disk-backed trigram search index, disk-backed symbol cache, persisted SQLite callgraph store builder, AST-grep integration, patch parsing (Add, Delete, and Update hunks) and matching engine, vt100 terminal rendering for PTY screen snapshots
+- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/callgraph_store/dead_code_projection.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/inspect/` (including `oxc_engine/` and `scanners/`), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`
+- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, semantic embedding index (covering Java, Kotlin, Scala, Swift, Ruby, PHP, Lua, Perl, R, Objective-C, and other supported languages), disk-backed trigram search index, disk-backed symbol cache, persisted SQLite callgraph store builder, AST-grep integration, patch parsing (Add, Delete, and Update hunks) and matching engine, vt100 terminal rendering for PTY screen snapshots, codebase-health scanners, NestJS framework route and decorator spec entry point detection, same-file export liveness propagation, Go interface method liveness matching, and manifest-derived signal tiering for ranking/down-ranking findings (Product, Test, Tooling) and generated-file filtering
 - Depends on: tree-sitter grammars, ast-grep, vt100, external formatter and checker processes, ONNX Runtime (optional), fastembed / OpenAI-compatible / Ollama backends (optional)
 - Used by: `crates/aft/src/commands/*.rs`
 
 **State and diagnostics layer:**
 - Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
 - Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/response_finalize.rs`
-- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store (which tracks and masks watcher-stale diagnostics for caching and pull reuse), document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels, and main-loop pending responses registry
+- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), Windows verbatim path normalization via `canonicalize_normalized` to eliminate path comparison asymmetry, undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store (which tracks and masks watcher-stale diagnostics for caching and pull reuse), document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels, and main-loop pending responses registry
 - Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `db/` and `callgraph_store/`), `serde`
 - Used by: All command handlers through `AppContext`
 
@@ -91,9 +91,9 @@
 
 1. Validate path and verify symlink safety (recursively follow components up to 40 hops to reject escaping paths) -- `crates/aft/src/context.rs`
 2. Translate tool arguments to command parameters -- `crates/aft/src/subc_translate.rs`
-3. Check edit permissions -- `packages/opencode-plugin/src/tools/permissions.ts` (or Pi equivalents)
+3. Check edit permissions -- `packages/opencode-plugin/src/tools/permissions.ts` (or Pi equivalents). Under Pi, project-internal mutations apply without confirmation prompts, while external paths are validated by Rust path restrictions to avoid unanswered-prompt hangs.
 4. Snapshot, mutate, diff, and validate content -- `crates/aft/src/edit.rs`
-5. Auto-format and optionally collect diagnostics after write -- `crates/aft/src/format.rs`, `crates/aft/src/context.rs`
+5. Auto-format and optionally collect diagnostics after write -- `crates/aft/src/format.rs`, `crates/aft/src/context.rs`. By default, edits return immediately without waiting for LSP diagnostics; pass `diagnostics: true` to enable synchronous wait for diagnostics, or run `aft_inspect` (diagnostics category) to check them asynchronously.
 
 **Call-graph and navigation flow:**
 
@@ -193,6 +193,19 @@
 - Purpose: Persisted SQLite database of project-wide call dependencies.
 - Location: `crates/aft/src/callgraph_store/mod.rs`
 - Pattern: Background-built SQLite schema containing resolved and name-only call edges, refreshed incrementally on file edits, and queried by navigation commands. Returns a `Building` status during cold builds. Cold-build warming is deferred while a cold semantic index seed is actively collecting or embedding.
+
+**Oxc Liveness Engine:**
+- Purpose: Perform liveness and dead-code analysis for JavaScript/TypeScript and other supported files.
+- Location: `crates/aft/src/inspect/oxc_engine/`
+- Pattern: Build a liveness graph starting from resolved entry points. Features include:
+  - Framework-decorator roots: Seeding NestJS `@Controller` or `@Injectable` exports as live.
+  - Same-file value reference propagation: Keeping exported helpers live when they are referenced locally in the same file, even if the file is not reached from a global entry point.
+  - Language-specific dispatch rules: Keeping Go interface methods and receiver/interface dispatches live by matching method names to keep their bodies reachable.
+
+**ProjectRoles / SignalTier:**
+- Purpose: Rank inspect findings to prioritize actionable product code over tests, tooling, and generated artifacts.
+- Location: `crates/aft/src/inspect/entry_points.rs`, `crates/aft/src/inspect/generated.rs`
+- Pattern: Manifest-derived classification mapping files onto `Product`, `Test`, or `Tooling` tiers, combining with generated-file marker detection to sort high-signal findings first in `aft_inspect` summary previews and drill-downs.
 
 **CallGraph:**
 - Purpose: Cache per-file local call data and resolve immediate import edges.
