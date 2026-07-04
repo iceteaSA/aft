@@ -129,7 +129,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// changes dead/unused verdict roll-ups without changing per-file facts.
 /// v26: TS/JS per-file facts record exported-symbol decorators, and NestJS
 /// decorator roots change dead/unused verdict roll-ups.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 27;
+/// v28: Rust dead-code facts include function/type names found inside macro
+/// token trees. The aggregate scan uses those names for reachability only;
+/// call-graph navigation remains based on resolved source-level calls.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 28;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1801,6 +1804,12 @@ mod tests {
                 "internal_calls": [],
                 "liveness_roots": [],
                 "dispatched_method_names": ["render"],
+                "macro_token_refs": [{
+                    "caller_symbol": "render",
+                    "line": 1,
+                    "name": "Widget",
+                    "shape": "struct"
+                }],
                 "type_ref_names": ["Widget"],
             }),
         )
@@ -1827,12 +1836,16 @@ mod tests {
         assert_eq!(decoded.category, InspectCategory::DeadCode.as_str());
         assert_eq!(decoded.contribution["dispatched_method_names"][0], "render");
         assert_eq!(decoded.contribution["type_ref_names"][0], "Widget");
+        assert_eq!(
+            decoded.contribution["macro_token_refs"][0]["shape"],
+            "struct"
+        );
         assert!(decoded.type_ref_names.contains("Widget"));
         assert_eq!(
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 27);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 28);
     }
 
     #[test]

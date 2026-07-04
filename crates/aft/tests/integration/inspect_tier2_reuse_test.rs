@@ -1767,6 +1767,31 @@ testOnly();
     );
 
     assert_dead_code_incremental_matches_cold(
+        "rust_macro_token_refs_file_changed",
+        |root| {
+            write_file(
+                root,
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            );
+            write_file(root, "src/lib.rs", "mod ui;\n");
+            write_file(
+                root,
+                "src/ui.rs",
+                "#[no_mangle]\npub extern \"C\" fn render() { element! { Header { title() } } }\npub struct Header;\npub fn title() {}\npub fn dead() {}\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/ui.rs",
+                "#[no_mangle]\npub extern \"C\" fn render() { element! { Header { title() } } }\npub struct Header;\npub fn title() {}\npub fn dead() {}\npub fn added_dead() {}\n",
+            );
+        },
+        &["src/ui.rs"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
         "cross_file_type_ref_removed",
         |root| {
             write_file(
@@ -1956,6 +1981,63 @@ fn inspect_dead_code_twice_cold_is_deterministic() {
         aggregate_item_symbols(&cold_a),
         aggregate_item_symbols(&cold_b)
     );
+}
+
+#[test]
+fn inspect_dead_code_rust_macro_token_refs_twice_cold_is_deterministic() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("dead-code-rust-macro-twice-cold");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        root.as_path(),
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(root.as_path(), "src/lib.rs", "mod ui;\n");
+    write_file(
+        root.as_path(),
+        "src/ui.rs",
+        "#[no_mangle]\npub extern \"C\" fn render() { element! { Header { title() } } }\npub struct Header;\npub fn title() {}\npub fn dead() {}\n",
+    );
+
+    let inspect_a = temp_dir.path().join("rust-macro-cold-a/inspect");
+    rebuild_dead_code_callgraph_store(&root, &inspect_a);
+    let manager_a = InspectManager::new();
+    let (cold_a, _elapsed_a) = run_reuse_category(
+        &manager_a,
+        snapshot(&root, &inspect_a),
+        InspectCategory::DeadCode,
+    );
+
+    let inspect_b = temp_dir.path().join("rust-macro-cold-b/inspect");
+    rebuild_dead_code_callgraph_store(&root, &inspect_b);
+    let manager_b = InspectManager::new();
+    let (cold_b, _elapsed_b) = run_reuse_category(
+        &manager_b,
+        snapshot(&root, &inspect_b),
+        InspectCategory::DeadCode,
+    );
+
+    assert_eq!(cold_a.aggregate, cold_b.aggregate);
+    assert_eq!(
+        contribution_payloads(&root, &cold_a),
+        contribution_payloads(&root, &cold_b)
+    );
+    assert_eq!(
+        aggregate_item_symbols(&cold_a),
+        aggregate_item_symbols(&cold_b)
+    );
+    eprintln!(
+        "aggregate={}",
+        serde_json::to_string_pretty(&cold_a.aggregate).unwrap()
+    );
+    eprintln!(
+        "payloads={}",
+        serde_json::to_string_pretty(&contribution_payloads(&root, &cold_a)).unwrap()
+    );
+    assert!(!aggregate_contains_symbol(&cold_a, "src/ui.rs", "Header"));
+    assert!(!aggregate_contains_symbol(&cold_a, "src/ui.rs", "title"));
+    assert!(aggregate_contains_symbol(&cold_a, "src/ui.rs", "dead"));
 }
 
 #[test]

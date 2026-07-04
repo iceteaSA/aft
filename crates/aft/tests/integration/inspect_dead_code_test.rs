@@ -1354,7 +1354,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/app.ts".to_string(),
             json!({
                 "file": "src/app.ts",
-                "facts_format_version": 2,
+                "facts_format_version": 3,
                 "exports": [
                     {"symbol": "main", "kind": "function", "line": 2}
                 ],
@@ -1368,7 +1368,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/barrel.ts".to_string(),
             json!({
                 "file": "src/barrel.ts",
-                "facts_format_version": 2,
+                "facts_format_version": 3,
                 "exports": [
                     {"symbol": "Result", "kind": "re_export", "line": 1}
                 ],
@@ -1381,7 +1381,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/foo.rs".to_string(),
             json!({
                 "file": "src/foo.rs",
-                "facts_format_version": 2,
+                "facts_format_version": 3,
                 "exports": [
                     {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
                     {"symbol": "Dead", "kind": "struct", "line": 2, "is_type_like": true}
@@ -1392,13 +1392,16 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/lib.rs".to_string(),
             json!({
                 "file": "src/lib.rs",
-                "facts_format_version": 2,
+                "facts_format_version": 3,
                 "exports": [
                     {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
                     {"symbol": "use_foo", "kind": "function", "line": 3}
                 ],
                 "raw_reexports": [
                     {"language": "rust", "source": "foo", "kind": "named", "imported": "Foo", "exported": "Foo", "line": 1}
+                ],
+                "rust_imports": [
+                    {"source": "foo::Foo", "names": [], "default_import": null, "namespace_import": null}
                 ],
                 "type_ref_names": ["Foo"]
             }),
@@ -1407,7 +1410,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/service.ts".to_string(),
             json!({
                 "file": "src/service.ts",
-                "facts_format_version": 2,
+                "facts_format_version": 3,
                 "exports": [
                     {"symbol": "Service", "kind": "class", "line": 1},
                     {"symbol": "render", "kind": "method", "line": 1},
@@ -1462,7 +1465,7 @@ fn inspect_dead_code_contribution_shape_matches_contract() {
         contribution.contribution,
         json!({
             "file": "src/foo.ts",
-            "facts_format_version": 2,
+            "facts_format_version": 3,
             "exports": [
                 {"symbol": "Foo", "kind": "class", "line": 1},
                 {"symbol": "helper", "kind": "function", "line": 2}

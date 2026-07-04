@@ -29,7 +29,12 @@ use crate::parser::{detect_language, grammar_for, LangId};
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 2;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 3;
+const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
+const RUST_MACRO_REF_SHAPE_CALL: &str = "call";
+const RUST_MACRO_REF_SHAPE_METHOD: &str = "method";
+const RUST_MACRO_REF_SHAPE_STRUCT: &str = "struct";
+const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 
 type ExportNode = (String, String);
 type OutboundCallsByCallerFile<'a> = BTreeMap<PathBuf, Vec<&'a CallgraphOutboundCall>>;
@@ -44,9 +49,25 @@ struct ImportedExportLiveness {
 #[derive(Debug, Default)]
 struct FileAnalysis {
     raw_imports: Vec<RawImportContribution>,
+    rust_imports: Vec<RawImportContribution>,
     raw_reexports: Vec<RawReexportContribution>,
     attribute_entry_points: Vec<String>,
+    macro_token_refs: Vec<MacroTokenRefContribution>,
     type_ref_names: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RustMacroToken<'a> {
+    text: &'a str,
+    kind: &'a str,
+    line: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RustImportedSymbolSpec {
+    local_name: String,
+    module_segments: Vec<String>,
+    imported_name: String,
 }
 
 #[derive(Default)]
@@ -81,11 +102,13 @@ impl DeadCodeFileAnalyzer {
         let needs_ts_raw_facts = is_ts_js && !has_oxc_file;
         let needs_rust_reexports = matches!(lang, LangId::Rust);
         let needs_rust_attribute_entry_points = matches!(lang, LangId::Rust);
+        let needs_rust_macro_token_refs = matches!(lang, LangId::Rust);
 
         if !needs_type_refs
             && !needs_ts_raw_facts
             && !needs_rust_reexports
             && !needs_rust_attribute_entry_points
+            && !needs_rust_macro_token_refs
         {
             return FileAnalysis::default();
         }
@@ -93,7 +116,10 @@ impl DeadCodeFileAnalyzer {
         let Ok(source) = fs::read_to_string(file) else {
             return FileAnalysis::default();
         };
-        let needs_tree = needs_type_refs || needs_ts_raw_facts || needs_rust_attribute_entry_points;
+        let needs_tree = needs_type_refs
+            || needs_ts_raw_facts
+            || needs_rust_attribute_entry_points
+            || needs_rust_macro_token_refs;
         let tree = needs_tree
             .then(|| self.parse_source(lang, &source))
             .flatten();
@@ -109,6 +135,14 @@ impl DeadCodeFileAnalyzer {
         let raw_imports = if needs_ts_raw_facts {
             tree.as_ref()
                 .map(|tree| raw_imports_from_tree(&source, tree, lang))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let rust_imports = if needs_rust_macro_token_refs {
+            tree.as_ref()
+                .map(|tree| rust_raw_import_contributions(&source, tree))
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -141,10 +175,20 @@ impl DeadCodeFileAnalyzer {
             Vec::new()
         };
 
+        let macro_token_refs = if needs_rust_macro_token_refs {
+            tree.as_ref()
+                .map(|tree| rust_macro_token_refs(&source, tree.root_node()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         FileAnalysis {
             raw_imports,
+            rust_imports,
             raw_reexports,
             attribute_entry_points,
+            macro_token_refs,
             type_ref_names,
         }
     }
@@ -333,8 +377,10 @@ fn gather_file_contribution(
         });
     let FileAnalysis {
         raw_imports,
+        rust_imports,
         raw_reexports,
         attribute_entry_points,
+        macro_token_refs,
         type_ref_names,
     } = file_analyzer.analyze_file(file, oxc_facts.is_some());
 
@@ -366,6 +412,12 @@ fn gather_file_contribution(
     }
     if !raw_reexports.is_empty() {
         payload["raw_reexports"] = json!(raw_reexports);
+    }
+    if !rust_imports.is_empty() {
+        payload["rust_imports"] = json!(rust_imports);
+    }
+    if !macro_token_refs.is_empty() {
+        payload["macro_token_refs"] = json!(macro_token_refs);
     }
     if !attribute_entry_points.is_empty() {
         payload["attribute_entry_points"] = json!(attribute_entry_points);
@@ -577,6 +629,13 @@ fn materialize_dead_code_contributions(
                     &default_export_symbols_by_file,
                 ));
             }
+            internal_calls.extend(resolve_macro_token_liveness_edges(
+                project_root,
+                &contribution.file,
+                &contribution.macro_token_refs,
+                &contribution.rust_imports,
+                &exported_symbols_by_file,
+            ));
             sort_dedup_internal_calls(&mut internal_calls);
 
             let dispatched_method_names = outbound_calls_for_file
@@ -1267,6 +1326,426 @@ fn project_internal_call(
     })
 }
 
+fn resolve_macro_token_liveness_edges(
+    _project_root: &Path,
+    caller_file: &str,
+    refs: &[MacroTokenRefContribution],
+    rust_imports: &[RawImportContribution],
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<InternalCall> {
+    let mut calls = Vec::new();
+    for reference in refs {
+        let Some((file, symbol)) = resolve_macro_token_ref_target(
+            caller_file,
+            reference,
+            rust_imports,
+            exported_symbols_by_file,
+        ) else {
+            continue;
+        };
+        calls.push(InternalCall {
+            caller_symbol: reference.caller_symbol.clone(),
+            file,
+            symbol,
+            line: reference.line,
+            provenance: MACRO_TOKEN_LIVENESS_PROVENANCE.to_string(),
+        });
+    }
+    sort_dedup_internal_calls(&mut calls);
+    calls
+}
+
+fn resolve_macro_token_ref_target(
+    caller_file: &str,
+    reference: &MacroTokenRefContribution,
+    rust_imports: &[RawImportContribution],
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<ExportNode> {
+    let path = reference.path.as_deref().unwrap_or(&[]);
+    match reference.shape.as_str() {
+        RUST_MACRO_REF_SHAPE_CALL => resolve_macro_call_or_struct_ref(
+            caller_file,
+            path,
+            &reference.name,
+            rust_imports,
+            exported_symbols_by_file,
+        ),
+        RUST_MACRO_REF_SHAPE_STRUCT => resolve_macro_call_or_struct_ref(
+            caller_file,
+            path,
+            &reference.name,
+            rust_imports,
+            exported_symbols_by_file,
+        ),
+        RUST_MACRO_REF_SHAPE_METHOD => resolve_macro_method_ref(
+            caller_file,
+            path,
+            &reference.name,
+            rust_imports,
+            exported_symbols_by_file,
+        ),
+        _ => None,
+    }
+}
+
+fn resolve_macro_call_or_struct_ref(
+    caller_file: &str,
+    path: &[String],
+    name: &str,
+    rust_imports: &[RawImportContribution],
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<ExportNode> {
+    if path.is_empty() {
+        if let Some(target) = exported_symbol_target(caller_file, name, exported_symbols_by_file) {
+            return Some(target);
+        }
+        return unique_macro_target(imported_macro_targets_for_local(
+            caller_file,
+            name,
+            rust_imports,
+            exported_symbols_by_file,
+        ));
+    }
+
+    let scoped_symbol = macro_scoped_symbol(path, name);
+    if let Some(target) =
+        exported_symbol_target(caller_file, &scoped_symbol, exported_symbols_by_file)
+    {
+        return Some(target);
+    }
+
+    unique_macro_target(resolve_macro_module_targets(
+        caller_file,
+        path,
+        name,
+        rust_imports,
+        exported_symbols_by_file,
+    ))
+}
+
+fn resolve_macro_method_ref(
+    caller_file: &str,
+    path: &[String],
+    name: &str,
+    rust_imports: &[RawImportContribution],
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<ExportNode> {
+    let (type_name, module_path) = path.split_last()?;
+    let scoped_symbol = macro_scoped_symbol(path, name);
+    if let Some(target) =
+        exported_symbol_target(caller_file, &scoped_symbol, exported_symbols_by_file)
+    {
+        return Some(target);
+    }
+
+    let target_symbol = format!("{type_name}::{name}");
+    let mut targets = BTreeSet::new();
+    if module_path.is_empty() {
+        for (file, imported_type) in imported_macro_targets_for_local(
+            caller_file,
+            type_name,
+            rust_imports,
+            exported_symbols_by_file,
+        ) {
+            let imported_method = format!("{imported_type}::{name}");
+            if let Some(target) =
+                exported_symbol_target(&file, &imported_method, exported_symbols_by_file)
+            {
+                targets.insert(target);
+            }
+        }
+    } else {
+        targets.extend(resolve_macro_module_targets(
+            caller_file,
+            module_path,
+            &target_symbol,
+            rust_imports,
+            exported_symbols_by_file,
+        ));
+    }
+    unique_macro_target(targets)
+}
+
+fn resolve_macro_module_targets(
+    caller_file: &str,
+    module_path: &[String],
+    target_symbol: &str,
+    rust_imports: &[RawImportContribution],
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<ExportNode> {
+    let mut targets = BTreeSet::new();
+    for candidate in rust_macro_module_path_candidates(module_path, rust_imports) {
+        let segment_refs = candidate.iter().map(String::as_str).collect::<Vec<_>>();
+        let Some(resolved_segments) = rust_resolve_segments_for_macro(caller_file, &segment_refs)
+        else {
+            continue;
+        };
+        let Some(file) = rust_file_for_segments_from_contributions(
+            caller_file,
+            &resolved_segments,
+            exported_symbols_by_file,
+        ) else {
+            continue;
+        };
+        if let Some(target) = exported_symbol_target(&file, target_symbol, exported_symbols_by_file)
+        {
+            targets.insert(target);
+        }
+    }
+    targets
+}
+
+fn imported_macro_targets_for_local(
+    caller_file: &str,
+    local_name: &str,
+    rust_imports: &[RawImportContribution],
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<ExportNode> {
+    let mut targets = BTreeSet::new();
+    for import in rust_imports {
+        for imported in rust_imported_symbol_specs(import) {
+            if imported.local_name != local_name {
+                continue;
+            }
+            let segment_refs = imported
+                .module_segments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let Some(resolved_segments) =
+                rust_resolve_segments_for_macro(caller_file, &segment_refs)
+            else {
+                continue;
+            };
+            let Some(file) = rust_file_for_segments_from_contributions(
+                caller_file,
+                &resolved_segments,
+                exported_symbols_by_file,
+            ) else {
+                continue;
+            };
+            if let Some(target) =
+                exported_symbol_target(&file, &imported.imported_name, exported_symbols_by_file)
+            {
+                targets.insert(target);
+            }
+        }
+    }
+    targets
+}
+
+fn rust_macro_module_path_candidates(
+    path: &[String],
+    rust_imports: &[RawImportContribution],
+) -> Vec<Vec<String>> {
+    let mut candidates = Vec::new();
+    if let Some(first) = path.first() {
+        for import in rust_imports {
+            let Some((local_name, mut import_segments)) = rust_import_module_alias_segments(import)
+            else {
+                continue;
+            };
+            if &local_name == first {
+                import_segments.extend(path[1..].iter().cloned());
+                push_unique_macro_path_candidate(&mut candidates, import_segments);
+            }
+        }
+    }
+    push_unique_macro_path_candidate(&mut candidates, path.to_vec());
+    candidates
+}
+
+fn rust_import_module_alias_segments(
+    import: &RawImportContribution,
+) -> Option<(String, Vec<String>)> {
+    let path = import.source.trim().trim_end_matches(';').trim();
+    if path.contains("::{") || path.contains('{') || path.contains('*') {
+        return None;
+    }
+    let (path_without_alias, alias) = path
+        .split_once(" as ")
+        .map(|(left, right)| (left.trim(), Some(right.trim())))
+        .unwrap_or((path, None));
+    let segments = rust_path_segments(path_without_alias);
+    let local_name = alias.or_else(|| segments.last().map(String::as_str))?;
+    if rust_macro_name_is_upper_camel(local_name) {
+        return None;
+    }
+    Some((local_name.to_string(), segments))
+}
+
+fn rust_imported_symbol_specs(import: &RawImportContribution) -> Vec<RustImportedSymbolSpec> {
+    let path = import.source.trim().trim_end_matches(';').trim();
+    if let Some((prefix, rest)) = path.split_once("::{") {
+        let list = rest.trim_end_matches('}');
+        return list
+            .split(',')
+            .filter_map(|specifier| rust_imported_symbol_spec(prefix, specifier))
+            .collect();
+    }
+
+    rust_imported_symbol_spec("", path).into_iter().collect()
+}
+
+fn rust_imported_symbol_spec(prefix: &str, specifier: &str) -> Option<RustImportedSymbolSpec> {
+    let specifier = specifier.trim();
+    if specifier.is_empty() || specifier == "*" || specifier.contains('{') {
+        return None;
+    }
+    let (path_without_alias, alias) = specifier
+        .split_once(" as ")
+        .map(|(left, right)| (left.trim(), Some(right.trim())))
+        .unwrap_or((specifier, None));
+    let mut segments = rust_path_segments(path_without_alias);
+    let imported_name = segments.pop()?;
+    let local_name = alias.unwrap_or(imported_name.as_str()).trim();
+    if local_name.is_empty() || local_name == "_" {
+        return None;
+    }
+
+    let mut module_segments = rust_path_segments(prefix);
+    module_segments.extend(segments);
+    Some(RustImportedSymbolSpec {
+        local_name: local_name.to_string(),
+        module_segments,
+        imported_name,
+    })
+}
+
+fn rust_path_segments(path: &str) -> Vec<String> {
+    path.split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn push_unique_macro_path_candidate(candidates: &mut Vec<Vec<String>>, candidate: Vec<String>) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn rust_resolve_segments_for_macro(caller_file: &str, segments: &[&str]) -> Option<Vec<String>> {
+    if segments.is_empty() {
+        return Some(Vec::new());
+    }
+    let caller_segments = rust_module_segments_for_rel(caller_file);
+    match segments[0] {
+        "crate" => Some(
+            segments[1..]
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect(),
+        ),
+        "self" => {
+            let mut resolved = caller_segments;
+            resolved.extend(segments[1..].iter().map(|item| (*item).to_string()));
+            Some(resolved)
+        }
+        "super" => {
+            let mut resolved = caller_segments;
+            resolved.pop();
+            resolved.extend(segments[1..].iter().map(|item| (*item).to_string()));
+            Some(resolved)
+        }
+        _ => {
+            let mut resolved = caller_segments;
+            resolved.pop();
+            resolved.extend(segments.iter().map(|item| (*item).to_string()));
+            Some(resolved)
+        }
+    }
+}
+
+fn rust_file_for_segments_from_contributions(
+    caller_file: &str,
+    segments: &[String],
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<String> {
+    let src_prefix = rust_src_prefix_for_rel(caller_file);
+    if segments.is_empty() {
+        let lib = format!("{src_prefix}/lib.rs");
+        if exported_symbols_by_file.contains_key(&lib) {
+            return Some(lib);
+        }
+        let main = format!("{src_prefix}/main.rs");
+        if exported_symbols_by_file.contains_key(&main) {
+            return Some(main);
+        }
+    }
+
+    let candidate = if segments.is_empty() {
+        format!("{src_prefix}/lib.rs")
+    } else {
+        format!("{}/{}.rs", src_prefix, segments.join("/"))
+    };
+    if exported_symbols_by_file.contains_key(&candidate) {
+        return Some(candidate);
+    }
+    if !segments.is_empty() {
+        let mod_candidate = format!("{}/{}/mod.rs", src_prefix, segments.join("/"));
+        if exported_symbols_by_file.contains_key(&mod_candidate) {
+            return Some(mod_candidate);
+        }
+    }
+    None
+}
+
+fn rust_src_prefix_for_rel(rel_path: &str) -> String {
+    rel_path
+        .split_once("/src/")
+        .map(|(prefix, _)| format!("{prefix}/src"))
+        .unwrap_or_else(|| "src".to_string())
+}
+
+fn rust_module_segments_for_rel(rel_path: &str) -> Vec<String> {
+    let after_src = rel_path
+        .split_once("/src/")
+        .map(|(_, rest)| rest)
+        .or_else(|| rel_path.strip_prefix("src/"))
+        .unwrap_or(rel_path);
+    if matches!(after_src, "lib.rs" | "main.rs") {
+        return Vec::new();
+    }
+    if let Some(prefix) = after_src.strip_suffix("/mod.rs") {
+        return prefix.split('/').map(|item| item.to_string()).collect();
+    }
+    after_src
+        .strip_suffix(".rs")
+        .unwrap_or(after_src)
+        .split('/')
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn macro_scoped_symbol(path: &[String], name: &str) -> String {
+    if path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}::{name}", path.join("::"))
+    }
+}
+
+fn exported_symbol_target(
+    file: &str,
+    symbol: &str,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<ExportNode> {
+    exported_symbols_by_file
+        .get(file)
+        .is_some_and(|symbols| symbols.contains(symbol))
+        .then(|| (file.to_string(), symbol.to_string()))
+}
+
+fn unique_macro_target(targets: BTreeSet<ExportNode>) -> Option<ExportNode> {
+    if targets.len() == 1 {
+        targets.into_iter().next()
+    } else {
+        None
+    }
+}
+
 fn raw_imports_from_tree(
     source: &str,
     tree: &tree_sitter::Tree,
@@ -1282,6 +1761,344 @@ fn raw_imports_from_tree(
             namespace_import: import.namespace_import,
         })
         .collect()
+}
+
+fn rust_raw_import_contributions(
+    source: &str,
+    tree: &tree_sitter::Tree,
+) -> Vec<RawImportContribution> {
+    parse_imports(source, tree, LangId::Rust)
+        .imports
+        .into_iter()
+        .map(|import| RawImportContribution {
+            source: import.module_path,
+            names: import.names,
+            default_import: None,
+            namespace_import: None,
+        })
+        .collect()
+}
+
+fn rust_macro_token_refs(source: &str, root: tree_sitter::Node) -> Vec<MacroTokenRefContribution> {
+    let mut refs = BTreeSet::new();
+    let mut scope_stack = Vec::new();
+    collect_rust_macro_token_refs(source, root, &mut scope_stack, &mut refs);
+    refs.into_iter().collect()
+}
+
+fn collect_rust_macro_token_refs(
+    source: &str,
+    node: tree_sitter::Node,
+    scope_stack: &mut Vec<String>,
+    refs: &mut BTreeSet<MacroTokenRefContribution>,
+) {
+    let scope_len = scope_stack.len();
+    if node.kind() == "function_item" {
+        if let Some(symbol) = rust_function_symbol_name(source, &node) {
+            scope_stack.push(symbol);
+        }
+    }
+
+    if node.kind() == "macro_invocation" {
+        if let Some(token_tree) = find_child_by_kind(node, "token_tree") {
+            let caller_symbol = scope_stack
+                .last()
+                .cloned()
+                .unwrap_or_else(|| TOP_LEVEL_SYMBOL.to_string());
+            let mut tokens = Vec::new();
+            collect_rust_macro_tokens(source, token_tree, &mut tokens);
+            extract_rust_macro_token_refs(&tokens, &caller_symbol, refs);
+        }
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_rust_macro_token_refs(source, cursor.node(), scope_stack, refs);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    scope_stack.truncate(scope_len);
+}
+
+fn collect_rust_macro_tokens<'a>(
+    source: &'a str,
+    node: tree_sitter::Node,
+    tokens: &mut Vec<RustMacroToken<'a>>,
+) {
+    if rust_macro_token_node_is_opaque(node.kind()) {
+        return;
+    }
+
+    if node.child_count() == 0 {
+        let text = node_text(source, node).trim();
+        if !text.is_empty() {
+            tokens.push(RustMacroToken {
+                text,
+                kind: node.kind(),
+                line: node.start_position().row as u32 + 1,
+            });
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_rust_macro_tokens(source, cursor.node(), tokens);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn rust_macro_token_node_is_opaque(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_literal" | "raw_string_literal" | "char_literal" | "line_comment" | "block_comment"
+    )
+}
+
+fn extract_rust_macro_token_refs(
+    tokens: &[RustMacroToken<'_>],
+    caller_symbol: &str,
+    refs: &mut BTreeSet<MacroTokenRefContribution>,
+) {
+    for index in 0..tokens.len() {
+        let token = &tokens[index];
+        if !rust_macro_token_is_identifier(token) || rust_macro_token_is_keyword(token.text) {
+            continue;
+        }
+        if index > 0 && tokens[index - 1].text == "." {
+            continue;
+        }
+        if tokens.get(index + 1).is_some_and(|next| next.text == "!") {
+            continue;
+        }
+
+        let path = rust_macro_path_before(tokens, index);
+        let next = rust_macro_next_after_optional_turbofish(tokens, index + 1);
+        if tokens.get(next).is_some_and(|next| next.text == "(") {
+            let shape = if path
+                .last()
+                .is_some_and(|segment| rust_macro_name_is_upper_camel(segment))
+            {
+                RUST_MACRO_REF_SHAPE_METHOD
+            } else {
+                RUST_MACRO_REF_SHAPE_CALL
+            };
+            refs.insert(MacroTokenRefContribution {
+                caller_symbol: caller_symbol.to_string(),
+                line: token.line,
+                name: token.text.to_string(),
+                path: macro_ref_path(path),
+                shape: shape.to_string(),
+            });
+            continue;
+        }
+
+        if rust_macro_name_is_upper_camel(token.text)
+            && tokens.get(index + 1).is_some_and(|next| next.text == "{")
+        {
+            refs.insert(MacroTokenRefContribution {
+                caller_symbol: caller_symbol.to_string(),
+                line: token.line,
+                name: token.text.to_string(),
+                path: macro_ref_path(path),
+                shape: RUST_MACRO_REF_SHAPE_STRUCT.to_string(),
+            });
+        }
+    }
+}
+
+fn rust_macro_path_before(tokens: &[RustMacroToken<'_>], index: usize) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut cursor = index;
+    while cursor >= 2
+        && tokens[cursor - 1].text == "::"
+        && rust_macro_token_is_path_segment(&tokens[cursor - 2])
+    {
+        segments.push(tokens[cursor - 2].text.to_string());
+        cursor -= 2;
+    }
+    segments.reverse();
+    segments
+}
+
+fn rust_macro_next_after_optional_turbofish(tokens: &[RustMacroToken<'_>], index: usize) -> usize {
+    if tokens.get(index).is_none_or(|token| token.text != "::")
+        || tokens.get(index + 1).is_none_or(|token| token.text != "<")
+    {
+        return index;
+    }
+
+    let mut depth = 0usize;
+    let mut cursor = index + 1;
+    while let Some(token) = tokens.get(cursor) {
+        match token.text {
+            "<" => depth += 1,
+            ">" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return cursor + 1;
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    index
+}
+
+fn macro_ref_path(path: Vec<String>) -> Option<Vec<String>> {
+    (!path.is_empty()).then_some(path)
+}
+
+fn rust_macro_token_is_identifier(token: &RustMacroToken<'_>) -> bool {
+    matches!(token.kind, "identifier" | "type_identifier")
+        || rust_macro_text_is_identifier(token.text)
+}
+
+fn rust_macro_token_is_path_segment(token: &RustMacroToken<'_>) -> bool {
+    rust_macro_token_is_identifier(token)
+        && (!rust_macro_token_is_keyword(token.text)
+            || matches!(token.text, "crate" | "self" | "super"))
+}
+
+fn rust_macro_text_is_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn rust_macro_name_is_upper_camel(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+}
+
+fn rust_macro_token_is_keyword(text: &str) -> bool {
+    matches!(
+        text,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+    )
+}
+
+fn rust_function_symbol_name(
+    source: &str,
+    function_node: &tree_sitter::Node<'_>,
+) -> Option<String> {
+    let name_node = function_node.child_by_field_name("name")?;
+    let name = node_text(source, name_node).to_string();
+    let declaration_list_owner = rust_function_declaration_list_owner(function_node);
+
+    match declaration_list_owner.as_ref().map(tree_sitter::Node::kind) {
+        Some("impl_item") => {
+            let scope_name = rust_impl_scope_name(declaration_list_owner.as_ref().unwrap(), source);
+            if scope_name.is_empty() {
+                Some(name)
+            } else {
+                Some(format!("{scope_name}::{name}"))
+            }
+        }
+        Some(owner_kind) if owner_kind != "mod_item" => None,
+        _ => {
+            let scope_chain = rust_mod_scope_chain(function_node, source);
+            if scope_chain.is_empty() {
+                Some(name)
+            } else {
+                Some(format!("{}::{name}", scope_chain.join("::")))
+            }
+        }
+    }
+}
+
+fn rust_function_declaration_list_owner<'a>(
+    function_node: &tree_sitter::Node<'a>,
+) -> Option<tree_sitter::Node<'a>> {
+    function_node
+        .parent()
+        .filter(|parent| parent.kind() == "declaration_list")
+        .and_then(|parent| parent.parent())
+}
+
+fn rust_mod_scope_chain(node: &tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let mut scopes = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item" {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                scopes.push(node_text(source, name_node).to_string());
+            }
+        }
+        current = parent.parent();
+    }
+    scopes.reverse();
+    scopes
+}
+
+fn rust_impl_scope_name(impl_node: &tree_sitter::Node<'_>, source: &str) -> String {
+    let mut type_names: Vec<String> = Vec::new();
+    let mut child_cursor = impl_node.walk();
+    if child_cursor.goto_first_child() {
+        loop {
+            let child = child_cursor.node();
+            if child.kind() == "type_identifier" || child.kind() == "generic_type" {
+                type_names.push(node_text(source, child).to_string());
+            }
+            if !child_cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    if type_names.len() >= 2 {
+        format!("{} for {}", type_names[0], type_names[1])
+    } else if type_names.len() == 1 {
+        type_names[0].clone()
+    } else {
+        String::new()
+    }
 }
 
 fn ts_raw_reexport_contributions(
@@ -2371,6 +3188,10 @@ struct DeadCodeContribution {
     #[serde(default)]
     raw_reexports: Vec<RawReexportContribution>,
     #[serde(default)]
+    rust_imports: Vec<RawImportContribution>,
+    #[serde(default)]
+    macro_token_refs: Vec<MacroTokenRefContribution>,
+    #[serde(default)]
     attribute_entry_points: Vec<String>,
     #[serde(default)]
     oxc_facts: Option<OxcFactsContribution>,
@@ -2415,6 +3236,16 @@ struct RawReexportContribution {
     #[serde(default)]
     exported: Option<String>,
     line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct MacroTokenRefContribution {
+    caller_symbol: String,
+    line: u32,
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<Vec<String>>,
+    shape: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2613,6 +3444,25 @@ mod tests {
                 item.get("file").and_then(serde_json::Value::as_str) == Some(file)
                     && item.get("symbol").and_then(serde_json::Value::as_str) == Some(symbol)
             })
+    }
+
+    fn rust_entry_scan(
+        files: &[(&str, &str)],
+        exports: &[(&str, &str, &str)],
+    ) -> serde_json::Value {
+        let (_temp_dir, root, paths) = fixture_project(files);
+        let entry_points = [root.join("src/main.rs")]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let exports = exports
+            .iter()
+            .map(|(file, symbol, kind)| export(&root, file, symbol, kind))
+            .collect::<Vec<_>>();
+        scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, Vec::new(), entry_points),
+        ))
     }
 
     fn scan_success_with_oxc(job: InspectJob) -> InspectScanSuccess {
@@ -3213,6 +4063,141 @@ pub fn false_helper() -> String { "dead".to_string() }
             "false_command"
         ));
         assert!(aggregate_has_item(&aggregate, "src/db.rs", "false_helper"));
+    }
+
+    #[test]
+    fn rust_macro_token_liveness_rescues_bare_join_calls() {
+        let aggregate = rust_entry_scan(
+            &[(
+                "src/main.rs",
+                "fn main() { tokio::join!(fetch_a(), fetch_b()); }\nfn fetch_a() {}\nfn fetch_b() {}\nfn dead() {}\n",
+            )],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/main.rs", "fetch_a", "function"),
+                ("src/main.rs", "fetch_b", "function"),
+                ("src/main.rs", "dead", "function"),
+            ],
+        );
+
+        assert!(!aggregate_has_item(&aggregate, "src/main.rs", "fetch_a"));
+        assert!(!aggregate_has_item(&aggregate, "src/main.rs", "fetch_b"));
+        assert!(aggregate_has_item(&aggregate, "src/main.rs", "dead"));
+    }
+
+    #[test]
+    fn rust_macro_token_liveness_rescues_upper_camel_component_and_nested_call() {
+        let aggregate = rust_entry_scan(
+            &[(
+                "src/main.rs",
+                "fn main() { element! { Header { title() } } }\nstruct Header;\nfn title() {}\nfn dead() {}\n",
+            )],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/main.rs", "Header", "struct"),
+                ("src/main.rs", "title", "function"),
+                ("src/main.rs", "dead", "function"),
+            ],
+        );
+
+        assert!(!aggregate_has_item(&aggregate, "src/main.rs", "Header"));
+        assert!(!aggregate_has_item(&aggregate, "src/main.rs", "title"));
+        assert!(aggregate_has_item(&aggregate, "src/main.rs", "dead"));
+    }
+
+    #[test]
+    fn rust_macro_token_liveness_ignores_json_string_keys_but_keeps_values() {
+        let aggregate = rust_entry_scan(
+            &[(
+                "src/main.rs",
+                "fn main() { json!({\"dead_key\": compute_x()}); }\nfn compute_x() {}\nfn dead_key() {}\n",
+            )],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/main.rs", "compute_x", "function"),
+                ("src/main.rs", "dead_key", "function"),
+            ],
+        );
+
+        assert!(!aggregate_has_item(&aggregate, "src/main.rs", "compute_x"));
+        assert!(aggregate_has_item(&aggregate, "src/main.rs", "dead_key"));
+    }
+
+    #[test]
+    fn rust_macro_token_liveness_resolves_path_qualified_calls() {
+        let aggregate = rust_entry_scan(
+            &[
+                (
+                    "src/main.rs",
+                    "mod m;\nfn main() { wrapper!(m::helper()); }\n",
+                ),
+                ("src/m.rs", "pub fn helper() {}\npub fn dead() {}\n"),
+            ],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/m.rs", "helper", "function"),
+                ("src/m.rs", "dead", "function"),
+            ],
+        );
+
+        assert!(!aggregate_has_item(&aggregate, "src/m.rs", "helper"));
+        assert!(aggregate_has_item(&aggregate, "src/m.rs", "dead"));
+    }
+
+    #[test]
+    fn rust_macro_token_liveness_rescues_turbofish_calls() {
+        let aggregate = rust_entry_scan(
+            &[(
+                "src/main.rs",
+                "fn main() { wrapper!(parse::<T>()); }\nstruct T;\nfn parse<T>() {}\nfn dead() {}\n",
+            )],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/main.rs", "T", "struct"),
+                ("src/main.rs", "parse", "function"),
+                ("src/main.rs", "dead", "function"),
+            ],
+        );
+
+        assert!(!aggregate_has_item(&aggregate, "src/main.rs", "parse"));
+        assert!(aggregate_has_item(&aggregate, "src/main.rs", "dead"));
+    }
+
+    #[test]
+    fn rust_macro_token_liveness_does_not_rescue_receiver_methods_or_bare_idents() {
+        let aggregate = rust_entry_scan(
+            &[
+                (
+                    "src/main.rs",
+                    "mod other;\nfn main() { wrapper!(socket.recv(), recv); }\n",
+                ),
+                ("src/other.rs", "pub fn recv() {}\n"),
+            ],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/other.rs", "recv", "function"),
+            ],
+        );
+
+        assert!(aggregate_has_item(&aggregate, "src/other.rs", "recv"));
+    }
+
+    #[test]
+    fn rust_macro_token_liveness_inside_dead_caller_does_not_rescue_target() {
+        let aggregate = rust_entry_scan(
+            &[(
+                "src/main.rs",
+                "fn main() {}\nfn unreachable() { wrapper!(target()); }\nfn target() {}\n",
+            )],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/main.rs", "unreachable", "function"),
+                ("src/main.rs", "target", "function"),
+            ],
+        );
+
+        assert!(aggregate_has_item(&aggregate, "src/main.rs", "unreachable"));
+        assert!(aggregate_has_item(&aggregate, "src/main.rs", "target"));
     }
 
     #[test]
