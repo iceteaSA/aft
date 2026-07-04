@@ -222,108 +222,63 @@ export async function assertExternalDirectoryPermission(
   );
 }
 
-const ReadParams = Type.Union([
-  Type.Object({
-    path: Type.String({
+// OpenAI-compatible tool calling requires a root JSON Schema object.
+// TypeBox unions of object variants serialize to a bare root-level `anyOf`, so
+// keep these schemas flat and enforce the required primary/alias pair at
+// runtime. `coerceAliasedStringParam` preserves the declared-field precedence.
+const ReadParams = Type.Object({
+  path: Type.Optional(
+    Type.String({
       description: "Path to the file to read (absolute or relative to project root)",
     }),
-    filePath: Type.Optional(
-      Type.String({
-        description: "Compatibility alias for `path`. Used only when `path` is absent.",
-      }),
-    ),
-    offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
-    limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
-  }),
-  Type.Object({
-    path: Type.Optional(
-      Type.String({
-        description: "Path to the file to read (absolute or relative to project root)",
-      }),
-    ),
-    filePath: Type.String({
-      description: "Compatibility alias for `path`. Used only when `path` is absent.",
+  ),
+  filePath: Type.Optional(
+    Type.String({
+      description: "Alias for `path` — provide one of the two.",
     }),
-    offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
-    limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
-  }),
-]);
+  ),
+  offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
+});
 
-const WriteParams = Type.Union([
-  Type.Object({
-    filePath: Type.String({
+const WriteParams = Type.Object({
+  filePath: Type.Optional(
+    Type.String({
       description: "Path to the file to write (absolute or relative to project root)",
     }),
-    path: Type.Optional(
-      Type.String({
-        description: "Compatibility alias for `filePath`. Used only when `filePath` is absent.",
-      }),
-    ),
-    content: Type.String({ description: "Full file contents to write" }),
-  }),
-  Type.Object({
-    filePath: Type.Optional(
-      Type.String({
-        description: "Path to the file to write (absolute or relative to project root)",
-      }),
-    ),
-    path: Type.String({
-      description: "Compatibility alias for `filePath`. Used only when `filePath` is absent.",
+  ),
+  path: Type.Optional(
+    Type.String({
+      description: "Alias for `filePath` — provide one of the two.",
     }),
-    content: Type.String({ description: "Full file contents to write" }),
-  }),
-]);
+  ),
+  content: Type.String({ description: "Full file contents to write" }),
+});
 
-const EditParams = Type.Union([
-  Type.Object({
-    filePath: Type.String({
+const EditParams = Type.Object({
+  filePath: Type.Optional(
+    Type.String({
       description: "Path to the file to edit (absolute or relative to project root)",
     }),
-    path: Type.Optional(
-      Type.String({
-        description: "Compatibility alias for `filePath`. Used only when `filePath` is absent.",
-      }),
-    ),
-    oldString: Type.Optional(
-      Type.String({ description: "Text to find (exact match, fuzzy fallback)" }),
-    ),
-    newString: Type.Optional(
-      Type.String({ description: "Replacement text (omit to delete match)" }),
-    ),
-    replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence" })),
-    occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER),
-    appendContent: Type.Optional(
-      Type.String({
-        description:
-          "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
-      }),
-    ),
-  }),
-  Type.Object({
-    filePath: Type.Optional(
-      Type.String({
-        description: "Path to the file to edit (absolute or relative to project root)",
-      }),
-    ),
-    path: Type.String({
-      description: "Compatibility alias for `filePath`. Used only when `filePath` is absent.",
+  ),
+  path: Type.Optional(
+    Type.String({
+      description: "Alias for `filePath` — provide one of the two.",
     }),
-    oldString: Type.Optional(
-      Type.String({ description: "Text to find (exact match, fuzzy fallback)" }),
-    ),
-    newString: Type.Optional(
-      Type.String({ description: "Replacement text (omit to delete match)" }),
-    ),
-    replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence" })),
-    occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER),
-    appendContent: Type.Optional(
-      Type.String({
-        description:
-          "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
-      }),
-    ),
-  }),
-]);
+  ),
+  oldString: Type.Optional(
+    Type.String({ description: "Text to find (exact match, fuzzy fallback)" }),
+  ),
+  newString: Type.Optional(Type.String({ description: "Replacement text (omit to delete match)" })),
+  replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence" })),
+  occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER),
+  appendContent: Type.Optional(
+    Type.String({
+      description:
+        "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
+    }),
+  ),
+});
 
 const GrepParams = Type.Object({
   pattern: Type.String({ description: "Regex pattern to search for" }),
@@ -444,7 +399,7 @@ export function registerHoistedTools(
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const pathArg = readPathArg(params);
         if (typeof pathArg !== "string") {
-          throw new Error("read: missing required `path`");
+          throw new Error("read: missing required parameter `path`");
         }
         const offset = coerceOptionalInt(params.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
         const limit = coerceOptionalInt(params.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
@@ -517,7 +472,7 @@ export function registerHoistedTools(
       ) {
         const filePathArg = mutationFilePathArg(params);
         if (typeof filePathArg !== "string") {
-          throw new Error("write: missing required `filePath`");
+          throw new Error("write: missing required parameter `filePath`");
         }
         // Resolve ~ and relative paths before the permission check. Pass the
         // original filePath string in the request so the path the agent
@@ -569,7 +524,7 @@ export function registerHoistedTools(
       ) {
         const filePathArg = mutationFilePathArg(params);
         if (typeof filePathArg !== "string") {
-          throw new Error("edit: missing required `filePath`");
+          throw new Error("edit: missing required parameter `filePath`");
         }
         // Resolve ~ and relative paths before the permission check. Pass the
         // original filePath string in the request so the path the agent

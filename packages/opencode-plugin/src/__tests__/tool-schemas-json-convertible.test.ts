@@ -79,9 +79,21 @@ function collectAllTools(ctx: PluginContext): Record<string, ToolDefinition> {
   };
 }
 
+function expectRootObjectSchema(schema: unknown): void {
+  const record = schema as Record<string, unknown>;
+  expect(record.type).toBe("object");
+  expect(record.anyOf).toBeUndefined();
+  expect(record.oneOf).toBeUndefined();
+  expect(record.allOf).toBeUndefined();
+}
+
 describe("tool args MUST be JSON-Schema-convertible by host Zod", () => {
   const ctx = makeStubCtx();
   const allTools = collectAllTools(ctx);
+  const hoistedToolNames = new Set([
+    ...Object.keys(hoistedTools(ctx)),
+    ...Object.keys(aftPrefixedTools(ctx)),
+  ]);
   const entries = Object.entries(allTools);
 
   test(`registers at least 10 tools (sanity)`, () => {
@@ -101,6 +113,9 @@ describe("tool args MUST be JSON-Schema-convertible by host Zod", () => {
       // Sanity: conversion should produce an object schema.
       const schema = jsonSchema as Record<string, unknown>;
       expect(schema.type).toBe("object");
+      if (hoistedToolNames.has(toolName)) {
+        expectRootObjectSchema(schema);
+      }
     });
   }
 });

@@ -36,16 +36,17 @@ function schemaAccepts(schema: unknown, value: unknown): boolean {
   return Value.Check(schema as TSchema, value);
 }
 
-function schemaVariants(schema: unknown): Array<{ properties?: Record<string, unknown> }> {
-  const record = schema as {
-    properties?: Record<string, unknown>;
-    anyOf?: Array<{ properties?: Record<string, unknown> }>;
-  };
-  return record.anyOf ?? [record];
+function expectRootObjectSchema(schema: unknown): void {
+  const record = schema as Record<string, unknown>;
+  expect(record.type).toBe("object");
+  expect(record.anyOf).toBeUndefined();
+  expect(record.oneOf).toBeUndefined();
+  expect(record.allOf).toBeUndefined();
 }
 
 function schemaHasProperty(schema: unknown, property: string): boolean {
-  return schemaVariants(schema).some((variant) => variant.properties?.[property] !== undefined);
+  const record = schema as { properties?: Record<string, unknown> };
+  return record.properties?.[property] !== undefined;
 }
 
 afterEach(async () => {
@@ -53,6 +54,22 @@ afterEach(async () => {
 });
 
 describe("hoisted tool adapters", () => {
+  test("read/write/edit schemas stay plain root object schemas", () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({ success: true }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: true,
+      hoistWrite: true,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    expectRootObjectSchema(tools.get("read")!.parameters);
+    expectRootObjectSchema(tools.get("write")!.parameters);
+    expectRootObjectSchema(tools.get("edit")!.parameters);
+  });
+
   test("read maps offset/limit to inclusive start_line/end_line and appends footer", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge((_command, params) => ({
@@ -91,7 +108,7 @@ describe("hoisted tool adapters", () => {
     expect(unbounded.content[0].text).toContain("Showing lines 1-2 of 10");
   });
 
-  test("read accepts filePath as a compatibility alias without overriding path", async () => {
+  test("read accepts path or filePath, preserves path precedence, and errors clearly when both are absent", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
     registerHoistedTools(api, makePluginContext(bridge), {
@@ -113,8 +130,8 @@ describe("hoisted tool adapters", () => {
     await executeTool(readTool, { path: "canonical.ts", filePath: "alias.ts" });
     expect(toolArgs(calls[1])).toEqual({ filePath: "canonical.ts" });
 
-    expect(schemaAccepts(readTool.parameters, {})).toBe(false);
-    await expect(executeTool(readTool, {})).rejects.toThrow("missing required `path`");
+    expect(schemaAccepts(readTool.parameters, {})).toBe(true);
+    await expect(executeTool(readTool, {})).rejects.toThrow("missing required parameter `path`");
   });
 
   test("read emits image content for vision-capable Pi models", async () => {
@@ -302,11 +319,11 @@ describe("hoisted tool adapters", () => {
     });
 
     expect(schemaAccepts(editTool.parameters, { oldString: "before", newString: "after" })).toBe(
-      false,
+      true,
     );
     await expect(
       executeTool(editTool, { oldString: "before", newString: "after" }),
-    ).rejects.toThrow("missing required `filePath`");
+    ).rejects.toThrow("missing required parameter `filePath`");
   });
 
   test("edit defaults diagnostics off and omits LSP payload", async () => {
@@ -607,9 +624,9 @@ describe("hoisted tool adapters", () => {
     await executeTool(writeTool, { filePath: "canonical.ts", path: "alias.ts", content: "x" });
     expect(toolArgs(calls[1])).toEqual({ filePath: "canonical.ts", content: "x" });
 
-    expect(schemaAccepts(writeTool.parameters, { content: "x" })).toBe(false);
+    expect(schemaAccepts(writeTool.parameters, { content: "x" })).toBe(true);
     await expect(executeTool(writeTool, { content: "x" })).rejects.toThrow(
-      "missing required `filePath`",
+      "missing required parameter `filePath`",
     );
   });
 
