@@ -11,13 +11,35 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     mpsc::{self, Receiver, RecvTimeoutError},
-    Arc, Mutex,
+    Arc, Mutex, Once,
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+static DISABLE_IN_PROCESS_FILE_WATCHER: Once = Once::new();
+
+/// Disable the real OS watcher for any test that calls `handle_configure`
+/// in-process. Those tests do not need a live FSEvents stream, and under heavy
+/// macOS load `notify` can wedge forever while stopping an FSEvents watcher if
+/// `fseventsd` is saturated.
+///
+/// Safety: the integration-binary helpers call this before they invoke
+/// in-process `handle_configure`, so those code paths never install a real
+/// watcher. Child-process tests remain safe because `spawn_inner()` always sets
+/// `AFT_TEST_DISABLE_FILE_WATCHER` on the `Command`, and
+/// `spawn_with_real_watcher_env()` explicitly overrides it back to `"0"` for
+/// real-watcher children. We also verified that the `integration` binary has no
+/// test asserting real-watcher behavior in-process; those tests live in the
+/// `watcher_integration` binary or use spawned children.
+#[allow(unused_unsafe)]
+pub fn disable_in_process_file_watcher() {
+    DISABLE_IN_PROCESS_FILE_WATCHER.call_once(|| unsafe {
+        std::env::set_var("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+    });
+}
 
 enum StdoutEvent {
     Json(serde_json::Value),

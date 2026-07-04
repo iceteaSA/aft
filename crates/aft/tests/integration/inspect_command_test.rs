@@ -91,6 +91,7 @@ fn configured_context(root: &Path) -> AppContext {
 }
 
 fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -> AppContext {
+    crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -2673,6 +2674,7 @@ fn inspect_command_diagnostics_inapplicable_root_marker_reports_no_server_not_pe
             ..Config::default()
         },
     );
+    crate::helpers::disable_in_process_file_watcher();
     let configure = request(json!({
         "id": "configure",
         "command": "configure",

@@ -3,7 +3,8 @@
 // so some re-exports are unused in one or the other.
 #[allow(unused_imports)]
 pub use crate::test_helpers::{
-    cargo_manifest_dir, fixture_path, user_config, user_config_tier, AftProcess,
+    cargo_manifest_dir, disable_in_process_file_watcher, fixture_path, user_config,
+    user_config_tier, AftProcess,
 };
 
 pub fn json_string(value: &impl std::fmt::Display) -> String {

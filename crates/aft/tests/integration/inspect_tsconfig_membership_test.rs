@@ -49,6 +49,7 @@ fn request(payload: Value) -> RawRequest {
 }
 
 fn configured_context(root: &Path) -> AppContext {
+    crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
