@@ -60,23 +60,20 @@ def run_command(command: list[str]) -> str:
         command,
         cwd=ROOT,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        # Keep stderr SEPARATE: cargo writes compile progress ("Compiling ...",
+        # "Blocking waiting for file lock ...") to stderr, and merging it into
+        # the parsed stdout breaks the list parsers whenever a rebuild happens.
+        stderr=subprocess.PIPE,
         text=True,
         check=False,
         # ANSI color wraps cargo's output and silently breaks the line parsers
         # below when a CI environment exports CARGO_TERM_COLOR=always.
         env={**os.environ, "CARGO_TERM_COLOR": "never"},
     )
-    output = completed.stdout or ""
-    filtered_output = "\n".join(
-        line
-        for line in output.splitlines()
-        if not line.startswith("    Blocking waiting for file lock on package cache")
-    )
-    if output.endswith("\n"):
-        filtered_output += "\n"
+    filtered_output = completed.stdout or ""
     if completed.returncode != 0:
         sys.stderr.write(f"command failed ({completed.returncode}): {' '.join(command)}\n")
+        sys.stderr.write(completed.stderr or "")
         sys.stderr.write(filtered_output)
         sys.exit(completed.returncode)
     return filtered_output
