@@ -1,0 +1,29 @@
+# nextest only drives the integration-test slice of the Rust gate.
+# Unit and binary tests stay on libtest so they do not fan out into thousands of
+# short-lived processes.
+[profile.default]
+retries = 0
+fail-fast = true
+# nextest accepts negative integers relative to CPU count. Use "num-cpus - 2"
+# so two cores stay free for the fake LSP servers, shell subprocesses, and the
+# rest of the workstation while the integration suite fans out.
+test-threads = -2
+
+[test-groups]
+# These families are process-heavy enough to benefit from their own caps even
+# when the wider integration suite runs in parallel.
+lsp = { max-threads = 4 }
+bash = { max-threads = 4 }
+subc = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'binary(=lsp_registry_test) or binary(=lsp_transport_test) or test(/^lsp_/) or test(/^inspect_(diagnostics|tsconfig_membership)_test::/)'
+test-group = 'lsp'
+
+[[profile.default.overrides]]
+filter = 'test(/^bash_/) or test(/^subc_bridge_test::subc_bridge_bash_/)'
+test-group = 'bash'
+
+[[profile.default.overrides]]
+filter = 'test(/^subc_bridge_test::(subc_bridge_(bg_|callgraph_|configure_|core_|duplicate_|failed_|goodbye_|l3_|lossy_|mutating_|new_|principal_|pure_|reliable_|response_|routebind_|semantic_|session_|tool_|untrusted_|watcher_)|subc_rejects_)/)'
+test-group = 'subc'
