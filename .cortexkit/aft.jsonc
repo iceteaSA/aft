@@ -5,8 +5,11 @@
   "$schema": "https://raw.githubusercontent.com/cortexkit/aft/master/assets/aft.schema.json",
   "hoist_builtin_tools": true,
 
-  // Format files automatically after every aft_edit operation
-  "format_on_edit": true,
+  // Post-edit auto-format stays off: reformatting right after a patch makes
+  // the on-disk file drift from what the agent last read, so its next
+  // apply_patch context no longer matches (observed as every-patch failures).
+  // Formatting runs in the pre-commit/gate flow instead.
+  "format_on_edit": false,
 
   // Auto-validate after edits: "syntax" (tree-sitter) or "full" (runs type checker)
   "validate_on_edit": "syntax",
