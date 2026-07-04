@@ -44,6 +44,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@nextest
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -67,8 +69,8 @@ jobs:
       - name: Cargo build (debug — needed by plugin e2e tests)
         run: cargo build -p agent-file-tools
 
-      - name: Cargo test
-        run: cargo test --workspace
+      - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
+        run: ./scripts/rust-test-gate.sh
 
       - name: Bun typecheck
         run: bun run typecheck
@@ -100,12 +102,14 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-macos:
     name: Unit tests (macOS)
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
 
       # Intentionally NO Swatinem/rust-cache on macOS — rust-cache restore
       # on macos-latest overwrites the just-installed ~/.cargo/bin/cargo
@@ -135,8 +139,8 @@ jobs:
       - name: Cargo build (debug — needed by plugin e2e tests)
         run: cargo build -p agent-file-tools
 
-      - name: Cargo test
-        run: cargo test --workspace
+      - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
+        run: ./scripts/rust-test-gate.sh
         env:
           AFT_TEST_DIAG: "1"
 
@@ -172,6 +176,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@nextest
+
       # Compile-only gate that DENIES warnings. Catches cross-target warnings
       # (e.g. unix-`cfg` code unused on Windows) that the mac/Linux clippy gates
       # structurally cannot see, without running the flaky Windows test runtime.
@@ -182,11 +188,15 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
-      - name: Cargo test
-        run: cargo test --workspace
-        shell: pwsh
+      - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
+        # bash shell: the gate helper is a bash script; GitHub Windows runners
+        # ship git-bash. Thread cap of 4 because Windows runners are 2-core and
+        # process-spawn is expensive there — a wide nextest fan-out thrashes.
+        run: ./scripts/rust-test-gate.sh
+        shell: bash
         env:
           AFT_TEST_DIAG: "1"
+          NEXTEST_TEST_THREADS: "4"
 
   # ---------------------------------------------------------------------------
   # Bash permission flow on Windows

@@ -23,5 +23,16 @@
   },
 
   // Enable indexed search for grep and glob hoisting
-  "search_index": true
+  "search_index": true,
+
+  "inspect": {
+    "duplicates": {
+      // The OpenCode and Pi plugins are deliberate parity trees (same tool
+      // surface, two harness SDKs). Their mirrored files are architecture,
+      // not accidental duplication — keep them out of the headline count.
+      "expected_mirrors": [
+        ["packages/opencode-plugin/**", "packages/pi-plugin/**"]
+      ]
+    }
+  }
 }

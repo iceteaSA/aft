@@ -103,7 +103,7 @@ jobs:
 
   build-darwin-arm64:
     name: Build macOS ARM64
-    runs-on: macos-latest
+    runs-on: macos-26
     needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
@@ -137,7 +137,7 @@ jobs:
 
   build-darwin-x64:
     name: Build macOS x64
-    runs-on: macos-latest
+    runs-on: macos-26
     needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5

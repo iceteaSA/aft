@@ -213,8 +213,8 @@ if [ "${SKIP_RUST_TESTS:-}" = "1" ]; then
   echo "  (skipping local cargo tests — SKIP_RUST_TESTS=1)"
   echo "  ↳ CI still runs the full suite on its own runners before publishing."
 else
-  echo "  cargo test..."
-  cargo test --quiet 2>&1 || { echo "Error: Rust tests failed"; exit 1; }
+  echo "  rust test gate (unit on libtest, integration on nextest, watcher isolated)..."
+  ./scripts/rust-test-gate.sh 2>&1 || { echo "Error: Rust tests failed"; exit 1; }
 fi
 
 if [ "${SKIP_JS_TESTS:-}" = "1" ]; then
