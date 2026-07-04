@@ -9,6 +9,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
 use crate::config::Config;
+use crate::jsonc::strip_jsonc;
 
 use super::job::{
     contribution_with_type_ref_names, type_ref_names_from_contribution, FileContribution,
@@ -1312,117 +1313,6 @@ fn resolver_config_extends_targets(
 
 fn parse_resolver_config_json(source: &str) -> Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(source).or_else(|_| serde_json::from_str(&strip_jsonc(source)))
-}
-
-fn strip_jsonc(source: &str) -> String {
-    strip_trailing_commas(&strip_jsonc_comments(source))
-}
-
-fn strip_jsonc_comments(source: &str) -> String {
-    let mut output = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            output.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = true;
-            output.push(ch);
-            continue;
-        }
-
-        if ch == '/' {
-            match chars.peek().copied() {
-                Some('/') => {
-                    chars.next();
-                    for next in chars.by_ref() {
-                        if next == '\n' {
-                            output.push('\n');
-                            break;
-                        }
-                    }
-                }
-                Some('*') => {
-                    chars.next();
-                    let mut previous = '\0';
-                    for next in chars.by_ref() {
-                        if next == '\n' {
-                            output.push('\n');
-                        }
-                        if previous == '*' && next == '/' {
-                            break;
-                        }
-                        previous = next;
-                    }
-                }
-                _ => output.push(ch),
-            }
-            continue;
-        }
-
-        output.push(ch);
-    }
-
-    output
-}
-
-fn strip_trailing_commas(source: &str) -> String {
-    let chars = source.chars().collect::<Vec<_>>();
-    let mut output = String::with_capacity(source.len());
-    let mut index = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while index < chars.len() {
-        let ch = chars[index];
-        if in_string {
-            output.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = true;
-            output.push(ch);
-            index += 1;
-            continue;
-        }
-
-        if ch == ',' {
-            let mut next = index + 1;
-            while next < chars.len() && chars[next].is_whitespace() {
-                next += 1;
-            }
-            if next < chars.len() && matches!(chars[next], '}' | ']') {
-                index += 1;
-                continue;
-            }
-        }
-
-        output.push(ch);
-        index += 1;
-    }
-
-    output
 }
 
 fn collect_extends_specs<'a>(value: Option<&'a serde_json::Value>, specs: &mut Vec<&'a str>) {
