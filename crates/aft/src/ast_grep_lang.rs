@@ -10,7 +10,6 @@ use ast_grep_core::matcher::PatternError;
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
 use ast_grep_core::Pattern;
 
-
 /// Supported languages for AST pattern matching via ast-grep.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AstGrepLang {
@@ -90,7 +89,6 @@ impl LanguageExt for PhpPatternLang {
 }
 
 impl AstGrepLang {
-
     /// Parse from a string (case-insensitive).
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {

@@ -779,7 +779,6 @@ impl CallGraph {
         Ok(&self.data[&canon])
     }
 
-
     /// Resolve a cross-file call edge.
     ///
     /// Given a callee expression and the calling file's import block,
@@ -3403,7 +3402,6 @@ function helperB() {}
                 .any(|call| call.callee_name == "helperB"),
             "B::run calls should not be overwritten"
         );
-
     }
 
     // --- extract_parameters ---
