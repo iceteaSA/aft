@@ -1435,6 +1435,13 @@ fn init_git_repo(root: &Path) {
         assert!(
             Command::new("git")
                 .current_dir(root)
+                // Hermetic: ignore the machine's global/system git config. A
+                // user-level `core.fsmonitor = true` would spawn a daemon that
+                // drops a unix socket into `.git/`, which `copy_dir_all`
+                // cannot fs::copy; other global settings can skew fixtures
+                // the same way.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .args(args)
                 .status()
                 .unwrap()
@@ -1465,9 +1472,12 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         let target = dst.join(entry.file_name());
         if file_type.is_dir() {
             copy_dir_all(&entry.path(), &target)?;
-        } else {
+        } else if file_type.is_file() {
             fs::copy(entry.path(), target)?;
         }
+        // Sockets, fifos, and other special files (e.g. git's fsmonitor
+        // daemon socket) cannot be fs::copy'd and are irrelevant to the
+        // clone fixture.
     }
     Ok(())
 }
