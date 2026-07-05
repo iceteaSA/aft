@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, RwLock};
 
 use rusqlite::Connection;
@@ -17,33 +19,36 @@ const V2_FORMAT_VERSION: &str = "v2";
 const MAX_RESTORE_OPERATION_LOCK_RETRIES: usize = 32;
 
 #[cfg(test)]
-type RestoreBeforeLockHook = (String, Box<dyn FnMut(usize) -> bool + Send>);
+type RestoreBeforeLockHook = Box<dyn FnMut(usize) -> bool + Send>;
 
 #[cfg(test)]
-static RESTORE_BEFORE_LOCK_HOOK: Mutex<Option<RestoreBeforeLockHook>> = Mutex::new(None);
+static RESTORE_BEFORE_LOCK_HOOKS: LazyLock<Mutex<HashMap<String, RestoreBeforeLockHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 fn set_restore_before_lock_hook_for_tests(
     session: &str,
     hook: impl FnMut(usize) -> bool + Send + 'static,
 ) {
-    *RESTORE_BEFORE_LOCK_HOOK.lock().unwrap() = Some((session.to_string(), Box::new(hook)));
+    RESTORE_BEFORE_LOCK_HOOKS
+        .lock()
+        .unwrap()
+        .insert(session.to_string(), Box::new(hook));
 }
 
 #[cfg(test)]
 fn run_restore_before_lock_hook_for_tests(session: &str, attempt: usize) {
-    let mut hook_slot = RESTORE_BEFORE_LOCK_HOOK.lock().unwrap();
-    let Some((hook_session, mut hook)) = hook_slot.take() else {
+    let mut hooks = RESTORE_BEFORE_LOCK_HOOKS.lock().unwrap();
+    let Some(mut hook) = hooks.remove(session) else {
         return;
     };
-    if hook_session != session {
-        *hook_slot = Some((hook_session, hook));
-        return;
-    }
-    drop(hook_slot);
+    drop(hooks);
     let keep_hook = hook(attempt);
     if keep_hook {
-        *RESTORE_BEFORE_LOCK_HOOK.lock().unwrap() = Some((hook_session, hook));
+        RESTORE_BEFORE_LOCK_HOOKS
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), hook);
     }
 }
 
@@ -4549,6 +4554,42 @@ mod tests {
             *churn_count.lock().unwrap(),
             MAX_RESTORE_OPERATION_LOCK_RETRIES
         );
+    }
+
+    #[test]
+    fn restore_last_operation_test_hooks_are_isolated_per_session() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session_a = "restore-hook-session-a";
+        let session_b = "restore-hook-session-b";
+        let path_a = project.path().join("restore-hook-a.txt");
+        fs::write(&path_a, "v0").unwrap();
+
+        let mut store_a = BackupStore::new();
+        store_a.set_storage_dir(storage.path().to_path_buf(), 72);
+        store_a
+            .snapshot_with_op(session_a, &path_a, "old op", Some("op-old-a"))
+            .unwrap();
+        fs::write(&path_a, "v1").unwrap();
+
+        let hook_storage = storage.path().to_path_buf();
+        let hook_path_a = path_a.clone();
+        set_restore_before_lock_hook_for_tests(session_a, move |_| {
+            let mut hook_store = BackupStore::new();
+            hook_store.set_storage_dir(hook_storage.clone(), 72);
+            hook_store
+                .snapshot_with_op(session_a, &hook_path_a, "new op", Some("op-new-a"))
+                .unwrap();
+            fs::write(&hook_path_a, "v2").unwrap();
+            false
+        });
+        set_restore_before_lock_hook_for_tests(session_b, |_| false);
+
+        let restored = store_a.restore_last_operation(session_a).unwrap();
+
+        assert_eq!(restored.op_id, "op-new-a");
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), "v1");
+        run_restore_before_lock_hook_for_tests(session_b, 0);
     }
 
     #[test]
