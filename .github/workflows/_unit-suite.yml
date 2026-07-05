@@ -35,7 +35,10 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-linux:
     name: Unit tests (Linux)
-    runs-on: ubuntu-22.04
+    # 24.04 (glibc 2.39): the pinned subc-core-linux-x64 asset is built on a
+    # 2.39 host and exits at startup on 22.04's glibc 2.35. Revert to 22.04
+    # when SUBC cuts an asset with a lower floor (asked, subc-core-v0.1.1).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
