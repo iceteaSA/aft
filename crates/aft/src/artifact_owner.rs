@@ -358,6 +358,12 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
+    // PID 0 is the System Idle Process on Windows, so tasklist reports it as
+    // running; treat it as dead like the Unix path does (it can never be an
+    // AFT bridge).
+    if pid == 0 {
+        return false;
+    }
     let filter = format!("PID eq {pid}");
     let Ok(output) = std::process::Command::new("tasklist")
         .args(["/FI", &filter, "/FO", "CSV", "/NH"])
