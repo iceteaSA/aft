@@ -3217,7 +3217,7 @@ fn submit_maintenance_drain(
     let response_id = request_id.clone();
     let completion_root_id = root_id.clone();
     let (empty_bg_sessions_tx, empty_bg_sessions_rx) = oneshot::channel::<Vec<(String, u64)>>();
-    let rx = executor.submit_async(
+    let rx = executor.submit_maintenance_async(
         root_id,
         Lane::Mutating,
         request_id.clone(),
@@ -3629,6 +3629,28 @@ fn build_manifest() -> ModuleManifest {
     }
 }
 
+fn dispatch_liveness_metrics(executor: &Executor) -> Value {
+    match executor.try_dispatch_liveness_snapshot() {
+        Some(snapshot) => json!({
+            "interactive": {
+                "queued": snapshot.interactive.queued,
+                "oldest_age_ms": snapshot.interactive.oldest_age_ms,
+            },
+            "maintenance": {
+                "queued": snapshot.maintenance.queued,
+                "oldest_age_ms": snapshot.maintenance.oldest_age_ms,
+            },
+            "running": {
+                "interactive": snapshot.running.interactive,
+                "maintenance": snapshot.running.maintenance,
+            },
+            "interactive_reserve": snapshot.interactive_reserve,
+            "maintenance_cap": snapshot.maintenance_cap,
+        }),
+        None => json!({ "scheduler_busy": true }),
+    }
+}
+
 fn build_health_report(executor: &Executor) -> HealthReport {
     let mut roots: Vec<RootHealthSnapshot> = executor
         .actor_entries()
@@ -3655,6 +3677,7 @@ fn build_health_report(executor: &Executor) -> HealthReport {
             "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
             "root_count": roots.len(),
             "roots": roots,
+            "dispatch_liveness": dispatch_liveness_metrics(executor),
         })),
     }
 }
@@ -3688,6 +3711,85 @@ mod tests {
             .expect("temp root");
         let root = ProjectRootId::from_path(dir.path()).expect("project root id");
         (dir, root)
+    }
+
+    fn test_ctx() -> Arc<AppContext> {
+        Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        ))
+    }
+
+    #[test]
+    fn health_report_includes_nonblocking_dispatch_liveness_for_queued_interactive() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 2,
+            drr_quantum: 1,
+        });
+        let (_dir_a, root_a) = test_root("health-liveness-a");
+        let (_dir_b, root_b) = test_root("health-liveness-b");
+        let (_dir_c, root_c) = test_root("health-liveness-c");
+        executor.register_actor(root_a.clone(), test_ctx());
+        executor.register_actor(root_b.clone(), test_ctx());
+        executor.register_actor(root_c.clone(), test_ctx());
+
+        let (started_tx, started_rx) = crossbeam_channel::bounded(2);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(2);
+        let mut blockers = Vec::new();
+        for (index, root) in [root_a, root_b].into_iter().enumerate() {
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            blockers.push(executor.submit(
+                root,
+                Lane::PureRead,
+                format!("health-blocker-{index}"),
+                Box::new(move |_| {
+                    started_tx.send(index).expect("signal blocker start");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release blocker");
+                    Response::success(format!("blocker-{index}"), json!({ "ok": true }))
+                }),
+            ));
+        }
+        for _ in 0..2 {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocker starts");
+        }
+
+        let queued = executor.submit(
+            root_c,
+            Lane::PureRead,
+            "queued-interactive".to_string(),
+            Box::new(|_| Response::success("queued-interactive", json!({ "ok": true }))),
+        );
+        std::thread::sleep(Duration::from_millis(75));
+
+        let report = build_health_report(&executor);
+        let dispatch = report
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.get("dispatch_liveness"))
+            .expect("dispatch_liveness metric");
+        assert_eq!(dispatch.get("scheduler_busy"), None);
+        assert_eq!(dispatch["interactive"]["queued"].as_u64(), Some(1));
+        assert!(dispatch["interactive"]["oldest_age_ms"].as_u64().is_some());
+
+        for _ in 0..2 {
+            release_tx.send(()).expect("release blocker");
+        }
+        for blocker in blockers {
+            blocker
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocker completion response");
+        }
+        queued
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued completion response");
     }
 
     fn status_frame(seq: u64) -> PushFrame {

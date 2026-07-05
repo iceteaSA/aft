@@ -59,6 +59,13 @@ fn observe_max(max_seen: &AtomicUsize, value: usize) {
     }
 }
 
+fn recv_async(rx: tokio::sync::oneshot::Receiver<Response>) -> Response {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build current-thread runtime")
+        .block_on(async { rx.await.expect("async completion sender stays alive") })
+}
+
 #[test]
 fn actor_contexts_returns_registered_contexts() {
     let executor = test_executor(2, 1, 1, 2);
@@ -721,5 +728,206 @@ fn no_dispatch_of_nonrunnable() {
             .expect("randomized completion response");
     }
 
+    assert_eq!(executor.nonrunnable_dispatch_count(), 0);
+}
+
+#[test]
+fn maintenance_cap_preserves_reserved_workers_for_interactive() {
+    let executor = test_executor(4, 1, 1, 2);
+    assert_eq!(executor.interactive_reserve(), 2);
+    assert_eq!(executor.maintenance_cap(), 2);
+
+    let mut dirs = Vec::new();
+    let mut roots = Vec::new();
+    for index in 0..3 {
+        let (dir, root) = test_root(&format!("maintenance-reserve-{index}"));
+        executor.register_actor(root.clone(), test_ctx());
+        dirs.push(dir);
+        roots.push(root);
+    }
+
+    let (maintenance_started_tx, maintenance_started_rx) = crossbeam_channel::bounded(2);
+    let (release_maintenance_tx, release_maintenance_rx) = crossbeam_channel::bounded(2);
+    let mut maintenance = Vec::new();
+    for index in 0..executor.maintenance_cap() {
+        let started_tx = maintenance_started_tx.clone();
+        let release_rx = release_maintenance_rx.clone();
+        maintenance.push(executor.submit_maintenance_async(
+            roots[index].clone(),
+            Lane::Mutating,
+            format!("maintenance-{index}"),
+            Box::new(move |_| {
+                started_tx.send(index).expect("signal maintenance start");
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release maintenance blocker");
+                ok(format!("maintenance-{index}"))
+            }),
+        ));
+    }
+    for _ in 0..executor.maintenance_cap() {
+        maintenance_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance fills cap");
+    }
+
+    let (interactive_started_tx, interactive_started_rx) = crossbeam_channel::bounded(1);
+    let interactive = executor.submit(
+        roots[2].clone(),
+        Lane::PureRead,
+        "interactive".to_string(),
+        Box::new(move |_| {
+            interactive_started_tx
+                .send(())
+                .expect("signal interactive start");
+            ok("interactive")
+        }),
+    );
+
+    interactive_started_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("interactive starts while maintenance remains blocked");
+    interactive
+        .recv_timeout(Duration::from_secs(1))
+        .expect("interactive completion response");
+
+    for _ in 0..executor.maintenance_cap() {
+        release_maintenance_tx
+            .send(())
+            .expect("release maintenance blocker");
+    }
+    for rx in maintenance {
+        assert!(recv_async(rx).success);
+    }
+    assert_eq!(dirs.len(), 3);
+}
+
+#[test]
+fn newer_interactive_mutator_beats_older_same_actor_maintenance_mutator() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_block_dir, block_root) = test_root("same-root-priority-block");
+    let (_dir, root) = test_root("same-root-priority");
+    executor.register_actor(block_root.clone(), test_ctx());
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (block_started_tx, block_started_rx) = crossbeam_channel::bounded(1);
+    let (release_block_tx, release_block_rx) = crossbeam_channel::bounded(1);
+    let blocker = executor.submit_maintenance_async(
+        block_root,
+        Lane::Mutating,
+        "maintenance-blocker".to_string(),
+        Box::new(move |_| {
+            block_started_tx.send(()).expect("signal blocker start");
+            release_block_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release blocker");
+            ok("blocker")
+        }),
+    );
+    block_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("maintenance blocker starts");
+
+    let (maintenance_started_tx, maintenance_started_rx) = crossbeam_channel::bounded(1);
+    let maintenance = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::Mutating,
+        "older-maintenance".to_string(),
+        Box::new(move |_| {
+            maintenance_started_tx
+                .send(())
+                .expect("signal older maintenance start");
+            ok("older-maintenance")
+        }),
+    );
+    assert!(maintenance_started_rx
+        .recv_timeout(Duration::from_millis(75))
+        .is_err());
+
+    let (interactive_started_tx, interactive_started_rx) = crossbeam_channel::bounded(1);
+    let interactive = executor.submit(
+        root,
+        Lane::Mutating,
+        "newer-interactive".to_string(),
+        Box::new(move |_| {
+            interactive_started_tx
+                .send(())
+                .expect("signal newer interactive start");
+            ok("newer-interactive")
+        }),
+    );
+    interactive_started_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("newer interactive mutator starts before older maintenance");
+    assert!(maintenance_started_rx
+        .recv_timeout(Duration::from_millis(75))
+        .is_err());
+    interactive
+        .recv_timeout(Duration::from_secs(1))
+        .expect("interactive completion response");
+
+    release_block_tx.send(()).expect("release blocker");
+    assert!(recv_async(blocker).success);
+    maintenance_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("maintenance starts after cap frees");
+    assert!(recv_async(maintenance).success);
+}
+
+#[test]
+fn mutating_jobs_are_not_dispatched_to_park_on_epoch_write() {
+    let executor = test_executor(4, 1, 3, 2);
+    let (_dir, root) = test_root("mutator-admission");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(3);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(3);
+    let mut handles = Vec::new();
+    for index in 0..3 {
+        let started_tx = started_tx.clone();
+        let release_rx = release_rx.clone();
+        handles.push(executor.submit(
+            root.clone(),
+            Lane::Mutating,
+            format!("mutator-{index}"),
+            Box::new(move |_| {
+                started_tx.send(index).expect("signal mutator start");
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release mutator");
+                ok(format!("mutator-{index}"))
+            }),
+        ));
+    }
+
+    assert_eq!(
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first mutator starts"),
+        0
+    );
+    assert!(started_rx.recv_timeout(Duration::from_millis(75)).is_err());
+    let snapshot = executor
+        .try_dispatch_liveness_snapshot()
+        .expect("scheduler liveness snapshot");
+    assert_eq!(snapshot.running.interactive, 1);
+    assert_eq!(snapshot.interactive.queued, 2);
+
+    for expected in 1..3 {
+        release_tx.send(()).expect("release current mutator");
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("next mutator starts"),
+            expected
+        );
+        assert!(started_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+    release_tx.send(()).expect("release final mutator");
+    for handle in handles {
+        handle
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mutator completion response");
+    }
     assert_eq!(executor.nonrunnable_dispatch_count(), 0);
 }

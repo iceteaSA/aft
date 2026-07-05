@@ -25,6 +25,7 @@ use super::oxc_engine::{
 };
 use crate::cache_freshness::{self, FileFreshness};
 use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore, CallGraphStoreError};
+use crate::cold_build_limiter;
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -56,6 +57,7 @@ pub struct Tier2RunSubmissionError {
 pub struct Tier2RunSubmission {
     pub queued_categories: Vec<InspectCategory>,
     pub newly_queued_categories: Vec<InspectCategory>,
+    pub deferred_categories: Vec<InspectCategory>,
     pub errors: Vec<Tier2RunSubmissionError>,
 }
 
@@ -237,12 +239,19 @@ impl InspectManager {
         if in_flight.contains_key(&key) {
             return Ok(key);
         }
+        let Some(permit) = cold_build_limiter::try_acquire() else {
+            return Err(format!(
+                "cold build concurrency limit ({}) reached; retrying later",
+                cold_build_limiter::limit()
+            ));
+        };
         in_flight.insert(key.clone(), Vec::new());
         drop(in_flight);
 
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
         pool.spawn(move || {
+            let _permit = permit;
             let result = manager.tier2_run_with_reuse_job_result(job);
             manager.route_tier2_reuse_completion(result);
         });
@@ -308,10 +317,26 @@ impl InspectManager {
             return submission;
         }
 
+        let Some(permit) = cold_build_limiter::try_acquire() else {
+            let deferred = submission.newly_queued_categories.clone();
+            if let Ok(mut in_flight) = self.in_flight.lock() {
+                for category in &deferred {
+                    in_flight.remove(&JobKey::for_project_category(*category));
+                }
+            }
+            submission
+                .queued_categories
+                .retain(|category| !deferred.contains(category));
+            submission.deferred_categories = deferred;
+            submission.newly_queued_categories.clear();
+            return submission;
+        };
+
         let categories_for_worker = submission.newly_queued_categories.clone();
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
         pool.spawn(move || {
+            let _permit = permit;
             for category in categories_for_worker {
                 let result = manager.tier2_run_with_reuse_result(snapshot.clone(), category, None);
                 manager.route_tier2_reuse_completion(result);

@@ -132,6 +132,11 @@ impl Tier2RefreshScheduler {
         self.clear_activity_window();
     }
 
+    pub fn note_dispatch_deferred(&mut self) {
+        self.last_scan_started_at = None;
+        self.pull_demand_pending = true;
+    }
+
     pub fn last_trigger_reason(&self) -> Option<Tier2TriggerReason> {
         self.last_trigger_reason
     }

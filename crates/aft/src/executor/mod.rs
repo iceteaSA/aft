@@ -10,7 +10,7 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
@@ -39,6 +39,14 @@ pub enum Lane {
     /// Mutating work. Becomes a writer barrier at the actor queue head, drains
     /// in-flight reads, and runs under the actor epoch write gate.
     Mutating,
+}
+
+/// Scheduler class used to keep deferrable maintenance from occupying the
+/// workers reserved for interactive route binds, tool calls, and bash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobClass {
+    Interactive,
+    Maintenance,
 }
 
 pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>;
@@ -80,6 +88,8 @@ struct EffectiveConfig {
     heavy_permits: usize,
     drr_quantum: isize,
     deficit_cap: isize,
+    interactive_reserve: usize,
+    maintenance_cap: usize,
 }
 
 impl ExecutorConfig {
@@ -91,6 +101,8 @@ impl ExecutorConfig {
         let heavy_permits = self.heavy_permits.clamp(2, 3);
         let drr_quantum = self.drr_quantum.max(1);
         let deficit_cap = (actor_cap.max(1) as isize) * 4;
+        let interactive_reserve = if pool_size >= 4 { 2 } else { 1 };
+        let maintenance_cap = pool_size.saturating_sub(interactive_reserve).max(1);
 
         EffectiveConfig {
             pool_size,
@@ -99,6 +111,8 @@ impl ExecutorConfig {
             heavy_permits,
             drr_quantum,
             deficit_cap,
+            interactive_reserve,
+            maintenance_cap,
         }
     }
 }
@@ -121,6 +135,27 @@ impl CompletionHandle {
     pub fn into_receiver(self) -> Receiver<Response> {
         self.rx
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchClassQueueSnapshot {
+    pub queued: usize,
+    pub oldest_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchRunningSnapshot {
+    pub interactive: usize,
+    pub maintenance: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchLivenessSnapshot {
+    pub interactive: DispatchClassQueueSnapshot,
+    pub maintenance: DispatchClassQueueSnapshot,
+    pub running: DispatchRunningSnapshot,
+    pub interactive_reserve: usize,
+    pub maintenance_cap: usize,
 }
 
 /// Concurrent scheduler-dispatch executor.
@@ -251,6 +286,7 @@ impl Executor {
         let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
         self.submit_with_completion(
             root_id,
+            JobClass::Interactive,
             lane,
             request_id,
             job,
@@ -269,6 +305,26 @@ impl Executor {
         let (completion_tx, completion_rx) = oneshot::channel();
         self.submit_with_completion(
             root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Async(completion_tx),
+        );
+        completion_rx
+    }
+
+    pub fn submit_maintenance_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob,
+    ) -> oneshot::Receiver<Response> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_with_completion(
+            root_id,
+            JobClass::Maintenance,
             lane,
             request_id,
             job,
@@ -280,12 +336,13 @@ impl Executor {
     fn submit_with_completion(
         &self,
         root_id: ProjectRootId,
+        job_class: JobClass,
         lane: Lane,
         request_id: String,
         job: ExecutorJob,
         completion: CompletionSender,
     ) {
-        let command = lane_command(lane);
+        let command = job_command(job_class, lane);
         let mut job = Some(job);
         let mut completion = Some(completion);
 
@@ -295,6 +352,7 @@ impl Executor {
                 Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
                 Some(actor) => {
                     actor.push_job(
+                        job_class,
                         lane,
                         QueuedJob {
                             job: job.take().expect("executor job already queued"),
@@ -303,6 +361,7 @@ impl Executor {
                                 .expect("executor completion already queued"),
                             request_id: request_id.clone(),
                             command,
+                            queued_at: Instant::now(),
                         },
                     );
                     None
@@ -339,6 +398,21 @@ impl Executor {
 
     pub fn heavy_permits(&self) -> usize {
         self.inner.config.heavy_permits
+    }
+
+    pub fn interactive_reserve(&self) -> usize {
+        self.inner.config.interactive_reserve
+    }
+
+    pub fn maintenance_cap(&self) -> usize {
+        self.inner.config.maintenance_cap
+    }
+
+    pub fn try_dispatch_liveness_snapshot(&self) -> Option<DispatchLivenessSnapshot> {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.dispatch_liveness_snapshot())
     }
 
     pub fn nonrunnable_dispatch_count(&self) -> usize {
@@ -395,6 +469,8 @@ struct SchedulerState {
     actor_order: Vec<ProjectRootId>,
     cursor: usize,
     idle_workers: usize,
+    interactive_inflight: usize,
+    maintenance_inflight: usize,
     config: EffectiveConfig,
 }
 
@@ -405,9 +481,62 @@ impl SchedulerState {
             actor_order: Vec::new(),
             cursor: 0,
             idle_workers: config.pool_size,
+            interactive_inflight: 0,
+            maintenance_inflight: 0,
             config,
         }
     }
+
+    fn dispatch_liveness_snapshot(&self) -> DispatchLivenessSnapshot {
+        let now = Instant::now();
+        let mut interactive = QueueSnapshotAccumulator::default();
+        let mut maintenance = QueueSnapshotAccumulator::default();
+        for actor in self.actors.values() {
+            interactive.add(actor.class_queues(JobClass::Interactive), now);
+            maintenance.add(actor.class_queues(JobClass::Maintenance), now);
+        }
+
+        DispatchLivenessSnapshot {
+            interactive: interactive.finish(),
+            maintenance: maintenance.finish(),
+            running: DispatchRunningSnapshot {
+                interactive: self.interactive_inflight,
+                maintenance: self.maintenance_inflight,
+            },
+            interactive_reserve: self.config.interactive_reserve,
+            maintenance_cap: self.config.maintenance_cap,
+        }
+    }
+}
+
+#[derive(Default)]
+struct QueueSnapshotAccumulator {
+    queued: usize,
+    oldest_age_ms: Option<u64>,
+}
+
+impl QueueSnapshotAccumulator {
+    fn add(&mut self, queues: &ClassQueues, now: Instant) {
+        self.queued += queues.queued_count();
+        if let Some(queued_at) = queues.oldest_queued_at() {
+            let age_ms = duration_millis_u64(now.saturating_duration_since(queued_at));
+            self.oldest_age_ms = Some(
+                self.oldest_age_ms
+                    .map_or(age_ms, |oldest| oldest.max(age_ms)),
+            );
+        }
+    }
+
+    fn finish(self) -> DispatchClassQueueSnapshot {
+        DispatchClassQueueSnapshot {
+            queued: self.queued,
+            oldest_age_ms: self.oldest_age_ms,
+        }
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 struct ActorState {
@@ -416,13 +545,10 @@ struct ActorState {
     read_inflight: usize,
     lsp_inflight: bool,
     actor_total_inflight: usize,
-    writer_pending: bool,
+    writer_inflight: bool,
     deficit: isize,
-    order: VecDeque<Lane>,
-    pure_reads: VecDeque<QueuedJob>,
-    lsp_status: VecDeque<QueuedJob>,
-    heavy_init: VecDeque<QueuedJob>,
-    mutating: VecDeque<QueuedJob>,
+    interactive: ClassQueues,
+    maintenance: ClassQueues,
     fatal: bool,
 }
 
@@ -434,14 +560,75 @@ impl ActorState {
             read_inflight: 0,
             lsp_inflight: false,
             actor_total_inflight: 0,
-            writer_pending: false,
+            writer_inflight: false,
             deficit: 0,
+            interactive: ClassQueues::new(),
+            maintenance: ClassQueues::new(),
+            fatal: false,
+        }
+    }
+
+    fn push_job(&mut self, job_class: JobClass, lane: Lane, job: QueuedJob) {
+        self.class_queues_mut(job_class).push_job(lane, job);
+    }
+
+    fn has_queued_jobs(&self) -> bool {
+        self.interactive.has_queued_jobs() || self.maintenance.has_queued_jobs()
+    }
+
+    fn has_queued_jobs_for(&self, job_class: JobClass) -> bool {
+        self.class_queues(job_class).has_queued_jobs()
+    }
+
+    fn front_lane(&self, job_class: JobClass) -> Option<Lane> {
+        self.class_queues(job_class).front_lane()
+    }
+
+    fn pop_front_job(&mut self, job_class: JobClass, lane: Lane) -> Option<QueuedJob> {
+        self.class_queues_mut(job_class).pop_front_job(lane)
+    }
+
+    fn higher_priority_writer_barrier_blocks(&self, job_class: JobClass) -> bool {
+        matches!(job_class, JobClass::Maintenance)
+            && self.front_lane(JobClass::Interactive) == Some(Lane::Mutating)
+    }
+
+    fn class_queues(&self, job_class: JobClass) -> &ClassQueues {
+        match job_class {
+            JobClass::Interactive => &self.interactive,
+            JobClass::Maintenance => &self.maintenance,
+        }
+    }
+
+    fn class_queues_mut(&mut self, job_class: JobClass) -> &mut ClassQueues {
+        match job_class {
+            JobClass::Interactive => &mut self.interactive,
+            JobClass::Maintenance => &mut self.maintenance,
+        }
+    }
+
+    fn fail_queued_jobs(&mut self) {
+        self.interactive.fail_queued_jobs();
+        self.maintenance.fail_queued_jobs();
+    }
+}
+
+struct ClassQueues {
+    order: VecDeque<Lane>,
+    pure_reads: VecDeque<QueuedJob>,
+    lsp_status: VecDeque<QueuedJob>,
+    heavy_init: VecDeque<QueuedJob>,
+    mutating: VecDeque<QueuedJob>,
+}
+
+impl ClassQueues {
+    fn new() -> Self {
+        Self {
             order: VecDeque::new(),
             pure_reads: VecDeque::new(),
             lsp_status: VecDeque::new(),
             heavy_init: VecDeque::new(),
             mutating: VecDeque::new(),
-            fatal: false,
         }
     }
 
@@ -454,10 +641,40 @@ impl ActorState {
         !self.order.is_empty()
     }
 
+    fn front_lane(&self) -> Option<Lane> {
+        self.order.front().copied()
+    }
+
     fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob> {
         let order_lane = self.order.pop_front()?;
         debug_assert_eq!(order_lane, lane);
         self.queue_mut(lane).pop_front()
+    }
+
+    fn queued_count(&self) -> usize {
+        self.order.len()
+    }
+
+    fn oldest_queued_at(&self) -> Option<Instant> {
+        self.front_lane()
+            .and_then(|lane| self.queue(lane).front().map(|job| job.queued_at))
+    }
+
+    fn fail_queued_jobs(&mut self) {
+        self.order.clear();
+        fail_queued_job_queue(&mut self.pure_reads);
+        fail_queued_job_queue(&mut self.lsp_status);
+        fail_queued_job_queue(&mut self.heavy_init);
+        fail_queued_job_queue(&mut self.mutating);
+    }
+
+    fn queue(&self, lane: Lane) -> &VecDeque<QueuedJob> {
+        match lane {
+            Lane::PureRead => &self.pure_reads,
+            Lane::SerialLspStatus => &self.lsp_status,
+            Lane::HeavyInit => &self.heavy_init,
+            Lane::Mutating => &self.mutating,
+        }
     }
 
     fn queue_mut(&mut self, lane: Lane) -> &mut VecDeque<QueuedJob> {
@@ -468,14 +685,6 @@ impl ActorState {
             Lane::Mutating => &mut self.mutating,
         }
     }
-
-    fn fail_queued_jobs(&mut self) {
-        self.order.clear();
-        fail_queued_job_queue(&mut self.pure_reads);
-        fail_queued_job_queue(&mut self.lsp_status);
-        fail_queued_job_queue(&mut self.heavy_init);
-        fail_queued_job_queue(&mut self.mutating);
-    }
 }
 
 struct QueuedJob {
@@ -483,6 +692,7 @@ struct QueuedJob {
     completion: CompletionSender,
     request_id: String,
     command: String,
+    queued_at: Instant,
 }
 
 fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
@@ -493,8 +703,8 @@ fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
     }
 }
 
-fn lane_command(lane: Lane) -> String {
-    format!("executor::{lane:?}")
+fn job_command(job_class: JobClass, lane: Lane) -> String {
+    format!("executor::{job_class:?}::{lane:?}")
 }
 
 fn actor_fatal_response(request_id: impl Into<String>) -> Response {
@@ -548,6 +758,7 @@ impl CompletionSender {
 
 struct RunJob {
     root_id: ProjectRootId,
+    job_class: JobClass,
     lane: Lane,
     ctx: Arc<AppContext>,
     epoch: Arc<RwLock<()>>,
@@ -560,6 +771,7 @@ struct RunJob {
 
 struct CompletionEvent {
     root_id: ProjectRootId,
+    job_class: JobClass,
     lane: Lane,
     heavy_permit: Option<HeavyPermit>,
     panicked: bool,
@@ -615,10 +827,20 @@ fn process_scheduler_event(event: SchedulerEvent, state: &mut SchedulerState) ->
 fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
     let CompletionEvent {
         root_id,
+        job_class,
         lane,
         heavy_permit,
         panicked,
     } = event;
+
+    match job_class {
+        JobClass::Interactive => {
+            state.interactive_inflight = state.interactive_inflight.saturating_sub(1);
+        }
+        JobClass::Maintenance => {
+            state.maintenance_inflight = state.maintenance_inflight.saturating_sub(1);
+        }
+    }
 
     if let Some(actor) = state.actors.get_mut(&root_id) {
         actor.actor_total_inflight = actor.actor_total_inflight.saturating_sub(1);
@@ -631,7 +853,7 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
             }
             Lane::HeavyInit => {}
             Lane::Mutating => {
-                actor.writer_pending = false;
+                actor.writer_inflight = false;
             }
         }
 
@@ -652,52 +874,32 @@ fn dispatch_runnable(
     nonrunnable_dispatches: &AtomicUsize,
 ) {
     while state.idle_workers > 0 && !state.actor_order.is_empty() {
-        let actor_count = state.actor_order.len();
         let mut made_progress = false;
+        let mut dispatch_failed = false;
 
-        for _ in 0..actor_count {
-            if state.idle_workers == 0 || state.actor_order.is_empty() {
-                break;
-            }
+        made_progress |= dispatch_runnable_class(
+            state,
+            JobClass::Interactive,
+            heavy,
+            run_tx,
+            nonrunnable_dispatches,
+            &mut dispatch_failed,
+        );
+        if dispatch_failed || state.idle_workers == 0 {
+            return;
+        }
 
-            if state.cursor >= state.actor_order.len() {
-                state.cursor = 0;
-            }
-            let root_id = state.actor_order[state.cursor].clone();
-            state.cursor = (state.cursor + 1) % state.actor_order.len();
-
-            let run_job = {
-                let Some(actor) = state.actors.get_mut(&root_id) else {
-                    continue;
-                };
-
-                if actor.fatal {
-                    actor.fail_queued_jobs();
-                    actor.deficit = 0;
-                    continue;
-                }
-
-                if !actor.has_queued_jobs() {
-                    actor.deficit = 0;
-                    continue;
-                }
-
-                actor.deficit =
-                    (actor.deficit + state.config.drr_quantum).min(state.config.deficit_cap);
-                if actor.deficit < JOB_COST {
-                    continue;
-                }
-
-                try_admit_actor(&root_id, actor, &state.config, heavy)
-            };
-
-            if let Some(run_job) = run_job {
-                state.idle_workers -= 1;
-                made_progress = true;
-                if run_tx.send(run_job).is_err() {
-                    nonrunnable_dispatches.fetch_add(1, Ordering::AcqRel);
-                    return;
-                }
+        if can_dispatch_class(state, JobClass::Maintenance) {
+            made_progress |= dispatch_runnable_class(
+                state,
+                JobClass::Maintenance,
+                heavy,
+                run_tx,
+                nonrunnable_dispatches,
+                &mut dispatch_failed,
+            );
+            if dispatch_failed {
+                return;
             }
         }
 
@@ -707,28 +909,113 @@ fn dispatch_runnable(
     }
 }
 
+fn dispatch_runnable_class(
+    state: &mut SchedulerState,
+    job_class: JobClass,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob>,
+    nonrunnable_dispatches: &AtomicUsize,
+    dispatch_failed: &mut bool,
+) -> bool {
+    if !can_dispatch_class(state, job_class) || state.actor_order.is_empty() {
+        return false;
+    }
+
+    let actor_count = state.actor_order.len();
+    let mut made_progress = false;
+
+    for _ in 0..actor_count {
+        if !can_dispatch_class(state, job_class) || state.actor_order.is_empty() {
+            break;
+        }
+
+        if state.cursor >= state.actor_order.len() {
+            state.cursor = 0;
+        }
+        let root_id = state.actor_order[state.cursor].clone();
+        state.cursor = (state.cursor + 1) % state.actor_order.len();
+
+        let run_job = {
+            let Some(actor) = state.actors.get_mut(&root_id) else {
+                continue;
+            };
+
+            if actor.fatal {
+                actor.fail_queued_jobs();
+                actor.deficit = 0;
+                continue;
+            }
+
+            if !actor.has_queued_jobs() {
+                actor.deficit = 0;
+                continue;
+            }
+
+            if !actor.has_queued_jobs_for(job_class) {
+                continue;
+            }
+
+            actor.deficit =
+                (actor.deficit + state.config.drr_quantum).min(state.config.deficit_cap);
+            if actor.deficit < JOB_COST {
+                continue;
+            }
+
+            try_admit_actor(&root_id, actor, job_class, &state.config, heavy)
+        };
+
+        if let Some(run_job) = run_job {
+            state.idle_workers -= 1;
+            match job_class {
+                JobClass::Interactive => state.interactive_inflight += 1,
+                JobClass::Maintenance => state.maintenance_inflight += 1,
+            }
+            made_progress = true;
+            if run_tx.send(run_job).is_err() {
+                nonrunnable_dispatches.fetch_add(1, Ordering::AcqRel);
+                *dispatch_failed = true;
+                return made_progress;
+            }
+        }
+    }
+
+    made_progress
+}
+
+fn can_dispatch_class(state: &SchedulerState, job_class: JobClass) -> bool {
+    if state.idle_workers == 0 {
+        return false;
+    }
+    match job_class {
+        JobClass::Interactive => true,
+        JobClass::Maintenance => {
+            state.maintenance_inflight < state.config.maintenance_cap
+                && state.idle_workers > state.config.interactive_reserve
+        }
+    }
+}
+
 fn try_admit_actor(
     root_id: &ProjectRootId,
     actor: &mut ActorState,
+    job_class: JobClass,
     config: &EffectiveConfig,
     heavy: &Arc<HeavySemaphore>,
 ) -> Option<RunJob> {
-    let lane = *actor.order.front()?;
+    let lane = actor.front_lane(job_class)?;
     let mut heavy_permit = None;
 
+    if actor.writer_inflight || actor.higher_priority_writer_barrier_blocks(job_class) {
+        return None;
+    }
+
+    let has_epoch_reader = actor.read_inflight > 0 || actor.lsp_inflight;
+    let actor_has_capacity = actor.actor_total_inflight < config.actor_cap;
     let runnable = match lane {
-        Lane::PureRead => {
-            !actor.writer_pending
-                && actor.read_inflight < config.read_cap
-                && actor.actor_total_inflight < config.actor_cap
-        }
-        Lane::SerialLspStatus => {
-            !actor.writer_pending
-                && !actor.lsp_inflight
-                && actor.actor_total_inflight < config.actor_cap
-        }
+        Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_capacity,
+        Lane::SerialLspStatus => !actor.lsp_inflight && actor_has_capacity,
         Lane::HeavyInit => {
-            if actor.actor_total_inflight >= config.actor_cap {
+            if !actor_has_capacity {
                 false
             } else if let Some(permit) = heavy.try_acquire() {
                 heavy_permit = Some(permit);
@@ -737,17 +1024,14 @@ fn try_admit_actor(
                 false
             }
         }
-        Lane::Mutating => {
-            actor.writer_pending = true;
-            actor.read_inflight == 0 && actor.actor_total_inflight < config.actor_cap
-        }
+        Lane::Mutating => !has_epoch_reader && actor_has_capacity,
     };
 
     if !runnable {
         return None;
     }
 
-    let queued = actor.pop_front_job(lane)?;
+    let queued = actor.pop_front_job(job_class, lane)?;
     actor.deficit -= JOB_COST;
     match lane {
         Lane::PureRead => {
@@ -762,12 +1046,14 @@ fn try_admit_actor(
             actor.actor_total_inflight += 1;
         }
         Lane::Mutating => {
+            actor.writer_inflight = true;
             actor.actor_total_inflight += 1;
         }
     }
 
     Some(RunJob {
         root_id: root_id.clone(),
+        job_class,
         lane,
         ctx: Arc::clone(&actor.ctx),
         epoch: Arc::clone(&actor.epoch),
@@ -798,6 +1084,7 @@ fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
         }
         let completion = CompletionEvent {
             root_id: run_job.root_id,
+            job_class: run_job.job_class,
             lane: run_job.lane,
             heavy_permit: run_job.heavy_permit.take(),
             panicked,

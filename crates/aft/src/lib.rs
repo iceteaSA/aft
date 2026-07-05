@@ -58,6 +58,7 @@ pub mod callgraph;
 pub mod callgraph_store;
 pub mod calls;
 pub mod checkpoint;
+pub mod cold_build_limiter;
 pub mod commands;
 pub mod compress;
 pub mod config;

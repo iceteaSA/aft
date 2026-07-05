@@ -2030,6 +2030,14 @@ impl AppContext {
             return false;
         }
 
+        let Some(permit) = crate::cold_build_limiter::try_acquire() else {
+            crate::slog_info!(
+                "callgraph store cold build deferred by cold build limit ({})",
+                crate::cold_build_limiter::limit()
+            );
+            return false;
+        };
+
         if force_rebuild {
             // Consume the force flag now so a follow-up request doesn't queue a
             // second forced build while this one is in flight.
@@ -2041,6 +2049,7 @@ impl AppContext {
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
 
         std::thread::spawn(move || {
+            let _permit = permit;
             crate::log_ctx::with_session(session_id, || {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let built = if force_rebuild {
@@ -2288,6 +2297,17 @@ impl AppContext {
             .collect::<Vec<_>>();
         let submission =
             manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
+        if !submission.deferred_categories.is_empty() {
+            self.tier2_refresh_scheduler.lock().note_dispatch_deferred();
+            crate::slog_info!(
+                "tier2 refresh deferred by cold build limit: categories={:?}",
+                submission
+                    .deferred_categories
+                    .iter()
+                    .map(|category| category.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
         if submission.has_new_work() {
             crate::slog_info!(
                 "tier2 refresh scheduled: reason={}, categories={:?}",
