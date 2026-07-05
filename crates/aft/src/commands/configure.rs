@@ -2853,6 +2853,45 @@ mod tests {
     }
 
     #[test]
+    fn linked_worktree_configure_schedules_no_cold_warm_builds() {
+        let _env_guard = home_env_mutex();
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .status()
+            .unwrap()
+            .success());
+
+        crate::context::reset_callgraph_cold_build_spawn_count_for_test();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": worktree,
+            "harness": "opencode",
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": true,
+                "callgraph_store": true
+            }))]
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+
+        assert!(response.success);
+        assert_eq!(ctx.cache_role(), "worktree");
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(ctx.semantic_index_rx().lock().is_none());
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert_eq!(crate::context::callgraph_cold_build_spawn_count_for_test(), 0);
+    }
+
+    #[test]
     fn dead_artifact_owner_manifest_is_taken_over_on_configure() {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
