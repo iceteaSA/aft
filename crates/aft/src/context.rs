@@ -146,6 +146,12 @@ pub struct StatusEmitter {
     notify: mpsc::Sender<()>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ConfigureWarmState {
+    generation: u64,
+    key: Option<String>,
+}
+
 impl StatusEmitter {
     fn new(progress_sender: SharedProgressSender) -> Self {
         let (notify, rx) = mpsc::channel();
@@ -707,7 +713,8 @@ pub struct AppContext {
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
     lsp_manager: parking_lot::Mutex<LspManager>,
-    configure_generation: AtomicU64,
+    configure_generation: Arc<AtomicU64>,
+    configure_warm_state: parking_lot::Mutex<ConfigureWarmState>,
     /// Last-seen value of `InspectManager::reuse_completion_count()`, so the
     /// per-request inspect drain can detect watcher-driven Tier-2 scans that
     /// finished since the previous tick and refresh the status bar (#3).
@@ -899,7 +906,8 @@ impl AppContext {
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_thread: parking_lot::Mutex::new(None),
             lsp_manager: parking_lot::Mutex::new(lsp_manager),
-            configure_generation: AtomicU64::new(0),
+            configure_generation: Arc::new(AtomicU64::new(0)),
+            configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
             last_seen_reuse_completions: AtomicU64::new(0),
             configure_warnings_tx,
             configure_warnings_rx,
@@ -1455,8 +1463,29 @@ impl AppContext {
             .wrapping_add(1)
     }
 
+    /// Record the warm-maintenance key for a successful configure.
+    ///
+    /// Returns the previous generation when the key is unchanged, allowing an
+    /// equivalent reconfigure to adopt already-running warm work instead of
+    /// dropping receivers and rescheduling another full project pass.
+    pub fn note_configure_warm_key(&self, generation: u64, key: String) -> Option<u64> {
+        let mut state = self.configure_warm_state.lock();
+        let adopted = state
+            .key
+            .as_ref()
+            .filter(|previous| *previous == &key)
+            .map(|_| state.generation);
+        state.generation = generation;
+        state.key = Some(key);
+        adopted
+    }
+
     pub fn configure_generation(&self) -> u64 {
         self.configure_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn configure_generation_flag(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.configure_generation)
     }
 
     pub fn configure_warnings_sender(
@@ -1993,6 +2022,8 @@ impl AppContext {
     ) -> bool {
         let session_id = crate::log_ctx::current_session();
         let chunk_size = self.config().callgraph_chunk_size;
+        let build_generation = self.configure_generation();
+        let generation_flag = self.configure_generation_flag();
 
         let mut rx_guard = self.callgraph_store_rx.lock();
         if rx_guard.is_some() {
@@ -2031,7 +2062,14 @@ impl AppContext {
                 };
                 match built {
                     Ok(store) => {
-                        let _ = tx.send(store);
+                        if generation_flag.load(Ordering::SeqCst) == build_generation {
+                            let _ = tx.send(store);
+                        } else {
+                            crate::slog_info!(
+                                "callgraph store warm build result discarded for stale generation {}",
+                                build_generation
+                            );
+                        }
                     }
                     Err(error) => {
                         crate::slog_warn!("callgraph store cold build failed: {}", error);

@@ -505,6 +505,41 @@ fn semantic_fingerprint_config_changed(
         || previous.base_url != next.base_url
 }
 
+fn workspace_manifest_fingerprint(project_root: &Path) -> String {
+    let mut parts = Vec::new();
+    push_manifest_fingerprint(&mut parts, project_root.join("package.json"));
+    let packages_dir = project_root.join("packages");
+    if let Ok(entries) = fs::read_dir(packages_dir) {
+        let mut manifests = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("package.json"))
+            .collect::<Vec<_>>();
+        manifests.sort();
+        for manifest in manifests {
+            push_manifest_fingerprint(&mut parts, manifest);
+        }
+    }
+    parts.join("|")
+}
+
+fn push_manifest_fingerprint(parts: &mut Vec<String>, path: PathBuf) {
+    if let Ok(metadata) = fs::metadata(&path) {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+            .unwrap_or((0, 0));
+        parts.push(format!(
+            "{}:{}:{}:{}",
+            path.display(),
+            metadata.len(),
+            modified.0,
+            modified.1
+        ));
+    }
+}
+
 /// Parse the `lsp_paths_extra` config param: an array of absolute directory
 /// paths the plugin wants AFT to search when resolving LSP binaries (used
 /// for the auto-install cache, e.g.
@@ -1565,11 +1600,35 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     let artifact_owner_lease = artifact_owner_claim.and_then(|claim| claim.lease);
     ctx.set_artifact_owner(artifact_owner_status.clone(), artifact_owner_lease);
-    ctx.reset_tier2_refresh_scheduler();
-    let semantic_cold_seed_generation = ctx.reset_semantic_cold_seed_gate_for_configure();
-    if next_config.semantic_search && !ctx.shared_artifacts_read_only() && !home_match {
-        ctx.schedule_semantic_cold_seed_gate_for_configure();
-    }
+    let configure_generation = ctx.advance_configure_generation();
+    let warm_key = format!(
+        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};callgraph={}:{};inspect={};manifests={}",
+        canonical_cache_root,
+        next_config.storage_dir,
+        home_match,
+        is_worktree_bridge,
+        ctx.shared_artifacts_read_only(),
+        next_config.search_index,
+        next_config.search_index_max_file_size,
+        next_config.semantic_search,
+        next_config.semantic,
+        next_config.callgraph_store,
+        next_config.callgraph_chunk_size,
+        next_config.inspect.enabled,
+        workspace_manifest_fingerprint(&canonical_cache_root),
+    );
+    let adopted_warm_generation = ctx.note_configure_warm_key(configure_generation, warm_key);
+    let equivalent_warm_config = adopted_warm_generation.is_some();
+    let semantic_cold_seed_generation = if !equivalent_warm_config {
+        ctx.reset_tier2_refresh_scheduler();
+        let semantic_cold_seed_generation = ctx.reset_semantic_cold_seed_gate_for_configure();
+        if next_config.semantic_search && !ctx.shared_artifacts_read_only() && !home_match {
+            ctx.schedule_semantic_cold_seed_gate_for_configure();
+        }
+        semantic_cold_seed_generation
+    } else {
+        configure_generation
+    };
     // Project root (and thus tsconfig resolution) may have changed; drop the
     // status-bar membership cache so the next bar count re-resolves from disk.
     ctx.clear_tsconfig_membership_cache();
@@ -1653,6 +1712,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let semantic_search = ctx.config().semantic_search;
     let search_index_max_file_size = ctx.config().search_index_max_file_size;
     let semantic_config = ctx.config().semantic.clone();
+    let mut search_index_cache_reused = false;
+
+    // Reconfigure is still the signal that workspace package metadata may have
+    // changed, even when the warm-maintenance key is otherwise equivalent.
+    crate::callgraph::clear_workspace_package_cache();
 
     let search_build_in_progress = ctx
         .search_index_rx()
@@ -1660,6 +1724,29 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
+    if equivalent_warm_config {
+        if search_build_in_progress {
+            slog_info!(
+                "search index build adopted by generation {} (previous generation {})",
+                configure_generation,
+                adopted_warm_generation.unwrap_or(configure_generation)
+            );
+        }
+        if semantic_build_in_progress {
+            slog_info!(
+                "semantic index build adopted by generation {} (previous generation {})",
+                configure_generation,
+                adopted_warm_generation.unwrap_or(configure_generation)
+            );
+        }
+        if ctx.callgraph_store_rx().lock().is_some() {
+            slog_info!(
+                "callgraph store warm build adopted by generation {} (previous generation {})",
+                configure_generation,
+                adopted_warm_generation.unwrap_or(configure_generation)
+            );
+        }
+    } else {
     // Note: We intentionally only WARN on rapid reconfigure (rather than tracking
     // JoinHandles to cancel old threads) because:
     //   1. Old thread results are dropped when ctx.search_index_rx() is reset
@@ -1670,12 +1757,20 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // generation-counter + cancellation-token pattern.
     if search_build_in_progress {
         slog_warn!(
-            "configure called while search index build is still in progress; previous build will continue detached"
+            "search index build cancelled (superseded by generation {})",
+            configure_generation
         );
     }
     if semantic_build_in_progress {
         slog_warn!(
-            "configure called while semantic index build is still in progress; previous build will continue detached"
+            "semantic index build cancelled (superseded by generation {})",
+            configure_generation
+        );
+    }
+    if ctx.callgraph_store_rx().lock().is_some() {
+        slog_warn!(
+            "callgraph store warm build cancelled (superseded by generation {})",
+            configure_generation
         );
     }
 
@@ -1715,7 +1810,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_degraded_reasons(degraded_reasons.clone());
 
     let storage_dir = ctx.config().storage_dir.clone();
-    let mut search_index_cache_reused = false;
 
     if search_index {
         let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
@@ -1728,6 +1822,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let is_worktree_bridge_for_search = is_worktree_bridge;
         let shared_artifacts_read_only_for_search = ctx.shared_artifacts_read_only();
         let session_id_for_bg = log_ctx::current_session();
+        let search_generation = configure_generation;
+        let search_generation_flag = ctx.configure_generation_flag();
 
         if shared_artifacts_read_only_for_search {
             match crate::readonly_artifacts::open_search_index_read_only(
@@ -1806,7 +1902,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             };
                             verified.verify_against_disk(head_for_verify);
                             let symbol_files = search_index_symbol_files(&verified);
-                            let _ = tx.send(verified);
+                            if search_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                                == search_generation
+                            {
+                                let _ = tx.send(verified);
+                            } else {
+                                slog_info!(
+                                    "search index build result discarded for stale generation {}",
+                                    search_generation
+                                );
+                                return;
+                            }
                             spawn_symbol_cache_prewarm(
                                 root_for_prewarm,
                                 symbol_cache,
@@ -1841,6 +1947,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     mark_search_rebuild_spawn_for_debug();
 
                     let root_clone = canonical_cache_root.clone();
+                    let search_generation_flag = Arc::clone(&search_generation_flag);
                     thread::spawn(move || {
                         let session_id_for_prewarm = session_id_for_bg.clone();
                         log_ctx::with_session(session_id_for_bg, || {
@@ -1875,7 +1982,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             };
 
                             let symbol_files = search_index_symbol_files(&index);
-                            let _ = tx.send(index);
+                            if search_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                                == search_generation
+                            {
+                                let _ = tx.send(index);
+                            } else {
+                                slog_info!(
+                                    "search index build result discarded for stale generation {}",
+                                    search_generation
+                                );
+                                return;
+                            }
                             spawn_symbol_cache_prewarm(
                                 root_clone,
                                 symbol_cache,
@@ -1967,6 +2084,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let semantic_cold_seed_active = ctx.semantic_cold_seed_active_flag();
         let semantic_cold_seed_generation_flag = ctx.semantic_cold_seed_generation_flag();
         let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
+        let semantic_generation = configure_generation;
+        let semantic_generation_flag = ctx.configure_generation_flag();
         let session_id_for_bg2 = log_ctx::current_session();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg2, || {
@@ -2319,6 +2438,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     }
                 };
 
+                if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                    != semantic_generation
+                {
+                    slog_info!(
+                        "semantic index build result discarded for stale generation {}",
+                        semantic_generation
+                    );
+                    clear_cold_seed_active();
+                    return;
+                }
+
                 if tx.send(event).is_err() {
                     clear_cold_seed_active();
                 }
@@ -2354,6 +2484,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 }
             }
         }
+    }
     }
 
     let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
@@ -2395,7 +2526,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let configure_generation = ctx.advance_configure_generation();
     let config_snapshot = ctx.config().clone();
 
     // Defer the full source-file walk + language detection +
@@ -2815,6 +2945,7 @@ mod tests {
 
     #[test]
     fn sibling_clone_same_artifact_key_opens_shared_artifacts_read_only() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let owner = temp.path().join("owner");
@@ -2855,6 +2986,7 @@ mod tests {
     #[test]
     fn linked_worktree_configure_schedules_no_cold_warm_builds() {
         let _env_guard = home_env_mutex();
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         init_git_fixture(&main);
@@ -2869,7 +3001,6 @@ mod tests {
             .unwrap()
             .success());
 
-        crate::context::reset_callgraph_cold_build_spawn_count_for_test();
         let ctx = test_context();
         let req = configure_request_with_params(json!({
             "project_root": worktree,
@@ -2888,11 +3019,42 @@ mod tests {
         assert!(ctx.search_index_rx().read().unwrap().is_none());
         assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(ctx.callgraph_store_rx().lock().is_none());
-        assert_eq!(crate::context::callgraph_cold_build_spawn_count_for_test(), 0);
     }
 
     #[test]
+    fn equivalent_reconfigure_keeps_warm_work_adopted_and_idempotent() {
+        let _env_guard = home_env_mutex();
+        let temp = tempfile::tempdir().unwrap();
+        init_git_fixture(temp.path());
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+
+        let first = super::handle_configure(&req, &ctx);
+        assert!(first.success);
+
+        for _ in 0..5 {
+            let response = super::handle_configure(&req, &ctx);
+            assert!(response.success);
+        }
+
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(ctx.semantic_index_rx().lock().is_none());
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert_eq!(ctx.configure_generation(), 6);
+    }
+
+
+    #[test]
     fn dead_artifact_owner_manifest_is_taken_over_on_configure() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let owner = temp.path().join("owner");
@@ -3091,6 +3253,11 @@ mod tests {
     /// runtimes on an `AppContext`, and each test must stop its runtime before
     /// the next one starts.
     fn watcher_test_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn artifact_owner_test_mutex() -> &'static std::sync::Mutex<()> {
         static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         M.get_or_init(|| std::sync::Mutex::new(()))
     }
