@@ -3,7 +3,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BridgePool, type AftTransportPool } from "@cortexkit/aft-bridge";
+import { type AftTransportPool, BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { astTools } from "../../tools/ast.js";
 import { importTools } from "../../tools/imports.js";
@@ -15,8 +15,8 @@ import {
   createHarness,
   type E2EHarness,
   type HarnessFactory,
-  type PreparedBinary,
   harnessPool,
+  type PreparedBinary,
   prepareBinary,
 } from "./helpers.js";
 

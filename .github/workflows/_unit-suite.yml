@@ -57,6 +57,12 @@ jobs:
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
+      # Fail fast: lint + typecheck are the cheapest checks and the most
+      # common push mistakes — surface them in the first minute instead of
+      # after a multi-minute cargo build.
+      - name: Bun lint
+        run: bun run lint
+
       - name: Build aft-bridge dist (workspace consumers depend on it)
         run: bun run --cwd packages/aft-bridge build
 
@@ -65,6 +71,9 @@ jobs:
         # packages/pi-plugin/dist/index.js. Build it before bun test recurses
         # into that workspace.
         run: bun run --cwd packages/pi-plugin build
+
+      - name: Bun typecheck
+        run: bun run typecheck
 
       - name: Cargo build (debug — needed by plugin e2e tests)
         run: cargo build -p agent-file-tools
@@ -77,12 +86,6 @@ jobs:
           # so use every core.
           NEXTEST_TEST_THREADS: "num-cpus"
 
-      - name: Bun typecheck
-        run: bun run typecheck
-
-      - name: Bun lint
-        run: bun run lint
-
       - name: Build all JS packages (release gate)
         # Only at release time: every published JS package must build. At PR
         # time, individual package builds run inside their own test scripts.
@@ -92,10 +95,19 @@ jobs:
       - name: Fetch pinned subc-core
         id: subc_core
         env:
-          # gh reads GH_TOKEN / GITHUB_TOKEN for release downloads. Keep the
-          # repo-read auth boundary explicit and skip interactive login probes.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # cortexkit/subconscious is a private repo, so the job-scoped
+          # GITHUB_TOKEN cannot read its releases — the fetch needs the
+          # dedicated cross-repo read token. Fork/contributor PRs don't get
+          # repo secrets: skip the fetch there (the subc e2e suites then skip
+          # loudly) instead of failing their CI. When the token IS present,
+          # any fetch failure stays a hard job failure.
+          GH_TOKEN: ${{ secrets.SUBC_CORE_READ_TOKEN }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::SUBC_CORE_READ_TOKEN not available (fork PR?) — subc e2e suites will skip"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           path="$(./scripts/fetch-subc-core.sh)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
 
@@ -147,11 +159,18 @@ jobs:
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
+      # Fail fast: cheapest checks first (see the Linux job).
+      - name: Bun lint
+        run: bun run lint
+
       - name: Build aft-bridge dist (workspace consumers depend on it)
         run: bun run --cwd packages/aft-bridge build
 
       - name: Build pi-plugin dist (Pi RPC tests need it)
         run: bun run --cwd packages/pi-plugin build
+
+      - name: Bun typecheck
+        run: bun run typecheck
 
       - name: Cargo build (debug — needed by plugin e2e tests)
         run: cargo build -p agent-file-tools
@@ -163,16 +182,18 @@ jobs:
           # See the Linux job: full core count on otherwise-idle CI runners.
           NEXTEST_TEST_THREADS: "num-cpus"
 
-      - name: Bun typecheck
-        run: bun run typecheck
-
       - name: Fetch pinned subc-core
         id: subc_core
         env:
-          # gh reads GH_TOKEN / GITHUB_TOKEN for release downloads. Keep the
-          # repo-read auth boundary explicit and skip interactive login probes.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # See the Linux job: private-repo release read needs the dedicated
+          # cross-repo token; absent token (fork PR) skips instead of failing.
+          GH_TOKEN: ${{ secrets.SUBC_CORE_READ_TOKEN }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::SUBC_CORE_READ_TOKEN not available (fork PR?) — subc e2e suites will skip"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           path="$(./scripts/fetch-subc-core.sh)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
 

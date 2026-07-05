@@ -12,13 +12,13 @@ import {
   inlineUserConfigTier,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
-import { bridgeLogger } from "../../logger.js";
 import {
-  prepareSubcLane,
-  startSubcRig,
   type PreparedSubcLane,
+  prepareSubcLane,
   type SubcRig,
+  startSubcRig,
 } from "../../../../aft-bridge/src/__tests__/e2e/subc-rig.js";
+import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
 // "[aft] invalidated 7 files") into $TMPDIR/aft-plugin-test.log instead of

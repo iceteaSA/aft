@@ -4,7 +4,7 @@ import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { BridgePool, type AftTransportPool } from "@cortexkit/aft-bridge";
+import { type AftTransportPool, BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
@@ -14,8 +14,8 @@ import {
   createHarness,
   type E2EHarness,
   type HarnessFactory,
-  type PreparedBinary,
   harnessPool,
+  type PreparedBinary,
   prepareBinary,
   readTextFile,
 } from "./helpers.js";
