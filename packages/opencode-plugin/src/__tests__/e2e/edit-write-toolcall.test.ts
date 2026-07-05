@@ -132,6 +132,30 @@ maybeDescribe("e2e hoisted edit/write tool_call cutover", () => {
     });
   });
 
+  test("edit on a >512KB file falls back to the preview hunk diff (no blank filediff)", async () => {
+    const h = await harness();
+    // Over Rust's 512KB diff-content cap: the response diff is counts-only
+    // (`truncated: true`, no before/after). Fabricating empty contents used to
+    // render a blank diff in the UI.
+    const big = `${"a".repeat(600_000)}\nbeta\n`;
+    await writeFile(h.path("big.txt"), big);
+
+    const result = await executeEdit(h, {
+      filePath: "big.txt",
+      oldString: "beta",
+      newString: "BETA",
+    });
+
+    expect(await readTextFile(h.path("big.txt"))).toContain("BETA");
+    expect(result.output).toBe("Edited (+1/-1).");
+    // No fabricated empty-content filediff...
+    expect(result.metadata?.filediff).toBeUndefined();
+    // ...and the rendered diff carries the real hunk from the preview.
+    const diffText = result.metadata?.diff as string | undefined;
+    expect(diffText).toContain("-beta");
+    expect(diffText).toContain("+BETA");
+  });
+
   test("edit symbol+content mutates the symbol and returns server text", async () => {
     const h = await harness();
     await writeFile(

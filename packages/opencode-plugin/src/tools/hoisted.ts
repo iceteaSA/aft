@@ -509,10 +509,20 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       // / Desktop) because the store Map lived in one ESM graph and the merge
       // ran in another. See GitHub #96.
       const diff = data.diff as
-        | { before?: string; after?: string; additions?: number; deletions?: number }
+        | {
+            before?: string;
+            after?: string;
+            additions?: number;
+            deletions?: number;
+            truncated?: boolean;
+          }
         | undefined;
       if (!diff) return output;
 
+      // See the edit tool: >512KB files return counts-only (`truncated`) with
+      // no before/after — fabricating an empty `before` would render the whole
+      // file as added. Fall back to the preview's hunk-scoped diff.
+      const truncated = diff.truncated === true;
       const dp = relativeToWorktree(filePath, projectRoot);
       const beforeContent = diff.before ?? "";
       const afterContent = diff.after ?? content;
@@ -520,14 +530,22 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         output,
         title: dp,
         metadata: {
-          diff: buildUnifiedDiff(filePath, beforeContent, afterContent),
-          filediff: {
-            file: filePath,
-            before: beforeContent,
-            after: afterContent,
-            additions: diff?.additions ?? 0,
-            deletions: diff?.deletions ?? 0,
-          },
+          diff: truncated
+            ? typeof preview.preview_diff === "string"
+              ? preview.preview_diff
+              : ""
+            : buildUnifiedDiff(filePath, beforeContent, afterContent),
+          ...(truncated
+            ? {}
+            : {
+                filediff: {
+                  file: filePath,
+                  before: beforeContent,
+                  after: afterContent,
+                  additions: diff?.additions ?? 0,
+                  deletions: diff?.deletions ?? 0,
+                },
+              }),
           diagnostics: {},
         },
       };
@@ -700,24 +718,44 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
       const output = data.text;
       const diff = data.diff as
-        | { before?: string; after?: string; additions?: number; deletions?: number }
+        | {
+            before?: string;
+            after?: string;
+            additions?: number;
+            deletions?: number;
+            truncated?: boolean;
+          }
         | undefined;
       if (!diff) return output;
 
       // UI metadata returned directly on the result (see write tool for the
       // rationale; replaces the old metadata-store + after-hook merge that
       // intermittently lost the diff under duplicate plugin loads — GitHub #96).
+      //
+      // Files over Rust's 512KB diff cap return counts-only (`truncated: true`)
+      // with no before/after. Fabricating empty contents here rendered a blank
+      // diff in the UI — use the preview's hunk-scoped unified diff instead
+      // (it scales with the edit, not the file) and omit the filediff view.
+      const truncated = diff.truncated === true;
       const beforeContent = diff.before ?? "";
       const afterContent = diff.after ?? "";
       const uiMeta = {
-        diff: buildUnifiedDiff(filePath, beforeContent, afterContent),
-        filediff: {
-          file: filePath,
-          before: beforeContent,
-          after: afterContent,
-          additions: diff.additions ?? 0,
-          deletions: diff.deletions ?? 0,
-        },
+        diff: truncated
+          ? typeof preview.preview_diff === "string"
+            ? preview.preview_diff
+            : ""
+          : buildUnifiedDiff(filePath, beforeContent, afterContent),
+        ...(truncated
+          ? {}
+          : {
+              filediff: {
+                file: filePath,
+                before: beforeContent,
+                after: afterContent,
+                additions: diff.additions ?? 0,
+                deletions: diff.deletions ?? 0,
+              },
+            }),
         diagnostics: {},
       };
       return { output, title: relativeToWorktree(filePath, projectRoot), metadata: uiMeta };
