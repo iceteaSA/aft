@@ -30,7 +30,7 @@
     "test:unit": "bun test src/__tests__"
   },
   "dependencies": {
-    "@cortexkit/subc-client": "^0.3.3",
+    "@cortexkit/subc-client": "^0.3.4",
     "undici": "^7.25.0"
   },
   "devDependencies": {

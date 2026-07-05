@@ -212,10 +212,15 @@ describe("SubcTransport.toolCall", () => {
     // Orchestrated bash passes its wait-aware budget as transportTimeoutMs;
     // it must win over timeoutMs and reach client.request, otherwise long
     // commands die at the client's default unary deadline mid-execution.
-    await t.toolCall("s", "bash", { command: "sleep 100" }, {
-      transportTimeoutMs: 905_000,
-      timeoutMs: 60_000,
-    });
+    await t.toolCall(
+      "s",
+      "bash",
+      { command: "sleep 100" },
+      {
+        transportTimeoutMs: 905_000,
+        timeoutMs: 60_000,
+      },
+    );
     expect(client.requests[0]?.options?.timeoutMs).toBe(905_000);
 
     // Plain per-command override still applies when no orchestrated budget.
@@ -295,6 +300,46 @@ describe("SubcTransport Rd reconnect", () => {
     const result = await t.toolCall("s", "read", {});
     expect(result.text).toBe("recovered");
     expect(madeClients).toBe(2); // the dead client was dropped, a fresh one connected
+  });
+
+  test("unknown_channel reopens the route and resends once", async () => {
+    let calls = 0;
+    const client = new FakeClient(async () => {
+      calls += 1;
+      if (calls === 1) throw new SubcError("unknown channel 1", "unknown_channel");
+      return envelope({ id: "r", success: true, text: "resent after reopen" });
+    });
+    const { pool } = poolWith(client);
+    const transport = pool.getBridge("/work/proj");
+
+    const result = await transport.toolCall("s", "write", { filePath: "a.txt", content: "ok" });
+
+    expect(result.success).toBe(true);
+    expect(result.text).toBe("resent after reopen");
+    expect(client.routeOpens.length).toBe(2);
+    expect(client.requests.length).toBe(2);
+    expect(client.requests[0]?.channel).toBe(1);
+    expect(client.requests[1]?.channel).toBe(2);
+    expect(client.requests[1]?.body).toEqual(client.requests[0]?.body);
+  });
+
+  test("outcome-unknown request failures still surface without an in-place retry", async () => {
+    const outcomeUnknown = new SubcCallError(
+      "outcome_unknown",
+      "connection dropped after the request was queued",
+    );
+    const client = new FakeClient(async () => {
+      throw outcomeUnknown;
+    });
+    const { pool } = poolWith(client);
+    const transport = pool.getBridge("/work/proj");
+
+    await expect(
+      transport.toolCall("s", "write", { filePath: "a.txt", content: "ok" }),
+    ).rejects.toBe(outcomeUnknown);
+    expect(client.routeOpens.length).toBe(1);
+    expect(client.requests.length).toBe(1);
+    expect(client.closed).toBe(1);
   });
 
   test("a not-queued write failure (transient, not_sent-equivalent) drops the client", async () => {

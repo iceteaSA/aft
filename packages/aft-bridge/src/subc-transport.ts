@@ -25,6 +25,7 @@ import {
   type RouteTarget,
   SubcCallError,
   SubcClient,
+  SubcError,
 } from "@cortexkit/subc-client";
 import type { StatusSnapshot } from "./bridge.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
@@ -267,6 +268,10 @@ class BgSubscription {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isUnknownChannelError(err: unknown): boolean {
+  return err instanceof SubcError && err.code === "unknown_channel";
 }
 
 /**
@@ -567,12 +572,12 @@ export class SubcTransportPool implements AftTransportPool {
 
   /**
    * Open-or-reuse a route for `identity` and send `body` as a data-plane Request.
-   * Rd reconnect (mutation-safe by construction — NEVER auto-retries): on a
-   * transport-level {@link SubcCallError} the cached channel is discarded and the
-   * dead client cleared so the NEXT call re-establishes, but the failed call is
-   * surfaced to the agent unchanged (identical to a standalone bridge death). Only
-   * `SubcClient.request` transport failures throw here; a tool-level error comes
-   * back as a normal reply with `success:false` and is returned, not thrown.
+   * Rd reconnect is mutation-safe by construction: transport failures surface to
+   * the caller after clearing stale route/client state so the NEXT call
+   * re-establishes. The only in-place retry is `unknown_channel`, where the daemon
+   * proves the route was absent and the request was not delivered to the module.
+   * Tool-level errors come back as normal replies with `success:false` and are
+   * returned, not thrown.
    */
   async routeRequest(
     identity: BindIdentity,
@@ -586,41 +591,82 @@ export class SubcTransportPool implements AftTransportPool {
 
     try {
       const client = await this.ensureClient();
-      // closeSession/shutdown marks and deletes the record synchronously. A request
-      // that was waiting for connect must not open a route for a session that no
-      // longer exists.
-      if (!this.isCurrentSession(key, record)) {
-        throw new RouteTornDownError("subc session closed");
-      }
-
-      let channel: number;
-      let entry: RouteEntry;
-      try {
-        ({ channel, entry } = await this.routeChannel(client, identity, record));
-        // routeOpen may have awaited. Do not send a request after a close, even
-        // if a stale route entry just resolved.
+      const openRoute = async (): Promise<{ channel: number; entry: RouteEntry }> => {
+        // closeSession/shutdown marks and deletes the record synchronously. A request
+        // that was waiting for connect must not open a route for a session that no
+        // longer exists.
         if (!this.isCurrentSession(key, record)) {
           throw new RouteTornDownError("subc session closed");
         }
-      } catch (err) {
-        // A teardown that raced the open is not a transport fault — surface it
-        // without dropping the client or charging the failure budget.
-        if (err instanceof RouteTornDownError) throw err;
-        // routeOpen itself failed. Classify the error like other request failures
-        // for transient connection death, but only while this request's session
-        // and client are still current. A close-induced failure must not drop a
-        // healthy client shared by other sessions.
-        if (
-          isConsumerReconnectTransient(err) &&
-          this.isCurrentSession(key, record) &&
-          this.client === client
-        ) {
-          this.dropClient(client);
-        }
-        throw err;
-      }
 
-      try {
+        try {
+          const opened = await this.routeChannel(client, identity, record);
+          // routeOpen may have awaited. Do not send a request after a close, even
+          // if a stale route entry just resolved.
+          if (!this.isCurrentSession(key, record)) {
+            throw new RouteTornDownError("subc session closed");
+          }
+          return opened;
+        } catch (err) {
+          // A teardown that raced the open is not a transport fault — surface it
+          // without dropping the client or charging the failure budget.
+          if (err instanceof RouteTornDownError) throw err;
+          // routeOpen itself failed. Classify the error like other request failures
+          // for transient connection death, but only while this request's session
+          // and client are still current. A close-induced failure must not drop a
+          // healthy client shared by other sessions.
+          if (
+            isConsumerReconnectTransient(err) &&
+            this.isCurrentSession(key, record) &&
+            this.client === client
+          ) {
+            this.dropClient(client);
+          }
+          throw err;
+        }
+      };
+
+      const clearRouteEntry = (entry: RouteEntry): void => {
+        if (record.routeEntry === entry) {
+          entry.closed = true;
+          record.routeEntry = null;
+        }
+      };
+
+      const handleRequestFailure = (err: unknown, entry: RouteEntry): void => {
+        // The raw `request()` path does not turn failures into SubcCallError; it
+        // rejects with a base SubcError for route-level failures or a raw socket
+        // error for connection failures. Use `isConsumerReconnectTransient`, not
+        // `instanceof SubcCallError`, to distinguish a dead connection from a dead
+        // route.
+        //
+        // A failed request makes its own route suspect, so drop it and let the next
+        // call re-open. Check only the current entry; a stale failure must not
+        // delete a successor route in the same still-open session.
+        clearRouteEntry(entry);
+        // Only a failure from the current session on the current client can charge
+        // or drop that client. A failure caused by closeSession sees
+        // !isCurrentSession because close marked/deleted the record before awaiting
+        // transport cleanup.
+        if (this.isCurrentSession(key, record) && this.client === client) {
+          if (isConsumerReconnectTransient(err)) {
+            this.transportFailures = 0;
+            this.dropClient(client);
+          } else if (
+            !isUnknownChannelError(err) &&
+            ++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES
+          ) {
+            // A run of non-transient throws (timeouts / route GOODBYEs) with no
+            // success between them is a half-open socket: local writes succeed but
+            // no response ever returns, so isConsumerReconnectTransient never fires
+            // and the client would otherwise be kept forever. Force reconnect.
+            this.transportFailures = 0;
+            this.dropClient(client);
+          }
+        }
+      };
+
+      const requestOnRoute = async (channel: number): Promise<unknown> => {
         // Forward the caller's progress callback to the subc client. Current
         // foreground calls return one final reply, so production does not rely on
         // live progress events here.
@@ -637,37 +683,30 @@ export class SubcTransportPool implements AftTransportPool {
         // resurrect one.
         this.ensureBgSubscription(identity, record);
         return reply;
+      };
+
+      let { channel, entry } = await openRoute();
+      try {
+        return await requestOnRoute(channel);
       } catch (err) {
-        // The raw `request()` path does not turn failures into SubcCallError; it
-        // rejects with a base SubcError for route-level failures or a raw socket
-        // error for connection failures. Use `isConsumerReconnectTransient`, not
-        // `instanceof SubcCallError`, to distinguish a dead connection from a dead
-        // route.
-        //
-        // A failed request makes its own route suspect, so drop it and let the next
-        // call re-open. Check only the current entry; a stale failure must not
-        // delete a successor route in the same still-open session.
-        if (record.routeEntry === entry) {
-          entry.closed = true;
-          record.routeEntry = null;
-        }
-        // Only a failure from the current session on the current client can charge
-        // or drop that client. A failure caused by closeSession sees
-        // !isCurrentSession because close marked/deleted the record before awaiting
-        // transport cleanup.
-        if (this.isCurrentSession(key, record) && this.client === client) {
-          if (isConsumerReconnectTransient(err)) {
-            this.transportFailures = 0;
-            this.dropClient(client);
-          } else if (++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES) {
-            // A run of non-transient throws (timeouts / route GOODBYEs) with no
-            // success between them is a half-open socket: local writes succeed but
-            // no response ever returns, so isConsumerReconnectTransient never fires
-            // and the client would otherwise be kept forever. Force reconnect.
-            this.transportFailures = 0;
-            this.dropClient(client);
+        if (
+          isUnknownChannelError(err) &&
+          this.isCurrentSession(key, record) &&
+          this.client === client
+        ) {
+          // The daemon says this channel does not exist, so the request was not
+          // delivered to the module. Reopen the route and resend once; all other
+          // route/request failures keep the no-auto-retry mutation-safety rule.
+          clearRouteEntry(entry);
+          ({ channel, entry } = await openRoute());
+          try {
+            return await requestOnRoute(channel);
+          } catch (retryErr) {
+            handleRequestFailure(retryErr, entry);
+            throw retryErr;
           }
         }
+        handleRequestFailure(err, entry);
         throw err;
       }
     } finally {
