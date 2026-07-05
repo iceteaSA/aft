@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { constants } from "node:fs";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 
@@ -11,6 +11,8 @@ const SUBC_BINARY_NAME = process.platform === "win32" ? "subc-core.exe" : "subc-
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../../..");
 const TARGET_DEBUG_BINARY = resolve(PROJECT_ROOT, "target", "debug", AFT_BINARY_NAME);
 const FALLBACK_AFT_BINARY = resolve(homedir(), ".cargo", "bin", AFT_BINARY_NAME);
+const FETCH_SUBC_CORE_SCRIPT = resolve(PROJECT_ROOT, "scripts", "fetch-subc-core.sh");
+const FETCHED_SUBC_CORE_CACHE_ROOT = resolve(homedir(), ".cache", "aft-ci", "subc-core");
 const DEFAULT_SUBC_RELEASE = resolve(
   homedir(),
   "Work/Projects/CortexKit/subconscious/target/release",
@@ -316,9 +318,27 @@ async function resolveSubcCore(): Promise<{ path: string | null; skipReason?: st
   for (const candidate of [DEFAULT_SUBC_RELEASE, DEFAULT_SUBC_DEBUG]) {
     if (await isExecutable(candidate)) return { path: candidate };
   }
+
+  const fetchedCache = await resolveFetchedSubcCoreCachePath();
+  if (fetchedCache.path && (await isExecutable(fetchedCache.path))) {
+    return { path: fetchedCache.path };
+  }
+
+  const siblingLocations = `${DEFAULT_SUBC_RELEASE} or ${DEFAULT_SUBC_DEBUG}`;
+  if (fetchedCache.path) {
+    return {
+      path: null,
+      skipReason:
+        `subc-core binary not found at ${siblingLocations}; set SUBC_CORE_BIN, ` +
+        `build the sibling subconscious checkout, or run ${relative(PROJECT_ROOT, FETCH_SUBC_CORE_SCRIPT)} ` +
+        `once to populate ${fetchedCache.path}`,
+    };
+  }
   return {
     path: null,
-    skipReason: `subc-core binary not found at ${DEFAULT_SUBC_RELEASE} or ${DEFAULT_SUBC_DEBUG}; set SUBC_CORE_BIN`,
+    skipReason:
+      `subc-core binary not found at ${siblingLocations}; set SUBC_CORE_BIN or build the sibling ` +
+      `subconscious checkout (${fetchedCache.unavailableReason ?? "no cached release is available"})`,
   };
 }
 
@@ -327,6 +347,18 @@ async function prepareAftBinary(): Promise<{
   skipReason?: string;
   buildAttempted: boolean;
 }> {
+  const envPath = process.env.AFT_BINARY_PATH?.trim();
+  if (envPath) {
+    if (await isExecutable(envPath)) {
+      return { binaryPath: envPath, buildAttempted: false };
+    }
+    const skipReason = `AFT_BINARY_PATH is not executable: ${envPath}`;
+    if (process.env.CI === "true") {
+      throw new Error(`e2e setup failed: ${skipReason}`);
+    }
+    return { binaryPath: null, skipReason, buildAttempted: false };
+  }
+
   if (await isExecutable(TARGET_DEBUG_BINARY)) {
     return { binaryPath: TARGET_DEBUG_BINARY, buildAttempted: false };
   }
@@ -349,6 +381,53 @@ async function prepareAftBinary(): Promise<{
     throw new Error(`e2e setup failed: ${skipReason}`);
   }
   return { binaryPath: null, skipReason, buildAttempted: true };
+}
+
+async function resolveFetchedSubcCoreCachePath(): Promise<{
+  path: string | null;
+  unavailableReason?: string;
+}> {
+  const target = fetchedSubcCoreTarget();
+  if (!target) {
+    return {
+      path: null,
+      unavailableReason:
+        `the pinned fetch cache only publishes darwin-arm64 and linux-x64 assets (current: ${process.platform}/${process.arch})`,
+    };
+  }
+
+  const tag = await readPinnedSubcCoreTag();
+  if (!tag) {
+    return {
+      path: null,
+      unavailableReason: `could not read SUBC_CORE_TAG from ${relative(PROJECT_ROOT, FETCH_SUBC_CORE_SCRIPT)}`,
+    };
+  }
+
+  return { path: resolve(FETCHED_SUBC_CORE_CACHE_ROOT, tag, `subc-core`) };
+}
+
+function fetchedSubcCoreTarget(): string | null {
+  if (process.platform === "darwin" && process.arch === "arm64") return "darwin-arm64";
+  if (process.platform === "linux" && process.arch === "x64") return "linux-x64";
+  return null;
+}
+
+let pinnedSubcCoreTagPromise: Promise<string | null> | null = null;
+
+async function readPinnedSubcCoreTag(): Promise<string | null> {
+  pinnedSubcCoreTagPromise ??= readPinnedSubcCoreTagOnce();
+  return pinnedSubcCoreTagPromise;
+}
+
+async function readPinnedSubcCoreTagOnce(): Promise<string | null> {
+  try {
+    const script = await readFile(FETCH_SUBC_CORE_SCRIPT, "utf8");
+    const match = script.match(/^SUBC_CORE_TAG=["\']?([^"\'\n]+)["\']?$/m);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 async function spawnReadyDaemon(

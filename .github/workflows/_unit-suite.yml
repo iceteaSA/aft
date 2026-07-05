@@ -89,12 +89,24 @@ jobs:
         if: inputs.strict == true
         run: bun run --filter '*' build
 
+      - name: Fetch pinned subc-core
+        id: subc_core
+        env:
+          # gh reads GH_TOKEN / GITHUB_TOKEN for release downloads. Keep the
+          # repo-read auth boundary explicit and skip interactive login probes.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          path="$(./scripts/fetch-subc-core.sh)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
       - name: Bun test (all packages)
         run: bun run test:unit
         env:
           # Tests don't need real cache locations — keep them out of the runner's
           # ~/.cache to avoid cross-test pollution.
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
+          SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
 
   # ---------------------------------------------------------------------------
   # Rust + plugin tests on macOS
@@ -154,10 +166,22 @@ jobs:
       - name: Bun typecheck
         run: bun run typecheck
 
+      - name: Fetch pinned subc-core
+        id: subc_core
+        env:
+          # gh reads GH_TOKEN / GITHUB_TOKEN for release downloads. Keep the
+          # repo-read auth boundary explicit and skip interactive login probes.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          path="$(./scripts/fetch-subc-core.sh)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
       - name: Bun test (all packages)
         run: bun run test:unit
         env:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
+          SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
 
   # ---------------------------------------------------------------------------
   # Rust integration tests on Windows
