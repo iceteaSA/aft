@@ -63,7 +63,7 @@ class FakeSubscription {
 /** Records every routeOpen/request/subscribe so a test can assert caching + bodies. */
 class FakeClient implements SubcClientLike {
   routeOpens: BindIdentity[] = [];
-  requests: { channel: number; body: unknown }[] = [];
+  requests: { channel: number; body: unknown; options?: { timeoutMs?: number } }[] = [];
   subscriptions: FakeSubscription[] = [];
   closedRoutes: number[] = [];
   closed = 0;
@@ -87,8 +87,12 @@ class FakeClient implements SubcClientLike {
     return this.nextChannel++;
   }
 
-  async request(channel: number, body: unknown): Promise<unknown> {
-    this.requests.push({ channel, body });
+  async request(
+    channel: number,
+    body: unknown,
+    options?: { timeoutMs?: number },
+  ): Promise<unknown> {
+    this.requests.push({ channel, body, options });
     return this.onRequest(channel, body);
   }
 
@@ -198,6 +202,25 @@ describe("SubcTransport.toolCall", () => {
       arguments: { oldString: "a" },
       preview: true,
     });
+  });
+
+  test("transportTimeoutMs (wait-aware bash budget) reaches the wire request deadline", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "ok" }));
+    const { pool } = poolWith(client);
+    const t = pool.getBridge("/work/proj");
+
+    // Orchestrated bash passes its wait-aware budget as transportTimeoutMs;
+    // it must win over timeoutMs and reach client.request, otherwise long
+    // commands die at the client's default unary deadline mid-execution.
+    await t.toolCall("s", "bash", { command: "sleep 100" }, {
+      transportTimeoutMs: 905_000,
+      timeoutMs: 60_000,
+    });
+    expect(client.requests[0]?.options?.timeoutMs).toBe(905_000);
+
+    // Plain per-command override still applies when no orchestrated budget.
+    await t.toolCall("s", "grep", { query: "x" }, { timeoutMs: 60_000 });
+    expect(client.requests[1]?.options?.timeoutMs).toBe(60_000);
   });
 
   test("caches the route per (root, harness, session) and reuses it", async () => {

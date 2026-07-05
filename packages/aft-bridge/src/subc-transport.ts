@@ -453,7 +453,11 @@ class SubcTransport implements AftProjectTransport {
   } {
     if (!options) return {};
     const preview = (options as ToolCallOptions).preview;
-    const timeoutMs = options.timeoutMs;
+    // Mirror BinaryBridge.send's budget precedence (transportTimeoutMs wins):
+    // orchestrated bash passes its wait-aware budget as transportTimeoutMs, and
+    // dropping it here would cap long tool executions at the subc client's
+    // default unary deadline while the command keeps running module-side.
+    const timeoutMs = options.transportTimeoutMs ?? options.timeoutMs;
     const onProgress = (options as { onProgress?: RequestOptions["onProgress"] }).onProgress;
     return { preview, timeoutMs, onProgress };
   }
