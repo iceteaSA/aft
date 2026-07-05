@@ -1007,13 +1007,13 @@ pub fn spawn_search_corpus_refresh(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
     ctx.reset_symbol_cache();
 
-    let is_worktree_bridge = ctx.is_worktree_bridge();
+    let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
     let session_id = log_ctx::current_session();
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
             let cache_dir =
                 aft::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
-            let _cache_lock = if is_worktree_bridge {
+            let _cache_lock = if shared_artifacts_read_only {
                 None
             } else {
                 match aft::search_index::CacheLock::acquire(&cache_dir) {
@@ -1033,7 +1033,7 @@ pub fn spawn_search_corpus_refresh(
                 &cache_dir,
             );
             delay_search_rebuild_publish_for_debug();
-            if !is_worktree_bridge {
+            if !shared_artifacts_read_only {
                 let head = index.stored_git_head().map(str::to_owned);
                 index.write_to_disk(&cache_dir, head.as_deref());
             }
@@ -1095,13 +1095,13 @@ pub fn refresh_project_corpus(
         }
     }
 
-    if config.search_index {
+    if config.search_index && !ctx.shared_artifacts_read_only() {
         spawn_search_corpus_refresh(ctx, root.clone(), config.clone());
         status_changed = true;
         aft::slog_info!("started search index refresh after {}", reason);
     }
 
-    if config.semantic_search {
+    if config.semantic_search && !ctx.shared_artifacts_read_only() {
         if let Some(sender) = ctx.semantic_refresh_sender() {
             *ctx.semantic_index_status()
                 .write()
@@ -1351,7 +1351,7 @@ pub fn drain_watcher_events(ctx: &AppContext) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         search_index_rx.is_some()
     };
-    if !oversized_inline_batch && search_build_in_progress {
+    if !ctx.shared_artifacts_read_only() && !oversized_inline_batch && search_build_in_progress {
         ctx.add_pending_search_index_paths(changed.iter().cloned());
     }
     let semantic_source_paths = changed
@@ -1361,16 +1361,19 @@ pub fn drain_watcher_events(ctx: &AppContext) {
         .collect::<Vec<_>>();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
-    if !oversized_inline_batch
+    if !ctx.shared_artifacts_read_only()
+        && !oversized_inline_batch
         && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
         && !semantic_source_paths.is_empty()
     {
         ctx.add_pending_semantic_index_paths(semantic_source_paths.clone());
     }
 
-    if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
-        for path in &changed {
-            symbol_cache.invalidate(path);
+    if !ctx.shared_artifacts_read_only() {
+        if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
+            for path in &changed {
+                symbol_cache.invalidate(path);
+            }
         }
     }
 
@@ -1378,7 +1381,7 @@ pub fn drain_watcher_events(ctx: &AppContext) {
     if !oversized_inline_batch {
         refresh_callgraph_store_for_watcher(ctx, &changed);
 
-        {
+        if !ctx.shared_artifacts_read_only() {
             let mut index_ref = ctx
                 .search_index()
                 .write()
@@ -1394,7 +1397,9 @@ pub fn drain_watcher_events(ctx: &AppContext) {
             }
         }
 
-        let stale_paths = {
+        let stale_paths = if ctx.shared_artifacts_read_only() {
+            Vec::new()
+        } else {
             let mut semantic_index_ref = ctx
                 .semantic_index()
                 .write()

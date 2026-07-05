@@ -3220,6 +3220,7 @@ fn submit_maintenance_drain(
         Lane::Mutating,
         request_id.clone(),
         Box::new(move |ctx| {
+            ctx.heartbeat_artifact_owner_lease();
             runtime_drain::drain_configure_warning_events(ctx);
             runtime_drain::drain_search_index_events(ctx);
             runtime_drain::drain_callgraph_store_events(ctx);

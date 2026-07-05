@@ -220,6 +220,10 @@ impl AppContext {
         // project subdirectory. Empty list = full-featured mode.
         let degraded_reasons = self.degraded_reasons();
         let degraded = !degraded_reasons.is_empty();
+        let artifact_owner = self
+            .artifact_owner_status()
+            .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null);
 
         // Agent status-bar counts (the `[AFT E· W· | D· U· C· | T·]` glance).
         // Surfaced for the TUI sidebar so users see the same code-health view
@@ -244,6 +248,7 @@ impl AppContext {
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
             "canonical_root": self.canonical_cache_root_opt().map(|p| p.display().to_string()),
             "cache_role": self.cache_role(),
+            "artifact_owner": artifact_owner,
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
             "features": {

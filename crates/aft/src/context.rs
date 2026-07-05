@@ -10,6 +10,7 @@ use notify::RecommendedWatcher;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::artifact_owner::{ArtifactOwnerLease, ArtifactOwnerMode, ArtifactOwnerStatus};
 use crate::backup::hash_session;
 use crate::backup::BackupStore;
 use crate::bash_background::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
@@ -660,6 +661,9 @@ pub struct AppContext {
     canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
     is_worktree_bridge: parking_lot::Mutex<bool>,
     git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
+    shared_artifacts_read_only: parking_lot::Mutex<bool>,
+    artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
+    artifact_owner_lease: parking_lot::Mutex<Option<ArtifactOwnerLease>>,
     /// Reasons (if any) why heavy AFT subsystems were auto-disabled for the
     /// current project root. Populated by `handle_configure` based on the
     /// canonical project root. Each reason is a stable machine-readable string
@@ -862,6 +866,9 @@ impl AppContext {
             canonical_cache_root: parking_lot::Mutex::new(None),
             is_worktree_bridge: parking_lot::Mutex::new(false),
             git_common_dir: parking_lot::Mutex::new(None),
+            shared_artifacts_read_only: parking_lot::Mutex::new(false),
+            artifact_owner_status: parking_lot::Mutex::new(None),
+            artifact_owner_lease: parking_lot::Mutex::new(None),
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
             callgraph_store: RwLock::new(None),
             callgraph_store_force_rebuild: parking_lot::Mutex::new(false),
@@ -1624,6 +1631,33 @@ impl AppContext {
         *self.git_common_dir.lock() = git_common_dir;
     }
 
+    pub fn set_artifact_owner(
+        &self,
+        status: Option<ArtifactOwnerStatus>,
+        lease: Option<ArtifactOwnerLease>,
+    ) {
+        let read_only = status
+            .as_ref()
+            .is_some_and(|status| status.mode == ArtifactOwnerMode::ReadOnly);
+        *self.shared_artifacts_read_only.lock() = read_only;
+        *self.artifact_owner_status.lock() = status;
+        *self.artifact_owner_lease.lock() = lease;
+    }
+
+    pub fn shared_artifacts_read_only(&self) -> bool {
+        self.is_worktree_bridge() || *self.shared_artifacts_read_only.lock()
+    }
+
+    pub fn artifact_owner_status(&self) -> Option<ArtifactOwnerStatus> {
+        self.artifact_owner_status.lock().clone()
+    }
+
+    pub fn heartbeat_artifact_owner_lease(&self) {
+        if let Some(lease) = self.artifact_owner_lease.lock().as_mut() {
+            lease.heartbeat_if_due();
+        }
+    }
+
     pub fn is_worktree_bridge(&self) -> bool {
         *self.is_worktree_bridge.lock()
     }
@@ -1666,6 +1700,8 @@ impl AppContext {
             "not_initialized"
         } else if self.is_worktree_bridge() {
             "worktree"
+        } else if *self.shared_artifacts_read_only.lock() {
+            "read_only"
         } else {
             "main"
         }

@@ -1508,6 +1508,44 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         crate::format::clear_tool_cache();
     }
 
+    let project_key = artifact_cache_key(&canonical_cache_root);
+    let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
+    let artifact_owner_claim = if home_match {
+        None
+    } else {
+        match crate::artifact_owner::claim_or_open_read_only(
+            next_config.storage_dir.as_deref(),
+            &canonical_cache_root,
+            &project_key,
+            &project_scope_key,
+            git_common_dir.as_deref(),
+        ) {
+            Ok(claim) => Some(claim),
+            Err(error) => {
+                return Response::error(
+                    &req.id,
+                    "artifact_owner_unavailable",
+                    format!("failed to claim artifact owner manifest: {error}"),
+                );
+            }
+        }
+    };
+    let artifact_owner_status = artifact_owner_claim
+        .as_ref()
+        .map(|claim| claim.status.clone());
+    let artifact_owner_read_only = artifact_owner_status
+        .as_ref()
+        .is_some_and(|status| status.mode == crate::artifact_owner::ArtifactOwnerMode::ReadOnly);
+    if artifact_owner_read_only {
+        degraded_reasons.push("artifact_owner_read_only".to_string());
+        if let Some(note) = artifact_owner_status
+            .as_ref()
+            .and_then(|status| status.note.as_ref())
+        {
+            slog_warn!("{}", note);
+        }
+    }
+
     // Commit phase: no validation returns after this point.
     ctx.set_config(next_config.clone());
     ctx.set_harness(harness.clone());
@@ -1525,9 +1563,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
+    let artifact_owner_lease = artifact_owner_claim.and_then(|claim| claim.lease);
+    ctx.set_artifact_owner(artifact_owner_status.clone(), artifact_owner_lease);
     ctx.reset_tier2_refresh_scheduler();
     let semantic_cold_seed_generation = ctx.reset_semantic_cold_seed_gate_for_configure();
-    if next_config.semantic_search && !is_worktree_bridge && !home_match {
+    if next_config.semantic_search && !ctx.shared_artifacts_read_only() && !home_match {
         ctx.schedule_semantic_cold_seed_gate_for_configure();
     }
     // Project root (and thus tsconfig resolution) may have changed; drop the
@@ -1680,144 +1720,213 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if search_index {
         let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
         let current_head = current_git_head(&canonical_cache_root);
-        let baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
-        search_index_cache_reused = baseline.is_some();
 
         let root_for_prewarm = canonical_cache_root.clone();
         let symbol_cache = ctx.symbol_cache();
         let symbol_storage = storage_dir.clone();
-        let symbol_project_key = artifact_cache_key(&canonical_cache_root);
+        let symbol_project_key = project_key.clone();
         let is_worktree_bridge_for_search = is_worktree_bridge;
+        let shared_artifacts_read_only_for_search = ctx.shared_artifacts_read_only();
         let session_id_for_bg = log_ctx::current_session();
 
-        match baseline {
-            Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
-                // Install the cached index immediately as NOT-ready, then VERIFY
-                // it against disk on a BACKGROUND thread. `verify_against_disk`
-                // walks the project and content-hashes every cached file
-                // (verify_file_strict → blake3), which is O(repo) and MUST NOT
-                // run on the dispatch thread: configure is dispatched on the
-                // single request loop, so an inline verify blocks configure and
-                // every queued request (bash/read/edit) past the 30s transport
-                // timeout on a large repo. This regressed in v0.39.1 — v0.39.0
-                // verify was stat-only (mtime+size); content_hash was added to
-                // FileFreshness so verify now hashes all files. While ready=false
-                // grep/glob fall back to a walk, exactly like the cache-miss
-                // branch below. The drain installs the verified, ready index.
-                index.set_ready(false);
-                *ctx.search_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index.clone());
-
-                let (tx, rx): (
-                    crossbeam_channel::Sender<SearchIndex>,
-                    crossbeam_channel::Receiver<SearchIndex>,
-                ) = unbounded();
-                *ctx.search_index_rx()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
-
-                #[cfg(debug_assertions)]
-                mark_search_rebuild_spawn_for_debug();
-
-                let head_for_verify = current_head.clone();
-                thread::spawn(move || {
-                    let session_id_for_prewarm = session_id_for_bg.clone();
-                    log_ctx::with_session(session_id_for_bg, || {
-                        let mut verified = index;
-                        let _cache_lock = if is_worktree_bridge_for_search {
-                            None
-                        } else {
-                            CacheLock::acquire(&cache_dir).ok()
-                        };
-                        verified.verify_against_disk(head_for_verify);
-                        let symbol_files = search_index_symbol_files(&verified);
-                        let _ = tx.send(verified);
-                        spawn_symbol_cache_prewarm(
-                            root_for_prewarm,
-                            symbol_cache,
-                            symbol_storage,
-                            symbol_project_key,
-                            symbol_cache_generation,
-                            symbol_files,
-                            is_worktree_bridge_for_search,
-                            session_id_for_prewarm,
-                        );
-                    });
-                });
+        if shared_artifacts_read_only_for_search {
+            match crate::readonly_artifacts::open_search_index_read_only(
+                &canonical_cache_root,
+                storage_dir.as_deref(),
+            ) {
+                crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
+                    search_index_cache_reused = true;
+                    let symbol_files = search_index_symbol_files(&index);
+                    *ctx.search_index()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                    spawn_symbol_cache_prewarm(
+                        root_for_prewarm,
+                        symbol_cache,
+                        symbol_storage,
+                        symbol_project_key,
+                        symbol_cache_generation,
+                        symbol_files,
+                        true,
+                        session_id_for_bg,
+                    );
+                }
+                crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                    slog_warn!(
+                        "search index is read-only and stale for {} file(s); not repairing shared artifacts",
+                        stale.drift_count
+                    );
+                }
+                crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
+                    slog_warn!("search index is read-only but no shared artifact snapshot exists");
+                }
             }
-            mut baseline => {
-                if let Some(index) = baseline.as_mut() {
+        } else {
+            let baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
+            search_index_cache_reused = baseline.is_some();
+            match baseline {
+                Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
+                    // Install the cached index immediately as NOT-ready, then VERIFY
+                    // it against disk on a BACKGROUND thread. `verify_against_disk`
+                    // walks the project and content-hashes every cached file
+                    // (verify_file_strict → blake3), which is O(repo) and MUST NOT
+                    // run on the dispatch thread: configure is dispatched on the
+                    // single request loop, so an inline verify blocks configure and
+                    // every queued request (bash/read/edit) past the 30s transport
+                    // timeout on a large repo. This regressed in v0.39.1 — v0.39.0
+                    // verify was stat-only (mtime+size); content_hash was added to
+                    // FileFreshness so verify now hashes all files. While ready=false
+                    // grep/glob fall back to a walk, exactly like the cache-miss
+                    // branch below. The drain installs the verified, ready index.
                     index.set_ready(false);
                     *ctx.search_index()
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index.clone());
-                }
 
-                let (tx, rx): (
-                    crossbeam_channel::Sender<SearchIndex>,
-                    crossbeam_channel::Receiver<SearchIndex>,
-                ) = unbounded();
-                *ctx.search_index_rx()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+                    let (tx, rx): (
+                        crossbeam_channel::Sender<SearchIndex>,
+                        crossbeam_channel::Receiver<SearchIndex>,
+                    ) = unbounded();
+                    *ctx.search_index_rx()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
 
-                #[cfg(debug_assertions)]
-                mark_search_rebuild_spawn_for_debug();
+                    #[cfg(debug_assertions)]
+                    mark_search_rebuild_spawn_for_debug();
 
-                let root_clone = canonical_cache_root.clone();
-                thread::spawn(move || {
-                    let session_id_for_prewarm = session_id_for_bg.clone();
-                    log_ctx::with_session(session_id_for_bg, || {
-                        let index = {
+                    let head_for_verify = current_head.clone();
+                    thread::spawn(move || {
+                        let session_id_for_prewarm = session_id_for_bg.clone();
+                        log_ctx::with_session(session_id_for_bg, || {
+                            let mut verified = index;
                             let _cache_lock = if is_worktree_bridge_for_search {
                                 None
                             } else {
-                                match CacheLock::acquire(&cache_dir) {
-                                    Ok(lock) => Some(lock),
-                                    Err(error) => {
-                                        slog_warn!(
-                                            "failed to acquire search cache lock: {}",
-                                            error
-                                        );
-                                        None
-                                    }
-                                }
+                                CacheLock::acquire(&cache_dir).ok()
                             };
-                            let mut index = SearchIndex::rebuild_or_refresh(
-                                &root_clone,
-                                search_index_max_file_size,
-                                current_head,
-                                baseline,
-                                Some(&cache_dir),
+                            verified.verify_against_disk(head_for_verify);
+                            let symbol_files = search_index_symbol_files(&verified);
+                            let _ = tx.send(verified);
+                            spawn_symbol_cache_prewarm(
+                                root_for_prewarm,
+                                symbol_cache,
+                                symbol_storage,
+                                symbol_project_key,
+                                symbol_cache_generation,
+                                symbol_files,
+                                is_worktree_bridge_for_search,
+                                session_id_for_prewarm,
                             );
-                            delay_search_rebuild_publish_for_debug();
-                            if !is_worktree_bridge_for_search {
-                                let head = index.stored_git_head().map(str::to_owned);
-                                index.write_to_disk(&cache_dir, head.as_deref());
-                            }
-                            index
-                        };
-
-                        let symbol_files = search_index_symbol_files(&index);
-                        let _ = tx.send(index);
-                        spawn_symbol_cache_prewarm(
-                            root_clone,
-                            symbol_cache,
-                            symbol_storage,
-                            symbol_project_key,
-                            symbol_cache_generation,
-                            symbol_files,
-                            is_worktree_bridge_for_search,
-                            session_id_for_prewarm,
-                        );
+                        });
                     });
-                });
+                }
+                mut baseline => {
+                    if let Some(index) = baseline.as_mut() {
+                        index.set_ready(false);
+                        *ctx.search_index()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(index.clone());
+                    }
+
+                    let (tx, rx): (
+                        crossbeam_channel::Sender<SearchIndex>,
+                        crossbeam_channel::Receiver<SearchIndex>,
+                    ) = unbounded();
+                    *ctx.search_index_rx()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+
+                    #[cfg(debug_assertions)]
+                    mark_search_rebuild_spawn_for_debug();
+
+                    let root_clone = canonical_cache_root.clone();
+                    thread::spawn(move || {
+                        let session_id_for_prewarm = session_id_for_bg.clone();
+                        log_ctx::with_session(session_id_for_bg, || {
+                            let index = {
+                                let _cache_lock = if is_worktree_bridge_for_search {
+                                    None
+                                } else {
+                                    match CacheLock::acquire(&cache_dir) {
+                                        Ok(lock) => Some(lock),
+                                        Err(error) => {
+                                            slog_warn!(
+                                                "failed to acquire search cache lock: {}",
+                                                error
+                                            );
+                                            None
+                                        }
+                                    }
+                                };
+                                let mut index = SearchIndex::rebuild_or_refresh(
+                                    &root_clone,
+                                    search_index_max_file_size,
+                                    current_head,
+                                    baseline,
+                                    Some(&cache_dir),
+                                );
+                                delay_search_rebuild_publish_for_debug();
+                                if !is_worktree_bridge_for_search {
+                                    let head = index.stored_git_head().map(str::to_owned);
+                                    index.write_to_disk(&cache_dir, head.as_deref());
+                                }
+                                index
+                            };
+
+                            let symbol_files = search_index_symbol_files(&index);
+                            let _ = tx.send(index);
+                            spawn_symbol_cache_prewarm(
+                                root_clone,
+                                symbol_cache,
+                                symbol_storage,
+                                symbol_project_key,
+                                symbol_cache_generation,
+                                symbol_files,
+                                is_worktree_bridge_for_search,
+                                session_id_for_prewarm,
+                            );
+                        });
+                    });
+                }
             }
         }
     }
 
-    if semantic_search {
+    if semantic_search && ctx.shared_artifacts_read_only() {
+        match crate::readonly_artifacts::open_semantic_index_read_only(
+            &canonical_cache_root,
+            storage_dir.as_deref(),
+        ) {
+            crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
+                *ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::ready();
+            }
+            crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Failed(format!(
+                        "semantic index is read-only and stale for {} file(s)",
+                        stale.drift_count
+                    ));
+            }
+            crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Failed(
+                        "semantic index is read-only but no shared artifact snapshot exists"
+                            .to_string(),
+                    );
+            }
+        }
+    } else if semantic_search {
         let semantic_initial_stage = if previous_config.semantic_search
             && previous_project_root.as_deref() == Some(root_path.as_path())
             && semantic_fingerprint_config_changed(&previous_config.semantic, &semantic_config)
@@ -1851,7 +1960,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
         let root_clone = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
-        let semantic_project_key = crate::search_index::artifact_cache_key(&canonical_cache_root);
+        let semantic_project_key = project_key.clone();
         let semantic_config = semantic_config.clone();
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
@@ -2343,6 +2452,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "warnings": [],
             "warnings_pending": warnings_pending,
             "search_index_cache_reused": search_index_cache_reused,
+            "artifact_owner": artifact_owner_status
+                .as_ref()
+                .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null)),
             "config_dropped_keys": config_dropped_keys
                 .iter()
                 .map(|d| json!({ "key": d.key, "tier": d.tier, "reason": d.reason }))
@@ -2370,6 +2482,7 @@ mod tests {
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
+    use std::process::Command;
 
     fn test_context() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
@@ -2426,6 +2539,47 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, doc).unwrap();
+    }
+
+    fn init_git_fixture(root: &std::path::Path) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn configure_with_storage(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({ "search_index": true, "semantic_search": false }))],
+        }))
     }
 
     #[test]
@@ -2657,6 +2811,81 @@ mod tests {
             std::fs::canonicalize(temp.path()).unwrap()
         );
         assert_eq!(ctx.cache_role(), "main");
+    }
+
+    #[test]
+    fn sibling_clone_same_artifact_key_opens_shared_artifacts_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let owner = temp.path().join("owner");
+        init_git_fixture(&owner);
+        let sibling = temp.path().join("sibling");
+        assert!(Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&owner)
+            .arg(&sibling)
+            .status()
+            .unwrap()
+            .success());
+
+        let owner_ctx = test_context();
+        let owner_response =
+            super::handle_configure(&configure_with_storage(&owner, &storage), &owner_ctx);
+        assert!(owner_response.success);
+        assert_eq!(owner_ctx.cache_role(), "main");
+
+        let sibling_ctx = test_context();
+        let sibling_response =
+            super::handle_configure(&configure_with_storage(&sibling, &storage), &sibling_ctx);
+
+        assert!(sibling_response.success);
+        assert_eq!(sibling_ctx.cache_role(), "read_only");
+        assert!(sibling_ctx.shared_artifacts_read_only());
+        assert_eq!(
+            sibling_response.data["artifact_owner"]["mode"],
+            json!("read_only")
+        );
+        assert!(sibling_response.data["artifact_owner"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("shared artifacts opened read-only"));
+        assert!(sibling_ctx.search_index_rx().read().unwrap().is_none());
+    }
+
+    #[test]
+    fn dead_artifact_owner_manifest_is_taken_over_on_configure() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let owner = temp.path().join("owner");
+        init_git_fixture(&owner);
+        let sibling = temp.path().join("sibling");
+        assert!(Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&owner)
+            .arg(&sibling)
+            .status()
+            .unwrap()
+            .success());
+        let key = crate::search_index::artifact_cache_key(&owner);
+        crate::artifact_owner::write_synthetic_manifest_for_test(
+            &storage,
+            &owner,
+            &key,
+            "dead-owner",
+            0,
+            0,
+        );
+
+        let sibling_ctx = test_context();
+        let sibling_response =
+            super::handle_configure(&configure_with_storage(&sibling, &storage), &sibling_ctx);
+
+        assert!(sibling_response.success);
+        assert_eq!(sibling_ctx.cache_role(), "main");
+        assert_eq!(
+            sibling_response.data["artifact_owner"]["mode"],
+            json!("owner")
+        );
     }
 
     #[test]

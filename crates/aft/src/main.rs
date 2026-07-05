@@ -294,6 +294,7 @@ fn main() {
 
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
+        runtime.heartbeat_artifact_owner_lease();
         aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::runtime_drain::drain_search_index_events(runtime);
         aft::runtime_drain::drain_callgraph_store_events(runtime);

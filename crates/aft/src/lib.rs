@@ -46,6 +46,7 @@
 // Response::error instead of panicking. Confirmed zero .unwrap()/.expect() in
 // production error paths as of v0.6.3 audit.
 
+pub mod artifact_owner;
 pub mod ast_grep_hints;
 pub mod ast_grep_lang;
 pub mod backup;
