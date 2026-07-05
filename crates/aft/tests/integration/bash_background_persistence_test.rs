@@ -923,10 +923,19 @@ fn spawn_detached_survives_parent_restart() {
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
 
+    // The task must still be running when the restarted process rehydrates
+    // it. A fixed-duration sleep races the restart under CI load, so gate the
+    // task's exit on a sentinel file the test controls instead.
+    let stop_file = project.path().join("stop-detached-task");
+    let command = format!(
+        "until [ -e '{}' ]; do sleep 0.1; done",
+        stop_file.display()
+    );
+
     let task_id = {
         let mut aft = AftProcess::spawn();
         configure_background(&mut aft, project.path(), storage.path(), SESSION);
-        let task_id = spawn_bg(&mut aft, SESSION, "sleep 1", None);
+        let task_id = spawn_bg(&mut aft, SESSION, &command, None);
         assert!(aft.shutdown().success());
         task_id
     };
@@ -940,6 +949,7 @@ fn spawn_detached_survives_parent_restart() {
     );
     assert_eq!(running["status"], "running");
 
+    std::fs::write(&stop_file, b"stop").unwrap();
     let completed = wait_for_status(&mut aft, SESSION, &task_id, "completed");
     assert_eq!(completed["exit_code"], 0);
     assert!(aft.shutdown().success());

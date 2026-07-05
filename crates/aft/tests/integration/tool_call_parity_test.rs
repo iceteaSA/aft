@@ -443,6 +443,12 @@ fn normalize_value(value: &mut Value, project_root: &Path) {
                 "backup_id",
                 "project_cache_key",
                 "tier2_last_run",
+                // The artifact-owner block reports the cache key (derived from
+                // the temp root path, differs per process) and the manifest
+                // path (under the temp storage dir, outside root masking).
+                "project_key",
+                "manifest_path",
+                "owner_project_scope_key",
             ] {
                 if map.contains_key(key) {
                     map.insert(key.to_string(), Value::String(format!("<{key}>")));
@@ -488,5 +494,31 @@ fn normalize_text(text: &str, project_root: &Path) -> String {
     for root in roots {
         normalized = normalized.replace(&root, "<PROJECT_ROOT>");
     }
+    // The status text embeds the artifact-owner block whose key (derived from
+    // the temp root path) and manifest path (under the temp storage dir)
+    // differ per process — same class as the envelope-level masking above.
+    for key in ["project_key", "manifest_path", "owner_project_scope_key"] {
+        normalized = mask_json_string_value(&normalized, key);
+    }
     normalized
+}
+
+/// Replace every `"key": "<anything>"` string value with `"key": "<key>"` in
+/// a JSON-ish text blob, without a regex dependency.
+fn mask_json_string_value(text: &str, key: &str) -> String {
+    let needle = format!("\"{key}\": \"");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(&needle) {
+        let value_start = start + needle.len();
+        out.push_str(&rest[..value_start]);
+        let Some(end) = rest[value_start..].find('"') else {
+            rest = &rest[value_start..];
+            break;
+        };
+        out.push_str(&format!("<{key}>"));
+        rest = &rest[value_start + end..];
+    }
+    out.push_str(rest);
+    out
 }
