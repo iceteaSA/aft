@@ -1755,376 +1755,390 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     } else {
-    // Note: We intentionally only WARN on rapid reconfigure (rather than tracking
-    // JoinHandles to cancel old threads) because:
-    //   1. Old thread results are dropped when ctx.search_index_rx() is reset
-    //   2. Atomic tempfile writes via std::fs::rename are race-safe (last writer wins)
-    //   3. Only CPU is wasted; no correctness issue
-    //   4. Tracking handles would add complexity for negligible benefit
-    // If reconfigure rate becomes a real problem, switch to a single
-    // generation-counter + cancellation-token pattern.
-    if search_build_in_progress {
-        slog_warn!(
-            "search index build cancelled (superseded by generation {})",
-            configure_generation
-        );
-    }
-    if semantic_build_in_progress {
-        slog_warn!(
-            "semantic index build cancelled (superseded by generation {})",
-            configure_generation
-        );
-    }
-    if ctx.callgraph_store_rx().lock().is_some() {
-        slog_warn!(
-            "callgraph store warm build cancelled (superseded by generation {})",
-            configure_generation
-        );
-    }
+        // Note: We intentionally only WARN on rapid reconfigure (rather than tracking
+        // JoinHandles to cancel old threads) because:
+        //   1. Old thread results are dropped when ctx.search_index_rx() is reset
+        //   2. Atomic tempfile writes via std::fs::rename are race-safe (last writer wins)
+        //   3. Only CPU is wasted; no correctness issue
+        //   4. Tracking handles would add complexity for negligible benefit
+        // If reconfigure rate becomes a real problem, switch to a single
+        // generation-counter + cancellation-token pattern.
+        if search_build_in_progress {
+            slog_warn!(
+                "search index build cancelled (superseded by generation {})",
+                configure_generation
+            );
+        }
+        if semantic_build_in_progress {
+            slog_warn!(
+                "semantic index build cancelled (superseded by generation {})",
+                configure_generation
+            );
+        }
+        if ctx.callgraph_store_rx().lock().is_some() {
+            slog_warn!(
+                "callgraph store warm build cancelled (superseded by generation {})",
+                configure_generation
+            );
+        }
 
-    *ctx.search_index()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    *ctx.search_index_rx()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    let symbol_cache_generation = ctx.reset_symbol_cache();
-    *ctx.semantic_index()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    *ctx.semantic_index_rx().lock() = None;
-    *ctx.callgraph_store()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    if previous_project_root.as_ref() == Some(&root_path) {
-        ctx.mark_callgraph_store_force_rebuild();
-    }
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-    ctx.clear_semantic_refresh_worker();
-    *ctx.semantic_embedding_model().lock() = None;
-    ctx.clear_pending_index_updates();
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *ctx.search_index_rx()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let symbol_cache_generation = ctx.reset_symbol_cache();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *ctx.semantic_index_rx().lock() = None;
+        *ctx.callgraph_store()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if previous_project_root.as_ref() == Some(&root_path) {
+            ctx.mark_callgraph_store_force_rebuild();
+        }
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+        ctx.clear_semantic_refresh_worker();
+        *ctx.semantic_embedding_model().lock() = None;
+        ctx.clear_pending_index_updates();
 
-    // Snapshot accumulated degraded reasons on the context so status /
-    // sidebar / future tool calls all see the same state. The only
-    // synchronously-emitted reason is `home_root`.
-    // The semantic-build thread may push its own "skipped — too many files"
-    // status downstream; we don't yet thread that back into the persistent
-    // reasons list because semantic auto-skip is already surfaced through
-    // `SemanticIndexStatus::Failed`. If that ever becomes inconsistent UX
-    // we can wire it through a channel; for now status snapshot sources
-    // semantic state from the live SemanticIndexStatus, not the reasons.
-    ctx.set_degraded_reasons(degraded_reasons.clone());
+        // Snapshot accumulated degraded reasons on the context so status /
+        // sidebar / future tool calls all see the same state. The only
+        // synchronously-emitted reason is `home_root`.
+        // The semantic-build thread may push its own "skipped — too many files"
+        // status downstream; we don't yet thread that back into the persistent
+        // reasons list because semantic auto-skip is already surfaced through
+        // `SemanticIndexStatus::Failed`. If that ever becomes inconsistent UX
+        // we can wire it through a channel; for now status snapshot sources
+        // semantic state from the live SemanticIndexStatus, not the reasons.
+        ctx.set_degraded_reasons(degraded_reasons.clone());
 
-    let storage_dir = ctx.config().storage_dir.clone();
+        let storage_dir = ctx.config().storage_dir.clone();
 
-    if search_index {
-        let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
-        let current_head = current_git_head(&canonical_cache_root);
+        if search_index {
+            let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
+            let current_head = current_git_head(&canonical_cache_root);
 
-        let root_for_prewarm = canonical_cache_root.clone();
-        let symbol_cache = ctx.symbol_cache();
-        let symbol_storage = storage_dir.clone();
-        let symbol_project_key = project_key.clone();
-        let is_worktree_bridge_for_search = is_worktree_bridge;
-        let shared_artifacts_read_only_for_search = ctx.shared_artifacts_read_only();
-        let session_id_for_bg = log_ctx::current_session();
-        let search_generation = configure_generation;
-        let search_generation_flag = ctx.configure_generation_flag();
+            let root_for_prewarm = canonical_cache_root.clone();
+            let symbol_cache = ctx.symbol_cache();
+            let symbol_storage = storage_dir.clone();
+            let symbol_project_key = project_key.clone();
+            let is_worktree_bridge_for_search = is_worktree_bridge;
+            let shared_artifacts_read_only_for_search = ctx.shared_artifacts_read_only();
+            let session_id_for_bg = log_ctx::current_session();
+            let search_generation = configure_generation;
+            let search_generation_flag = ctx.configure_generation_flag();
 
-        if shared_artifacts_read_only_for_search {
-            match crate::readonly_artifacts::open_search_index_read_only(
-                &canonical_cache_root,
-                storage_dir.as_deref(),
-            ) {
-                crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
-                    search_index_cache_reused = true;
-                    let symbol_files = search_index_symbol_files(&index);
-                    *ctx.search_index()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-                    spawn_symbol_cache_prewarm(
-                        root_for_prewarm,
-                        symbol_cache,
-                        symbol_storage,
-                        symbol_project_key,
-                        symbol_cache_generation,
-                        symbol_files,
-                        true,
-                        session_id_for_bg,
-                    );
-                }
-                crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                    slog_warn!(
+            if shared_artifacts_read_only_for_search {
+                match crate::readonly_artifacts::open_search_index_read_only(
+                    &canonical_cache_root,
+                    storage_dir.as_deref(),
+                ) {
+                    crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
+                        search_index_cache_reused = true;
+                        let symbol_files = search_index_symbol_files(&index);
+                        *ctx.search_index()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                        spawn_symbol_cache_prewarm(
+                            root_for_prewarm,
+                            symbol_cache,
+                            symbol_storage,
+                            symbol_project_key,
+                            symbol_cache_generation,
+                            symbol_files,
+                            true,
+                            session_id_for_bg,
+                        );
+                    }
+                    crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                        slog_warn!(
                         "search index is read-only and stale for {} file(s); not repairing shared artifacts",
                         stale.drift_count
                     );
+                    }
+                    crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
+                        slog_warn!(
+                            "search index is read-only but no shared artifact snapshot exists"
+                        );
+                    }
                 }
-                crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
-                    slog_warn!("search index is read-only but no shared artifact snapshot exists");
-                }
-            }
-        } else {
-            let baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
-            search_index_cache_reused = baseline.is_some();
-            match baseline {
-                Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
-                    // Install the cached index immediately as NOT-ready, then VERIFY
-                    // it against disk on a BACKGROUND thread. `verify_against_disk`
-                    // walks the project and content-hashes every cached file
-                    // (verify_file_strict → blake3), which is O(repo) and MUST NOT
-                    // run on the dispatch thread: configure is dispatched on the
-                    // single request loop, so an inline verify blocks configure and
-                    // every queued request (bash/read/edit) past the 30s transport
-                    // timeout on a large repo. This regressed in v0.39.1 — v0.39.0
-                    // verify was stat-only (mtime+size); content_hash was added to
-                    // FileFreshness so verify now hashes all files. While ready=false
-                    // grep/glob fall back to a walk, exactly like the cache-miss
-                    // branch below. The drain installs the verified, ready index.
-                    index.set_ready(false);
-                    *ctx.search_index()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index.clone());
-
-                    let (tx, rx): (
-                        crossbeam_channel::Sender<SearchIndex>,
-                        crossbeam_channel::Receiver<SearchIndex>,
-                    ) = unbounded();
-                    *ctx.search_index_rx()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
-
-                    #[cfg(debug_assertions)]
-                    mark_search_rebuild_spawn_for_debug();
-
-                    let head_for_verify = current_head.clone();
-                    thread::spawn(move || {
-                        let session_id_for_prewarm = session_id_for_bg.clone();
-                        log_ctx::with_session(session_id_for_bg, || {
-                            let mut verified = index;
-                            let _cache_lock = if is_worktree_bridge_for_search {
-                                None
-                            } else {
-                                CacheLock::acquire(&cache_dir).ok()
-                            };
-                            verified.verify_against_disk(head_for_verify);
-                            let symbol_files = search_index_symbol_files(&verified);
-                            if search_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                                == search_generation
-                            {
-                                let _ = tx.send(verified);
-                            } else {
-                                slog_info!(
-                                    "search index build result discarded for stale generation {}",
-                                    search_generation
-                                );
-                                return;
-                            }
-                            spawn_symbol_cache_prewarm(
-                                root_for_prewarm,
-                                symbol_cache,
-                                symbol_storage,
-                                symbol_project_key,
-                                symbol_cache_generation,
-                                symbol_files,
-                                is_worktree_bridge_for_search,
-                                session_id_for_prewarm,
-                            );
-                        });
-                    });
-                }
-                mut baseline => {
-                    if let Some(index) = baseline.as_mut() {
+            } else {
+                let baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
+                search_index_cache_reused = baseline.is_some();
+                match baseline {
+                    Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
+                        // Install the cached index immediately as NOT-ready, then VERIFY
+                        // it against disk on a BACKGROUND thread. `verify_against_disk`
+                        // walks the project and content-hashes every cached file
+                        // (verify_file_strict → blake3), which is O(repo) and MUST NOT
+                        // run on the dispatch thread: configure is dispatched on the
+                        // single request loop, so an inline verify blocks configure and
+                        // every queued request (bash/read/edit) past the 30s transport
+                        // timeout on a large repo. This regressed in v0.39.1 — v0.39.0
+                        // verify was stat-only (mtime+size); content_hash was added to
+                        // FileFreshness so verify now hashes all files. While ready=false
+                        // grep/glob fall back to a walk, exactly like the cache-miss
+                        // branch below. The drain installs the verified, ready index.
                         index.set_ready(false);
                         *ctx.search_index()
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(index.clone());
-                    }
 
-                    let (tx, rx): (
-                        crossbeam_channel::Sender<SearchIndex>,
-                        crossbeam_channel::Receiver<SearchIndex>,
-                    ) = unbounded();
-                    *ctx.search_index_rx()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+                        let (tx, rx): (
+                            crossbeam_channel::Sender<SearchIndex>,
+                            crossbeam_channel::Receiver<SearchIndex>,
+                        ) = unbounded();
+                        *ctx.search_index_rx()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
 
-                    #[cfg(debug_assertions)]
-                    mark_search_rebuild_spawn_for_debug();
+                        #[cfg(debug_assertions)]
+                        mark_search_rebuild_spawn_for_debug();
 
-                    let root_clone = canonical_cache_root.clone();
-                    let search_generation_flag = Arc::clone(&search_generation_flag);
-                    thread::spawn(move || {
-                        let session_id_for_prewarm = session_id_for_bg.clone();
-                        log_ctx::with_session(session_id_for_bg, || {
-                            let index = {
+                        let head_for_verify = current_head.clone();
+                        thread::spawn(move || {
+                            let session_id_for_prewarm = session_id_for_bg.clone();
+                            log_ctx::with_session(session_id_for_bg, || {
+                                let _permit = crate::cold_build_limiter::acquire_blocking(
+                                    "search index warm verify",
+                                );
+                                let mut verified = index;
                                 let _cache_lock = if is_worktree_bridge_for_search {
                                     None
                                 } else {
-                                    match CacheLock::acquire(&cache_dir) {
-                                        Ok(lock) => Some(lock),
-                                        Err(error) => {
-                                            slog_warn!(
-                                                "failed to acquire search cache lock: {}",
-                                                error
-                                            );
-                                            None
-                                        }
-                                    }
+                                    CacheLock::acquire(&cache_dir).ok()
                                 };
-                                let mut index = SearchIndex::rebuild_or_refresh(
-                                    &root_clone,
-                                    search_index_max_file_size,
-                                    current_head,
-                                    baseline,
-                                    Some(&cache_dir),
-                                );
-                                delay_search_rebuild_publish_for_debug();
-                                if !is_worktree_bridge_for_search {
-                                    let head = index.stored_git_head().map(str::to_owned);
-                                    index.write_to_disk(&cache_dir, head.as_deref());
-                                }
-                                index
-                            };
-
-                            let symbol_files = search_index_symbol_files(&index);
-                            if search_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                                == search_generation
-                            {
-                                let _ = tx.send(index);
-                            } else {
-                                slog_info!(
+                                verified.verify_against_disk(head_for_verify);
+                                let symbol_files = search_index_symbol_files(&verified);
+                                if search_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                                    == search_generation
+                                {
+                                    let _ = tx.send(verified);
+                                } else {
+                                    slog_info!(
                                     "search index build result discarded for stale generation {}",
                                     search_generation
                                 );
-                                return;
-                            }
-                            spawn_symbol_cache_prewarm(
-                                root_clone,
-                                symbol_cache,
-                                symbol_storage,
-                                symbol_project_key,
-                                symbol_cache_generation,
-                                symbol_files,
-                                is_worktree_bridge_for_search,
-                                session_id_for_prewarm,
-                            );
+                                    return;
+                                }
+                                spawn_symbol_cache_prewarm(
+                                    root_for_prewarm,
+                                    symbol_cache,
+                                    symbol_storage,
+                                    symbol_project_key,
+                                    symbol_cache_generation,
+                                    symbol_files,
+                                    is_worktree_bridge_for_search,
+                                    session_id_for_prewarm,
+                                );
+                            });
                         });
-                    });
+                    }
+                    mut baseline => {
+                        if let Some(index) = baseline.as_mut() {
+                            index.set_ready(false);
+                            *ctx.search_index()
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(index.clone());
+                        }
+
+                        let (tx, rx): (
+                            crossbeam_channel::Sender<SearchIndex>,
+                            crossbeam_channel::Receiver<SearchIndex>,
+                        ) = unbounded();
+                        *ctx.search_index_rx()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+
+                        #[cfg(debug_assertions)]
+                        mark_search_rebuild_spawn_for_debug();
+
+                        let root_clone = canonical_cache_root.clone();
+                        let search_generation_flag = Arc::clone(&search_generation_flag);
+                        thread::spawn(move || {
+                            let session_id_for_prewarm = session_id_for_bg.clone();
+                            log_ctx::with_session(session_id_for_bg, || {
+                                let _permit = crate::cold_build_limiter::acquire_blocking(
+                                    "search index build",
+                                );
+                                let index = {
+                                    let _cache_lock = if is_worktree_bridge_for_search {
+                                        None
+                                    } else {
+                                        match CacheLock::acquire(&cache_dir) {
+                                            Ok(lock) => Some(lock),
+                                            Err(error) => {
+                                                slog_warn!(
+                                                    "failed to acquire search cache lock: {}",
+                                                    error
+                                                );
+                                                None
+                                            }
+                                        }
+                                    };
+                                    let mut index = SearchIndex::rebuild_or_refresh(
+                                        &root_clone,
+                                        search_index_max_file_size,
+                                        current_head,
+                                        baseline,
+                                        Some(&cache_dir),
+                                    );
+                                    delay_search_rebuild_publish_for_debug();
+                                    if !is_worktree_bridge_for_search {
+                                        let head = index.stored_git_head().map(str::to_owned);
+                                        index.write_to_disk(&cache_dir, head.as_deref());
+                                    }
+                                    index
+                                };
+
+                                let symbol_files = search_index_symbol_files(&index);
+                                if search_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                                    == search_generation
+                                {
+                                    let _ = tx.send(index);
+                                } else {
+                                    slog_info!(
+                                    "search index build result discarded for stale generation {}",
+                                    search_generation
+                                );
+                                    return;
+                                }
+                                spawn_symbol_cache_prewarm(
+                                    root_clone,
+                                    symbol_cache,
+                                    symbol_storage,
+                                    symbol_project_key,
+                                    symbol_cache_generation,
+                                    symbol_files,
+                                    is_worktree_bridge_for_search,
+                                    session_id_for_prewarm,
+                                );
+                            });
+                        });
+                    }
                 }
             }
         }
-    }
 
-    if semantic_search && ctx.shared_artifacts_read_only() {
-        match crate::readonly_artifacts::open_semantic_index_read_only(
-            &canonical_cache_root,
-            storage_dir.as_deref(),
-        ) {
-            crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
-                *ctx.semantic_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::ready();
+        if semantic_search && ctx.shared_artifacts_read_only() {
+            match crate::readonly_artifacts::open_semantic_index_read_only(
+                &canonical_cache_root,
+                storage_dir.as_deref(),
+            ) {
+                crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
+                    *ctx.semantic_index()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                    *ctx.semantic_index_status()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        SemanticIndexStatus::ready();
+                }
+                crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                    *ctx.semantic_index_status()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        SemanticIndexStatus::Failed(format!(
+                            "semantic index is read-only and stale for {} file(s)",
+                            stale.drift_count
+                        ));
+                }
+                crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
+                    *ctx.semantic_index_status()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        SemanticIndexStatus::Failed(
+                            "semantic index is read-only but no shared artifact snapshot exists"
+                                .to_string(),
+                        );
+                }
             }
-            crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::Failed(format!(
-                        "semantic index is read-only and stale for {} file(s)",
-                        stale.drift_count
-                    ));
-            }
-            crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::Failed(
-                        "semantic index is read-only but no shared artifact snapshot exists"
-                            .to_string(),
-                    );
-            }
-        }
-    } else if semantic_search {
-        let semantic_initial_stage = if previous_config.semantic_search
-            && previous_project_root.as_deref() == Some(root_path.as_path())
-            && semantic_fingerprint_config_changed(&previous_config.semantic, &semantic_config)
-        {
-            "fingerprint_change"
-        } else {
-            "initial"
-        };
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: semantic_initial_stage.to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-        let (tx, rx): (
-            crossbeam_channel::Sender<SemanticIndexEvent>,
-            crossbeam_channel::Receiver<SemanticIndexEvent>,
-        ) = unbounded();
-        *ctx.semantic_index_rx().lock() = Some(rx);
-
-        let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
-        let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
-        let refresh_worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
-        ctx.install_semantic_refresh_worker(
-            refresh_tx,
-            refresh_event_rx,
-            Arc::clone(&refresh_worker_slot),
-        );
-
-        let root_clone = canonical_cache_root.clone();
-        let semantic_storage = storage_dir.clone();
-        let semantic_project_key = project_key.clone();
-        let semantic_config = semantic_config.clone();
-        let tx_progress = tx.clone();
-        let is_worktree_bridge_for_semantic = is_worktree_bridge;
-        let semantic_cold_seed_active = ctx.semantic_cold_seed_active_flag();
-        let semantic_cold_seed_generation_flag = ctx.semantic_cold_seed_generation_flag();
-        let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
-        let semantic_generation = configure_generation;
-        let semantic_generation_flag = ctx.configure_generation_flag();
-        let session_id_for_bg2 = log_ctx::current_session();
-        thread::spawn(move || {
-            log_ctx::with_session(session_id_for_bg2, || {
-                // Cap file count to bound memory on huge project roots (e.g.,
-                // /home/user). The local fastembed model (~200MB) + embeddings +
-                // batch buffers can exceed memory on constrained systems when
-                // indexing tens of thousands of files. Configurable via
-                // `semantic.max_files` (default 20k); remote backends that embed
-                // server-side can raise it freely.
-                let max_semantic_files = semantic_config.max_files;
-                let mut semantic_retry_attempt: usize = 0;
-                let set_cold_seed_active = || {
-                    if semantic_cold_seed_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        == semantic_cold_seed_generation_for_worker
-                    {
-                        semantic_cold_seed_active.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
+        } else if semantic_search {
+            let semantic_initial_stage = if previous_config.semantic_search
+                && previous_project_root.as_deref() == Some(root_path.as_path())
+                && semantic_fingerprint_config_changed(&previous_config.semantic, &semantic_config)
+            {
+                "fingerprint_change"
+            } else {
+                "initial"
+            };
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SemanticIndexStatus::Building {
+                    stage: semantic_initial_stage.to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
                 };
-                let clear_cold_seed_active = || {
-                    if semantic_cold_seed_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        == semantic_cold_seed_generation_for_worker
-                    {
-                        semantic_cold_seed_active.store(false, std::sync::atomic::Ordering::SeqCst);
-                    }
-                };
-                let clear_cold_seed_gate_and_notify = || {
-                    clear_cold_seed_active();
-                    let _ = tx_progress.send(SemanticIndexEvent::ColdSeedGateCleared);
-                };
+            let (tx, rx): (
+                crossbeam_channel::Sender<SemanticIndexEvent>,
+                crossbeam_channel::Receiver<SemanticIndexEvent>,
+            ) = unbounded();
+            *ctx.semantic_index_rx().lock() = Some(rx);
 
-                let build_once =
+            let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
+            let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
+            let refresh_worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
+            ctx.install_semantic_refresh_worker(
+                refresh_tx,
+                refresh_event_rx,
+                Arc::clone(&refresh_worker_slot),
+            );
+
+            let root_clone = canonical_cache_root.clone();
+            let semantic_storage = storage_dir.clone();
+            let semantic_project_key = project_key.clone();
+            let semantic_config = semantic_config.clone();
+            let tx_progress = tx.clone();
+            let is_worktree_bridge_for_semantic = is_worktree_bridge;
+            let semantic_cold_seed_active = ctx.semantic_cold_seed_active_flag();
+            let semantic_cold_seed_generation_flag = ctx.semantic_cold_seed_generation_flag();
+            let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
+            let semantic_generation = configure_generation;
+            let semantic_generation_flag = ctx.configure_generation_flag();
+            let session_id_for_bg2 = log_ctx::current_session();
+            thread::spawn(move || {
+                log_ctx::with_session(session_id_for_bg2, || {
+                    // Cap file count to bound memory on huge project roots (e.g.,
+                    // /home/user). The local fastembed model (~200MB) + embeddings +
+                    // batch buffers can exceed memory on constrained systems when
+                    // indexing tens of thousands of files. Configurable via
+                    // `semantic.max_files` (default 20k); remote backends that embed
+                    // server-side can raise it freely.
+                    let max_semantic_files = semantic_config.max_files;
+                    let mut semantic_retry_attempt: usize = 0;
+                    let set_cold_seed_active = || {
+                        if semantic_cold_seed_generation_flag
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            == semantic_cold_seed_generation_for_worker
+                        {
+                            semantic_cold_seed_active
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    };
+                    let clear_cold_seed_active = || {
+                        if semantic_cold_seed_generation_flag
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            == semantic_cold_seed_generation_for_worker
+                        {
+                            semantic_cold_seed_active
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    };
+                    let clear_cold_seed_gate_and_notify = || {
+                        clear_cold_seed_active();
+                        let _ = tx_progress.send(SemanticIndexEvent::ColdSeedGateCleared);
+                    };
+
+                    let build_once =
                     || -> Result<(SemanticIndex, crate::semantic_index::EmbeddingModel), String> {
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "initializing_embedding_model".to_string(),
@@ -2358,141 +2372,141 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         Ok((index, model))
                     };
 
-                // Build-level retry: if the embedding backend is unreachable or
-                // briefly failing (connection refused, timeout, 5xx/429), riding
-                // it out beats parking the index in `Failed` forever — a state
-                // nothing re-triggers short of a bridge restart. We keep retrying
-                // with capped backoff, surfacing an honest "waiting for backend"
-                // building-state so the sidebar shows recovery-in-progress, not a
-                // red failure. The moment the backend returns, the build
-                // succeeds and the index goes Ready.
-                //
-                // Permanent errors (dimension mismatch, too-many-files, 4xx auth)
-                // are NOT marked transient and fail fast with the real message.
-                //
-                // Supersession is automatic: a reconfigure replaces the bridge's
-                // semantic receiver, so the next `tx`/`tx_progress.send` returns
-                // Err (receiver dropped) and this thread exits without competing
-                // with the fresh build.
-                let build_result = loop {
-                    let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
-                    match attempt_result {
-                        Ok(Err(ref error))
-                            if crate::semantic_index::embedding_failure_is_transient(error) =>
-                        {
-                            let clean =
-                                crate::semantic_index::strip_transient_embedding_marker(error);
-                            let backoff = semantic_build_retry_backoff(semantic_retry_attempt);
-                            semantic_retry_attempt += 1;
-                            slog_warn!(
+                    // Build-level retry: if the embedding backend is unreachable or
+                    // briefly failing (connection refused, timeout, 5xx/429), riding
+                    // it out beats parking the index in `Failed` forever — a state
+                    // nothing re-triggers short of a bridge restart. We keep retrying
+                    // with capped backoff, surfacing an honest "waiting for backend"
+                    // building-state so the sidebar shows recovery-in-progress, not a
+                    // red failure. The moment the backend returns, the build
+                    // succeeds and the index goes Ready.
+                    //
+                    // Permanent errors (dimension mismatch, too-many-files, 4xx auth)
+                    // are NOT marked transient and fail fast with the real message.
+                    //
+                    // Supersession is automatic: a reconfigure replaces the bridge's
+                    // semantic receiver, so the next `tx`/`tx_progress.send` returns
+                    // Err (receiver dropped) and this thread exits without competing
+                    // with the fresh build.
+                    let build_result = loop {
+                        let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
+                        match attempt_result {
+                            Ok(Err(ref error))
+                                if crate::semantic_index::embedding_failure_is_transient(error) =>
+                            {
+                                let clean =
+                                    crate::semantic_index::strip_transient_embedding_marker(error);
+                                let backoff = semantic_build_retry_backoff(semantic_retry_attempt);
+                                semantic_retry_attempt += 1;
+                                slog_warn!(
                                 "semantic index build: embedding backend unavailable ({}); retrying in {}s",
                                 clean,
                                 backoff.as_secs(),
                             );
-                            // Surface "waiting for backend" as a building stage so
-                            // the sidebar shows recovery-in-progress. If the
-                            // receiver is gone (reconfigure superseded us), bail.
-                            clear_cold_seed_active();
-                            if tx_progress
-                                .send(SemanticIndexEvent::Progress {
-                                    stage: format!("waiting_for_embedding_backend: {clean}"),
-                                    files: None,
-                                    entries_done: None,
-                                    entries_total: None,
-                                })
-                                .is_err()
-                            {
-                                return;
+                                // Surface "waiting for backend" as a building stage so
+                                // the sidebar shows recovery-in-progress. If the
+                                // receiver is gone (reconfigure superseded us), bail.
+                                clear_cold_seed_active();
+                                if tx_progress
+                                    .send(SemanticIndexEvent::Progress {
+                                        stage: format!("waiting_for_embedding_backend: {clean}"),
+                                        files: None,
+                                        entries_done: None,
+                                        entries_total: None,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                if tx_progress
+                                    .send(SemanticIndexEvent::ColdSeedGateCleared)
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                thread::sleep(backoff);
+                                continue;
                             }
-                            if tx_progress
-                                .send(SemanticIndexEvent::ColdSeedGateCleared)
-                                .is_err()
-                            {
-                                return;
-                            }
-                            thread::sleep(backoff);
-                            continue;
+                            other => break other,
                         }
-                        other => break other,
-                    }
-                };
+                    };
 
-                let event = match build_result {
-                    Ok(Ok((index, model))) => {
-                        let worker_index = index.clone();
-                        let worker_handle = spawn_semantic_refresh_worker(
-                            root_clone.clone(),
-                            worker_index,
-                            model,
-                            semantic_config.max_batch_size.max(1),
-                            semantic_config.max_files,
-                            refresh_rx,
-                            refresh_event_tx,
-                            log_ctx::current_session(),
+                    let event = match build_result {
+                        Ok(Ok((index, model))) => {
+                            let worker_index = index.clone();
+                            let worker_handle = spawn_semantic_refresh_worker(
+                                root_clone.clone(),
+                                worker_index,
+                                model,
+                                semantic_config.max_batch_size.max(1),
+                                semantic_config.max_files,
+                                refresh_rx,
+                                refresh_event_tx,
+                                log_ctx::current_session(),
+                            );
+                            if let Ok(mut slot) = refresh_worker_slot.lock() {
+                                *slot = Some(worker_handle);
+                            }
+                            SemanticIndexEvent::Ready(index)
+                        }
+                        Ok(Err(error)) => {
+                            slog_warn!("failed to build semantic index: {}", error);
+                            SemanticIndexEvent::Failed(error)
+                        }
+                        Err(_) => {
+                            let error = "semantic index build panicked".to_string();
+                            slog_warn!("{}", error);
+                            SemanticIndexEvent::Failed(error)
+                        }
+                    };
+
+                    if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        != semantic_generation
+                    {
+                        slog_info!(
+                            "semantic index build result discarded for stale generation {}",
+                            semantic_generation
                         );
-                        if let Ok(mut slot) = refresh_worker_slot.lock() {
-                            *slot = Some(worker_handle);
-                        }
-                        SemanticIndexEvent::Ready(index)
+                        clear_cold_seed_active();
+                        return;
                     }
-                    Ok(Err(error)) => {
-                        slog_warn!("failed to build semantic index: {}", error);
-                        SemanticIndexEvent::Failed(error)
-                    }
-                    Err(_) => {
-                        let error = "semantic index build panicked".to_string();
-                        slog_warn!("{}", error);
-                        SemanticIndexEvent::Failed(error)
-                    }
-                };
 
-                if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                    != semantic_generation
-                {
-                    slog_info!(
-                        "semantic index build result discarded for stale generation {}",
-                        semantic_generation
-                    );
-                    clear_cold_seed_active();
-                    return;
-                }
-
-                if tx.send(event).is_err() {
-                    clear_cold_seed_active();
-                }
+                    if tx.send(event).is_err() {
+                        clear_cold_seed_active();
+                    }
+                });
             });
-        });
-    }
+        }
 
-    // Clear the workspace package caches here because reconfigure can point AFT at a
-    // different root; reset them before warming the callgraph store for the new project.
-    crate::callgraph::clear_workspace_package_cache();
+        // Clear the workspace package caches here because reconfigure can point AFT at a
+        // different root; reset them before warming the callgraph store for the new project.
+        crate::callgraph::clear_workspace_package_cache();
 
-    if next_config.callgraph_store && !home_match {
-        if ctx.semantic_cold_seed_active() {
-            ctx.defer_callgraph_store_warm_for_semantic_cold_seed();
-            slog_info!(
+        if next_config.callgraph_store && !home_match {
+            if ctx.semantic_cold_seed_active() {
+                ctx.defer_callgraph_store_warm_for_semantic_cold_seed();
+                slog_info!(
                 "callgraph store warm deferred until semantic cold seed gate clears or completes"
             );
-        } else {
-            match ctx.callgraph_store_for_ops() {
-                CallgraphStoreAccess::Ready(_) => {
-                    slog_debug!("callgraph store ready at configure");
-                }
-                CallgraphStoreAccess::Building => {
-                    slog_info!("callgraph store warm build scheduled at configure");
-                }
-                CallgraphStoreAccess::Unavailable => {
-                    slog_info!(
-                        "callgraph store unavailable at configure; dead_code will retry later"
-                    );
-                }
-                CallgraphStoreAccess::Error(error) => {
-                    slog_warn!("callgraph store configure warm failed: {}", error);
+            } else {
+                match ctx.callgraph_store_for_ops() {
+                    CallgraphStoreAccess::Ready(_) => {
+                        slog_debug!("callgraph store ready at configure");
+                    }
+                    CallgraphStoreAccess::Building => {
+                        slog_info!("callgraph store warm build scheduled at configure");
+                    }
+                    CallgraphStoreAccess::Unavailable => {
+                        slog_info!(
+                            "callgraph store unavailable at configure; dead_code will retry later"
+                        );
+                    }
+                    CallgraphStoreAccess::Error(error) => {
+                        slog_warn!("callgraph store configure warm failed: {}", error);
+                    }
                 }
             }
         }
-    }
     }
 
     let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
@@ -3058,7 +3072,6 @@ mod tests {
         assert!(ctx.callgraph_store_rx().lock().is_none());
         assert_eq!(ctx.configure_generation(), 6);
     }
-
 
     #[test]
     fn dead_artifact_owner_manifest_is_taken_over_on_configure() {

@@ -927,10 +927,7 @@ fn spawn_detached_survives_parent_restart() {
     // it. A fixed-duration sleep races the restart under CI load, so gate the
     // task's exit on a sentinel file the test controls instead.
     let stop_file = project.path().join("stop-detached-task");
-    let command = format!(
-        "until [ -e '{}' ]; do sleep 0.1; done",
-        stop_file.display()
-    );
+    let command = format!("until [ -e '{}' ]; do sleep 0.1; done", stop_file.display());
 
     let task_id = {
         let mut aft = AftProcess::spawn();
