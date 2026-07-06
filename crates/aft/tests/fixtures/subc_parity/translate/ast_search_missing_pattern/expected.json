@@ -1,6 +1,0 @@
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "ast_search: missing required param 'pattern'"
-  }
-}

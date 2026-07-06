@@ -1,5 +1,0 @@
-checkpoint created pre-edit
-files 2
-skipped
-  ↳ <PROJECT_ROOT>/missing.ts: not tracked
-  ↳ <PROJECT_ROOT>/locked.ts: unknown error

@@ -1,4 +1,0 @@
-No files matched the scope (paths/globs resolved to zero files)
-
-Scope warnings:
-  empty → no files

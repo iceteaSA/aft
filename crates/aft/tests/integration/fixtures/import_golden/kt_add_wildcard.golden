@@ -1,6 +1,0 @@
-package com.example
-
-import kotlin.collections.List
-import kotlin.math.*
-
-fun main() {}

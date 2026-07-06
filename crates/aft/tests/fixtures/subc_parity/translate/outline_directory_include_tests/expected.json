@@ -1,7 +1,0 @@
-{
-  "args": {
-    "directory": "<PROJECT_ROOT>/src",
-    "includeTests": true
-  },
-  "command": "outline"
-}

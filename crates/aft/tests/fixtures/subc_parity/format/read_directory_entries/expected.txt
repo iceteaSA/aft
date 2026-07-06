@@ -1,3 +1,0 @@
-alpha.ts
-beta.ts
-src/

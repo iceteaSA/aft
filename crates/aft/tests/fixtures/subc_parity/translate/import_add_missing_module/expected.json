@@ -1,6 +1,0 @@
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "'module' is required for 'add' op"
-  }
-}

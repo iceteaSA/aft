@@ -1,6 +1,0 @@
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "'name' is required for 'checkpoint' op"
-  }
-}

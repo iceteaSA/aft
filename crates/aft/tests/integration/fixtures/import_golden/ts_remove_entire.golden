@@ -1,3 +1,0 @@
-import { keep } from "other";
-
-export const x = 1;

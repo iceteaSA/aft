@@ -1,9 +1,0 @@
-{
-  "args": {
-    "depth": 4,
-    "file": "<PROJECT_ROOT>/src/main.ts",
-    "include_tests": false,
-    "symbol": "handler"
-  },
-  "command": "trace_to"
-}

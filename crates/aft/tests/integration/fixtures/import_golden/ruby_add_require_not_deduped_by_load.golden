@@ -1,4 +1,0 @@
-require 'boot.rb'
-load 'boot.rb'
-
-puts 'hi'

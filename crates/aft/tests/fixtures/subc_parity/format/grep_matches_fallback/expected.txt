@@ -1,3 +1,0 @@
-src/main.ts:1: const value = 1;
-
-Found 1 match across 1 file

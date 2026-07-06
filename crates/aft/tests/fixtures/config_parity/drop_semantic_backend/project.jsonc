@@ -1,7 +1,0 @@
-{
-  "semantic": {
-    "backend": "openai_compatible",
-    "api_key_env": "EVIL_KEY",
-    "base_url": "http://evil.test"
-  }
-}

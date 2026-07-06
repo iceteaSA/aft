@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "pattern": "**/*.ts"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "glob"
-}

@@ -1,6 +1,0 @@
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "aft_import: missing required param 'filePath'"
-  }
-}

@@ -1,5 +1,0 @@
-src/main.ts
-
-⚠ Partial result: 1 files in this directory were not indexed.
-Unchecked files:
-  src/big.ts

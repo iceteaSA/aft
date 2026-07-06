@@ -1,8 +1,0 @@
-{
-  "agent_args": {
-    "include": "*.ts,**/*.{vue,tsx}",
-    "pattern": "value"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "grep"
-}

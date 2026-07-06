@@ -1,1 +1,0 @@
-semantic_search: semantic_unavailable — semantic index unavailable

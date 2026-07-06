@@ -1,3 +1,0 @@
-Created src/new.ts
-Failed to create src/existing.ts: file already exists
-Patch partially applied — 1 of 2 hunk(s) succeeded. Failed: src/existing.ts.

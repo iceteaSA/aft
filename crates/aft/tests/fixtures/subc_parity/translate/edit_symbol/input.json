@@ -1,9 +1,0 @@
-{
-  "agent_args": {
-    "content": "const value = 2;",
-    "filePath": "src/main.ts",
-    "symbol": "value"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "edit"
-}

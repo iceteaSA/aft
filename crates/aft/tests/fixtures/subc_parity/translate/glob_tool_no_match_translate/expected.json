@@ -1,6 +1,0 @@
-{
-  "args": {
-    "pattern": "**/*.zzz"
-  },
-  "command": "glob"
-}

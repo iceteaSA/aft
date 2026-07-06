@@ -1,9 +1,0 @@
-{
-  "args": {
-    "files": [
-      "src/main.ts"
-    ],
-    "name": "single-file"
-  },
-  "command": "checkpoint"
-}

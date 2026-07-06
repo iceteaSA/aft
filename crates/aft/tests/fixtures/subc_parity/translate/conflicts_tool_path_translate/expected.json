@@ -1,6 +1,0 @@
-{
-  "args": {
-    "path": "<PROJECT_ROOT>/src"
-  },
-  "command": "git_conflicts"
-}

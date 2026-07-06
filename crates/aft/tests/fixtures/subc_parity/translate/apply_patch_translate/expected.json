@@ -1,6 +1,0 @@
-{
-  "args": {
-    "patch_text": "*** Begin Patch\n*** Update File: src/main.ts\n@@\n-const value = 1;\n+const value = 2;\n*** End Patch"
-  },
-  "command": "apply_patch"
-}

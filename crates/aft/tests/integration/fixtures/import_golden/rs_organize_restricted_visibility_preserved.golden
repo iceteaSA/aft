@@ -1,6 +1,0 @@
-pub(crate) use crate::a::CrateOnly;
-use crate::a::Private;
-pub use crate::a::Public;
-pub(super) use crate::a::SuperOnly;
-
-fn main() {}

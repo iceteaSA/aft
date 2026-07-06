@@ -1,3 +1,0 @@
-#include "project/config.h"
-
-void f(void);

@@ -1,5 +1,0 @@
-package com.example;
-
-import static java.util.Collections.emptyList;
-
-class C {}

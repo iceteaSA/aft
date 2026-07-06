@@ -1,3 +1,0 @@
-1 file matching **/*.ts
-
-src/main.ts

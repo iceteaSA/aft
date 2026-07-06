@@ -1,4 +1,0 @@
-#include <stdio.h>
-#include "keep.h"
-
-int main(void) { return 0; }

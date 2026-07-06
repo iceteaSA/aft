@@ -1,9 +1,0 @@
-{
-  "agent_args": {
-    "contextLines": 2,
-    "symbols": "Features",
-    "url": "https://example.com/doc"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "zoom"
-}

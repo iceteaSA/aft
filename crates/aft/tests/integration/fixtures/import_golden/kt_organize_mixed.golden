@@ -1,8 +1,0 @@
-package com.example
-
-import kotlin.math.*
-
-import com.alpha.A
-import com.zeta.Z as Last
-
-fun main() {}

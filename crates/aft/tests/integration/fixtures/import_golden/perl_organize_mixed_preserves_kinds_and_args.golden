@@ -1,7 +1,0 @@
-require Foo::Runtime;
-use Foo qw(a b);
-no strict 'refs';
-use parent -norequire, 'Base';
-use Foo::Plain;
-
-1;

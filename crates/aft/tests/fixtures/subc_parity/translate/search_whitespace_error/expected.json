@@ -1,6 +1,0 @@
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "semantic_search: invalid params: `query` must be a non-empty string"
-  }
-}

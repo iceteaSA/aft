@@ -1,3 +1,0 @@
-import type { Foo } from './types';
-
-export const x = 1;

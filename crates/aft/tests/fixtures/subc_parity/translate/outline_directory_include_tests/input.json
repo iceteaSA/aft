@@ -1,8 +1,0 @@
-{
-  "agent_args": {
-    "includeTests": true,
-    "target": "src"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "outline"
-}

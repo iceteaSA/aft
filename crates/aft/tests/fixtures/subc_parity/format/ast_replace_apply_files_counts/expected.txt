@@ -1,4 +1,0 @@
-Replaced 3 match(es) in 2 file(s) (5 searched)
-
-  src/main.ts: 1 replacement
-  src/other.ts: 2 replacements

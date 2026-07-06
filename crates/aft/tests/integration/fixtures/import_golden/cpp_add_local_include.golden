@@ -1,3 +1,0 @@
-#include "project/widget.hpp"
-
-void f();

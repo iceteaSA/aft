@@ -1,9 +1,0 @@
-{
-  "args": {
-    "case_sensitive": true,
-    "max_results": 100,
-    "path": "<PROJECT_ROOT>/src <PROJECT_ROOT>/docs",
-    "pattern": "value"
-  },
-  "command": "grep"
-}

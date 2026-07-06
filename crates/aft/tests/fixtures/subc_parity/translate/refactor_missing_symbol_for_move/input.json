@@ -1,9 +1,0 @@
-{
-  "agent_args": {
-    "destination": "<PROJECT_ROOT>/src/moved.ts",
-    "filePath": "<PROJECT_ROOT>/src/main.ts",
-    "op": "move"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "refactor"
-}

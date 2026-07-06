@@ -1,2 +1,0 @@
-No merge conflicts found.
-Checked repo root: <PROJECT_ROOT>

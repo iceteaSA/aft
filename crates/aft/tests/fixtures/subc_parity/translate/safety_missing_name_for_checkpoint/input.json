@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "op": "checkpoint"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "safety"
-}

@@ -1,6 +1,0 @@
-package com.example
-
-import com.example.Existing
-import com.example.Original as Renamed
-
-fun main() {}

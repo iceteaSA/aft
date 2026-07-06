@@ -1,7 +1,0 @@
-namespace App {
-using System;
-// keep using section note
-using System.Xml;
-
-class C {}
-}

@@ -1,9 +1,0 @@
-package main
-
-import "fmt"
-import "os"
-import (
-	"github.com/z/z"
-)
-
-func main() {}

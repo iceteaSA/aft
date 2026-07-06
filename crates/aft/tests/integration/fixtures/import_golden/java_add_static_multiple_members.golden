@@ -1,7 +1,0 @@
-package com.example;
-
-import static java.util.Collections.emptyList;
-import static java.util.Collections.singletonList;
-import java.util.List;
-
-class C {}

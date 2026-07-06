@@ -1,6 +1,0 @@
-import scala.concurrent.{ExecutionContext => EC}
-
-import a._
-import cats.syntax.all._
-
-object Main { val x = 1 }

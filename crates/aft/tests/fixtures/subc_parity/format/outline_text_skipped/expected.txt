@@ -1,5 +1,0 @@
-main.ts
-  fn main
-
-Skipped 1 file(s):
-  bad.ts — parse error

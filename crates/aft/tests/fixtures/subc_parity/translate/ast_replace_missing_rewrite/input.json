@@ -1,8 +1,0 @@
-{
-  "agent_args": {
-    "lang": "typescript",
-    "pattern": "console.log($MSG)"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "ast_replace"
-}

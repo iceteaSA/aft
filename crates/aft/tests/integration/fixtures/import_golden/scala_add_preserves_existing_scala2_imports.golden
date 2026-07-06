@@ -1,5 +1,0 @@
-import a.{b => c}
-import a._
-import z.Y
-
-object Main { val x = 1 }

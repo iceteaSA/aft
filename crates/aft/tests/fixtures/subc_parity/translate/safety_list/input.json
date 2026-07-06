@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "op": "list"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "safety"
-}

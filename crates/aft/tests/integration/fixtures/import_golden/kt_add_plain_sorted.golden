@@ -1,6 +1,0 @@
-package com.example
-
-import com.alpha.A
-import com.zeta.Z
-
-fun main() {}

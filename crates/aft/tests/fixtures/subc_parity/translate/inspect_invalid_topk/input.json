@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "topK": 1.5
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "inspect"
-}

@@ -1,4 +1,0 @@
-require 'json'
-load 'boot.rb'
-
-puts 'hi'

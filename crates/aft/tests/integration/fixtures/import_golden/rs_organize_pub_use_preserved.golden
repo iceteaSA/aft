@@ -1,4 +1,0 @@
-pub use crate::a::Exported;
-use crate::a::Internal;
-
-fn main() {}

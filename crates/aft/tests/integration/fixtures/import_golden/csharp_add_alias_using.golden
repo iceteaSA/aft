@@ -1,5 +1,0 @@
-using Con = System.Console;
-
-namespace App;
-
-class C {}

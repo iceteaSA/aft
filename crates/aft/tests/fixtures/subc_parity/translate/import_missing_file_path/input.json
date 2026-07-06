@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "op": "organize"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "import"
-}

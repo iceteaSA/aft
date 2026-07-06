@@ -1,8 +1,0 @@
-{
-  "agent_args": {
-    "destination": "src/move-to.ts",
-    "filePath": "src/move-from.ts"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "move"
-}

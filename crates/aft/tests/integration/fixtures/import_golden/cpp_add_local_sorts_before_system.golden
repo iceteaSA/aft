@@ -1,4 +1,0 @@
-#include <vector>
-#include "aaa.hpp"
-
-int main() { return 0; }

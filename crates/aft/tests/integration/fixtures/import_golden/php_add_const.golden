@@ -1,8 +1,0 @@
-<?php
-
-namespace Demo;
-
-use App\Existing;
-use const App\VERSION;
-
-class C {}

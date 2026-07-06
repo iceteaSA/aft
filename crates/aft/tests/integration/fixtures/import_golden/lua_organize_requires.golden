@@ -1,5 +1,0 @@
-local zeta = require("zeta")
-require("boot")
-local alpha = require("alpha")
-
-return alpha, zeta

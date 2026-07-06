@@ -1,3 +1,0 @@
-use Foo::Keep;
-
-print "hi\n";

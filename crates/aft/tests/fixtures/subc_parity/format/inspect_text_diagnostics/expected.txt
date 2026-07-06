@@ -1,5 +1,0 @@
-todos: 2
-
-diagnostics: 1 errors, 2 warnings, 0 info, 0 hints
-diagnostics details:
-- src/main.ts:1:2 error boom [tsserver]

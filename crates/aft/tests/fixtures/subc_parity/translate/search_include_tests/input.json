@@ -1,9 +1,0 @@
-{
-  "agent_args": {
-    "includeTests": true,
-    "query": "fixtures",
-    "topK": 7
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "search"
-}

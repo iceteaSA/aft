@@ -1,1 +1,0 @@
-path is not inside a git repository: <PROJECT_ROOT>/missing

@@ -1,5 +1,0 @@
-src/main.ts:1-1 [ambiguous_symbol run]
-
-1: symbol 'run' is ambiguous (2 candidates) — zoom a qualified name for its body
-2: - run() — function run(): void
-3: - Worker.run() — method run(): Promise<void>

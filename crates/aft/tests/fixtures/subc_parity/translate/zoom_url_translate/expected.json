@@ -1,8 +1,0 @@
-{
-  "args": {
-    "context_lines": 2,
-    "file": "https://example.com/doc",
-    "symbol": "Features"
-  },
-  "command": "zoom"
-}

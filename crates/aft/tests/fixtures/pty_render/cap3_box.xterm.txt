@@ -1,9 +1,0 @@
-┌──┐
-│hi│
-└──┘
-* 27f369ed mason: route pi safety through tool_call
-* c95b9054 mason: cut aft_safety over to tool_call
-* 01fffbc2 mason: cut over apply_patch tool_call path
-* 8e725b91 mason: add dormant apply_patch leaf
-* 5e24cdd7 mason: cut Pi follow-on tools to tool_call
-* b5531856 mason: port apply patch parser chunks

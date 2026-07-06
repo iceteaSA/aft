@@ -1,8 +1,0 @@
-<?php
-
-namespace Demo;
-
-use App\Existing;
-use function App\helper;
-
-class C {}

@@ -1,3 +1,0 @@
-import cats.effect.{IO, Resource}
-
-object Main { val x = 1 }

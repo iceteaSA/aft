@@ -1,7 +1,0 @@
-{
-  "experimental_bash_background": true,
-  "experimental_bash_compress": true,
-  "experimental_bash_rewrite": true,
-  "formatter_timeout_secs": 30,
-  "restrict_to_project_root": false
-}

@@ -1,6 +1,0 @@
-{
-  "lsp": {
-    "python": "ty",
-    "diagnostics_on_edit": true
-  }
-}

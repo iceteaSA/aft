@@ -1,5 +1,0 @@
-global using System;
-
-namespace App;
-
-class C {}

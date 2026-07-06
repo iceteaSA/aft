@@ -1,9 +1,0 @@
-{
-  "args": {
-    "depth": 2,
-    "expression": "value",
-    "file": "<PROJECT_ROOT>/src/main.ts",
-    "symbol": "run"
-  },
-  "command": "trace_data"
-}

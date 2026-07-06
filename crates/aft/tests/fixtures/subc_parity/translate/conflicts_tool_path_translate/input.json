@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "path": "<PROJECT_ROOT>/src"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "conflicts"
-}

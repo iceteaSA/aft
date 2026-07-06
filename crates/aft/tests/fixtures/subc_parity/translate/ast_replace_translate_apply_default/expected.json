@@ -1,9 +1,0 @@
-{
-  "args": {
-    "dry_run": false,
-    "lang": "typescript",
-    "pattern": "console.log($MSG)",
-    "rewrite": "logger.info($MSG)"
-  },
-  "command": "ast_replace"
-}

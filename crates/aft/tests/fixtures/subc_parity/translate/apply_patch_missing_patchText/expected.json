@@ -1,6 +1,0 @@
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "apply_patch: missing required param 'patchText'"
-  }
-}

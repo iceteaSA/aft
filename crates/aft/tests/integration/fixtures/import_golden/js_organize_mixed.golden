@@ -1,5 +1,0 @@
-import { a } from 'alpha';
-
-import { b } from './b';
-
-export const x = 1;

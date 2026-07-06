@@ -1,7 +1,0 @@
-{
-  "args": {
-    "path": "<PROJECT_ROOT>/src",
-    "pattern": "**/*.ts"
-  },
-  "command": "glob"
-}

@@ -1,7 +1,0 @@
-{
-  "args": {
-    "lang": "typescript",
-    "pattern": "console.log($MSG)"
-  },
-  "command": "ast_search"
-}

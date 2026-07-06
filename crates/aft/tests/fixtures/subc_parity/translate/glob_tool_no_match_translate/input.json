@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "pattern": "**/*.zzz"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "glob"
-}

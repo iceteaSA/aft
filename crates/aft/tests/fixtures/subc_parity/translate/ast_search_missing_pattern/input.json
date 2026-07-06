@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "lang": "typescript"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "ast_search"
-}

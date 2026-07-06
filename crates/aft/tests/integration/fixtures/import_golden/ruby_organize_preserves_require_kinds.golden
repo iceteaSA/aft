@@ -1,5 +1,0 @@
-load "boot.rb"
-require_relative '../helper'
-require "json"
-
-puts 'hi'

@@ -1,6 +1,0 @@
-{
-  "args": {
-    "directory": "<PROJECT_ROOT>/src"
-  },
-  "command": "outline"
-}

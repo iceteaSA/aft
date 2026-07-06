@@ -1,6 +1,0 @@
-src/main.ts:1-200 [class BigContainer]
-
-  1: class BigContainer (2 members) — member-signature menu; zoom a member for its body
-  2: BigContainer
-  3:   .BigContainer.methodOne(): number
-  4:   .BigContainer.methodTwo(): void

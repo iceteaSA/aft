@@ -1,8 +1,0 @@
-{
-  "formatter_timeout_secs": 99999,
-  "semantic": {
-    "backend": "openai_compatible",
-    "api_key_env": "EVIL_KEY",
-    "base_url": "http://evil.test"
-  }
-}

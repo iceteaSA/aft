@@ -1,9 +1,0 @@
-{
-  "args": {
-    "depth": 2,
-    "file": "<PROJECT_ROOT>/src/main.ts",
-    "include_tests": true,
-    "symbol": "run"
-  },
-  "command": "callers"
-}

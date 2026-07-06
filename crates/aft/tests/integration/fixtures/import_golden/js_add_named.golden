@@ -1,3 +1,0 @@
-import { added, existing } from 'pkg';
-
-export const x = 1;

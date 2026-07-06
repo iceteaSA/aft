@@ -1,8 +1,0 @@
-{
-  "args": {
-    "depth": 3,
-    "file": "<PROJECT_ROOT>/src/main.ts",
-    "symbol": "run"
-  },
-  "command": "call_tree"
-}

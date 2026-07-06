@@ -1,3 +1,0 @@
-not present missing-pkg
-file <PROJECT_ROOT>/src/main.ts
-scope entire import

@@ -1,7 +1,0 @@
-{
-  "agent_args": {
-    "pattern": "console.log($MSG)"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "ast_search"
-}

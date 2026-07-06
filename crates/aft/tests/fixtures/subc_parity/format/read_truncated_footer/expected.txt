@@ -1,3 +1,0 @@
-1: hello
-
-(Showing lines 1-100 of 250. Use startLine/endLine to read other sections.)

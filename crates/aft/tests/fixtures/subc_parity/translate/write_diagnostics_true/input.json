@@ -1,9 +1,0 @@
-{
-  "agent_args": {
-    "content": "export {};\n",
-    "filePath": "src/new.ts"
-  },
-  "diagnostics_on_edit": true,
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "write"
-}

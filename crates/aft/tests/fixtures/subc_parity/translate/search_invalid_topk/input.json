@@ -1,8 +1,0 @@
-{
-  "agent_args": {
-    "query": "value",
-    "topK": -1
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "search"
-}

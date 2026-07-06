@@ -1,8 +1,0 @@
-{
-  "agent_args": {
-    "name": "before-edit",
-    "op": "restore"
-  },
-  "project_root": "<PROJECT_ROOT>",
-  "tool_name": "safety"
-}

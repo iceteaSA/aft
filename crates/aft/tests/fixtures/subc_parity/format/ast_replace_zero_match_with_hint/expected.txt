@@ -1,6 +1,0 @@
-No matches found (searched 4 files)
-
-Scope warnings:
-  src/generated → no files
-
-Hint: JS/TS function patterns need params and body. Try: "function $NAME($$$) { $$$ }" (or `export async function ...`).

@@ -1,3 +1,0 @@
-run [<PROJECT_ROOT>/src/main.ts:1]
-  ↳ + 11 unresolved external calls: alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, … (+1 more)
-  ↳ project [<PROJECT_ROOT>/src/project.ts:13]

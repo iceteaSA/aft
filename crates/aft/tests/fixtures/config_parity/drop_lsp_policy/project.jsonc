@@ -1,9 +1,0 @@
-{
-  "lsp": {
-    "auto_install": false,
-    "grace_days": 1,
-    "versions": {
-      "x": "1.0.0"
-    }
-  }
-}

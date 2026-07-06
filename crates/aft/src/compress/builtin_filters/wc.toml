@@ -1,7 +1,0 @@
-[filter]
-matches = ["wc"]
-description = "Compact wc output; keep trailing totals."
-
-[cap]
-max_lines = 50
-keep = "tail"

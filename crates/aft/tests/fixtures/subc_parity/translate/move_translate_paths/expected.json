@@ -1,7 +1,0 @@
-{
-  "args": {
-    "destination": "<PROJECT_ROOT>/src/move-to.ts",
-    "file": "<PROJECT_ROOT>/src/move-from.ts"
-  },
-  "command": "move_file"
-}

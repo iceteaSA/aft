@@ -1,6 +1,0 @@
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "'symbol' is required for 'move' op"
-  }
-}

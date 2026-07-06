@@ -1,7 +1,0 @@
-{
-  "args": {
-    "query": "value",
-    "top_k": 10
-  },
-  "command": "semantic_search"
-}
