@@ -1332,6 +1332,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         Some(raw) => match serde_json::from_value::<Harness>(raw.clone()) {
             Ok(harness) => harness,
             Err(_) => {
+                // A malformed fed fingerprint gets its own machine code: at
+                // bind time it means either a federation-module bug or
+                // fingerprint-format drift between the fed spec and ours, and
+                // a typed code lets the fed side detect that without parsing
+                // prose.
+                let is_fed_shaped = raw.as_str().is_some_and(|s| s.starts_with("fed:"));
+                if is_fed_shaped {
+                    return Response::error(
+                        &req.id,
+                        "bad_harness_fingerprint",
+                        "configure payload invalid field 'harness'; fed fingerprint must be 32-64 lowercase hex characters",
+                    );
+                }
                 return Response::error(
                     &req.id,
                     "invalid_request",

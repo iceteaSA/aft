@@ -4151,7 +4151,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         .expect("route bind frame"),
     )
     .await;
-    expect_route_bind_error(&mut stream, 101, "config_divergence").await;
+    expect_route_bind_error(&mut stream, 101, "bad_harness_fingerprint").await;
 
     send_connection_goodbye(&mut stream).await;
 }
