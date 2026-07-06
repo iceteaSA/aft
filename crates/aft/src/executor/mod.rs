@@ -291,6 +291,20 @@ impl Executor {
             .collect()
     }
 
+    /// Non-blocking variant for the health path: the probe reply must stay
+    /// cheap under any load, so it skips the actor list (reported as busy)
+    /// rather than waiting on the scheduler state lock.
+    pub fn try_actor_entries(&self) -> Option<Vec<(ProjectRootId, Arc<AppContext>)>> {
+        let state = self.inner.state.try_lock()?;
+        Some(
+            state
+                .actors
+                .iter()
+                .map(|(root_id, actor_state)| (root_id.clone(), Arc::clone(&actor_state.ctx)))
+                .collect(),
+        )
+    }
+
     pub fn submit(
         &self,
         root_id: ProjectRootId,

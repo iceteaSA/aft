@@ -4282,8 +4282,13 @@ fn build_health_report(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     dispatch_path_metrics: &DispatchPathMetrics,
 ) -> HealthReport {
+    // Health replies must stay cheap under any load (subc-health rule: a
+    // probe that queues behind busy state lies about liveness and gets the
+    // module health-killed). Every read below is try-lock-only: a contended
+    // scheduler lock degrades to an empty root list instead of waiting.
     let mut roots: Vec<RootHealthSnapshot> = executor
-        .actor_entries()
+        .try_actor_entries()
+        .unwrap_or_default()
         .into_iter()
         .map(|(root_id, ctx)| ctx.try_health_snapshot(root_id.as_path()))
         .collect();
