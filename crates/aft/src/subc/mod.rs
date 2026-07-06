@@ -67,6 +67,11 @@ const PUSH_BUFFER_MAX_PER_KEY: usize = 256;
 /// route loop indefinitely.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Cadence for the loop's deadline-driven drain work (retry-buffer flush,
+/// bg-wake emission, maintenance submission). Checked at the top of every
+/// loop turn so busy select arms cannot starve it.
+const DRAIN_TICK_PERIOD: Duration = Duration::from_millis(250);
+
 const WRITER_QUEUE_CAPACITY: usize = 256;
 
 /// Keep reliable Push bursts from monopolizing the current-thread subc loop;
@@ -711,7 +716,15 @@ where
     let (reader_tx, mut reader_rx) = mpsc::channel::<Result<Frame, SubcError>>(256);
     let reader_task = spawn_reader_task(read, reader_tx);
     let shutdown = Arc::new(Notify::new());
-    let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
+    // Drain-tick deadline is tracked manually and checked at the TOP of every
+    // loop turn rather than as an Interval select arm: the select below is
+    // `biased` (bind completions first), and biased polling means a saturated
+    // higher arm (sustained lossy push traffic keeps lossy_rx always-ready)
+    // would starve every arm below it, including a timer arm — leaving
+    // backpressured reliable frames parked in the retry buffer past their
+    // delivery deadline. The pre-turn check cannot be starved by arm order;
+    // the sleep_until arm below only exists to wake an otherwise-idle loop.
+    let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
@@ -761,6 +774,62 @@ where
         .await
         {
             break Err(error);
+        }
+
+        if tokio::time::Instant::now() >= next_drain_at {
+            push::emit_bg_event_wakes(
+                &writer_tx,
+                &dispatch_path_metrics,
+                &bg_subs,
+                &mut bg_wake_pending,
+            );
+            warn_slow_pending_binds(&mut pending_binds, &executor);
+
+            let retried = push::drain_retry_buffers_for_bound_routes(
+                &writer_tx,
+                &dispatch_path_metrics,
+                &routes,
+                &mut retry_buffer,
+            );
+            if retried > 0 {
+                log::debug!(
+                    "subc attach: retried {retried} reliable Push frame(s) after writer backpressure"
+                );
+            }
+
+            let (due_roots, deferred_roots) =
+                due_maintenance_roots(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
+            if deferred_roots {
+                dispatch_path_metrics
+                    .maintenance_budget_deferrals
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            for root_id in due_roots {
+                let bg_sessions_to_check: Vec<(String, u64)> = bg_sub_by_session
+                    .iter()
+                    .filter_map(|((root, session), _)| {
+                        if root == &root_id {
+                            Some((
+                                session.clone(),
+                                bg_wake_epoch
+                                    .get(&(root_id.clone(), session.clone()))
+                                    .copied()
+                                    .unwrap_or(0),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                submit_maintenance_drain(
+                    &executor,
+                    root_id,
+                    bg_sessions_to_check,
+                    &maintenance_tx,
+                    &dispatch_path_metrics,
+                );
+            }
+            next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
         }
 
         tokio::select! {
@@ -1058,59 +1127,9 @@ where
                     );
                 }
             }
-            _ = drain_interval.tick() => {
-                push::emit_bg_event_wakes(
-                    &writer_tx,
-                    &dispatch_path_metrics,
-                    &bg_subs,
-                    &mut bg_wake_pending,
-                );
-                warn_slow_pending_binds(&mut pending_binds, &executor);
-
-                let retried = push::drain_retry_buffers_for_bound_routes(
-                    &writer_tx,
-                    &dispatch_path_metrics,
-                    &routes,
-                    &mut retry_buffer,
-                );
-                if retried > 0 {
-                    log::debug!(
-                        "subc attach: retried {retried} reliable Push frame(s) after writer backpressure"
-                    );
-                }
-
-                let (due_roots, deferred_roots) =
-                    due_maintenance_roots(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
-                if deferred_roots {
-                    dispatch_path_metrics
-                        .maintenance_budget_deferrals
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                for root_id in due_roots {
-                    let bg_sessions_to_check: Vec<(String, u64)> = bg_sub_by_session
-                        .iter()
-                        .filter_map(|((root, session), _)| {
-                            if root == &root_id {
-                                Some((
-                                    session.clone(),
-                                    bg_wake_epoch
-                                        .get(&(root_id.clone(), session.clone()))
-                                        .copied()
-                                        .unwrap_or(0),
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    submit_maintenance_drain(
-                        &executor,
-                        root_id,
-                        bg_sessions_to_check,
-                        &maintenance_tx,
-                        &dispatch_path_metrics,
-                    );
-                }
+            _ = tokio::time::sleep_until(next_drain_at) => {
+                // Wakes an otherwise-idle loop so the pre-turn drain check
+                // above runs on schedule; the drain work itself lives there.
             }
         }
     };
