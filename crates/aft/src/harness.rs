@@ -9,6 +9,7 @@ pub enum Harness {
     Pi,
     Runner,
     Mcp { client: String },
+    Fed { fingerprint: String },
 }
 
 impl Harness {
@@ -18,6 +19,11 @@ impl Harness {
             Harness::Pi => "pi".to_string(),
             Harness::Runner => "runner".to_string(),
             Harness::Mcp { client } => format!("mcp--{}", sanitize_client(client)),
+            Harness::Fed { fingerprint } => format!(
+                "fed--{}--{}",
+                &fingerprint[..FED_SLUG_READABLE_HEX_LEN],
+                hash_hex_prefix(fingerprint, FED_SLUG_HASH_HEX_LEN)
+            ),
         }
     }
 
@@ -27,6 +33,7 @@ impl Harness {
             Harness::Pi => "pi".to_string(),
             Harness::Runner => "runner".to_string(),
             Harness::Mcp { client } => format!("mcp:{client}"),
+            Harness::Fed { fingerprint } => format!("fed:{fingerprint}"),
         }
     }
 }
@@ -36,6 +43,15 @@ impl Harness {
 /// names bounded while the hash guarantees uniqueness.
 const MCP_SLUG_READABLE_MAX: usize = 40;
 const MCP_SLUG_HASH_HEX_LEN: usize = 32;
+const FED_FINGERPRINT_MIN_HEX_LEN: usize = 32;
+const FED_FINGERPRINT_MAX_HEX_LEN: usize = 64;
+const FED_SLUG_READABLE_HEX_LEN: usize = 16;
+const FED_SLUG_HASH_HEX_LEN: usize = 8;
+
+fn hash_hex_prefix(raw: &str, hex_len: usize) -> String {
+    let hash = blake3::hash(raw.as_bytes()).to_hex();
+    hash.as_str()[..hex_len].to_string()
+}
 
 /// Build the storage slug for an MCP client. The readable portion is a
 /// sanitized, length-capped rendering of the raw client; a short hash of the
@@ -75,8 +91,30 @@ fn sanitize_client(client: &str) -> String {
 
     // A 128-bit hash suffix prevents hostile same-readable slugs from sharing
     // storage while keeping directory names short enough for common filesystems.
-    let hash = blake3::hash(client.as_bytes()).to_hex();
-    format!("{readable}--{}", &hash.as_str()[..MCP_SLUG_HASH_HEX_LEN])
+    format!(
+        "{readable}--{}",
+        hash_hex_prefix(client, MCP_SLUG_HASH_HEX_LEN)
+    )
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn parse_fed_harness(value: &str) -> Result<Harness, String> {
+    let fingerprint = &value[4..];
+    if !(FED_FINGERPRINT_MIN_HEX_LEN..=FED_FINGERPRINT_MAX_HEX_LEN).contains(&fingerprint.len())
+        || !is_lower_hex(fingerprint)
+    {
+        return Err(format!(
+            "unsupported harness '{value}'; fed fingerprint must be 32-64 lowercase hex characters"
+        ));
+    }
+    Ok(Harness::Fed {
+        fingerprint: fingerprint.to_string(),
+    })
 }
 
 impl Serialize for Harness {
@@ -99,8 +137,9 @@ impl<'de> Deserialize<'de> for Harness {
             type Value = Harness;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter
-                    .write_str("a harness string: 'opencode', 'pi', 'runner', or 'mcp:<client>'")
+                formatter.write_str(
+                    "a harness string: 'opencode', 'pi', 'runner', 'mcp:<client>', or 'fed:<fingerprint>'",
+                )
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -141,8 +180,9 @@ impl std::str::FromStr for Harness {
                     })
                 }
             }
+            other if other.starts_with("fed:") => parse_fed_harness(other),
             other => Err(format!(
-                "unsupported harness '{other}'; expected 'opencode', 'pi', 'runner', or 'mcp:<client>'"
+                "unsupported harness '{other}'; expected 'opencode', 'pi', 'runner', 'mcp:<client>', or 'fed:<fingerprint>'"
             )),
         }
     }
@@ -209,6 +249,44 @@ mod tests {
             }
         );
         assert!(Harness::from_str("mcp:").is_err());
+    }
+
+    #[test]
+    fn fed_round_trips_and_rejects_malformed_fingerprints() {
+        let fingerprint64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let h = Harness::Fed {
+            fingerprint: fingerprint64.to_string(),
+        };
+        assert_eq!(
+            serde_json::to_string(&h).unwrap(),
+            format!("\"fed:{fingerprint64}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<Harness>(&format!("\"fed:{fingerprint64}\"")).unwrap(),
+            h
+        );
+
+        let fingerprint32 = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            Harness::from_str(&format!("fed:{fingerprint32}")).unwrap(),
+            Harness::Fed {
+                fingerprint: fingerprint32.to_string(),
+            }
+        );
+
+        for invalid in [
+            "fed:",
+            "fed:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+            "fed:0123456789abcdef0123456789abcde",
+            "fed:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+            "fed:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+            "fed:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:extra",
+        ] {
+            assert!(
+                Harness::from_str(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -302,5 +380,54 @@ mod tests {
             "long client segment must be length-bounded, got len {}",
             long.len()
         );
+    }
+
+    #[test]
+    fn fed_storage_segment_is_path_safe_bounded_and_disambiguated() {
+        let prefix = "0123456789abcdef";
+        let fingerprint_a = format!("{prefix}{}", "0".repeat(48));
+        let fingerprint_b = format!("{prefix}{}", "f".repeat(48));
+        let seg = |fingerprint: &str| {
+            Harness::Fed {
+                fingerprint: fingerprint.to_string(),
+            }
+            .storage_segment()
+        };
+        let seg_a = seg(&fingerprint_a);
+        let seg_b = seg(&fingerprint_b);
+        for segment in [&seg_a, &seg_b] {
+            assert!(
+                segment.starts_with(&format!("fed--{prefix}--")),
+                "fed segment must keep the 16-hex readable prefix, got {segment:?}"
+            );
+            assert!(
+                !segment.contains(['/', '\\', ':']),
+                "fed segment must be path-safe, got {segment:?}"
+            );
+            let (_readable, suffix) = segment.rsplit_once("--").expect("hash suffix");
+            assert_eq!(
+                suffix.len(),
+                super::FED_SLUG_HASH_HEX_LEN,
+                "fed hash suffix must use 8 hex chars, got {segment:?}"
+            );
+            assert!(
+                suffix.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "fed hash suffix must be hex, got {segment:?}"
+            );
+            assert!(
+                segment.len()
+                    <= "fed--".len()
+                        + super::FED_SLUG_READABLE_HEX_LEN
+                        + "--".len()
+                        + super::FED_SLUG_HASH_HEX_LEN,
+                "fed segment must be length-bounded, got len {}",
+                segment.len()
+            );
+        }
+        assert_ne!(
+            seg_a, seg_b,
+            "distinct fed fingerprints that share a readable prefix must not share storage"
+        );
+        assert_eq!(seg(&fingerprint_a), seg_a);
     }
 }

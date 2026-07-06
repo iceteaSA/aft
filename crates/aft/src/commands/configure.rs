@@ -1335,7 +1335,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 return Response::error(
                     &req.id,
                     "invalid_request",
-                    "configure payload invalid field 'harness'; expected 'opencode', 'pi', 'runner', or 'mcp:<client>'",
+                    "configure payload invalid field 'harness'; expected 'opencode', 'pi', 'runner', 'mcp:<client>', or 'fed:<fingerprint>'",
                 );
             }
         },
@@ -1343,7 +1343,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "configure payload missing required field 'harness'; expected 'opencode', 'pi', 'runner', or 'mcp:<client>'",
+                "configure payload missing required field 'harness'; expected 'opencode', 'pi', 'runner', 'mcp:<client>', or 'fed:<fingerprint>'",
             );
         }
     };
@@ -2894,7 +2894,7 @@ mod tests {
         assert_eq!(response.data["code"], "invalid_request");
         assert_eq!(
             response.data["message"],
-            "configure payload missing required field 'harness'; expected 'opencode', 'pi', 'runner', or 'mcp:<client>'"
+            "configure payload missing required field 'harness'; expected 'opencode', 'pi', 'runner', 'mcp:<client>', or 'fed:<fingerprint>'"
         );
     }
 

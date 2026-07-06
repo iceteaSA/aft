@@ -1432,6 +1432,94 @@ fn subc_bridge_principal_trust_enforces_restrict_and_bash_deny() {
 }
 
 #[test]
+fn subc_bridge_fed_harness_enforces_restrict_and_bash_deny() {
+    run_subc_bridge_test(
+        "subc_bridge_fed_harness_enforces_restrict_and_bash_deny",
+        Duration::from_secs(60),
+        drive_fed_harness_untrusted_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_rejects_malformed_fed_harness_on_bind() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let conn_path = conn_dir.path().join("subc-connection.json");
+
+    let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    std_listener
+        .set_nonblocking(true)
+        .expect("set fake daemon nonblocking");
+    let port = std_listener.local_addr().expect("fake daemon addr").port();
+    let key = vec![0x42; subc_transport::KEY_LEN];
+    let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+    let conn = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".to_string(),
+            port,
+        }],
+        key: key.clone(),
+        daemon_id,
+        pid: std::process::id(),
+        daemon_ver: "subc-test".to_string(),
+    };
+    connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
+
+    let root_path = root.path().to_path_buf();
+    let daemon = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fake daemon runtime");
+        runtime.block_on(async move {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                drive_malformed_fed_harness_bind_production_daemon(
+                    std_listener,
+                    key,
+                    daemon_id,
+                    root_path,
+                ),
+            )
+            .await
+            .expect("malformed fed bind daemon watchdog");
+        });
+    });
+
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        },
+    ));
+    let executor = Arc::new(Executor::with_config(ExecutorConfig {
+        pool_size: 2,
+        read_cap: 2,
+        actor_cap: 2,
+        heavy_permits: 1,
+        drr_quantum: 1,
+    }));
+    let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
+
+    run_subc_mode(
+        &conn_path,
+        ctx,
+        executor,
+        malformed_fed_bind_production_dispatch,
+        Some(user_config_path),
+    )
+    .expect("subc mode exits cleanly");
+    daemon.join().expect("malformed fed bind daemon joins");
+
+    drop(root);
+    drop(storage);
+}
+
+#[test]
 fn subc_bridge_untrusted_bind_cannot_observe_trusted_bash() {
     run_subc_bridge_test(
         "subc_bridge_untrusted_bind_cannot_observe_trusted_bash",
@@ -1719,6 +1807,17 @@ fn s1_guard_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
         }
     }
     Response::success(req.id, json!({}))
+}
+
+fn malformed_fed_bind_production_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        other => Response::error(
+            req.id,
+            "unexpected_command",
+            format!("unexpected command during malformed fed bind test: {other}"),
+        ),
+    }
 }
 
 /// Security regression for audit finding S1: in production mode an `mcp:*` front
@@ -3902,6 +4001,157 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
         .await;
         assert_tool_error_code(&denied, "bash_denied_untrusted", name);
     }
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_fed_harness_untrusted_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        ..
+    } = open_fake_daemon_session(input).await;
+    let inside = root1.join("fed-inside.txt");
+    let outside = root2.join("fed-outside.txt");
+    std::fs::write(&inside, "fed inside\n").expect("write fed in-root fixture");
+    std::fs::write(&outside, "fed outside\n").expect("write fed out-of-root fixture");
+    let fed_harness = "fed:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    bind_route_with_principal(
+        &mut stream,
+        1,
+        101,
+        &root1,
+        fed_harness,
+        "fed-session",
+        Some(Principal::Direct),
+    )
+    .await;
+
+    let in_root_read = call_tool_response(
+        &mut stream,
+        1,
+        102,
+        "read",
+        json!({ "filePath": inside.to_string_lossy() }),
+        "fed in-root read",
+    )
+    .await;
+    assert_tool_success(&in_root_read, "fed in-root read");
+
+    let out_of_root_read = call_tool_response(
+        &mut stream,
+        1,
+        103,
+        "read",
+        json!({ "filePath": outside.to_string_lossy() }),
+        "fed out-of-root read",
+    )
+    .await;
+    assert_tool_error_code(
+        &out_of_root_read,
+        "path_outside_root",
+        "fed out-of-root read",
+    );
+
+    for (corr, name, args) in [
+        (
+            104,
+            "bash",
+            json!({ "params": { "command": "printf denied", "timeout": 5000 } }),
+        ),
+        (
+            105,
+            "bash_status",
+            json!({ "params": { "task_id": "bash-denied" } }),
+        ),
+        (106, "bash_drain_completions", json!({})),
+        (
+            107,
+            "bash_ack_completions",
+            json!({ "task_ids": ["bash-denied"] }),
+        ),
+    ] {
+        let denied = call_tool_response(
+            &mut stream,
+            1,
+            corr,
+            name,
+            args,
+            "fed harness bash-family deny",
+        )
+        .await;
+        assert_tool_error_code(&denied, "bash_denied_untrusted", name);
+    }
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_malformed_fed_harness_bind_production_daemon(
+    std_listener: StdTcpListener,
+    key: Vec<u8>,
+    daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
+    root: std::path::PathBuf,
+) {
+    let listener = TcpListener::from_std(std_listener).expect("tokio listener");
+    let (mut stream, _) = listener.accept().await.expect("accept aft client");
+    authenticate_server(
+        &mut stream,
+        &key,
+        &daemon_id,
+        "subc-test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("authenticate aft client");
+
+    let hello = read_any_frame_timeout(&mut stream, "ModuleHello").await;
+    assert_eq!(hello.header.ty, FrameType::Hello);
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            hello.header.corr,
+            serde_json::to_vec(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: Vec::new(),
+                subc_capabilities: Vec::new(),
+                storage: None,
+            })
+            .expect("hello ack body"),
+        )
+        .expect("hello ack frame"),
+    )
+    .await;
+
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: BindIdentity {
+            project_root: root,
+            harness: "fed:".to_string(),
+            session: "fed-malformed-session".to_string(),
+        },
+        principal: Some(Principal::Direct),
+    };
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            101,
+            serde_json::to_vec(&bind).expect("route bind body"),
+        )
+        .expect("route bind frame"),
+    )
+    .await;
+    expect_route_bind_error(&mut stream, 101, "config_divergence").await;
 
     send_connection_goodbye(&mut stream).await;
 }

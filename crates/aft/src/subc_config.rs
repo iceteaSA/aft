@@ -3,7 +3,7 @@
 //! Config is single-per-project, read by AFT directly off disk from the
 //! CortexKit config files: user `~/.config/cortexkit/aft.jsonc` and project
 //! `<root>/.cortexkit/aft.jsonc`. There is NO wire-relayed config path — a front
-//! (runner or `mcp:*`) cannot push config over the connection. This makes the
+//! (runner, `mcp:*`, or `fed:*`) cannot push config over the connection. This makes the
 //! resolved config harness-INDEPENDENT: every harness binding a project reads
 //! the identical on-disk config, so two trust domains sharing the per-root actor
 //! can never diverge or inherit each other's capabilities.

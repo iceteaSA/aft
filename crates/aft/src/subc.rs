@@ -299,6 +299,18 @@ pub(crate) fn trust_for_principal(principal: &Option<Principal>) -> BindTrust {
     }
 }
 
+fn harness_forces_untrusted(harness: &str) -> bool {
+    harness.starts_with("fed:")
+}
+
+pub(crate) fn trust_for_bind(harness: &str, principal: &Option<Principal>) -> BindTrust {
+    if harness_forces_untrusted(harness) {
+        BindTrust::Untrusted
+    } else {
+        trust_for_principal(principal)
+    }
+}
+
 fn principal_label(principal: &Option<Principal>) -> String {
     match principal {
         Some(Principal::Direct) => "direct".to_string(),
@@ -2215,10 +2227,11 @@ async fn handle_control_request(
             let bind_project_root = identity.project_root.clone();
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
-            let bind_trust = trust_for_principal(&principal);
+            let bind_trust = trust_for_bind(&bind_harness, &principal);
             log::info!(
-                "subc attach: route {} principal={} trust={}",
+                "subc attach: route {} harness={} principal={} trust={}",
                 route_channel,
+                bind_harness,
                 principal_label(&principal),
                 bind_trust.label()
             );
@@ -2226,7 +2239,7 @@ async fn handle_control_request(
             // Config is single-per-project, read by AFT directly from the
             // CortexKit config files (user: ~/.config/cortexkit/aft.jsonc,
             // project: <root>/.cortexkit/aft.jsonc). Wire-relayed config tiers are
-            // IGNORED entirely: a front (runner or mcp:*) cannot push config over
+            // IGNORED entirely: a front (runner, mcp:*, or fed:*) cannot push config over
             // the wire. This is what makes config harness-INDEPENDENT — every
             // harness binding a project gets the identical on-disk config, so two
             // trust domains sharing the per-root actor can never diverge or
@@ -4348,6 +4361,22 @@ mod tests {
             BindTrust::Untrusted
         );
         assert_eq!(trust_for_principal(&None), BindTrust::Untrusted);
+    }
+
+    #[test]
+    fn fed_harness_class_maps_to_untrusted_regardless_of_fingerprint_value() {
+        let principal = Some(Principal::Direct);
+        let fingerprint_a = "fed:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let fingerprint_b = "fed:0123456789abcdef111111111111111111111111111111111111111111111111";
+
+        assert_eq!(
+            trust_for_bind(fingerprint_a, &principal),
+            BindTrust::Untrusted
+        );
+        assert_eq!(
+            trust_for_bind(fingerprint_b, &principal),
+            BindTrust::Untrusted
+        );
     }
 
     #[test]

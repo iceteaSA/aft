@@ -462,7 +462,7 @@ pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
 /// escalation: under the subc daemon a single `AppContext` per project root is
 /// shared across harness identities, and `configure` seeds `base` from the
 /// previous bind's config. With the old overlay semantics, a later low-trust
-/// bind (e.g. `mcp:*`) that omitted a field inherited an earlier high-trust
+/// bind (e.g. `mcp:*` or `fed:*`) that omitted a field inherited an earlier high-trust
 /// bind's capability for it (confirmed on the wire: `url_fetch_allow_private`
 /// SSRF, and `lsp_servers` arbitrary-binary). Reset-onto-default makes the
 /// resolved core config a pure function of THIS bind's own tiers.
