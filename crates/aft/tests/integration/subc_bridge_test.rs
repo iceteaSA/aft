@@ -1523,6 +1523,16 @@ fn subc_bridge_health_check_returns_root_status_report() {
 }
 
 #[test]
+fn subc_bridge_health_check_reports_pending_route_bind() {
+    run_subc_bridge_test(
+        "subc_bridge_health_check_reports_pending_route_bind",
+        Duration::from_secs(30),
+        drive_pending_bind_health_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_mutating_internal_error_is_not_fatal_teardown() {
     run_subc_bridge_test(
         "subc_bridge_mutating_internal_error_is_not_fatal_teardown",
@@ -4339,6 +4349,54 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
         );
     }
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_pending_bind_health_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    let started_before = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        11,
+        110,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "inspect": { "enabled": false },
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("pending bind configure started", |inner| {
+        inner.slow_configure_started > started_before
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    send_control_request(&mut stream, 111, ModuleControlRequest::HealthCheck {}).await;
+    let report = expect_health_check_report(&mut stream, 111).await;
+    let metrics = report.metrics.expect("health check metrics");
+    let pending_binds = metrics
+        .pointer("/dispatch_path/pending_binds")
+        .expect("dispatch_path pending_binds metrics");
+    assert_eq!(pending_binds.get("count").and_then(Value::as_u64), Some(1));
+    assert!(
+        pending_binds
+            .get("oldest_age_ms")
+            .and_then(Value::as_u64)
+            .is_some_and(|age| age > 0),
+        "pending bind should report a non-zero age: {pending_binds:?}"
+    );
+
+    state.release_slow_configures();
+    expect_route_bind_ack(&mut stream, 110).await;
     send_connection_goodbye(&mut stream).await;
 }
 
