@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,10 @@ const PUSH_BUFFER_MAX_PER_KEY: usize = 256;
 /// writer queue stays full, tear the subc edge down instead of stalling the
 /// route loop indefinitely.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+
+const WRITER_QUEUE_CAPACITY: usize = 256;
+
+const DISPATCH_PATH_BIND_WARN_AFTER: Duration = Duration::from_secs(6);
 
 /// Small bounded memory of completed task ids used to suppress stale lossy
 /// long-running reminders that arrive after their reliable completion event.
@@ -133,6 +137,101 @@ impl PersistentCancelSignal {
             }
             notified.await;
         }
+    }
+}
+
+struct DispatchPathMetrics {
+    origin: Instant,
+    frame_loop_last_tick_ms: AtomicU64,
+    writer_queued: AtomicUsize,
+    writer_saturation_count: AtomicU64,
+    control_completion_queued: AtomicUsize,
+    maintenance_queued: AtomicUsize,
+    bash_deferred_queued: AtomicUsize,
+    bash_poll_touch_queued: AtomicUsize,
+    response_tasks_live: AtomicUsize,
+}
+
+impl DispatchPathMetrics {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            frame_loop_last_tick_ms: AtomicU64::new(0),
+            writer_queued: AtomicUsize::new(0),
+            writer_saturation_count: AtomicU64::new(0),
+            control_completion_queued: AtomicUsize::new(0),
+            maintenance_queued: AtomicUsize::new(0),
+            bash_deferred_queued: AtomicUsize::new(0),
+            bash_poll_touch_queued: AtomicUsize::new(0),
+            response_tasks_live: AtomicUsize::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        duration_millis_u64(self.origin.elapsed())
+    }
+
+    fn mark_frame_loop_tick(&self) {
+        self.frame_loop_last_tick_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    fn snapshot(
+        &self,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        executor: &Executor,
+    ) -> Value {
+        let now = Instant::now();
+        let oldest_pending_age_ms = pending_binds
+            .values()
+            .map(|bind| duration_millis_u64(now.saturating_duration_since(bind.started_at)))
+            .max();
+        let last_tick_ms = self.frame_loop_last_tick_ms.load(Ordering::Relaxed);
+        json!({
+            "frame_loop": {
+                "last_tick_age_ms": self.now_ms().saturating_sub(last_tick_ms),
+            },
+            "pending_binds": {
+                "count": pending_binds.len(),
+                "oldest_age_ms": oldest_pending_age_ms,
+            },
+            "completion_channels": {
+                "control": self.control_completion_queued.load(Ordering::Relaxed),
+                "maintenance": self.maintenance_queued.load(Ordering::Relaxed),
+                "bash_deferred": self.bash_deferred_queued.load(Ordering::Relaxed),
+                "bash_poll_touch": self.bash_poll_touch_queued.load(Ordering::Relaxed),
+            },
+            "writer": {
+                "queued": self.writer_queued.load(Ordering::Relaxed),
+                "capacity": WRITER_QUEUE_CAPACITY,
+                "saturation_count": self.writer_saturation_count.load(Ordering::Relaxed),
+            },
+            "response_tasks": {
+                "live": self.response_tasks_live.load(Ordering::Relaxed),
+            },
+            "mutating_lanes": mutating_lanes_metrics(executor),
+        })
+    }
+}
+
+struct ResponseTaskGuard {
+    metrics: Arc<DispatchPathMetrics>,
+}
+
+impl ResponseTaskGuard {
+    fn new(metrics: &Arc<DispatchPathMetrics>) -> Self {
+        metrics.response_tasks_live.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics: Arc::clone(metrics),
+        }
+    }
+}
+
+impl Drop for ResponseTaskGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .response_tasks_live
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -228,6 +327,9 @@ struct PendingBind {
     bind_root_id: ProjectRootId,
     inserted_new_actor: bool,
     cancelled: bool,
+    configure_request_id: String,
+    started_at: Instant,
+    warned_half_deadline: bool,
 }
 
 struct RouteBindCompletion {
@@ -408,6 +510,7 @@ fn remove_bg_subscription_index(
 
 fn end_bg_subscription(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
     bg_wake_pending: &mut HashSet<RouteChannel>,
@@ -415,7 +518,7 @@ fn end_bg_subscription(
     identity: Option<&RouteIdentity>,
 ) {
     if let Some(sub) = bg_subs.get(&channel).copied() {
-        let _ = try_send_bg_stream_end(writer_tx, channel, &sub);
+        let _ = try_send_bg_stream_end(writer_tx, metrics, channel, &sub);
         bg_subs.remove(&channel);
         bg_wake_pending.remove(&channel);
         remove_bg_subscription_index(bg_sub_by_session, channel, identity);
@@ -615,6 +718,7 @@ enum PushSendOutcome {
 
 fn try_send_push_body(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     body: &[u8],
 ) -> PushSendOutcome {
@@ -636,10 +740,10 @@ fn try_send_push_body(
             return PushSendOutcome::PermanentFailure;
         }
     };
-    match writer_tx.try_send(push_frame) {
+    match try_enqueue_writer_frame(writer_tx, metrics, push_frame) {
         Ok(()) => PushSendOutcome::Sent,
-        Err(mpsc::error::TrySendError::Full(_)) => PushSendOutcome::Backpressure,
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+        Err(WriterEnqueueError::Full(_)) => PushSendOutcome::Backpressure,
+        Err(WriterEnqueueError::Closed(_)) => {
             log::warn!("subc attach: writer closed while sending Push frame");
             PushSendOutcome::PermanentFailure
         }
@@ -648,6 +752,7 @@ fn try_send_push_body(
 
 fn try_send_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     frame: &PushFrame,
 ) -> PushSendOutcome {
@@ -658,11 +763,12 @@ fn try_send_push_frame(
             return PushSendOutcome::PermanentFailure;
         }
     };
-    try_send_push_body(writer_tx, channel, &body)
+    try_send_push_body(writer_tx, metrics, channel, &body)
 }
 
 fn try_send_bg_stream_frame(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     sub: &BgSub,
     ty: FrameType,
@@ -680,10 +786,10 @@ fn try_send_bg_stream_frame(
                 return PushSendOutcome::PermanentFailure;
             }
         };
-    match writer_tx.try_send(frame) {
+    match try_enqueue_writer_frame(writer_tx, metrics, frame) {
         Ok(()) => PushSendOutcome::Sent,
-        Err(mpsc::error::TrySendError::Full(_)) => PushSendOutcome::Backpressure,
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+        Err(WriterEnqueueError::Full(_)) => PushSendOutcome::Backpressure,
+        Err(WriterEnqueueError::Closed(_)) => {
             log::warn!("subc attach: writer closed while sending bg_events stream frame");
             PushSendOutcome::PermanentFailure
         }
@@ -692,6 +798,7 @@ fn try_send_bg_stream_frame(
 
 fn try_send_bg_stream_data(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     sub: &BgSub,
 ) -> PushSendOutcome {
@@ -702,19 +809,35 @@ fn try_send_bg_stream_data(
             return PushSendOutcome::PermanentFailure;
         }
     };
-    try_send_bg_stream_frame(writer_tx, channel, sub, FrameType::StreamData, body)
+    try_send_bg_stream_frame(
+        writer_tx,
+        metrics,
+        channel,
+        sub,
+        FrameType::StreamData,
+        body,
+    )
 }
 
 fn try_send_bg_stream_end(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     sub: &BgSub,
 ) -> PushSendOutcome {
-    try_send_bg_stream_frame(writer_tx, channel, sub, FrameType::StreamEnd, Vec::new())
+    try_send_bg_stream_frame(
+        writer_tx,
+        metrics,
+        channel,
+        sub,
+        FrameType::StreamEnd,
+        Vec::new(),
+    )
 }
 
 fn emit_bg_event_wakes(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     bg_subs: &HashMap<RouteChannel, BgSub>,
     bg_wake_pending: &mut HashSet<RouteChannel>,
 ) {
@@ -722,7 +845,7 @@ fn emit_bg_event_wakes(
     let mut stale_channels = Vec::new();
     for channel in pending_channels {
         if let Some(sub) = bg_subs.get(&channel) {
-            let _ = try_send_bg_stream_data(writer_tx, channel, sub);
+            let _ = try_send_bg_stream_data(writer_tx, metrics, channel, sub);
         } else {
             stale_channels.push(channel);
         }
@@ -805,6 +928,7 @@ fn migrate_retry_buffer_to_push_buffer(
 
 fn replay_buffered_push_frames(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     key: &ReplayKey,
@@ -822,7 +946,7 @@ fn replay_buffered_push_frames(
             if frame_is_bash_observation(&frame) && !trust.allows_bash_observation() {
                 continue;
             }
-            match try_send_push_frame(writer_tx, channel, &frame) {
+            match try_send_push_frame(writer_tx, metrics, channel, &frame) {
                 PushSendOutcome::Sent => sent += 1,
                 PushSendOutcome::Backpressure => {
                     queue.push_front(frame);
@@ -851,6 +975,7 @@ fn replay_buffered_push_frames(
 
 fn drain_retry_buffer_for_channel(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     retry_buffer: &mut RetryBuffer,
 ) -> usize {
@@ -863,7 +988,7 @@ fn drain_retry_buffer_for_channel(
         };
 
         while let Some((key, frame)) = queue.pop_front() {
-            match try_send_push_frame(writer_tx, channel, &frame) {
+            match try_send_push_frame(writer_tx, metrics, channel, &frame) {
                 PushSendOutcome::Sent => sent += 1,
                 PushSendOutcome::Backpressure => {
                     queue.push_front((key, frame));
@@ -892,13 +1017,14 @@ fn drain_retry_buffer_for_channel(
 
 fn drain_retry_buffers_for_bound_routes(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     retry_buffer: &mut RetryBuffer,
 ) -> usize {
     let channels: Vec<RouteChannel> = routes.keys().copied().collect();
     channels
         .into_iter()
-        .map(|channel| drain_retry_buffer_for_channel(writer_tx, channel, retry_buffer))
+        .map(|channel| drain_retry_buffer_for_channel(writer_tx, metrics, channel, retry_buffer))
         .sum()
 }
 
@@ -962,6 +1088,7 @@ fn buffer_detached_reliable_push_frame(
 
 fn fan_out_lossy_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     root: &ProjectRootId,
@@ -988,7 +1115,7 @@ fn fan_out_lossy_push_frame(
         .into_iter()
         .filter(|&channel| {
             matches!(
-                try_send_push_body(writer_tx, channel, &body),
+                try_send_push_body(writer_tx, metrics, channel, &body),
                 PushSendOutcome::Sent
             )
         })
@@ -1002,6 +1129,7 @@ fn fan_out_lossy_push_frame(
 
 fn fan_out_reliable_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -1035,7 +1163,7 @@ fn fan_out_reliable_push_frame(
             continue;
         }
 
-        match try_send_push_frame(writer_tx, channel, frame) {
+        match try_send_push_frame(writer_tx, metrics, channel, frame) {
             PushSendOutcome::Sent => sent_frames += 1,
             PushSendOutcome::Backpressure => {
                 buffer_retry_frame(retry_buffer, channel, key, frame.clone());
@@ -1059,6 +1187,7 @@ fn fan_out_reliable_push_frame(
 
 fn process_reliable_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -1074,6 +1203,7 @@ fn process_reliable_push_frame(
     }
     let _ = fan_out_reliable_push_frame(
         writer_tx,
+        metrics,
         routes,
         root_channels,
         session_identity,
@@ -1087,6 +1217,7 @@ fn process_reliable_push_frame(
 
 fn process_lossy_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     completed_tasks: &CompletedTaskIds,
@@ -1102,7 +1233,7 @@ fn process_lossy_push_frame(
         return;
     }
 
-    let _ = fan_out_lossy_push_frame(writer_tx, routes, root_channels, &root, &frame);
+    let _ = fan_out_lossy_push_frame(writer_tx, metrics, routes, root_channels, &root, &frame);
 }
 
 /// Sync command dispatch, passed in from `main` (the binary owns the command
@@ -1293,8 +1424,9 @@ where
         },
     }
 
-    let (writer_tx, writer_rx) = mpsc::channel::<Frame>(256);
-    let writer_task = spawn_writer_task(write, writer_rx);
+    let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    let (writer_tx, writer_rx) = mpsc::channel::<Frame>(WRITER_QUEUE_CAPACITY);
+    let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
     // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
     // the `select!` below: a drain-interval tick (or shutdown) firing while a
     // frame is mid-transit would drop the partially-consumed bytes and desync the
@@ -1333,6 +1465,7 @@ where
     let mut route_bash_cancels: HashMap<RouteChannel, RouteBashCancel> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
+        dispatch_path_metrics.mark_frame_loop_tick();
         tokio::select! {
             _ = shutdown.notified() => {
                 log::warn!("subc attach: fatal executor response requested teardown");
@@ -1361,7 +1494,7 @@ where
                             Ok(pong) => pong,
                             Err(error) => break Err(SubcError::FrameBuild(error)),
                         };
-                        if let Err(error) = send_frame(&writer_tx, pong).await {
+                        if let Err(error) = send_frame(&writer_tx, &dispatch_path_metrics, pong).await {
                             break Err(error);
                         }
                     }
@@ -1373,6 +1506,7 @@ where
                         let channel = route_key(frame.header.channel);
                         end_bg_subscription(
                             &writer_tx,
+                            &dispatch_path_metrics,
                             &mut bg_subs,
                             &mut bg_sub_by_session,
                             &mut bg_wake_pending,
@@ -1440,6 +1574,7 @@ where
                             &mut live_roots,
                             &mut pending_binds,
                             &control_completion_tx,
+                            &dispatch_path_metrics,
                             &push_senders,
                             dispatch,
                             user_config_path.as_deref(),
@@ -1461,6 +1596,7 @@ where
                             &connection_cancel,
                             &bash_deferred_tx,
                             &bash_poll_touch_tx,
+                            &dispatch_path_metrics,
                             &mut route_bash_cancels,
                             &mut bg_subs,
                             &mut bg_sub_by_session,
@@ -1479,6 +1615,7 @@ where
                         if bg_subs.contains_key(&channel) {
                             end_bg_subscription(
                                 &writer_tx,
+                                &dispatch_path_metrics,
                                 &mut bg_subs,
                                 &mut bg_sub_by_session,
                                 &mut bg_wake_pending,
@@ -1505,6 +1642,7 @@ where
                 for (root, frame) in batch {
                     if let Some((root, session)) = process_reliable_push_frame(
                         &writer_tx,
+                        &dispatch_path_metrics,
                         &routes,
                         &root_channels,
                         &session_identity,
@@ -1536,6 +1674,7 @@ where
                 while let Ok((reliable_root, reliable_frame)) = reliable_rx.try_recv() {
                     if let Some((root, session)) = process_reliable_push_frame(
                         &writer_tx,
+                        &dispatch_path_metrics,
                         &routes,
                         &root_channels,
                         &session_identity,
@@ -1571,6 +1710,7 @@ where
                 for (root, frame) in coalesce_push_batch(batch) {
                     process_lossy_push_frame(
                         &writer_tx,
+                        &dispatch_path_metrics,
                         &routes,
                         &root_channels,
                         &completed_tasks,
@@ -1580,6 +1720,7 @@ where
                 }
             }
             Some(completion) = control_completion_rx.recv() => {
+                decrement_counted_channel(&dispatch_path_metrics.control_completion_queued);
                 if let Err(error) = handle_route_bind_completion(
                     &writer_tx,
                     completion,
@@ -1591,6 +1732,7 @@ where
                     &mut pending_binds,
                     &executor,
                     &shutdown,
+                    &dispatch_path_metrics,
                 )
                 .await
                 {
@@ -1598,6 +1740,7 @@ where
                 }
             }
             Some(done) = bash_deferred_rx.recv() => {
+                decrement_counted_channel(&dispatch_path_metrics.bash_deferred_queued);
                 if let Err(error) = handle_bash_deferred_completion(
                     &writer_tx,
                     done,
@@ -1605,6 +1748,7 @@ where
                     &mut live_roots,
                     &mut route_bash_cancels,
                     &shutdown,
+                    &dispatch_path_metrics,
                 )
                 .await
                 {
@@ -1612,11 +1756,13 @@ where
                 }
             }
             Some(root_id) = bash_poll_touch_rx.recv() => {
+                decrement_counted_channel(&dispatch_path_metrics.bash_poll_touch_queued);
                 if let Some(meta) = live_roots.get_mut(&root_id) {
                     meta.touch();
                 }
             }
             Some(completion) = maintenance_rx.recv() => {
+                decrement_counted_channel(&dispatch_path_metrics.maintenance_queued);
                 let root_id = completion.root_id;
                 let response = completion.response;
                 if let Some(meta) = live_roots.get_mut(&root_id) {
@@ -1639,10 +1785,17 @@ where
                 }
             }
             _ = drain_interval.tick() => {
-                emit_bg_event_wakes(&writer_tx, &bg_subs, &mut bg_wake_pending);
+                emit_bg_event_wakes(
+                    &writer_tx,
+                    &dispatch_path_metrics,
+                    &bg_subs,
+                    &mut bg_wake_pending,
+                );
+                warn_slow_pending_binds(&mut pending_binds, &executor);
 
                 let retried = drain_retry_buffers_for_bound_routes(
                     &writer_tx,
+                    &dispatch_path_metrics,
                     &routes,
                     &mut retry_buffer,
                 );
@@ -1675,6 +1828,7 @@ where
                         root_id,
                         bg_sessions_to_check,
                         &maintenance_tx,
+                        &dispatch_path_metrics,
                     );
                 }
             }
@@ -1693,12 +1847,14 @@ where
 fn spawn_writer_task<W>(
     mut write: W,
     mut rx: mpsc::Receiver<Frame>,
+    metrics: Arc<DispatchPathMetrics>,
 ) -> JoinHandle<Result<(), subc_transport::FrameIoError>>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
+            decrement_counted_channel(&metrics.writer_queued);
             write_frame(&mut write, &frame).await?;
         }
         Ok(())
@@ -1750,11 +1906,90 @@ async fn finish_writer_task(
     }
 }
 
-async fn send_frame(tx: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), SubcError> {
-    match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.send(frame)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(SubcError::WriterClosed),
-        Err(_) => Err(SubcError::WriterBackpressureTimeout),
+enum WriterEnqueueError {
+    Full(Frame),
+    Closed(Frame),
+}
+
+fn decrement_counted_channel(counter: &AtomicUsize) {
+    let previous = counter.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(previous > 0, "counted channel depth underflow");
+}
+
+async fn send_counted_channel<T>(
+    tx: &mpsc::Sender<T>,
+    counter: &AtomicUsize,
+    item: T,
+) -> Result<(), mpsc::error::SendError<T>> {
+    counter.fetch_add(1, Ordering::Relaxed);
+    match tx.send(item).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            decrement_counted_channel(counter);
+            Err(error)
+        }
+    }
+}
+
+fn try_enqueue_writer_frame(
+    tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+) -> Result<(), WriterEnqueueError> {
+    match tx.try_reserve() {
+        Ok(permit) => {
+            metrics.writer_queued.fetch_add(1, Ordering::Relaxed);
+            permit.send(frame);
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Full(())) => {
+            metrics
+                .writer_saturation_count
+                .fetch_add(1, Ordering::Relaxed);
+            Err(WriterEnqueueError::Full(frame))
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => Err(WriterEnqueueError::Closed(frame)),
+    }
+}
+
+async fn send_writer_frame(
+    tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+) -> Result<(), mpsc::error::SendError<Frame>> {
+    match try_enqueue_writer_frame(tx, metrics, frame) {
+        Ok(()) => Ok(()),
+        Err(WriterEnqueueError::Closed(frame)) => Err(mpsc::error::SendError(frame)),
+        Err(WriterEnqueueError::Full(frame)) => match tx.reserve().await {
+            Ok(permit) => {
+                metrics.writer_queued.fetch_add(1, Ordering::Relaxed);
+                permit.send(frame);
+                Ok(())
+            }
+            Err(_) => Err(mpsc::error::SendError(frame)),
+        },
+    }
+}
+
+async fn send_frame(
+    tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+) -> Result<(), SubcError> {
+    match try_enqueue_writer_frame(tx, metrics, frame) {
+        Ok(()) => Ok(()),
+        Err(WriterEnqueueError::Closed(_)) => Err(SubcError::WriterClosed),
+        Err(WriterEnqueueError::Full(frame)) => {
+            match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.reserve()).await {
+                Ok(Ok(permit)) => {
+                    metrics.writer_queued.fetch_add(1, Ordering::Relaxed);
+                    permit.send(frame);
+                    Ok(())
+                }
+                Ok(Err(_)) => Err(SubcError::WriterClosed),
+                Err(_) => Err(SubcError::WriterBackpressureTimeout),
+            }
+        }
     }
 }
 
@@ -1780,6 +2015,7 @@ async fn handle_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     let route_id = route_key(completion.route_channel);
     let Some(pending) = pending_binds.remove(&route_id) else {
@@ -1855,6 +2091,7 @@ async fn handle_route_bind_completion(
             completion.flags,
             "config_divergence",
             &message,
+            metrics,
         )
         .await?;
         if fatal {
@@ -1864,6 +2101,7 @@ async fn handle_route_bind_completion(
                 completion.ver,
                 completion.corr,
                 shutdown,
+                metrics,
             )
             .await;
         }
@@ -1898,8 +2136,9 @@ async fn handle_route_bind_completion(
         ack,
     )
     .map_err(SubcError::FrameBuild)?;
-    send_frame(tx, response).await?;
-    let replayed = replay_buffered_push_frames(tx, route_id, push_buffer, &replay_key, bind_trust);
+    send_frame(tx, metrics, response).await?;
+    let replayed =
+        replay_buffered_push_frames(tx, metrics, route_id, push_buffer, &replay_key, bind_trust);
     if replayed > 0 {
         log::debug!(
             "subc attach: replayed {} buffered Push frame(s) to route {} root {} harness {} session {}",
@@ -1930,6 +2169,7 @@ async fn handle_control_request(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
+    metrics: &Arc<DispatchPathMetrics>,
     push_senders: &PushSenders,
     dispatch: DispatchFn,
     user_config_path: Option<&Path>,
@@ -1950,6 +2190,7 @@ async fn handle_control_request(
                     frame,
                     "config_divergence",
                     "route bind is already pending for channel",
+                    metrics,
                 )
                 .await;
             }
@@ -1962,6 +2203,7 @@ async fn handle_control_request(
                         frame,
                         "config_divergence",
                         &format!("invalid route project root: {error}"),
+                        metrics,
                     )
                     .await;
                 }
@@ -2017,6 +2259,7 @@ async fn handle_control_request(
                         frame,
                         "config_divergence",
                         &format!("failed to build configure request: {error}"),
+                        metrics,
                     )
                     .await;
                 }
@@ -2062,16 +2305,18 @@ async fn handle_control_request(
                 inserted
             };
 
+            let configure_request_id = configure_req.id.clone();
             pending_binds.insert(
                 route_id,
                 PendingBind {
                     bind_root_id: bind_root_id.clone(),
                     inserted_new_actor,
                     cancelled: false,
+                    configure_request_id: configure_request_id.clone(),
+                    started_at: Instant::now(),
+                    warned_half_deadline: false,
                 },
             );
-
-            let configure_request_id = configure_req.id.clone();
             let configure_rx = executor.submit_async(
                 bind_root_id.clone(),
                 Lane::Mutating,
@@ -2091,7 +2336,9 @@ async fn handle_control_request(
             let completion_ver = frame.header.ver;
             let completion_corr = frame.header.corr;
             let completion_flags = frame.header.flags;
+            let completion_metrics = Arc::clone(metrics);
             tokio::spawn(async move {
+                let _response_task = ResponseTaskGuard::new(&completion_metrics);
                 let configure_response =
                     await_executor_response(configure_rx, configure_request_id.clone()).await;
                 let drain_response = if configure_response.success && !root_was_live {
@@ -2123,7 +2370,14 @@ async fn handle_control_request(
                     corr: completion_corr,
                     flags: completion_flags,
                 };
-                if completion_tx.send(completion).await.is_err() {
+                if send_counted_channel(
+                    &completion_tx,
+                    &completion_metrics.control_completion_queued,
+                    completion,
+                )
+                .await
+                .is_err()
+                {
                     log::debug!(
                         "subc attach: dropped RouteBind completion for route {} after loop exit",
                         completion_route_channel
@@ -2134,7 +2388,7 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
-            let report = build_health_report(executor);
+            let report = build_health_report(executor, pending_binds, metrics);
             let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(SubcError::Json)?;
             let response = Frame::build_with_version(
@@ -2146,7 +2400,7 @@ async fn handle_control_request(
                 body,
             )
             .map_err(SubcError::FrameBuild)?;
-            send_frame(tx, response).await
+            send_frame(tx, metrics, response).await
         }
     }
 }
@@ -2199,6 +2453,7 @@ async fn send_route_bind_error(
     frame: &Frame,
     code: &str,
     message: &str,
+    metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     send_route_bind_error_parts(
         tx,
@@ -2207,6 +2462,7 @@ async fn send_route_bind_error(
         frame.header.flags,
         code,
         message,
+        metrics,
     )
     .await
 }
@@ -2218,9 +2474,10 @@ async fn send_route_bind_error_parts(
     flags: Flags,
     code: &str,
     message: &str,
+    metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     let response = build_error_frame(ver, 0, corr, flags, code, message)?;
-    send_frame(tx, response).await?;
+    send_frame(tx, metrics, response).await?;
     log::warn!("subc attach: route bind rejected ({code}): {message}");
     Ok(())
 }
@@ -2240,6 +2497,7 @@ async fn handle_tool_call(
     connection_cancel: &PersistentCancelSignal,
     bash_deferred_tx: &mpsc::Sender<BashDeferredCompletion>,
     bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    metrics: &Arc<DispatchPathMetrics>,
     route_bash_cancels: &mut HashMap<RouteChannel, RouteBashCancel>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
@@ -2258,7 +2516,7 @@ async fn handle_tool_call(
             "route_not_bound",
             "route is not bound before tool call",
         )?;
-        return send_frame(tx, error).await;
+        return send_frame(tx, metrics, error).await;
     }
 
     let Some(identity) = routes.get(&route_id).cloned() else {
@@ -2270,7 +2528,7 @@ async fn handle_tool_call(
             "route_not_bound",
             "route is not bound before tool call",
         )?;
-        return send_frame(tx, error).await;
+        return send_frame(tx, metrics, error).await;
     };
     if let Some(meta) = live_roots.get_mut(&identity.root) {
         meta.touch();
@@ -2283,7 +2541,7 @@ async fn handle_tool_call(
         == Some("bg_events");
     if is_bg_events_subscribe {
         if let Some(old_sub) = bg_subs.get(&route_id).copied() {
-            let _ = try_send_bg_stream_end(tx, route_id, &old_sub);
+            let _ = try_send_bg_stream_end(tx, metrics, route_id, &old_sub);
         }
         if !identity.trust.allows_bash_observation() {
             bg_subs.remove(&route_id);
@@ -2340,7 +2598,7 @@ async fn handle_tool_call(
             frame.header.flags,
             &result,
         )?;
-        return send_frame(tx, response_frame).await;
+        return send_frame(tx, metrics, response_frame).await;
     }
 
     // A non-core name is NOT in the tool manifest. AFT fails closed and
@@ -2377,7 +2635,7 @@ async fn handle_tool_call(
             frame.header.flags,
             &result,
         )?;
-        return send_frame(tx, response_frame).await;
+        return send_frame(tx, metrics, response_frame).await;
     }
 
     if bare_name == "bash" {
@@ -2403,6 +2661,7 @@ async fn handle_tool_call(
             executor,
             bash_deferred_tx,
             bash_poll_touch_tx,
+            metrics,
             dispatch,
             identity.root,
             identity.project_root,
@@ -2482,7 +2741,9 @@ async fn handle_tool_call(
     let corr = frame.header.corr;
     let flags = frame.header.flags;
     let ver = frame.header.ver;
+    let completion_metrics = Arc::clone(metrics);
     tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&completion_metrics);
         let response = await_executor_response(rx, request_id.clone()).await;
         let text = text_rx.await.unwrap_or_else(|_| {
             crate::subc_format::format_response_with_context(
@@ -2495,7 +2756,8 @@ async fn handle_tool_call(
         let fatal = response_is_fatal_panic(&result.response);
         match build_tool_response_frame(ver, route_channel, corr, flags, &result) {
             Ok(response_frame) => {
-                let _ = completion_tx.send(response_frame).await;
+                let _ =
+                    send_writer_frame(&completion_tx, &completion_metrics, response_frame).await;
             }
             Err(error) => {
                 log::error!("subc attach: failed to build tool response frame: {error}");
@@ -2508,6 +2770,7 @@ async fn handle_tool_call(
                 ver,
                 corr,
                 &completion_shutdown,
+                &completion_metrics,
             )
             .await;
         }
@@ -2647,6 +2910,7 @@ fn submit_deferred_bash(
     executor: &Arc<Executor>,
     completion_tx: &mpsc::Sender<BashDeferredCompletion>,
     poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    metrics: &Arc<DispatchPathMetrics>,
     dispatch: DispatchFn,
     root: ProjectRootId,
     project_root: PathBuf,
@@ -2812,8 +3076,10 @@ fn submit_deferred_bash(
     let executor = Arc::clone(executor);
     let completion_tx = completion_tx.clone();
     let poll_touch_tx = poll_touch_tx.clone();
+    let task_metrics = Arc::clone(metrics);
     let root_for_task = root.clone();
     tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&task_metrics);
         let spawn_response = await_executor_response(spawn_rx, request_id.clone()).await;
         let spawn_control = spawn_control_rx.await;
         match spawn_control {
@@ -2832,6 +3098,7 @@ fn submit_deferred_bash(
                 let fatal = response_is_fatal_panic(&result.response);
                 send_bash_deferred_completion(
                     &completion_tx,
+                    &task_metrics,
                     route_channel,
                     corr,
                     flags,
@@ -2857,6 +3124,7 @@ fn submit_deferred_bash(
                     executor,
                     completion_tx,
                     poll_touch_tx,
+                    task_metrics,
                     route_channel,
                     corr,
                     flags,
@@ -2881,6 +3149,7 @@ fn submit_deferred_bash(
                 let fatal = response_is_fatal_panic(&result.response);
                 send_bash_deferred_completion(
                     &completion_tx,
+                    &task_metrics,
                     route_channel,
                     corr,
                     flags,
@@ -2901,6 +3170,7 @@ async fn run_deferred_bash_wait(
     executor: Arc<Executor>,
     completion_tx: mpsc::Sender<BashDeferredCompletion>,
     poll_touch_tx: mpsc::Sender<ProjectRootId>,
+    metrics: Arc<DispatchPathMetrics>,
     route_channel: u16,
     corr: u64,
     flags: Flags,
@@ -2923,6 +3193,7 @@ async fn run_deferred_bash_wait(
             _ = cancel.cancelled() => {
                 send_bash_deferred_completion(
                     &completion_tx,
+                    &metrics,
                     route_channel,
                     corr,
                     flags,
@@ -3015,7 +3286,12 @@ async fn run_deferred_bash_wait(
                     }),
                 );
                 let poll_response = await_executor_response(poll_rx, request_id.clone()).await;
-                let _ = poll_touch_tx.send(root.clone()).await;
+                let _ = send_counted_channel(
+                    &poll_touch_tx,
+                    &metrics.bash_poll_touch_queued,
+                    root.clone(),
+                )
+                .await;
                 match poll_control_rx.await.unwrap_or(BashPollControl::Done) {
                     BashPollControl::Done => {
                         let text = poll_text_rx.await.unwrap_or_else(|_| {
@@ -3032,6 +3308,7 @@ async fn run_deferred_bash_wait(
                         let fatal = response_is_fatal_panic(&result.response);
                         send_bash_deferred_completion(
                             &completion_tx,
+                            &metrics,
                             route_channel,
                             corr,
                             flags,
@@ -3059,6 +3336,7 @@ async fn run_deferred_bash_wait(
                         let fatal = response_is_fatal_panic(&result.response);
                         send_bash_deferred_completion(
                             &completion_tx,
+                            &metrics,
                             route_channel,
                             corr,
                             flags,
@@ -3144,6 +3422,7 @@ async fn submit_bash_promote(
 #[allow(clippy::too_many_arguments)]
 async fn send_bash_deferred_completion(
     completion_tx: &mpsc::Sender<BashDeferredCompletion>,
+    metrics: &DispatchPathMetrics,
     channel: u16,
     corr: u64,
     flags: Flags,
@@ -3153,8 +3432,10 @@ async fn send_bash_deferred_completion(
     result: Option<ToolCallResult>,
     fatal: bool,
 ) {
-    let _ = completion_tx
-        .send(BashDeferredCompletion {
+    let _ = send_counted_channel(
+        completion_tx,
+        &metrics.bash_deferred_queued,
+        BashDeferredCompletion {
             channel,
             corr,
             flags,
@@ -3163,8 +3444,9 @@ async fn send_bash_deferred_completion(
             request_id,
             result,
             fatal,
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn handle_bash_deferred_completion(
@@ -3174,6 +3456,7 @@ async fn handle_bash_deferred_completion(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     route_bash_cancels: &mut HashMap<RouteChannel, RouteBashCancel>,
     shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     if let Some(meta) = live_roots.get_mut(&done.root) {
         meta.active_bash_waits = meta.active_bash_waits.saturating_sub(1);
@@ -3194,7 +3477,7 @@ async fn handle_bash_deferred_completion(
         if routes.contains_key(&route_id) {
             let frame =
                 build_tool_response_frame(done.ver, done.channel, done.corr, done.flags, &result)?;
-            send_frame(tx, frame).await?;
+            send_frame(tx, metrics, frame).await?;
         } else {
             log::debug!(
                 "subc attach: dropping deferred bash response {} for unbound route {}",
@@ -3211,7 +3494,15 @@ async fn handle_bash_deferred_completion(
     }
 
     if done.fatal {
-        signal_fatal_teardown(tx, Some(done.channel), done.ver, done.corr, shutdown).await;
+        signal_fatal_teardown(
+            tx,
+            Some(done.channel),
+            done.ver,
+            done.corr,
+            shutdown,
+            metrics,
+        )
+        .await;
     }
     Ok(())
 }
@@ -3220,6 +3511,7 @@ fn submit_maintenance_drain(
     root_id: ProjectRootId,
     bg_sessions_to_check: Vec<(String, u64)>,
     completion_tx: &mpsc::Sender<MaintenanceCompletion>,
+    metrics: &Arc<DispatchPathMetrics>,
 ) {
     let request_id = format!(
         "subc-maintenance-drain-{}",
@@ -3254,16 +3546,21 @@ fn submit_maintenance_drain(
         }),
     );
     let completion_tx = completion_tx.clone();
+    let completion_metrics = Arc::clone(metrics);
     tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&completion_metrics);
         let response = await_executor_response(rx, request_id).await;
         let empty_bg_sessions = empty_bg_sessions_rx.await.unwrap_or_default();
-        let _ = completion_tx
-            .send(MaintenanceCompletion {
+        let _ = send_counted_channel(
+            &completion_tx,
+            &completion_metrics.maintenance_queued,
+            MaintenanceCompletion {
                 root_id: completion_root_id,
                 response,
                 empty_bg_sessions,
-            })
-            .await;
+            },
+        )
+        .await;
     });
 }
 
@@ -3358,10 +3655,11 @@ async fn signal_fatal_teardown(
     ver: u8,
     corr: u64,
     shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
 ) {
     if let Some(route_channel) = route_channel {
         if let Ok(frame) = build_goodbye_frame(ver, route_channel, corr) {
-            if let Err(error) = send_frame(tx, frame).await {
+            if let Err(error) = send_frame(tx, metrics, frame).await {
                 log::warn!(
                     "subc attach: failed to queue fatal route Goodbye for route {route_channel}: {error}"
                 );
@@ -3369,7 +3667,7 @@ async fn signal_fatal_teardown(
         }
     }
     if let Ok(frame) = build_goodbye_frame(ver, 0, 0) {
-        if let Err(error) = send_frame(tx, frame).await {
+        if let Err(error) = send_frame(tx, metrics, frame).await {
             log::warn!("subc attach: failed to queue fatal channel-0 Goodbye: {error}");
         }
     }
@@ -3641,6 +3939,57 @@ fn build_manifest() -> ModuleManifest {
     }
 }
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn warn_slow_pending_binds(
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    executor: &Executor,
+) {
+    let now = Instant::now();
+    for (route, pending) in pending_binds.iter_mut() {
+        if pending.warned_half_deadline {
+            continue;
+        }
+        let age = now.saturating_duration_since(pending.started_at);
+        if age < DISPATCH_PATH_BIND_WARN_AFTER {
+            continue;
+        }
+        pending.warned_half_deadline = true;
+        let configure_state = executor
+            .try_mutating_job_state_label(&pending.bind_root_id, &pending.configure_request_id)
+            .unwrap_or("scheduler_busy");
+        crate::slog_warn!(
+            "subc attach: pending RouteBind route {} for root {} crossed {}ms (configure_request_id={}, configure_state={})",
+            route,
+            pending.bind_root_id.as_path().display(),
+            duration_millis_u64(age),
+            pending.configure_request_id,
+            configure_state
+        );
+    }
+}
+
+fn mutating_lanes_metrics(executor: &Executor) -> Value {
+    match executor.try_mutating_lane_snapshots() {
+        Some(snapshots) => Value::Array(
+            snapshots
+                .into_iter()
+                .map(|snapshot| {
+                    json!({
+                        "root": snapshot.root_id.as_path().to_string_lossy(),
+                        "request_id": snapshot.request_id,
+                        "job": snapshot.command,
+                        "started_age_ms": snapshot.started_age_ms,
+                    })
+                })
+                .collect(),
+        ),
+        None => json!({ "scheduler_busy": true }),
+    }
+}
+
 fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     match executor.try_dispatch_liveness_snapshot() {
         Some(snapshot) => json!({
@@ -3663,7 +4012,11 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     }
 }
 
-fn build_health_report(executor: &Executor) -> HealthReport {
+fn build_health_report(
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    dispatch_path_metrics: &DispatchPathMetrics,
+) -> HealthReport {
     let mut roots: Vec<RootHealthSnapshot> = executor
         .actor_entries()
         .into_iter()
@@ -3690,6 +4043,7 @@ fn build_health_report(executor: &Executor) -> HealthReport {
             "root_count": roots.len(),
             "roots": roots,
             "dispatch_liveness": dispatch_liveness_metrics(executor),
+            "dispatch_path": dispatch_path_metrics.snapshot(pending_binds, executor),
         })),
     }
 }
@@ -3798,7 +4152,9 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(75));
 
-        let report = build_health_report(&executor);
+        let metrics = DispatchPathMetrics::new();
+        let pending_binds = HashMap::new();
+        let report = build_health_report(&executor, &pending_binds, &metrics);
         let dispatch = report
             .metrics
             .as_ref()
@@ -3819,6 +4175,25 @@ mod tests {
         queued
             .recv_timeout(Duration::from_secs(1))
             .expect("queued completion response");
+    }
+
+    #[test]
+    fn writer_depth_counter_tracks_enqueued_frames_until_drain() {
+        let metrics = DispatchPathMetrics::new();
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+
+        for corr in 1..=3 {
+            let frame = Frame::build(FrameType::Ping, control_flags(), 0, corr, Vec::new())
+                .expect("test frame");
+            assert!(try_enqueue_writer_frame(&writer_tx, &metrics, frame).is_ok());
+        }
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 3);
+
+        for _ in 0..3 {
+            writer_rx.try_recv().expect("queued writer frame");
+            decrement_counted_channel(&metrics.writer_queued);
+        }
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 0);
     }
 
     fn status_frame(seq: u64) -> PushFrame {
@@ -4014,6 +4389,7 @@ mod tests {
     fn fan_out_push_frame_routes_session_scoped_and_project_scoped_frames() {
         let (_root_dir, root) = test_root("subc-session-routing-root");
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let metrics = DispatchPathMetrics::new();
         let identity1 = route_identity(&root, "session-1");
         let identity2 = route_identity(&root, "session-2");
         let mut routes = HashMap::new();
@@ -4029,6 +4405,7 @@ mod tests {
 
         let session_result = fan_out_reliable_push_frame(
             &writer_tx,
+            &metrics,
             &routes,
             &root_channels,
             &session_identity,
@@ -4054,8 +4431,14 @@ mod tests {
             "session-scoped frame must not broadcast to sibling sessions"
         );
 
-        let project_result =
-            fan_out_lossy_push_frame(&writer_tx, &routes, &root_channels, &root, &status_frame(9));
+        let project_result = fan_out_lossy_push_frame(
+            &writer_tx,
+            &metrics,
+            &routes,
+            &root_channels,
+            &root,
+            &status_frame(9),
+        );
         assert_eq!(
             project_result,
             FanOutResult {
@@ -4123,12 +4506,14 @@ mod tests {
             session: "session-1".to_string(),
         };
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(4);
+        let metrics = DispatchPathMetrics::new();
         let mut push_buffer = HashMap::new();
         buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
         buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-b"));
 
         let replayed = replay_buffered_push_frames(
             &writer_tx,
+            &metrics,
             route_key(3),
             &mut push_buffer,
             &key,
@@ -4156,11 +4541,13 @@ mod tests {
             session: "session-1".to_string(),
         };
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(4);
+        let metrics = DispatchPathMetrics::new();
         let mut push_buffer = HashMap::new();
         buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
 
         let replayed = replay_buffered_push_frames(
             &writer_tx,
+            &metrics,
             route_key(3),
             &mut push_buffer,
             &key,
@@ -4311,6 +4698,7 @@ mod tests {
     fn fan_out_lossy_push_frame_drops_when_writer_is_full_without_blocking() {
         let (_root_dir, root) = test_root("subc-writer-full-root");
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        let metrics = DispatchPathMetrics::new();
         writer_tx
             .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
@@ -4320,8 +4708,14 @@ mod tests {
 
         let routes = HashMap::new();
         let started = Instant::now();
-        let result =
-            fan_out_lossy_push_frame(&writer_tx, &routes, &root_channels, &root, &status_frame(1));
+        let result = fan_out_lossy_push_frame(
+            &writer_tx,
+            &metrics,
+            &routes,
+            &root_channels,
+            &root,
+            &status_frame(1),
+        );
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "saturated writer fan-out must return immediately"
@@ -4358,12 +4752,14 @@ mod tests {
         let mut retry_buffer = HashMap::new();
         let mut push_buffer = HashMap::new();
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        let metrics = DispatchPathMetrics::new();
         writer_tx
             .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
 
         let result = fan_out_reliable_push_frame(
             &writer_tx,
+            &metrics,
             &routes,
             &root_channels,
             &session_identity,
@@ -4387,7 +4783,7 @@ mod tests {
         let queued = writer_rx.try_recv().expect("prefilled frame");
         assert_eq!(queued.header.ty, FrameType::Ping);
         assert_eq!(
-            drain_retry_buffer_for_channel(&writer_tx, route_key(9), &mut retry_buffer),
+            drain_retry_buffer_for_channel(&writer_tx, &metrics, route_key(9), &mut retry_buffer),
             1
         );
         let retried = writer_rx.try_recv().expect("retried reliable push");
@@ -4410,6 +4806,7 @@ mod tests {
         let mut retry_buffer = HashMap::new();
         let mut push_buffer = HashMap::new();
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        let metrics = DispatchPathMetrics::new();
         writer_tx
             .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
@@ -4418,6 +4815,7 @@ mod tests {
         let second = completion_frame("fifo-2");
         let _ = fan_out_reliable_push_frame(
             &writer_tx,
+            &metrics,
             &routes,
             &root_channels,
             &session_identity,
@@ -4431,6 +4829,7 @@ mod tests {
 
         let _ = fan_out_reliable_push_frame(
             &writer_tx,
+            &metrics,
             &routes,
             &root_channels,
             &session_identity,
@@ -4450,13 +4849,13 @@ mod tests {
         assert_eq!(queued_tasks, vec!["fifo-1", "fifo-2"]);
 
         assert_eq!(
-            drain_retry_buffer_for_channel(&writer_tx, route_key(9), &mut retry_buffer),
+            drain_retry_buffer_for_channel(&writer_tx, &metrics, route_key(9), &mut retry_buffer),
             1
         );
         let first_sent = writer_rx.try_recv().expect("first reliable push");
         assert_eq!(push_frame_task_id(&first_sent).as_deref(), Some("fifo-1"));
         assert_eq!(
-            drain_retry_buffer_for_channel(&writer_tx, route_key(9), &mut retry_buffer),
+            drain_retry_buffer_for_channel(&writer_tx, &metrics, route_key(9), &mut retry_buffer),
             1
         );
         let second_sent = writer_rx.try_recv().expect("second reliable push");
@@ -4473,6 +4872,7 @@ mod tests {
             session: "session-1".to_string(),
         };
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(2);
+        let metrics = DispatchPathMetrics::new();
         writer_tx
             .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
@@ -4484,6 +4884,7 @@ mod tests {
         assert_eq!(
             replay_buffered_push_frames(
                 &writer_tx,
+                &metrics,
                 route_key(4),
                 &mut push_buffer,
                 &key,
@@ -4506,6 +4907,7 @@ mod tests {
         assert_eq!(
             replay_buffered_push_frames(
                 &writer_tx,
+                &metrics,
                 route_key(4),
                 &mut push_buffer,
                 &key,
@@ -4559,6 +4961,7 @@ mod tests {
             session: "session-1".to_string(),
         };
         let (writer_tx, writer_rx) = mpsc::channel::<Frame>(1);
+        let metrics = DispatchPathMetrics::new();
         drop(writer_rx);
 
         let mut push_buffer = HashMap::new();
@@ -4570,6 +4973,7 @@ mod tests {
         assert_eq!(
             replay_buffered_push_frames(
                 &writer_tx,
+                &metrics,
                 route_key(4),
                 &mut push_buffer,
                 &key,
@@ -4587,7 +4991,7 @@ mod tests {
             completion_frame("closed-retry"),
         );
         assert_eq!(
-            drain_retry_buffer_for_channel(&writer_tx, route_key(4), &mut retry_buffer),
+            drain_retry_buffer_for_channel(&writer_tx, &metrics, route_key(4), &mut retry_buffer),
             0
         );
         assert!(!retry_buffer.contains_key(&route_key(4)));
@@ -4739,6 +5143,7 @@ mod tests {
     #[tokio::test]
     async fn control_send_times_out_when_writer_queue_remains_full() {
         let (writer_tx, _writer_rx) = mpsc::channel::<Frame>(1);
+        let metrics = DispatchPathMetrics::new();
         writer_tx
             .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
@@ -4746,6 +5151,7 @@ mod tests {
 
         let result = send_frame(
             &writer_tx,
+            &metrics,
             Frame::build(FrameType::Pong, control_flags(), 0, 2, Vec::new()).unwrap(),
         )
         .await;

@@ -158,6 +158,21 @@ pub struct DispatchLivenessSnapshot {
     pub maintenance_cap: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutatingLaneSnapshot {
+    pub root_id: ProjectRootId,
+    pub request_id: String,
+    pub command: String,
+    pub started_age_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RunningMutatingJob {
+    request_id: String,
+    command: String,
+    started_at: Instant,
+}
+
 /// Concurrent scheduler-dispatch executor.
 pub struct Executor {
     inner: Arc<ExecutorInner>,
@@ -415,6 +430,24 @@ impl Executor {
             .map(|state| state.dispatch_liveness_snapshot())
     }
 
+    pub fn try_mutating_lane_snapshots(&self) -> Option<Vec<MutatingLaneSnapshot>> {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.mutating_lane_snapshots())
+    }
+
+    pub fn try_mutating_job_state_label(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> Option<&'static str> {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.mutating_job_state_label(root_id, request_id))
+    }
+
     pub fn nonrunnable_dispatch_count(&self) -> usize {
         self.inner.nonrunnable_dispatches.load(Ordering::Acquire)
     }
@@ -507,6 +540,49 @@ impl SchedulerState {
             maintenance_cap: self.config.maintenance_cap,
         }
     }
+
+    fn mutating_lane_snapshots(&self) -> Vec<MutatingLaneSnapshot> {
+        let now = Instant::now();
+        let mut snapshots: Vec<_> = self
+            .actors
+            .iter()
+            .filter_map(|(root_id, actor)| {
+                actor
+                    .mutating_inflight
+                    .as_ref()
+                    .map(|job| MutatingLaneSnapshot {
+                        root_id: root_id.clone(),
+                        request_id: job.request_id.clone(),
+                        command: job.command.clone(),
+                        started_age_ms: duration_millis_u64(
+                            now.saturating_duration_since(job.started_at),
+                        ),
+                    })
+            })
+            .collect();
+        snapshots.sort_by(|left, right| left.root_id.as_path().cmp(right.root_id.as_path()));
+        snapshots
+    }
+
+    fn mutating_job_state_label(&self, root_id: &ProjectRootId, request_id: &str) -> &'static str {
+        let Some(actor) = self.actors.get(root_id) else {
+            return "actor_missing";
+        };
+        if actor
+            .mutating_inflight
+            .as_ref()
+            .is_some_and(|job| job.request_id == request_id)
+        {
+            return "running";
+        }
+        if actor.has_queued_mutating_job(request_id) {
+            return "queued";
+        }
+        if actor.writer_inflight {
+            return "blocked_by_other_mutating";
+        }
+        "not_found"
+    }
 }
 
 #[derive(Default)]
@@ -546,6 +622,7 @@ struct ActorState {
     lsp_inflight: bool,
     actor_total_inflight: usize,
     writer_inflight: bool,
+    mutating_inflight: Option<RunningMutatingJob>,
     deficit: isize,
     interactive: ClassQueues,
     maintenance: ClassQueues,
@@ -561,6 +638,7 @@ impl ActorState {
             lsp_inflight: false,
             actor_total_inflight: 0,
             writer_inflight: false,
+            mutating_inflight: None,
             deficit: 0,
             interactive: ClassQueues::new(),
             maintenance: ClassQueues::new(),
@@ -610,6 +688,11 @@ impl ActorState {
     fn fail_queued_jobs(&mut self) {
         self.interactive.fail_queued_jobs();
         self.maintenance.fail_queued_jobs();
+    }
+
+    fn has_queued_mutating_job(&self, request_id: &str) -> bool {
+        self.interactive.has_queued_mutating_job(request_id)
+            || self.maintenance.has_queued_mutating_job(request_id)
     }
 }
 
@@ -666,6 +749,10 @@ impl ClassQueues {
         fail_queued_job_queue(&mut self.lsp_status);
         fail_queued_job_queue(&mut self.heavy_init);
         fail_queued_job_queue(&mut self.mutating);
+    }
+
+    fn has_queued_mutating_job(&self, request_id: &str) -> bool {
+        self.mutating.iter().any(|job| job.request_id == request_id)
     }
 
     fn queue(&self, lane: Lane) -> &VecDeque<QueuedJob> {
@@ -854,6 +941,7 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
             Lane::HeavyInit => {}
             Lane::Mutating => {
                 actor.writer_inflight = false;
+                actor.mutating_inflight = None;
             }
         }
 
@@ -1033,6 +1121,13 @@ fn try_admit_actor(
 
     let queued = actor.pop_front_job(job_class, lane)?;
     actor.deficit -= JOB_COST;
+    if lane == Lane::Mutating {
+        actor.mutating_inflight = Some(RunningMutatingJob {
+            request_id: queued.request_id.clone(),
+            command: queued.command.clone(),
+            started_at: Instant::now(),
+        });
+    }
     match lane {
         Lane::PureRead => {
             actor.read_inflight += 1;
