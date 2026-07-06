@@ -9,13 +9,15 @@ import { resolvePromptContext } from "./last-assistant-model.js";
  * it shows in the right place in the OpenCode UI, and carries `noReply: true`
  * so no LLM call is made.
  *
- * IMPORTANT (cache + crash safety): this path deliberately passes ONLY `agent`
- * (never model/variant). OpenCode crashes if model/variant are supplied on a
- * `noReply: true` prompt, and omitting them keeps the synthetic message from
- * busting the provider prefix cache the previous assistant turn warmed.
- *
- * Lives in `shared/` (not `index.ts`) because `index.ts` must export only the
- * plugin default; both the plugin entry and `tools/permissions.ts` call this.
+ * Model/variant ARE passed when resolvable, mirroring the session's newest
+ * context: OpenCode's `createUserMessage` resolves an omitted model as
+ * `agent.model ?? session-current ?? default` and PERSISTS the result via
+ * `setAgentModel` — so omitting the model on a session whose user picked a
+ * non-default model silently resets the session's model/variant (observed on
+ * OpenCode Desktop via /aft-status). Passing the resolved current context
+ * makes that persistence a no-op. Older OpenCode builds crashed when model
+ * was supplied on a `noReply: true` prompt, so on any failure we retry once
+ * without model/variant rather than dropping the message.
  */
 export async function sendIgnoredMessage(
   client: unknown,
@@ -30,32 +32,49 @@ export async function sendIgnoredMessage(
   };
 
   let agent: string | undefined;
+  let model: { providerID: string; modelID: string } | undefined;
+  let variant: string | undefined;
   try {
     const ctx = await resolvePromptContext(
       client as Parameters<typeof resolvePromptContext>[0],
       sessionID,
     );
     agent = ctx?.agent;
+    model = ctx?.model;
+    variant = ctx?.variant;
   } catch {
     agent = undefined;
   }
 
-  const body: Record<string, unknown> = {
+  const send = async (body: Record<string, unknown>): Promise<void> => {
+    const promptInput = { path: { id: sessionID }, body };
+    if (typeof typedClient.session?.prompt === "function") {
+      await Promise.resolve(typedClient.session.prompt(promptInput));
+      return;
+    }
+    if (typeof typedClient.session?.promptAsync === "function") {
+      await typedClient.session.promptAsync(promptInput);
+      return;
+    }
+    throw new Error("[aft-plugin] client.session.prompt is unavailable");
+  };
+
+  const base: Record<string, unknown> = {
     noReply: true,
     parts: [{ type: "text", text, ignored: true }],
   };
-  if (agent) body.agent = agent;
-  const promptInput = { path: { id: sessionID }, body };
+  if (agent) base.agent = agent;
 
-  if (typeof typedClient.session?.prompt === "function") {
-    await Promise.resolve(typedClient.session.prompt(promptInput));
-    return;
+  if (model) {
+    const withModel: Record<string, unknown> = { ...base, model };
+    if (variant) withModel.variant = variant;
+    try {
+      await send(withModel);
+      return;
+    } catch {
+      // Retry below without model/variant (legacy-host compatibility).
+    }
   }
 
-  if (typeof typedClient.session?.promptAsync === "function") {
-    await typedClient.session.promptAsync(promptInput);
-    return;
-  }
-
-  throw new Error("[aft-plugin] client.session.prompt is unavailable");
+  await send(base);
 }

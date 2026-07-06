@@ -149,19 +149,55 @@ describe("Lane G plugin orchestration regressions", () => {
     }
   });
 
-  test("/aft-status ignored-message helper keeps noReply payload model-free but agent-aware (issue #62)", () => {
-    // sendIgnoredMessage was extracted to shared/ignored-message.ts so
-    // tools/permissions.ts can reuse it (index.ts exports only the plugin).
-    const helper = readFileSync(resolve(import.meta.dir, "../shared/ignored-message.ts"), "utf-8");
-    expect(helper).toContain("noReply: true");
-    // Issue #62: agent IS passed so notifications render under the user's
-    // current agent. Model/variant remain off this path (no LLM turn fires
-    // for noReply: true, and earlier OpenCode versions crashed when we
-    // passed model on this path).
-    expect(helper).toContain("body.agent");
-    expect(helper).toContain("resolvePromptContext");
-    expect(helper).not.toContain("body.model");
-    expect(helper).not.toContain("body.variant");
+  test("/aft-status ignored-message helper passes session model context with model-free fallback", async () => {
+    // OpenCode persists the model it resolves for EVERY user message (even
+    // noReply) via setAgentModel; omitting model here reset Desktop sessions
+    // to the agent's default model. The helper now mirrors the session's
+    // newest model/variant, and retries model-free for legacy hosts that
+    // rejected model on noReply prompts (issue #62 history).
+    const { sendIgnoredMessage } = await import("../shared/ignored-message.js");
+    const calls: Array<Record<string, unknown>> = [];
+    const client = {
+      session: {
+        prompt: (input: { body: Record<string, unknown> }) => {
+          calls.push(input.body);
+        },
+        messages: async () => [
+          {
+            info: {
+              role: "assistant",
+              agent: "build",
+              providerID: "anthropic",
+              modelID: "claude-x",
+              variant: "max",
+            },
+          },
+        ],
+      },
+    };
+    await sendIgnoredMessage(client, "ses_test", "hello");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].noReply).toBe(true);
+    expect(calls[0].agent).toBe("build");
+    expect(calls[0].model).toEqual({ providerID: "anthropic", modelID: "claude-x" });
+    expect(calls[0].variant).toBe("max");
+
+    // Legacy host: first send (with model) throws -> retried model-free.
+    const legacyCalls: Array<Record<string, unknown>> = [];
+    const legacyClient = {
+      session: {
+        prompt: (input: { body: Record<string, unknown> }) => {
+          legacyCalls.push(input.body);
+          if (input.body.model) throw new Error("model not allowed on noReply");
+        },
+        messages: client.session.messages,
+      },
+    };
+    await sendIgnoredMessage(legacyClient, "ses_test", "hello");
+    expect(legacyCalls).toHaveLength(2);
+    expect(legacyCalls[1].model).toBeUndefined();
+    expect(legacyCalls[1].variant).toBeUndefined();
+    expect(legacyCalls[1].agent).toBe("build");
   });
 
   test("glob external permission treats existing outside file as file scope", async () => {
