@@ -217,6 +217,7 @@ fn principal_label(principal: &Option<Principal>) -> String {
 /// still arrive later.
 struct RootMeta {
     maintenance_pending: bool,
+    maintenance_poisoned: bool,
     last_touched: Instant,
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
@@ -317,6 +318,7 @@ impl RootMeta {
     fn new(now: Instant) -> Self {
         Self {
             maintenance_pending: false,
+            maintenance_poisoned: false,
             last_touched: now,
             diagnostics_on_edit: false,
             active_bash_waits: 0,
@@ -326,6 +328,20 @@ impl RootMeta {
     fn touch(&mut self) {
         self.last_touched = Instant::now();
     }
+}
+
+fn due_maintenance_roots(live_roots: &mut HashMap<ProjectRootId, RootMeta>) -> Vec<ProjectRootId> {
+    live_roots
+        .iter_mut()
+        .filter_map(|(root_id, meta)| {
+            if meta.maintenance_pending || meta.maintenance_poisoned {
+                None
+            } else {
+                meta.maintenance_pending = true;
+                Some(root_id.clone())
+            }
+        })
+        .collect()
 }
 
 fn route_key(channel: u16) -> RouteChannel {
@@ -1614,6 +1630,9 @@ where
                     &bg_wake_epoch,
                 );
                 if response_is_fatal_panic(&response) {
+                    if let Some(meta) = live_roots.get_mut(&root_id) {
+                        meta.maintenance_poisoned = true;
+                    }
                     log::warn!(
                         "subc attach: maintenance drain observed a fatal actor; deferring teardown until a route request can receive actor_fatal"
                     );
@@ -1633,17 +1652,7 @@ where
                     );
                 }
 
-                let due_roots: Vec<ProjectRootId> = live_roots
-                    .iter_mut()
-                    .filter_map(|(root_id, meta)| {
-                        if meta.maintenance_pending {
-                            None
-                        } else {
-                            meta.maintenance_pending = true;
-                            Some(root_id.clone())
-                        }
-                    })
-                    .collect();
+                let due_roots = due_maintenance_roots(&mut live_roots);
                 for root_id in due_roots {
                     let bg_sessions_to_check: Vec<(String, u64)> = bg_sub_by_session
                         .iter()
@@ -1870,10 +1879,12 @@ async fn handle_route_bind_completion(
         .and_modify(|meta| {
             meta.touch();
             meta.diagnostics_on_edit = completion.diagnostics_on_edit;
+            meta.maintenance_poisoned = false;
         })
         .or_insert_with(|| RootMeta::new(Instant::now()));
     if let Some(meta) = live_roots.get_mut(&completion.bind_root_id) {
         meta.diagnostics_on_edit = completion.diagnostics_on_edit;
+        meta.maintenance_poisoned = false;
     }
 
     let ack =
@@ -3718,6 +3729,23 @@ mod tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         ))
+    }
+
+    #[test]
+    fn due_maintenance_roots_skip_poisoned_roots() {
+        let (_healthy_dir, healthy_root) = test_root("maintenance-healthy");
+        let (_poisoned_dir, poisoned_root) = test_root("maintenance-poisoned");
+        let mut live_roots = HashMap::new();
+        live_roots.insert(healthy_root.clone(), RootMeta::new(Instant::now()));
+        let mut poisoned_meta = RootMeta::new(Instant::now());
+        poisoned_meta.maintenance_poisoned = true;
+        live_roots.insert(poisoned_root.clone(), poisoned_meta);
+
+        let due = due_maintenance_roots(&mut live_roots);
+
+        assert_eq!(due, vec![healthy_root.clone()]);
+        assert!(live_roots[&healthy_root].maintenance_pending);
+        assert!(!live_roots[&poisoned_root].maintenance_pending);
     }
 
     #[test]

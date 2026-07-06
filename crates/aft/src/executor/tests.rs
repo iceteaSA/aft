@@ -803,6 +803,168 @@ fn maintenance_cap_preserves_reserved_workers_for_interactive() {
 }
 
 #[test]
+fn interactive_mutator_dispatches_while_maintenance_backlog_saturates_pool() {
+    let executor = test_executor(4, 1, 1, 2);
+    let pool_size = executor.pool_size();
+
+    let mut dirs = Vec::new();
+    let mut roots = Vec::new();
+    for index in 0..=pool_size {
+        let (dir, root) = test_root(&format!("maintenance-backlog-{index}"));
+        executor.register_actor(root.clone(), test_ctx());
+        dirs.push(dir);
+        roots.push(root);
+    }
+
+    let (maintenance_started_tx, maintenance_started_rx) = crossbeam_channel::bounded(pool_size);
+    let (release_maintenance_tx, release_maintenance_rx) = crossbeam_channel::bounded(pool_size);
+    let mut maintenance = Vec::new();
+    for index in 0..pool_size {
+        let started_tx = maintenance_started_tx.clone();
+        let release_rx = release_maintenance_rx.clone();
+        maintenance.push(executor.submit_maintenance_async(
+            roots[index].clone(),
+            Lane::Mutating,
+            format!("maintenance-backlog-{index}"),
+            Box::new(move |_| {
+                started_tx.send(index).expect("signal maintenance start");
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release maintenance backlog");
+                ok(format!("maintenance-backlog-{index}"))
+            }),
+        ));
+    }
+
+    for _ in 0..executor.maintenance_cap() {
+        maintenance_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance fills its cap");
+    }
+
+    let (interactive_started_tx, interactive_started_rx) = crossbeam_channel::bounded(1);
+    let interactive = executor.submit(
+        roots[pool_size].clone(),
+        Lane::Mutating,
+        "interactive-route-bind".to_string(),
+        Box::new(move |_| {
+            interactive_started_tx
+                .send(())
+                .expect("signal interactive mutator start");
+            ok("interactive-route-bind")
+        }),
+    );
+
+    interactive_started_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("interactive mutator starts despite a pool-sized maintenance backlog");
+    interactive
+        .recv_timeout(Duration::from_secs(1))
+        .expect("interactive completion response");
+
+    for _ in 0..pool_size {
+        release_maintenance_tx
+            .send(())
+            .expect("release maintenance backlog");
+    }
+    for rx in maintenance {
+        assert!(recv_async(rx).success);
+    }
+    assert_eq!(dirs.len(), pool_size + 1);
+}
+
+#[test]
+fn startup_burst_maintenance_warmups_do_not_delay_interactive_binds() {
+    let executor = test_executor(4, 1, 1, 2);
+    let maintenance_roots = 12;
+    let interactive_roots = 4;
+
+    let mut dirs = Vec::new();
+    let mut maintenance = Vec::new();
+    let mut interactive = Vec::new();
+    for index in 0..maintenance_roots {
+        let (dir, root) = test_root(&format!("startup-warm-{index}"));
+        executor.register_actor(root.clone(), test_ctx());
+        dirs.push(dir);
+        maintenance.push(root);
+    }
+    for index in 0..interactive_roots {
+        let (dir, root) = test_root(&format!("startup-bind-{index}"));
+        executor.register_actor(root.clone(), test_ctx());
+        dirs.push(dir);
+        interactive.push(root);
+    }
+
+    let (maintenance_started_tx, maintenance_started_rx) =
+        crossbeam_channel::bounded(maintenance_roots);
+    let (release_maintenance_tx, release_maintenance_rx) =
+        crossbeam_channel::bounded(maintenance_roots);
+    let mut maintenance_receivers = Vec::new();
+    for (index, root) in maintenance.into_iter().enumerate() {
+        let started_tx = maintenance_started_tx.clone();
+        let release_rx = release_maintenance_rx.clone();
+        maintenance_receivers.push(executor.submit_maintenance_async(
+            root,
+            Lane::Mutating,
+            format!("startup-warm-{index}"),
+            Box::new(move |_| {
+                started_tx
+                    .send(index)
+                    .expect("signal startup maintenance start");
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release startup maintenance");
+                ok(format!("startup-warm-{index}"))
+            }),
+        ));
+    }
+
+    for _ in 0..executor.maintenance_cap() {
+        maintenance_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup maintenance fills cap");
+    }
+
+    let (interactive_done_tx, interactive_done_rx) = crossbeam_channel::bounded(interactive_roots);
+    let mut interactive_handles = Vec::new();
+    for (index, root) in interactive.into_iter().enumerate() {
+        let done_tx = interactive_done_tx.clone();
+        interactive_handles.push(executor.submit(
+            root,
+            Lane::Mutating,
+            format!("startup-bind-{index}"),
+            Box::new(move |_| {
+                done_tx
+                    .send(index)
+                    .expect("signal startup interactive bind");
+                ok(format!("startup-bind-{index}"))
+            }),
+        ));
+    }
+
+    for completed in 0..interactive_roots {
+        interactive_done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap_or_else(|_| panic!("interactive bind {completed} waited for maintenance"));
+    }
+    for handle in interactive_handles {
+        handle
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup interactive completion response");
+    }
+
+    for _ in 0..maintenance_roots {
+        release_maintenance_tx
+            .send(())
+            .expect("release startup maintenance");
+    }
+    for rx in maintenance_receivers {
+        assert!(recv_async(rx).success);
+    }
+    assert_eq!(dirs.len(), maintenance_roots + interactive_roots);
+}
+
+#[test]
 fn newer_interactive_mutator_beats_older_same_actor_maintenance_mutator() {
     let executor = test_executor(2, 1, 1, 2);
     let (_block_dir, block_root) = test_root("same-root-priority-block");
