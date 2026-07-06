@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,7 @@ pub struct InspectManager {
     oxc_facts_cache: Mutex<OxcFactsCache>,
     soft_deadline: Duration,
     next_job_id: AtomicU64,
+    heavy_root_work_allowed: Arc<AtomicBool>,
     /// Monotonic count of Tier-2 completions delivered via the reuse path
     /// (watcher-driven scheduler runs). These bypass `result_rx`/
     /// `drain_completions`, so the `&AppContext`-side drain polls this counter
@@ -120,11 +121,28 @@ pub struct InspectManager {
 
 impl InspectManager {
     pub fn new() -> Self {
-        Self::with_worker(default_worker(), DEFAULT_SOFT_DEADLINE)
+        Self::with_heavy_root_work_gate(Arc::new(AtomicBool::new(true)))
+    }
+
+    pub fn with_heavy_root_work_gate(heavy_root_work_allowed: Arc<AtomicBool>) -> Self {
+        Self::with_worker_and_gate(
+            default_worker(),
+            DEFAULT_SOFT_DEADLINE,
+            heavy_root_work_allowed,
+        )
     }
 
     #[doc(hidden)]
     pub fn with_worker(worker: InspectWorker, soft_deadline: Duration) -> Self {
+        Self::with_worker_and_gate(worker, soft_deadline, Arc::new(AtomicBool::new(true)))
+    }
+
+    #[doc(hidden)]
+    pub fn with_worker_and_gate(
+        worker: InspectWorker,
+        soft_deadline: Duration,
+        heavy_root_work_allowed: Arc<AtomicBool>,
+    ) -> Self {
         let handles = start_dispatch_loop(worker);
         Self {
             request_tx: handles.request_tx,
@@ -135,8 +153,23 @@ impl InspectManager {
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
             next_job_id: AtomicU64::new(1),
+            heavy_root_work_allowed,
             reuse_completions: AtomicU64::new(0),
         }
+    }
+
+    fn heavy_root_work_allowed(&self) -> bool {
+        self.heavy_root_work_allowed.load(Ordering::SeqCst)
+    }
+
+    fn category_needs_heavy_root_work(category: InspectCategory) -> bool {
+        category != InspectCategory::Diagnostics
+    }
+
+    fn heavy_root_work_block_message(category: InspectCategory) -> String {
+        format!(
+            "inspect category '{category}' is unavailable because heavy project-wide work is disabled for this root"
+        )
     }
 
     pub fn submit_category(
@@ -158,6 +191,11 @@ impl InspectManager {
         if !category.is_active() {
             return JobOutcome::Failed {
                 message: format!("inspect category '{category}' is disabled in v0.33"),
+            };
+        }
+        if Self::category_needs_heavy_root_work(category) && !self.heavy_root_work_allowed() {
+            return JobOutcome::Failed {
+                message: Self::heavy_root_work_block_message(category),
             };
         }
 
@@ -203,6 +241,9 @@ impl InspectManager {
                 "inspect category '{category}' is disabled in v0.33"
             ));
         }
+        if Self::category_needs_heavy_root_work(category) && !self.heavy_root_work_allowed() {
+            return Err(Self::heavy_root_work_block_message(category));
+        }
         let key = JobKey::for_category_scope(category, &caller_scope);
         self.enqueue_without_waiter(
             snapshot,
@@ -228,6 +269,9 @@ impl InspectManager {
             return Err(format!(
                 "inspect category '{category}' is not a Tier 2 category"
             ));
+        }
+        if !self.heavy_root_work_allowed() {
+            return Err(Self::heavy_root_work_block_message(category));
         }
 
         let job = self.tier2_reuse_job(snapshot, category, None);
@@ -286,6 +330,15 @@ impl InspectManager {
         }
 
         if requested.is_empty() {
+            return submission;
+        }
+        if !self.heavy_root_work_allowed() {
+            for category in requested {
+                submission.errors.push(Tier2RunSubmissionError {
+                    category,
+                    message: Self::heavy_root_work_block_message(category),
+                });
+            }
             return submission;
         }
 
@@ -487,6 +540,11 @@ impl InspectManager {
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
         }
+        if !self.heavy_root_work_allowed() {
+            return JobOutcome::Failed {
+                message: Self::heavy_root_work_block_message(category),
+            };
+        }
         let cache = match self.cache_for_snapshot(&snapshot) {
             Ok(cache) => cache,
             Err(message) => return JobOutcome::Failed { message },
@@ -528,6 +586,14 @@ impl InspectManager {
         if let Err(outcome) = validate_tier2_read_category(category) {
             return DirectTier2RunOutcome {
                 outcome,
+                force_paths_completed: false,
+            };
+        }
+        if !self.heavy_root_work_allowed() {
+            return DirectTier2RunOutcome {
+                outcome: JobOutcome::Failed {
+                    message: Self::heavy_root_work_block_message(category),
+                },
                 force_paths_completed: false,
             };
         }
@@ -677,6 +743,11 @@ impl InspectManager {
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
         }
+        if !self.heavy_root_work_allowed() {
+            return JobOutcome::Failed {
+                message: Self::heavy_root_work_block_message(category),
+            };
+        }
         let cache = match self.cache_for_snapshot(&snapshot) {
             Ok(cache) => cache,
             Err(message) => return JobOutcome::Failed { message },
@@ -692,6 +763,11 @@ impl InspectManager {
     ) -> JobOutcome {
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
+        }
+        if !self.heavy_root_work_allowed() {
+            return JobOutcome::Failed {
+                message: Self::heavy_root_work_block_message(category),
+            };
         }
         let key = JobKey::for_project_category(category);
         let in_flight = self

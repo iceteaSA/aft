@@ -677,6 +677,11 @@ pub struct AppContext {
     /// distinct degraded-mode UI states without re-deriving the reason locally.
     /// Empty when the project is healthy / full-featured.
     degraded_reasons: parking_lot::Mutex<Vec<String>>,
+    /// Configure-time gate for project-wide scans, builds, and watcher-driven
+    /// refreshes that would otherwise walk the whole root. `handle_configure`
+    /// closes it for degraded home roots and every heavy-work entry point reads
+    /// the same atomic so the decision cannot drift after configure returns.
+    heavy_root_work_allowed: Arc<AtomicBool>,
     callgraph_store: RwLock<Option<Arc<CallGraphStore>>>,
     callgraph_store_force_rebuild: parking_lot::Mutex<bool>,
     callgraph_store_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
@@ -852,6 +857,7 @@ impl AppContext {
         let (configure_warnings_tx, configure_warnings_rx) = crossbeam_channel::unbounded();
         let progress_sender: SharedProgressSender = Arc::new(Mutex::new(None));
         let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
+        let heavy_root_work_allowed = Arc::new(AtomicBool::new(true));
         let symbol_cache = provider
             .as_any()
             .downcast_ref::<TreeSitterProvider>()
@@ -877,6 +883,7 @@ impl AppContext {
             artifact_owner_status: parking_lot::Mutex::new(None),
             artifact_owner_lease: parking_lot::Mutex::new(None),
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
+            heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
             callgraph_store: RwLock::new(None),
             callgraph_store_force_rebuild: parking_lot::Mutex::new(false),
             callgraph_store_rx: parking_lot::Mutex::new(None),
@@ -885,7 +892,9 @@ impl AppContext {
             search_index_rx: RwLock::new(None),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
-            inspect_manager: Arc::new(InspectManager::new()),
+            inspect_manager: Arc::new(InspectManager::with_heavy_root_work_gate(Arc::clone(
+                &heavy_root_work_allowed,
+            ))),
             tier2_refresh_scheduler: parking_lot::Mutex::new(Tier2RefreshScheduler::new()),
             pending_tier2_paths: parking_lot::Mutex::new(BTreeSet::new()),
             semantic_index: RwLock::new(None),
@@ -1020,7 +1029,9 @@ impl AppContext {
             SemanticIndexStatus::Disabled => "disabled",
             SemanticIndexStatus::Failed(_) => "degraded",
         };
-        let callgraph_store_status = if callgraph_store.as_ref().is_some() {
+        let callgraph_store_status = if !self.heavy_root_work_allowed() {
+            "disabled"
+        } else if callgraph_store.as_ref().is_some() {
             "ready"
         } else if callgraph_store_rx.is_some() || config.callgraph_store {
             "building"
@@ -1708,6 +1719,15 @@ impl AppContext {
         *self.degraded_reasons.lock() = reasons;
     }
 
+    pub fn set_heavy_root_work_allowed(&self, allowed: bool) {
+        self.heavy_root_work_allowed
+            .store(allowed, Ordering::SeqCst);
+    }
+
+    pub fn heavy_root_work_allowed(&self) -> bool {
+        self.heavy_root_work_allowed.load(Ordering::SeqCst)
+    }
+
     pub fn add_degraded_reason(&self, reason: impl Into<String>) -> bool {
         let reason = reason.into();
         let mut reasons = self.degraded_reasons.lock();
@@ -1779,6 +1799,9 @@ impl AppContext {
         respect_config_flag: bool,
     ) -> Result<Option<Arc<CallGraphStore>>, CallGraphStoreError> {
         if respect_config_flag && !self.config().callgraph_store {
+            return Ok(None);
+        }
+        if !self.heavy_root_work_allowed() {
             return Ok(None);
         }
         if let Some(store) = {
@@ -1885,6 +1908,10 @@ impl AppContext {
     }
 
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
+        if !self.heavy_root_work_allowed() {
+            return CallgraphStoreAccess::Unavailable;
+        }
+
         // Converge to a newer generation another process (or a local cold
         // rebuild) may have published: if our resident store is superseded, drop
         // it so the open path below reopens via the pointer. Cheap pointer read.
@@ -2026,6 +2053,10 @@ impl AppContext {
         callgraph_dir: PathBuf,
         force_rebuild: bool,
     ) -> bool {
+        if !self.heavy_root_work_allowed() {
+            return false;
+        }
+
         let session_id = crate::log_ctx::current_session();
         let chunk_size = self.config().callgraph_chunk_size;
         let build_generation = self.configure_generation();
@@ -2222,9 +2253,10 @@ impl AppContext {
     }
 
     pub fn request_tier2_refresh_pull(&self) -> bool {
+        let can_schedule = !self.is_worktree_bridge() && self.heavy_root_work_allowed();
         self.tier2_refresh_scheduler
             .lock()
-            .request_pull(!self.is_worktree_bridge())
+            .request_pull(can_schedule)
     }
 
     pub fn tick_tier2_refresh_scheduler(
@@ -2241,7 +2273,7 @@ impl AppContext {
         changed_path_count: usize,
     ) -> Option<Tier2TriggerReason> {
         let manager = self.inspect_manager();
-        let can_write = !self.is_worktree_bridge();
+        let can_write = !self.is_worktree_bridge() && self.heavy_root_work_allowed();
         let in_flight = manager.tier2_any_in_flight();
         let semantic_cold_seed_active = self.semantic_cold_seed_active();
         let decision = self.tier2_refresh_scheduler.lock().tick_with_semantic_gate(
@@ -2284,11 +2316,7 @@ impl AppContext {
 
     fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
         if self.is_worktree_bridge()
-            || self
-                .degraded_reasons
-                .lock()
-                .iter()
-                .any(|r| r == "home_root")
+            || !self.heavy_root_work_allowed()
             || !self.config().inspect.enabled
         {
             return;
@@ -2441,13 +2469,7 @@ impl AppContext {
             .semantic_callgraph_warm_deferred
             .swap(false, Ordering::SeqCst)
         {
-            if !self.config().callgraph_store
-                || self
-                    .degraded_reasons
-                    .lock()
-                    .iter()
-                    .any(|reason| reason == "home_root")
-            {
+            if !self.config().callgraph_store || !self.heavy_root_work_allowed() {
                 return;
             }
 
@@ -3244,8 +3266,12 @@ mod force_restrict_tests {
 #[cfg(test)]
 mod callgraph_store_for_ops_tests {
     use super::*;
+    use crate::inspect::{InspectCategory, InspectSnapshot, JobOutcome, JobScope};
     use crate::parser::TreeSitterProvider;
+    use crate::protocol::RawRequest;
+    use serde_json::json;
     use std::ffi::OsString;
+    use std::path::Path;
     use std::sync::{Barrier, Mutex as StdMutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
 
@@ -3306,6 +3332,77 @@ mod callgraph_store_for_ops_tests {
         ))
     }
 
+    fn with_fake_home_env<R>(home: &Path, f: impl FnOnce() -> R) -> R {
+        let _guard = crate::test_env::process_env_lock();
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("USERPROFILE", home);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match prev_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn configure_request_with_params(params: serde_json::Value) -> RawRequest {
+        RawRequest {
+            id: "cfg".to_string(),
+            command: "configure".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params,
+        }
+    }
+
+    fn user_tier(doc: serde_json::Value) -> serde_json::Value {
+        json!({
+            "tier": "user",
+            "source": "/u/aft.jsonc",
+            "doc": doc.to_string(),
+        })
+    }
+
+    fn configure_context(project_root: &Path, storage_dir: &Path) -> AppContext {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let response = crate::commands::configure::handle_configure(
+            &configure_request_with_params(json!({
+                "project_root": project_root,
+                "harness": "opencode",
+                "storage_dir": storage_dir,
+                "config": [user_tier(json!({
+                    "callgraph_store": true,
+                    "search_index": true,
+                    "semantic_search": true,
+                }))],
+            })),
+            &ctx,
+        );
+        assert!(response.success, "configure should succeed: {response:?}");
+        ctx
+    }
+
+    fn inspect_snapshot(ctx: &AppContext) -> InspectSnapshot {
+        InspectSnapshot::new(
+            ctx.canonical_cache_root(),
+            ctx.inspect_dir(),
+            ctx.config(),
+            ctx.symbol_cache(),
+        )
+    }
+
     fn empty_semantic_index_for_ctx(ctx: &AppContext) -> SemanticIndex {
         let project_root = ctx
             .config()
@@ -3316,6 +3413,115 @@ mod callgraph_store_for_ops_tests {
         let mut embed = |_texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> { Ok(Vec::new()) };
         SemanticIndex::build(&project_root, &files, &mut embed, 1)
             .expect("empty semantic index should build")
+    }
+
+    #[test]
+    fn home_root_gate_blocks_callgraph_store_entry_points() {
+        let _wait_guard = force_async_callgraph_builds();
+        let home = TempDir::new().expect("home tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        let source_dir = home.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::write(
+            source_dir.join("lib.rs"),
+            "pub fn caller() { callee(); }\npub fn callee() {}\n",
+        )
+        .expect("source file");
+
+        with_fake_home_env(home.path(), || {
+            let ctx = configure_context(home.path(), storage.path());
+            assert!(
+                !ctx.heavy_root_work_allowed(),
+                "HOME root configure must close the heavy-root-work gate"
+            );
+            assert_eq!(
+                ctx.try_health_snapshot(home.path())
+                    .callgraph_store
+                    .as_ref()
+                    .map(|component| component.status),
+                Some("disabled"),
+                "HOME root health must not advertise callgraph building"
+            );
+
+            reset_callgraph_cold_build_spawn_count_for_test();
+            assert!(matches!(
+                ctx.callgraph_store_for_ops(),
+                CallgraphStoreAccess::Unavailable
+            ));
+            assert!(
+                ctx.ensure_callgraph_store()
+                    .expect("ensure_callgraph_store should not error")
+                    .is_none(),
+                "shared gate must also block synchronous standalone callgraph builds"
+            );
+            assert_eq!(
+                callgraph_cold_build_spawn_count_for_test(),
+                0,
+                "HOME root gate must not spawn a cold callgraph build"
+            );
+        });
+    }
+
+    #[test]
+    fn home_root_gate_blocks_inspect_manager_submit_paths() {
+        let home = TempDir::new().expect("home tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        let source_dir = home.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::write(source_dir.join("lib.rs"), "pub fn one() {}\n").expect("source file");
+
+        with_fake_home_env(home.path(), || {
+            let ctx = configure_context(home.path(), storage.path());
+            let snapshot = inspect_snapshot(&ctx);
+            let scope = JobScope::for_project(snapshot.project_root.clone());
+            let manager = ctx.inspect_manager();
+
+            assert!(matches!(
+                manager.submit_category(snapshot.clone(), InspectCategory::Metrics, scope.clone()),
+                JobOutcome::Failed { .. }
+            ));
+
+            let submission = manager.submit_tier2_run_with_reuse_serial_background(
+                snapshot,
+                vec![InspectCategory::DeadCode],
+            );
+            assert!(submission.queued_categories.is_empty());
+            assert!(submission.newly_queued_categories.is_empty());
+            assert!(submission.deferred_categories.is_empty());
+            assert_eq!(submission.errors.len(), 1);
+            assert!(
+                !manager.tier2_any_in_flight(),
+                "HOME root gate must reject Tier-2 submission before any job is queued"
+            );
+        });
+    }
+
+    #[test]
+    fn non_home_root_still_allows_callgraph_cold_builds() {
+        let _env_guard = force_async_callgraph_builds();
+        reset_callgraph_cold_build_spawn_count_for_test();
+        let ctx = cold_build_context();
+
+        assert!(ctx.heavy_root_work_allowed());
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building | CallgraphStoreAccess::Ready(_)
+        ));
+        assert_eq!(
+            callgraph_cold_build_spawn_count_for_test(),
+            1,
+            "non-home roots must still be able to cold-build the callgraph store"
+        );
+
+        let rx = ctx
+            .callgraph_store_rx
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("non-home cold build should install an in-flight receiver");
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("background cold build should complete");
+        *ctx.callgraph_store_rx.lock() = None;
     }
 
     #[test]

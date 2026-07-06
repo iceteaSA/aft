@@ -1050,6 +1050,9 @@ pub fn refresh_project_corpus(
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return false;
     };
+    if !ctx.heavy_root_work_allowed() {
+        return false;
+    }
     let config = ctx.config();
     let mut status_changed = false;
 
@@ -1156,7 +1159,7 @@ pub fn refresh_callgraph_store_for_watcher(
     ctx: &AppContext,
     changed: &HashSet<std::path::PathBuf>,
 ) {
-    if ctx.is_worktree_bridge() {
+    if ctx.is_worktree_bridge() || !ctx.heavy_root_work_allowed() {
         return;
     }
     let source_paths = changed
@@ -1244,7 +1247,11 @@ pub fn drain_watcher_events(ctx: &AppContext) {
                         path.display()
                     );
                     if !rescan_required {
-                        ctx.rebuild_gitignore();
+                        if ctx.heavy_root_work_allowed() {
+                            ctx.rebuild_gitignore();
+                        } else {
+                            ctx.clear_gitignore();
+                        }
                     }
                 }
                 Ok(WatcherDispatchEvent::RootDeleted) => {
@@ -1286,11 +1293,16 @@ pub fn drain_watcher_events(ctx: &AppContext) {
         rescan_required = false;
     }
 
+    let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
     let mut status_changed = watcher_status_changed;
     let mut project_corpus_refresh_requested = false;
     if rescan_required {
         aft::slog_warn!("watcher overflow: forcing project rescan");
-        ctx.rebuild_gitignore();
+        if heavy_root_work_allowed {
+            ctx.rebuild_gitignore();
+        } else {
+            ctx.clear_gitignore();
+        }
         status_changed |= refresh_project_after_watcher_rescan(ctx);
         project_corpus_refresh_requested = true;
         changed.clear();
@@ -1314,7 +1326,9 @@ pub fn drain_watcher_events(ctx: &AppContext) {
         return;
     }
 
-    ctx.add_pending_tier2_paths(changed.iter().cloned());
+    if heavy_root_work_allowed {
+        ctx.add_pending_tier2_paths(changed.iter().cloned());
+    }
 
     // A real source change makes the last-known Tier-2 counts stale until the
     // next background scan reconciles them — surface that in the status bar
@@ -1351,7 +1365,11 @@ pub fn drain_watcher_events(ctx: &AppContext) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         search_index_rx.is_some()
     };
-    if !ctx.shared_artifacts_read_only() && !oversized_inline_batch && search_build_in_progress {
+    if heavy_root_work_allowed
+        && !ctx.shared_artifacts_read_only()
+        && !oversized_inline_batch
+        && search_build_in_progress
+    {
         ctx.add_pending_search_index_paths(changed.iter().cloned());
     }
     let semantic_source_paths = changed
@@ -1361,7 +1379,8 @@ pub fn drain_watcher_events(ctx: &AppContext) {
         .collect::<Vec<_>>();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
-    if !ctx.shared_artifacts_read_only()
+    if heavy_root_work_allowed
+        && !ctx.shared_artifacts_read_only()
         && !oversized_inline_batch
         && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
         && !semantic_source_paths.is_empty()
@@ -1378,7 +1397,7 @@ pub fn drain_watcher_events(ctx: &AppContext) {
     }
 
     let mut semantic_refresh_paths = Vec::new();
-    if !oversized_inline_batch {
+    if heavy_root_work_allowed && !oversized_inline_batch {
         refresh_callgraph_store_for_watcher(ctx, &changed);
 
         if !ctx.shared_artifacts_read_only() {

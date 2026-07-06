@@ -1580,6 +1580,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             slog_warn!("{}", note);
         }
     }
+    let heavy_root_work_allowed =
+        !home_match && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
     // Commit phase: no validation returns after this point.
     ctx.set_config(next_config.clone());
@@ -1600,6 +1602,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     let artifact_owner_lease = artifact_owner_claim.and_then(|claim| claim.lease);
     ctx.set_artifact_owner(artifact_owner_status.clone(), artifact_owner_lease);
+    // Snapshot degraded-mode state once at configure time so every later
+    // heavy-work entry point reads the same cheap gate instead of re-deriving
+    // home-root logic independently.
+    ctx.set_degraded_reasons(degraded_reasons.clone());
+    ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
     let warm_key = format!(
         "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};callgraph={}:{};inspect={};manifests={}",
         canonical_cache_root,
@@ -1800,17 +1807,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.clear_semantic_refresh_worker();
         *ctx.semantic_embedding_model().lock() = None;
         ctx.clear_pending_index_updates();
-
-        // Snapshot accumulated degraded reasons on the context so status /
-        // sidebar / future tool calls all see the same state. The only
-        // synchronously-emitted reason is `home_root`.
-        // The semantic-build thread may push its own "skipped — too many files"
-        // status downstream; we don't yet thread that back into the persistent
-        // reasons list because semantic auto-skip is already surfaced through
-        // `SemanticIndexStatus::Failed`. If that ever becomes inconsistent UX
-        // we can wire it through a channel; for now status snapshot sources
-        // semantic state from the live SemanticIndexStatus, not the reasons.
-        ctx.set_degraded_reasons(degraded_reasons.clone());
 
         let storage_dir = ctx.config().storage_dir.clone();
 
@@ -3351,6 +3347,10 @@ mod tests {
         assert!(response.success);
         assert!(ctx.is_degraded(), "expected degraded mode for HOME root");
         assert!(
+            !ctx.heavy_root_work_allowed(),
+            "HOME root configure must close the heavy-root-work gate"
+        );
+        assert!(
             ctx.degraded_reasons().contains(&"home_root".to_string()),
             "expected `home_root` reason, got {:?}",
             ctx.degraded_reasons()
@@ -3412,6 +3412,10 @@ mod tests {
         assert!(
             !ctx.is_degraded(),
             "subdirectories of $HOME must not enter degraded mode"
+        );
+        assert!(
+            ctx.heavy_root_work_allowed(),
+            "subdirectories of $HOME must keep heavy root work enabled"
         );
         assert!(
             ctx.degraded_reasons().is_empty(),
