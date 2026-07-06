@@ -95,25 +95,40 @@ fn unchanged_head_warm_configure_reuses_verified_cache_without_rebuild_thread() 
     wait_for_search_index_ready(&mut aft, Duration::from_secs(5));
     fs::remove_file(&marker).expect("remove cold-build marker");
 
+    // An equivalent reconfigure in the SAME process is the zero-work rebind
+    // path: the live, watcher-maintained index keeps serving, no verify or
+    // rebuild thread spawns (re-verifying on every rebind was configure-storm
+    // fuel: one long-lived session can rebind hundreds of times).
     let second = configure_search_index(&mut aft, project.path(), "cfg-second");
     assert_eq!(second["success"], true, "configure failed: {second:?}");
     assert_eq!(second["search_index_cache_reused"], true);
-    // Warm reuse now VERIFIES the cached index on a background thread instead of
-    // inline on the dispatch thread (verify_against_disk content-hashes every
-    // cached file, O(repo) — blocking configure past the 30s transport timeout
-    // on a large repo). So the unchanged-HEAD warm path DOES spawn the
-    // background marker now, and configure returns without doing the hash-all
-    // work synchronously. (Previously this asserted `!marker.exists()`, which
-    // encoded the buggy inline-verify behavior.)
     assert!(
-        marker.exists(),
-        "warm reuse should verify the cached index on a background thread"
+        !marker.exists(),
+        "equivalent same-process rebind must not spawn index work"
     );
-
     let ready = wait_for_search_index_ready(&mut aft, Duration::from_secs(5));
     assert_eq!(ready["search_index"]["status"], "ready");
-
     let status = aft.shutdown();
+    assert!(status.success());
+
+    // A REAL warm restart (fresh process, unchanged HEAD) loads the disk cache
+    // and verifies it on a background thread instead of inline on the dispatch
+    // thread (verify_against_disk content-hashes every cached file, O(repo) —
+    // blocking configure past the 30s transport timeout on a large repo).
+    let mut restarted = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_SEARCH_REBUILD_THREAD_MARKER",
+        marker.as_os_str(),
+    )]);
+    let warm = configure_search_index(&mut restarted, project.path(), "cfg-warm-restart");
+    assert_eq!(warm["success"], true, "configure failed: {warm:?}");
+    assert_eq!(warm["search_index_cache_reused"], true);
+    assert!(
+        marker.exists(),
+        "warm restart should verify the cached index on a background thread"
+    );
+    let ready = wait_for_search_index_ready(&mut restarted, Duration::from_secs(5));
+    assert_eq!(ready["search_index"]["status"], "ready");
+    let status = restarted.shutdown();
     assert!(status.success());
 }
 

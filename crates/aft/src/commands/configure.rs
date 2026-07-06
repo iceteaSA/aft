@@ -1725,6 +1725,14 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     if equivalent_warm_config {
+        // The zero-work rebind path keeps the live index serving; report that
+        // honestly instead of implying the cache was dropped.
+        search_index_cache_reused = search_index
+            && ctx
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
         if search_build_in_progress {
             slog_info!(
                 "search index build adopted by generation {} (previous generation {})",
