@@ -42,6 +42,66 @@ fn wait_for_terminal_status(aft: &mut AftProcess, task_id: &str) -> serde_json::
 }
 
 #[cfg(unix)]
+#[test]
+fn bash_inherits_login_shell_enriched_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let fake_bin = dir.path().join("fake-bin");
+    let cargo_bin = home.join(".cargo/bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    std::fs::create_dir_all(&cargo_bin).unwrap();
+
+    let tool_name = format!("aft-path-probe-{}", std::process::id());
+    let tool_path = fake_bin.join(&tool_name);
+    write_executable_shim(&tool_path, "#!/bin/sh\nexit 0\n");
+
+    let fake_shell = dir.path().join("fake-login-shell");
+    write_executable_shim(
+        &fake_shell,
+        r#"#!/bin/sh
+if [ "$1" = '-l' ] && [ "$2" = '-c' ]; then
+  printf '%s' "$AFT_TEST_FAKE_LOGIN_PATH"
+  exit 0
+fi
+exit 64
+"#,
+    );
+
+    let login_path = format!("{}:/usr/bin:/bin", fake_bin.display());
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", std::ffi::OsStr::new("/usr/bin:/bin")),
+        ("HOME", home.as_os_str()),
+        ("SHELL", fake_shell.as_os_str()),
+        (
+            "AFT_TEST_FAKE_LOGIN_PATH",
+            std::ffi::OsStr::new(&login_path),
+        ),
+    ]);
+
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "bash-login-path",
+            "method": "bash",
+            "params": { "command": format!("command -v {tool_name}") }
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "bash spawn failed: {response:?}");
+    let task_id = response["task_id"].as_str().unwrap();
+    let status = wait_for_terminal_status(&mut aft, task_id);
+
+    assert_eq!(status["status"], "completed", "bash failed: {status:?}");
+    assert_eq!(status["exit_code"], 0, "bash failed: {status:?}");
+    assert_eq!(
+        status["output_preview"].as_str().unwrap().trim(),
+        tool_path.to_string_lossy(),
+        "bash child did not inherit the login-shell-enriched PATH: {status:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
     let output = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])

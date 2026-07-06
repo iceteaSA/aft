@@ -58,6 +58,10 @@ fn main() {
         }
     }
 
+    // Daemon launches can miss user shell PATH entries. Initialize before any
+    // AFT threads or executors start so all subprocesses inherit one PATH.
+    aft::effective_path::initialize_process_path();
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
             use std::io::Write;
