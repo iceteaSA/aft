@@ -1,0 +1,306 @@
+//! Dispatch-path metrics and health-report helpers for the subc transport loop.
+
+use super::{
+    json, Arc, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport, HealthStatus,
+    Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
+    DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
+};
+
+pub(super) struct DispatchPathMetrics {
+    pub(super) origin: Instant,
+    pub(super) frame_loop_last_tick_ms: AtomicU64,
+    pub(super) writer_queued: AtomicUsize,
+    pub(super) writer_saturation_count: AtomicU64,
+    pub(super) control_completion_queued: AtomicUsize,
+    pub(super) maintenance_queued: AtomicUsize,
+    pub(super) bash_deferred_queued: AtomicUsize,
+    pub(super) bash_poll_touch_queued: AtomicUsize,
+    pub(super) reliable_push_budget_deferrals: AtomicU64,
+    pub(super) maintenance_budget_deferrals: AtomicU64,
+    pub(super) response_tasks_live: AtomicUsize,
+}
+
+impl DispatchPathMetrics {
+    pub(super) fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            frame_loop_last_tick_ms: AtomicU64::new(0),
+            writer_queued: AtomicUsize::new(0),
+            writer_saturation_count: AtomicU64::new(0),
+            control_completion_queued: AtomicUsize::new(0),
+            maintenance_queued: AtomicUsize::new(0),
+            bash_deferred_queued: AtomicUsize::new(0),
+            bash_poll_touch_queued: AtomicUsize::new(0),
+            reliable_push_budget_deferrals: AtomicU64::new(0),
+            maintenance_budget_deferrals: AtomicU64::new(0),
+            response_tasks_live: AtomicUsize::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        duration_millis_u64(self.origin.elapsed())
+    }
+
+    pub(super) fn mark_frame_loop_tick(&self) {
+        self.frame_loop_last_tick_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    fn snapshot(
+        &self,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        executor: &Executor,
+    ) -> Value {
+        let now = Instant::now();
+        let oldest_pending_age_ms = pending_binds
+            .values()
+            .map(|bind| duration_millis_u64(now.saturating_duration_since(bind.started_at)))
+            .max();
+        let last_tick_ms = self.frame_loop_last_tick_ms.load(Ordering::Relaxed);
+        json!({
+            "frame_loop": {
+                "last_tick_age_ms": self.now_ms().saturating_sub(last_tick_ms),
+            },
+            "pending_binds": {
+                "count": pending_binds.len(),
+                "oldest_age_ms": oldest_pending_age_ms,
+            },
+            "completion_channels": {
+                "control": self.control_completion_queued.load(Ordering::Relaxed),
+                "maintenance": self.maintenance_queued.load(Ordering::Relaxed),
+                "bash_deferred": self.bash_deferred_queued.load(Ordering::Relaxed),
+                "bash_poll_touch": self.bash_poll_touch_queued.load(Ordering::Relaxed),
+            },
+            "budget_deferrals": {
+                "reliable_push": self.reliable_push_budget_deferrals.load(Ordering::Relaxed),
+                "maintenance": self.maintenance_budget_deferrals.load(Ordering::Relaxed),
+            },
+            "writer": {
+                "queued": self.writer_queued.load(Ordering::Relaxed),
+                "capacity": WRITER_QUEUE_CAPACITY,
+                "saturation_count": self.writer_saturation_count.load(Ordering::Relaxed),
+            },
+            "response_tasks": {
+                "live": self.response_tasks_live.load(Ordering::Relaxed),
+            },
+            "mutating_lanes": mutating_lanes_metrics(executor),
+        })
+    }
+}
+
+pub(super) struct ResponseTaskGuard {
+    metrics: Arc<DispatchPathMetrics>,
+}
+
+impl ResponseTaskGuard {
+    pub(super) fn new(metrics: &Arc<DispatchPathMetrics>) -> Self {
+        metrics.response_tasks_live.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics: Arc::clone(metrics),
+        }
+    }
+}
+
+impl Drop for ResponseTaskGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .response_tasks_live
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+pub(super) fn warn_slow_pending_binds(
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    executor: &Executor,
+) {
+    let now = Instant::now();
+    for (route, pending) in pending_binds.iter_mut() {
+        if pending.warned_half_deadline {
+            continue;
+        }
+        let age = now.saturating_duration_since(pending.started_at);
+        if age < DISPATCH_PATH_BIND_WARN_AFTER {
+            continue;
+        }
+        pending.warned_half_deadline = true;
+        let configure_state = executor
+            .try_mutating_job_state_label(&pending.bind_root_id, &pending.configure_request_id)
+            .unwrap_or("scheduler_busy");
+        crate::slog_warn!(
+            "subc attach: pending RouteBind route {} for root {} crossed {}ms (configure_request_id={}, configure_state={})",
+            route,
+            pending.bind_root_id.as_path().display(),
+            duration_millis_u64(age),
+            pending.configure_request_id,
+            configure_state
+        );
+    }
+}
+
+fn mutating_lanes_metrics(executor: &Executor) -> Value {
+    match executor.try_mutating_lane_snapshots() {
+        Some(snapshots) => Value::Array(
+            snapshots
+                .into_iter()
+                .map(|snapshot| {
+                    json!({
+                        "root": snapshot.root_id.as_path().to_string_lossy(),
+                        "request_id": snapshot.request_id,
+                        "job": snapshot.command,
+                        "started_age_ms": snapshot.started_age_ms,
+                    })
+                })
+                .collect(),
+        ),
+        None => json!({ "scheduler_busy": true }),
+    }
+}
+
+fn dispatch_liveness_metrics(executor: &Executor) -> Value {
+    match executor.try_dispatch_liveness_snapshot() {
+        Some(snapshot) => json!({
+            "interactive": {
+                "queued": snapshot.interactive.queued,
+                "oldest_age_ms": snapshot.interactive.oldest_age_ms,
+            },
+            "maintenance": {
+                "queued": snapshot.maintenance.queued,
+                "oldest_age_ms": snapshot.maintenance.oldest_age_ms,
+            },
+            "running": {
+                "interactive": snapshot.running.interactive,
+                "maintenance": snapshot.running.maintenance,
+            },
+            "interactive_reserve": snapshot.interactive_reserve,
+            "maintenance_cap": snapshot.maintenance_cap,
+        }),
+        None => json!({ "scheduler_busy": true }),
+    }
+}
+
+pub(super) fn build_health_report(
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    dispatch_path_metrics: &DispatchPathMetrics,
+) -> HealthReport {
+    // Health replies must stay cheap under any load (subc-health rule: a
+    // probe that queues behind busy state lies about liveness and gets the
+    // module health-killed). Every read below is try-lock-only: a contended
+    // scheduler lock degrades to an empty root list instead of waiting.
+    let mut roots: Vec<RootHealthSnapshot> = executor
+        .try_actor_entries()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(root_id, ctx)| ctx.try_health_snapshot(root_id.as_path()))
+        .collect();
+    roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
+
+    let all_roots_ready = roots.iter().all(RootHealthSnapshot::is_fully_ready);
+    let detail = if roots.is_empty() || all_roots_ready {
+        None
+    } else {
+        Some("one or more root actors are still warming, degraded, or busy".to_string())
+    };
+
+    HealthReport {
+        status: if all_roots_ready {
+            HealthStatus::Ok
+        } else {
+            HealthStatus::Degraded
+        },
+        detail,
+        metrics: Some(json!({
+            "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
+            "root_count": roots.len(),
+            "roots": roots,
+            "dispatch_liveness": dispatch_liveness_metrics(executor),
+            "dispatch_path": dispatch_path_metrics.snapshot(pending_binds, executor),
+        })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{test_ctx, test_root};
+    use super::super::{Lane, Response};
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn health_report_includes_nonblocking_dispatch_liveness_for_queued_interactive() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 2,
+            drr_quantum: 1,
+        });
+        let (_dir_a, root_a) = test_root("health-liveness-a");
+        let (_dir_b, root_b) = test_root("health-liveness-b");
+        let (_dir_c, root_c) = test_root("health-liveness-c");
+        executor.register_actor(root_a.clone(), test_ctx());
+        executor.register_actor(root_b.clone(), test_ctx());
+        executor.register_actor(root_c.clone(), test_ctx());
+
+        let (started_tx, started_rx) = crossbeam_channel::bounded(2);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(2);
+        let mut blockers = Vec::new();
+        for (index, root) in [root_a, root_b].into_iter().enumerate() {
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            blockers.push(executor.submit(
+                root,
+                Lane::PureRead,
+                format!("health-blocker-{index}"),
+                Box::new(move |_| {
+                    started_tx.send(index).expect("signal blocker start");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release blocker");
+                    Response::success(format!("blocker-{index}"), json!({ "ok": true }))
+                }),
+            ));
+        }
+        for _ in 0..2 {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocker starts");
+        }
+
+        let queued = executor.submit(
+            root_c,
+            Lane::PureRead,
+            "queued-interactive".to_string(),
+            Box::new(|_| Response::success("queued-interactive", json!({ "ok": true }))),
+        );
+        std::thread::sleep(Duration::from_millis(75));
+
+        let metrics = DispatchPathMetrics::new();
+        let pending_binds = HashMap::new();
+        let report = build_health_report(&executor, &pending_binds, &metrics);
+        let dispatch = report
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.get("dispatch_liveness"))
+            .expect("dispatch_liveness metric");
+        assert_eq!(dispatch.get("scheduler_busy"), None);
+        assert_eq!(dispatch["interactive"]["queued"].as_u64(), Some(1));
+        assert!(dispatch["interactive"]["oldest_age_ms"].as_u64().is_some());
+
+        for _ in 0..2 {
+            release_tx.send(()).expect("release blocker");
+        }
+        for blocker in blockers {
+            blocker
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocker completion response");
+        }
+        queued
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued completion response");
+    }
+}
