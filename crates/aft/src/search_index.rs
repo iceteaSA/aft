@@ -3200,34 +3200,98 @@ pub(crate) fn current_git_head(root: &Path) -> Option<String> {
     run_git(root, &["rev-parse", "HEAD"])
 }
 
-/// On-disk ARTIFACT cache key (search, semantic, symbol, callgraph, inspect).
-///
-/// For git repos this is the repository ROOT COMMIT — so a linked worktree
-/// shares the main checkout's index (opened read-only), the deliberate
-/// worktree-sharing mechanism. For non-git it is the canonical filesystem path.
-///
-/// This is the per-REPOSITORY identity. It is intentionally DISTINCT from
-/// [`crate::path_identity::project_scope_key`] (the per-CHECKOUT identity used
-/// for bash/compression/backup/checkpoint scoping). Its value is unchanged from
-/// the historical `project_cache_key`, so existing on-disk caches are NOT
-/// invalidated by the P0 identity split.
 pub fn artifact_cache_key(project_root: &Path) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
 
-    if let Some(root_commit) = run_git(project_root, &["rev-list", "--max-parents=0", "HEAD"]) {
-        // Git repo: root commit is the unique identity.
-        // Same repo cloned anywhere produces the same key.
-        hasher.update(root_commit.as_bytes());
-    } else {
-        // Non-git project: use the canonical filesystem path as identity.
-        let canonical_root = canonicalize_or_normalize(project_root);
-        hasher.update(canonical_root.to_string_lossy().as_bytes());
+    match repo_root_commit_with_retry(project_root) {
+        Some(root_commit) => {
+            // Git repo: root commit is the unique identity.
+            // Same repo cloned anywhere produces the same key.
+            hasher.update(root_commit.as_bytes());
+        }
+        None => {
+            // Non-git project: use the canonical filesystem path as identity.
+            let canonical_root = canonicalize_or_normalize(project_root);
+            hasher.update(canonical_root.to_string_lossy().as_bytes());
+        }
     }
 
     let digest = format!("{:x}", hasher.finalize());
     digest[..16].to_string()
+}
+
+/// Resolve the repository root commit, retrying transient git failures.
+///
+/// The distinction matters because the fallback is not benign: two clones of
+/// one repo that key differently (one by commit, one by path) each claim
+/// artifact ownership and write the shared cache concurrently. A git
+/// invocation that fails under load (spawn failure, resource exhaustion) must
+/// therefore be retried, and only deterministic outcomes (not a repo, no
+/// commits yet) may fall back to path identity silently.
+fn repo_root_commit_with_retry(project_root: &Path) -> Option<String> {
+    for attempt in 0..3u32 {
+        match git_root_commit_once(project_root) {
+            RootCommitProbe::Commit(commit) => return Some(commit),
+            RootCommitProbe::NotARepo => return None,
+            RootCommitProbe::Transient(detail) => {
+                if attempt == 2 {
+                    crate::slog_warn!(
+                        "artifact cache key: git root-commit probe failed after retries ({}); \
+                         falling back to path identity for {}",
+                        detail,
+                        project_root.display()
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+            }
+        }
+    }
+    None
+}
+
+enum RootCommitProbe {
+    Commit(String),
+    /// Deterministic: not a git work tree, or a repo with no commits yet.
+    NotARepo,
+    /// Ambiguous failure (spawn error, killed, unexpected git error): retry.
+    Transient(String),
+}
+
+fn git_root_commit_once(project_root: &Path) -> RootCommitProbe {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-list", "--max-parents=0", "HEAD"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return RootCommitProbe::Transient(format!("spawn failed: {error}")),
+    };
+
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if value.is_empty() {
+            return RootCommitProbe::NotARepo;
+        }
+        return RootCommitProbe::Commit(value);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not a git repository")
+        || stderr.contains("unknown revision")
+        || stderr.contains("bad revision")
+        || stderr.contains("ambiguous argument 'HEAD'")
+    {
+        return RootCommitProbe::NotARepo;
+    }
+    RootCommitProbe::Transient(format!(
+        "exit {:?}: {}",
+        output.status.code(),
+        stderr.trim().chars().take(200).collect::<String>()
+    ))
 }
 
 /// Fingerprint corpus-shaping ignore rules that are not represented by git HEAD.
