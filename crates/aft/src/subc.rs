@@ -69,6 +69,17 @@ const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 
 const WRITER_QUEUE_CAPACITY: usize = 256;
 
+/// Keep reliable Push bursts from monopolizing the current-thread subc loop;
+/// any remaining must-deliver frames stay queued for the next loop turn.
+const RELIABLE_PUSH_DRAIN_BUDGET: usize = 32;
+
+/// Limit maintenance submissions per tick so background drains cannot delay
+/// control-plane work such as completed RouteBind acknowledgements.
+const MAINTENANCE_SUBMIT_BUDGET: usize = 4;
+
+const RELIABLE_WRITER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const RELIABLE_WRITER_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+
 const DISPATCH_PATH_BIND_WARN_AFTER: Duration = Duration::from_secs(6);
 
 /// Small bounded memory of completed task ids used to suppress stale lossy
@@ -149,6 +160,8 @@ struct DispatchPathMetrics {
     maintenance_queued: AtomicUsize,
     bash_deferred_queued: AtomicUsize,
     bash_poll_touch_queued: AtomicUsize,
+    reliable_push_budget_deferrals: AtomicU64,
+    maintenance_budget_deferrals: AtomicU64,
     response_tasks_live: AtomicUsize,
 }
 
@@ -163,6 +176,8 @@ impl DispatchPathMetrics {
             maintenance_queued: AtomicUsize::new(0),
             bash_deferred_queued: AtomicUsize::new(0),
             bash_poll_touch_queued: AtomicUsize::new(0),
+            reliable_push_budget_deferrals: AtomicU64::new(0),
+            maintenance_budget_deferrals: AtomicU64::new(0),
             response_tasks_live: AtomicUsize::new(0),
         }
     }
@@ -200,6 +215,10 @@ impl DispatchPathMetrics {
                 "maintenance": self.maintenance_queued.load(Ordering::Relaxed),
                 "bash_deferred": self.bash_deferred_queued.load(Ordering::Relaxed),
                 "bash_poll_touch": self.bash_poll_touch_queued.load(Ordering::Relaxed),
+            },
+            "budget_deferrals": {
+                "reliable_push": self.reliable_push_budget_deferrals.load(Ordering::Relaxed),
+                "maintenance": self.maintenance_budget_deferrals.load(Ordering::Relaxed),
             },
             "writer": {
                 "queued": self.writer_queued.load(Ordering::Relaxed),
@@ -444,18 +463,26 @@ impl RootMeta {
     }
 }
 
-fn due_maintenance_roots(live_roots: &mut HashMap<ProjectRootId, RootMeta>) -> Vec<ProjectRootId> {
-    live_roots
-        .iter_mut()
-        .filter_map(|(root_id, meta)| {
-            if meta.maintenance_pending || meta.maintenance_poisoned {
-                None
-            } else {
-                meta.maintenance_pending = true;
-                Some(root_id.clone())
-            }
-        })
-        .collect()
+fn due_maintenance_roots(
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    budget: usize,
+) -> (Vec<ProjectRootId>, bool) {
+    let mut roots = Vec::new();
+    let mut deferred = false;
+
+    for (root_id, meta) in live_roots.iter_mut() {
+        if meta.maintenance_pending || meta.maintenance_poisoned {
+            continue;
+        }
+        if roots.len() >= budget {
+            deferred = true;
+            continue;
+        }
+        meta.maintenance_pending = true;
+        roots.push(root_id.clone());
+    }
+
+    (roots, deferred)
 }
 
 fn route_key(channel: u16) -> RouteChannel {
@@ -755,7 +782,7 @@ fn try_send_push_body(
     match try_enqueue_writer_frame(writer_tx, metrics, push_frame) {
         Ok(()) => PushSendOutcome::Sent,
         Err(WriterEnqueueError::Full(_)) => PushSendOutcome::Backpressure,
-        Err(WriterEnqueueError::Closed(_)) => {
+        Err(WriterEnqueueError::Closed) => {
             log::warn!("subc attach: writer closed while sending Push frame");
             PushSendOutcome::PermanentFailure
         }
@@ -801,7 +828,7 @@ fn try_send_bg_stream_frame(
     match try_enqueue_writer_frame(writer_tx, metrics, frame) {
         Ok(()) => PushSendOutcome::Sent,
         Err(WriterEnqueueError::Full(_)) => PushSendOutcome::Backpressure,
-        Err(WriterEnqueueError::Closed(_)) => {
+        Err(WriterEnqueueError::Closed) => {
             log::warn!("subc attach: writer closed while sending bg_events stream frame");
             PushSendOutcome::PermanentFailure
         }
@@ -1227,6 +1254,112 @@ fn process_reliable_push_frame(
     completed_bg_session
 }
 
+#[allow(clippy::too_many_arguments)]
+fn process_reliable_push_and_arm_bg_wake(
+    writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    retry_buffer: &mut RetryBuffer,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    completed_tasks: &mut CompletedTaskIds,
+    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    root: ProjectRootId,
+    frame: PushFrame,
+) {
+    if let Some((root, session)) = process_reliable_push_frame(
+        writer_tx,
+        metrics,
+        routes,
+        root_channels,
+        session_identity,
+        retry_buffer,
+        push_buffer,
+        completed_tasks,
+        root,
+        frame,
+    ) {
+        if let Some(channel) = bg_sub_by_session
+            .get(&(root.clone(), session.clone()))
+            .copied()
+        {
+            arm_bg_wake(root, session, channel, bg_wake_pending, bg_wake_epoch);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_reliable_push_turn(
+    writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    retry_buffer: &mut RetryBuffer,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    completed_tasks: &mut CompletedTaskIds,
+    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    reliable_rx: &mut mpsc::UnboundedReceiver<PushEnvelope>,
+    first: Option<PushEnvelope>,
+) -> (usize, bool) {
+    let mut processed = 0;
+
+    if let Some((root, frame)) = first {
+        process_reliable_push_and_arm_bg_wake(
+            writer_tx,
+            metrics,
+            routes,
+            root_channels,
+            session_identity,
+            retry_buffer,
+            push_buffer,
+            completed_tasks,
+            bg_sub_by_session,
+            bg_wake_pending,
+            bg_wake_epoch,
+            root,
+            frame,
+        );
+        processed += 1;
+    }
+
+    while processed < RELIABLE_PUSH_DRAIN_BUDGET {
+        let Ok((root, frame)) = reliable_rx.try_recv() else {
+            return (processed, false);
+        };
+        process_reliable_push_and_arm_bg_wake(
+            writer_tx,
+            metrics,
+            routes,
+            root_channels,
+            session_identity,
+            retry_buffer,
+            push_buffer,
+            completed_tasks,
+            bg_sub_by_session,
+            bg_wake_pending,
+            bg_wake_epoch,
+            root,
+            frame,
+        );
+        processed += 1;
+    }
+
+    let deferred = !reliable_rx.is_empty();
+    if deferred {
+        metrics
+            .reliable_push_budget_deferrals
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    (processed, deferred)
+}
+
 fn process_lossy_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
     metrics: &DispatchPathMetrics,
@@ -1384,6 +1517,70 @@ async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStre
     Ok(stream)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn process_route_bind_completion(
+    writer_tx: &mpsc::Sender<Frame>,
+    completion: RouteBindCompletion,
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    executor: &Arc<Executor>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    decrement_counted_channel(&metrics.control_completion_queued);
+    handle_route_bind_completion(
+        writer_tx,
+        completion,
+        routes,
+        root_channels,
+        session_identity,
+        push_buffer,
+        live_roots,
+        pending_binds,
+        executor,
+        shutdown,
+        metrics,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_pending_route_bind_completions(
+    control_completion_rx: &mut mpsc::Receiver<RouteBindCompletion>,
+    writer_tx: &mpsc::Sender<Frame>,
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    executor: &Arc<Executor>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    while let Ok(completion) = control_completion_rx.try_recv() {
+        process_route_bind_completion(
+            writer_tx,
+            completion,
+            routes,
+            root_channels,
+            session_identity,
+            push_buffer,
+            live_roots,
+            pending_binds,
+            executor,
+            shutdown,
+            metrics,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
 /// the connection (EOF), sends channel-0 Goodbye, or a fatal mutating executor
 /// response requests whole-connection teardown.
@@ -1478,7 +1675,48 @@ where
 
     let loop_result: Result<(), SubcError> = loop {
         dispatch_path_metrics.mark_frame_loop_tick();
+        // RouteBind completions are control-plane unblockers. Drain any completed
+        // binds before entering other branch work so Push and maintenance bursts
+        // can only add one loop-turn of latency.
+        if let Err(error) = drain_pending_route_bind_completions(
+            &mut control_completion_rx,
+            &writer_tx,
+            &mut routes,
+            &mut root_channels,
+            &mut session_identity,
+            &mut push_buffer,
+            &mut live_roots,
+            &mut pending_binds,
+            &executor,
+            &shutdown,
+            &dispatch_path_metrics,
+        )
+        .await
+        {
+            break Err(error);
+        }
+
         tokio::select! {
+            biased;
+            Some(completion) = control_completion_rx.recv() => {
+                if let Err(error) = process_route_bind_completion(
+                    &writer_tx,
+                    completion,
+                    &mut routes,
+                    &mut root_channels,
+                    &mut session_identity,
+                    &mut push_buffer,
+                    &mut live_roots,
+                    &mut pending_binds,
+                    &executor,
+                    &shutdown,
+                    &dispatch_path_metrics,
+                )
+                .await
+                {
+                    break Err(error);
+                }
+            }
             _ = shutdown.notified() => {
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(());
@@ -1643,72 +1881,49 @@ where
                 }
             }
             Some((root_id, frame)) = reliable_rx.recv() => {
-                // Drain reliable frames in FIFO order. They are intentionally not
-                // coalesced: completion, pattern-match, and warning frames are
-                // must-deliver events.
-                let mut batch = vec![(root_id, frame)];
-                while let Ok(item) = reliable_rx.try_recv() {
-                    batch.push(item);
-                }
-
-                for (root, frame) in batch {
-                    if let Some((root, session)) = process_reliable_push_frame(
-                        &writer_tx,
-                        &dispatch_path_metrics,
-                        &routes,
-                        &root_channels,
-                        &session_identity,
-                        &mut retry_buffer,
-                        &mut push_buffer,
-                        &mut completed_tasks,
-                        root,
-                        frame,
-                    ) {
-                        if let Some(channel) = bg_sub_by_session
-                            .get(&(root.clone(), session.clone()))
-                            .copied()
-                        {
-                            arm_bg_wake(
-                                root,
-                                session,
-                                channel,
-                                &mut bg_wake_pending,
-                                &mut bg_wake_epoch,
-                            );
-                        }
-                    }
+                // Reliable Push frames are FIFO and must-deliver, but draining an
+                // unbounded burst in one current-thread turn can starve RouteBind
+                // completions. The budget defers excess frames, never drops them.
+                let (_, deferred) = drain_reliable_push_turn(
+                    &writer_tx,
+                    &dispatch_path_metrics,
+                    &routes,
+                    &root_channels,
+                    &session_identity,
+                    &mut retry_buffer,
+                    &mut push_buffer,
+                    &mut completed_tasks,
+                    &bg_sub_by_session,
+                    &mut bg_wake_pending,
+                    &mut bg_wake_epoch,
+                    &mut reliable_rx,
+                    Some((root_id, frame)),
+                );
+                if deferred {
+                    tokio::task::yield_now().await;
                 }
             }
             Some((root_id, frame)) = lossy_rx.recv() => {
-                // If both lanes are ready, process any already-queued reliable
-                // completions first so a following stale BashLongRunning frame can
-                // be suppressed even if select! happened to wake on the lossy lane.
-                while let Ok((reliable_root, reliable_frame)) = reliable_rx.try_recv() {
-                    if let Some((root, session)) = process_reliable_push_frame(
-                        &writer_tx,
-                        &dispatch_path_metrics,
-                        &routes,
-                        &root_channels,
-                        &session_identity,
-                        &mut retry_buffer,
-                        &mut push_buffer,
-                        &mut completed_tasks,
-                        reliable_root,
-                        reliable_frame,
-                    ) {
-                        if let Some(channel) = bg_sub_by_session
-                            .get(&(root.clone(), session.clone()))
-                            .copied()
-                        {
-                            arm_bg_wake(
-                                root,
-                                session,
-                                channel,
-                                &mut bg_wake_pending,
-                                &mut bg_wake_epoch,
-                            );
-                        }
-                    }
+                // When both push lanes have work, handle a small reliable slice before lossy work.
+                // That ordering lets completed task ids suppress stale BashLongRunning frames.
+                // The slice stays bounded so reliable bursts cannot monopolize this loop turn.
+                let (_, deferred) = drain_reliable_push_turn(
+                    &writer_tx,
+                    &dispatch_path_metrics,
+                    &routes,
+                    &root_channels,
+                    &session_identity,
+                    &mut retry_buffer,
+                    &mut push_buffer,
+                    &mut completed_tasks,
+                    &bg_sub_by_session,
+                    &mut bg_wake_pending,
+                    &mut bg_wake_epoch,
+                    &mut reliable_rx,
+                    None,
+                );
+                if deferred {
+                    tokio::task::yield_now().await;
                 }
 
                 // Drain the currently queued burst in one loop turn so lossy
@@ -1729,26 +1944,6 @@ where
                         root,
                         frame,
                     );
-                }
-            }
-            Some(completion) = control_completion_rx.recv() => {
-                decrement_counted_channel(&dispatch_path_metrics.control_completion_queued);
-                if let Err(error) = handle_route_bind_completion(
-                    &writer_tx,
-                    completion,
-                    &mut routes,
-                    &mut root_channels,
-                    &mut session_identity,
-                    &mut push_buffer,
-                    &mut live_roots,
-                    &mut pending_binds,
-                    &executor,
-                    &shutdown,
-                    &dispatch_path_metrics,
-                )
-                .await
-                {
-                    break Err(error);
                 }
             }
             Some(done) = bash_deferred_rx.recv() => {
@@ -1817,7 +2012,13 @@ where
                     );
                 }
 
-                let due_roots = due_maintenance_roots(&mut live_roots);
+                let (due_roots, deferred_roots) =
+                    due_maintenance_roots(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
+                if deferred_roots {
+                    dispatch_path_metrics
+                        .maintenance_budget_deferrals
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 for root_id in due_roots {
                     let bg_sessions_to_check: Vec<(String, u64)> = bg_sub_by_session
                         .iter()
@@ -1920,7 +2121,7 @@ async fn finish_writer_task(
 
 enum WriterEnqueueError {
     Full(Frame),
-    Closed(Frame),
+    Closed,
 }
 
 fn decrement_counted_channel(counter: &AtomicUsize) {
@@ -1960,26 +2161,53 @@ fn try_enqueue_writer_frame(
                 .fetch_add(1, Ordering::Relaxed);
             Err(WriterEnqueueError::Full(frame))
         }
-        Err(mpsc::error::TrySendError::Closed(())) => Err(WriterEnqueueError::Closed(frame)),
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            drop(frame);
+            Err(WriterEnqueueError::Closed)
+        }
     }
 }
 
-async fn send_writer_frame(
+async fn send_reliable_writer_frame(
     tx: &mpsc::Sender<Frame>,
     metrics: &DispatchPathMetrics,
-    frame: Frame,
-) -> Result<(), mpsc::error::SendError<Frame>> {
-    match try_enqueue_writer_frame(tx, metrics, frame) {
-        Ok(()) => Ok(()),
-        Err(WriterEnqueueError::Closed(frame)) => Err(mpsc::error::SendError(frame)),
-        Err(WriterEnqueueError::Full(frame)) => match tx.reserve().await {
-            Ok(permit) => {
+    mut frame: Frame,
+    context: &'static str,
+) -> Result<(), SubcError> {
+    let mut warned = false;
+    let mut backoff = RELIABLE_WRITER_RETRY_INITIAL_BACKOFF;
+
+    loop {
+        match try_enqueue_writer_frame(tx, metrics, frame) {
+            Ok(()) => return Ok(()),
+            Err(WriterEnqueueError::Closed) => return Err(SubcError::WriterClosed),
+            Err(WriterEnqueueError::Full(returned_frame)) => {
+                frame = returned_frame;
+            }
+        }
+
+        match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.reserve()).await {
+            Ok(Ok(permit)) => {
                 metrics.writer_queued.fetch_add(1, Ordering::Relaxed);
                 permit.send(frame);
-                Ok(())
+                return Ok(());
             }
-            Err(_) => Err(mpsc::error::SendError(frame)),
-        },
+            Ok(Err(_)) => return Err(SubcError::WriterClosed),
+            Err(_) => {
+                metrics
+                    .writer_saturation_count
+                    .fetch_add(1, Ordering::Relaxed);
+                if !warned {
+                    log::warn!(
+                        "subc attach: writer queue stayed full while sending {context}; retrying reliable frame"
+                    );
+                    warned = true;
+                }
+                tokio::time::sleep(backoff).await;
+                backoff =
+                    std::cmp::min(backoff.saturating_mul(2), RELIABLE_WRITER_RETRY_MAX_BACKOFF);
+            }
+        }
     }
 }
 
@@ -1990,7 +2218,7 @@ async fn send_frame(
 ) -> Result<(), SubcError> {
     match try_enqueue_writer_frame(tx, metrics, frame) {
         Ok(()) => Ok(()),
-        Err(WriterEnqueueError::Closed(_)) => Err(SubcError::WriterClosed),
+        Err(WriterEnqueueError::Closed) => Err(SubcError::WriterClosed),
         Err(WriterEnqueueError::Full(frame)) => {
             match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.reserve()).await {
                 Ok(Ok(permit)) => {
@@ -1999,7 +2227,12 @@ async fn send_frame(
                     Ok(())
                 }
                 Ok(Err(_)) => Err(SubcError::WriterClosed),
-                Err(_) => Err(SubcError::WriterBackpressureTimeout),
+                Err(_) => {
+                    metrics
+                        .writer_saturation_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(SubcError::WriterBackpressureTimeout)
+                }
             }
         }
     }
@@ -2159,7 +2392,7 @@ async fn handle_route_bind_completion(
         ack,
     )
     .map_err(SubcError::FrameBuild)?;
-    send_frame(tx, metrics, response).await?;
+    send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await?;
     let replayed =
         replay_buffered_push_frames(tx, metrics, route_id, push_buffer, &replay_key, bind_trust);
     if replayed > 0 {
@@ -2501,7 +2734,7 @@ async fn send_route_bind_error_parts(
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     let response = build_error_frame(ver, 0, corr, flags, code, message)?;
-    send_frame(tx, metrics, response).await?;
+    send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
     log::warn!("subc attach: route bind rejected ({code}): {message}");
     Ok(())
 }
@@ -2540,7 +2773,7 @@ async fn handle_tool_call(
             "route_not_bound",
             "route is not bound before tool call",
         )?;
-        return send_frame(tx, metrics, error).await;
+        return send_reliable_writer_frame(tx, metrics, error, "route_not_bound error").await;
     }
 
     let Some(identity) = routes.get(&route_id).cloned() else {
@@ -2552,7 +2785,7 @@ async fn handle_tool_call(
             "route_not_bound",
             "route is not bound before tool call",
         )?;
-        return send_frame(tx, metrics, error).await;
+        return send_reliable_writer_frame(tx, metrics, error, "route_not_bound error").await;
     };
     if let Some(meta) = live_roots.get_mut(&identity.root) {
         meta.touch();
@@ -2622,7 +2855,7 @@ async fn handle_tool_call(
             frame.header.flags,
             &result,
         )?;
-        return send_frame(tx, metrics, response_frame).await;
+        return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
 
     // A non-core name is NOT in the tool manifest. AFT fails closed and
@@ -2659,7 +2892,7 @@ async fn handle_tool_call(
             frame.header.flags,
             &result,
         )?;
-        return send_frame(tx, metrics, response_frame).await;
+        return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
 
     if bare_name == "bash" {
@@ -2780,8 +3013,16 @@ async fn handle_tool_call(
         let fatal = response_is_fatal_panic(&result.response);
         match build_tool_response_frame(ver, route_channel, corr, flags, &result) {
             Ok(response_frame) => {
-                let _ =
-                    send_writer_frame(&completion_tx, &completion_metrics, response_frame).await;
+                if let Err(error) = send_reliable_writer_frame(
+                    &completion_tx,
+                    &completion_metrics,
+                    response_frame,
+                    "tool response",
+                )
+                .await
+                {
+                    log::warn!("subc attach: failed to queue tool response frame: {error}");
+                }
             }
             Err(error) => {
                 log::error!("subc attach: failed to build tool response frame: {error}");
@@ -3501,7 +3742,7 @@ async fn handle_bash_deferred_completion(
         if routes.contains_key(&route_id) {
             let frame =
                 build_tool_response_frame(done.ver, done.channel, done.corr, done.flags, &result)?;
-            send_frame(tx, metrics, frame).await?;
+            send_reliable_writer_frame(tx, metrics, frame, "deferred bash response").await?;
         } else {
             log::debug!(
                 "subc attach: dropping deferred bash response {} for unbound route {}",
@@ -4120,9 +4361,10 @@ mod tests {
         poisoned_meta.maintenance_poisoned = true;
         live_roots.insert(poisoned_root.clone(), poisoned_meta);
 
-        let due = due_maintenance_roots(&mut live_roots);
+        let (due, deferred) = due_maintenance_roots(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
 
         assert_eq!(due, vec![healthy_root.clone()]);
+        assert!(!deferred);
         assert!(live_roots[&healthy_root].maintenance_pending);
         assert!(!live_roots[&poisoned_root].maintenance_pending);
     }
@@ -4218,6 +4460,179 @@ mod tests {
             decrement_counted_channel(&metrics.writer_queued);
         }
         assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn due_maintenance_roots_defers_unsubmitted_roots_without_marking_pending() {
+        let mut live_roots = HashMap::new();
+        let mut root_ids = Vec::new();
+        let mut _dirs = Vec::new();
+        for index in 0..(MAINTENANCE_SUBMIT_BUDGET + 2) {
+            let (dir, root_id) = test_root(&format!("maintenance-budget-{index}"));
+            live_roots.insert(root_id.clone(), RootMeta::new(Instant::now()));
+            root_ids.push(root_id);
+            _dirs.push(dir);
+        }
+
+        let (first_due, first_deferred) =
+            due_maintenance_roots(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
+
+        assert_eq!(first_due.len(), MAINTENANCE_SUBMIT_BUDGET);
+        assert!(first_deferred);
+        let first_due_set: HashSet<_> = first_due.into_iter().collect();
+        assert!(first_due_set
+            .iter()
+            .all(|root| live_roots[root].maintenance_pending));
+
+        let all_roots: HashSet<_> = root_ids.into_iter().collect();
+        let deferred_roots: HashSet<_> = all_roots.difference(&first_due_set).cloned().collect();
+        assert!(deferred_roots
+            .iter()
+            .all(|root| !live_roots[root].maintenance_pending));
+
+        let (second_due, _) = due_maintenance_roots(&mut live_roots, usize::MAX);
+        let second_due_set: HashSet<_> = second_due.into_iter().collect();
+        assert_eq!(second_due_set, deferred_roots);
+    }
+
+    #[tokio::test]
+    async fn reliable_writer_send_retries_after_timeout_and_preserves_frame() {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        writer_tx
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .expect("prefill writer queue");
+
+        let metrics_for_task = Arc::clone(&metrics);
+        let tx_for_task = writer_tx.clone();
+        let send_task = tokio::spawn(async move {
+            send_reliable_writer_frame(
+                &tx_for_task,
+                &metrics_for_task,
+                Frame::build(FrameType::Pong, control_flags(), 0, 2, Vec::new()).unwrap(),
+                "test reliable frame",
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.writer_saturation_count.load(Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reliable send should observe a timed-out full writer queue");
+
+        let prefilled = writer_rx.recv().await.expect("prefilled frame");
+        assert_eq!(prefilled.header.corr, 1);
+        let result = tokio::time::timeout(Duration::from_secs(2), send_task)
+            .await
+            .expect("reliable send should finish after writer drains")
+            .expect("reliable send task should not panic");
+        assert!(result.is_ok());
+        let delivered = writer_rx.recv().await.expect("retried reliable frame");
+        assert_eq!(delivered.header.corr, 2);
+    }
+
+    #[tokio::test]
+    async fn reliable_push_drain_budget_defers_without_reordering() {
+        let (_dir, root) = test_root("reliable-budget-root");
+        let session = "session-budget".to_string();
+        let mut routes = HashMap::new();
+        routes.insert(
+            1,
+            RouteIdentity {
+                root: root.clone(),
+                project_root: root.as_path().to_path_buf(),
+                harness: "opencode".to_string(),
+                session: session.clone(),
+                trust: BindTrust::FirstParty,
+            },
+        );
+        let mut root_channels = HashMap::new();
+        root_channels.insert(root.clone(), HashSet::from([1]));
+        let session_identity = HashMap::new();
+        let mut retry_buffer = RetryBuffer::new();
+        let mut push_buffer = HashMap::new();
+        let mut completed_tasks = CompletedTaskIds::default();
+        let bg_sub_by_session = HashMap::new();
+        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_epoch = HashMap::new();
+        let metrics = DispatchPathMetrics::new();
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(RELIABLE_PUSH_DRAIN_BUDGET + 8);
+        let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
+        let total = RELIABLE_PUSH_DRAIN_BUDGET + 3;
+        let first = (
+            root.clone(),
+            completion_frame_with_session("budget-0", &session),
+        );
+        for index in 1..total {
+            reliable_tx
+                .send((
+                    root.clone(),
+                    completion_frame_with_session(&format!("budget-{index}"), &session),
+                ))
+                .expect("queue reliable frame");
+        }
+
+        let (processed, deferred_by_budget) = drain_reliable_push_turn(
+            &writer_tx,
+            &metrics,
+            &routes,
+            &root_channels,
+            &session_identity,
+            &mut retry_buffer,
+            &mut push_buffer,
+            &mut completed_tasks,
+            &bg_sub_by_session,
+            &mut bg_wake_pending,
+            &mut bg_wake_epoch,
+            &mut reliable_rx,
+            Some(first),
+        );
+
+        assert_eq!(processed, RELIABLE_PUSH_DRAIN_BUDGET);
+        assert!(deferred_by_budget);
+        assert_eq!(
+            metrics
+                .reliable_push_budget_deferrals
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let mut delivered = Vec::new();
+        for _ in 0..RELIABLE_PUSH_DRAIN_BUDGET {
+            let frame = writer_rx.try_recv().expect("budgeted push frame");
+            delivered.push(push_frame_task_id(&frame).expect("push task id"));
+        }
+        assert_eq!(
+            delivered,
+            (0..RELIABLE_PUSH_DRAIN_BUDGET)
+                .map(|index| format!("budget-{index}"))
+                .collect::<Vec<_>>()
+        );
+
+        let next_first = reliable_rx.recv().await.expect("deferred reliable frame");
+        drain_reliable_push_turn(
+            &writer_tx,
+            &metrics,
+            &routes,
+            &root_channels,
+            &session_identity,
+            &mut retry_buffer,
+            &mut push_buffer,
+            &mut completed_tasks,
+            &bg_sub_by_session,
+            &mut bg_wake_pending,
+            &mut bg_wake_epoch,
+            &mut reliable_rx,
+            Some(next_first),
+        );
+        let mut deferred = Vec::new();
+        while let Ok(frame) = writer_rx.try_recv() {
+            deferred.push(push_frame_task_id(&frame).expect("deferred push task id"));
+        }
+        assert_eq!(deferred, vec!["budget-32", "budget-33", "budget-34"]);
     }
 
     fn status_frame(seq: u64) -> PushFrame {

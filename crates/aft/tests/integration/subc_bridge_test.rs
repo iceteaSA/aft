@@ -991,6 +991,31 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 json!({ "emitted": emitted, "task_id": task_id, "session_id": session_id }),
             )
         }
+        "subc_test_emit_bash_completed_burst" => {
+            let prefix = req
+                .params
+                .get("prefix")
+                .and_then(Value::as_str)
+                .unwrap_or("subc-test-burst");
+            let count = req.params.get("count").and_then(Value::as_u64).unwrap_or(1);
+            let session_id = req
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| req.session())
+                .to_string();
+            let mut emitted = 0;
+            for index in 0..count {
+                let task_id = format!("{prefix}-{index}");
+                if emit_push_frame(ctx, bash_completed_push(&task_id, &session_id)) {
+                    emitted += 1;
+                }
+            }
+            Response::success(
+                req.id,
+                json!({ "emitted": emitted, "prefix": prefix, "session_id": session_id }),
+            )
+        }
         "subc_test_emit_bash_completed_then_long_running" => {
             let task_id = req
                 .params
@@ -1329,6 +1354,16 @@ fn subc_bridge_routebind_nonblocking_slow_configure() {
         "subc_bridge_routebind_nonblocking_slow_configure",
         Duration::from_secs(30),
         drive_routebind_nonblocking_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_routebind_ack_is_prioritized_over_reliable_flood() {
+    run_subc_bridge_test(
+        "subc_bridge_routebind_ack_is_prioritized_over_reliable_flood",
+        Duration::from_secs(60),
+        drive_routebind_priority_daemon,
         |_, _, _| {},
     );
 }
@@ -3064,6 +3099,123 @@ async fn drive_routebind_nonblocking_daemon(input: FakeDaemonInput) {
     state.release_slow_configures();
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
     expect_route_bind_ack(&mut stream, 19).await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_route_bind(&mut stream, 8, 18, &slow_root).await;
+    expect_route_bind_ack(&mut stream, 18).await;
+
+    let slow_bind_base = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        9,
+        19,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("priority route 9 configure started", |inner| {
+        inner.slow_configure_started > slow_bind_base
+    });
+
+    let flood_prefix = "routebind-priority-flood";
+    let flood_count = 512_u64;
+    const TEST_WRITER_QUEUE_CAPACITY: u64 = 256;
+    const TEST_RELIABLE_PUSH_DRAIN_BUDGET: u64 = 32;
+    const ACK_AFTER_RELEASE_PUSH_BOUND: u64 =
+        TEST_WRITER_QUEUE_CAPACITY + 2 * TEST_RELIABLE_PUSH_DRAIN_BUDGET;
+    send_tool_call(
+        &mut stream,
+        1,
+        901,
+        "subc_test_emit_bash_completed_burst",
+        json!({ "prefix": flood_prefix, "count": flood_count }),
+    )
+    .await;
+
+    let mut flood_seen = 0_u64;
+    let mut flood_after_release_before_ack = 0_u64;
+    let mut flood_response_seen = false;
+    let mut saw_flood = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for RouteBindAck during reliable flood"
+        );
+        let frame = read_any_frame_timeout(&mut stream, "RouteBindAck during reliable flood").await;
+        match frame.header.ty {
+            FrameType::Push => {
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if push_type(&body) == Some("bash_completed")
+                    && push_task_id(&body).is_some_and(|task| task.starts_with(flood_prefix))
+                {
+                    flood_seen += 1;
+                    if saw_flood {
+                        flood_after_release_before_ack += 1;
+                    } else {
+                        saw_flood = true;
+                        state.release_slow_configures();
+                    }
+                }
+            }
+            FrameType::Response if frame.header.channel == 0 && frame.header.corr == 19 => {
+                assert!(
+                    saw_flood,
+                    "test must observe flood pressure before bind ack"
+                );
+                let ack: ModuleControlResponse =
+                    serde_json::from_slice(&frame.body).expect("RouteBindAck body");
+                assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+                // The bind acknowledgment can sit behind flood frames already queued for writing.
+                // The writer queue holds 256 frames, and the loop may finish two 32-frame
+                // reliable batches before it observes the completed bind job.
+                assert!(
+                    flood_after_release_before_ack <= ACK_AFTER_RELEASE_PUSH_BOUND,
+                    "RouteBindAck waited behind {flood_after_release_before_ack} reliable Push frames after release"
+                );
+                break;
+            }
+            FrameType::Response if frame.header.corr == 901 => {
+                flood_response_seen = true;
+            }
+            other => panic!("unexpected frame during reliable flood priority test: {other:?}"),
+        }
+    }
+    state.wait_for_slow_configure_finished(slow_bind_base + 1);
+
+    while flood_seen < flood_count || !flood_response_seen {
+        let frame = read_any_frame_timeout(&mut stream, "remaining reliable flood frames").await;
+        match frame.header.ty {
+            FrameType::Push => {
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if push_type(&body) == Some("bash_completed")
+                    && push_task_id(&body).is_some_and(|task| task.starts_with(flood_prefix))
+                {
+                    flood_seen += 1;
+                }
+            }
+            FrameType::Response if frame.header.corr == 901 => {
+                flood_response_seen = true;
+            }
+            other => panic!("unexpected frame while draining reliable flood: {other:?}"),
+        }
+    }
 
     send_connection_goodbye(&mut stream).await;
 }
