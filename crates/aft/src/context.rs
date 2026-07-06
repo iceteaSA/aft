@@ -1463,21 +1463,27 @@ impl AppContext {
             .wrapping_add(1)
     }
 
-    /// Record the warm-maintenance key for a successful configure.
+    /// Record the warm-maintenance key for a successful configure and return
+    /// the generation this configure operates under.
     ///
-    /// Returns the previous generation when the key is unchanged, allowing an
-    /// equivalent reconfigure to adopt already-running warm work instead of
-    /// dropping receivers and rescheduling another full project pass.
-    pub fn note_configure_warm_key(&self, generation: u64, key: String) -> Option<u64> {
+    /// An unchanged key ADOPTS the running generation without advancing it:
+    /// in-flight build workers gate their publish on the generation flag being
+    /// unchanged, so advancing on an equivalent rebind would silently discard
+    /// every adopted build's result at completion (the receiver never
+    /// resolves, and long builds can never finish under rebind traffic). Only
+    /// a genuinely different warm config advances the generation, which is
+    /// what cancels superseded in-flight builds.
+    pub fn note_configure_warm_key(&self, key: String) -> (u64, bool) {
         let mut state = self.configure_warm_state.lock();
-        let adopted = state
-            .key
-            .as_ref()
-            .filter(|previous| *previous == &key)
-            .map(|_| state.generation);
+        let equivalent = state.key.as_ref().is_some_and(|previous| *previous == key);
+        let generation = if equivalent {
+            self.configure_generation()
+        } else {
+            self.advance_configure_generation()
+        };
         state.generation = generation;
         state.key = Some(key);
-        adopted
+        (generation, equivalent)
     }
 
     pub fn configure_generation(&self) -> u64 {

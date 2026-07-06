@@ -1600,7 +1600,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     let artifact_owner_lease = artifact_owner_claim.and_then(|claim| claim.lease);
     ctx.set_artifact_owner(artifact_owner_status.clone(), artifact_owner_lease);
-    let configure_generation = ctx.advance_configure_generation();
     let warm_key = format!(
         "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};callgraph={}:{};inspect={};manifests={}",
         canonical_cache_root,
@@ -1617,8 +1616,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.inspect.enabled,
         workspace_manifest_fingerprint(&canonical_cache_root),
     );
-    let adopted_warm_generation = ctx.note_configure_warm_key(configure_generation, warm_key);
-    let equivalent_warm_config = adopted_warm_generation.is_some();
+    let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
     let semantic_cold_seed_generation = if !equivalent_warm_config {
         ctx.reset_tier2_refresh_scheduler();
         let semantic_cold_seed_generation = ctx.reset_semantic_cold_seed_gate_for_configure();
@@ -1735,23 +1733,20 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 .is_some();
         if search_build_in_progress {
             slog_info!(
-                "search index build adopted by generation {} (previous generation {})",
-                configure_generation,
-                adopted_warm_generation.unwrap_or(configure_generation)
+                "search index build adopted by equivalent reconfigure (generation {})",
+                configure_generation
             );
         }
         if semantic_build_in_progress {
             slog_info!(
-                "semantic index build adopted by generation {} (previous generation {})",
-                configure_generation,
-                adopted_warm_generation.unwrap_or(configure_generation)
+                "semantic index build adopted by equivalent reconfigure (generation {})",
+                configure_generation
             );
         }
         if ctx.callgraph_store_rx().lock().is_some() {
             slog_info!(
-                "callgraph store warm build adopted by generation {} (previous generation {})",
-                configure_generation,
-                adopted_warm_generation.unwrap_or(configure_generation)
+                "callgraph store warm build adopted by equivalent reconfigure (generation {})",
+                configure_generation
             );
         }
     } else {
@@ -3062,6 +3057,7 @@ mod tests {
         let first = super::handle_configure(&req, &ctx);
         assert!(first.success);
 
+        let generation_after_first = ctx.configure_generation();
         for _ in 0..5 {
             let response = super::handle_configure(&req, &ctx);
             assert!(response.success);
@@ -3070,7 +3066,26 @@ mod tests {
         assert!(ctx.search_index_rx().read().unwrap().is_none());
         assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(ctx.callgraph_store_rx().lock().is_none());
-        assert_eq!(ctx.configure_generation(), 6);
+        // Load-bearing: in-flight build workers publish only while the
+        // generation flag equals their spawn generation. If equivalent
+        // rebinds advanced it, every rebind during a long build would
+        // silently discard the build's result at completion.
+        assert_eq!(ctx.configure_generation(), generation_after_first);
+
+        // A genuinely different warm config must still advance (this is what
+        // cancels superseded in-flight builds).
+        let changed = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+        let response = super::handle_configure(&changed, &ctx);
+        assert!(response.success);
+        assert_eq!(ctx.configure_generation(), generation_after_first + 1);
     }
 
     #[test]
