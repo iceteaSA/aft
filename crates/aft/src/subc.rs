@@ -3449,6 +3449,7 @@ fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   over the session's own backup/checkpoint state — the plugin safety tool
 ///   calls them BEFORE `aft_safety undo`/`restore` to know which paths to ask
 ///   permission for. Without them, safety undo/restore fails over subc.
+///
 /// Lanes are already assigned in `command_lane` (drain/undo_preview/
 /// checkpoint_paths = PureRead, ack = Mutating).
 fn is_subc_native_plumbing_tool(name: &str) -> bool {
