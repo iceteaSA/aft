@@ -346,6 +346,13 @@ fn current_hostname() -> String {
 
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        // Our own process: trivially alive. This is a real production case
+        // (the daemon serves sibling checkouts of one repo as two roots in
+        // one process) and probing our own PID through the OS is where the
+        // probe can flake.
+        return true;
+    }
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
@@ -358,6 +365,13 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        // Our own process: trivially alive. Also avoids the tasklist probe,
+        // which can return empty output under loaded-runner contention and
+        // misreport a live owner as dead (observed as sibling checkouts
+        // stealing the artifact lease in CI).
+        return true;
+    }
     // PID 0 is the System Idle Process on Windows, so tasklist reports it as
     // running; treat it as dead like the Unix path does (it can never be an
     // AFT bridge).
