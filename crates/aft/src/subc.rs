@@ -1614,7 +1614,9 @@ where
                     &bg_wake_epoch,
                 );
                 if response_is_fatal_panic(&response) {
-                    signal_fatal_teardown(&writer_tx, None, PROTOCOL_VERSION, 0, &shutdown).await;
+                    log::warn!(
+                        "subc attach: maintenance drain observed a fatal actor; deferring teardown until a route request can receive actor_fatal"
+                    );
                 }
             }
             _ = drain_interval.tick() => {
