@@ -10,7 +10,7 @@
 - Use `packages/aft-bridge/src/transport-factory.ts` to instantiate either `BridgePool` (standalone NDJSON bridge, isolating one `aft` process per project root) or `SubcTransportPool` (daemon-backed transport) satisfying the shared `AftTransportPool` interface.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular, with `crates/aft/src/commands/tool_call.rs` acting as the single endpoint for tool invocation routing.
-- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/inspect/` (including codebase-health scanners and the `oxc_engine/` liveness solver), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
+- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/inspect/` (including codebase-health scanners and the `oxc_engine/` liveness solver), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, `crates/aft/src/lsp/`, `crates/aft/src/artifact_owner.rs`, and `crates/aft/src/readonly_artifacts.rs` as shared engines behind multiple commands.
 
 ## Layers
 
@@ -31,7 +31,7 @@
 **Shared bridge layer:**
 - Purpose: Resolve or download the binary, start worker processes, manage ONNX runtime, format output, select and manage the transport pool, and forward requests. All harness adapters share this layer.
 - Location: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/subc-transport.ts`, `packages/aft-bridge/src/transport.ts`, `packages/aft-bridge/src/transport-factory.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`, `packages/aft-bridge/src/zoom-format.ts`
-- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, route caching per session-identity, background event subscriptions with independent reconnects, session bridge lifecycle, restart handling, version checks, binary discovery, binary download, ONNX runtime detection, storage migration, compact UI formatting, active logger
+- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, route caching per session-identity, background event subscriptions with independent reconnects, session bridge lifecycle, restart handling, version checks, binary discovery, binary download, ONNX runtime detection, storage migration, compact UI formatting, active logger, wait-aware transport budgets propagation (mapping `transportTimeoutMs` to route requests to avoid premature client-side timeouts during long command execution)
 - Depends on: Node child-process APIs, GitHub releases, `onnxruntime-node`, `@cortexkit/subc-client`
 - Used by: `packages/opencode-plugin/src/index.ts`, `packages/pi-plugin/src/index.ts`
 
@@ -59,7 +59,7 @@
 **Protocol and command layer:**
 - Purpose: Accept NDJSON requests, route tool calls via the unified `tool_call` command, and dispatch them to focused command handlers.
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`
-- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, server-rendered agent-facing text formatting, and standalone command handlers for read/write/edit/apply_patch/delete_file/move_file/outline/zoom/bash/bash_orchestrate/bash_status/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
+- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, server-rendered agent-facing text formatting, control channel 0 health check responder, and standalone command handlers for read/write/edit/apply_patch/delete_file/move_file/outline/zoom/bash/bash_orchestrate/bash_status/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
 - Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
@@ -72,8 +72,8 @@
 
 **State and diagnostics layer:**
 - Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
-- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/response_finalize.rs`
-- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), Windows verbatim path normalization via `canonicalize_normalized` to eliminate path comparison asymmetry, undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store (which tracks and masks watcher-stale diagnostics for caching and pull reuse), document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels, and main-loop pending responses registry
+- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/response_finalize.rs`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`
+- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), Windows verbatim path normalization via `canonicalize_normalized` to eliminate path comparison asymmetry, undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store (which tracks and masks watcher-stale diagnostics for caching and pull reuse), document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels, main-loop pending responses registry, and artifact owner lease registry (writing an owner manifest containing PID and hostname to detect and reclaim stale leases, falling back to read-only mode if a lease is actively owned by another session)
 - Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `db/` and `callgraph_store/`), `serde`
 - Used by: All command handlers through `AppContext`
 
@@ -134,6 +134,15 @@
 1. Check cache, npm platform package, PATH, and cargo install locations -- `packages/aft-bridge/src/resolver.ts`
 2. Download and checksum-verify a release asset when local resolution fails -- `packages/aft-bridge/src/downloader.ts`
 3. Start bridges against the resolved binary and hot-swap after version mismatch -- `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`
+
+**Artifact ownership and read-only caching flow:**
+
+1. During `configure`, verify repository and cache directory scopes, and request a write lease -- `crates/aft/src/commands/configure.rs`, `crates/aft/src/artifact_owner.rs`.
+2. Write an `owner.json` manifest to the cache directory carrying the current checkout's scope key, path, PID, and hostname.
+3. If no manifest exists, or if the existing manifest belongs to the same checkout, or if the owning process is dead (stale heartbeat or inactive process ID/hostname), reclaim and write a new lease ("Owner" mode).
+4. If an active process on another checkout owns the manifest, claim "ReadOnly" mode.
+5. In "ReadOnly" mode, heavy operations like cold callgraph builds, search index generation, and semantic index warming are disabled. Any search or semantic search queries read the cached index files using strict read-only openers -- `crates/aft/src/readonly_artifacts.rs`.
+6. The active "Owner" session emits periodic heartbeat file-writes to the lease manifest file during its event loop tick -- `crates/aft/src/main.rs`.
 
 ## Key Abstractions
 
@@ -251,6 +260,12 @@
 - Purpose: Represent the coding-agent harness (OpenCode or Pi) for config and CLI dispatch.
 - Location: `crates/aft/src/harness.rs`
 - Pattern: Simple enum with serde round-trip and display/from-str
+
+**ArtifactOwnerLease / ArtifactOwnerClaim:**
+- Purpose: Prevent concurrent AFT processes from corrupting shared cache artifacts for the same repository while allowing safe read-only fallbacks.
+- Location: `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`
+- Pattern: File-system lease with active process liveness tracking.
+- Contains: Unique process identification (`pid`, `hostname`), heartbeat updates during the event loop to preserve the lease, stale lease reclamation, and read-only index adapters that query the cached search and semantic indexes without trigger-building or modifying files.
 
 ## Entry Points
 
