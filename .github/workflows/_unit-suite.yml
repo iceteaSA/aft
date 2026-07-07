@@ -199,6 +199,14 @@ jobs:
           AFT_TEST_DIAG: "1"
           # See the Linux job: full core count on otherwise-idle CI runners.
           NEXTEST_TEST_THREADS: "num-cpus"
+          # This job deliberately runs without rust-cache (see above), so the
+          # release-storm phase would cold-build the whole workspace in
+          # release profile every run and blow the job timeout (observed:
+          # debug suite green at 12min, release build still compiling at the
+          # 25min kill). The storm tests exercise no macOS-specific paths;
+          # Linux CI (cached) and the local gate are the release-storm
+          # arbiters.
+          AFT_GATE_SKIP_RELEASE_STORM: "1"
 
       # See the Linux job: private-repo release read via the cortexkit-ci
       # App token; absent secrets (fork PR / not yet configured) skip
