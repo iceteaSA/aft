@@ -10,7 +10,9 @@ use notify::RecommendedWatcher;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::artifact_owner::{ArtifactOwnerLease, ArtifactOwnerMode, ArtifactOwnerStatus};
+use crate::artifact_owner::{
+    ArtifactOwnerLease, ArtifactOwnerLeaseRegistration, ArtifactOwnerMode, ArtifactOwnerStatus,
+};
 use crate::backup::hash_session;
 use crate::backup::BackupStore;
 use crate::bash_background::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
@@ -688,7 +690,7 @@ pub struct AppContext {
     git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
     shared_artifacts_read_only: parking_lot::Mutex<bool>,
     artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
-    artifact_owner_lease: parking_lot::Mutex<Option<ArtifactOwnerLease>>,
+    artifact_owner_lease: parking_lot::Mutex<Option<ArtifactOwnerLeaseRegistration>>,
     /// Reasons (if any) why heavy AFT subsystems were auto-disabled for the
     /// current project root. Populated by `handle_configure` based on the
     /// canonical project root. Each reason is a stable machine-readable string
@@ -814,6 +816,7 @@ impl Drop for ForceRestrictGuard<'_> {
 
 impl Drop for AppContext {
     fn drop(&mut self) {
+        self.artifact_owner_lease.get_mut().take();
         if let Some(runtime) = self.watcher_thread.get_mut().take() {
             runtime.shutdown_and_join();
         }
@@ -1770,7 +1773,7 @@ impl AppContext {
             .is_some_and(|status| status.mode == ArtifactOwnerMode::ReadOnly);
         *self.shared_artifacts_read_only.lock() = read_only;
         *self.artifact_owner_status.lock() = status;
-        *self.artifact_owner_lease.lock() = lease;
+        *self.artifact_owner_lease.lock() = lease.map(crate::artifact_owner::register_heartbeat);
     }
 
     pub fn shared_artifacts_read_only(&self) -> bool {
@@ -1779,12 +1782,6 @@ impl AppContext {
 
     pub fn artifact_owner_status(&self) -> Option<ArtifactOwnerStatus> {
         self.artifact_owner_status.lock().clone()
-    }
-
-    pub fn heartbeat_artifact_owner_lease(&self) {
-        if let Some(lease) = self.artifact_owner_lease.lock().as_mut() {
-            lease.heartbeat_if_due();
-        }
     }
 
     pub fn is_worktree_bridge(&self) -> bool {

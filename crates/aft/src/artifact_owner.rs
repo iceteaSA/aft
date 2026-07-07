@@ -1,6 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -38,7 +42,7 @@ pub struct ArtifactOwnerStatus {
     pub note: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ArtifactOwnerLease {
     path: PathBuf,
     manifest: ArtifactOwnerManifest,
@@ -50,6 +54,30 @@ pub struct ArtifactOwnerClaim {
     pub status: ArtifactOwnerStatus,
     pub lease: Option<ArtifactOwnerLease>,
 }
+
+#[derive(Debug)]
+pub struct ArtifactOwnerLeaseRegistration {
+    id: u64,
+    state: Arc<HeartbeatState>,
+}
+
+#[derive(Debug)]
+struct HeartbeatState {
+    registry: Mutex<HeartbeatRegistry>,
+    next_id: AtomicU64,
+    thread_started: AtomicBool,
+    shutdown: AtomicBool,
+    wake_tx: crossbeam_channel::Sender<()>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+}
+
+#[derive(Debug, Default)]
+struct HeartbeatRegistry {
+    leases: BTreeMap<u64, ArtifactOwnerLease>,
+    warned_failures: BTreeSet<PathBuf>,
+}
+
+static HEARTBEAT_STATE: OnceLock<Arc<HeartbeatState>> = OnceLock::new();
 
 pub fn claim_or_open_read_only(
     storage_dir: Option<&Path>,
@@ -125,16 +153,178 @@ pub fn claim_or_open_read_only(
     }
 }
 
+pub fn register_heartbeat(lease: ArtifactOwnerLease) -> ArtifactOwnerLeaseRegistration {
+    let state = heartbeat_state();
+    start_heartbeat_thread(&state);
+    let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut registry = state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.warned_failures.remove(&lease.path);
+        registry.leases.insert(id, lease);
+    }
+    wake_heartbeat_thread(&state);
+    ArtifactOwnerLeaseRegistration { id, state }
+}
+
+pub fn shutdown_heartbeat_thread() {
+    if let Some(state) = HEARTBEAT_STATE.get() {
+        state.shutdown.store(true, Ordering::SeqCst);
+        wake_heartbeat_thread(state);
+    }
+}
+
+impl Drop for ArtifactOwnerLeaseRegistration {
+    fn drop(&mut self) {
+        let removed = {
+            let mut registry = self
+                .state
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let removed = registry.leases.remove(&self.id);
+            if let Some(lease) = &removed {
+                registry.warned_failures.remove(&lease.path);
+            }
+            removed
+        };
+        if removed.is_some() {
+            wake_heartbeat_thread(&self.state);
+        }
+    }
+}
+
+fn heartbeat_state() -> Arc<HeartbeatState> {
+    HEARTBEAT_STATE
+        .get_or_init(|| {
+            let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+            Arc::new(HeartbeatState {
+                registry: Mutex::new(HeartbeatRegistry::default()),
+                next_id: AtomicU64::new(1),
+                thread_started: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
+                wake_tx,
+                wake_rx,
+            })
+        })
+        .clone()
+}
+
+fn start_heartbeat_thread(state: &Arc<HeartbeatState>) {
+    if state.thread_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let state = Arc::clone(state);
+    thread::spawn(move || heartbeat_thread_loop(state));
+}
+
+fn heartbeat_thread_loop(state: Arc<HeartbeatState>) {
+    let ticker = crossbeam_channel::tick(Duration::from_millis(heartbeat_interval_ms()));
+    while !state.shutdown.load(Ordering::SeqCst) {
+        if !heartbeat_registry_has_leases(&state) {
+            if state.wake_rx.recv().is_err() {
+                break;
+            }
+            if state.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            heartbeat_registered_leases(&state);
+            continue;
+        }
+
+        crossbeam_channel::select! {
+            recv(ticker) -> tick => {
+                if tick.is_err() {
+                    break;
+                }
+            }
+            recv(state.wake_rx) -> _ => {}
+        }
+
+        if state.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        heartbeat_registered_leases(&state);
+    }
+}
+
+fn heartbeat_registry_has_leases(state: &HeartbeatState) -> bool {
+    state
+        .registry
+        .lock()
+        .map(|registry| !registry.leases.is_empty())
+        .unwrap_or(false)
+}
+
+fn heartbeat_registered_leases(state: &HeartbeatState) {
+    let leases = {
+        let registry = state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry
+            .leases
+            .iter()
+            .map(|(id, lease)| (*id, lease.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    for (id, mut lease) in leases {
+        let path = lease.path.clone();
+        match lease.try_heartbeat_if_due() {
+            Ok(false) => {}
+            Ok(true) => {
+                let mut registry = state
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(current) = registry.leases.get_mut(&id) {
+                    current.manifest.heartbeat_at_ms = lease.manifest.heartbeat_at_ms;
+                    current.last_heartbeat_ms = lease.last_heartbeat_ms;
+                }
+            }
+            Err(error) => {
+                let should_warn = {
+                    let mut registry = state
+                        .registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    registry.warned_failures.insert(path.clone())
+                };
+                if should_warn {
+                    crate::slog_warn!(
+                        "artifact owner heartbeat failed for {}: {}",
+                        path.display(),
+                        error
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn wake_heartbeat_thread(state: &HeartbeatState) {
+    let _ = state.wake_tx.try_send(());
+}
+
 impl ArtifactOwnerLease {
     pub fn heartbeat_if_due(&mut self) {
+        let _ = self.try_heartbeat_if_due();
+    }
+
+    fn try_heartbeat_if_due(&mut self) -> io::Result<bool> {
         let now = now_ms();
-        if now.saturating_sub(self.last_heartbeat_ms) < fs_lock::HEARTBEAT_INTERVAL_MS {
-            return;
+        if now.saturating_sub(self.last_heartbeat_ms) < heartbeat_interval_ms() {
+            return Ok(false);
         }
         self.manifest.heartbeat_at_ms = now;
-        if atomic_write_manifest(&self.path, &self.manifest).is_ok() {
-            self.last_heartbeat_ms = now;
-        }
+        atomic_write_manifest(&self.path, &self.manifest)?;
+        self.last_heartbeat_ms = now;
+        Ok(true)
     }
 }
 
@@ -231,6 +421,7 @@ fn reclaim_manifest_if_unchanged(path: &Path, judged: &ArtifactOwnerManifest) ->
     }
 }
 
+#[derive(Debug)]
 enum ReadManifestError {
     NotFound,
     Io(io::Error),
@@ -305,6 +496,19 @@ fn sync_parent(path: &Path) {
             let _ = dir.sync_all();
         }
     }
+}
+
+fn heartbeat_interval_ms() -> u64 {
+    #[cfg(test)]
+    if let Ok(raw) = std::env::var("AFT_TEST_ARTIFACT_OWNER_HEARTBEAT_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            if ms > 0 {
+                return ms;
+            }
+        }
+    }
+
+    fs_lock::HEARTBEAT_INTERVAL_MS
 }
 
 fn now_ms() -> u64 {
@@ -425,6 +629,90 @@ pub(crate) fn write_synthetic_manifest_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock as StdOnceLock};
+    use std::time::Instant;
+
+    use serde_json::json;
+
+    use crate::config::Config;
+    use crate::context::{default_language_provider_factory, AppContext};
+    use crate::executor::{Executor, Lane};
+    use crate::path_identity::ProjectRootId;
+    use crate::protocol::Response;
+
+    static HEARTBEAT_TEST_SERIAL: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn heartbeat_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        HEARTBEAT_TEST_SERIAL
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_test_heartbeat_interval(ms: u64) -> EnvVarGuard {
+        let key = "AFT_TEST_ARTIFACT_OWNER_HEARTBEAT_MS";
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, ms.to_string());
+        EnvVarGuard { key, previous }
+    }
+
+    fn claim_stale_owner(
+        storage_dir: &Path,
+        root: &Path,
+    ) -> (ArtifactOwnerStatus, ArtifactOwnerLease) {
+        fs::create_dir_all(root).unwrap();
+        let mut claim =
+            claim_or_open_read_only(Some(storage_dir), root, "shared-key", "scope", None).unwrap();
+        let lease = claim.lease.as_mut().expect("owner lease");
+        lease.manifest.heartbeat_at_ms = 0;
+        lease.last_heartbeat_ms = 0;
+        atomic_write_manifest(&lease.path, &lease.manifest).unwrap();
+        (claim.status, claim.lease.take().unwrap())
+    }
+
+    fn context_with_artifact_owner(
+        status: ArtifactOwnerStatus,
+        lease: ArtifactOwnerLease,
+    ) -> AppContext {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        ctx.set_artifact_owner(Some(status), Some(lease));
+        ctx
+    }
+
+    fn wait_for_heartbeat(path: &Path, after_ms: u64) -> ArtifactOwnerManifest {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let manifest = read_manifest(path).unwrap();
+            if manifest.heartbeat_at_ms > after_ms {
+                return manifest;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for heartbeat");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_heartbeat_stops(path: &Path) {
+        thread::sleep(Duration::from_millis(120));
+        let stable = read_manifest(path).unwrap().heartbeat_at_ms;
+        thread::sleep(Duration::from_millis(120));
+        let manifest = read_manifest(path).unwrap();
+        assert_eq!(manifest.heartbeat_at_ms, stable);
+    }
 
     #[test]
     fn sibling_checkout_opens_read_only_while_owner_is_alive() {
@@ -505,5 +793,72 @@ mod tests {
         .unwrap();
 
         assert_eq!(claim.status.mode, ArtifactOwnerMode::Owner);
+    }
+
+    #[test]
+    fn heartbeat_advances_while_mutating_lane_is_busy() {
+        let _serial = heartbeat_serial_guard();
+        let _interval = set_test_heartbeat_interval(25);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let (status, lease) = claim_stale_owner(temp.path(), &root);
+        let manifest_path = lease.path.clone();
+        let ctx = Arc::new(context_with_artifact_owner(status, lease));
+        let root_id = ProjectRootId::from_path(&root).unwrap();
+        let executor = Executor::new();
+        executor.register_actor(root_id.clone(), Arc::clone(&ctx));
+
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let hold = executor.submit(
+            root_id,
+            Lane::Mutating,
+            "hold-mutating-lane".to_string(),
+            Box::new(move |_| {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                Response::success("hold-mutating-lane", json!({ "released": true }))
+            }),
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mutating lane job started");
+
+        let manifest = wait_for_heartbeat(&manifest_path, 0);
+        assert!(manifest.heartbeat_at_ms > 0);
+
+        release_tx.send(()).unwrap();
+        hold.recv_timeout(Duration::from_secs(1))
+            .expect("held lane released");
+    }
+
+    #[test]
+    fn lease_release_stops_heartbeat() {
+        let _serial = heartbeat_serial_guard();
+        let _interval = set_test_heartbeat_interval(25);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let (status, lease) = claim_stale_owner(temp.path(), &root);
+        let manifest_path = lease.path.clone();
+        let ctx = context_with_artifact_owner(status, lease);
+
+        let _manifest = wait_for_heartbeat(&manifest_path, 0);
+        ctx.set_artifact_owner(None, None);
+        assert_heartbeat_stops(&manifest_path);
+    }
+
+    #[test]
+    fn context_shutdown_releases_heartbeat() {
+        let _serial = heartbeat_serial_guard();
+        let _interval = set_test_heartbeat_interval(25);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let (status, lease) = claim_stale_owner(temp.path(), &root);
+        let manifest_path = lease.path.clone();
+        let ctx = context_with_artifact_owner(status, lease);
+
+        let _manifest = wait_for_heartbeat(&manifest_path, 0);
+        drop(ctx);
+        assert_heartbeat_stops(&manifest_path);
     }
 }

@@ -13,6 +13,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrainBatchOutcome {
+    pub processed: usize,
+    pub has_more: bool,
+}
+
+pub const WATCHER_EVENT_DRAIN_BATCH_CAP: usize = 256;
+pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
+
 pub fn drain_configure_warning_events(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
     for (generation, frame) in ctx.drain_configure_warnings() {
@@ -1214,11 +1223,16 @@ pub fn refresh_callgraph_store_for_watcher(
 /// coalescing; this drain only reacts to compact control events and surviving
 /// paths because the cache/index state below is not Send.
 pub fn drain_watcher_events(ctx: &AppContext) {
+    let _ = drain_watcher_events_bounded(ctx, usize::MAX);
+}
+
+pub fn drain_watcher_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
     let mut changed: HashSet<std::path::PathBuf> = HashSet::new();
     let mut ignore_file_changed = false;
     let mut rescan_required = false;
     let mut watcher_failed = None;
     let mut root_deleted = false;
+    let mut outcome = DrainBatchOutcome::default();
 
     {
         let rx_ref = ctx.watcher_rx().lock();
@@ -1226,22 +1240,29 @@ pub fn drain_watcher_events(ctx: &AppContext) {
             Some(rx) => rx,
             None => {
                 ctx.tick_tier2_refresh_scheduler(0);
-                return; // No watcher configured
+                return outcome; // No watcher configured
             }
         };
 
         loop {
+            if outcome.processed >= max_events {
+                outcome.has_more = !rx.is_empty();
+                break;
+            }
             match rx.try_recv() {
                 Ok(WatcherDispatchEvent::Paths(paths)) => {
+                    outcome.processed += 1;
                     if !rescan_required {
                         changed.extend(paths);
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired) => {
+                    outcome.processed += 1;
                     rescan_required = true;
                     changed.clear();
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { path }) => {
+                    outcome.processed += 1;
                     ignore_file_changed = true;
                     log::debug!(
                         "watcher: ignore rules changed at {}, rebuilding matcher",
@@ -1256,10 +1277,12 @@ pub fn drain_watcher_events(ctx: &AppContext) {
                     }
                 }
                 Ok(WatcherDispatchEvent::RootDeleted) => {
+                    outcome.processed += 1;
                     root_deleted = true;
                     break;
                 }
                 Ok(WatcherDispatchEvent::Error(error)) => {
+                    outcome.processed += 1;
                     watcher_failed = Some(error);
                     break;
                 }
@@ -1324,7 +1347,7 @@ pub fn drain_watcher_events(ctx: &AppContext) {
             ctx.status_emitter().signal(ctx.build_status_snapshot());
         }
         ctx.tick_tier2_refresh_scheduler(scheduler_changed_path_count);
-        return;
+        return outcome;
     }
 
     if heavy_root_work_allowed {
@@ -1510,12 +1533,21 @@ pub fn drain_watcher_events(ctx: &AppContext) {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
     ctx.tick_tier2_refresh_scheduler(scheduler_changed_path_count);
+    outcome
 }
 
 pub fn drain_lsp_events(ctx: &AppContext) {
+    let _ = drain_lsp_events_bounded(ctx, usize::MAX);
+}
+
+pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
     let drained = {
         let mut lsp = ctx.lsp();
-        lsp.drain_events()
+        lsp.drain_events_bounded(max_events)
+    };
+    let outcome = DrainBatchOutcome {
+        processed: drained.events.len(),
+        has_more: drained.has_more,
     };
     let mut status_changed = drained.diagnostics_changed;
     for event in drained.events {
@@ -1558,5 +1590,72 @@ pub fn drain_lsp_events(ctx: &AppContext) {
     }
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::context::{default_language_provider_factory, AppContext};
+
+    fn watcher_context(
+        root: &Path,
+    ) -> (AppContext, crossbeam_channel::Sender<WatcherDispatchEvent>) {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        ctx.update_config(|config| {
+            config.project_root = Some(root.to_path_buf());
+        });
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        (ctx, tx)
+    }
+
+    #[test]
+    fn watcher_drain_batch_cap_yields_with_events_remaining() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = watcher_context(temp.path());
+        let cap = 3;
+        for index in 0..(cap * 2 + 1) {
+            tx.send(WatcherDispatchEvent::Paths(vec![temp
+                .path()
+                .join(format!("file-{index}.rs"))]))
+                .unwrap();
+        }
+
+        let first = drain_watcher_events_bounded(&ctx, cap);
+
+        assert_eq!(first.processed, cap);
+        assert!(first.has_more);
+        assert_eq!(ctx.pending_tier2_paths().len(), cap);
+    }
+
+    #[test]
+    fn watcher_drain_requeues_until_all_events_are_applied() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = watcher_context(temp.path());
+        let cap = 4;
+        let total = cap * 2 + 3;
+        for index in 0..total {
+            tx.send(WatcherDispatchEvent::Paths(vec![temp
+                .path()
+                .join(format!("file-{index}.rs"))]))
+                .unwrap();
+        }
+
+        let mut processed = 0;
+        loop {
+            let outcome = drain_watcher_events_bounded(&ctx, cap);
+            assert!(outcome.processed <= cap);
+            processed += outcome.processed;
+            if !outcome.has_more {
+                break;
+            }
+        }
+
+        assert_eq!(processed, total);
+        assert_eq!(ctx.pending_tier2_paths().len(), total);
     }
 }

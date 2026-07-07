@@ -2840,7 +2840,11 @@ mod tests {
 
     fn init_git_fixture(root: &std::path::Path) {
         std::fs::create_dir_all(root).unwrap();
-        std::fs::write(root.join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        std::fs::write(
+            root.join("tracked.rs"),
+            format!("// fixture:{}\nfn tracked() {{}}\n", root.display()),
+        )
+        .unwrap();
         assert!(Command::new("git")
             .current_dir(root)
             .args(["init", "--quiet"])
