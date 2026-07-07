@@ -909,6 +909,7 @@ fn send_bind(
             harness: "opencode".to_string(),
             session: session.to_string(),
         },
+        consumer_capabilities: None,
         principal: Some(Principal::Direct),
     };
     send_control(tx, corr, request);
