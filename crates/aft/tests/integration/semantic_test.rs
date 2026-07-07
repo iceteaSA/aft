@@ -478,17 +478,47 @@ fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidati
     assert_eq!(ready["semantic_index"]["refreshing_count"], 0);
 
     let edited_file = project.path().join("src/b.rs");
-    fs::write(
-        &edited_file,
-        "pub fn edited_refresh_marker() -> &'static str {\n    \"after edit\"\n}\n",
-    )
-    .expect("edit file");
+    let edited_contents =
+        "pub fn edited_refresh_marker() -> &'static str {\n    \"after edit\"\n}\n";
+    fs::write(&edited_file, edited_contents).expect("edit file");
 
-    let refreshing =
-        wait_for_semantic_status(&mut aft, "ready with one refreshing file", |response| {
-            response["semantic_index"]["status"] == "ready"
+    // Re-touch with unique content while waiting: the recursive FSEvents
+    // watcher attaches asynchronously after configure, so under full-suite
+    // parallelism (machine-wide fseventsd pressure) the single write above
+    // can land before the watch is live and never be observed — the refresh
+    // then never fires and the wait times out. Unique trailing comments keep
+    // emitting modify events that survive the refresh's content-hash dedup;
+    // the mock server holds the refresh embed open, so refreshing_count == 1
+    // stays observable once it fires. Same fix as the watcher_integration
+    // twin (wait_for_semantic_status_with_retouch).
+    let refreshing = {
+        let mut last_response = None;
+        let mut matched = None;
+        for i in 0..400 {
+            let response = status(&mut aft);
+            assert_eq!(
+                response["success"], true,
+                "status should succeed while waiting for refreshing file: {response:?}"
+            );
+            if response["semantic_index"]["status"] == "ready"
                 && response["semantic_index"]["refreshing_count"] == 1
-        });
+            {
+                matched = Some(response);
+                break;
+            }
+            if i % 3 == 0 {
+                let _ = fs::write(&edited_file, format!("{edited_contents}// retouch {i}\n"));
+            }
+            last_response = Some(response);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        matched.unwrap_or_else(|| {
+            panic!(
+                "semantic status did not reach one refreshing file in time; last: {:?}",
+                last_response
+            )
+        })
+    };
     assert_eq!(refreshing["semantic_index"]["status"], "ready");
     assert_eq!(refreshing["semantic_index"]["refreshing_count"], 1);
 
