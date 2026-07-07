@@ -4,17 +4,19 @@ import { describe, expect, test } from "bun:test";
 
 // The `./tui` export is raw TSX with `/** @jsxImportSource @opentui/solid */`,
 // so importing it forces resolution of `@opentui/solid/jsx-dev-runtime` and
-// `solid-js`. Ownership of those packages is the host's: OpenCode registers
-// its own OpenTUI JSX transform before importing TUI plugins, and a
-// plugin-local runtime copy creates the dual-instance/version-skew break
-// (host 0.3.4 vs local 0.4.2 idle-CPU incident, and again on the next host
-// bump). They are therefore declared as optional PEERS plus exact DEV deps —
-// never runtime `dependencies`. In this repo the dev deps satisfy the
-// resolution below; under a real OpenCode install the host copies do. The
-// rest of the bun suite never imports the TSX entry, so nothing else catches
-// resolution breaks in this class. This test imports the entry exactly the
-// way OpenCode loads `./tui` and asserts it resolves + exposes the plugin
-// shape.
+// `solid-js`. Those MUST be runtime `dependencies`, pinned to the OpenTUI
+// line the host embeds: OpenTUI's Solid transform excludes any path under
+// node_modules, and a PUBLISHED plugin's TUI entry lives inside OpenCode's
+// plugin cache under node_modules — so the host transform is skipped there
+// and bare imports resolve through the package's own node_modules. Removing
+// the deps passes every dev-checkout test (file paths outside node_modules
+// DO get the host transform) and then kills the sidebar silently for every
+// npm-install user (magic-context v0.31.1 shipped that shape and broke;
+// OpenCode Alfonso traced the exclusion to createSolidTransformPlugin()).
+// Dev-path validation cannot catch this class: verify published shape via
+// npm pack + prod-only install + import of the TUI entry. This test imports
+// the entry exactly the way OpenCode loads `./tui` and asserts it resolves +
+// exposes the plugin shape.
 describe("tui entry module resolution", () => {
   test("the ./tui entry imports without a missing-module error", async () => {
     const mod = (await import("../tui/index.tsx")) as {
@@ -36,23 +38,20 @@ describe("tui entry module resolution", () => {
     expect(solid).toContain("solid-js");
   });
 
-  test("opentui and solid are never runtime dependencies", async () => {
-    // The host owns the OpenTUI/solid runtime. Shipping them in
-    // `dependencies` makes npm install a plugin-local copy that shadows the
-    // host's, recreating the dual-instance/version-skew break on every host
-    // bump. Optional peers + dev deps only.
+  test("opentui and solid are exact-pinned runtime dependencies", async () => {
+    // Published TUI entries import these from INSIDE OpenCode's plugin cache
+    // (under node_modules), where the host's Solid transform does not apply —
+    // they must ship as runtime deps or published installs die at import.
+    // Exact pins (no ^/~ range) keep the local copy tracking the host's
+    // embedded OpenTUI line instead of drifting ahead on a range.
     const pkg = (await import("../../package.json")) as {
-      default: {
-        dependencies?: Record<string, string>;
-        peerDependencies?: Record<string, string>;
-        peerDependenciesMeta?: Record<string, { optional?: boolean }>;
-      };
+      default: { dependencies?: Record<string, string> };
     };
     const deps = pkg.default.dependencies ?? {};
-    for (const banned of ["@opentui/core", "@opentui/solid", "solid-js"]) {
-      expect(deps[banned]).toBeUndefined();
-      expect(pkg.default.peerDependencies?.[banned]).toBeDefined();
-      expect(pkg.default.peerDependenciesMeta?.[banned]?.optional).toBe(true);
+    for (const required of ["@opentui/core", "@opentui/solid", "solid-js"]) {
+      const pin = deps[required];
+      expect(pin).toBeDefined();
+      expect(/^\d/.test(pin ?? "")).toBe(true);
     }
   });
 });
