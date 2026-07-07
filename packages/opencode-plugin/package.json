@@ -2,7 +2,7 @@
   "name": "@cortexkit/aft-opencode",
   "version": "0.45.1",
   "type": "module",
-  "description": "OpenCode plugin for Agent File Tools (AFT) — tree-sitter and lsp powered code analysis",
+  "description": "OpenCode plugin for Agent File Tools (AFT) \u2014 tree-sitter and lsp powered code analysis",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "license": "MIT",
@@ -13,13 +13,14 @@
   "files": [
     "dist",
     "src/tui",
+    "src/tui-compiled",
     "src/shared",
     "src/logger.ts",
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk && bun build src/tui/index.tsx --outfile dist/tui.js --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opencode-ai/sdk --external @opentui/solid --external solid-js && tsc --emitDeclarationOnly",
-    "typecheck": "tsc --noEmit",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk && tsc --emitDeclarationOnly && bun run build:tui",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "pretest": "node -e \"if (process.env.CI !== 'true') { const { spawnSync } = require('node:child_process'); const result = spawnSync('cargo', ['build'], { cwd: '../..', stdio: 'inherit', shell: process.platform === 'win32' }); process.exit(result.status ?? 1); } else { console.log('Skipping cargo build in CI; workflow builds agent-file-tools before tests.'); }\"",
     "test": "bun test",
     "test:e2e": "bun test src/__tests__/e2e/",
@@ -27,7 +28,9 @@
     "schema": "bun scripts/build-schema.ts",
     "build:tool-schemas": "bun run scripts/build-tool-schemas.ts",
     "prepublishOnly": "bun run build",
-    "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
+    "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'",
+    "build:tui": "bun scripts/build-tui.ts",
+    "smoke:tui": "bun test ./scripts/smoke-tui-pack-install.ts"
   },
   "dependencies": {
     "@clack/prompts": "^1.6.0",
@@ -60,7 +63,7 @@
     },
     "./tui": {
       "types": "./src/tui/index.tsx",
-      "import": "./src/tui/index.tsx"
+      "import": "./src/tui/entry.mjs"
     }
   },
   "oc-plugin": [

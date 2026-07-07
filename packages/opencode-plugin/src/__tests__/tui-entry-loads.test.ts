@@ -2,23 +2,29 @@
 
 import { describe, expect, test } from "bun:test";
 
-// The `./tui` export is raw TSX with `/** @jsxImportSource @opentui/solid */`,
-// so importing it forces resolution of `@opentui/solid/jsx-dev-runtime` and
-// `solid-js`. Those MUST be runtime `dependencies`, pinned to the OpenTUI
-// line the host embeds: OpenTUI's Solid transform excludes any path under
-// node_modules, and a PUBLISHED plugin's TUI entry lives inside OpenCode's
-// plugin cache under node_modules — so the host transform is skipped there
-// and bare imports resolve through the package's own node_modules. Removing
-// the deps passes every dev-checkout test (file paths outside node_modules
-// DO get the host transform) and then kills the sidebar silently for every
-// npm-install user (magic-context v0.31.1 shipped that shape and broke;
-// OpenCode Alfonso traced the exclusion to createSolidTransformPlugin()).
-// Dev-path validation cannot catch this class: verify published shape via
-// npm pack + prod-only install + import of the TUI entry. This test imports
-// the entry exactly the way OpenCode loads `./tui` and asserts it resolves +
-// exposes the plugin shape.
+// OpenCode loads the plugin's `./tui` export, which now points at entry.mjs.
+// In a development checkout there is no host virtual runtime registry, so the
+// loader must fall back to the raw TSX module. Published installs are different:
+// OpenTUI skips the Solid transform for code loaded from node_modules, so the
+// packed plugin must also ship a precompiled TUI tree. That published-path
+// verification lives in scripts/smoke-tui-pack-install.ts; this test covers the
+// repo-checkout fallback path and the runtime dependencies it still needs.
 describe("tui entry module resolution", () => {
-  test("the ./tui entry imports without a missing-module error", async () => {
+  test("the ./tui entry falls back to the raw TSX module in a repo checkout", async () => {
+    const raw = (await import("../tui/index.tsx")) as {
+      default?: { id?: string; tui?: unknown };
+    };
+    const entry = (await import("../tui/entry.mjs")) as {
+      default?: { id?: string; tui?: unknown };
+    };
+
+    expect(raw.default).toBeDefined();
+    expect(entry.default).toBe(raw.default);
+    expect(entry.default?.id).toBe("aft-opencode");
+    expect(typeof entry.default?.tui).toBe("function");
+  });
+
+  test("the raw TSX entry still imports without a missing-module error", async () => {
     const mod = (await import("../tui/index.tsx")) as {
       default?: { id?: string; tui?: unknown };
     };
@@ -39,11 +45,10 @@ describe("tui entry module resolution", () => {
   });
 
   test("opentui and solid are exact-pinned runtime dependencies", async () => {
-    // Published TUI entries import these from INSIDE OpenCode's plugin cache
-    // (under node_modules), where the host's Solid transform does not apply —
-    // they must ship as runtime deps or published installs die at import.
-    // Exact pins (no ^/~ range) keep the local copy tracking the host's
-    // embedded OpenTUI line instead of drifting ahead on a range.
+    // Published TUI entries import these from inside OpenCode's plugin cache
+    // under node_modules, where the host's Solid transform does not apply.
+    // They must ship as runtime deps, and exact pins keep the local copy on the
+    // host's embedded OpenTUI line instead of drifting ahead on a range.
     const pkg = (await import("../../package.json")) as {
       default: { dependencies?: Record<string, string> };
     };
