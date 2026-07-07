@@ -57,6 +57,7 @@ mod extract_function_test;
 mod extract_tokens_test;
 mod format_test;
 mod fs_lock_audit_test;
+mod gather_test;
 mod github_comment_write;
 mod github_read_cache_attachment;
 mod github_read_persistence;
