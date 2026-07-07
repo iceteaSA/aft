@@ -707,11 +707,25 @@ mod tests {
     }
 
     fn assert_heartbeat_stops(path: &Path) {
-        thread::sleep(Duration::from_millis(120));
-        let stable = read_manifest(path).unwrap().heartbeat_at_ms;
-        thread::sleep(Duration::from_millis(120));
-        let manifest = read_manifest(path).unwrap();
-        assert_eq!(manifest.heartbeat_at_ms, stable);
+        // The heartbeat thread snapshots the lease list before writing, so
+        // unregistration can race AT MOST ONE in-flight write (the loop is
+        // serial). Re-baseline until two consecutive reads agree instead of
+        // assuming instant quiescence; fail only if writes keep advancing
+        // past the deadline (a genuinely un-stopped heartbeat).
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut baseline = read_manifest(path).unwrap().heartbeat_at_ms;
+        loop {
+            thread::sleep(Duration::from_millis(150));
+            let current = read_manifest(path).unwrap().heartbeat_at_ms;
+            if current == baseline {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "heartbeat kept advancing after release: {baseline} -> {current}"
+            );
+            baseline = current;
+        }
     }
 
     #[test]
