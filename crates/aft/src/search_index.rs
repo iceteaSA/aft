@@ -388,6 +388,12 @@ enum SearchMatcher {
     Regex(Regex),
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum IgnoreRulesLoadPolicy {
+    Strict,
+    BorrowTolerant,
+}
+
 impl SearchIndex {
     pub fn new() -> Self {
         SearchIndex {
@@ -754,11 +760,16 @@ impl SearchIndex {
         Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
     }
 
-    pub(crate) fn read_from_disk_strict_read_only(
+    pub(crate) fn read_from_disk_borrow_tolerant(
         cache_dir: &Path,
         current_canonical_root: &Path,
-    ) -> Option<Self> {
-        Self::read_from_disk_with_options(cache_dir, current_canonical_root, false)
+    ) -> Option<(Self, bool)> {
+        Self::read_from_disk_with_policy(
+            cache_dir,
+            current_canonical_root,
+            false,
+            IgnoreRulesLoadPolicy::BorrowTolerant,
+        )
     }
 
     fn read_from_disk_with_options(
@@ -766,6 +777,21 @@ impl SearchIndex {
         current_canonical_root: &Path,
         allow_legacy_repair: bool,
     ) -> Option<Self> {
+        Self::read_from_disk_with_policy(
+            cache_dir,
+            current_canonical_root,
+            allow_legacy_repair,
+            IgnoreRulesLoadPolicy::Strict,
+        )
+        .map(|(index, _)| index)
+    }
+
+    fn read_from_disk_with_policy(
+        cache_dir: &Path,
+        current_canonical_root: &Path,
+        allow_legacy_repair: bool,
+        ignore_rules_load_policy: IgnoreRulesLoadPolicy,
+    ) -> Option<(Self, bool)> {
         debug_assert!(current_canonical_root.is_absolute());
         let cache_path = cache_dir.join("cache.bin");
         let cache_file = open_cache_file_read(&cache_path).ok()?;
@@ -831,7 +857,9 @@ impl SearchIndex {
         reader.read_exact(&mut ignore_fingerprint_bytes).ok()?;
         let stored_ignore_rules_fingerprint = String::from_utf8(ignore_fingerprint_bytes).ok()?;
         let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&project_root);
-        if stored_ignore_rules_fingerprint != current_ignore_rules_fingerprint {
+        let ignore_rules_differ =
+            stored_ignore_rules_fingerprint != current_ignore_rules_fingerprint;
+        if ignore_rules_differ && ignore_rules_load_policy == IgnoreRulesLoadPolicy::Strict {
             return None;
         }
 
@@ -992,7 +1020,7 @@ impl SearchIndex {
             }
         }
 
-        Some(index)
+        Some((index, ignore_rules_differ))
     }
 
     pub fn stored_git_head(&self) -> Option<&str> {

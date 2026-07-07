@@ -16,38 +16,49 @@ use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex};
 #[derive(Debug)]
 pub(crate) enum ReadOnlyArtifact<T> {
     Fresh(T),
-    Stale(ReadOnlyStale),
+    Stale(ReadOnlyStale<T>),
     Absent,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ReadOnlyStale {
+#[derive(Debug)]
+pub(crate) struct ReadOnlyStale<T> {
+    pub index: T,
     pub drift_count: usize,
-    pub reason: String,
+    pub ignore_rules_differ: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum GitRootResolutionError {
+    PathNotFound(PathBuf),
+    NotAGitRoot,
+    Other(String),
 }
 
 pub(crate) fn resolve_git_root_from_user_path(
     project_root: &Path,
     raw_path: &str,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, GitRootResolutionError> {
     let expanded = expand_tilde(raw_path);
     let requested = if expanded.is_absolute() {
         expanded
     } else {
         project_root.join(expanded)
     };
-    let existing = nearest_existing_parent(&requested).ok_or_else(|| {
-        format!(
-            "path has no existing parent from which to resolve a git root: {}",
-            requested.display()
-        )
-    })?;
+    if !requested.exists() {
+        return Err(GitRootResolutionError::PathNotFound(requested));
+    }
+
+    let existing = nearest_existing_parent(&requested)
+        .ok_or_else(|| GitRootResolutionError::PathNotFound(requested.clone()))?;
     let git_base = if existing.is_file() {
         existing.parent().unwrap_or(&existing).to_path_buf()
     } else {
         existing
     };
-    git_toplevel(&git_base)
+    git_toplevel(&git_base).map_err(|error| match error.as_str() {
+        "not_a_git_root" => GitRootResolutionError::NotAGitRoot,
+        _ => GitRootResolutionError::Other(error),
+    })
 }
 
 pub(crate) fn open_search_index_read_only(
@@ -59,16 +70,22 @@ pub(crate) fn open_search_index_read_only(
         return ReadOnlyArtifact::Absent;
     }
 
-    let Some(mut index) = SearchIndex::read_from_disk_strict_read_only(&cache_dir, project_root)
+    let Some((mut index, ignore_rules_differ)) =
+        SearchIndex::read_from_disk_borrow_tolerant(&cache_dir, project_root)
     else {
         return ReadOnlyArtifact::Absent;
     };
-    match search_drift_count(&index, project_root) {
-        0 => {
-            index.set_ready(true);
-            ReadOnlyArtifact::Fresh(index)
-        }
-        drift_count => ReadOnlyArtifact::Stale(stale(drift_count)),
+
+    let drift_count = search_drift_count(&index, project_root);
+    index.set_ready(true);
+    if drift_count == 0 && !ignore_rules_differ {
+        ReadOnlyArtifact::Fresh(index)
+    } else {
+        ReadOnlyArtifact::Stale(ReadOnlyStale {
+            index,
+            drift_count,
+            ignore_rules_differ,
+        })
     }
 }
 
@@ -89,21 +106,20 @@ pub(crate) fn open_semantic_index_read_only(
     }
 
     let Some(index) =
-        SemanticIndex::read_from_disk(storage_dir, &project_key, project_root, true, None)
+        SemanticIndex::read_from_disk_borrow_tolerant(storage_dir, &project_key, project_root)
     else {
         return ReadOnlyArtifact::Absent;
     };
 
-    match semantic_drift_count(&index, project_root) {
-        0 => ReadOnlyArtifact::Fresh(index),
-        drift_count => ReadOnlyArtifact::Stale(stale(drift_count)),
-    }
-}
-
-fn stale(drift_count: usize) -> ReadOnlyStale {
-    ReadOnlyStale {
-        drift_count,
-        reason: format!("files changed since index build ({drift_count} drifted file(s))"),
+    let drift_count = semantic_drift_count(&index, project_root);
+    if drift_count == 0 {
+        ReadOnlyArtifact::Fresh(index)
+    } else {
+        ReadOnlyArtifact::Stale(ReadOnlyStale {
+            index,
+            drift_count,
+            ignore_rules_differ: false,
+        })
     }
 }
 
@@ -334,6 +350,21 @@ mod tests {
         cache_dir
     }
 
+    fn clone_checkout(root: &Path) -> (TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("create clone dir");
+        let clone_root = temp.path().join("clone");
+        let status = Command::new("git")
+            .arg("clone")
+            .arg("--quiet")
+            .arg(root)
+            .arg(&clone_root)
+            .status()
+            .expect("git clone");
+        assert!(status.success(), "git clone failed");
+        let clone_root = fs::canonicalize(clone_root).expect("canonical clone root");
+        (temp, clone_root)
+    }
+
     fn build_semantic_artifact(root: &Path, storage: &Path) {
         let source = root.join("src/lib.rs");
         let fingerprint = SemanticIndexFingerprint {
@@ -375,10 +406,44 @@ mod tests {
         match open_search_index_read_only(&root, Some(storage.path())) {
             ReadOnlyArtifact::Stale(stale) => {
                 assert!(stale.drift_count >= 1);
-                assert!(stale.reason.contains("files changed since index build"));
+                assert!(!stale.ignore_rules_differ);
+                assert!(stale.index.stored_git_head().is_some());
             }
             other => panic!("expected stale artifact, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn search_opener_marks_cross_checkout_ignore_rule_mismatch_as_stale() {
+        let (_project, root) = fixture_project();
+        let storage = tempfile::tempdir().expect("storage");
+        let owner_only_ignore = root.join(".foo/.gitignore");
+        fs::create_dir_all(owner_only_ignore.parent().expect("ignore parent"))
+            .expect("create ignore dir");
+        fs::write(&owner_only_ignore, "# owner-only ignore file\n").expect("write ignore file");
+        build_search_artifact(&root, storage.path());
+
+        let (_clone, sibling_root) = clone_checkout(&root);
+        match open_search_index_read_only(&sibling_root, Some(storage.path())) {
+            ReadOnlyArtifact::Stale(stale) => {
+                assert!(stale.ignore_rules_differ);
+                assert!(stale.index.stored_git_head().is_some());
+            }
+            other => panic!("expected stale borrowed artifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owner_search_loader_stays_strict_on_ignore_rule_mismatch() {
+        let (_project, root) = fixture_project();
+        let storage = tempfile::tempdir().expect("storage");
+        let cache_dir = build_search_artifact(&root, storage.path());
+        let owner_only_ignore = root.join(".foo/.gitignore");
+        fs::create_dir_all(owner_only_ignore.parent().expect("ignore parent"))
+            .expect("create ignore dir");
+        fs::write(&owner_only_ignore, "# owner-only ignore file\n").expect("write ignore file");
+
+        assert!(SearchIndex::read_from_disk(&cache_dir, &root).is_none());
     }
 
     #[test]

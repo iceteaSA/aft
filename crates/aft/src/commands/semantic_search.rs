@@ -19,7 +19,7 @@ use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::readonly_artifacts::{
     open_search_index_read_only, open_semantic_index_read_only, resolve_git_root_from_user_path,
-    ReadOnlyArtifact,
+    GitRootResolutionError, ReadOnlyArtifact,
 };
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, GrepMatch, GrepResult, IndexStatus, SearchIndex,
@@ -136,6 +136,28 @@ struct DegradedGrepFallbackResult {
     candidate_files: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ExternalBorrowMetadata {
+    drift_count: usize,
+    ignore_rules_differ: bool,
+    built_at_git_head: Option<String>,
+}
+
+impl ExternalBorrowMetadata {
+    fn from_search_index(index: &SearchIndex) -> Self {
+        Self {
+            drift_count: 0,
+            ignore_rules_differ: false,
+            built_at_git_head: index.stored_git_head().map(str::to_owned),
+        }
+    }
+
+    fn record_drift(&mut self, drift_count: usize, ignore_rules_differ: bool) {
+        self.drift_count = self.drift_count.max(drift_count);
+        self.ignore_rules_differ |= ignore_rules_differ;
+    }
+}
+
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {
         Ok(params) => params,
@@ -176,14 +198,23 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(requested_path) = requested_path {
         let external_root = match resolve_git_root_from_user_path(&project_root, &requested_path) {
             Ok(root) => root,
-            Err(error) if error == "not_a_git_root" => {
+            Err(GitRootResolutionError::PathNotFound(path)) => {
+                return Response::error(
+                    &req.id,
+                    "path_not_found",
+                    format!("path does not exist: {}", path.display()),
+                );
+            }
+            Err(GitRootResolutionError::NotAGitRoot) => {
                 return Response::error(
                     &req.id,
                     "not_a_git_root",
                     format!("path is not inside a git repository: {requested_path}"),
                 );
             }
-            Err(error) => return Response::error(&req.id, "path_resolution_failed", error),
+            Err(GitRootResolutionError::Other(error)) => {
+                return Response::error(&req.id, "path_resolution_failed", error);
+            }
         };
 
         if external_root != project_root {
@@ -256,37 +287,31 @@ fn handle_external_search(
     external_root: PathBuf,
 ) -> Response {
     let storage_dir = ctx.config().storage_dir.clone();
-    let search_index = match open_search_index_read_only(&external_root, storage_dir.as_deref()) {
-        ReadOnlyArtifact::Fresh(index) => index,
+    let (search_index, borrow_metadata) = match open_search_index_read_only(
+        &external_root,
+        storage_dir.as_deref(),
+    ) {
+        ReadOnlyArtifact::Fresh(index) => {
+            let borrow_metadata = ExternalBorrowMetadata::from_search_index(&index);
+            (index, borrow_metadata)
+        }
         ReadOnlyArtifact::Absent => {
             return external_index_error(
-                &req.id,
-                "not_indexed",
-                format!(
-                    "No AFT search index found for {}. Start an AFT session in that project to build the index before searching it from another root.",
-                    external_root.display()
-                ),
-                &external_root,
-                serde_json::Map::new(),
-            );
+                    &req.id,
+                    "not_indexed",
+                    format!(
+                        "No AFT search index found for {}. Start an AFT session in that project to build the index before searching it from another root.",
+                        external_root.display()
+                    ),
+                    &external_root,
+                    serde_json::Map::new(),
+                    &ExternalBorrowMetadata::default(),
+                );
         }
         ReadOnlyArtifact::Stale(stale) => {
-            let mut extras = serde_json::Map::new();
-            extras.insert(
-                "drift_count".to_string(),
-                serde_json::json!(stale.drift_count),
-            );
-            return external_index_error(
-                &req.id,
-                "index_stale",
-                format!(
-                    "AFT search index for {} is stale: {}.",
-                    external_root.display(),
-                    stale.reason
-                ),
-                &external_root,
-                extras,
-            );
+            let mut borrow_metadata = ExternalBorrowMetadata::from_search_index(&stale.index);
+            borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
+            (stale.index, borrow_metadata)
         }
     };
 
@@ -306,6 +331,7 @@ fn handle_external_search(
             &external_root,
             params.include_tests,
             &search_index,
+            &borrow_metadata,
         ),
         SearchMode::Semantic | SearchMode::Hybrid => handle_external_semantic_or_hybrid_search(
             req,
@@ -317,6 +343,7 @@ fn handle_external_search(
             warnings,
             external_root,
             search_index,
+            borrow_metadata,
         ),
     }
 }
@@ -332,6 +359,7 @@ fn handle_external_grep_search(
     external_root: &Path,
     include_tests: bool,
     search_index: &SearchIndex,
+    borrow_metadata: &ExternalBorrowMetadata,
 ) -> Response {
     let auto_regex = mode == SearchMode::Regex && !regex_explicit;
     let mut effective_mode = mode;
@@ -348,7 +376,7 @@ fn handle_external_grep_search(
                 &req.id,
                 "invalid_pattern",
                 message,
-                external_response_extras(external_root),
+                external_response_extras(external_root, borrow_metadata),
             )),
             CompileResult::UnsupportedSyntax { feature, .. } => Err(Response::error_with_data(
                 &req.id,
@@ -356,7 +384,7 @@ fn handle_external_grep_search(
                 format!(
                     "Pattern uses regex syntax not supported by AFT's engine: {feature}. Use hint:'literal' or rewrite without {feature}."
                 ),
-                external_response_extras(external_root),
+                external_response_extras(external_root, borrow_metadata),
             )),
         }
     };
@@ -384,7 +412,7 @@ fn handle_external_grep_search(
                     &req.id,
                     "invalid_pattern",
                     message,
-                    external_response_extras(external_root),
+                    external_response_extras(external_root, borrow_metadata),
                 );
             }
         }
@@ -405,7 +433,7 @@ fn handle_external_grep_search(
                     format!(
                         "Pattern uses regex syntax not supported by AFT's engine: {feature}. Use hint:'literal' or rewrite without {feature}."
                     ),
-                    external_response_extras(external_root),
+                    external_response_extras(external_root, borrow_metadata),
                 );
             }
         }
@@ -427,8 +455,12 @@ fn handle_external_grep_search(
         .collect::<Vec<_>>();
     let interpreted_as = interpreted_as_label(effective_mode);
     let display_root = absolute_display_root(external_root);
-    let text = format_grep_search_text(&result, &display_root, interpreted_as);
-    let extras = external_response_extras(external_root)
+    let text = prepend_external_borrow_note(
+        format_grep_search_text(&result, &display_root, interpreted_as),
+        external_root,
+        borrow_metadata,
+    );
+    let extras = external_response_extras(external_root, borrow_metadata)
         .as_object()
         .cloned()
         .unwrap_or_default();
@@ -462,6 +494,7 @@ fn handle_external_semantic_or_hybrid_search(
     mut warnings: Vec<String>,
     external_root: PathBuf,
     search_index: SearchIndex,
+    mut borrow_metadata: ExternalBorrowMetadata,
 ) -> Response {
     let lexical = if mode == SearchMode::Hybrid {
         collect_lexical_files_from_snapshot(
@@ -492,11 +525,15 @@ fn handle_external_semantic_or_hybrid_search(
             }
         },
         ReadOnlyArtifact::Stale(stale) => {
-            warnings.push(format!(
-                "External semantic index is stale: {}; returning lexical-only results.",
-                stale.reason
-            ));
-            None
+            borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
+            if semantic_fingerprint_matches_session(ctx, &stale.index) {
+                Some(stale.index)
+            } else {
+                warnings.push(
+                    "External semantic index was built for a different embedding backend or model; returning lexical-only results from the trigram index.".to_string(),
+                );
+                None
+            }
         }
         ReadOnlyArtifact::Absent => {
             warnings.push(
@@ -524,6 +561,7 @@ fn handle_external_semantic_or_hybrid_search(
             warnings,
             &external_root,
             top_k,
+            &borrow_metadata,
         );
     };
 
@@ -551,6 +589,7 @@ fn handle_external_semantic_or_hybrid_search(
                     warnings,
                     &external_root,
                     top_k,
+                    &borrow_metadata,
                 );
             }
         };
@@ -585,6 +624,18 @@ fn handle_external_semantic_or_hybrid_search(
         enrich_snippets_from_source_with_context(&mut results, &external_root, None);
     let display_root = absolute_display_root(&external_root);
 
+    let text = prepend_external_borrow_note(
+        format_semantic_text_with_display_root(
+            &results,
+            &display_root,
+            more_available,
+            snippets_incomplete,
+            None,
+        ),
+        &external_root,
+        &borrow_metadata,
+    );
+
     search_response(
         req,
         SearchResponseParts {
@@ -594,19 +645,13 @@ fn handle_external_semantic_or_hybrid_search(
             semantic_status: "ready",
             status: "ready",
             complete: true,
-            text: format_semantic_text_with_display_root(
-                &results,
-                &display_root,
-                more_available,
-                snippets_incomplete,
-                None,
-            ),
+            text,
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
             more_available,
             engine_capped: lexical.engine_capped,
             fully_degraded: false,
             warnings,
-            extras: external_response_extras(&external_root)
+            extras: external_response_extras(&external_root, &borrow_metadata)
                 .as_object()
                 .cloned()
                 .unwrap_or_default(),
@@ -624,6 +669,7 @@ fn external_lexical_only_response(
     mut warnings: Vec<String>,
     external_root: &Path,
     top_k: usize,
+    borrow_metadata: &ExternalBorrowMetadata,
 ) -> Response {
     let lexical_count = lexical.files.len();
     let lexical_engine_capped = lexical.engine_capped;
@@ -641,8 +687,13 @@ fn external_lexical_only_response(
             .to_string(),
     );
     let display_root = absolute_display_root(external_root);
+    let text = prepend_external_borrow_note(
+        format_lexical_unavailable_text(&detail, &results, &display_root),
+        external_root,
+        borrow_metadata,
+    );
     let mut extras = semantic_unavailable_extras(true);
-    for (key, value) in external_response_extras(external_root)
+    for (key, value) in external_response_extras(external_root, borrow_metadata)
         .as_object()
         .cloned()
         .unwrap_or_default()
@@ -659,7 +710,7 @@ fn external_lexical_only_response(
             semantic_status: "unavailable",
             status: "ready",
             complete: false,
-            text: format_lexical_unavailable_text(&detail, &results, &display_root),
+            text,
             results: result_values,
             more_available: lexical_count > top_k || lexical_engine_capped,
             engine_capped: lexical_engine_capped,
@@ -685,8 +736,9 @@ fn external_index_error(
     message: String,
     external_root: &Path,
     mut extras: serde_json::Map<String, serde_json::Value>,
+    borrow_metadata: &ExternalBorrowMetadata,
 ) -> Response {
-    for (key, value) in external_response_extras(external_root)
+    for (key, value) in external_response_extras(external_root, borrow_metadata)
         .as_object()
         .cloned()
         .unwrap_or_default()
@@ -696,11 +748,63 @@ fn external_index_error(
     Response::error_with_data(request_id, code, message, serde_json::Value::Object(extras))
 }
 
-fn external_response_extras(external_root: &Path) -> serde_json::Value {
+fn external_response_extras(
+    external_root: &Path,
+    borrow_metadata: &ExternalBorrowMetadata,
+) -> serde_json::Value {
     serde_json::json!({
         "external_root": external_root.display().to_string(),
+        "borrowed": true,
+        "drift_count": borrow_metadata.drift_count,
+        "ignore_rules_differ": borrow_metadata.ignore_rules_differ,
         SUPPRESS_STATUS_BAR_FIELD: true,
     })
+}
+
+fn prepend_external_borrow_note(
+    text: String,
+    external_root: &Path,
+    borrow_metadata: &ExternalBorrowMetadata,
+) -> String {
+    match external_borrow_note(external_root, borrow_metadata) {
+        Some(note) => format!("{note}\n\n{text}"),
+        None => text,
+    }
+}
+
+fn external_borrow_note(
+    external_root: &Path,
+    borrow_metadata: &ExternalBorrowMetadata,
+) -> Option<String> {
+    if borrow_metadata.drift_count == 0 && !borrow_metadata.ignore_rules_differ {
+        return None;
+    }
+
+    let mut details = Vec::new();
+    if borrow_metadata.drift_count > 0 {
+        details.push(format!(
+            "{} file(s) drifted since build",
+            borrow_metadata.drift_count
+        ));
+    }
+    if borrow_metadata.ignore_rules_differ {
+        details.push("ignore rules differ between checkouts".to_string());
+    }
+
+    let head_clause = borrow_metadata
+        .built_at_git_head
+        .as_deref()
+        .map(|head| format!(" (built at HEAD {})", short_git_head(head)))
+        .unwrap_or_default();
+    Some(format!(
+        "note: borrowed index for {}{head_clause}: {}; line numbers may be off — grep the target root for exact positions.",
+        external_root.display(),
+        details.join("; ")
+    ))
+}
+
+fn short_git_head(head: &str) -> &str {
+    head.get(..12).unwrap_or(head)
 }
 
 fn absolute_display_root(root: &Path) -> PathBuf {

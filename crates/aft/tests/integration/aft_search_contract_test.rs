@@ -144,28 +144,91 @@ fn git_project_with_needle() -> (tempfile::TempDir, std::path::PathBuf, &'static
     (project, source_file, source)
 }
 
+fn git_head(root: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .expect("git rev-parse HEAD");
+    assert!(output.status.success(), "git rev-parse HEAD failed");
+    String::from_utf8(output.stdout)
+        .expect("utf8 git head")
+        .trim()
+        .to_string()
+}
+
+fn clone_checkout(root: &Path) -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp = tempfile::tempdir().expect("create clone dir");
+    let clone_root = temp.path().join("clone");
+    let status = std::process::Command::new("git")
+        .arg("clone")
+        .arg("--quiet")
+        .arg(root)
+        .arg(&clone_root)
+        .status()
+        .expect("git clone");
+    assert!(status.success(), "git clone failed");
+    let clone_root = std::fs::canonicalize(clone_root).expect("canonical clone root");
+    (temp, clone_root)
+}
+
 fn persist_search_index(root: &Path, storage_dir: &Path) {
     let canonical_root = std::fs::canonicalize(root).expect("canonical root");
     let cache_dir = resolve_cache_dir(&canonical_root, Some(storage_dir));
     let mut index = SearchIndex::build(&canonical_root);
-    index.write_to_disk(&cache_dir, None);
+    let head = git_head(&canonical_root);
+    index.write_to_disk(&cache_dir, Some(&head));
 }
 
-fn persist_mismatched_semantic_index(root: &Path, source_file: &Path, storage_dir: &Path) {
+fn persist_semantic_index_with_fingerprint(
+    root: &Path,
+    source_file: &Path,
+    storage_dir: &Path,
+    fingerprint: SemanticIndexFingerprint,
+) {
     let canonical_root = std::fs::canonicalize(root).expect("canonical root");
     let mut embed =
         |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
     let canonical_source = std::fs::canonicalize(source_file).expect("canonical source file");
     let mut index = SemanticIndex::build(&canonical_root, &[canonical_source], &mut embed, 8)
         .expect("build semantic index");
-    index.set_fingerprint(SemanticIndexFingerprint {
-        backend: "openai_compatible".to_string(),
-        model: "other-model".to_string(),
-        base_url: "http://127.0.0.1".to_string(),
-        dimension: 3,
-        chunking_version: 1,
-    });
+    index.set_fingerprint(fingerprint);
     index.write_to_disk(storage_dir, &artifact_cache_key(&canonical_root));
+}
+
+fn persist_matching_semantic_index(
+    root: &Path,
+    source_file: &Path,
+    storage_dir: &Path,
+    base_url: &str,
+) {
+    persist_semantic_index_with_fingerprint(
+        root,
+        source_file,
+        storage_dir,
+        SemanticIndexFingerprint {
+            backend: "openai_compatible".to_string(),
+            model: "test-embedding".to_string(),
+            base_url: base_url.to_string(),
+            dimension: 3,
+            chunking_version: 2,
+        },
+    );
+}
+
+fn persist_mismatched_semantic_index(root: &Path, source_file: &Path, storage_dir: &Path) {
+    persist_semantic_index_with_fingerprint(
+        root,
+        source_file,
+        storage_dir,
+        SemanticIndexFingerprint {
+            backend: "openai_compatible".to_string(),
+            model: "other-model".to_string(),
+            base_url: "http://127.0.0.1".to_string(),
+            dimension: 3,
+            chunking_version: 2,
+        },
+    );
 }
 
 fn openai_context(project_root: &Path, base_url: String) -> AppContext {
@@ -173,6 +236,30 @@ fn openai_context(project_root: &Path, base_url: String) -> AppContext {
         Box::new(TreeSitterProvider::new()),
         Config {
             project_root: Some(project_root.to_path_buf()),
+            semantic: SemanticBackendConfig {
+                backend: SemanticBackend::OpenAiCompatible,
+                model: "test-embedding".to_string(),
+                base_url: Some(base_url),
+                api_key_env: None,
+                timeout_ms: 5_000,
+                max_batch_size: 64,
+                max_files: 20_000,
+            },
+            ..Config::default()
+        },
+    )
+}
+
+fn openai_context_with_storage(
+    project_root: &Path,
+    storage_dir: &Path,
+    base_url: String,
+) -> AppContext {
+    AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(project_root.to_path_buf()),
+            storage_dir: Some(storage_dir.to_path_buf()),
             semantic: SemanticBackendConfig {
                 backend: SemanticBackend::OpenAiCompatible,
                 model: "test-embedding".to_string(),
@@ -528,6 +615,49 @@ fn blank_queries_are_rejected_before_routing() {
 }
 
 #[test]
+fn external_missing_path_returns_path_not_found() {
+    let session_project = tempfile::tempdir().expect("session project");
+    let missing = session_project.path().join("does-not-exist");
+    let ctx = test_context(session_project.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), &missing),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], false);
+    assert_eq!(response["code"], "path_not_found");
+    assert!(
+        response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(&missing.display().to_string())),
+        "expected missing-path message to name the requested path: {response:?}"
+    );
+}
+
+#[test]
+fn external_absent_cache_returns_not_indexed() {
+    let (external_project, _external_source, _source) = git_project_with_needle();
+    let session_project = tempfile::tempdir().expect("session project");
+    let storage = tempfile::tempdir().expect("storage");
+    let ctx = test_context_with_storage(session_project.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), external_project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], false);
+    assert_eq!(response["code"], "not_indexed");
+    assert!(
+        response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("No AFT search index found")),
+        "expected unchanged not_indexed message: {response:?}"
+    );
+}
+
+#[test]
 fn same_root_path_param_is_byte_identical_to_default_search() {
     let (project, _source_file, _source) = git_project_with_needle();
     let ctx = test_context(project.path());
@@ -549,6 +679,99 @@ fn same_root_path_param_is_byte_identical_to_default_search() {
         serde_json::to_vec(&without_path).expect("serialize without path"),
         "same-root path must preserve the single-root response contract byte-for-byte"
     );
+}
+
+#[test]
+fn external_ignore_rule_mismatch_serves_borrowed_results_with_warning() {
+    let (owner_project, _owner_source, _source) = git_project_with_needle();
+    let storage = tempfile::tempdir().expect("storage");
+    let owner_only_ignore = owner_project.path().join(".foo/.gitignore");
+    std::fs::create_dir_all(owner_only_ignore.parent().expect("ignore parent"))
+        .expect("create ignore dir");
+    std::fs::write(&owner_only_ignore, "# owner-only ignore file\n").expect("write ignore file");
+    persist_search_index(owner_project.path(), storage.path());
+
+    let (_clone, sibling_root) = clone_checkout(owner_project.path());
+    let session_project = tempfile::tempdir().expect("session project");
+    let ctx = test_context_with_storage(session_project.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), &sibling_root),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "external search should succeed: {response:?}"
+    );
+    assert_eq!(response["borrowed"], true);
+    assert_eq!(response["ignore_rules_differ"], true);
+    assert!(
+        response["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("ignore rules differ between checkouts")),
+        "expected borrow warning note in rendered text: {response:?}"
+    );
+    let results = response["results"].as_array().expect("results array");
+    assert!(
+        results
+            .iter()
+            .any(|result| result["file"].as_str().is_some_and(|file| {
+                Path::new(file).is_absolute() && file.replace('\\', "/").ends_with("src/lib.rs")
+            })),
+        "expected borrowed literal result from sibling checkout: {response:?}"
+    );
+}
+
+#[test]
+fn external_semantic_search_serves_drifted_borrowed_indexes_with_note() {
+    let (external_project, external_source, _source) = git_project_with_needle();
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external_project.path(), storage.path());
+    let (base_url, handle) = start_mock_embedding_server();
+    persist_matching_semantic_index(
+        external_project.path(),
+        &external_source,
+        storage.path(),
+        &base_url,
+    );
+    std::fs::write(
+        &external_source,
+        "// drifted after index build\npub fn needle_symbol() -> bool { true }\npub fn exported() {}\n",
+    )
+    .expect("mutate external source");
+    let expected_head = git_head(external_project.path());
+
+    let session_project = tempfile::tempdir().expect("session project");
+    let ctx = openai_context_with_storage(session_project.path(), storage.path(), base_url);
+    let response = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("semantic"), external_project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "external semantic search should succeed: {response:?}"
+    );
+    assert_eq!(response["borrowed"], true);
+    assert_eq!(response["semantic_status"], "ready");
+    assert!(response["drift_count"]
+        .as_u64()
+        .is_some_and(|count| count >= 1));
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("note: borrowed index for"),
+        "expected borrow note: {response:?}"
+    );
+    assert!(
+        text.contains("line numbers may be off"),
+        "expected drift warning: {response:?}"
+    );
+    assert!(
+        text.contains(&expected_head[..12]),
+        "expected borrowed note to mention the stored search-index HEAD: {response:?}"
+    );
+    handle.join().expect("embedding server thread");
 }
 
 #[test]

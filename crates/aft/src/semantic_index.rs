@@ -2445,6 +2445,14 @@ impl SemanticIndex {
         }
     }
 
+    pub(crate) fn read_from_disk_borrow_tolerant(
+        storage_dir: &Path,
+        project_key: &str,
+        current_canonical_root: &Path,
+    ) -> Option<Self> {
+        Self::read_from_disk(storage_dir, project_key, current_canonical_root, true, None)
+    }
+
     /// Serialize the index to bytes for disk persistence
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
