@@ -390,41 +390,6 @@ fn allocate_reverse_corr(
     }
 }
 
-fn route_bind_elicitation_capable(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return false;
-    };
-    [
-        "/metadata/consumer/capabilities/elicitation",
-        "/metadata/capabilities/elicitation",
-        "/metadata/elicitation",
-        "/consumer/capabilities/elicitation",
-        "/consumer_capabilities/elicitation",
-        "/capabilities/elicitation",
-    ]
-    .iter()
-    .any(|pointer| {
-        value
-            .pointer(pointer)
-            .is_some_and(elicitation_capability_enabled)
-    })
-}
-
-fn elicitation_capability_enabled(value: &Value) -> bool {
-    match value {
-        Value::Bool(enabled) => *enabled,
-        // MCP initialize capabilities commonly use an empty object to mean the
-        // capability exists. Treat any object here as presence unless it carries
-        // an explicit boolean `enabled: false` marker.
-        Value::Object(map) => map.get("enabled").and_then(Value::as_bool).unwrap_or(true),
-        Value::Array(items) => items
-            .iter()
-            .any(|item| item.as_str() == Some("elicitation")),
-        Value::String(value) => value == "elicitation" || value == "true",
-        _ => false,
-    }
-}
-
 fn bash_permission_kind_label(kind: &crate::bash_permissions::PermissionKind) -> &'static str {
     match kind {
         crate::bash_permissions::PermissionKind::ExternalDirectory => "external directory",
@@ -1948,6 +1913,7 @@ async fn handle_control_request(
             target: _,
             identity,
             principal,
+            consumer_capabilities,
         } => {
             let route_id = route_key(route_channel);
             if pending_binds.contains_key(&route_id) {
@@ -1982,7 +1948,13 @@ async fn handle_control_request(
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
             let bind_trust = trust_for_bind(&bind_harness, &principal);
-            let consumer_elicitation_capable = route_bind_elicitation_capable(&frame.body);
+            // Typed capability DECLARATION (protocol 0.8): the facade stamps it
+            // from the MCP host's initialize-advertised capabilities. Absent
+            // means no reverse-request capability — flat deny, fail-closed. A
+            // consumer over-declaring only earns asks that TTL-deny.
+            let consumer_elicitation_capable = consumer_capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.iter().any(|c| c == "elicitation"));
             log::info!(
                 "subc attach: route {} harness={} principal={} trust={} elicitation={}",
                 route_channel,

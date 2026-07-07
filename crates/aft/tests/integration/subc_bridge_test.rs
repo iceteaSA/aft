@@ -2060,6 +2060,7 @@ async fn drive_s1_rejection_daemon(
             session: "s1-session".to_string(),
         },
         principal: Some(Principal::Direct),
+        consumer_capabilities: None,
     };
     send_frame(
         &mut stream,
@@ -4024,24 +4025,19 @@ async fn send_route_bind_with_elicitation_capability(
     )
     .expect("write project config");
 
-    let body = json!({
-        "op": "route.bind",
-        "route_channel": route_channel,
-        "target": RouteTarget::ToolProvider { module_id: "aft".to_string() },
-        "identity": BindIdentity {
+    let body = ModuleControlRequest::RouteBind {
+        route_channel,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: BindIdentity {
             project_root: root.to_path_buf(),
             harness: "runner".to_string(),
             session: format!("elicitation-session-{route_channel}"),
         },
-        "principal": subc_mcp_principal(),
-        "metadata": {
-            "consumer": {
-                "capabilities": {
-                    "elicitation": {}
-                }
-            }
-        }
-    });
+        principal: Some(subc_mcp_principal()),
+        consumer_capabilities: Some(vec!["elicitation".to_string()]),
+    };
     send_frame(
         stream,
         Frame::build(
@@ -4762,6 +4758,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
             session: "fed-malformed-session".to_string(),
         },
         principal: Some(Principal::Direct),
+        consumer_capabilities: None,
     };
     send_frame(
         &mut stream,
@@ -5721,6 +5718,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc(
     principal: Option<Principal>,
     doc: Value,
 ) {
+    let consumer_capabilities: Option<Vec<String>> = None;
     // Config is read by AFT from <root>/.cortexkit/aft.jsonc, NOT from the wire
     // (the wire `config` is ignored since the unification). Write the bind's doc
     // (real config fields + any subc_test_* directives the fake dispatch reads)
@@ -5747,6 +5745,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc(
             session: session.to_string(),
         },
         principal,
+        consumer_capabilities,
     };
     send_frame(
         stream,
