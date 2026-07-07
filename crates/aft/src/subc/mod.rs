@@ -1784,6 +1784,24 @@ where
                     return;
                 }
                 Err(error) => {
+                    // A killed daemon surfaces as ConnectionReset (RST) on
+                    // Windows where Unix delivers a clean EOF (FIN); a
+                    // mid-teardown daemon can also abort the socket. Both mean
+                    // "daemon went away", not a wire fault — normalize them to
+                    // the clean-close path so module exit behavior matches
+                    // across platforms (same class subc-core fixed in d33d9a71).
+                    if let subc_transport::FrameIoError::Io(io_error) = &error {
+                        if matches!(
+                            io_error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) {
+                            log::info!(
+                                "subc attach: connection reset by daemon; treating as close"
+                            );
+                            return;
+                        }
+                    }
                     let _ = tx.send(Err(SubcError::FrameIo(error))).await;
                     return;
                 }
