@@ -353,10 +353,17 @@ mod tests {
     fn clone_checkout(root: &Path) -> (TempDir, PathBuf) {
         let temp = tempfile::tempdir().expect("create clone dir");
         let clone_root = temp.path().join("clone");
+        // fixture_project returns a canonicalized root, which on Windows is a
+        // verbatim `\\?\` path. git cannot take verbatim paths as the clone
+        // source, so strip the prefix for the git invocation only.
+        let clone_source = root
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_string();
         let status = Command::new("git")
             .arg("clone")
             .arg("--quiet")
-            .arg(root)
+            .arg(&clone_source)
             .arg(&clone_root)
             .status()
             .expect("git clone");

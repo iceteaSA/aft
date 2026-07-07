@@ -159,19 +159,34 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     if let Some(dir) = std::env::var_os("AFT_CACHE_DIR") {
         return PathBuf::from(dir).join("aft");
     }
-    // Fallback to the user's home directory. On Unix this is `$HOME`; on
-    // Windows `HOME` is typically unset, so fall back to `USERPROFILE`
-    // (which is always set in interactive sessions and in the env that
-    // OpenCode/Pi pass through to plugin processes). If both are missing
-    // (rare — embedded contexts, broken shells), fall back to a temp
-    // directory rather than `"."` — a relative path makes bg-bash wrapper
-    // commands like `move /Y .\.cache\aft\... ...` fail with "system
-    // cannot find the path specified" once the working directory shifts.
+    // Default to the CortexKit shared data root — the SAME location the
+    // plugins inject as `storage_dir` on every configure. Before this, the
+    // fallback was the pre-migration `~/.cache/aft`, which only plugin-less
+    // invocations ever hit; once the daemon-supervised module became such an
+    // invocation it built a parallel storage universe there (duplicate
+    // trigram/semantic/callgraph caches AND a separate artifact-owner
+    // manifest, so cross-front leases could not see each other). Keep this
+    // in sync with resolveCortexKitStorageRoot in the TS packages.
+    cortexkit_data_root().join("cortexkit").join("aft")
+}
+
+fn cortexkit_data_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    home.join(".cache").join("aft")
+    if cfg!(windows) {
+        return std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Local"));
+    }
+    home.join(".local").join("share")
 }
 
 pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::harness::Harness) {
@@ -232,4 +247,61 @@ fn dir_has_entries(path: &std::path::Path) -> bool {
     std::fs::read_dir(path)
         .map(|mut entries| entries.next().is_some())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod storage_root_tests {
+    use std::path::PathBuf;
+
+    // The plugins inject the CortexKit data root as `storage_dir` on every
+    // configure; plugin-less invocations (daemon-supervised module, bare CLI,
+    // warmup) hit the Rust fallback below instead. If the two ever diverge
+    // again, every front pays duplicate cold indexes AND artifact-owner
+    // manifests split across universes so cross-front ReadOnly leasing goes
+    // blind (the v0.45.x daemon-module regression: the fallback still pointed
+    // at pre-migration ~/.cache/aft). This locks all Rust fallback sites to
+    // the same resolution the TS packages use (resolveCortexKitStorageRoot:
+    // XDG_DATA_HOME || platform data dir, + cortexkit/aft).
+    #[test]
+    fn plugin_less_fallback_matches_plugin_injected_cortexkit_root() {
+        let _guard = crate::test_env::process_env_lock();
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(PathBuf::from)
+                    .expect("test environment provides a home directory");
+                if cfg!(windows) {
+                    std::env::var_os("LOCALAPPDATA")
+                        .or_else(|| std::env::var_os("APPDATA"))
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| home.join("AppData").join("Local"))
+                } else {
+                    home.join(".local").join("share")
+                }
+            });
+        let expected_plugin_injected_root = data_home.join("cortexkit").join("aft");
+
+        let cache_dir_override_absent = std::env::var_os("AFT_CACHE_DIR").is_none();
+        assert!(
+            cache_dir_override_absent,
+            "test requires AFT_CACHE_DIR unset to exercise the real fallback"
+        );
+
+        assert_eq!(
+            super::storage_dir(None),
+            expected_plugin_injected_root,
+            "bash_background::storage_dir fallback diverged from the plugin-injected root"
+        );
+
+        let temp_project = tempfile::tempdir().expect("temp project");
+        let resolved = crate::search_index::resolve_cache_dir(temp_project.path(), None);
+        assert!(
+            resolved.starts_with(&expected_plugin_injected_root),
+            "search_index::resolve_cache_dir fallback diverged: {}",
+            resolved.display()
+        );
+    }
 }

@@ -248,11 +248,9 @@ fn warmup_storage_dir() -> PathBuf {
     if let Some(value) = std::env::var_os("AFT_STORAGE_DIR") {
         return PathBuf::from(value);
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    home.join(".cache").join("aft")
+    // Same CortexKit shared data root the plugins inject — warming here must
+    // land in the storage universe real sessions will read from.
+    aft::bash_background::storage_dir(None)
 }
 
 /// Build the `configure` params for a warmup run.

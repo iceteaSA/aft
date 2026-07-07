@@ -910,19 +910,15 @@ mod tests {
 
     #[test]
     fn restore_glob_checkpoint_reports_failures() {
-        // Isolate the checkpoint store's lock-file dir per test by giving each
-        // run its own `AFT_CACHE_DIR`. The default storage_dir lives under
-        // `$HOME/.cache/aft` (or `$AFT_CACHE_DIR`), and under parallel
-        // `cargo test` with a shared HOME (CI containers, sandboxed runners),
-        // two tests can race on the same `checkpoints/<project>/checkpoint.lock`
-        // path and fail with `No such file or directory` during the
-        // `create_dir_all` + `try_acquire` sequence.
+        // Isolate the checkpoint store's lock-file dir with a per-test
+        // configured storage_dir. This used to mutate the process-global
+        // AFT_CACHE_DIR env var instead, which raced parallel lib tests:
+        // resolve_manifest_dir prefers AFT_CACHE_DIR over configured storage,
+        // so a configure running in another test during this test's window
+        // looked for its artifact-owner manifest in OUR tempdir, found
+        // nothing, and claimed Owner where ReadOnly was expected (the
+        // Windows-CI sibling_clone flake).
         let cache = tempfile::tempdir().unwrap();
-        // SAFETY: tests run single-threaded inside this function and the env
-        // var is restored on drop; we only mutate process env briefly here.
-        unsafe {
-            std::env::set_var("AFT_CACHE_DIR", cache.path());
-        }
 
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -931,6 +927,9 @@ mod tests {
         fs::write(&a, "const a = TARGET;\n").unwrap();
 
         let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        ctx.checkpoint()
+            .lock()
+            .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
         let backup = ctx.backup().lock();
         let checkpoint_name = ctx
             .checkpoint()
@@ -947,11 +946,6 @@ mod tests {
 
         let result = restore_glob_checkpoint(&ctx, "default", &checkpoint_name, &[a, b]);
         ctx.checkpoint().lock().delete("default", &checkpoint_name);
-
-        // SAFETY: only one test in this module mutates this env var.
-        unsafe {
-            std::env::remove_var("AFT_CACHE_DIR");
-        }
 
         assert!(result.unwrap_err().contains("file not found"));
     }

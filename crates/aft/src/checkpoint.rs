@@ -116,6 +116,14 @@ impl CheckpointStore {
         Self::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT)
     }
 
+    /// Point this store's mutation lock at a private path. Tests use this for
+    /// isolation instead of mutating the process-global `AFT_CACHE_DIR` env
+    /// var, which races parallel lib tests that resolve storage paths.
+    #[cfg(test)]
+    pub(crate) fn set_lock_path_for_test(&mut self, lock_path: PathBuf) {
+        self.lock_path = lock_path;
+    }
+
     fn with_lock_path(lock_path: PathBuf, lock_timeout: Duration) -> Self {
         CheckpointStore {
             checkpoints: HashMap::new(),

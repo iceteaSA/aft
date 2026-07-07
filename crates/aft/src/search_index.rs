@@ -2854,16 +2854,11 @@ pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Pat
     if let Some(dir) = storage_dir {
         return dir.join("index").join(artifact_cache_key(project_root));
     }
-    // Fallback to ~/.cache/aft/ (legacy, for standalone binary usage).
-    // On Windows `HOME` is typically unset, so try `USERPROFILE` next.
-    // If neither is set, fall back to a temp directory rather than `"."`
-    // because the search-index code reads/writes absolute paths.
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    home.join(".cache")
-        .join("aft")
+    // No configured dir: use the same CortexKit shared data root the plugins
+    // inject, so plugin-less invocations (daemon module, bare CLI) share one
+    // storage universe with plugin sessions instead of splitting caches and
+    // artifact-owner manifests across two roots.
+    crate::bash_background::storage_dir(None)
         .join("index")
         .join(artifact_cache_key(project_root))
 }
