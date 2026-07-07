@@ -99,6 +99,7 @@ mod status_compression_test;
 mod status_disk_scope_test;
 mod subc_bridge_test;
 mod subc_format_test;
+mod subc_storm_test;
 mod subc_translate_test;
 mod symbol_cache_persist_test;
 mod tool_call_parity_test;
