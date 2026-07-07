@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -150,6 +150,25 @@ pub struct StatusEmitter {
 struct ConfigureWarmState {
     generation: u64,
     key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigureMaintenanceJob {
+    pub(crate) generation: u64,
+    pub(crate) root_path: PathBuf,
+    pub(crate) canonical_cache_root: PathBuf,
+    pub(crate) harness: Harness,
+    pub(crate) storage_root: PathBuf,
+    pub(crate) harness_dir: PathBuf,
+    pub(crate) session_id: String,
+    pub(crate) home_match: bool,
+    pub(crate) format_tool_cache_clear_needed: bool,
+    pub(crate) run_bash_replay: bool,
+    pub(crate) refresh_project_runtime: bool,
+    pub(crate) sync_bash_compress_flag: bool,
+    pub(crate) reset_filter_registry: bool,
+    pub(crate) clear_failed_spawns: bool,
+    pub(crate) warm_callgraph_store: bool,
 }
 
 impl StatusEmitter {
@@ -720,6 +739,10 @@ pub struct AppContext {
     lsp_manager: parking_lot::Mutex<LspManager>,
     configure_generation: Arc<AtomicU64>,
     configure_warm_state: parking_lot::Mutex<ConfigureWarmState>,
+    configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
+    configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
+    artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
+    artifact_cache_key_derivations: AtomicU64,
     /// Last-seen value of `InspectManager::reuse_completion_count()`, so the
     /// per-request inspect drain can detect watcher-driven Tier-2 scans that
     /// finished since the previous tick and refresh the status bar (#3).
@@ -742,6 +765,7 @@ pub struct AppContext {
     /// `compress::compress_with_registry`). Reloaded when configure changes
     /// the project root or storage_dir; see [`AppContext::reset_filter_registry`].
     filter_registry: crate::compress::SharedFilterRegistry,
+    filter_registry_rebuild_count: AtomicU64,
     /// Set to true once the filter_registry has been populated. Avoids
     /// double-loading on hot paths without holding a write lock.
     filter_registry_loaded: std::sync::atomic::AtomicBool,
@@ -917,6 +941,10 @@ impl AppContext {
             lsp_manager: parking_lot::Mutex::new(lsp_manager),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
+            configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
+            configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
+            artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
+            artifact_cache_key_derivations: AtomicU64::new(0),
             last_seen_reuse_completions: AtomicU64::new(0),
             configure_warnings_tx,
             configure_warnings_rx,
@@ -927,6 +955,7 @@ impl AppContext {
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
             )),
+            filter_registry_rebuild_count: AtomicU64::new(0),
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: Arc::new(std::sync::RwLock::new(None)),
@@ -1109,6 +1138,11 @@ impl AppContext {
     /// when the project root changes, so the next bar count re-reads from disk.
     pub fn clear_tsconfig_membership_cache(&self) {
         self.tsconfig_membership.lock().clear();
+    }
+
+    #[cfg(test)]
+    pub fn tsconfig_membership_clear_generation_for_test(&self) -> u64 {
+        self.tsconfig_membership.lock().clear_generation()
     }
 
     /// Mark the status-bar Tier-2 counts stale (rendered with `~`) without
@@ -1399,6 +1433,8 @@ impl AppContext {
     /// `compress::compress` calls pick up new filters.
     pub fn reset_filter_registry(&self) {
         let new_registry = crate::compress::build_registry_for_context(self);
+        self.filter_registry_rebuild_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self.filter_registry.write() {
             Ok(mut slot) => *slot = new_registry,
             Err(poisoned) => *poisoned.into_inner() = new_registry,
@@ -1415,10 +1451,17 @@ impl AppContext {
         // Build outside the lock to avoid blocking other readers during a
         // multi-file TOML parse.
         let new_registry = crate::compress::build_registry_for_context(self);
+        self.filter_registry_rebuild_count
+            .fetch_add(1, Ordering::SeqCst);
         if let Ok(mut slot) = self.filter_registry.write() {
             *slot = new_registry;
             self.filter_registry_loaded.store(true, Ordering::Release);
         }
+    }
+
+    #[cfg(test)]
+    pub fn filter_registry_rebuild_count_for_test(&self) -> u64 {
+        self.filter_registry_rebuild_count.load(Ordering::SeqCst)
     }
 
     pub fn app(&self) -> Arc<App> {
@@ -1495,6 +1538,37 @@ impl AppContext {
         state.generation = generation;
         state.key = Some(key);
         (generation, equivalent)
+    }
+
+    pub fn note_configure_session_binding(&self, root: PathBuf, session_id: String) -> bool {
+        self.configured_session_roots
+            .lock()
+            .insert((root, session_id))
+    }
+
+    pub(crate) fn enqueue_configure_maintenance(&self, job: ConfigureMaintenanceJob) {
+        self.configure_maintenance_jobs.lock().push_back(job);
+    }
+
+    pub(crate) fn drain_configure_maintenance(&self) -> Vec<ConfigureMaintenanceJob> {
+        self.configure_maintenance_jobs.lock().drain(..).collect()
+    }
+
+    pub fn memoized_artifact_cache_key(&self, canonical_root: &Path) -> String {
+        let mut keys = self.artifact_cache_keys.lock();
+        if let Some(key) = keys.get(canonical_root).cloned() {
+            return key;
+        }
+        let key = crate::search_index::artifact_cache_key(canonical_root);
+        self.artifact_cache_key_derivations
+            .fetch_add(1, Ordering::SeqCst);
+        keys.insert(canonical_root.to_path_buf(), key.clone());
+        key
+    }
+
+    #[cfg(test)]
+    pub fn artifact_cache_key_derivation_count_for_test(&self) -> u64 {
+        self.artifact_cache_key_derivations.load(Ordering::SeqCst)
     }
 
     pub fn configure_generation(&self) -> u64 {

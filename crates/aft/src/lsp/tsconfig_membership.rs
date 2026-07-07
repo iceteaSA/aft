@@ -25,6 +25,7 @@ const TS_JS_EXTENSIONS: &[&str] = &[
 #[derive(Default)]
 pub(crate) struct TsconfigMembershipCache {
     projects: HashMap<PathBuf, Option<ResolvedTsConfig>>,
+    clear_generation: u64,
 }
 
 impl TsconfigMembershipCache {
@@ -40,6 +41,12 @@ impl TsconfigMembershipCache {
     /// files keyed under a different directory).
     pub(crate) fn clear(&mut self) {
         self.projects.clear();
+        self.clear_generation = self.clear_generation.wrapping_add(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_generation(&self) -> u64 {
+        self.clear_generation
     }
 
     pub(crate) fn should_skip_diagnostics(&mut self, file: &Path) -> bool {

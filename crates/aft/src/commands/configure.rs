@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::SemanticBackendConfig;
 use crate::context::{
-    AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
-    SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+    AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticIndexEvent,
+    SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -23,8 +23,8 @@ use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    artifact_cache_key, build_path_filters, current_git_head, resolve_cache_dir,
-    walk_project_files_bounded_matching, CacheLock, SearchIndex,
+    build_path_filters, current_git_head, resolve_cache_dir, walk_project_files_bounded_matching,
+    CacheLock, SearchIndex,
 };
 use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
 use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
@@ -38,9 +38,45 @@ static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// index. The disk-backed (pread) trigram index is RAM-bounded at any repo
 /// size (~745 MiB measured on Chromium's 176k files), so there is no longer a
 /// file-count ceiling on search.
-const SOURCE_FILE_COUNT_WALK_BOUND: usize = 20_000;
+const SOURCE_FILE_COUNT_WALK_BOUND: usize = 5_000;
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
+
+#[cfg(test)]
+static CONFIGURE_REPLAY_SESSION_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn sleep_from_env_ms(name: &str) {
+    let Some(delay) = std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|delay| *delay > 0)
+    else {
+        return;
+    };
+    thread::sleep(Duration::from_millis(delay));
+}
+
+#[cfg(not(test))]
+fn sleep_from_env_ms(_name: &str) {}
+
+fn delay_configure_deferred_walk_for_test() {
+    sleep_from_env_ms("AFT_TEST_CONFIGURE_DEFERRED_WALK_DELAY_MS");
+}
+
+fn delay_configure_deferred_maintenance_for_test() {
+    sleep_from_env_ms("AFT_TEST_CONFIGURE_DEFERRED_MAINTENANCE_DELAY_MS");
+}
+
+#[cfg(test)]
+fn reset_configure_replay_session_calls_for_test() {
+    CONFIGURE_REPLAY_SESSION_CALLS.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn configure_replay_session_calls_for_test() -> u64 {
+    CONFIGURE_REPLAY_SESSION_CALLS.load(Ordering::SeqCst)
+}
 
 fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
@@ -1393,6 +1429,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let previous_config = ctx.config();
     let previous_project_root = previous_config.project_root.clone();
+    let previous_canonical_cache_root = ctx.canonical_cache_root_opt();
+    let project_root_changed =
+        previous_canonical_cache_root.as_deref() != Some(canonical_cache_root.as_path());
     let mut next_config = previous_config.as_ref().clone();
     next_config.project_root = Some(root_path.clone());
     next_config.harness = Some(harness.clone());
@@ -1519,13 +1558,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Bounded source-file count for the sidebar/status `source_file_count` hint.
-    // `take(bound + 1)` keeps it O(bound), not O(project), on monorepo-scale
-    // repos. Purely informational — search is no longer disabled by file count.
-    let source_file_count = if home_match {
-        // When the project root is the user's home directory, indexing is
-        // force-disabled later in this function, so the count hint is never
-        // used — skip the (potentially whole-home-tree) walk and return the
-        // bound so the value still reads as "large".
+    // Daemon/plugin clients can receive the accurate count in the deferred
+    // configure_warnings frame, so the bind ack keeps only the field shape and a
+    // bounded sentinel. Standalone/no-push callers still get the old bounded
+    // count in the response because there is no async frame to merge later.
+    let source_file_count_pending = !home_match && ctx.progress_sender_handle().is_some();
+    let source_file_count = if home_match || source_file_count_pending {
+        // Skip the whole-tree walk for home roots, return the bound plus one so
+        // the count still looks large, and reuse that sentinel while daemon
+        // clients wait for the deferred accurate count.
         SOURCE_FILE_COUNT_WALK_BOUND.saturating_add(1)
     } else {
         crate::callgraph::walk_project_files(&root_path)
@@ -1552,11 +1593,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    if previous_project_root.as_ref() != Some(&root_path) {
-        crate::format::clear_tool_cache();
-    }
+    let format_tool_cache_clear_needed = previous_project_root.as_ref() != Some(&root_path);
 
-    let project_key = artifact_cache_key(&canonical_cache_root);
+    let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     let artifact_owner_claim = if home_match {
         None
@@ -1637,6 +1676,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         workspace_manifest_fingerprint(&canonical_cache_root),
     );
     let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
+    let first_session_bind =
+        ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
     let semantic_cold_seed_generation = if !equivalent_warm_config {
         ctx.reset_tier2_refresh_scheduler();
         let semantic_cold_seed_generation = ctx.reset_semantic_cold_seed_gate_for_configure();
@@ -1649,83 +1690,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     // Project root (and thus tsconfig resolution) may have changed; drop the
     // status-bar membership cache so the next bar count re-resolves from disk.
-    ctx.clear_tsconfig_membership_cache();
+    // Equivalent rebinds keep this hot cache because no tsconfig input changed.
+    if !equivalent_warm_config || project_root_changed {
+        ctx.clear_tsconfig_membership_cache();
+    }
     ctx.backup()
         .lock()
         .set_db_project_key(crate::path_identity::project_scope_key(
             &canonical_cache_root,
         ));
-    if let Some(storage_dir) = next_config.storage_dir.clone() {
-        // Ensure the storage root directory exists so subsystems (trust,
-        // backups, checkpoints, DB, persistence) can create their sub-trees
-        // without a separate create_dir_all per subsystem. On fresh installs
-        // this directory hasn't been created yet, and every subsystem
-        // currently creates its own subdirectory lazily — but the root must
-        // exist for status/diagnostics to report a valid path.
-        if let Err(err) = fs::create_dir_all(&storage_dir) {
-            slog_warn!(
-                "failed to create storage directory {}: {}",
-                storage_dir.display(),
-                err
-            );
-        }
-        ctx.backup().lock().set_storage_dir_for_harness(
-            storage_dir,
-            harness.clone(),
-            next_config.checkpoint_ttl_hours,
-        );
-    }
-
-    // Rebuild gitignore matcher used by the watcher event filter to honor the
-    // user's `.gitignore` files instead of a hardcoded directory list. Skipped
-    // entirely when `home_match` is true — the walk would traverse `$HOME`.
-    if !home_match {
-        ctx.rebuild_gitignore();
-    } else {
-        ctx.clear_gitignore();
-    }
-
-    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
-    match crate::url_fetch::cleanup_url_cache(&storage_root) {
-        Ok(0) => {}
-        Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
-        Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
-    }
-    let db_path = storage_root.join("aft.db");
-    match crate::db::open(&db_path) {
-        Ok(conn) => {
-            let shared = Arc::new(Mutex::new(conn));
-            ctx.set_db(shared.clone());
-            ctx.backup().lock().set_db_pool(shared.clone());
-            ctx.bash_background().set_db_pool(shared);
-        }
-        Err(err) => {
-            ctx.clear_db();
-            ctx.backup().lock().clear_db_pool();
-            ctx.bash_background().clear_db_pool();
-            slog_warn!(
-                "failed to open aft.db at {}: {} — running with JSON-only persistence",
-                db_path.display(),
-                err
-            );
-        }
-    }
-    match crate::migrate_storage::cleanup_staging_dirs(&storage_root, harness.clone()) {
-        Ok(0) => {}
-        Ok(n) => slog_info!(
-            "swept {} staging directory orphans from prior migrations",
-            n
-        ),
-        Err(err) => slog_warn!(
-            "staging cleanup failed: {} (will retry next configure)",
-            err
-        ),
-    }
-    ctx.bash_background().configure_long_running_reminders(
-        next_config.bash_long_running_reminder_enabled,
-        next_config.bash_long_running_reminder_interval_ms,
-    );
-
     let search_index = ctx.config().search_index;
     let semantic_search = ctx.config().semantic_search;
     let search_index_max_file_size = ctx.config().search_index_max_file_size;
@@ -2485,72 +2458,34 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         // Clear the workspace package caches here because reconfigure can point AFT at a
         // different root; reset them before warming the callgraph store for the new project.
         crate::callgraph::clear_workspace_package_cache();
-
-        if next_config.callgraph_store && !home_match {
-            if ctx.semantic_cold_seed_active() {
-                ctx.defer_callgraph_store_warm_for_semantic_cold_seed();
-                slog_info!(
-                "callgraph store warm deferred until semantic cold seed gate clears or completes"
-            );
-            } else {
-                match ctx.callgraph_store_for_ops() {
-                    CallgraphStoreAccess::Ready(_) => {
-                        slog_debug!("callgraph store ready at configure");
-                    }
-                    CallgraphStoreAccess::Building => {
-                        slog_info!("callgraph store warm build scheduled at configure");
-                    }
-                    CallgraphStoreAccess::Unavailable => {
-                        slog_info!(
-                            "callgraph store unavailable at configure; dead_code will retry later"
-                        );
-                    }
-                    CallgraphStoreAccess::Error(error) => {
-                        slog_warn!("callgraph store configure warm failed: {}", error);
-                    }
-                }
-            }
-        }
     }
 
-    let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-    crate::bash_background::repair_legacy_root_tasks(&bg_storage_root, harness.clone());
-
-    let bg_storage_dir = ctx.harness_dir();
-    if let Err(error) =
-        ctx.bash_background()
-            .replay_session_for_project(&bg_storage_dir, req.session(), &root_path)
-    {
-        slog_warn!("failed to replay background bash tasks: {error}");
-    }
-
-    // Spawn file watcher for live invalidation off the configure foreground.
-    // FSEvents startup can synchronously wait for seconds on very large roots;
-    // configure should return while the watcher attaches in the background.
-    if !home_match {
-        install_project_watcher(ctx, &canonical_cache_root);
-    } else {
-        ctx.stop_watcher_runtime();
-    }
+    let refresh_project_runtime = !equivalent_warm_config || project_root_changed;
+    let sync_bash_compress_flag = !equivalent_warm_config
+        || previous_config.experimental_bash_compress != next_config.experimental_bash_compress;
+    let clear_failed_spawns = !equivalent_warm_config
+        || previous_config.lsp_paths_extra != next_config.lsp_paths_extra
+        || previous_config.lsp_auto_install_binaries != next_config.lsp_auto_install_binaries
+        || previous_config.lsp_inflight_installs != next_config.lsp_inflight_installs;
+    ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
+        generation: configure_generation,
+        root_path: root_path.clone(),
+        canonical_cache_root: canonical_cache_root.clone(),
+        harness: harness.clone(),
+        storage_root: crate::bash_background::storage_dir(next_config.storage_dir.as_deref()),
+        harness_dir: ctx.harness_dir(),
+        session_id: req.session().to_string(),
+        home_match,
+        format_tool_cache_clear_needed,
+        run_bash_replay: !equivalent_warm_config || first_session_bind,
+        refresh_project_runtime,
+        sync_bash_compress_flag,
+        reset_filter_registry: !equivalent_warm_config,
+        clear_failed_spawns,
+        warm_callgraph_store: next_config.callgraph_store && !home_match && !equivalent_warm_config,
+    });
 
     slog_info!("project root set: {}", root_path.display());
-
-    // Sync compression/filter state before snapshotting the async warning worker.
-    ctx.sync_bash_compress_flag();
-    ctx.reset_filter_registry();
-
-    // Forget cached LSP spawn FAILURES on every configure. A configure means
-    // something changed (the user may have just installed the missing server,
-    // fixed PATH, or changed a version pin), so a previously-failed server
-    // should be retried on the next file event instead of staying skipped until
-    // a full restart. Bounded — configure is not a per-request hot path.
-    let cleared = ctx.lsp().clear_failed_spawns();
-    if cleared > 0 {
-        slog_debug!(
-            "configure: cleared {} cached LSP spawn failure(s) for retry",
-            cleared
-        );
-    }
 
     let config_snapshot = ctx.config().clone();
 
@@ -2559,7 +2494,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // On a normal project this finishes in <1 s and pushes a
     // `ConfigureWarningsFrame` for the plugin to surface; on a huge directory
     // it may take seconds-to-minutes, but configure itself returns now.
-    let warnings_pending = !home_match && ctx.progress_sender_handle().is_some();
+    let warnings_pending = source_file_count_pending;
     if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
         let warning_generation = configure_generation;
@@ -2570,6 +2505,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let session_id_for_frame = session_id_for_bg.clone();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg, || {
+                delay_configure_deferred_walk_for_test();
                 let source_files: Vec<PathBuf> =
                     crate::callgraph::walk_project_files(&walk_root).collect();
                 let detected_languages: HashSet<LangId> = source_files
@@ -2605,6 +2541,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "project_root": root_path.display().to_string(),
             "source_file_count": source_file_count,
             "source_file_count_bounded": true,
+            "source_file_count_pending": source_file_count_pending,
             "warnings": [],
             "warnings_pending": warnings_pending,
             "search_index_cache_reused": search_index_cache_reused,
@@ -2617,13 +2554,187 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 .collect::<Vec<_>>(),
         }),
     );
-    ctx.status_emitter().signal(ctx.build_status_snapshot());
     response
+}
+
+pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
+    for job in ctx.drain_configure_maintenance() {
+        if ctx.configure_generation() != job.generation {
+            slog_info!(
+                "dropping stale configure maintenance for generation {} (current {})",
+                job.generation,
+                ctx.configure_generation()
+            );
+            continue;
+        }
+
+        delay_configure_deferred_maintenance_for_test();
+
+        if job.format_tool_cache_clear_needed {
+            crate::format::clear_tool_cache();
+        }
+
+        ctx.backup()
+            .lock()
+            .set_db_project_key(crate::path_identity::project_scope_key(
+                &job.canonical_cache_root,
+            ));
+
+        if let Some(storage_dir) = ctx.config().storage_dir.clone() {
+            // Ensure the storage root exists for persistence subsystems. This is
+            // maintenance work: the configure ack only needs the accepted config
+            // snapshot, while disk-backed stores can converge immediately after.
+            if let Err(err) = fs::create_dir_all(&storage_dir) {
+                slog_warn!(
+                    "failed to create storage directory {}: {}",
+                    storage_dir.display(),
+                    err
+                );
+            }
+            ctx.backup().lock().set_storage_dir_for_harness(
+                storage_dir,
+                job.harness.clone(),
+                ctx.config().checkpoint_ttl_hours,
+            );
+        }
+
+        if job.refresh_project_runtime {
+            // Rebuild gitignore matcher used by the watcher event filter to honor
+            // the user's `.gitignore` files instead of a hardcoded directory list.
+            // Skipped entirely for home roots because that walk would traverse
+            // `$HOME`.
+            if !job.home_match {
+                ctx.rebuild_gitignore();
+            } else {
+                ctx.clear_gitignore();
+            }
+        }
+
+        match crate::url_fetch::cleanup_url_cache(&job.storage_root) {
+            Ok(0) => {}
+            Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
+            Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+        }
+
+        let db_path = job.storage_root.join("aft.db");
+        match crate::db::open(&db_path) {
+            Ok(conn) => {
+                let shared = Arc::new(Mutex::new(conn));
+                ctx.set_db(shared.clone());
+                ctx.backup().lock().set_db_pool(shared.clone());
+                ctx.bash_background().set_db_pool(shared);
+            }
+            Err(err) => {
+                ctx.clear_db();
+                ctx.backup().lock().clear_db_pool();
+                ctx.bash_background().clear_db_pool();
+                slog_warn!(
+                    "failed to open aft.db at {}: {} — running with JSON-only persistence",
+                    db_path.display(),
+                    err
+                );
+            }
+        }
+
+        match crate::migrate_storage::cleanup_staging_dirs(&job.storage_root, job.harness.clone()) {
+            Ok(0) => {}
+            Ok(n) => slog_info!(
+                "swept {} staging directory orphans from prior migrations",
+                n
+            ),
+            Err(err) => slog_warn!(
+                "staging cleanup failed: {} (will retry next configure)",
+                err
+            ),
+        }
+
+        let config = ctx.config();
+        ctx.bash_background().configure_long_running_reminders(
+            config.bash_long_running_reminder_enabled,
+            config.bash_long_running_reminder_interval_ms,
+        );
+        drop(config);
+
+        if job.run_bash_replay {
+            crate::bash_background::repair_legacy_root_tasks(
+                &job.storage_root,
+                job.harness.clone(),
+            );
+            #[cfg(test)]
+            CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
+            if let Err(error) = ctx.bash_background().replay_session_for_project(
+                &job.harness_dir,
+                &job.session_id,
+                &job.root_path,
+            ) {
+                slog_warn!("failed to replay background bash tasks: {error}");
+            }
+        }
+
+        if job.refresh_project_runtime {
+            // FSEvents startup can synchronously wait for seconds on very large
+            // roots; configure returns before this maintenance step attaches.
+            if !job.home_match {
+                install_project_watcher(ctx, &job.canonical_cache_root);
+            } else {
+                ctx.stop_watcher_runtime();
+            }
+        }
+
+        if job.sync_bash_compress_flag {
+            ctx.sync_bash_compress_flag();
+        }
+        if job.reset_filter_registry {
+            ctx.reset_filter_registry();
+        }
+
+        if job.clear_failed_spawns {
+            // Forget cached LSP spawn FAILURES when configure inputs changed. A
+            // pure equivalent rebind keeps this cache hot; a real config/root
+            // change lets the next file event retry previously missing servers.
+            let cleared = ctx.lsp().clear_failed_spawns();
+            if cleared > 0 {
+                slog_debug!(
+                    "configure: cleared {} cached LSP spawn failure(s) for retry",
+                    cleared
+                );
+            }
+        }
+
+        if job.warm_callgraph_store {
+            if ctx.semantic_cold_seed_active() {
+                ctx.defer_callgraph_store_warm_for_semantic_cold_seed();
+                slog_info!(
+                    "callgraph store warm deferred until semantic cold seed gate clears or completes"
+                );
+            } else {
+                match ctx.callgraph_store_for_ops() {
+                    CallgraphStoreAccess::Ready(_) => {
+                        slog_debug!("callgraph store ready at configure maintenance");
+                    }
+                    CallgraphStoreAccess::Building => {
+                        slog_info!("callgraph store warm build scheduled by configure maintenance");
+                    }
+                    CallgraphStoreAccess::Unavailable => {
+                        slog_info!(
+                            "callgraph store unavailable at configure maintenance; dead_code will retry later"
+                        );
+                    }
+                    CallgraphStoreAccess::Error(error) => {
+                        slog_warn!("callgraph store configure warm failed: {}", error);
+                    }
+                }
+            }
+        }
+
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::ffi::OsString;
     #[cfg(unix)]
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -2637,11 +2748,54 @@ mod tests {
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
-    use crate::protocol::RawRequest;
+    use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest};
     use std::process::Command;
 
     fn test_context() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn wait_for_configure_warnings(
+        ctx: &AppContext,
+        generation: u64,
+        timeout: Duration,
+    ) -> ConfigureWarningsFrame {
+        let deadline = Instant::now() + timeout;
+        loop {
+            for (frame_generation, frame) in ctx.drain_configure_warnings() {
+                if frame_generation == generation {
+                    return frame;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for configure warnings frame"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -2670,6 +2824,16 @@ mod tests {
             command: "configure".to_string(),
             lsp_hints: None,
             session_id: None,
+            params,
+        }
+    }
+
+    fn configure_request_with_session(params: serde_json::Value, session_id: &str) -> RawRequest {
+        RawRequest {
+            id: "cfg".to_string(),
+            command: "configure".to_string(),
+            lsp_hints: None,
+            session_id: Some(session_id.to_string()),
             params,
         }
     }
@@ -3048,8 +3212,61 @@ mod tests {
     }
 
     #[test]
+    fn configure_defers_large_tree_file_walk_until_after_ack() {
+        let _env_guard = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _delay_walk = EnvVarGuard::set("AFT_TEST_CONFIGURE_DEFERRED_WALK_DELAY_MS", "400");
+        let temp = tempfile::tempdir().unwrap();
+        init_git_fixture(temp.path());
+        for dir in 0..10 {
+            let dir_path = temp.path().join(format!("bulk-{dir}"));
+            std::fs::create_dir_all(&dir_path).unwrap();
+            for file in 0..40 {
+                std::fs::write(dir_path.join(format!("file-{file}.rs")), "fn main() {}\n").unwrap();
+            }
+        }
+
+        let ctx = test_context();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(|_frame: PushFrame| {}))));
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+
+        let start = Instant::now();
+        let response = super::handle_configure(&req, &ctx);
+        let elapsed = start.elapsed();
+
+        assert!(response.success);
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "configure ack should not wait for delayed deferred walk: {elapsed:?}"
+        );
+        assert_eq!(
+            response.data["source_file_count"],
+            json!(super::SOURCE_FILE_COUNT_WALK_BOUND + 1)
+        );
+        assert_eq!(response.data["source_file_count_pending"], json!(true));
+        assert!(ctx.drain_configure_warnings().is_empty());
+
+        let frame =
+            wait_for_configure_warnings(&ctx, ctx.configure_generation(), Duration::from_secs(2));
+        assert!(
+            frame.source_file_count >= 400,
+            "deferred walk should publish the accurate count, got {}",
+            frame.source_file_count
+        );
+    }
+
+    #[test]
     fn equivalent_reconfigure_keeps_warm_work_adopted_and_idempotent() {
         let _env_guard = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let temp = tempfile::tempdir().unwrap();
         init_git_fixture(temp.path());
         let ctx = test_context();
@@ -3065,16 +3282,38 @@ mod tests {
 
         let first = super::handle_configure(&req, &ctx);
         assert!(first.success);
+        super::drain_deferred_configure_maintenance(&ctx);
 
         let generation_after_first = ctx.configure_generation();
+        let tsconfig_clear_generation_after_first =
+            ctx.tsconfig_membership_clear_generation_for_test();
+        let filter_rebuilds_after_first = ctx.filter_registry_rebuild_count_for_test();
+        let artifact_derivations_after_first = ctx.artifact_cache_key_derivation_count_for_test();
+        assert_eq!(artifact_derivations_after_first, 1);
         for _ in 0..5 {
             let response = super::handle_configure(&req, &ctx);
             assert!(response.success);
+            super::drain_deferred_configure_maintenance(&ctx);
         }
 
         assert!(ctx.search_index_rx().read().unwrap().is_none());
         assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert_eq!(
+            ctx.tsconfig_membership_clear_generation_for_test(),
+            tsconfig_clear_generation_after_first,
+            "equivalent rebind must keep the tsconfig-membership cache hot"
+        );
+        assert_eq!(
+            ctx.filter_registry_rebuild_count_for_test(),
+            filter_rebuilds_after_first,
+            "equivalent rebind must not rebuild the TOML filter registry"
+        );
+        assert_eq!(
+            ctx.artifact_cache_key_derivation_count_for_test(),
+            artifact_derivations_after_first,
+            "equivalent rebind must reuse the artifact cache key"
+        );
         // Load-bearing: in-flight build workers publish only while the
         // generation flag equals their spawn generation. If equivalent
         // rebinds advanced it, every rebind during a long build would
@@ -3094,7 +3333,60 @@ mod tests {
         }));
         let response = super::handle_configure(&changed, &ctx);
         assert!(response.success);
+        super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(ctx.configure_generation(), generation_after_first + 1);
+        assert_eq!(
+            ctx.tsconfig_membership_clear_generation_for_test(),
+            tsconfig_clear_generation_after_first + 1
+        );
+        assert_eq!(
+            ctx.filter_registry_rebuild_count_for_test(),
+            filter_rebuilds_after_first + 1
+        );
+    }
+
+    #[test]
+    fn equivalent_reconfigure_replays_new_sessions_but_not_same_session_rebinds() {
+        let _env_guard = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        super::reset_configure_replay_session_calls_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        init_git_fixture(temp.path());
+        let ctx = test_context();
+        let params = json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        });
+
+        let session_a = configure_request_with_session(params.clone(), "session-a");
+        let response = super::handle_configure(&session_a, &ctx);
+        assert!(response.success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(super::configure_replay_session_calls_for_test(), 1);
+
+        let response = super::handle_configure(&session_a, &ctx);
+        assert!(response.success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(
+            super::configure_replay_session_calls_for_test(),
+            1,
+            "equivalent rebind for an already-bound session should skip replay"
+        );
+
+        let session_b = configure_request_with_session(params, "session-b");
+        let response = super::handle_configure(&session_b, &ctx);
+        assert!(response.success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(
+            super::configure_replay_session_calls_for_test(),
+            2,
+            "a new session on an equivalent warm root still needs session replay"
+        );
     }
 
     #[test]
