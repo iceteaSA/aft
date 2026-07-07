@@ -279,11 +279,17 @@ jobs:
         # bash shell: the gate helper is a bash script; GitHub Windows runners
         # ship git-bash. Thread cap of 4 because Windows runners are 2-core and
         # process-spawn is expensive there — a wide nextest fan-out thrashes.
+        # The release-storm phase is skipped here: the 2-core runner cannot
+        # afford the cold release-profile build inside the job timeout, and
+        # its absolute latency bounds are not meaningful on that hardware.
+        # Linux and macOS CI run the release-storm phase and stay the
+        # arbiters for it.
         run: ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_TEST_DIAG: "1"
           NEXTEST_TEST_THREADS: "4"
+          AFT_GATE_SKIP_RELEASE_STORM: "1"
 
   # ---------------------------------------------------------------------------
   # Bash permission flow on Windows

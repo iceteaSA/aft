@@ -44,5 +44,12 @@ run_phase "cargo test -p agent-file-tools --test watcher_integration --quiet -- 
 # debug-ignored because an unoptimized build under load cannot honor those
 # bounds even when the code is correct; the release profile is the
 # authoritative calibration (measured ~14s for the whole storm suite).
-run_phase "cargo nextest run --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
-  cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+# Skippable because the 2-core Windows CI runner can neither afford the
+# cold release-profile build inside the job timeout nor honor absolute
+# latency bounds — Linux and macOS CI remain the release-storm arbiters.
+if [[ "${AFT_GATE_SKIP_RELEASE_STORM:-}" == "1" ]]; then
+  echo "==> release-storm phase skipped (AFT_GATE_SKIP_RELEASE_STORM=1)"
+else
+  run_phase "cargo nextest run --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
+    cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+fi
