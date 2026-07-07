@@ -244,10 +244,9 @@ fn configure_repairs_legacy_root_bash_tasks_into_harness_namespace() {
         .join("bash-tasks")
         .join(aft::backup::hash_session(SESSION))
         .join(format!("{task_id}.json"));
-    assert!(
-        harness_json.exists(),
-        "configure should move task JSON to harness path"
-    );
+    // Configure returns before the legacy-task repair now; poll for the
+    // maintenance side effect before checking the migrated layout.
+    wait_for_path(&harness_json);
     assert!(
         !storage.path().join("bash-tasks").exists(),
         "legacy root task directory should be removed after repair"

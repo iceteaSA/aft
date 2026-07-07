@@ -14,6 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 pub fn drain_configure_warning_events(ctx: &AppContext) {
+    crate::commands::configure::drain_deferred_configure_maintenance(ctx);
     for (generation, frame) in ctx.drain_configure_warnings() {
         if ctx.configure_generation() != generation {
             aft::slog_info!(

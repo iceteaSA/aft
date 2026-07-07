@@ -162,7 +162,10 @@ impl AppContext {
         let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
         let disk_info = match (&config.storage_dir, &config.project_root) {
             (Some(dir), Some(root)) => {
-                let key = crate::search_index::artifact_cache_key(root);
+                let key_root = self
+                    .canonical_cache_root_opt()
+                    .unwrap_or_else(|| root.clone());
+                let key = self.memoized_artifact_cache_key(&key_root);
                 let trigram_size = dir_size(&dir.join("index").join(&key));
                 let semantic_size = dir_size(&dir.join("semantic").join(&key));
                 serde_json::json!({
