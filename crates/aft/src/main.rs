@@ -293,12 +293,12 @@ fn main() {
         runtime.lsp().shutdown_all();
         runtime.bash_background().detach();
     }
+    aft::artifact_owner::shutdown_heartbeat_thread();
     aft::slog_info!("stdin closed, shutting down");
 }
 
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
-        runtime.heartbeat_artifact_owner_lease();
         aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::runtime_drain::drain_search_index_events(runtime);
         aft::runtime_drain::drain_callgraph_store_events(runtime);
@@ -424,6 +424,7 @@ fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspC
             for registry in &bg_registries {
                 registry.detach();
             }
+            aft::artifact_owner::shutdown_heartbeat_thread();
             // Kill LSP children synchronously before exit. Without this, LSP
             // child processes (typescript-language-server, biome lsp-proxy,
             // etc.) get orphaned to PID 1 because process::exit bypasses the
@@ -464,6 +465,7 @@ unsafe extern "system" fn windows_console_handler(ctrl_type: u32) -> i32 {
             for registry in bg_registries {
                 registry.detach();
             }
+            aft::artifact_owner::shutdown_heartbeat_thread();
             let killed = lsp_children.kill_all();
             if killed > 0 {
                 aft::slog_info!(

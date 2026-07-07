@@ -80,7 +80,19 @@ const RELIABLE_PUSH_DRAIN_BUDGET: usize = 32;
 
 /// Limit maintenance submissions per tick so background drains cannot delay
 /// control-plane work such as completed RouteBind acknowledgements.
+///
+/// The decomposed maintenance pass charges this budget by Mutating job, not by
+/// root. Roots keep a small per-pass queue of drain families; a tick submits up
+/// to this many jobs across all roots, and capped watcher/LSP follow-up batches
+/// re-enter that queue instead of bypassing the budget.
 const MAINTENANCE_SUBMIT_BUDGET: usize = 4;
+const INITIAL_MAINTENANCE_DRAIN_KINDS: [MaintenanceDrainKind; 3] = [
+    MaintenanceDrainKind::Watcher,
+    MaintenanceDrainKind::Lsp,
+    MaintenanceDrainKind::Short,
+];
+#[cfg(test)]
+const INITIAL_MAINTENANCE_JOB_COUNT: usize = INITIAL_MAINTENANCE_DRAIN_KINDS.len();
 
 const RELIABLE_WRITER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const RELIABLE_WRITER_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
@@ -241,6 +253,9 @@ fn principal_label(principal: &Option<Principal>) -> String {
 /// still arrive later.
 struct RootMeta {
     maintenance_pending: bool,
+    maintenance_jobs_in_flight: usize,
+    maintenance_queued_kinds: VecDeque<MaintenanceDrainKind>,
+    maintenance_last_submitted: Option<Instant>,
     maintenance_poisoned: bool,
     last_touched: Instant,
     diagnostics_on_edit: bool,
@@ -297,6 +312,30 @@ struct MaintenanceCompletion {
     root_id: ProjectRootId,
     response: Response,
     empty_bg_sessions: Vec<(String, u64)>,
+    requeue_kind: Option<MaintenanceDrainKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceDrainKind {
+    Watcher,
+    Lsp,
+    Short,
+}
+
+impl MaintenanceDrainKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Watcher => "watcher",
+            Self::Lsp => "lsp",
+            Self::Short => "short",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MaintenanceJobOutcome {
+    empty_bg_sessions: Vec<(String, u64)>,
+    requeue_kind: Option<MaintenanceDrainKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -325,6 +364,9 @@ impl RootMeta {
     fn new(now: Instant) -> Self {
         Self {
             maintenance_pending: false,
+            maintenance_jobs_in_flight: 0,
+            maintenance_queued_kinds: VecDeque::new(),
+            maintenance_last_submitted: None,
             maintenance_poisoned: false,
             last_touched: now,
             diagnostics_on_edit: false,
@@ -337,26 +379,77 @@ impl RootMeta {
     }
 }
 
-fn due_maintenance_roots(
+fn due_maintenance_jobs(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     budget: usize,
-) -> (Vec<ProjectRootId>, bool) {
-    let mut roots = Vec::new();
+) -> (Vec<(ProjectRootId, MaintenanceDrainKind)>, bool) {
+    let mut jobs = Vec::new();
     let mut deferred = false;
+    let mut roots = live_roots.keys().cloned().collect::<Vec<_>>();
+    roots.sort_by(|left, right| {
+        let left_last = live_roots
+            .get(left)
+            .and_then(|meta| meta.maintenance_last_submitted);
+        let right_last = live_roots
+            .get(right)
+            .and_then(|meta| meta.maintenance_last_submitted);
+        left_last
+            .cmp(&right_last)
+            .then_with(|| left.as_path().cmp(right.as_path()))
+    });
 
-    for (root_id, meta) in live_roots.iter_mut() {
-        if meta.maintenance_pending || meta.maintenance_poisoned {
+    for root_id in roots {
+        let Some(meta) = live_roots.get_mut(&root_id) else {
+            continue;
+        };
+        if meta.maintenance_poisoned {
             continue;
         }
-        if roots.len() >= budget {
-            deferred = true;
-            continue;
+
+        if !meta.maintenance_pending {
+            if jobs.len() >= budget {
+                deferred = true;
+                continue;
+            }
+            meta.maintenance_pending = true;
+            meta.maintenance_queued_kinds
+                .extend(INITIAL_MAINTENANCE_DRAIN_KINDS);
         }
-        meta.maintenance_pending = true;
-        roots.push(root_id.clone());
+
+        while let Some(kind) = meta.maintenance_queued_kinds.pop_front() {
+            if jobs.len() >= budget {
+                meta.maintenance_queued_kinds.push_front(kind);
+                deferred = true;
+                break;
+            }
+            meta.maintenance_jobs_in_flight += 1;
+            meta.maintenance_last_submitted = Some(Instant::now());
+            jobs.push((root_id.clone(), kind));
+        }
+
+        meta.maintenance_pending =
+            meta.maintenance_jobs_in_flight > 0 || !meta.maintenance_queued_kinds.is_empty();
     }
 
-    (roots, deferred)
+    (jobs, deferred)
+}
+
+fn note_maintenance_completion(
+    meta: &mut RootMeta,
+    requeue_kind: Option<MaintenanceDrainKind>,
+    fatal: bool,
+) {
+    if fatal {
+        meta.maintenance_poisoned = true;
+    }
+
+    if let Some(kind) = requeue_kind.filter(|_| !meta.maintenance_poisoned) {
+        meta.maintenance_queued_kinds.push_back(kind);
+    }
+
+    meta.maintenance_jobs_in_flight = meta.maintenance_jobs_in_flight.saturating_sub(1);
+    meta.maintenance_pending =
+        meta.maintenance_jobs_in_flight > 0 || !meta.maintenance_queued_kinds.is_empty();
 }
 
 fn route_key(channel: u16) -> RouteChannel {
@@ -1229,33 +1322,38 @@ where
                 );
             }
 
-            let (due_roots, deferred_roots) =
-                due_maintenance_roots(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
-            if deferred_roots {
+            let (due_jobs, deferred_jobs) =
+                due_maintenance_jobs(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
+            if deferred_jobs {
                 dispatch_path_metrics
                     .maintenance_budget_deferrals
                     .fetch_add(1, Ordering::Relaxed);
             }
-            for root_id in due_roots {
-                let bg_sessions_to_check: Vec<(String, u64)> = bg_sub_by_session
-                    .iter()
-                    .filter_map(|((root, session), _)| {
-                        if root == &root_id {
-                            Some((
-                                session.clone(),
-                                bg_wake_epoch
-                                    .get(&(root_id.clone(), session.clone()))
-                                    .copied()
-                                    .unwrap_or(0),
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                submit_maintenance_drain(
+            for (root_id, kind) in due_jobs {
+                let bg_sessions_to_check = if kind == MaintenanceDrainKind::Short {
+                    bg_sub_by_session
+                        .iter()
+                        .filter_map(|((root, session), _)| {
+                            if root == &root_id {
+                                Some((
+                                    session.clone(),
+                                    bg_wake_epoch
+                                        .get(&(root_id.clone(), session.clone()))
+                                        .copied()
+                                        .unwrap_or(0),
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                submit_maintenance_job(
                     &executor,
                     root_id,
+                    kind,
                     bg_sessions_to_check,
                     &maintenance_tx,
                     &dispatch_path_metrics,
@@ -1590,10 +1688,11 @@ where
             }
             Some(completion) = maintenance_rx.recv() => {
                 decrement_counted_channel(&dispatch_path_metrics.maintenance_queued);
-                let root_id = completion.root_id;
+                let root_id = completion.root_id.clone();
                 let response = completion.response;
+                let response_is_fatal = response_is_fatal_panic(&response);
                 if let Some(meta) = live_roots.get_mut(&root_id) {
-                    meta.maintenance_pending = false;
+                    note_maintenance_completion(meta, completion.requeue_kind, response_is_fatal);
                 }
                 push::clear_stale_bg_wakes_for_empty_sessions(
                     &root_id,
@@ -1602,7 +1701,7 @@ where
                     &mut bg_wake_pending,
                     &bg_wake_epoch,
                 );
-                if response_is_fatal_panic(&response) {
+                if response_is_fatal {
                     if let Some(meta) = live_roots.get_mut(&root_id) {
                         meta.maintenance_poisoned = true;
                     }
@@ -2620,43 +2719,74 @@ async fn handle_tool_call(
     Ok(())
 }
 
-fn submit_maintenance_drain(
+fn submit_maintenance_job(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
+    kind: MaintenanceDrainKind,
     bg_sessions_to_check: Vec<(String, u64)>,
     completion_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
     let request_id = format!(
-        "subc-maintenance-drain-{}",
+        "subc-maintenance-drain-{}-{}",
+        kind.label(),
         root_id.as_path().to_string_lossy()
     );
     let response_id = request_id.clone();
     let completion_root_id = root_id.clone();
-    let (empty_bg_sessions_tx, empty_bg_sessions_rx) = oneshot::channel::<Vec<(String, u64)>>();
+    let (outcome_tx, outcome_rx) = oneshot::channel::<MaintenanceJobOutcome>();
     let rx = executor.submit_maintenance_async(
         root_id,
         Lane::Mutating,
         request_id.clone(),
         Box::new(move |ctx| {
-            ctx.heartbeat_artifact_owner_lease();
-            runtime_drain::drain_configure_warning_events(ctx);
-            runtime_drain::drain_search_index_events(ctx);
-            runtime_drain::drain_callgraph_store_events(ctx);
-            runtime_drain::drain_semantic_index_events(ctx);
-            runtime_drain::drain_semantic_refresh_events(ctx);
-            runtime_drain::drain_inspect_events(ctx);
-            runtime_drain::drain_watcher_events(ctx);
-            runtime_drain::drain_lsp_events(ctx);
-            let empty_bg_sessions = bg_sessions_to_check
-                .into_iter()
-                .filter(|(session, _)| {
-                    !ctx.bash_background()
-                        .has_completions_for_session(Some(session.as_str()))
-                })
-                .collect();
-            let _ = empty_bg_sessions_tx.send(empty_bg_sessions);
-            Response::success(response_id, json!({ "drained": true }))
+            let outcome = match kind {
+                MaintenanceDrainKind::Watcher => {
+                    let drained = runtime_drain::drain_watcher_events_bounded(
+                        ctx,
+                        runtime_drain::WATCHER_EVENT_DRAIN_BATCH_CAP,
+                    );
+                    MaintenanceJobOutcome {
+                        empty_bg_sessions: Vec::new(),
+                        requeue_kind: drained.has_more.then_some(kind),
+                    }
+                }
+                MaintenanceDrainKind::Lsp => {
+                    let drained = runtime_drain::drain_lsp_events_bounded(
+                        ctx,
+                        runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP,
+                    );
+                    MaintenanceJobOutcome {
+                        empty_bg_sessions: Vec::new(),
+                        requeue_kind: drained.has_more.then_some(kind),
+                    }
+                }
+                MaintenanceDrainKind::Short => {
+                    runtime_drain::drain_configure_warning_events(ctx);
+                    runtime_drain::drain_search_index_events(ctx);
+                    runtime_drain::drain_callgraph_store_events(ctx);
+                    runtime_drain::drain_semantic_index_events(ctx);
+                    runtime_drain::drain_semantic_refresh_events(ctx);
+                    runtime_drain::drain_inspect_events(ctx);
+                    let empty_bg_sessions = bg_sessions_to_check
+                        .into_iter()
+                        .filter(|(session, _)| {
+                            !ctx.bash_background()
+                                .has_completions_for_session(Some(session.as_str()))
+                        })
+                        .collect();
+                    MaintenanceJobOutcome {
+                        empty_bg_sessions,
+                        requeue_kind: None,
+                    }
+                }
+            };
+            let requeued = outcome.requeue_kind.is_some();
+            let _ = outcome_tx.send(outcome);
+            Response::success(
+                response_id,
+                json!({ "drained": true, "kind": kind.label(), "requeued": requeued }),
+            )
         }),
     );
     let completion_tx = completion_tx.clone();
@@ -2664,14 +2794,15 @@ fn submit_maintenance_drain(
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&completion_metrics);
         let response = await_executor_response(rx, request_id).await;
-        let empty_bg_sessions = empty_bg_sessions_rx.await.unwrap_or_default();
+        let outcome = outcome_rx.await.unwrap_or_default();
         let _ = send_counted_channel(
             &completion_tx,
             &completion_metrics.maintenance_queued,
             MaintenanceCompletion {
                 root_id: completion_root_id,
                 response,
-                empty_bg_sessions,
+                empty_bg_sessions: outcome.empty_bg_sessions,
+                requeue_kind: outcome.requeue_kind,
             },
         )
         .await;
@@ -2874,7 +3005,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn due_maintenance_roots_skip_poisoned_roots() {
+    fn due_maintenance_jobs_skip_poisoned_roots() {
         let (_healthy_dir, healthy_root) = test_root("maintenance-healthy");
         let (_poisoned_dir, poisoned_root) = test_root("maintenance-poisoned");
         let mut live_roots = HashMap::new();
@@ -2883,20 +3014,25 @@ mod tests {
         poisoned_meta.maintenance_poisoned = true;
         live_roots.insert(poisoned_root.clone(), poisoned_meta);
 
-        let (due, deferred) = due_maintenance_roots(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
+        let (due, deferred) = due_maintenance_jobs(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
 
-        assert_eq!(due, vec![healthy_root.clone()]);
+        assert_eq!(due.len(), INITIAL_MAINTENANCE_JOB_COUNT);
+        assert!(due.iter().all(|(root, _)| root == &healthy_root));
         assert!(!deferred);
         assert!(live_roots[&healthy_root].maintenance_pending);
+        assert_eq!(
+            live_roots[&healthy_root].maintenance_jobs_in_flight,
+            INITIAL_MAINTENANCE_JOB_COUNT
+        );
         assert!(!live_roots[&poisoned_root].maintenance_pending);
     }
 
     #[test]
-    fn due_maintenance_roots_defers_unsubmitted_roots_without_marking_pending() {
+    fn due_maintenance_jobs_defers_unsubmitted_roots_without_marking_pending() {
         let mut live_roots = HashMap::new();
         let mut root_ids = Vec::new();
         let mut _dirs = Vec::new();
-        for index in 0..(MAINTENANCE_SUBMIT_BUDGET + 2) {
+        for index in 0..4 {
             let (dir, root_id) = test_root(&format!("maintenance-budget-{index}"));
             live_roots.insert(root_id.clone(), RootMeta::new(Instant::now()));
             root_ids.push(root_id);
@@ -2904,24 +3040,82 @@ mod tests {
         }
 
         let (first_due, first_deferred) =
-            due_maintenance_roots(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
+            due_maintenance_jobs(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET);
 
         assert_eq!(first_due.len(), MAINTENANCE_SUBMIT_BUDGET);
         assert!(first_deferred);
-        let first_due_set: HashSet<_> = first_due.into_iter().collect();
+        let first_due_set: HashSet<_> = first_due.into_iter().map(|(root, _)| root).collect();
         assert!(first_due_set
             .iter()
             .all(|root| live_roots[root].maintenance_pending));
+        assert!(first_due_set
+            .iter()
+            .any(|root| !live_roots[root].maintenance_queued_kinds.is_empty()));
 
         let all_roots: HashSet<_> = root_ids.into_iter().collect();
         let deferred_roots: HashSet<_> = all_roots.difference(&first_due_set).cloned().collect();
         assert!(deferred_roots
             .iter()
             .all(|root| !live_roots[root].maintenance_pending));
+    }
 
-        let (second_due, _) = due_maintenance_roots(&mut live_roots, usize::MAX);
-        let second_due_set: HashSet<_> = second_due.into_iter().collect();
-        assert_eq!(second_due_set, deferred_roots);
+    #[test]
+    fn maintenance_pending_survives_requeue_and_clears_after_final_batch() {
+        let (_dir, root) = test_root("maintenance-requeue");
+        let mut live_roots = HashMap::new();
+        live_roots.insert(root.clone(), RootMeta::new(Instant::now()));
+        let (due, deferred) = due_maintenance_jobs(&mut live_roots, usize::MAX);
+        assert_eq!(due.len(), INITIAL_MAINTENANCE_JOB_COUNT);
+        assert!(due.iter().all(|(due_root, _)| due_root == &root));
+        assert!(!deferred);
+
+        let meta = live_roots.get_mut(&root).unwrap();
+        note_maintenance_completion(meta, Some(MaintenanceDrainKind::Watcher), false);
+        assert!(meta.maintenance_pending);
+        assert_eq!(
+            meta.maintenance_jobs_in_flight,
+            INITIAL_MAINTENANCE_JOB_COUNT - 1
+        );
+        assert_eq!(meta.maintenance_queued_kinds.len(), 1);
+
+        let (requeued, deferred) = due_maintenance_jobs(&mut live_roots, 1);
+        assert_eq!(
+            requeued,
+            vec![(root.clone(), MaintenanceDrainKind::Watcher)]
+        );
+        assert!(!deferred);
+        let meta = live_roots.get_mut(&root).unwrap();
+        assert_eq!(
+            meta.maintenance_jobs_in_flight,
+            INITIAL_MAINTENANCE_JOB_COUNT
+        );
+        assert!(meta.maintenance_queued_kinds.is_empty());
+
+        for _ in 0..INITIAL_MAINTENANCE_JOB_COUNT {
+            note_maintenance_completion(meta, None, false);
+        }
+        assert!(!meta.maintenance_pending);
+        assert_eq!(meta.maintenance_jobs_in_flight, 0);
+    }
+
+    #[test]
+    fn maintenance_pending_clears_and_poison_stops_requeue_after_fatal() {
+        let (_dir, root) = test_root("maintenance-fatal");
+        let mut live_roots = HashMap::new();
+        live_roots.insert(root.clone(), RootMeta::new(Instant::now()));
+        let (due, _) = due_maintenance_jobs(&mut live_roots, usize::MAX);
+        assert_eq!(due.len(), INITIAL_MAINTENANCE_JOB_COUNT);
+
+        let meta = live_roots.get_mut(&root).unwrap();
+        note_maintenance_completion(meta, Some(MaintenanceDrainKind::Watcher), true);
+        assert!(meta.maintenance_poisoned);
+        assert!(meta.maintenance_queued_kinds.is_empty());
+
+        for _ in 1..INITIAL_MAINTENANCE_JOB_COUNT {
+            note_maintenance_completion(meta, None, false);
+        }
+        assert!(!meta.maintenance_pending);
+        assert_eq!(meta.maintenance_jobs_in_flight, 0);
     }
 
     #[test]

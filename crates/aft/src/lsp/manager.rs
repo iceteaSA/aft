@@ -205,6 +205,7 @@ pub struct PullWorkspaceResult {
 pub struct DrainedLspEvents {
     pub events: Vec<LspEvent>,
     pub diagnostics_changed: bool,
+    pub has_more: bool,
 }
 
 impl IntoIterator for DrainedLspEvents {
@@ -741,17 +742,26 @@ impl LspManager {
 
     /// Drain all pending LSP events. Call from the main loop.
     pub fn drain_events(&mut self) -> DrainedLspEvents {
+        self.drain_events_bounded(usize::MAX)
+    }
+
+    pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
         let mut events = Vec::new();
         let mut diagnostics_changed = false;
-        while let Ok(event) = self.event_rx.try_recv() {
+        while events.len() < max_events {
+            let Ok(event) = self.event_rx.try_recv() else {
+                break;
+            };
             if self.handle_event(&event).is_some() {
                 diagnostics_changed = true;
             }
             events.push(event);
         }
+        let has_more = events.len() >= max_events && !self.event_rx.is_empty();
         DrainedLspEvents {
             events,
             diagnostics_changed,
+            has_more,
         }
     }
 
