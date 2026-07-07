@@ -141,7 +141,10 @@ if (core) {
 
   const coreFiles = Array.isArray(core.files) ? core.files : [];
   if (!coreFiles.includes("src/tui-compiled")) {
-    fail(label, "files must include 'src/tui-compiled' so the published TUI ships its precompiled tree");
+    fail(
+      label,
+      "files must include 'src/tui-compiled' so the published TUI ships its precompiled tree",
+    );
   }
 
   const tuiExportImport = core.exports?.["./tui"]?.import;
@@ -252,7 +255,7 @@ for (const { label, pkg } of [
 // dist/subc-transport.js — tsc build, nothing inlined). Guard the dependency
 // direction so it can never silently regress to a devDep again.
 {
-  const deps = (bridge && bridge.dependencies) || {};
+  const deps = bridge?.dependencies || {};
   if (!deps["@cortexkit/subc-client"]) {
     fail(
       "@cortexkit/aft-bridge",
@@ -344,7 +347,9 @@ if (errors.length > 0) {
   console.log("  Platform os/cpu fields correct");
   console.log("  preferUnplugged set on all platform packages");
   console.log("  optionalDependencies complete in @cortexkit/aft-opencode and @cortexkit/aft-pi");
-  console.log("  @cortexkit/aft-opencode ships src/tui-compiled and exports ./tui through entry.mjs");
+  console.log(
+    "  @cortexkit/aft-opencode ships src/tui-compiled and exports ./tui through entry.mjs",
+  );
   console.log("  @cortexkit/aft-bridge dep version aligned in plugin and CLI packages");
   console.log("  bin, license, repository fields present in @cortexkit/aft and @cortexkit/aft-pi");
   process.exit(0);

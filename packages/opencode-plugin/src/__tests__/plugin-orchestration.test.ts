@@ -4,7 +4,7 @@ import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import {
   __resetConfigureWarningQueuesForTests,
   enqueueConfigParseWarnings,

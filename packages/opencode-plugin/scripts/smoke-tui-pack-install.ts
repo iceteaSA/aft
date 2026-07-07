@@ -47,10 +47,7 @@ function run(command: string, args: string[], cwd: string): string {
   if (result.stderr) process.stderr.write(result.stderr);
 
   if (result.status !== 0) {
-    fail(
-      `${command} ${args.join(" ")}`,
-      `exited with ${result.status ?? "unknown status"}`,
-    );
+    fail(`${command} ${args.join(" ")}`, `exited with ${result.status ?? "unknown status"}`);
   }
   return result.stdout;
 }

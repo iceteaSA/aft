@@ -29,8 +29,19 @@ const child = spawn(shimBin, ["shim", "--module-connection-file", connFile], {
   stdio: ["pipe", "pipe", "inherit"],
 });
 
+type JsonRpcMessage = {
+  id?: number;
+  result?: {
+    serverInfo?: unknown;
+    tools?: Array<{ name: string }>;
+    content?: Array<{ type: string; text?: string }>;
+    isError?: boolean;
+  };
+  error?: { code?: number; message?: string };
+};
+
 let buffer = "";
-const pending = new Map<number, (msg: any) => void>();
+const pending = new Map<number, (msg: JsonRpcMessage) => void>();
 child.stdout.on("data", (chunk: Buffer) => {
   buffer += chunk.toString("utf8");
   let idx: number;
@@ -38,7 +49,7 @@ child.stdout.on("data", (chunk: Buffer) => {
     const line = buffer.slice(0, idx).trim();
     buffer = buffer.slice(idx + 1);
     if (!line) continue;
-    const msg = JSON.parse(line);
+    const msg = JSON.parse(line) as JsonRpcMessage;
     if (typeof msg.id === "number" && pending.has(msg.id)) {
       const resolve = pending.get(msg.id);
       pending.delete(msg.id);
@@ -48,9 +59,9 @@ child.stdout.on("data", (chunk: Buffer) => {
 });
 
 let nextId = 1;
-function request(method: string, params?: unknown): Promise<any> {
+function request(method: string, params?: unknown): Promise<JsonRpcMessage> {
   const id = nextId++;
-  const p = new Promise<any>((resolve, reject) => {
+  const p = new Promise<JsonRpcMessage>((resolve, reject) => {
     pending.set(id, resolve);
     setTimeout(() => {
       if (pending.delete(id)) reject(new Error(`timeout waiting for ${method} (id=${id})`));
@@ -63,13 +74,13 @@ function notify(method: string, params?: unknown): void {
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
 }
 
-function callTool(name: string, args: Record<string, unknown>): Promise<any> {
+function callTool(name: string, args: Record<string, unknown>): Promise<JsonRpcMessage> {
   return request("tools/call", { name, arguments: args });
 }
-function toolText(reply: any): string {
+function toolText(reply: JsonRpcMessage): string {
   return (reply.result?.content ?? [])
-    .filter((c: any) => c.type === "text")
-    .map((c: any) => c.text)
+    .filter((c) => c.type === "text")
+    .map((c) => c.text ?? "")
     .join("\n");
 }
 
@@ -88,7 +99,7 @@ check("initialize", !!init.result?.serverInfo, JSON.stringify(init.result?.serve
 notify("notifications/initialized");
 
 const list = await request("tools/list");
-const toolNames: string[] = (list.result?.tools ?? []).map((t: any) => t.name);
+const toolNames: string[] = (list.result?.tools ?? []).map((t) => t.name);
 check(
   "tools/list exposes aft manifest",
   toolNames.some((n) => n.includes("read")) && toolNames.length >= 20,
