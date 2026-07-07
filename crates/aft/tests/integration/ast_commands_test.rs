@@ -1409,9 +1409,15 @@ fn ast_replace_member_access_pattern_completes_in_reasonable_time() {
     assert_eq!(resp["files_with_matches"], 60);
     assert_eq!(resp["total_replacements"], 60);
 
+    // Regression tripwire, not a benchmark: the guarded failure modes
+    // (re-compiling the pattern per file, losing the rayon par_iter walk)
+    // push 60 files well past 30s. The bound only needs to sit far below
+    // that while tolerating slow hardware — a contended 2-core Windows CI
+    // runner has taken 6.1s on the healthy path where dev machines take
+    // well under 2s, so 5s flaked without any regression present.
     assert!(
-        elapsed.as_secs_f64() < 5.0,
-        "ast_replace regressed: {} files took {:.2}s (expected < 5s). \
+        elapsed.as_secs_f64() < 20.0,
+        "ast_replace regressed: {} files took {:.2}s (expected < 20s). \
          If this fails, check that ast_replace.rs still pre-compiles the pattern \
          outside the file loop and uses rayon par_iter for the file walk.",
         resp["files_searched"],
