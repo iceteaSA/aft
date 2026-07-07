@@ -125,7 +125,6 @@ describe("BinaryBridge lifecycle", () => {
         type: "configure_warnings",
         session_id: "session-1",
         project_root: "/repo",
-        source_file_count: 10,
         warnings: [
           {
             kind: "formatter_not_installed",
@@ -172,7 +171,6 @@ describe("BinaryBridge lifecycle", () => {
         `${JSON.stringify({
           type: "configure_warnings",
           project_root: "/repo",
-          source_file_count: 10,
           warnings: [
             {
               kind: "formatter_not_installed",
@@ -224,7 +222,6 @@ describe("BinaryBridge lifecycle", () => {
         type: "configure_warnings",
         session_id: "session-a",
         project_root: "/repo",
-        source_file_count: 10,
         warnings: [
           {
             kind: "formatter_not_installed",

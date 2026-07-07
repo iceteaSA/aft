@@ -1546,6 +1546,15 @@ impl AppContext {
             .insert((root, session_id))
     }
 
+    /// Undo [`Self::note_configure_session_binding`] when the maintenance job
+    /// carrying the session's bash replay was dropped as stale: the session has
+    /// not actually been replayed, so its next bind must count as first again.
+    pub fn forget_configure_session_binding(&self, root: &Path, session_id: &str) {
+        self.configured_session_roots
+            .lock()
+            .remove(&(root.to_path_buf(), session_id.to_string()));
+    }
+
     pub(crate) fn enqueue_configure_maintenance(&self, job: ConfigureMaintenanceJob) {
         self.configure_maintenance_jobs.lock().push_back(job);
     }

@@ -382,9 +382,6 @@ impl AftProcess {
             .cloned()
             .unwrap_or_default();
         configure["warnings"] = serde_json::Value::Array(warnings);
-        if let Some(count) = frame.get("source_file_count").cloned() {
-            configure["source_file_count"] = count;
-        }
         configure["warnings_pending"] = serde_json::Value::Bool(false);
         configure
     }

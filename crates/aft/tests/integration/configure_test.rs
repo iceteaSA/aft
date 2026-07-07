@@ -588,8 +588,7 @@ fn configure_warnings_wait_consumes_pending_frame_before_reading_stdout() {
             "kind": "lsp_binary_missing",
             "server": "custom-thing",
             "binary": "nonexistent-binary"
-        }],
-        "source_file_count": 0
+        }]
     }));
 
     let configure = aft.merge_configure_warnings(json!({
@@ -607,7 +606,6 @@ fn configure_warnings_wait_consumes_pending_frame_before_reading_stdout() {
     )
     .expect("missing custom LSP warning from pending frame");
     assert_eq!(warning["server"], "custom-thing");
-    assert_eq!(configure["source_file_count"], 0);
     assert_eq!(configure["warnings_pending"], false);
 
     let shutdown = aft.shutdown();

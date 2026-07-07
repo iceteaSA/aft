@@ -2216,7 +2216,6 @@ pub(crate) mod test_support {
             frame_type: "configure_warnings",
             session_id: session_id.map(str::to_string),
             project_root: "/tmp/subc-test".to_string(),
-            source_file_count: 0,
             warnings: Vec::new(),
         })
     }

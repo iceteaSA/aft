@@ -116,8 +116,6 @@ pub struct ConfigureWarningsFrame {
     /// Project root the warnings refer to. Plugins use this to scope the
     /// session-id deduplication of repeated identical warnings.
     pub project_root: String,
-    /// Source-file count discovered by the bounded walk.
-    pub source_file_count: usize,
     /// Merged formatter/checker/LSP missing-binary warnings.
     pub warnings: Vec<serde_json::Value>,
 }
@@ -168,25 +166,19 @@ impl ProgressFrame {
 }
 
 impl ConfigureWarningsFrame {
-    pub fn new(
-        project_root: impl Into<String>,
-        source_file_count: usize,
-        warnings: Vec<serde_json::Value>,
-    ) -> Self {
-        Self::new_with_session_id(None, project_root, source_file_count, warnings)
+    pub fn new(project_root: impl Into<String>, warnings: Vec<serde_json::Value>) -> Self {
+        Self::new_with_session_id(None, project_root, warnings)
     }
 
     pub fn new_with_session_id(
         session_id: Option<String>,
         project_root: impl Into<String>,
-        source_file_count: usize,
         warnings: Vec<serde_json::Value>,
     ) -> Self {
         Self {
             frame_type: "configure_warnings",
             session_id,
             project_root: project_root.into(),
-            source_file_count,
             warnings,
         }
     }
@@ -227,7 +219,6 @@ mod tests {
         frame_type: String,
         session_id: Option<String>,
         project_root: String,
-        source_file_count: usize,
         warnings: Vec<serde_json::Value>,
     }
 
@@ -235,7 +226,6 @@ mod tests {
     fn configure_warnings_frame_serializes_null_session_id_by_default() {
         let frame = ConfigureWarningsFrame::new(
             "/repo",
-            42,
             vec![json!({
                 "kind": "formatter_not_installed",
                 "tool": "biome",
@@ -255,7 +245,6 @@ mod tests {
         let frame = ConfigureWarningsFrame::new_with_session_id(
             Some("session-1".to_string()),
             "/repo",
-            42,
             vec![json!({
                 "kind": "formatter_not_installed",
                 "tool": "biome",
@@ -270,7 +259,6 @@ mod tests {
         assert_eq!(decoded.frame_type, "configure_warnings");
         assert_eq!(decoded.session_id.as_deref(), Some("session-1"));
         assert_eq!(decoded.project_root, "/repo");
-        assert_eq!(decoded.source_file_count, 42);
         assert_eq!(decoded.warnings[0]["tool"], "biome");
     }
 

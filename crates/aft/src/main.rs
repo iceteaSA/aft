@@ -972,7 +972,6 @@ mod pending_response_tests {
                     frame_type: "configure_warnings",
                     session_id: Some("session-drain".to_string()),
                     project_root: root.path().display().to_string(),
-                    source_file_count: 0,
                     warnings: Vec::new(),
                 },
             ))
@@ -1641,8 +1640,7 @@ mod watcher_filter_tests {
         }
 
         let shutdown = std::sync::atomic::AtomicBool::new(false);
-        let frame =
-            PushFrame::ConfigureWarnings(ConfigureWarningsFrame::new("/repo", 0, Vec::new()));
+        let frame = PushFrame::ConfigureWarnings(ConfigureWarningsFrame::new("/repo", Vec::new()));
 
         write_push_frame_or_request_shutdown(&mut BrokenWriter, &frame, &shutdown);
 
@@ -1686,13 +1684,13 @@ mod watcher_filter_tests {
         warnings_tx
             .send((
                 current_generation - 1,
-                ConfigureWarningsFrame::new("/stale", 1, Vec::new()),
+                ConfigureWarningsFrame::new("/stale", Vec::new()),
             ))
             .unwrap();
         warnings_tx
             .send((
                 current_generation,
-                ConfigureWarningsFrame::new("/current", 2, Vec::new()),
+                ConfigureWarningsFrame::new("/current", Vec::new()),
             ))
             .unwrap();
 
@@ -1702,7 +1700,6 @@ mod watcher_filter_tests {
         match frame {
             PushFrame::ConfigureWarnings(frame) => {
                 assert_eq!(frame.project_root, "/current");
-                assert_eq!(frame.source_file_count, 2);
             }
             other => panic!("unexpected frame: {other:?}"),
         }

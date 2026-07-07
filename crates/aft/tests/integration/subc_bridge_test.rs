@@ -732,7 +732,6 @@ fn enqueue_configure_warning_if_requested(req: &RawRequest, ctx: &AppContext) {
     let frame = ConfigureWarningsFrame::new_with_session_id(
         aft::log_ctx::current_session(),
         project_root,
-        1,
         vec![json!({
             "code": "subc_test_configure_warning",
             "message": message,

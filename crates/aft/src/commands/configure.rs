@@ -32,13 +32,6 @@ use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Bounds the synchronous source-file count walk in `handle_configure` so it
-/// costs O(bound), not O(project), on monorepo-scale repos. This is only the
-/// `source_file_count` display/telemetry hint — it does NOT disable the search
-/// index. The disk-backed (pread) trigram index is RAM-bounded at any repo
-/// size (~745 MiB measured on Chromium's 176k files), so there is no longer a
-/// file-count ceiling on search.
-const SOURCE_FILE_COUNT_WALK_BOUND: usize = 5_000;
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 
@@ -1557,23 +1550,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
     }
 
-    // Bounded source-file count for the sidebar/status `source_file_count` hint.
-    // Daemon/plugin clients can receive the accurate count in the deferred
-    // configure_warnings frame, so the bind ack keeps only the field shape and a
-    // bounded sentinel. Standalone/no-push callers still get the old bounded
-    // count in the response because there is no async frame to merge later.
-    let source_file_count_pending = !home_match && ctx.progress_sender_handle().is_some();
-    let source_file_count = if home_match || source_file_count_pending {
-        // Skip the whole-tree walk for home roots, return the bound plus one so
-        // the count still looks large, and reuse that sentinel while daemon
-        // clients wait for the deferred accurate count.
-        SOURCE_FILE_COUNT_WALK_BOUND.saturating_add(1)
-    } else {
-        crate::callgraph::walk_project_files(&root_path)
-            .take(SOURCE_FILE_COUNT_WALK_BOUND.saturating_add(1))
-            .count()
-    };
-
     if home_match {
         if next_config.search_index {
             next_config.search_index = false;
@@ -2494,7 +2470,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // On a normal project this finishes in <1 s and pushes a
     // `ConfigureWarningsFrame` for the plugin to surface; on a huge directory
     // it may take seconds-to-minutes, but configure itself returns now.
-    let warnings_pending = source_file_count_pending;
+    let warnings_pending = !home_match && ctx.progress_sender_handle().is_some();
     if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
         let warning_generation = configure_generation;
@@ -2512,7 +2488,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     .iter()
                     .filter_map(|path| detect_language(path))
                     .collect();
-                let full_count = source_files.len();
                 let mut warnings =
                     detect_missing_tools_for_languages(&detected_languages, &config_for_bg)
                         .into_iter()
@@ -2523,7 +2498,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 let frame = crate::protocol::ConfigureWarningsFrame::new_with_session_id(
                     session_id_for_frame,
                     project_root_display,
-                    full_count,
                     warnings,
                 );
                 let _ = warning_tx.send((warning_generation, frame));
@@ -2532,16 +2506,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Return the success response immediately so the plugin can mark the project as
-    // configured. Missing-binary warnings and the accurate file count are sent later
-    // in a `configure_warnings` push frame; this bounded count only supports the
-    // initial search-index size hint.
+    // configured. Missing-binary warnings are sent later in a `configure_warnings`
+    // push frame.
     let response = Response::success(
         &req.id,
         json!({
             "project_root": root_path.display().to_string(),
-            "source_file_count": source_file_count,
-            "source_file_count_bounded": true,
-            "source_file_count_pending": source_file_count_pending,
             "warnings": [],
             "warnings_pending": warnings_pending,
             "search_index_cache_reused": search_index_cache_reused,
@@ -2565,6 +2535,13 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
                 job.generation,
                 ctx.configure_generation()
             );
+            // The superseding configure re-runs everything root-scoped, but
+            // bash replay is per-(root, session) and gated on the first bind
+            // of that session; forget the binding so the session's next bind
+            // replays its tasks instead of losing them to the dropped job.
+            if job.run_bash_replay {
+                ctx.forget_configure_session_binding(&job.canonical_cache_root, &job.session_id);
+            }
             continue;
         }
 
@@ -3247,20 +3224,14 @@ mod tests {
             elapsed < Duration::from_millis(200),
             "configure ack should not wait for delayed deferred walk: {elapsed:?}"
         );
-        assert_eq!(
-            response.data["source_file_count"],
-            json!(super::SOURCE_FILE_COUNT_WALK_BOUND + 1)
-        );
-        assert_eq!(response.data["source_file_count_pending"], json!(true));
+        assert!(response.data.get("source_file_count").is_none());
         assert!(ctx.drain_configure_warnings().is_empty());
 
+        // The deferred walk still completes and publishes its frame (for
+        // missing-binary warnings); only the count field is gone.
         let frame =
             wait_for_configure_warnings(&ctx, ctx.configure_generation(), Duration::from_secs(2));
-        assert!(
-            frame.source_file_count >= 400,
-            "deferred walk should publish the accurate count, got {}",
-            frame.source_file_count
-        );
+        assert_eq!(frame.frame_type, "configure_warnings");
     }
 
     #[test]
