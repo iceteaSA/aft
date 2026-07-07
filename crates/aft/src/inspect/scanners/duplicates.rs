@@ -21,6 +21,14 @@ use crate::parser::{detect_language, grammar_for, LangId};
 
 const LOWER_BOUND: u32 = 20;
 const MAX_COST: u32 = 7_000;
+/// Minimum source-line span for a REPORTED duplicate group: every occurrence
+/// must cover at least this many lines. The cost bound alone admits 3-4 line
+/// fragments (a dense call with member chains clears cost 20 easily), and
+/// field evidence shows those are idiomatic guards/setup blocks nobody would
+/// extract — report noise, not debt. SonarQube's duplicate-block convention
+/// (10 lines / ~100 tokens) is the calibration. Applied at the verdict layer
+/// so cached per-file fragment facts stay span-agnostic.
+const MIN_SPAN_LINES: u32 = 10;
 // Defensive recursion bound for `collect_fragments`. Hand-written code nests
 // only tens of levels deep, but minified bundles, generated code, and very long
 // operator/promise chains can produce trees thousands of nodes deep. The inspect
@@ -551,6 +559,13 @@ fn aggregate_file_scans_with_limit(
     )
 }
 
+fn occurrence_span_lines(occurrence: &FragmentOccurrence) -> u32 {
+    occurrence
+        .end_line
+        .saturating_sub(occurrence.start_line)
+        .saturating_add(1)
+}
+
 fn push_occurrence(
     by_hash: &mut BTreeMap<String, Vec<FragmentOccurrence>>,
     hash: &str,
@@ -591,7 +606,11 @@ fn aggregate_duplicate_occurrences(
     let mut groups = by_hash
         .iter()
         .filter(|(hash, occurrences)| {
-            occurrences.len() >= 2 && surfaced_hashes.contains(hash.as_str())
+            occurrences.len() >= 2
+                && surfaced_hashes.contains(hash.as_str())
+                && occurrences
+                    .iter()
+                    .all(|occurrence| occurrence_span_lines(occurrence) >= MIN_SPAN_LINES)
         })
         .filter_map(|(_, occurrences)| {
             let mut occurrences = occurrences.clone();
@@ -1072,10 +1091,10 @@ mod tests {
     fn generated_duplicate_groups_sort_below_headline_and_keep_totals() {
         let aggregate = aggregate_duplicate_contributions_with_limit(
             &[
-                contribution("src/a.ts", &[(1, 3, 10, "hand")]),
-                contribution("src/b.ts", &[(1, 3, 10, "hand")]),
-                contribution_with_generated("gen/a.ts", 100, false, true, &[(1, 9, 100, "gen")]),
-                contribution_with_generated("gen/b.ts", 100, false, true, &[(1, 9, 100, "gen")]),
+                contribution("src/a.ts", &[(1, 10, 10, "hand")]),
+                contribution("src/b.ts", &[(1, 10, 10, "hand")]),
+                contribution_with_generated("gen/a.ts", 100, false, true, &[(1, 12, 100, "gen")]),
+                contribution_with_generated("gen/b.ts", 100, false, true, &[(1, 12, 100, "gen")]),
             ],
             Vec::new(),
             None,
@@ -1087,10 +1106,31 @@ mod tests {
         assert_eq!(aggregate["total_groups"], 2, "{aggregate:#}");
         assert_eq!(aggregate["total_count"], 2, "{aggregate:#}");
         let items = aggregate["items"].as_array().expect("items");
-        assert_eq!(items[0]["files"][0], "src/a.ts:1-3", "{items:#?}");
+        assert_eq!(items[0]["files"][0], "src/a.ts:1-10", "{items:#?}");
         assert_eq!(items[1]["generated"], true, "{items:#?}");
-        assert_eq!(aggregate["top"][0]["files"][0], "src/a.ts:1-3");
-        assert_eq!(aggregate["generated_top"][0]["files"][0], "gen/a.ts:1-9");
+        assert_eq!(aggregate["top"][0]["files"][0], "src/a.ts:1-10");
+        assert_eq!(aggregate["generated_top"][0]["files"][0], "gen/a.ts:1-12");
+    }
+
+    #[test]
+    fn reported_duplicate_groups_require_each_occurrence_to_span_ten_lines() {
+        let short = aggregate_duplicate_contributions(
+            &[
+                contribution("src/a.ts", &[(1, 9, 200, "dense-call-chain")]),
+                contribution("src/b.ts", &[(1, 9, 200, "dense-call-chain")]),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(short["total_groups"], 0, "aggregate: {short:#}");
+
+        let long = aggregate_duplicate_contributions(
+            &[
+                contribution("src/a.ts", &[(1, 10, 200, "dense-call-chain")]),
+                contribution("src/b.ts", &[(1, 10, 200, "dense-call-chain")]),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(long["total_groups"], 1, "aggregate: {long:#}");
     }
 
     #[test]
@@ -1115,10 +1155,10 @@ mod tests {
         // standalone (unenclosed) in c.ts/d.ts. Its standalone occurrences are
         // maximal, so the idiom group must be preserved alongside the block.
         let contributions = vec![
-            contribution("src/a.ts", &[(1, 20, 1000, "block"), (3, 8, 400, "idiom")]),
-            contribution("src/b.ts", &[(1, 20, 1000, "block"), (3, 8, 400, "idiom")]),
-            contribution("src/c.ts", &[(40, 45, 400, "idiom")]),
-            contribution("src/d.ts", &[(70, 75, 400, "idiom")]),
+            contribution("src/a.ts", &[(1, 20, 1000, "block"), (3, 12, 400, "idiom")]),
+            contribution("src/b.ts", &[(1, 20, 1000, "block"), (3, 12, 400, "idiom")]),
+            contribution("src/c.ts", &[(40, 49, 400, "idiom")]),
+            contribution("src/d.ts", &[(70, 79, 400, "idiom")]),
         ];
 
         let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());
@@ -1146,11 +1186,11 @@ mod tests {
         let contributions = vec![
             contribution(
                 "src/a.ts",
-                &[(1, 20, 1000, "uniqueA"), (3, 8, 400, "child")],
+                &[(1, 20, 1000, "uniqueA"), (3, 12, 400, "child")],
             ),
             contribution(
                 "src/b.ts",
-                &[(1, 20, 1000, "uniqueB"), (3, 8, 400, "child")],
+                &[(1, 20, 1000, "uniqueB"), (3, 12, 400, "child")],
             ),
         ];
 
@@ -1163,16 +1203,16 @@ mod tests {
     #[test]
     fn framing_counts_unique_duplicated_lines_against_analyzed_lines() {
         let contributions = vec![
-            contribution_with_options("src/a.ts", 10, false, &[(2, 4, 300, "block")]),
-            contribution_with_options("src/b.ts", 10, false, &[(6, 8, 300, "block")]),
-            contribution_with_options("src/c.ts", 5, false, &[]),
+            contribution_with_options("src/a.ts", 20, false, &[(2, 11, 300, "block")]),
+            contribution_with_options("src/b.ts", 20, false, &[(6, 15, 300, "block")]),
+            contribution_with_options("src/c.ts", 10, false, &[]),
         ];
 
         let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());
 
-        assert_eq!(aggregate["duplicated_lines"], 6);
-        assert_eq!(aggregate["total_analyzed_lines"], 25);
-        assert_eq!(aggregate["duplicated_percent"].as_f64(), Some(24.0));
+        assert_eq!(aggregate["duplicated_lines"], 20);
+        assert_eq!(aggregate["total_analyzed_lines"], 50);
+        assert_eq!(aggregate["duplicated_percent"].as_f64(), Some(40.0));
         assert_eq!(aggregate["duplicated_file_count"], 2);
         assert_eq!(aggregate["total_groups"], 1);
     }
@@ -1180,13 +1220,13 @@ mod tests {
     #[test]
     fn expected_mirrors_suppress_only_groups_fully_straddling_pair() {
         let contributions = vec![
-            contribution("plugin/a.ts", &[(1, 6, 300, "mirror")]),
-            contribution("pi-plugin/a.ts", &[(1, 6, 300, "mirror")]),
-            contribution("plugin/b.ts", &[(10, 16, 400, "within-left")]),
-            contribution("plugin/c.ts", &[(10, 16, 400, "within-left")]),
-            contribution("plugin/d.ts", &[(20, 26, 500, "has-neither")]),
-            contribution("pi-plugin/d.ts", &[(20, 26, 500, "has-neither")]),
-            contribution("other/d.ts", &[(20, 26, 500, "has-neither")]),
+            contribution("plugin/a.ts", &[(1, 10, 300, "mirror")]),
+            contribution("pi-plugin/a.ts", &[(1, 10, 300, "mirror")]),
+            contribution("plugin/b.ts", &[(10, 19, 400, "within-left")]),
+            contribution("plugin/c.ts", &[(10, 19, 400, "within-left")]),
+            contribution("plugin/d.ts", &[(20, 29, 500, "has-neither")]),
+            contribution("pi-plugin/d.ts", &[(20, 29, 500, "has-neither")]),
+            contribution("other/d.ts", &[(20, 29, 500, "has-neither")]),
         ];
         let expected_mirrors = vec![["plugin/**".to_string(), "pi-plugin/**".to_string()]];
 
@@ -1222,8 +1262,8 @@ mod tests {
     #[test]
     fn expected_duplicate_marker_suppresses_groups_in_marked_files() {
         let contributions = vec![
-            contribution_with_options("src/marked.ts", 20, true, &[(1, 8, 300, "block")]),
-            contribution_with_options("src/plain.ts", 20, false, &[(1, 8, 300, "block")]),
+            contribution_with_options("src/marked.ts", 20, true, &[(1, 10, 300, "block")]),
+            contribution_with_options("src/plain.ts", 20, false, &[(1, 10, 300, "block")]),
         ];
 
         let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());

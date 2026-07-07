@@ -42,7 +42,8 @@ export function calculate(input: number) {
   const fourth = third + 3;
   const fifth = fourth + third;
   const sixth = fifth + second;
-  return sixth + fourth;
+  const seventh = sixth + fifth;
+  return seventh + fourth;
 }
 "#
     .to_string()

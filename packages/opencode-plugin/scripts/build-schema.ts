@@ -245,16 +245,6 @@ function buildSchema(): Record<string, unknown> {
           duplicates: {
             type: "object",
             properties: {
-              lower_bound: {
-                type: "integer",
-                minimum: 1,
-                description: "Minimum clone size (in AST nodes) to report as a duplicate group.",
-              },
-              discard_cost: {
-                type: "integer",
-                minimum: 0,
-                description: "Discard threshold for near-duplicate detection cost metric.",
-              },
               expected_mirrors: {
                 type: "array",
                 items: {
@@ -270,37 +260,9 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Intentional mirror path pairs for duplicate suppression. Each [globA, globB] pair matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported.",
               },
-              anonymize: {
-                type: "object",
-                properties: {
-                  variables: {
-                    type: "boolean",
-                    description: "Anonymize variable names in duplicate group display.",
-                  },
-                  fields: {
-                    type: "boolean",
-                    description: "Anonymize field names in duplicate group display.",
-                  },
-                  methods: {
-                    type: "boolean",
-                    description: "Anonymize method names in duplicate group display.",
-                  },
-                  types: {
-                    type: "boolean",
-                    description: "Anonymize type names in duplicate group display.",
-                  },
-                  literals: {
-                    type: "boolean",
-                    description: "Anonymize literal values in duplicate group display.",
-                  },
-                },
-                additionalProperties: false,
-                description:
-                  "Control which AST node kinds are anonymized when displaying duplicate groups.",
-              },
             },
             additionalProperties: false,
-            description: "Tuning knobs for the duplicate/near-duplicate code detection category.",
+            description: "Duplicate suppression config for the duplicates inspect category.",
           },
         },
         additionalProperties: false,

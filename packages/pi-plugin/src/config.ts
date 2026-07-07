@@ -91,16 +91,7 @@ export interface InspectConfig {
   tier2_soft_deadline_ms?: number;
   max_drill_down_items?: number;
   duplicates?: {
-    lower_bound?: number;
-    discard_cost?: number;
     expected_mirrors?: [string, string][];
-    anonymize?: {
-      variables?: boolean;
-      fields?: boolean;
-      methods?: boolean;
-      types?: boolean;
-      literals?: boolean;
-    };
   };
 }
 
@@ -485,19 +476,8 @@ const InspectConfigSchema = z.object({
   max_drill_down_items: z.number().int().positive().max(100).optional(),
   duplicates: z
     .object({
-      lower_bound: z.number().int().positive().optional(),
-      discard_cost: z.number().int().min(0).optional(),
       expected_mirrors: z
         .array(z.tuple([z.string().trim().min(1), z.string().trim().min(1)]))
-        .optional(),
-      anonymize: z
-        .object({
-          variables: z.boolean().optional(),
-          fields: z.boolean().optional(),
-          methods: z.boolean().optional(),
-          types: z.boolean().optional(),
-          literals: z.boolean().optional(),
-        })
         .optional(),
     })
     .optional(),
@@ -1062,20 +1042,9 @@ function mergeInspectConfig(
         ? {
             ...baseInspect?.duplicates,
             ...overrideInspect?.duplicates,
-            anonymize:
-              baseInspect?.duplicates?.anonymize || overrideInspect?.duplicates?.anonymize
-                ? {
-                    ...baseInspect?.duplicates?.anonymize,
-                    ...overrideInspect?.duplicates?.anonymize,
-                  }
-                : undefined,
           }
         : undefined,
   };
-
-  if (inspect.duplicates && inspect.duplicates.anonymize === undefined) {
-    delete inspect.duplicates.anonymize;
-  }
   if (Object.values(inspect).every((value) => value === undefined)) {
     return undefined;
   }

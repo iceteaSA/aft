@@ -364,43 +364,19 @@ impl RawInspect {
     }
 }
 
+/// Only `expected_mirrors` survives here: `lower_bound`, `discard_cost`, and
+/// `anonymize` were accepted-but-never-read knobs (the scanner hardcodes its
+/// cost bounds and anonymization rules), so they were removed from the schema
+/// rather than wired up.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RawInspectDuplicates {
-    #[serde(deserialize_with = "deserialize_opt_positive_usize")]
-    pub lower_bound: Option<usize>,
-    #[serde(deserialize_with = "deserialize_opt_u64")]
-    pub discard_cost: Option<u64>,
-    pub anonymize: Option<RawInspectAnonymize>,
     pub expected_mirrors: Option<Vec<[String; 2]>>,
 }
 
 impl RawInspectDuplicates {
     fn is_empty(&self) -> bool {
-        self.lower_bound.is_none()
-            && self.discard_cost.is_none()
-            && self.anonymize.is_none()
-            && self.expected_mirrors.is_none()
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct RawInspectAnonymize {
-    pub variables: Option<bool>,
-    pub fields: Option<bool>,
-    pub methods: Option<bool>,
-    pub types: Option<bool>,
-    pub literals: Option<bool>,
-}
-
-impl RawInspectAnonymize {
-    fn is_empty(&self) -> bool {
-        self.variables.is_none()
-            && self.fields.is_none()
-            && self.methods.is_none()
-            && self.types.is_none()
-            && self.literals.is_none()
+        self.expected_mirrors.is_none()
     }
 }
 
@@ -883,33 +859,11 @@ fn merge_inspect_duplicates(
     };
 
     let mut duplicates = base.unwrap_or_default();
-    duplicates.lower_bound = override_duplicates.lower_bound.or(duplicates.lower_bound);
-    duplicates.discard_cost = override_duplicates.discard_cost.or(duplicates.discard_cost);
     duplicates.expected_mirrors = override_duplicates
         .expected_mirrors
         .or(duplicates.expected_mirrors);
-    duplicates.anonymize =
-        merge_inspect_anonymize(duplicates.anonymize, override_duplicates.anonymize);
 
     (!duplicates.is_empty()).then_some(duplicates)
-}
-
-fn merge_inspect_anonymize(
-    base: Option<RawInspectAnonymize>,
-    override_anonymize: Option<RawInspectAnonymize>,
-) -> Option<RawInspectAnonymize> {
-    let Some(override_anonymize) = override_anonymize else {
-        return base;
-    };
-
-    let mut anonymize = base.unwrap_or_default();
-    anonymize.variables = override_anonymize.variables.or(anonymize.variables);
-    anonymize.fields = override_anonymize.fields.or(anonymize.fields);
-    anonymize.methods = override_anonymize.methods.or(anonymize.methods);
-    anonymize.types = override_anonymize.types.or(anonymize.types);
-    anonymize.literals = override_anonymize.literals.or(anonymize.literals);
-
-    (!anonymize.is_empty()).then_some(anonymize)
 }
 
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
@@ -1405,13 +1359,6 @@ where
                 .collect()
         })
         .transpose()
-}
-
-fn deserialize_opt_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<u64>::deserialize(deserializer)
 }
 
 fn deserialize_opt_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>

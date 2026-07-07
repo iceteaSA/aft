@@ -103,6 +103,21 @@ fn assert_no_groups(aggregate: &Value) {
     );
 }
 
+fn duplicate_fixture_source() -> &'static str {
+    r#"
+export function calculate(input: number) {
+  const first = input + 1;
+  const second = first + 2;
+  const third = second + first;
+  const fourth = third + 3;
+  const fifth = fourth + third;
+  const sixth = fifth + second;
+  const seventh = sixth + fifth;
+  return seventh + third;
+}
+"#
+}
+
 #[test]
 fn inspect_duplicates_empty_project_reports_no_groups() {
     let (_temp_dir, root) = fixture_root();
@@ -117,16 +132,7 @@ fn inspect_duplicates_empty_project_reports_no_groups() {
 #[test]
 fn inspect_duplicates_identical_anonymized_ast_reports_group() {
     let (_temp_dir, root) = fixture_root();
-    let source = r#"
-export function calculate(input: number) {
-  const first = input + 1;
-  const second = first + 2;
-  const third = second + first;
-  const fourth = third + 3;
-  const fifth = fourth + third;
-  return fifth + second;
-}
-"#;
+    let source = duplicate_fixture_source();
     write_file(&root, "src/foo.ts", source);
     write_file(&root, "src/bar.ts", source);
 
@@ -153,7 +159,9 @@ export function alpha(input: number) {
   const cherry = banana + apple;
   const date = cherry + 3;
   const elderberry = date + cherry;
-  return elderberry + banana;
+  const fig = elderberry + banana;
+  const grape = fig + elderberry;
+  return grape + cherry;
 }
 "#,
     );
@@ -167,7 +175,9 @@ export function beta(source: number) {
   const three = two + one;
   const four = three + 3;
   const five = four + three;
-  return five + two;
+  const six = five + two;
+  const seven = six + five;
+  return seven + three;
 }
 "#,
     );
@@ -193,6 +203,9 @@ export function run(target: Service) {
   target.first(target);
   target.first(target);
   target.first(target);
+  target.first(target);
+  target.first(target);
+  target.first(target);
   return target.first(target);
 }
 "#,
@@ -202,6 +215,9 @@ export function run(target: Service) {
         "src/second.ts",
         r#"
 export function run(target: Service) {
+  target.second(target);
+  target.second(target);
+  target.second(target);
   target.second(target);
   target.second(target);
   target.second(target);
@@ -229,7 +245,9 @@ export function values() {
   const c = b + 13;
   const d = c + 14;
   const e = d + 15;
-  return e + 16;
+  const f = e + 16;
+  const g = f + 17;
+  return g + 18;
 }
 "#,
     );
@@ -243,7 +261,9 @@ export function values() {
   const c = b + 23;
   const d = c + 24;
   const e = d + 25;
-  return e + 26;
+  const f = e + 26;
+  const g = f + 27;
+  return g + 28;
 }
 "#,
     );
@@ -300,23 +320,12 @@ fn inspect_duplicates_unsupported_language_contributes_empty_fragments() {
 #[test]
 fn inspect_duplicates_expected_duplicate_marker_suppresses_file_groups() {
     let (_temp_dir, root) = fixture_root();
-    let source = r#"
-// aft:expected-duplicate -- fixture source intentionally duplicates the calculate function from another file.
-export function calculate(input: number) {
-  const first = input + 1;
-  const second = first + 2;
-  const third = second + first;
-  const fourth = third + 3;
-  const fifth = fourth + third;
-  return fifth + second;
-}
-"#;
-    let mirror = source.replace(
-        "// aft:expected-duplicate -- fixture source intentionally duplicates the calculate function from another file.\n",
-        "",
+    let mirror = duplicate_fixture_source();
+    let source = format!(
+        "// aft:expected-duplicate -- fixture source intentionally duplicates the calculate function from another file.\n{mirror}",
     );
-    write_file(&root, "src/marked.ts", source);
-    write_file(&root, "src/plain.ts", &mirror);
+    write_file(&root, "src/marked.ts", &source);
+    write_file(&root, "src/plain.ts", mirror);
 
     let success = run_scan(&root);
 

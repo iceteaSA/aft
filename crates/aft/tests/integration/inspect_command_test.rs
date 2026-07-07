@@ -607,7 +607,9 @@ export function calculate(input: number) {
   const third = second + first;
   const fourth = third + 3;
   const fifth = fourth + third;
-  return fifth + second;
+  const sixth = fifth + second;
+  const seventh = sixth + fifth;
+  return seventh + third;
 }
 "#
 }

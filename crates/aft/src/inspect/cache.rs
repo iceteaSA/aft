@@ -133,7 +133,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v28: Rust dead-code facts include function/type names found inside macro
 /// token trees. The aggregate scan uses those names for reachability only;
 /// call-graph navigation remains based on resolved source-level calls.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 28;
+/// v29: duplicates verdicts require every reported occurrence to span at least
+/// 10 source lines, so unchanged per-file fragment facts can now aggregate to a
+/// different surfaced group set.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 29;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1735,7 +1738,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 28);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 29);
     }
 
     #[test]
