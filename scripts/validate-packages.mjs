@@ -139,6 +139,19 @@ if (core) {
     }
   }
 
+  const coreFiles = Array.isArray(core.files) ? core.files : [];
+  if (!coreFiles.includes("src/tui-compiled")) {
+    fail(label, "files must include 'src/tui-compiled' so the published TUI ships its precompiled tree");
+  }
+
+  const tuiExportImport = core.exports?.["./tui"]?.import;
+  if (tuiExportImport !== "./src/tui/entry.mjs") {
+    fail(
+      label,
+      `exports['./tui'].import must be './src/tui/entry.mjs', got '${tuiExportImport ?? "undefined"}'`,
+    );
+  }
+
   if (core.version) platformVersions.push({ name: label, version: core.version });
 }
 
@@ -331,6 +344,7 @@ if (errors.length > 0) {
   console.log("  Platform os/cpu fields correct");
   console.log("  preferUnplugged set on all platform packages");
   console.log("  optionalDependencies complete in @cortexkit/aft-opencode and @cortexkit/aft-pi");
+  console.log("  @cortexkit/aft-opencode ships src/tui-compiled and exports ./tui through entry.mjs");
   console.log("  @cortexkit/aft-bridge dep version aligned in plugin and CLI packages");
   console.log("  bin, license, repository fields present in @cortexkit/aft and @cortexkit/aft-pi");
   process.exit(0);
