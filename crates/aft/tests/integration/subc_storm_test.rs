@@ -20,10 +20,20 @@ use tokio::sync::mpsc;
 
 use super::subc_bridge_test::{self, FakeDaemonInput};
 
-const BIND_ACK_BOUND: Duration = Duration::from_secs(2);
-const TOOL_BOUND: Duration = Duration::from_secs(5);
-const HEALTH_BOUND: Duration = Duration::from_millis(500);
-const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(700);
+// Latency bounds are production-headroom assertions calibrated for RELEASE
+// builds (the daemon ships release; the release-profile storm suite passes
+// in ~14s on a loaded box where debug fails the 2s bind bound — same tree,
+// A/B established). The main storm test additionally exercises the module's
+// REAL 12s bind deadline, which no test-side bound scaling can relax, so it
+// is debug-ignored and runs in the gate's release-profile step. The
+// remaining storm tests keep meaningful absolute bounds in debug via this
+// multiplier: a genuine starvation regression blows past 4x (the pre-fix
+// failure ran 60s+, not 2-4s), while unoptimized-build overhead does not.
+const DEBUG_BOUND_MULTIPLIER: u32 = if cfg!(debug_assertions) { 4 } else { 1 };
+const BIND_ACK_BOUND: Duration = Duration::from_secs(2 * DEBUG_BOUND_MULTIPLIER as u64);
+const TOOL_BOUND: Duration = Duration::from_secs(5 * DEBUG_BOUND_MULTIPLIER as u64);
+const HEALTH_BOUND: Duration = Duration::from_millis(500 * DEBUG_BOUND_MULTIPLIER as u64);
+const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(700 * DEBUG_BOUND_MULTIPLIER as u64);
 const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Debug)]
@@ -225,6 +235,10 @@ fn configure_sleep_delay(req: &RawRequest) -> Option<Duration> {
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "asserts production-calibrated absolute latencies (2s bind headroom, the module's real 12s bind deadline); a debug build under load cannot honor them even when correct — run via the gate's release-storm step"
+)]
 fn subc_storm_rebinds_stay_live_under_build_and_tool_traffic() {
     let scale = StormScale::from_env();
     subc_bridge_test::run_subc_bridge_test_with_dispatch(

@@ -15,6 +15,11 @@ test-threads = -2
 lsp = { max-threads = 4 }
 bash = { max-threads = 4 }
 subc = { max-threads = 4 }
+# Storm rigs assert absolute wall-clock latencies (bind headroom, readiness
+# deadlines) with each rig spawning its own module loop, executor pool, and
+# mock embedding backend. Running several concurrently makes them contend
+# with each other and fail bounds they meet deterministically in isolation.
+storm = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'binary(=lsp_registry_test) or binary(=lsp_transport_test) or test(/^lsp_/) or test(/^inspect_(diagnostics|tsconfig_membership)_test::/)'
@@ -25,5 +30,9 @@ filter = 'test(/^bash_/) or test(/^subc_bridge_test::subc_bridge_bash_/)'
 test-group = 'bash'
 
 [[profile.default.overrides]]
-filter = 'test(/^subc_bridge_test::(subc_bridge_(bg_|callgraph_|configure_|core_|duplicate_|failed_|goodbye_|l3_|lossy_|mutating_|new_|principal_|pure_|reliable_|response_|routebind_|semantic_|session_|tool_|untrusted_|watcher_)|subc_rejects_)/) or test(/^subc_storm_test::/)'
+filter = 'test(/^subc_bridge_test::(subc_bridge_(bg_|callgraph_|configure_|core_|duplicate_|failed_|goodbye_|l3_|lossy_|mutating_|new_|principal_|pure_|reliable_|response_|routebind_|semantic_|session_|tool_|untrusted_|watcher_)|subc_rejects_)/)'
 test-group = 'subc'
+
+[[profile.default.overrides]]
+filter = 'test(/^subc_storm_test::/)'
+test-group = 'storm'
