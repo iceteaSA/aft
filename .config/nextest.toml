@@ -25,5 +25,5 @@ filter = 'test(/^bash_/) or test(/^subc_bridge_test::subc_bridge_bash_/)'
 test-group = 'bash'
 
 [[profile.default.overrides]]
-filter = 'test(/^subc_bridge_test::(subc_bridge_(bg_|callgraph_|configure_|core_|duplicate_|failed_|goodbye_|l3_|lossy_|mutating_|new_|principal_|pure_|reliable_|response_|routebind_|semantic_|session_|tool_|untrusted_|watcher_)|subc_rejects_)/)'
+filter = 'test(/^subc_bridge_test::(subc_bridge_(bg_|callgraph_|configure_|core_|duplicate_|failed_|goodbye_|l3_|lossy_|mutating_|new_|principal_|pure_|reliable_|response_|routebind_|semantic_|session_|tool_|untrusted_|watcher_)|subc_rejects_)/) or test(/^subc_storm_test::/)'
 test-group = 'subc'

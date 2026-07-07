@@ -2,7 +2,7 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -31,6 +31,18 @@ use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
 use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub fn reset_semantic_stale_generation_discards_for_test() {
+    SEMANTIC_STALE_GENERATION_DISCARDS.store(0, Ordering::SeqCst);
+}
+
+#[doc(hidden)]
+pub fn semantic_stale_generation_discards_for_test() -> usize {
+    SEMANTIC_STALE_GENERATION_DISCARDS.load(Ordering::SeqCst)
+}
 
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
@@ -2416,6 +2428,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
                         != semantic_generation
                     {
+                        SEMANTIC_STALE_GENERATION_DISCARDS.fetch_add(1, Ordering::SeqCst);
                         slog_info!(
                             "semantic index build result discarded for stale generation {}",
                             semantic_generation
