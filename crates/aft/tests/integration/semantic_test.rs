@@ -564,6 +564,15 @@ fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidati
     // server thread can drain cleanly on shutdown.
     server.release_refresh();
 
+    // Drain to quiescence before shutdown: the retouch loop above may have
+    // queued several refreshes (one per unique retouch write), and graceful
+    // exit waits for the refresh worker — killing the shutdown budget under
+    // full-suite load if the queue is still being served.
+    wait_for_semantic_status(&mut aft, "refresh drained", |response| {
+        response["semantic_index"]["status"] == "ready"
+            && response["semantic_index"]["refreshing_count"] == 0
+    });
+
     let status = aft.shutdown();
     assert!(status.success());
 }
