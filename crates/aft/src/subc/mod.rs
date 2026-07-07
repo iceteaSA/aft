@@ -86,6 +86,7 @@ const RELIABLE_WRITER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(10
 const RELIABLE_WRITER_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
 
 const DISPATCH_PATH_BIND_WARN_AFTER: Duration = Duration::from_secs(6);
+const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
 
 /// Small bounded memory of completed task ids used to suppress stale lossy
 /// long-running reminders that arrive after their reliable completion event.
@@ -255,6 +256,10 @@ struct PendingBind {
     configure_request_id: String,
     started_at: Instant,
     warned_half_deadline: bool,
+    deadline_reported: bool,
+    corr: u64,
+    ver: u8,
+    flags: Flags,
 }
 
 struct RouteBindCompletion {
@@ -1251,6 +1256,12 @@ where
                 &mut bg_wake_pending,
             );
             warn_slow_pending_binds(&mut pending_binds, &executor);
+            if let Err(error) =
+                expire_overdue_route_binds(&writer_tx, &mut pending_binds, &dispatch_path_metrics)
+                    .await
+            {
+                break Err(error);
+            }
 
             let retried = push::drain_retry_buffers_for_bound_routes(
                 &writer_tx,
@@ -1923,6 +1934,59 @@ async fn handle_route_bind_completion(
     Ok(())
 }
 
+async fn expire_overdue_route_binds(
+    tx: &mpsc::Sender<Frame>,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let now = Instant::now();
+    let expired: Vec<_> = pending_binds
+        .iter()
+        .filter_map(|(route, pending)| {
+            let age = now.saturating_duration_since(pending.started_at);
+            (!pending.deadline_reported && age >= ROUTE_BIND_DEADLINE).then(|| {
+                (
+                    *route,
+                    pending.corr,
+                    pending.ver,
+                    pending.flags,
+                    pending.bind_root_id.clone(),
+                    pending.configure_request_id.clone(),
+                    age,
+                )
+            })
+        })
+        .collect();
+
+    for (route, corr, ver, flags, root_id, configure_request_id, age) in expired {
+        if let Some(pending) = pending_binds.get_mut(&route) {
+            pending.cancelled = true;
+            pending.deadline_reported = true;
+        }
+        let age_ms = age.as_millis().min(u128::from(u64::MAX)) as u64;
+        let deadline_ms = ROUTE_BIND_DEADLINE.as_millis();
+        send_route_bind_error_parts(
+            tx,
+            ver,
+            corr,
+            flags,
+            "config_divergence",
+            &format!("route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms)"),
+            metrics,
+        )
+        .await?;
+        log::warn!(
+            "subc attach: route {} bind for root {} exceeded {}ms deadline (configure_request_id={})",
+            route,
+            root_id.as_path().display(),
+            deadline_ms,
+            configure_request_id
+        );
+    }
+
+    Ok(())
+}
+
 /// channel-0 control requests: RouteBind plus the cached health probe. RouteBind
 /// still reconciles the route's RootConfig through the executor's Mutating lane
 /// and resolves completion on a loop-owned control-completion channel so slow
@@ -2085,6 +2149,10 @@ async fn handle_control_request(
                     configure_request_id: configure_request_id.clone(),
                     started_at: Instant::now(),
                     warned_half_deadline: false,
+                    deadline_reported: false,
+                    corr: frame.header.corr,
+                    ver: frame.header.ver,
+                    flags: frame.header.flags,
                 },
             );
             let configure_rx = executor.submit_async(

@@ -1,0 +1,1356 @@
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener as StdTcpListener;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use aft::context::AppContext;
+use aft::protocol::{RawRequest, Response};
+use serde_json::{json, Value};
+use subc_protocol::session::{HealthReport, ModuleControlRequest, ModuleControlResponse};
+use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget};
+use subc_transport::{read_frame, write_frame};
+use tokio::sync::mpsc;
+
+use super::subc_bridge_test::{self, FakeDaemonInput};
+
+const BIND_ACK_BOUND: Duration = Duration::from_secs(2);
+const TOOL_BOUND: Duration = Duration::from_secs(5);
+const HEALTH_BOUND: Duration = Duration::from_millis(500);
+const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(700);
+const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
+
+#[derive(Clone, Debug)]
+struct StormScale {
+    roots: usize,
+    sessions_per_root: usize,
+    storm_for: Duration,
+}
+
+impl StormScale {
+    fn from_env() -> Self {
+        let mut scale = Self {
+            roots: 4,
+            sessions_per_root: 2,
+            storm_for: Duration::from_secs(6),
+        };
+        if let Ok(raw) = std::env::var("AFT_STORM_SCALE") {
+            if let Some((roots, sessions)) = raw
+                .split_once('x')
+                .or_else(|| raw.split_once('X'))
+                .and_then(|(left, right)| Some((left.parse().ok()?, right.parse().ok()?)))
+            {
+                scale.roots = roots;
+                scale.sessions_per_root = sessions;
+            } else if let Ok(roots) = raw.parse::<usize>() {
+                scale.roots = roots;
+            }
+        }
+        scale.roots = scale.roots.max(4);
+        scale.sessions_per_root = scale.sessions_per_root.max(2);
+        scale
+    }
+}
+
+#[derive(Debug)]
+struct RouteSpec {
+    channel: u16,
+    root_index: usize,
+    session: String,
+    next_bind_at: Instant,
+    next_tool_at: Instant,
+    bind_count: usize,
+    tool_count: usize,
+}
+
+#[derive(Debug)]
+struct BindTiming {
+    route: u16,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct ToolTiming {
+    route: u16,
+    started_at: Instant,
+    name: &'static str,
+}
+
+#[derive(Debug)]
+struct HealthTiming {
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct CompletionTiming {
+    started_at: Instant,
+}
+
+#[derive(Default, Debug)]
+struct StormStats {
+    bind_latencies: Vec<Duration>,
+    max_tool_latency: Duration,
+    max_health_latency: Duration,
+    max_completion_latency: Duration,
+}
+
+struct SlowEmbeddingServer {
+    base_url: String,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl SlowEmbeddingServer {
+    fn start(delay: Duration) -> Self {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
+        let addr = listener.local_addr().expect("embedding mock addr");
+        listener
+            .set_nonblocking(true)
+            .expect("embedding mock nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        thread::spawn(move || handle_embedding_request(stream, delay));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => panic!("embedding mock accept failed: {error}"),
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for SlowEmbeddingServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(self.base_url.trim_start_matches("http://"));
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("embedding mock joins");
+        }
+    }
+}
+
+fn handle_embedding_request(mut stream: std::net::TcpStream, delay: Duration) {
+    stream
+        .set_nonblocking(false)
+        .expect("embedding request stream blocking mode");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone embedding stream"));
+    let mut headers = String::new();
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).expect("read embedding header");
+        if read == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        headers.push_str(&line);
+    }
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body).expect("read embedding body");
+    let request_body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let input_count = request_body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .or_else(|| request_body.get("input").and_then(Value::as_str).map(|_| 1))
+        .unwrap_or(1)
+        .max(1);
+    thread::sleep(delay);
+    let data: Vec<Value> = (0..input_count)
+        .map(|index| {
+            json!({
+                "embedding": [index as f64 + 0.1, index as f64 + 0.2, index as f64 + 0.3],
+                "index": index,
+            })
+        })
+        .collect();
+    let response_body = json!({ "data": data }).to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response_body.len(), response_body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .expect("write embedding response");
+}
+
+fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if req.command == "configure" {
+        if let Some(delay) = configure_sleep_delay(&req) {
+            thread::sleep(delay);
+        }
+        return aft::commands::configure::handle_configure(&req, ctx);
+    }
+    subc_bridge_test::bridge_dispatch(req, ctx)
+}
+
+fn configure_sleep_delay(req: &RawRequest) -> Option<Duration> {
+    let tiers = req.params.get("config")?.as_array()?;
+    for tier in tiers {
+        let Some(doc) = tier.get("doc").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(doc) else {
+            continue;
+        };
+        if let Some(delay_ms) = value
+            .get("subc_test_configure_sleep_ms")
+            .and_then(Value::as_u64)
+        {
+            return Some(Duration::from_millis(delay_ms));
+        }
+    }
+    None
+}
+
+#[test]
+fn subc_storm_rebinds_stay_live_under_build_and_tool_traffic() {
+    let scale = StormScale::from_env();
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "subc_storm_rebinds_stay_live_under_build_and_tool_traffic",
+        Duration::from_secs(90),
+        move |input| drive_storm_daemon(input, scale),
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn subc_storm_completion_channel_saturation_does_not_delay_binds() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "subc_storm_completion_channel_saturation_does_not_delay_binds",
+        Duration::from_secs(30),
+        drive_completion_saturation_daemon,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn subc_storm_slow_config_read_does_not_delay_bind_ack() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "subc_storm_slow_config_read_does_not_delay_bind_ack",
+        Duration::from_secs(30),
+        drive_slow_config_read_daemon,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn subc_storm_detach_rebind_replays_completion_and_preserves_bash_task() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "subc_storm_detach_rebind_replays_completion_and_preserves_bash_task",
+        Duration::from_secs(45),
+        drive_detach_rebind_daemon,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn subc_storm_route_bind_deadline_errors_and_retry_recovers() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "subc_storm_route_bind_deadline_errors_and_retry_recovers",
+        Duration::from_secs(40),
+        drive_route_bind_deadline_daemon,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
+    let delay_ms = std::env::var("AFT_STORM_EMBED_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(5_000);
+    let embedding = SlowEmbeddingServer::start(Duration::from_millis(delay_ms));
+    write_user_semantic_config(&input.user_config_path, &embedding.base_url);
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let (tx, mut rx) = start_io(session.stream);
+    let (_tempdirs, roots) = create_storm_roots(scale.roots);
+    let semantic_roots: HashSet<usize> = (0..roots.len()).filter(|index| index % 2 == 0).collect();
+
+    aft::commands::configure::reset_semantic_stale_generation_discards_for_test();
+    let mut routes = build_route_specs(&scale, &roots);
+    let mut corr = 10_000_u64;
+    let mut pending_binds = HashMap::new();
+    let mut pending_tools = HashMap::new();
+    let mut pending_health = HashMap::new();
+    let mut pending_completions = HashMap::new();
+    let mut stats = StormStats::default();
+
+    for route in &routes {
+        corr += 1;
+        send_bind(
+            &tx,
+            route.channel,
+            corr,
+            &roots[route.root_index],
+            &route.session,
+            storm_project_config(true, semantic_roots.contains(&route.root_index), false, 0),
+        );
+        pending_binds.insert(
+            corr,
+            BindTiming {
+                route: route.channel,
+                started_at: Instant::now(),
+            },
+        );
+    }
+    drain_until_idle(
+        &mut rx,
+        &mut pending_binds,
+        &mut pending_tools,
+        &mut pending_health,
+        &mut pending_completions,
+        &mut stats,
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let storm_deadline = Instant::now() + scale.storm_for;
+    let mut next_health_at = Instant::now();
+    while Instant::now() < storm_deadline {
+        let now = Instant::now();
+        for route in &mut routes {
+            let route_has_pending_bind = pending_binds
+                .values()
+                .any(|bind| bind.route == route.channel);
+            if now >= route.next_bind_at && !route_has_pending_bind {
+                route.bind_count += 1;
+                corr += 1;
+                let semantic_enabled = semantic_roots.contains(&route.root_index);
+                let config_change = route.bind_count % 10 == 0 && !semantic_enabled;
+                if !semantic_enabled {
+                    touch_between_rebinds(&roots[route.root_index], route.bind_count);
+                }
+                send_bind(
+                    &tx,
+                    route.channel,
+                    corr,
+                    &roots[route.root_index],
+                    &route.session,
+                    storm_project_config(true, semantic_enabled, config_change, 0),
+                );
+                pending_binds.insert(
+                    corr,
+                    BindTiming {
+                        route: route.channel,
+                        started_at: Instant::now(),
+                    },
+                );
+                route.next_bind_at =
+                    now + Duration::from_millis(1_300 + u64::from(route.channel % 5) * 80);
+            }
+
+            let route_has_pending_tool = pending_tools
+                .values()
+                .any(|tool| tool.route == route.channel);
+            let route_has_pending_bind = pending_binds
+                .values()
+                .any(|bind| bind.route == route.channel);
+            if now >= route.next_tool_at && !route_has_pending_tool && !route_has_pending_bind {
+                route.tool_count += 1;
+                corr += 1;
+                send_interactive_tool(
+                    &tx,
+                    route,
+                    corr,
+                    &roots[route.root_index],
+                    &mut pending_completions,
+                );
+                let name = match route.tool_count % 4 {
+                    0 => "read",
+                    1 => "write",
+                    2 => "subc_test_emit_bash_completed",
+                    _ => "subc_test_enqueue_watcher_event",
+                };
+                pending_tools.insert(
+                    corr,
+                    ToolTiming {
+                        route: route.channel,
+                        started_at: now,
+                        name,
+                    },
+                );
+                route.next_tool_at = now + Duration::from_millis(500);
+            }
+        }
+
+        if now >= next_health_at {
+            corr += 1;
+            send_control(&tx, corr, ModuleControlRequest::HealthCheck {});
+            pending_health.insert(corr, HealthTiming { started_at: now });
+            next_health_at = now + Duration::from_millis(400);
+        }
+
+        read_one_or_sleep(
+            &mut rx,
+            &mut pending_binds,
+            &mut pending_tools,
+            &mut pending_health,
+            &mut pending_completions,
+            &mut stats,
+            Duration::from_millis(25),
+        )
+        .await;
+    }
+
+    drain_until_idle(
+        &mut rx,
+        &mut pending_binds,
+        &mut pending_tools,
+        &mut pending_health,
+        &mut pending_completions,
+        &mut stats,
+        Duration::from_secs(20),
+    )
+    .await;
+    wait_for_ready_health(&tx, &mut rx, &mut corr, &roots, &semantic_roots).await;
+    assert_eq!(
+        aft::commands::configure::semantic_stale_generation_discards_for_test(),
+        0,
+        "equivalent rebinds must not discard completed semantic builds as stale"
+    );
+    assert_bind_stats(&stats.bind_latencies);
+    assert!(
+        stats.max_tool_latency <= TOOL_BOUND,
+        "max tool latency {:?} exceeded {:?}",
+        stats.max_tool_latency,
+        TOOL_BOUND
+    );
+    assert!(
+        stats.max_health_latency <= HEALTH_BOUND,
+        "max health latency {:?} exceeded {:?}",
+        stats.max_health_latency,
+        HEALTH_BOUND
+    );
+    assert!(
+        stats.max_completion_latency <= COMPLETION_PUSH_BOUND,
+        "max reliable completion push latency {:?} exceeded {:?}",
+        stats.max_completion_latency,
+        COMPLETION_PUSH_BOUND
+    );
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_completion_saturation_daemon(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let (tx, mut rx) = start_io(session.stream);
+    let (_dirs, roots) = create_storm_roots(2);
+    let mut corr = 1_000_u64;
+    send_bind(
+        &tx,
+        1,
+        corr,
+        &roots[0],
+        "saturation-a",
+        storm_project_config(false, false, false, 0),
+    );
+    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_test_emit_bash_completed_burst",
+        json!({ "prefix": "saturation", "count": 512 }),
+    );
+    corr += 1;
+    let bind_corr = corr;
+    send_bind(
+        &tx,
+        2,
+        bind_corr,
+        &roots[1],
+        "saturation-b",
+        storm_project_config(false, false, false, 0),
+    );
+    let started = Instant::now();
+    loop {
+        let frame = read_frame_from_rx(&mut rx, Duration::from_secs(10), "saturation ack").await;
+        if is_ack(&frame, bind_corr) {
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed <= BIND_ACK_BOUND,
+                "bind ack behind completion flood took {elapsed:?}"
+            );
+            break;
+        }
+    }
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_slow_config_read_daemon(input: FakeDaemonInput) {
+    let _guard = EnvGuard::set("AFT_TEST_SUBC_CONFIG_READ_DELAY_MS", "750");
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let (tx, mut rx) = start_io(session.stream);
+    let (_dirs, roots) = create_storm_roots(1);
+    let corr = 2_000_u64;
+    send_bind(
+        &tx,
+        1,
+        corr,
+        &roots[0],
+        "slow-config-read",
+        storm_project_config(false, false, false, 0),
+    );
+    let started = Instant::now();
+    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+    assert!(
+        started.elapsed() <= BIND_ACK_BOUND,
+        "slow config read bind took {:?}",
+        started.elapsed()
+    );
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let state = Arc::clone(&session.state);
+    let (tx, mut rx) = start_io(session.stream);
+    let (_dirs, roots) = create_storm_roots(1);
+    let mut corr = 3_000_u64;
+    send_bind(
+        &tx,
+        1,
+        corr,
+        &roots[0],
+        "restart-session",
+        storm_project_config(false, false, false, 0),
+    );
+    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "bash",
+        json!({ "command": "sleep 1; printf storm-task-done", "background": true, "timeout": 10_000 }),
+    );
+    let launch = expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+    let task_id = launch["task_id"].as_str().expect("task_id").to_string();
+
+    corr += 1;
+    let reliable_task = "restart-reliable-completion";
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_test_defer_bash_completed",
+        json!({ "task_id": reliable_task, "session_id": "restart-session" }),
+    );
+    expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+    send_route_goodbye(&tx, 1, corr + 10);
+    state.release_deferred_pushes();
+    corr += 20;
+    send_bind(
+        &tx,
+        2,
+        corr,
+        &roots[0],
+        "restart-session",
+        storm_project_config(false, false, false, 0),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_ack = false;
+    let mut saw_replay = false;
+    while Instant::now() < deadline && !(saw_ack && saw_replay) {
+        let frame = read_frame_from_rx(&mut rx, Duration::from_secs(5), "rebind replay").await;
+        if is_ack(&frame, corr) {
+            saw_ack = true;
+        } else if frame.header.ty == FrameType::Push
+            && push_task_id(&frame).as_deref() == Some(reliable_task)
+        {
+            saw_replay = true;
+        }
+    }
+    assert!(saw_ack, "rebind ack missing");
+    assert!(
+        saw_replay,
+        "reliable completion was not replayed after rebind"
+    );
+
+    corr += 1;
+    send_tool(&tx, 2, corr, "bash_status", json!({ "task_id": task_id }));
+    let status = expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+    assert!(
+        status["status"].as_str().is_some(),
+        "detached background task status should be recoverable after rebind: {status:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    corr += 1;
+    send_tool(&tx, 2, corr, "bash_status", json!({ "task_id": task_id }));
+    let final_status = expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+    assert!(
+        matches!(
+            final_status["status"].as_str(),
+            Some("completed") | Some("exited")
+        ),
+        "detached background task should finish before the test leaves it behind: {final_status:?}"
+    );
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_route_bind_deadline_daemon(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let (tx, mut rx) = start_io(session.stream);
+    let (_dirs, roots) = create_storm_roots(1);
+    let mut corr = 4_000_u64;
+    send_bind(
+        &tx,
+        1,
+        corr,
+        &roots[0],
+        "deadline-session",
+        storm_project_config(false, false, false, 0),
+    );
+    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+
+    corr += 1;
+    let slow_corr = corr;
+    send_bind(
+        &tx,
+        1,
+        slow_corr,
+        &roots[0],
+        "deadline-session",
+        storm_project_config(
+            false,
+            false,
+            true,
+            ROUTE_BIND_DEADLINE.as_millis() as u64 + 750,
+        ),
+    );
+    let started = Instant::now();
+    let error = expect_error(
+        &mut rx,
+        slow_corr,
+        ROUTE_BIND_DEADLINE + Duration::from_secs(3),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= ROUTE_BIND_DEADLINE && elapsed <= ROUTE_BIND_DEADLINE + Duration::from_secs(2),
+        "deadline surfaced at {elapsed:?}, expected about {ROUTE_BIND_DEADLINE:?}"
+    );
+    assert_eq!(
+        error.get("code").and_then(Value::as_str),
+        Some("config_divergence")
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    corr += 1;
+    send_bind(
+        &tx,
+        1,
+        corr,
+        &roots[0],
+        "deadline-session",
+        storm_project_config(false, false, false, 0),
+    );
+    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+    send_goodbye_and_wait(&tx).await;
+}
+
+fn build_route_specs(scale: &StormScale, roots: &[PathBuf]) -> Vec<RouteSpec> {
+    let mut routes = Vec::new();
+    let now = Instant::now();
+    for root_index in 0..roots.len() {
+        for session_index in 0..scale.sessions_per_root {
+            let channel = (routes.len() + 1) as u16;
+            routes.push(RouteSpec {
+                channel,
+                root_index,
+                session: format!("storm-r{root_index}-s{session_index}"),
+                next_bind_at: now + Duration::from_millis(1_300 + u64::from(channel % 5) * 80),
+                next_tool_at: now + Duration::from_millis(200 + u64::from(channel % 3) * 75),
+                bind_count: if root_index % 2 == 1 && session_index == 0 {
+                    9
+                } else {
+                    0
+                },
+                tool_count: 0,
+            });
+        }
+    }
+    routes
+}
+
+fn create_storm_roots(count: usize) -> (Vec<tempfile::TempDir>, Vec<PathBuf>) {
+    let mut dirs = Vec::new();
+    let mut paths = Vec::new();
+    for index in 0..count {
+        let dir = tempfile::tempdir().expect("storm root tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("storm src dir");
+        std::fs::write(
+            src.join("lib.rs"),
+            format!(
+                "pub fn root_{index}_alpha() -> usize {{ {index} }}\npub fn root_{index}_beta() -> usize {{ root_{index}_alpha() + 1 }}\n"
+            ),
+        )
+        .expect("storm lib file");
+        std::fs::write(
+            dir.path().join("README.md"),
+            format!("# storm root {index}\n"),
+        )
+        .expect("storm readme");
+        init_git(dir.path());
+        paths.push(dir.path().to_path_buf());
+        dirs.push(dir);
+    }
+    (dirs, paths)
+}
+
+fn init_git(root: &Path) {
+    assert!(Command::new("git")
+        .current_dir(root)
+        .args(["init", "--quiet"])
+        .status()
+        .expect("git init")
+        .success());
+    assert!(Command::new("git")
+        .current_dir(root)
+        .args(["add", "."])
+        .status()
+        .expect("git add")
+        .success());
+    assert!(Command::new("git")
+        .current_dir(root)
+        .args([
+            "-c",
+            "user.name=AFT Tests",
+            "-c",
+            "user.email=aft-tests@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial"
+        ])
+        .status()
+        .expect("git commit")
+        .success());
+}
+
+fn touch_between_rebinds(root: &Path, count: usize) {
+    std::fs::write(
+        root.join("src").join(format!("storm_touch_{count}.rs")),
+        format!("pub fn storm_touch_{count}() -> usize {{ {count} }}\n"),
+    )
+    .expect("write storm touch file");
+}
+
+fn write_user_semantic_config(path: &Path, base_url: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("user config parent");
+    }
+    std::fs::write(
+        path,
+        json!({
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": "storm-embedding",
+                "base_url": base_url,
+                "timeout_ms": 60_000,
+                "max_batch_size": 64,
+                "max_files": 1_000,
+            }
+        })
+        .to_string(),
+    )
+    .expect("write user semantic config");
+}
+
+fn storm_project_config(
+    search: bool,
+    semantic: bool,
+    changed: bool,
+    configure_sleep_ms: u64,
+) -> Value {
+    let mut doc = json!({
+        "search_index": search,
+        "semantic_search": semantic,
+        "callgraph_store": false,
+        "inspect": { "enabled": changed },
+        "tool_surface": "all",
+    });
+    if configure_sleep_ms > 0 {
+        doc["subc_test_configure_sleep_ms"] = json!(configure_sleep_ms);
+    }
+    doc
+}
+
+fn send_interactive_tool(
+    tx: &mpsc::UnboundedSender<Frame>,
+    route: &RouteSpec,
+    corr: u64,
+    root: &Path,
+    pending_completions: &mut HashMap<String, CompletionTiming>,
+) {
+    match route.tool_count % 4 {
+        0 => send_tool(
+            tx,
+            route.channel,
+            corr,
+            "read",
+            json!({ "filePath": "README.md", "limit": 20 }),
+        ),
+        1 => send_tool(
+            tx,
+            route.channel,
+            corr,
+            "write",
+            json!({
+                "filePath": format!("storm_session_{}.txt", route.channel),
+                "content": format!("route={} tool={}\n", route.channel, route.tool_count),
+            }),
+        ),
+        2 => {
+            let task_id = format!("storm-completion-{}-{}", route.channel, route.tool_count);
+            pending_completions.insert(
+                task_id.clone(),
+                CompletionTiming {
+                    started_at: Instant::now(),
+                },
+            );
+            send_tool(
+                tx,
+                route.channel,
+                corr,
+                "subc_test_emit_bash_completed",
+                json!({ "task_id": task_id, "session_id": route.session }),
+            );
+        }
+        _ => {
+            let _ = root;
+            send_tool(
+                tx,
+                route.channel,
+                corr,
+                "subc_test_enqueue_watcher_event",
+                json!({}),
+            );
+        }
+    }
+}
+
+fn start_io(
+    stream: tokio::net::TcpStream,
+) -> (mpsc::UnboundedSender<Frame>, mpsc::UnboundedReceiver<Frame>) {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<Frame>();
+    let (mut read_half, mut write_half) = stream.into_split();
+    tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if write_frame(&mut write_half, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            match read_frame(&mut read_half).await {
+                Ok(Some(frame)) => {
+                    if in_tx.send(frame).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => panic!("storm io read failed: {error}"),
+            }
+        }
+    });
+    (out_tx, in_rx)
+}
+
+fn send_bind(
+    tx: &mpsc::UnboundedSender<Frame>,
+    channel: u16,
+    corr: u64,
+    root: &Path,
+    session: &str,
+    doc: Value,
+) {
+    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
+    std::fs::create_dir_all(project_cfg.parent().expect("project cfg parent")).expect("cfg dir");
+    std::fs::write(&project_cfg, serde_json::to_string(&doc).expect("cfg json"))
+        .expect("write cfg");
+    let request = ModuleControlRequest::RouteBind {
+        route_channel: channel,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: BindIdentity {
+            project_root: root.to_path_buf(),
+            harness: "opencode".to_string(),
+            session: session.to_string(),
+        },
+        principal: Some(Principal::Direct),
+    };
+    send_control(tx, corr, request);
+}
+
+fn send_control(tx: &mpsc::UnboundedSender<Frame>, corr: u64, request: ModuleControlRequest) {
+    tx.send(
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            corr,
+            serde_json::to_vec(&request).expect("control body"),
+        )
+        .expect("control frame"),
+    )
+    .expect("send control frame");
+}
+
+fn send_tool(
+    tx: &mpsc::UnboundedSender<Frame>,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+) {
+    tx.send(
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            corr,
+            serde_json::to_vec(&json!({ "name": name, "arguments": arguments }))
+                .expect("tool body"),
+        )
+        .expect("tool frame"),
+    )
+    .expect("send tool frame");
+}
+
+fn send_route_goodbye(tx: &mpsc::UnboundedSender<Frame>, channel: u16, corr: u64) {
+    tx.send(
+        Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Passive, false),
+            channel,
+            corr,
+            Vec::new(),
+        )
+        .expect("route goodbye"),
+    )
+    .expect("send route goodbye");
+}
+
+async fn send_goodbye_and_wait(tx: &mpsc::UnboundedSender<Frame>) {
+    send_goodbye(tx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+fn send_goodbye(tx: &mpsc::UnboundedSender<Frame>) {
+    tx.send(
+        Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            999_999,
+            Vec::new(),
+        )
+        .expect("goodbye"),
+    )
+    .expect("send goodbye");
+}
+
+async fn read_one_or_sleep(
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    pending_binds: &mut HashMap<u64, BindTiming>,
+    pending_tools: &mut HashMap<u64, ToolTiming>,
+    pending_health: &mut HashMap<u64, HealthTiming>,
+    pending_completions: &mut HashMap<String, CompletionTiming>,
+    stats: &mut StormStats,
+    timeout: Duration,
+) {
+    if let Ok(Some(frame)) = tokio::time::timeout(timeout, rx.recv()).await {
+        process_storm_frame(
+            frame,
+            pending_binds,
+            pending_tools,
+            pending_health,
+            pending_completions,
+            stats,
+        );
+    }
+}
+
+async fn drain_until_idle(
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    pending_binds: &mut HashMap<u64, BindTiming>,
+    pending_tools: &mut HashMap<u64, ToolTiming>,
+    pending_health: &mut HashMap<u64, HealthTiming>,
+    pending_completions: &mut HashMap<String, CompletionTiming>,
+    stats: &mut StormStats,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline
+        && (!pending_binds.is_empty()
+            || !pending_tools.is_empty()
+            || !pending_health.is_empty()
+            || !pending_completions.is_empty())
+    {
+        read_one_or_sleep(
+            rx,
+            pending_binds,
+            pending_tools,
+            pending_health,
+            pending_completions,
+            stats,
+            Duration::from_millis(100),
+        )
+        .await;
+    }
+    assert!(
+        pending_binds.is_empty(),
+        "pending binds did not drain: {pending_binds:?}"
+    );
+    assert!(
+        pending_tools.is_empty(),
+        "pending tools did not drain: {pending_tools:?}"
+    );
+    assert!(
+        pending_health.is_empty(),
+        "pending health checks did not drain: {pending_health:?}"
+    );
+    assert!(
+        pending_completions.is_empty(),
+        "pending completions did not drain: {pending_completions:?}"
+    );
+}
+
+fn process_storm_frame(
+    frame: Frame,
+    pending_binds: &mut HashMap<u64, BindTiming>,
+    pending_tools: &mut HashMap<u64, ToolTiming>,
+    pending_health: &mut HashMap<u64, HealthTiming>,
+    pending_completions: &mut HashMap<String, CompletionTiming>,
+    stats: &mut StormStats,
+) {
+    match frame.header.ty {
+        FrameType::Response if frame.header.channel == 0 => {
+            let response: ModuleControlResponse =
+                serde_json::from_slice(&frame.body).expect("control response");
+            if matches!(response, ModuleControlResponse::RouteBindAck {}) {
+                let timing = pending_binds
+                    .remove(&frame.header.corr)
+                    .expect("unexpected bind ack");
+                let elapsed = timing.started_at.elapsed();
+                assert!(
+                    elapsed <= BIND_ACK_BOUND,
+                    "RouteBindAck for route {} took {elapsed:?}",
+                    timing.route
+                );
+                stats.bind_latencies.push(elapsed);
+            } else if let Some(report) = response.health_report() {
+                let timing = pending_health
+                    .remove(&frame.header.corr)
+                    .expect("unexpected health response");
+                let elapsed = timing.started_at.elapsed();
+                assert!(elapsed <= HEALTH_BOUND, "health.check took {elapsed:?}");
+                stats.max_health_latency = stats.max_health_latency.max(elapsed);
+                assert_pending_bind_age(&report);
+            }
+        }
+        FrameType::Response => {
+            let timing = pending_tools
+                .remove(&frame.header.corr)
+                .expect("unexpected tool response");
+            let elapsed = timing.started_at.elapsed();
+            assert!(
+                elapsed <= TOOL_BOUND,
+                "{} on route {} took {elapsed:?}",
+                timing.name,
+                timing.route
+            );
+            stats.max_tool_latency = stats.max_tool_latency.max(elapsed);
+            let body: Value = serde_json::from_slice(&frame.body).expect("tool response body");
+            assert_ne!(
+                body.get("isError").and_then(Value::as_bool),
+                Some(true),
+                "tool failed: {body:?}"
+            );
+        }
+        FrameType::Push => {
+            if let Some(task_id) = push_task_id(&frame) {
+                if let Some(timing) = pending_completions.remove(task_id.as_str()) {
+                    let elapsed = timing.started_at.elapsed();
+                    assert!(
+                        elapsed <= COMPLETION_PUSH_BOUND,
+                        "completion {task_id} push took {elapsed:?}"
+                    );
+                    stats.max_completion_latency = stats.max_completion_latency.max(elapsed);
+                }
+            }
+        }
+        FrameType::Error => {
+            let body: Value = serde_json::from_slice(&frame.body).expect("error body");
+            panic!(
+                "unexpected error frame on channel {} corr {}: {body:?}",
+                frame.header.channel, frame.header.corr
+            );
+        }
+        other => panic!("unexpected storm frame: {other:?}"),
+    }
+}
+
+fn assert_pending_bind_age(report: &HealthReport) {
+    let Some(metrics) = report.metrics.as_ref() else {
+        return;
+    };
+    let Some(age) = metrics
+        .pointer("/dispatch_path/pending_binds/oldest_age_ms")
+        .and_then(Value::as_u64)
+    else {
+        return;
+    };
+    assert!(
+        age <= BIND_ACK_BOUND.as_millis() as u64,
+        "pending_binds.oldest_age_ms exceeded bind bound: {age}"
+    );
+}
+
+async fn wait_for_ready_health(
+    tx: &mpsc::UnboundedSender<Frame>,
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: &mut u64,
+    roots: &[PathBuf],
+    semantic_roots: &HashSet<usize>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(80);
+    loop {
+        *corr += 1;
+        send_control(tx, *corr, ModuleControlRequest::HealthCheck {});
+        let response =
+            read_control_response(rx, *corr, Duration::from_secs(5), "ready health").await;
+        let report = response.health_report().expect("health report");
+        if health_has_ready_roots(&report, roots, semantic_roots) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "roots did not become ready: {report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn health_has_ready_roots(
+    report: &HealthReport,
+    roots: &[PathBuf],
+    semantic_roots: &HashSet<usize>,
+) -> bool {
+    let Some(metrics) = report.metrics.as_ref() else {
+        return false;
+    };
+    let Some(entries) = metrics.get("roots").and_then(Value::as_array) else {
+        return false;
+    };
+    for (index, root) in roots.iter().enumerate() {
+        let expected = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        let expected = strip_verbatim(&expected.to_string_lossy());
+        let Some(entry) = entries.iter().find(|entry| {
+            entry
+                .get("project_root")
+                .and_then(Value::as_str)
+                .map(strip_verbatim)
+                .as_deref()
+                == Some(expected.as_str())
+        }) else {
+            return false;
+        };
+        if entry.get("state").and_then(Value::as_str) != Some("ready") {
+            return false;
+        }
+        if entry
+            .pointer("/search_index/status")
+            .and_then(Value::as_str)
+            != Some("ready")
+        {
+            return false;
+        }
+        let expected_semantic = if semantic_roots.contains(&index) {
+            "ready"
+        } else {
+            "disabled"
+        };
+        if entry
+            .pointer("/semantic_index/status")
+            .and_then(Value::as_str)
+            != Some(expected_semantic)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn strip_verbatim(path: &str) -> String {
+    path.trim_start_matches(r"\\?\").to_string()
+}
+
+fn assert_bind_stats(latencies: &[Duration]) {
+    assert!(
+        !latencies.is_empty(),
+        "storm produced no bind acknowledgements"
+    );
+    let max = *latencies.iter().max().expect("max bind latency");
+    let mut sorted = latencies.to_vec();
+    sorted.sort();
+    let p99_index = sorted
+        .len()
+        .saturating_sub(1)
+        .min((sorted.len() * 99) / 100);
+    let p99 = sorted[p99_index];
+    assert!(
+        max <= BIND_ACK_BOUND,
+        "max bind latency {max:?} exceeded {BIND_ACK_BOUND:?}; p99={p99:?}"
+    );
+}
+
+async fn expect_ack_within(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64, bound: Duration) {
+    let started = Instant::now();
+    loop {
+        let frame = read_frame_from_rx(rx, bound, "RouteBindAck").await;
+        if is_ack(&frame, corr) {
+            let elapsed = started.elapsed();
+            assert!(elapsed <= bound, "RouteBindAck {corr} took {elapsed:?}");
+            return;
+        }
+    }
+}
+
+async fn expect_tool_response(
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: u64,
+    timeout: Duration,
+) -> Value {
+    loop {
+        let frame = read_frame_from_rx(rx, timeout, "tool response").await;
+        if frame.header.ty == FrameType::Response && frame.header.corr == corr {
+            let body: Value = serde_json::from_slice(&frame.body).expect("tool body");
+            assert_ne!(
+                body.get("isError").and_then(Value::as_bool),
+                Some(true),
+                "tool failed: {body:?}"
+            );
+            return body.get("structuredContent").cloned().unwrap_or(body);
+        }
+    }
+}
+
+async fn expect_error(
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: u64,
+    timeout: Duration,
+) -> Value {
+    loop {
+        let frame = read_frame_from_rx(rx, timeout, "error frame").await;
+        if frame.header.ty == FrameType::Error && frame.header.corr == corr {
+            return serde_json::from_slice::<Value>(&frame.body).expect("error body");
+        }
+    }
+}
+
+async fn read_control_response(
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: u64,
+    timeout: Duration,
+    label: &str,
+) -> ModuleControlResponse {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        assert!(!remaining.is_zero(), "timed out waiting for {label}");
+        let frame = read_frame_from_rx(rx, remaining, label).await;
+        if frame.header.ty == FrameType::Response
+            && frame.header.channel == 0
+            && frame.header.corr == corr
+        {
+            return serde_json::from_slice(&frame.body).expect("control response body");
+        }
+    }
+}
+
+async fn read_frame_from_rx(
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    timeout: Duration,
+    label: &str,
+) -> Frame {
+    tokio::time::timeout(timeout, rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+        .unwrap_or_else(|| panic!("EOF waiting for {label}"))
+}
+
+fn is_ack(frame: &Frame, corr: u64) -> bool {
+    if frame.header.ty != FrameType::Response
+        || frame.header.channel != 0
+        || frame.header.corr != corr
+    {
+        return false;
+    }
+    serde_json::from_slice::<ModuleControlResponse>(&frame.body)
+        .is_ok_and(|response| matches!(response, ModuleControlResponse::RouteBindAck {}))
+}
+
+fn push_task_id(frame: &Frame) -> Option<String> {
+    let body: Value = serde_json::from_slice(&frame.body).ok()?;
+    body.get("task_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}

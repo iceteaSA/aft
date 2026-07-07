@@ -12,10 +12,9 @@
 //! user file is trusted (the user's own disk), the project file is untrusted
 //! (in-repo) and has its privileged fields dropped.
 
+use crate::config_resolve::ConfigTier;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-
-use crate::config_resolve::ConfigTier;
 
 /// CortexKit user config home: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`, falling
 /// back to `~/.config/cortexkit/aft.jsonc`. Matches the shared CortexKit
@@ -54,6 +53,14 @@ fn cortexkit_project_config_path(project_root: &Path) -> PathBuf {
 /// unreadable file silently.
 fn read_tiers_from(user_config_path: Option<&Path>, project_config_path: &Path) -> Vec<ConfigTier> {
     let mut tiers = Vec::new();
+
+    #[cfg(debug_assertions)]
+    if let Some(delay_ms) = std::env::var("AFT_TEST_SUBC_CONFIG_READ_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
 
     if let Some(user_path) = user_config_path {
         if let Ok(doc) = std::fs::read_to_string(user_path) {

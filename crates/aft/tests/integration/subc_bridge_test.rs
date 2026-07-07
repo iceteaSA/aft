@@ -35,35 +35,36 @@ use tokio::net::TcpListener;
 static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
 static BRIDGE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
-struct FakeDaemonInput {
-    listener: TcpListener,
-    key: Vec<u8>,
-    daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
-    root1: std::path::PathBuf,
-    root2: std::path::PathBuf,
-    failed_root: std::path::PathBuf,
-    push_burst_root: std::path::PathBuf,
-    slow_root: std::path::PathBuf,
-    callgraph_root: std::path::PathBuf,
-    callgraph_file: std::path::PathBuf,
-    state: Arc<BridgeState>,
-    executor: Arc<Executor>,
+pub(super) struct FakeDaemonInput {
+    pub(super) listener: TcpListener,
+    pub(super) key: Vec<u8>,
+    pub(super) daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
+    pub(super) root1: std::path::PathBuf,
+    pub(super) root2: std::path::PathBuf,
+    pub(super) failed_root: std::path::PathBuf,
+    pub(super) push_burst_root: std::path::PathBuf,
+    pub(super) slow_root: std::path::PathBuf,
+    pub(super) callgraph_root: std::path::PathBuf,
+    pub(super) callgraph_file: std::path::PathBuf,
+    pub(super) state: Arc<BridgeState>,
+    pub(super) executor: Arc<Executor>,
+    pub(super) user_config_path: std::path::PathBuf,
 }
 
-struct FakeDaemonSession {
-    stream: tokio::net::TcpStream,
-    root1: std::path::PathBuf,
-    root2: std::path::PathBuf,
-    failed_root: std::path::PathBuf,
-    push_burst_root: std::path::PathBuf,
-    slow_root: std::path::PathBuf,
-    callgraph_root: std::path::PathBuf,
-    callgraph_file: std::path::PathBuf,
-    state: Arc<BridgeState>,
-    executor: Arc<Executor>,
+pub(super) struct FakeDaemonSession {
+    pub(super) stream: tokio::net::TcpStream,
+    pub(super) root1: std::path::PathBuf,
+    pub(super) root2: std::path::PathBuf,
+    pub(super) failed_root: std::path::PathBuf,
+    pub(super) push_burst_root: std::path::PathBuf,
+    pub(super) slow_root: std::path::PathBuf,
+    pub(super) callgraph_root: std::path::PathBuf,
+    pub(super) callgraph_file: std::path::PathBuf,
+    pub(super) state: Arc<BridgeState>,
+    pub(super) executor: Arc<Executor>,
 }
 
-struct SubcBridgeTestRoots {
+pub(super) struct SubcBridgeTestRoots {
     root1: tempfile::TempDir,
     root2: tempfile::TempDir,
     failed_root: tempfile::TempDir,
@@ -109,7 +110,7 @@ impl SubcBridgeTestRoots {
 }
 
 #[derive(Default)]
-struct BridgeState {
+pub(super) struct BridgeState {
     inner: Mutex<BridgeInner>,
     cv: Condvar,
 }
@@ -288,7 +289,7 @@ impl BridgeState {
         guard.deferred_push_started
     }
 
-    fn release_deferred_pushes(&self) {
+    pub(super) fn release_deferred_pushes(&self) {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.deferred_push_release = true;
         self.cv.notify_all();
@@ -844,7 +845,7 @@ fn enqueue_semantic_refresh_event_for_test(
     )
 }
 
-fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = current_bridge_state();
     match req.command.as_str() {
         "configure" => {
@@ -1139,7 +1140,15 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
     Fut: Future<Output = ()> + 'static,
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
-    run_subc_bridge_test_inner(name, watchdog, env_setup, driver, after, true);
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        env_setup,
+        driver,
+        after,
+        true,
+        bridge_dispatch,
+    );
 }
 
 fn run_subc_bridge_production_test<F, Fut, A>(
@@ -1152,7 +1161,29 @@ fn run_subc_bridge_production_test<F, Fut, A>(
     Fut: Future<Output = ()> + 'static,
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
-    run_subc_bridge_test_inner(name, watchdog, Vec::new, driver, after, false);
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        false,
+        bridge_dispatch,
+    );
+}
+
+pub(super) fn run_subc_bridge_test_with_dispatch<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    driver: F,
+    after: A,
+    dispatch: aft::subc::DispatchFn,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(name, watchdog, Vec::new, driver, after, true, dispatch);
 }
 
 fn run_subc_bridge_test_inner<E, F, Fut, A>(
@@ -1162,6 +1193,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     driver: F,
     after: A,
     allow_native_passthrough: bool,
+    dispatch: aft::subc::DispatchFn,
 ) where
     E: FnOnce() -> Vec<EnvVarGuard>,
     F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
@@ -1175,6 +1207,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
 
     let roots = SubcBridgeTestRoots::new();
     let conn_path = roots.conn_dir.path().join("subc-connection.json");
+    let user_config_path = roots.storage.path().join("user-aft.jsonc");
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -1221,6 +1254,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let slow_root_path = roots.slow_root.path().to_path_buf();
     let callgraph_root_path = roots.callgraph_root.path().to_path_buf();
     let callgraph_file_path = roots.callgraph_file.clone();
+    let user_config_path_for_daemon = user_config_path.clone();
     let daemon = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1243,6 +1277,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
                     callgraph_file: callgraph_file_path,
                     state: daemon_state,
                     executor: executor_for_daemon,
+                    user_config_path: user_config_path_for_daemon,
                 }),
             )
             .await
@@ -1250,25 +1285,13 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
         });
     });
 
-    // Inject a hermetic (nonexistent) user config path so the W5 local read
-    // never touches a real ~/.config/cortexkit/aft.jsonc on the dev/CI machine.
-    let user_config_path = roots.storage.path().join("nonexistent-user-aft.jsonc");
+    // Inject a hermetic user config path so local config reads never touch a
+    // real ~/.config/cortexkit/aft.jsonc on the dev/CI machine. Most tests leave
+    // it absent; storm tests can write it through FakeDaemonInput.
     let run_result = if allow_native_passthrough {
-        run_subc_mode_for_test(
-            &conn_path,
-            ctx,
-            executor,
-            bridge_dispatch,
-            Some(user_config_path),
-        )
+        run_subc_mode_for_test(&conn_path, ctx, executor, dispatch, Some(user_config_path))
     } else {
-        run_subc_mode(
-            &conn_path,
-            ctx,
-            executor,
-            bridge_dispatch,
-            Some(user_config_path),
-        )
+        run_subc_mode(&conn_path, ctx, executor, dispatch, Some(user_config_path))
     };
     let join_result = daemon.join();
     clear_bridge_state();
@@ -2119,7 +2142,7 @@ async fn drive_s1_rejection_daemon(
     drop(stream);
 }
 
-async fn open_fake_daemon_session_with_hello(
+pub(super) async fn open_fake_daemon_session_with_hello(
     input: FakeDaemonInput,
 ) -> (FakeDaemonSession, ModuleHelloBody) {
     let FakeDaemonInput {
@@ -2135,6 +2158,7 @@ async fn open_fake_daemon_session_with_hello(
         callgraph_file,
         state,
         executor,
+        user_config_path: _,
     } = input;
     let (mut stream, _) = listener.accept().await.expect("accept aft client");
     authenticate_server(
@@ -2187,7 +2211,7 @@ async fn open_fake_daemon_session_with_hello(
     )
 }
 
-async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
+pub(super) async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
     let (session, _) = open_fake_daemon_session_with_hello(input).await;
     session
 }
@@ -2203,7 +2227,7 @@ async fn bind_routes_1_and_4(stream: &mut tokio::net::TcpStream, root1: &std::pa
     expect_route_bind_ack(stream, 44).await;
 }
 
-async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
+pub(super) async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
     send_frame(
         stream,
         Frame::build(FrameType::Goodbye, control_flags(), 0, 99, Vec::new())
