@@ -313,6 +313,7 @@ pub fn subc_translate_owned_with_context(
         "zoom" => translate_zoom(agent_args, project_root),
         "inspect" => translate_inspect(agent_args, project_root),
         "callgraph" => translate_callgraph(agent_args, project_root),
+        "gather" => translate_gather(agent_args, project_root),
         "conflicts" => translate_conflicts(agent_args),
         "ast_search" => translate_ast_search(agent_args),
         "ast_replace" => translate_ast_replace(agent_args),
@@ -1176,6 +1177,62 @@ fn translate_safety(args: Value, project_root: &Path) -> Result<Translated, Tran
 
     Ok(Translated {
         command: command.into(),
+        args: out,
+    })
+}
+
+fn translate_gather(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let has_question = map_in
+        .get("question")
+        .and_then(Value::as_str)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_symbol = map_in
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    if has_question && (has_symbol || has_file_path) {
+        return Err(invalid_request(
+            "aft_gather: provide exactly ONE mode — either 'question' OR 'symbol'+'filePath'",
+        ));
+    }
+    if has_symbol != has_file_path {
+        return Err(invalid_request(
+            "aft_gather: 'symbol' and 'filePath' must be provided together",
+        ));
+    }
+    if !has_question && !has_symbol && !has_file_path {
+        return Err(invalid_request(
+            "aft_gather: provide either 'question' or 'symbol'+'filePath'",
+        ));
+    }
+
+    let mut out = Map::new();
+    for key in &["question", "symbol", "budget"] {
+        if let Some(value) = map_in.get(*key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(file_path) = map_in.get("filePath").and_then(Value::as_str) {
+        if !file_path.is_empty() {
+            let resolved = resolve_path_from_project_root(project_root, file_path);
+            out.insert(
+                "filePath".to_string(),
+                Value::String(resolved.to_string_lossy().into_owned()),
+            );
+        }
+    }
+
+    Ok(Translated {
+        command: "gather".into(),
         args: out,
     })
 }

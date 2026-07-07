@@ -82,6 +82,7 @@ import { instrumentToolMap } from "./tool-perf.js";
 import { astTools } from "./tools/ast.js";
 import { bashToolDescription } from "./tools/bash.js";
 import { conflictTools } from "./tools/conflicts.js";
+import { gatherTools } from "./tools/gather.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
 import {
@@ -994,7 +995,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   const surface = aftConfig.tool_surface ?? "recommended";
 
   // Tools only available in "all" tier
-  const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"]);
+  const ALL_ONLY_TOOLS = new Set([
+    "aft_callgraph",
+    "aft_gather",
+    "aft_delete",
+    "aft_move",
+    "aft_refactor",
+  ]);
 
   // Build full tool map
   const allTools = normalizeToolMap({
@@ -1016,6 +1023,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...refactoringTools(ctx),
     // Git conflicts: recommended+
     ...(surface !== "minimal" && conflictTools(ctx)),
+    ...gatherTools(ctx),
   });
 
   // Remove all-only tools when surface is minimal or recommended
