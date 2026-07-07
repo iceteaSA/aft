@@ -844,6 +844,7 @@ mod tests {
                 harness: "opencode".to_string(),
                 session: session.clone(),
                 trust: BindTrust::FirstParty,
+                consumer_elicitation_capable: false,
             },
         );
         let mut root_channels = HashMap::new();

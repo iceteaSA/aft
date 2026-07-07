@@ -190,6 +190,13 @@ fn set_test_force_bash_promote_panic() -> EnvVarGuard {
     EnvVarGuard { key, previous }
 }
 
+fn set_test_bash_elicitation_ttl_ms(ms: u64) -> EnvVarGuard {
+    let key = "AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS";
+    let previous = std::env::var_os(key);
+    std::env::set_var(key, ms.to_string());
+    EnvVarGuard { key, previous }
+}
+
 fn install_bridge_state(state: Arc<BridgeState>) {
     let mut guard = bridge_state_slot()
         .lock()
@@ -1471,6 +1478,67 @@ fn subc_bridge_fed_harness_enforces_restrict_and_bash_deny() {
         "subc_bridge_fed_harness_enforces_restrict_and_bash_deny",
         Duration::from_secs(60),
         drive_fed_harness_untrusted_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_untrusted_bash_elicitation_allow_round_trip() {
+    run_subc_bridge_test(
+        "subc_bridge_untrusted_bash_elicitation_allow_round_trip",
+        Duration::from_secs(45),
+        drive_bash_elicitation_allow_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_untrusted_bash_elicitation_deny_and_malformed_fail_closed() {
+    run_subc_bridge_test(
+        "subc_bridge_untrusted_bash_elicitation_deny_and_malformed_fail_closed",
+        Duration::from_secs(60),
+        drive_bash_elicitation_deny_and_malformed_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_untrusted_bash_elicitation_ttl_denies_and_settles() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_untrusted_bash_elicitation_ttl_denies_and_settles",
+        Duration::from_secs(45),
+        || vec![set_test_bash_elicitation_ttl_ms(150)],
+        drive_bash_elicitation_ttl_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_untrusted_bash_elicitation_goodbye_sweeps_pending() {
+    run_subc_bridge_test(
+        "subc_bridge_untrusted_bash_elicitation_goodbye_sweeps_pending",
+        Duration::from_secs(45),
+        drive_bash_elicitation_goodbye_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_untrusted_bash_without_elicitation_stays_denied() {
+    run_subc_bridge_test(
+        "subc_bridge_untrusted_bash_without_elicitation_stays_denied",
+        Duration::from_secs(45),
+        drive_bash_no_elicitation_regression_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_first_party_bash_permission_required_stays_in_band() {
+    run_subc_bridge_test(
+        "subc_bridge_first_party_bash_permission_required_stays_in_band",
+        Duration::from_secs(45),
+        drive_first_party_bash_permission_required_regression_daemon,
         |_, _, _| {},
     );
 }
@@ -3931,6 +3999,160 @@ async fn bind_route_with_principal(
     expect_route_bind_ack(stream, corr).await;
 }
 
+async fn bind_untrusted_elicitation_route(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    root: &std::path::Path,
+) {
+    send_route_bind_with_elicitation_capability(stream, route_channel, corr, root).await;
+    expect_route_bind_ack(stream, corr).await;
+}
+
+async fn send_route_bind_with_elicitation_capability(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    root: &std::path::Path,
+) {
+    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
+    std::fs::create_dir_all(project_cfg.parent().expect("cortexkit dir parent"))
+        .expect("create .cortexkit dir");
+    std::fs::write(
+        &project_cfg,
+        serde_json::to_string(&minimal_bind_doc()).expect("serialize bind doc"),
+    )
+    .expect("write project config");
+
+    let body = json!({
+        "op": "route.bind",
+        "route_channel": route_channel,
+        "target": RouteTarget::ToolProvider { module_id: "aft".to_string() },
+        "identity": BindIdentity {
+            project_root: root.to_path_buf(),
+            harness: "runner".to_string(),
+            session: format!("elicitation-session-{route_channel}"),
+        },
+        "principal": subc_mcp_principal(),
+        "metadata": {
+            "consumer": {
+                "capabilities": {
+                    "elicitation": {}
+                }
+            }
+        }
+    });
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            corr,
+            serde_json::to_vec(&body).expect("route bind body"),
+        )
+        .expect("route bind frame"),
+    )
+    .await;
+}
+
+async fn expect_bash_elicitation_request(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    command_fragment: &str,
+) -> (u64, Value) {
+    let frame = read_frame_timeout(stream, "bash elicitation request").await;
+    assert_eq!(frame.header.ty, FrameType::Request);
+    assert_eq!(frame.header.channel, channel);
+    let body: Value = serde_json::from_slice(&frame.body).expect("elicitation request body");
+    assert_eq!(body["method"].as_str(), Some("elicitation/create"));
+    let params = &body["params"];
+    assert_eq!(params["mode"].as_str(), Some("form"));
+    let message = params["message"].as_str().expect("elicitation message");
+    assert!(
+        message.contains(command_fragment),
+        "elicitation message should mention command fragment {command_fragment:?}: {message:?}"
+    );
+    assert!(
+        message.contains("Matched"),
+        "elicitation message should mention matched patterns: {message:?}"
+    );
+    assert_eq!(
+        params["requestedSchema"]["properties"]["decision"]["enum"],
+        json!(["allow", "deny"])
+    );
+    assert!(
+        params["_meta"]["aft"]["asks"].as_array().is_some(),
+        "elicitation request should carry the scanner ask set: {body:?}"
+    );
+    (frame.header.corr, body)
+}
+
+async fn send_bash_elicitation_reply(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    body: Value,
+) {
+    send_bash_elicitation_reply_bytes(
+        stream,
+        channel,
+        corr,
+        serde_json::to_vec(&body).expect("elicitation reply body"),
+    )
+    .await;
+}
+
+async fn send_bash_elicitation_reply_bytes(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    body: Vec<u8>,
+) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            corr,
+            body,
+        )
+        .expect("elicitation reply frame"),
+    )
+    .await;
+}
+
+async fn expect_bash_denied_tool_response(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    label: &str,
+) -> Value {
+    let frame = read_frame_timeout(stream, label).await;
+    assert_eq!(frame.header.channel, channel);
+    assert_eq!(frame.header.corr, corr);
+    assert!(tool_result_is_error(&frame), "{label} should be an error");
+    let response = tool_response_json(&frame);
+    assert_tool_error_code(&response, "bash_denied_untrusted", label);
+    response
+}
+
+async fn send_route_goodbye(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Goodbye,
+            control_flags(),
+            channel,
+            corr,
+            Vec::new(),
+        )
+        .expect("route goodbye frame"),
+    )
+    .await;
+}
+
 fn assert_tool_success(response: &Value, label: &str) {
     assert_eq!(
         response["success"].as_bool(),
@@ -3980,6 +4202,257 @@ async fn call_tool_response(
 ) -> Value {
     let frame = call_tool_frame(stream, channel, corr, name, arguments, label).await;
     tool_response_json(&frame)
+}
+
+async fn drive_bash_elicitation_allow_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_untrusted_elicitation_route(&mut stream, 1, 101, &root1).await;
+
+    let touched = root1.join("elicitation-allow.txt");
+    send_tool_call(
+        &mut stream,
+        1,
+        102,
+        "bash",
+        json!({ "command": format!("touch {}", touched.display()), "compressed": false }),
+    )
+    .await;
+    let (ask_corr, body) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
+    assert!(
+        body["params"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("touch *"),
+        "message should render scanner patterns: {body:?}"
+    );
+    send_bash_elicitation_reply(
+        &mut stream,
+        1,
+        ask_corr,
+        json!({ "action": "accept", "content": { "decision": "allow" } }),
+    )
+    .await;
+
+    let frame = read_frame_timeout(&mut stream, "allowed bash response").await;
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 102);
+    assert!(!tool_result_is_error(&frame), "allow should run bash");
+    assert!(
+        touched.exists(),
+        "allowed bash should create the side-effect file"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_elicitation_deny_and_malformed_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_untrusted_elicitation_route(&mut stream, 1, 101, &root1).await;
+
+    let denied = root1.join("elicitation-denied.txt");
+    send_tool_call(
+        &mut stream,
+        1,
+        201,
+        "bash",
+        json!({ "command": format!("touch {}", denied.display()), "compressed": false }),
+    )
+    .await;
+    let (ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
+    send_bash_elicitation_reply(&mut stream, 1, ask_corr, json!({ "action": "decline" })).await;
+    expect_bash_denied_tool_response(&mut stream, 1, 201, "declined bash response").await;
+    assert!(!denied.exists(), "declined bash must not spawn a process");
+
+    let malformed_cases: Vec<(&str, Vec<u8>)> = vec![
+        ("wrong type", br#"[]"#.to_vec()),
+        ("missing decision", br#"{}"#.to_vec()),
+        ("garbage json", b"not json".to_vec()),
+        (
+            "extra field on flat allow",
+            br#"{"decision":"allow","extra":true}"#.to_vec(),
+        ),
+    ];
+    for (index, (label, body)) in malformed_cases.into_iter().enumerate() {
+        let corr = 210 + index as u64;
+        let path = root1.join(format!("elicitation-malformed-{index}.txt"));
+        send_tool_call(
+            &mut stream,
+            1,
+            corr,
+            "bash",
+            json!({ "command": format!("touch {}", path.display()), "compressed": false }),
+        )
+        .await;
+        let (ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
+        send_bash_elicitation_reply_bytes(&mut stream, 1, ask_corr, body).await;
+        expect_bash_denied_tool_response(&mut stream, 1, corr, label).await;
+        assert!(!path.exists(), "malformed {label} reply must not spawn");
+    }
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_elicitation_ttl_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_untrusted_elicitation_route(&mut stream, 1, 101, &root1).await;
+
+    let touched = root1.join("elicitation-ttl.txt");
+    send_tool_call(
+        &mut stream,
+        1,
+        301,
+        "bash",
+        json!({ "command": format!("touch {}", touched.display()), "compressed": false }),
+    )
+    .await;
+    let (ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
+    let frame = read_frame_within(&mut stream, Duration::from_secs(5), "ttl denied response")
+        .await
+        .expect("pending ask should deny at the test TTL");
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 301);
+    assert!(tool_result_is_error(&frame));
+    let response = tool_response_json(&frame);
+    assert_tool_error_code(&response, "bash_denied_untrusted", "ttl deny");
+    assert!(!touched.exists(), "timed-out ask must not spawn");
+
+    send_bash_elicitation_reply(
+        &mut stream,
+        1,
+        ask_corr,
+        json!({ "action": "accept", "content": { "decision": "allow" } }),
+    )
+    .await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(300),
+        "late allow after TTL",
+    )
+    .await;
+    assert!(!touched.exists(), "late allow after TTL must be ignored");
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_untrusted_elicitation_route(&mut stream, 1, 101, &root1).await;
+
+    let touched = root1.join("elicitation-goodbye.txt");
+    send_tool_call(
+        &mut stream,
+        1,
+        401,
+        "bash",
+        json!({ "command": format!("touch {}", touched.display()), "compressed": false }),
+    )
+    .await;
+    let (_ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
+    let started = Instant::now();
+    send_route_goodbye(&mut stream, 1, 402).await;
+    let frame = read_frame_within(
+        &mut stream,
+        Duration::from_secs(2),
+        "goodbye swept bash response",
+    )
+    .await
+    .expect("route GOODBYE should settle the pending ask without waiting for TTL");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "GOODBYE sweep should not wait for the 60s TTL"
+    );
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 401);
+    assert!(tool_result_is_error(&frame));
+    let response = tool_response_json(&frame);
+    assert_tool_error_code(&response, "bash_denied_untrusted", "goodbye deny");
+    assert!(!touched.exists(), "GOODBYE-denied bash must not spawn");
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_no_elicitation_regression_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route_with_principal(
+        &mut stream,
+        1,
+        101,
+        &root1,
+        "runner",
+        "no-elicitation-session",
+        Some(subc_mcp_principal()),
+    )
+    .await;
+
+    let touched = root1.join("no-elicitation-denied.txt");
+    send_tool_call(
+        &mut stream,
+        1,
+        102,
+        "bash",
+        json!({ "command": format!("touch {}", touched.display()), "compressed": false }),
+    )
+    .await;
+    expect_bash_denied_tool_response(&mut stream, 1, 102, "no elicitation bash deny").await;
+    assert!(
+        !touched.exists(),
+        "non-elicitation bind must not spawn bash"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_first_party_bash_permission_required_regression_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    let touched = root1.join("first-party-permission-required.txt");
+    send_tool_call(
+        &mut stream,
+        1,
+        501,
+        "bash",
+        json!({
+            "command": format!("touch {}", touched.display()),
+            "permissions_requested": true,
+            "compressed": false
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "first-party permission_required").await;
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 501);
+    assert!(tool_result_is_error(&frame));
+    let response = tool_response_json(&frame);
+    assert_tool_error_code(
+        &response,
+        "permission_required",
+        "first-party bash permission",
+    );
+    assert!(
+        response["asks"]
+            .as_array()
+            .is_some_and(|asks| !asks.is_empty()),
+        "first-party permission_required should still carry asks: {response:?}"
+    );
+    assert!(
+        !touched.exists(),
+        "permission_required must not spawn before a grant"
+    );
+
+    send_connection_goodbye(&mut stream).await;
 }
 
 async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {

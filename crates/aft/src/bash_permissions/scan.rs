@@ -43,6 +43,14 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
     let Some(project_root) = ctx.config().project_root.clone() else {
         return Vec::new();
     };
+    scan_with_project_root(command, &project_root, cwd)
+}
+
+pub fn scan_with_project_root(
+    command: &str,
+    project_root: &Path,
+    cwd: &Path,
+) -> Vec<PermissionAsk> {
     let project_root = resolve_existing(&project_root);
     let cwd = resolve_existing(cwd);
 

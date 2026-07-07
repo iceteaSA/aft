@@ -22,6 +22,12 @@ pub(super) struct RouteBashCancel {
     pub(super) active_waits: usize,
 }
 
+pub(super) struct BashElicitationPlan {
+    pub(super) command: String,
+    pub(super) asks: Vec<crate::bash_permissions::PermissionAsk>,
+    pub(super) grants: Vec<String>,
+}
+
 pub(super) struct BashDeferredCompletion {
     channel: u16,
     corr: u64,
@@ -76,6 +82,46 @@ fn bash_settings_from_translated(args: &serde_json::Map<String, Value>) -> BashT
             .unwrap_or(false),
         timeout: args.get("timeout").and_then(Value::as_u64),
     }
+}
+
+pub(super) fn prepare_bash_elicitation_plan(
+    arguments: &Value,
+    project_root: &Path,
+) -> Result<BashElicitationPlan, crate::subc_translate::TranslateError> {
+    let translated = crate::subc_translate::subc_translate("bash", arguments, project_root)?;
+    let command = translated
+        .args
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let workdir = translated
+        .args
+        .get("workdir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_root.to_path_buf());
+    let asks =
+        crate::bash_permissions::scan::scan_with_project_root(&command, project_root, &workdir);
+    let grants = permission_grants_for_retry(&asks);
+    Ok(BashElicitationPlan {
+        command,
+        asks,
+        grants,
+    })
+}
+
+fn permission_grants_for_retry(asks: &[crate::bash_permissions::PermissionAsk]) -> Vec<String> {
+    asks.iter()
+        .flat_map(|ask| {
+            if ask.always.is_empty() {
+                ask.patterns.iter()
+            } else {
+                ask.always.iter()
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 fn finalized_bash_result(
@@ -179,6 +225,7 @@ pub(super) fn submit_deferred_bash(
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     bind_trust: BindTrust,
+    permissions_granted: Option<Vec<String>>,
 ) {
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
     let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
@@ -196,7 +243,7 @@ pub(super) fn submit_deferred_bash(
                 let mut spawn_text_tx = Some(spawn_text_tx);
                 let mut spawn_control_tx = Some(spawn_control_tx);
 
-                if matches!(bind_trust, BindTrust::Untrusted) {
+                if matches!(bind_trust, BindTrust::Untrusted) && permissions_granted.is_none() {
                     let response = bash_denied_untrusted_response(request_id_for_spawn.clone());
                     return finish_bash_spawn_immediate(
                         response,
@@ -209,7 +256,7 @@ pub(super) fn submit_deferred_bash(
                     );
                 }
 
-                let translated = match crate::subc_translate::subc_translate(
+                let mut translated = match crate::subc_translate::subc_translate(
                     "bash",
                     &arguments,
                     &project_root_for_spawn,
@@ -232,6 +279,15 @@ pub(super) fn submit_deferred_bash(
                         );
                     }
                 };
+                if let Some(grants) = permissions_granted {
+                    translated
+                        .args
+                        .insert("permissions_requested".to_string(), Value::Bool(true));
+                    translated.args.insert(
+                        "permissions_granted".to_string(),
+                        Value::Array(grants.into_iter().map(Value::String).collect()),
+                    );
+                }
                 let settings = bash_settings_from_translated(&translated.args);
                 let raw_req = RawRequest {
                     id: request_id_for_spawn.clone(),
@@ -760,6 +816,29 @@ pub(super) async fn handle_bash_deferred_completion(
         .await;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn bash_denied_untrusted_completion(
+    channel: u16,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    root: ProjectRootId,
+    request_id: String,
+    format_context: crate::subc_format::FormatContext,
+) -> BashDeferredCompletion {
+    let response = bash_denied_untrusted_response(request_id.clone());
+    BashDeferredCompletion {
+        channel,
+        corr,
+        flags,
+        ver,
+        root,
+        request_id,
+        result: Some(bash_result_from_response(response, &format_context)),
+        fatal: false,
+    }
 }
 
 pub(super) fn bash_denied_untrusted_response(request_id: impl Into<String>) -> Response {

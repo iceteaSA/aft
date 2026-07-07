@@ -96,6 +96,10 @@ const COMPLETED_TASK_SUPPRESSION_MAX: usize = 4096;
 /// pinned while a foreground command is still running.
 const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Host elicitation asks fail closed if the MCP facade does not answer promptly.
+const BASH_ELICITATION_TIMEOUT: Duration = Duration::from_secs(60);
+const BASH_ELICITATION_CREATE_METHOD: &str = "elicitation/create";
+
 type RouteChannel = u32;
 type PushEnvelope = (ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
@@ -273,6 +277,7 @@ struct RouteIdentity {
     harness: String,
     session: String,
     trust: BindTrust,
+    consumer_elicitation_capable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +297,28 @@ struct MaintenanceCompletion {
     root_id: ProjectRootId,
     response: Response,
     empty_bg_sessions: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ReverseCorrKey {
+    route: RouteChannel,
+    corr: u64,
+}
+
+struct PendingBashAsk {
+    route_channel: u16,
+    tool_corr: u64,
+    tool_flags: Flags,
+    tool_ver: u8,
+    root: ProjectRootId,
+    project_root: PathBuf,
+    session_id: String,
+    request_id: String,
+    arguments: Value,
+    format_context: crate::subc_format::FormatContext,
+    cancel: bash::BashWaitCancel,
+    grants: Vec<String>,
+    expires_at: Instant,
 }
 
 impl RootMeta {
@@ -334,6 +361,430 @@ fn due_maintenance_roots(
 
 fn route_key(channel: u16) -> RouteChannel {
     RouteChannel::from(channel)
+}
+
+fn bash_elicitation_timeout() -> Duration {
+    if cfg!(debug_assertions) {
+        if let Ok(raw) = std::env::var("AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS") {
+            if let Ok(ms) = raw.parse::<u64>() {
+                if ms > 0 {
+                    return Duration::from_millis(ms);
+                }
+            }
+        }
+    }
+    BASH_ELICITATION_TIMEOUT
+}
+
+fn allocate_reverse_corr(
+    pending_bash_asks: &HashMap<ReverseCorrKey, PendingBashAsk>,
+    route: RouteChannel,
+    next_corr: &mut u64,
+) -> u64 {
+    loop {
+        let corr = *next_corr;
+        *next_corr = (*next_corr).wrapping_add(1).max(1);
+        if !pending_bash_asks.contains_key(&ReverseCorrKey { route, corr }) {
+            return corr;
+        }
+    }
+}
+
+fn route_bind_elicitation_capable(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    [
+        "/metadata/consumer/capabilities/elicitation",
+        "/metadata/capabilities/elicitation",
+        "/metadata/elicitation",
+        "/consumer/capabilities/elicitation",
+        "/consumer_capabilities/elicitation",
+        "/capabilities/elicitation",
+    ]
+    .iter()
+    .any(|pointer| {
+        value
+            .pointer(pointer)
+            .is_some_and(elicitation_capability_enabled)
+    })
+}
+
+fn elicitation_capability_enabled(value: &Value) -> bool {
+    match value {
+        Value::Bool(enabled) => *enabled,
+        // MCP initialize capabilities commonly use an empty object to mean the
+        // capability exists. Treat any object here as presence unless it carries
+        // an explicit boolean `enabled: false` marker.
+        Value::Object(map) => map.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| item.as_str() == Some("elicitation")),
+        Value::String(value) => value == "elicitation" || value == "true",
+        _ => false,
+    }
+}
+
+fn bash_permission_kind_label(kind: &crate::bash_permissions::PermissionKind) -> &'static str {
+    match kind {
+        crate::bash_permissions::PermissionKind::ExternalDirectory => "external directory",
+        crate::bash_permissions::PermissionKind::Bash => "bash",
+    }
+}
+
+fn bash_elicitation_patterns(asks: &[crate::bash_permissions::PermissionAsk]) -> Vec<String> {
+    let mut patterns = Vec::new();
+    let mut seen = HashSet::new();
+    for ask in asks {
+        for pattern in ask.patterns.iter().chain(ask.always.iter()) {
+            if seen.insert(pattern.clone()) {
+                patterns.push(pattern.clone());
+            }
+        }
+    }
+    patterns
+}
+
+fn bash_elicitation_message(
+    command: &str,
+    asks: &[crate::bash_permissions::PermissionAsk],
+) -> String {
+    let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let patterns = bash_elicitation_patterns(asks);
+    let pattern_text = if patterns.is_empty() {
+        "no matched permission patterns".to_string()
+    } else {
+        patterns.join(", ")
+    };
+    let ask_kinds = asks
+        .iter()
+        .map(|ask| bash_permission_kind_label(&ask.kind))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ask_kinds.is_empty() {
+        format!("Allow bash command `{command}`? Matched patterns: {pattern_text}")
+    } else {
+        format!("Allow bash command `{command}`? Matched {ask_kinds} patterns: {pattern_text}")
+    }
+}
+
+fn bash_elicitation_request_body(
+    command: &str,
+    asks: &[crate::bash_permissions::PermissionAsk],
+) -> Value {
+    json!({
+        "method": BASH_ELICITATION_CREATE_METHOD,
+        "params": {
+            "mode": "form",
+            "message": bash_elicitation_message(command, asks),
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "enum": ["allow", "deny"],
+                        "description": "Choose allow to run this bash command once, or deny to block it."
+                    }
+                },
+                "required": ["decision"],
+                "additionalProperties": false
+            },
+            "_meta": {
+                "aft": {
+                    "tool": "bash",
+                    "command": command,
+                    "asks": asks
+                }
+            }
+        }
+    })
+}
+
+fn build_bash_elicitation_request_frame(
+    ver: u8,
+    channel: u16,
+    corr: u64,
+    flags: Flags,
+    command: &str,
+    asks: &[crate::bash_permissions::PermissionAsk],
+) -> Result<Frame, SubcError> {
+    let body = bash_elicitation_request_body(command, asks);
+    Frame::build_with_version(
+        ver,
+        FrameType::Request,
+        flags,
+        channel,
+        corr,
+        serde_json::to_vec(&body).map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)
+}
+
+fn bash_elicitation_reply_is_allow(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    flat_bash_elicitation_reply_is_allow(&value) || mcp_bash_elicitation_reply_is_allow(&value)
+}
+
+fn flat_bash_elicitation_reply_is_allow(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == 1 && object.get("decision").and_then(Value::as_str) == Some("allow")
+}
+
+fn mcp_bash_elicitation_reply_is_allow(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 2 || object.get("action").and_then(Value::as_str) != Some("accept") {
+        return false;
+    }
+    let Some(content) = object.get("content").and_then(Value::as_object) else {
+        return false;
+    };
+    content.len() == 1 && content.get("decision").and_then(Value::as_str) == Some("allow")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_pending_bash_ask_denied(
+    tx: &mpsc::Sender<Frame>,
+    pending: PendingBashAsk,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let completion = bash::bash_denied_untrusted_completion(
+        pending.route_channel,
+        pending.tool_corr,
+        pending.tool_flags,
+        pending.tool_ver,
+        pending.root,
+        pending.request_id,
+        pending.format_context,
+    );
+    bash::handle_bash_deferred_completion(
+        tx,
+        completion,
+        routes,
+        live_roots,
+        route_bash_cancels,
+        shutdown,
+        metrics,
+    )
+    .await
+}
+
+fn take_pending_bash_asks_for_route(
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    route: RouteChannel,
+) -> Vec<PendingBashAsk> {
+    let keys = pending_bash_asks
+        .keys()
+        .copied()
+        .filter(|key| key.route == route)
+        .collect::<Vec<_>>();
+    keys.into_iter()
+        .filter_map(|key| pending_bash_asks.remove(&key))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_pending_bash_asks_for_route(
+    tx: &mpsc::Sender<Frame>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    route: RouteChannel,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    for pending in take_pending_bash_asks_for_route(pending_bash_asks, route) {
+        settle_pending_bash_ask_denied(
+            tx,
+            pending,
+            routes,
+            live_roots,
+            route_bash_cancels,
+            shutdown,
+            metrics,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_all_pending_bash_asks(
+    tx: &mpsc::Sender<Frame>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let pending = pending_bash_asks
+        .drain()
+        .map(|(_, pending)| pending)
+        .collect::<Vec<_>>();
+    for pending in pending {
+        settle_pending_bash_ask_denied(
+            tx,
+            pending,
+            routes,
+            live_roots,
+            route_bash_cancels,
+            shutdown,
+            metrics,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn expire_pending_bash_asks(
+    tx: &mpsc::Sender<Frame>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let now = Instant::now();
+    let expired = pending_bash_asks
+        .iter()
+        .filter_map(|(key, pending)| (pending.expires_at <= now).then_some(*key))
+        .collect::<Vec<_>>();
+    for key in expired {
+        if let Some(pending) = pending_bash_asks.remove(&key) {
+            log::debug!(
+                "subc attach: bash elicitation request {} on route {} expired fail-closed",
+                key.corr,
+                pending.route_channel
+            );
+            settle_pending_bash_ask_denied(
+                tx,
+                pending,
+                routes,
+                live_roots,
+                route_bash_cancels,
+                shutdown,
+                metrics,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_bash_elicitation_reply(
+    tx: &mpsc::Sender<Frame>,
+    frame: &Frame,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Arc<Executor>,
+    shutdown: &Arc<Notify>,
+    bash_deferred_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
+    bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    metrics: &Arc<DispatchPathMetrics>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    dispatch: DispatchFn,
+) -> Result<(), SubcError> {
+    let key = ReverseCorrKey {
+        route: route_key(frame.header.channel),
+        corr: frame.header.corr,
+    };
+    let Some(pending) = pending_bash_asks.remove(&key) else {
+        return Ok(());
+    };
+
+    if frame.header.ty == FrameType::Response && bash_elicitation_reply_is_allow(&frame.body) {
+        if routes.contains_key(&key.route) {
+            bash::submit_deferred_bash(
+                executor,
+                bash_deferred_tx,
+                bash_poll_touch_tx,
+                metrics,
+                dispatch,
+                pending.root,
+                pending.project_root,
+                pending.session_id,
+                pending.request_id,
+                pending.route_channel,
+                pending.tool_corr,
+                pending.tool_flags,
+                pending.tool_ver,
+                pending.arguments,
+                pending.format_context,
+                pending.cancel,
+                BindTrust::Untrusted,
+                Some(pending.grants),
+            );
+            return Ok(());
+        }
+        log::debug!(
+            "subc attach: dropping allowed bash elicitation reply {} for unbound route {}",
+            key.corr,
+            pending.route_channel
+        );
+    }
+
+    settle_pending_bash_ask_denied(
+        tx,
+        pending,
+        routes,
+        live_roots,
+        route_bash_cancels,
+        shutdown,
+        metrics,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cancel_pending_bash_ask_for_tool_call(
+    tx: &mpsc::Sender<Frame>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    route: RouteChannel,
+    tool_corr: u64,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let keys = pending_bash_asks
+        .iter()
+        .filter_map(|(key, pending)| {
+            (key.route == route && pending.tool_corr == tool_corr).then_some(*key)
+        })
+        .collect::<Vec<_>>();
+    for key in keys {
+        if let Some(pending) = pending_bash_asks.remove(&key) {
+            settle_pending_bash_ask_denied(
+                tx,
+                pending,
+                routes,
+                live_roots,
+                route_bash_cancels,
+                shutdown,
+                metrics,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 fn remove_root_channel(
@@ -751,10 +1202,26 @@ where
     let mut completed_tasks = push::CompletedTaskIds::default();
     let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
     let mut pending_binds: HashMap<RouteChannel, PendingBind> = HashMap::new();
+    let mut pending_bash_asks: HashMap<ReverseCorrKey, PendingBashAsk> = HashMap::new();
+    let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
         dispatch_path_metrics.mark_frame_loop_tick();
+        if let Err(error) = expire_pending_bash_asks(
+            &writer_tx,
+            &mut pending_bash_asks,
+            &routes,
+            &mut live_roots,
+            &mut route_bash_cancels,
+            &shutdown,
+            &dispatch_path_metrics,
+        )
+        .await
+        {
+            break Err(error);
+        }
+
         // RouteBind completions are control-plane unblockers. Drain any completed
         // binds before entering other branch work so Push and maintenance bursts
         // can only add one loop-turn of latency.
@@ -899,6 +1366,20 @@ where
                             channel,
                             routes.get(&channel),
                         );
+                        if let Err(error) = settle_pending_bash_asks_for_route(
+                            &writer_tx,
+                            &mut pending_bash_asks,
+                            channel,
+                            &routes,
+                            &mut live_roots,
+                            &mut route_bash_cancels,
+                            &shutdown,
+                            &dispatch_path_metrics,
+                        )
+                        .await
+                        {
+                            break Err(error);
+                        }
                         if let Some(cancel) = route_bash_cancels.remove(&channel) {
                             cancel.token.cancel();
                         }
@@ -951,6 +1432,26 @@ where
                             log::debug!("subc attach: unbound route {} torn down", frame.header.channel);
                         }
                     }
+                    FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
+                        if let Err(error) = handle_bash_elicitation_reply(
+                            &writer_tx,
+                            &frame,
+                            &mut pending_bash_asks,
+                            &routes,
+                            &mut live_roots,
+                            &executor,
+                            &shutdown,
+                            &bash_deferred_tx,
+                            &bash_poll_touch_tx,
+                            &dispatch_path_metrics,
+                            &mut route_bash_cancels,
+                            dispatch,
+                        )
+                        .await
+                        {
+                            break Err(error);
+                        }
+                    }
                     FrameType::Request if frame.header.channel == 0 => {
                         if let Err(error) = handle_control_request(
                             &writer_tx,
@@ -984,6 +1485,8 @@ where
                             &bash_poll_touch_tx,
                             &dispatch_path_metrics,
                             &mut route_bash_cancels,
+                            &mut pending_bash_asks,
+                            &mut next_bash_ask_corr,
                             &mut bg_subs,
                             &mut bg_sub_by_session,
                             &mut bg_wake_pending,
@@ -1009,10 +1512,26 @@ where
                                 routes.get(&channel),
                             );
                         }
+                        if let Err(error) = cancel_pending_bash_ask_for_tool_call(
+                            &writer_tx,
+                            &mut pending_bash_asks,
+                            channel,
+                            frame.header.corr,
+                            &routes,
+                            &mut live_roots,
+                            &mut route_bash_cancels,
+                            &shutdown,
+                            &dispatch_path_metrics,
+                        )
+                        .await
+                        {
+                            break Err(error);
+                        }
                     }
-                    // Push/etc. are not handled on ingress. In-flight tool-call
-                    // cancellation is not implemented, so non-bg_events Cancels
-                    // and unrelated frame types are ignored rather than acted on.
+                    // Incoming push messages are ignored here. Cancel frames only
+                    // stop pending bash elicitation requests; executor-level
+                    // cancellation for tool calls that are already running is not
+                    // implemented.
                     _ => {}
                 }
             }
@@ -1133,6 +1652,24 @@ where
             }
         }
     };
+
+    let mut loop_result = loop_result;
+    if !pending_bash_asks.is_empty() {
+        let no_routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
+        if let Err(error) = settle_all_pending_bash_asks(
+            &writer_tx,
+            &mut pending_bash_asks,
+            &no_routes,
+            &mut live_roots,
+            &mut route_bash_cancels,
+            &shutdown,
+            &dispatch_path_metrics,
+        )
+        .await
+        {
+            loop_result = loop_result.and(Err(error));
+        }
+    }
 
     // The reader task may be parked on `read_frame`; abort it (we are done with
     // the connection) and flush the writer.
@@ -1445,12 +1982,14 @@ async fn handle_control_request(
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
             let bind_trust = trust_for_bind(&bind_harness, &principal);
+            let consumer_elicitation_capable = route_bind_elicitation_capable(&frame.body);
             log::info!(
-                "subc attach: route {} harness={} principal={} trust={}",
+                "subc attach: route {} harness={} principal={} trust={} elicitation={}",
                 route_channel,
                 bind_harness,
                 principal_label(&principal),
-                bind_trust.label()
+                bind_trust.label(),
+                consumer_elicitation_capable
             );
 
             // Config is single-per-project, read by AFT directly from the
@@ -1501,6 +2040,7 @@ async fn handle_control_request(
                 harness: bind_harness.clone(),
                 session: bind_session.clone(),
                 trust: bind_trust,
+                consumer_elicitation_capable,
             };
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
@@ -1729,6 +2269,8 @@ async fn handle_tool_call(
     bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
     metrics: &Arc<DispatchPathMetrics>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    next_bash_ask_corr: &mut u64,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
     bg_wake_pending: &mut HashSet<RouteChannel>,
@@ -1813,7 +2355,10 @@ async fn handle_tool_call(
         .map(|meta| meta.diagnostics_on_edit)
         .unwrap_or(false);
 
-    if matches!(bind_trust, BindTrust::Untrusted) && is_bash_family_tool(&bare_name) {
+    if matches!(bind_trust, BindTrust::Untrusted)
+        && is_bash_family_tool(&bare_name)
+        && (bare_name != "bash" || !identity.consumer_elicitation_capable)
+    {
         let response = bash::bash_denied_untrusted_response(request_id.clone());
         let text = crate::subc_format::format_response_with_context(
             &bare_name,
@@ -1869,6 +2414,91 @@ async fn handle_tool_call(
     }
 
     if bare_name == "bash" {
+        if matches!(bind_trust, BindTrust::Untrusted) {
+            let plan = match bash::prepare_bash_elicitation_plan(
+                &call.arguments,
+                identity.project_root.as_path(),
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let response = Response::error(request_id.clone(), error.code, error.message);
+                    let text = crate::subc_format::format_response_with_context(
+                        &bare_name,
+                        &response,
+                        &format_context,
+                    );
+                    let result = ToolCallResult { text, response };
+                    let response_frame = build_tool_response_frame(
+                        frame.header.ver,
+                        frame.header.channel,
+                        frame.header.corr,
+                        frame.header.flags,
+                        &result,
+                    )?;
+                    return send_reliable_writer_frame(
+                        tx,
+                        metrics,
+                        response_frame,
+                        "tool response",
+                    )
+                    .await;
+                }
+            };
+
+            let meta = live_roots
+                .entry(identity.root.clone())
+                .or_insert_with(|| RootMeta::new(Instant::now()));
+            meta.active_bash_waits = meta.active_bash_waits.saturating_add(1);
+            meta.touch();
+
+            let route_cancel =
+                route_bash_cancels
+                    .entry(route_id)
+                    .or_insert_with(|| bash::RouteBashCancel {
+                        token: PersistentCancelSignal::new(),
+                        active_waits: 0,
+                    });
+            route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
+            let cancel = bash::BashWaitCancel {
+                connection: connection_cancel.clone(),
+                route: route_cancel.token.clone(),
+            };
+
+            let reverse_corr =
+                allocate_reverse_corr(pending_bash_asks, route_id, next_bash_ask_corr);
+            let ask_frame = build_bash_elicitation_request_frame(
+                frame.header.ver,
+                frame.header.channel,
+                reverse_corr,
+                frame.header.flags,
+                &plan.command,
+                &plan.asks,
+            )?;
+            pending_bash_asks.insert(
+                ReverseCorrKey {
+                    route: route_id,
+                    corr: reverse_corr,
+                },
+                PendingBashAsk {
+                    route_channel: frame.header.channel,
+                    tool_corr: frame.header.corr,
+                    tool_flags: frame.header.flags,
+                    tool_ver: frame.header.ver,
+                    root: identity.root,
+                    project_root: identity.project_root,
+                    session_id: identity.session,
+                    request_id,
+                    arguments: call.arguments,
+                    format_context,
+                    cancel,
+                    grants: plan.grants,
+                    expires_at: Instant::now() + bash_elicitation_timeout(),
+                },
+            );
+            return send_reliable_writer_frame(tx, metrics, ask_frame, "bash elicitation request")
+                .await;
+        }
+
         let meta = live_roots
             .entry(identity.root.clone())
             .or_insert_with(|| RootMeta::new(Instant::now()));
@@ -1906,6 +2536,7 @@ async fn handle_tool_call(
             format_context,
             cancel,
             bind_trust,
+            None,
         );
         return Ok(());
     }
@@ -2235,6 +2866,7 @@ pub(crate) mod test_support {
             harness: "opencode".to_string(),
             session: session_id.to_string(),
             trust,
+            consumer_elicitation_capable: false,
         }
     }
 
