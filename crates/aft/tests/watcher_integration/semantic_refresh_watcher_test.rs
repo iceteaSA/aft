@@ -531,7 +531,48 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     );
     assert_eq!(refreshing["semantic_index"]["refreshing_count"], 1);
 
-    // Observed the refreshing state; let the refresh complete.
+    // Mid-refresh queryability: while the edited file's embed is held open,
+    // the index must stay fully queryable (Ready, not Building), serve results
+    // from unchanged files, and disclose the in-flight refresh in warnings.
+    // These assertions used to live in a standalone copy of this scenario in
+    // the parallel `semantic_test` binary; a real-FSEvents test cannot run
+    // reliably outside this serialized binary, so the coverage moved here.
+    let mid_refresh = send(
+        &mut aft,
+        json!({
+            "id": "semantic-mid-refresh-search",
+            "command": "semantic_search",
+            "query": "alpha anchor",
+            "hint": "semantic",
+            "top_k": 5,
+        }),
+    );
+    assert_eq!(
+        mid_refresh["success"], true,
+        "mid-refresh semantic search should succeed: {mid_refresh:?}"
+    );
+    assert_eq!(mid_refresh["status"], "ready");
+    assert_eq!(mid_refresh["semantic_status"], "ready");
+    assert_eq!(mid_refresh["interpreted_as"], "semantic");
+    let mid_warnings = mid_refresh["warnings"].as_array().expect("warnings array");
+    assert!(
+        mid_warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("1 file(s) refreshing"))),
+        "expected refreshing warning, got {mid_warnings:?}"
+    );
+    let mid_results = mid_refresh["results"].as_array().expect("results array");
+    assert!(
+        mid_results.iter().any(|result| {
+            result["source"] == "semantic"
+                && result["file"]
+                    .as_str()
+                    .is_some_and(|file| file.replace('\\', "/").ends_with("src/a.rs"))
+        }),
+        "expected semantic result from unchanged file, got {mid_results:?}"
+    );
+
+    // Observed and queried the refreshing state; let the refresh complete.
     server.release_refresh();
 
     let refreshed = wait_for_semantic_status(&mut aft, "refresh completed", |response| {
