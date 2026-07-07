@@ -615,17 +615,28 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
         status["status"].as_str().is_some(),
         "detached background task status should be recoverable after rebind: {status:?}"
     );
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
-    corr += 1;
-    send_tool(&tx, 2, corr, "bash_status", json!({ "task_id": task_id }));
-    let final_status = expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
-    assert!(
-        matches!(
+    // Poll to terminal instead of a fixed post-sleep wait: a contended
+    // Windows CI runner can take several times the task's nominal 1s
+    // (detached wrapper spawn + scheduling), and fixed waits are the exact
+    // flake class the Windows integration rules ban.
+    let terminal_deadline = Instant::now() + Duration::from_secs(15);
+    let mut final_status = json!(null);
+    loop {
+        corr += 1;
+        send_tool(&tx, 2, corr, "bash_status", json!({ "task_id": task_id }));
+        final_status = expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+        if matches!(
             final_status["status"].as_str(),
             Some("completed") | Some("exited")
-        ),
-        "detached background task should finish before the test leaves it behind: {final_status:?}"
-    );
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < terminal_deadline,
+            "detached background task should finish before the test leaves it behind: {final_status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     send_goodbye_and_wait(&tx).await;
 }
 
