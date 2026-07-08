@@ -67,7 +67,11 @@ describe("hoisted tool adapters", () => {
 
     expectRootObjectSchema(tools.get("read")!.parameters);
     expectRootObjectSchema(tools.get("write")!.parameters);
-    const editSchema = tools.get("edit")!.parameters;
+    const editSchema = tools.get("edit")!.parameters as {
+      properties?: {
+        edits?: { items?: { properties?: Record<string, Record<string, unknown>> } };
+      };
+    };
     expectRootObjectSchema(editSchema);
     expect(schemaHasProperty(editSchema, "edits")).toBe(true);
     expect(
@@ -79,6 +83,30 @@ describe("hoisted tool adapters", () => {
         ],
       }),
     ).toBe(true);
+    expect(
+      schemaAccepts(editSchema, {
+        filePath: "batch.ts",
+        edits: [{ startLine: "2", endLine: "3", content: "replacement" }],
+      }),
+    ).toBe(true);
+
+    const batchStartLineSchema = editSchema.properties?.edits?.items?.properties?.startLine;
+    expect(batchStartLineSchema?.description).toBe(
+      "1-based start line for a batch line-range edit",
+    );
+    expect(Array.isArray(batchStartLineSchema?.anyOf)).toBe(true);
+    const batchStartLineVariants = (batchStartLineSchema?.anyOf ?? []) as Array<
+      Record<string, unknown>
+    >;
+    expect(
+      batchStartLineVariants.some(
+        (variant) =>
+          variant.type === "integer" &&
+          variant.minimum === 1 &&
+          variant.maximum === Number.MAX_SAFE_INTEGER,
+      ),
+    ).toBe(true);
+    expect(batchStartLineVariants.some((variant) => variant.type === "string")).toBe(true);
   });
 
   test("read maps offset/limit to inclusive start_line/end_line and appends footer", async () => {

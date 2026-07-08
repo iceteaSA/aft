@@ -99,7 +99,7 @@ const BashBaseParams = {
   command: Type.String({
     description: "Shell command to execute. Supports pipes, redirections, and shell syntax.",
   }),
-  timeout: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  timeout: optionalInt(1, Number.MAX_SAFE_INTEGER, "Hard kill timeout in milliseconds"),
   workdir: Type.Optional(
     Type.String({
       description:
@@ -145,8 +145,8 @@ const BashPtyParams = {
         'Spawn the command in a real PTY for interactive programs. Implies background: true automatically. Inspect with bash_status({ task_id, output_mode: "screen" }) and send input with bash_write.',
     }),
   ),
-  ptyRows: optionalInt(1, 60),
-  ptyCols: optionalInt(1, 140),
+  ptyRows: optionalInt(1, 60, "PTY terminal height in rows (minimum 1, maximum 60)"),
+  ptyCols: optionalInt(1, 140, "PTY terminal width in columns (minimum 1, maximum 140)"),
 };
 
 const BashParams = Type.Object({
@@ -188,7 +188,11 @@ const BashWatchParams = Type.Object({
   }),
   pattern: Type.Optional(Type.Union([Type.String(), Type.Object({ regex: Type.String() })])),
   background: Type.Optional(Type.Boolean()),
-  timeout_ms: optionalInt(1, MAX_BASH_STATUS_WAIT_TIMEOUT_MS),
+  timeout_ms: optionalInt(
+    1,
+    MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
+    "Maximum time to wait in milliseconds",
+  ),
   once: Type.Optional(Type.Boolean()),
 });
 

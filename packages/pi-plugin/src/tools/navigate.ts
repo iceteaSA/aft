@@ -50,7 +50,7 @@ function navigateParamsSchema() {
       description: "Source file containing the symbol (absolute or relative to project root)",
     }),
     symbol: Type.String({ description: "Name of the symbol to analyze" }),
-    depth: optionalInt(1, Number.MAX_SAFE_INTEGER),
+    depth: optionalInt(1, Number.MAX_SAFE_INTEGER, "Maximum call-graph depth to traverse"),
     expression: Type.Optional(
       Type.String({ description: "Expression to track (required for trace_data)" }),
     ),

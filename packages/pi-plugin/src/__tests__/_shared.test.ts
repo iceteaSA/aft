@@ -5,11 +5,14 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import {
   bridgeFor,
   callBridge,
   callToolCall,
   jsonTextResult,
+  optionalInt,
   stripSuccess,
   textResult,
 } from "../tools/_shared.js";
@@ -104,5 +107,49 @@ describe("tool shared helpers", () => {
       '"success": true',
     );
     expect(stripSuccess({ success: true, file: "a.ts" })).toEqual({ file: "a.ts" });
+  });
+});
+
+describe("optionalInt", () => {
+  test("accepts missing values, integers, and stringified integers", () => {
+    const schema = Type.Object({
+      startLine: optionalInt(1, 100, "1-based start line"),
+    });
+
+    expect(Value.Check(schema, {})).toBe(true);
+    expect(Value.Check(schema, { startLine: 24 })).toBe(true);
+    expect(Value.Check(schema, { startLine: "24" })).toBe(true);
+    expect(Value.Check(schema, { startLine: 24.5 })).toBe(false);
+    expect(Value.Check(schema, { startLine: null })).toBe(false);
+  });
+
+  test("keeps unions at the field level with documented integer bounds", () => {
+    const schema = Type.Object({
+      startLine: optionalInt(1, 60, "1-based start line"),
+    }) as {
+      type?: unknown;
+      anyOf?: unknown;
+      properties?: {
+        startLine?: {
+          description?: unknown;
+          anyOf?: Array<Record<string, unknown>>;
+        };
+      };
+    };
+
+    expect(schema.type).toBe("object");
+    expect(schema.anyOf).toBeUndefined();
+
+    const startLineSchema = schema.properties?.startLine;
+    expect(startLineSchema?.description).toBe("1-based start line");
+    expect(Array.isArray(startLineSchema?.anyOf)).toBe(true);
+
+    const variants = startLineSchema?.anyOf ?? [];
+    expect(
+      variants.some(
+        (variant) => variant.type === "integer" && variant.minimum === 1 && variant.maximum === 60,
+      ),
+    ).toBe(true);
+    expect(variants.some((variant) => variant.type === "string")).toBe(true);
   });
 });

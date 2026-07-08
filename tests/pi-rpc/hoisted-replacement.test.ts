@@ -141,6 +141,35 @@ describe("hoisted tool replacement matrix (real Pi RPC)", () => {
     expect(resultText(toolEnd)).toContain("2 edits");
   }, 120_000);
 
+  test("edit accepts integer and string batch line numbers through Pi validation", async () => {
+    for (const lineValue of [3, "3"] as const) {
+      const toolEnd = await withPiTool(
+        {
+          name: "edit",
+          arguments: {
+            filePath: `line-range-${String(lineValue)}.txt`,
+            edits: [{ startLine: lineValue, endLine: lineValue, content: "THREE" }],
+          },
+        },
+        {
+          message: `Replace line ${String(lineValue)} in line-range-${String(lineValue)}.txt.`,
+          setup: async (env) =>
+            writeFile(
+              join(env.workdir, `line-range-${String(lineValue)}.txt`),
+              "one\ntwo\nthree\n",
+            ),
+          afterTool: async (env) => {
+            expect(
+              await readFile(join(env.workdir, `line-range-${String(lineValue)}.txt`), "utf8"),
+            ).toBe("one\ntwo\nTHREE\n");
+          },
+        },
+      );
+      expect(toolEnd.isError).toBe(false);
+      expect(resultText(toolEnd)).toContain("Edited (+1/-1).");
+    }
+  }, 120_000);
+
   test("grep accepts brace-glob include filters across TypeScript and Rust", async () => {
     const toolEnd = await withPiTool(
       { name: "grep", arguments: { pattern: "needle", include: "*.{ts,rs}" } },

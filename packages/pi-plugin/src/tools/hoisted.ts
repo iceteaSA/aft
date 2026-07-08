@@ -237,8 +237,12 @@ const ReadParams = Type.Object({
       description: "Alias for `path` — provide one of the two.",
     }),
   ),
-  offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
-  limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  offset: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "1-based line number to start reading from (use with limit)",
+  ),
+  limit: optionalInt(1, Number.MAX_SAFE_INTEGER, "Maximum number of lines to return"),
 });
 
 const WriteParams = Type.Object({
@@ -262,10 +266,12 @@ const BatchEditParams = Type.Object({
   newString: Type.Optional(
     Type.String({ description: "Replacement text for a batch find/replace edit" }),
   ),
-  startLine: Type.Optional(
-    Type.Any({ description: "1-based start line for a batch line-range edit" }),
+  startLine: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "1-based start line for a batch line-range edit",
   ),
-  endLine: Type.Optional(Type.Any({ description: "1-based end line for a batch line-range edit" })),
+  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based end line for a batch line-range edit"),
   content: Type.Optional(
     Type.String({
       description: "Replacement text for a batch line-range edit (empty string deletes the lines)",
@@ -289,7 +295,11 @@ const EditParams = Type.Object({
   ),
   newString: Type.Optional(Type.String({ description: "Replacement text (omit to delete match)" })),
   replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence" })),
-  occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER),
+  occurrence: optionalInt(
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "0-based occurrence to replace when multiple matches exist",
+  ),
   appendContent: Type.Optional(
     Type.String({
       description:

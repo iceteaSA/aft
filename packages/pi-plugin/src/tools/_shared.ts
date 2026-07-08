@@ -18,8 +18,21 @@ type TextContent = { type: "text"; text: string; textSignature?: string };
 type ImageContent = { type: "image"; data: string; mimeType: string };
 type ContentBlock = TextContent | ImageContent;
 
-export const optionalInt = (_min: number, _max: number) =>
-  Type.Optional(Type.Any({ description: "(integer)" }));
+/**
+ * Optional integer field schema for Pi tool parameters.
+ *
+ * Pi validates tool arguments against this schema BEFORE our handler runs, and
+ * some models send stringified integers like "42". A strict `Type.Integer()`
+ * would reject those calls before `coerceOptionalInt()` can normalize them, so
+ * keep the schema permissive at the field level while still documenting the
+ * real integer contract for models and host UIs.
+ */
+export const optionalInt = (min: number, max: number, description = "(integer)") =>
+  Type.Optional(
+    Type.Union([Type.Integer({ minimum: min, maximum: max }), Type.String()], {
+      description,
+    }),
+  );
 
 // Re-exported from @cortexkit/aft-bridge — shared runtime coercion,
 // formatting, and timeout tables live in the host-neutral bridge package.

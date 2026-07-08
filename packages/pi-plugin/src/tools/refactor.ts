@@ -39,9 +39,9 @@ const RefactorParams = Type.Object({
   destination: Type.Optional(Type.String({ description: "Target file (for move)" })),
   scope: Type.Optional(Type.String({ description: "Disambiguation scope for move op" })),
   name: Type.Optional(Type.String({ description: "New function name (for extract)" })),
-  startLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
-  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
-  callSiteLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  startLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based start line for extract"),
+  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based end line (inclusive) for extract"),
+  callSiteLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based call site line for inline"),
 });
 
 /** Exported for renderer unit tests. */
