@@ -14,6 +14,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { Plugin } from "@opencode-ai/plugin";
 
+import { signalBashWaitDetachForProject } from "./bash-wait-detach.js";
 import {
   appendInTurnBgCompletions,
   extractSessionID,
@@ -1157,9 +1158,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // Eagerly warm the session-directory cache so the first tool call from
       // this turn routes to the right project (covers `opencode -s`-from-cwd).
       warmSessionDirectory(input.client, sid, input.directory);
-      // Signal any in-flight sync bash_watch to abort and convert to async
-      // so the user's message isn't blocked by a long-running wait.
+      // Signal any in-flight sync bash_watch or wait:true foreground bash to
+      // detach so the user's message is not blocked by a long-running wait.
       signalSyncWatchAbort(sid);
+      if (!sid) return;
+      const sessionDir =
+        getSessionDirectoryCached(sid) ??
+        (await getSessionDirectory(input.client, sid, input.directory)) ??
+        input.directory;
+      void signalBashWaitDetachForProject(pool, sessionDir, sid);
     },
     "tool.execute.before": async (toolInput: { sessionID?: string }) => {
       if (toolInput.sessionID) inspectTier2Idle.clear(toolInput.sessionID);

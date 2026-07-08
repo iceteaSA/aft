@@ -53,6 +53,12 @@ pub fn format_seconds(ms: u64) -> String {
     format!("{seconds}s")
 }
 
+fn format_background_handoff_tail(task_id: &str) -> String {
+    format!(
+        "{task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
+    )
+}
+
 /// Port of OpenCode `packages/opencode-plugin/src/tools/bash.ts` `formatPromotionMessage` (lines 603-614).
 pub fn format_promotion_message(
     task_id: &str,
@@ -63,8 +69,16 @@ pub fn format_promotion_message(
         .map(|timeout| timeout.min(wait_window_ms))
         .unwrap_or(wait_window_ms);
     format!(
-        "Foreground bash didn't finish within {} and was promoted to background: {task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate.",
-        format_seconds(waited)
+        "Foreground bash didn't finish within {} and was promoted to background: {}",
+        format_seconds(waited),
+        format_background_handoff_tail(task_id)
+    )
+}
+
+pub fn format_wait_detach_message(task_id: &str) -> String {
+    format!(
+        "Foreground bash is running in background as {}\nDetached because a user message arrived.",
+        format_background_handoff_tail(task_id)
     )
 }
 
@@ -121,6 +135,10 @@ pub fn build_bash_outcome(
     let request_id = req.id.clone();
     let session_id = req.session().to_string();
     let attach_command = "bash".to_string();
+    let detach_on_user_message = params.wait;
+    if detach_on_user_message {
+        ctx.bash_background().begin_wait_mode_session(&session_id);
+    }
     let wait_window_ms = select_foreground_wait_window_ms(
         ctx.config().foreground_wait_window_ms,
         params.timeout,
@@ -134,41 +152,62 @@ pub fn build_bash_outcome(
     let task_id_for_poll = task_id.clone();
     let request_id_for_poll = request_id.clone();
     let session_id_for_poll = session_id.clone();
+    let session_id_for_cleanup = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
-        let Some(snapshot) = poll_bash_status(
+        let response = if let Some(snapshot) = poll_bash_status(
             ctx,
             &task_id_for_poll,
             &session_id_for_poll,
             project_root.as_deref(),
             &storage_dir,
             RUNNING_OUTPUT_PREVIEW_BYTES,
-        ) else {
-            return Some(task_not_found_response(
+        ) {
+            if snapshot.info.status.is_terminal() {
+                Some(foreground_result_response(&request_id_for_poll, snapshot))
+            } else if detach_on_user_message
+                && ctx
+                    .bash_background()
+                    .take_wait_mode_detach(&session_id_for_poll)
+            {
+                Some(detach_wait_mode_bash(
+                    ctx,
+                    &task_id_for_poll,
+                    &session_id_for_poll,
+                    &request_id_for_poll,
+                ))
+            } else {
+                match decide_bash_step(
+                    snapshot,
+                    deadline,
+                    block_to_completion,
+                    Instant::now(),
+                    &request_id_for_poll,
+                ) {
+                    BashStep::Done(response) => Some(response),
+                    BashStep::Promote => Some(promote_bash(
+                        ctx,
+                        &task_id_for_poll,
+                        &session_id_for_poll,
+                        timeout,
+                        wait_window_ms,
+                        &request_id_for_poll,
+                    )),
+                    BashStep::Wait => None,
+                }
+            }
+        } else {
+            Some(task_not_found_response(
                 &request_id_for_poll,
                 &task_id_for_poll,
-            ));
+            ))
         };
 
-        match decide_bash_step(
-            snapshot,
-            deadline,
-            block_to_completion,
-            Instant::now(),
-            &request_id_for_poll,
-        ) {
-            BashStep::Done(response) => Some(response),
-            BashStep::Promote => Some(promote_bash(
-                ctx,
-                &task_id_for_poll,
-                &session_id_for_poll,
-                project_root.as_deref(),
-                timeout,
-                wait_window_ms,
-                &request_id_for_poll,
-            )),
-            BashStep::Wait => None,
+        if response.is_some() && detach_on_user_message {
+            ctx.bash_background()
+                .end_wait_mode_session(&session_id_for_cleanup);
         }
+        response
     });
 
     if let Some(response) = poll(ctx) {
@@ -234,13 +273,27 @@ pub(crate) fn promote_bash(
     ctx: &AppContext,
     task_id: &str,
     session_id: &str,
-    _project_root: Option<&Path>,
     timeout: Option<u64>,
     wait_window_ms: u64,
     request_id: &str,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms),
+        Err(message) if message.contains("not found") => {
+            Response::error(request_id, "task_not_found", message)
+        }
+        Err(message) => Response::error(request_id, "execution_failed", message),
+    }
+}
+
+pub(crate) fn detach_wait_mode_bash(
+    ctx: &AppContext,
+    task_id: &str,
+    session_id: &str,
+    request_id: &str,
+) -> Response {
+    match ctx.bash_background().promote(task_id, session_id) {
+        Ok(_) => wait_detach_response(request_id, task_id),
         Err(message) if message.contains("not found") => {
             Response::error(request_id, "task_not_found", message)
         }
@@ -291,6 +344,17 @@ fn promotion_response(
         request_id,
         json!({
             "output": format_promotion_message(task_id, timeout, wait_window_ms),
+            "task_id": task_id,
+            "status": "running",
+        }),
+    )
+}
+
+fn wait_detach_response(request_id: &str, task_id: &str) -> Response {
+    Response::success(
+        request_id,
+        json!({
+            "output": format_wait_detach_message(task_id),
             "task_id": task_id,
             "status": "running",
         }),
@@ -460,6 +524,14 @@ mod tests {
         assert_eq!(
             format_promotion_message("bash-123", Some(5_500), 8_000),
             "Foreground bash didn't finish within 5.5s and was promoted to background: bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate."
+        );
+    }
+
+    #[test]
+    fn wait_detach_message_mentions_user_message() {
+        assert_eq!(
+            format_wait_detach_message("bash-123"),
+            "Foreground bash is running in background as bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate.\nDetached because a user message arrived."
         );
     }
 

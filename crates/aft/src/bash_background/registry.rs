@@ -187,6 +187,8 @@ pub(crate) struct RegistryInner {
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
     pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
     pub(crate) watch_registry: Mutex<WatchRegistry>,
+    wait_detach_sessions: Mutex<HashSet<String>>,
+    active_wait_sessions: Mutex<HashMap<String, usize>>,
 }
 
 pub(crate) struct BgTask {
@@ -252,6 +254,8 @@ impl BgTaskRegistry {
                 wake_tx,
                 wake_rx,
                 watch_registry: Mutex::new(WatchRegistry::default()),
+                wait_detach_sessions: Mutex::new(HashSet::new()),
+                active_wait_sessions: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -272,6 +276,55 @@ impl BgTaskRegistry {
         if let Ok(mut slot) = self.inner.db_pool.write() {
             *slot = None;
         }
+    }
+
+    pub fn begin_wait_mode_session(&self, session_id: &str) {
+        if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
+            *active.entry(session_id.to_string()).or_insert(0) += 1;
+        }
+        if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
+            detach.remove(session_id);
+        }
+    }
+
+    pub fn end_wait_mode_session(&self, session_id: &str) {
+        if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
+            match active.get_mut(session_id) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    active.remove(session_id);
+                }
+                None => {}
+            }
+        }
+        if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
+            detach.remove(session_id);
+        }
+    }
+
+    pub fn signal_wait_mode_detach(&self, session_id: &str) -> bool {
+        let is_waiting = self
+            .inner
+            .active_wait_sessions
+            .lock()
+            .map(|active| active.get(session_id).copied().unwrap_or(0) > 0)
+            .unwrap_or(false);
+        if !is_waiting {
+            return false;
+        }
+        self.inner
+            .wait_detach_sessions
+            .lock()
+            .map(|mut detach| detach.insert(session_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    pub fn take_wait_mode_detach(&self, session_id: &str) -> bool {
+        self.inner
+            .wait_detach_sessions
+            .lock()
+            .map(|mut detach| detach.remove(session_id))
+            .unwrap_or(false)
     }
 
     /// Install the output-compression callback. Called by `main.rs` after

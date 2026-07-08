@@ -704,7 +704,6 @@ async fn submit_bash_promote(
                         ctx,
                         &task_id_for_promote,
                         &session_for_promote,
-                        ctx.config().project_root.as_deref(),
                         timeout,
                         wait_window_ms,
                         &request_id_for_promote,

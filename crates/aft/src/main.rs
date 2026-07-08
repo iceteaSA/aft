@@ -641,6 +641,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash_notify" => aft::commands::bash_notify::handle(&req, ctx),
         "bash_unnotify" => aft::commands::bash_notify::handle_unnotify(&req, ctx),
         "bash_promote" => aft::commands::bash_promote::handle(&req, ctx),
+        "bash_wait_detach" => aft::commands::bash_wait_detach::handle(&req, ctx),
         "bash_regex_match" => aft::commands::bash_regex_match::handle(&req),
         "bash_kill" => aft::commands::bash_kill::handle(&req, ctx),
         "bash_write" => aft::commands::bash_write::handle(&req, ctx),
@@ -861,11 +862,12 @@ fn write_push_frame(writer: &mut impl Write, frame: &PushFrame) -> io::Result<()
 mod pending_response_tests {
     use super::{drain_runtime_events_and_write_pending_to_writer, write_ready_pending_to_writer};
     use aft::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use aft::bash_background::registry::BgTaskSnapshot;
     use aft::bash_background::BgTaskStatus;
     use aft::config::Config;
     use aft::context::{App, AppContext};
     use aft::parser::TreeSitterProvider;
-    use aft::protocol::{ConfigureWarningsFrame, Response};
+    use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use aft::response_finalize::{
         attach_bg_completions, attach_status_bar, finalize_response, PendingResponse,
         PendingResponses,
@@ -875,7 +877,9 @@ mod pending_response_tests {
     use std::path::Path;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     struct FinalizeFixture {
@@ -953,6 +957,37 @@ mod pending_response_tests {
             .collect()
     }
 
+    #[cfg(unix)]
+    const WAIT_DETACH_COMMAND: &str = "sleep 1.5 && echo detached";
+    #[cfg(windows)]
+    const WAIT_DETACH_COMMAND: &str = "Start-Sleep -Milliseconds 1500; Write-Output detached";
+
+    fn wait_for_snapshot(
+        ctx: &AppContext,
+        root: &Path,
+        storage: &Path,
+        session_id: &str,
+        task_id: &str,
+        predicate: impl Fn(&BgTaskSnapshot) -> bool,
+    ) -> BgTaskSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(snapshot) = ctx.bash_background().status(
+                task_id,
+                session_id,
+                Some(root),
+                Some(storage),
+                1024,
+            ) {
+                if predicate(&snapshot) {
+                    return snapshot;
+                }
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for snapshot for {task_id}");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     #[test]
     fn finalize_response_matches_inline_finalizers() {
         let session_id = "session-finalize";
@@ -1026,6 +1061,120 @@ mod pending_response_tests {
         );
         assert_eq!(line_values(&writer).len(), 1);
         assert_eq!(poll_calls.get(), 3);
+    }
+
+    #[test]
+    fn wait_true_detach_signal_finalizes_early_and_keeps_completion_reminder() {
+        let root = TempDir::new().unwrap();
+        let storage = TempDir::new().unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let frames = Arc::new(Mutex::new(Vec::<PushFrame>::new()));
+        let frames_for_sender = Arc::clone(&frames);
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            frames_for_sender.lock().unwrap().push(frame);
+        }))));
+        let session_id = "session-wait-detach";
+        let request = RawRequest {
+            id: "wait-detach".to_string(),
+            command: "bash".to_string(),
+            lsp_hints: None,
+            session_id: Some(session_id.to_string()),
+            params: serde_json::json!({
+                "command": WAIT_DETACH_COMMAND,
+                "timeout": 10_000,
+                "foreground_orchestrate": true,
+                "block_to_completion": true,
+                "wait": true,
+                "notify_on_completion": false,
+                "compressed": true,
+            }),
+        };
+        let spawn_response = aft::commands::bash::handle(&request, &ctx);
+        assert!(spawn_response.success);
+        assert_eq!(spawn_response.data["status"], serde_json::json!("running"));
+        let task_id = spawn_response.data["task_id"].as_str().unwrap().to_string();
+        let outcome = aft::commands::bash_orchestrate::build_bash_outcome(&request, &ctx, spawn_response);
+        let mut pending = PendingResponses::default();
+        match outcome {
+            aft::response_finalize::DispatchOutcome::Deferred(pending_response) => {
+                pending.register(pending_response);
+            }
+            aft::response_finalize::DispatchOutcome::Immediate(response) => {
+                panic!("expected deferred wait-mode bash, got immediate response: {response:?}");
+            }
+        }
+
+        let mut writer = Vec::new();
+        assert_eq!(write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(), 0);
+        assert!(writer.is_empty());
+
+        let detach = super::dispatch(
+            RawRequest {
+                id: "wait-detach-signal".to_string(),
+                command: "bash_wait_detach".to_string(),
+                lsp_hints: None,
+                session_id: Some(session_id.to_string()),
+                params: serde_json::json!({}),
+            },
+            &ctx,
+        );
+        assert!(detach.success);
+        assert_eq!(detach.data["detached"], serde_json::json!(true));
+
+        assert_eq!(write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(), 1);
+        let values = line_values(&writer);
+        let response = values.last().unwrap();
+        let output = response["output"].as_str().unwrap();
+        assert_eq!(response["id"], serde_json::json!("wait-detach"));
+        assert_eq!(response["status"], serde_json::json!("running"));
+        assert!(output.contains(&task_id));
+        assert!(output.contains("Detached because a user message arrived."));
+        assert!(pending.is_empty());
+
+        let running = wait_for_snapshot(
+            &ctx,
+            root.path(),
+            storage.path(),
+            session_id,
+            &task_id,
+            |snapshot| snapshot.info.status == BgTaskStatus::Running,
+        );
+        assert_eq!(running.info.status, BgTaskStatus::Running);
+
+        wait_for_snapshot(
+            &ctx,
+            root.path(),
+            storage.path(),
+            session_id,
+            &task_id,
+            |snapshot| snapshot.info.status.is_terminal(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let saw_completion = frames.lock().unwrap().iter().any(|frame| {
+                matches!(
+                    frame,
+                    PushFrame::BashCompleted(completion)
+                        if completion.task_id == task_id && completion.session_id == session_id
+                )
+            });
+            if saw_completion {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for completion reminder for {task_id}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 
     #[test]

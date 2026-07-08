@@ -113,6 +113,7 @@ pub(super) fn command_lane(command: &str) -> Lane {
         | "bash_notify"
         | "bash_unnotify"
         | "bash_promote"
+        | "bash_wait_detach"
         | "bash_kill"
         | "bash_write"
         | "db_set_state"

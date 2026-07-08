@@ -30,6 +30,9 @@ const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
 // without weakening the raw-output contract elsewhere.
 const IS_WINDOWS = process.platform === "win32";
 const eol = (text: string): string => text.replace(/\r\n/g, "\n");
+const WAIT_DETACH_COMMAND = IS_WINDOWS
+  ? "Start-Sleep -Milliseconds 1500; Write-Output detached"
+  : "sleep 1.5 && echo detached";
 
 // Tests that assert Unix-shell output SEMANTICS — exact raw byte equality,
 // POSIX `pwd` path shape, or `cat`/`grep` rewrite output over forward-slash
@@ -254,6 +257,38 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       block_to_completion: true,
       timeout: 5_000,
     });
+  }, 30_000);
+
+  test("wait true detaches to background when a new message arrives", async () => {
+    const { h, bash, pool, bridgeCalls } = await pluginHarness({
+      experimental_bash_background: true,
+    });
+
+    const resultPromise = callPluginBash(bash, h, {
+      command: WAIT_DETACH_COMMAND,
+      wait: true,
+      timeout: 10_000,
+    });
+
+    let detachResponse: Record<string, unknown> | undefined;
+    const started = Date.now();
+    while (Date.now() - started < 2_000) {
+      detachResponse = await pool.getBridge(h.tempDir).send("bash_wait_detach", {
+        session_id: "e2e-session",
+      });
+      if (detachResponse.detached === true) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(detachResponse?.success).toBe(true);
+    expect(detachResponse?.detached).toBe(true);
+
+    const result = await resultPromise;
+
+    expect(result.output).toContain("Detached because a user message arrived.");
+    expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{16}$/);
+    expect(result.metadata.status).toBe("running");
+    expectNoClientPollOrPromote(bridgeCalls);
+    expect(nonConfigureCommands(bridgeCalls)).toContain("bash_wait_detach");
   }, 30_000);
 
   test("background true returns server launch text and task id without polling", async () => {

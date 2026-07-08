@@ -82,6 +82,7 @@ import { statusBarBlockForSession } from "./status-bar-inject.js";
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
 
+import { signalBashWaitDetachForProject } from "./bash-wait-detach.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { resolveSessionId } from "./tools/_shared.js";
@@ -931,8 +932,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   // User-message abort: when the user sends a message while the agent is
-  // blocked in a sync bash_watch wait, signal the wait to abort and convert
-  // to an async watch so the user isn't locked out.
+  // blocked in a sync bash_watch wait or a wait:true foreground bash, signal
+  // the wait to detach so the user is not locked out.
   (
     pi.on as (
       event: "input",
@@ -942,7 +943,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       ) => unknown,
     ) => void
   )("input", (_event, extCtx) => {
-    signalSyncWatchAbort(resolveSessionId(extCtx));
+    const sessionId = resolveSessionId(extCtx);
+    signalSyncWatchAbort(sessionId);
+    void signalBashWaitDetachForProject(pool, extCtx.cwd, sessionId);
   });
 
   // Also register process-level signal handlers so children get an orderly
