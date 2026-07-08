@@ -1349,9 +1349,15 @@ fn ast_search_member_access_pattern_completes_in_reasonable_time() {
     // Each file has 1 occurrence of the field-access pattern.
     assert_eq!(resp["total_matches"], 60);
 
+    // Regression tripwire, not a benchmark: the guarded failure modes
+    // (re-compiling the pattern per file, losing the rayon par_iter walk)
+    // push 60 files well past 30s. The bound only needs to sit far below
+    // that while tolerating slow hardware — a contended 2-core Windows CI
+    // runner exceeded 5s on the healthy path where dev machines take well
+    // under 2s (same calibration as the ast_replace twin below).
     assert!(
-        elapsed.as_secs_f64() < 5.0,
-        "ast_search regressed: {} files took {:.2}s (expected < 5s). \
+        elapsed.as_secs_f64() < 20.0,
+        "ast_search regressed: {} files took {:.2}s (expected < 20s). \
          If this fails, check that ast_search.rs still pre-compiles the pattern \
          outside the file loop and uses rayon par_iter for the file walk.",
         resp["files_searched"],
