@@ -1,8 +1,10 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { execFile } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { sep } from "node:path";
+import { promisify } from "node:util";
 import {
   cleanupHarnesses,
   cleanupSharedSubcRig,
@@ -36,6 +38,8 @@ const [
 ]).finally(() => {
   delete process.env.AFT_OPENCODE_E2E_IMPORT_ONLY;
 });
+
+const execFileAsync = promisify(execFile);
 
 const initialBinary = await prepareBinary();
 const initialSubc = await prepareSubcHarness(initialBinary);
@@ -105,13 +109,8 @@ maybeDescribe(describeName, () => {
         { name: "grep", args: { pattern: "subc_parity_marker", path: "." } },
         { name: "outline", args: { target: "sample.ts" } },
         { name: "zoom", args: { filePath: "sample.ts", symbols: "parityTarget" } },
+        { name: "inspect", args: {} },
         { name: "edit", args: { filePath: "edit.txt", oldString: "before", newString: "after" } },
-        // SUBC GAP (tracked): inspect's summary header includes dead_code,
-        // which needs the callgraph store. The subc executor defers cold
-        // builds through the maintenance lane and the rig's roots never get
-        // one, so subc renders "Dead code: unavailable" where NDJSON renders
-        // counts — deterministic, not load. Re-add inspect here when the subc
-        // path schedules callgraph cold builds for bound roots.
       ];
 
       for (const call of calls) {
@@ -145,6 +144,16 @@ async function seedParityFixture(harness: E2EHarness): Promise<void> {
     "utf8",
   );
   await writeFile(harness.path("edit.txt"), "before\n", "utf8");
+  await gitInitFixture(harness.tempDir);
+}
+
+async function gitInitFixture(root: string): Promise<void> {
+  const git = (args: string[]) => execFileAsync("git", args, { cwd: root });
+  await git(["init"]);
+  await git(["config", "user.email", "aft-tests@example.invalid"]);
+  await git(["config", "user.name", "AFT Tests"]);
+  await git(["add", "."]);
+  await git(["commit", "-m", "initial fixture"]);
 }
 
 async function toolText(

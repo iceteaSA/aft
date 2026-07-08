@@ -101,6 +101,23 @@ impl Default for Tier2ReuseOptions {
     }
 }
 
+fn cached_tier2_aggregate_usable(
+    category: InspectCategory,
+    options: &Tier2ReuseOptions,
+    aggregate: &Value,
+) -> bool {
+    if category == InspectCategory::DeadCode
+        && options.allow_callgraph_cold_build
+        && aggregate
+            .get("callgraph_available")
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        return false;
+    }
+    true
+}
+
 pub struct InspectManager {
     request_tx: Sender<InspectJob>,
     result_rx: Receiver<InspectResult>,
@@ -964,7 +981,9 @@ impl InspectManager {
         };
         delay_tier2_reuse_for_debug(&job.project_root);
         if !options.has_force_paths() {
-            if let Ok(Some(success)) = self.tier2_quick_reuse_success(&job, cache.as_ref()) {
+            if let Ok(Some(success)) =
+                self.tier2_quick_reuse_success(&job, cache.as_ref(), &options)
+            {
                 let result = InspectResult::success(&job, success, started.elapsed());
                 crate::slog_debug!(
                     "perf tier2 category={} reuse=hit ms={}",
@@ -1015,6 +1034,7 @@ impl InspectManager {
         &self,
         job: &InspectJob,
         cache: &InspectCache,
+        options: &Tier2ReuseOptions,
     ) -> Result<Option<InspectScanSuccess>, String> {
         let cached_records = load_contribution_freshness(cache, job.category)?;
         let current_by_relative = current_project_files(&job.project_root, &job.scope_files);
@@ -1048,6 +1068,9 @@ impl InspectManager {
         else {
             return Ok(None);
         };
+        if !cached_tier2_aggregate_usable(job.category, options, &aggregate) {
+            return Ok(None);
+        }
 
         cache
             .touch_tier2_last_full_run(job.category)
@@ -1191,15 +1214,17 @@ impl InspectManager {
                 .get_aggregated_for_config(&job.key, job.config.as_ref())
                 .map_err(|error| error.to_string())?
             {
-                cache
-                    .touch_tier2_last_full_run(job.category)
-                    .map_err(|error| error.to_string())?;
-                phases.log(job.category);
-                return Ok(InspectScanSuccess {
-                    scanned_files: scan_files,
-                    contributions: Vec::new(),
-                    aggregate,
-                });
+                if cached_tier2_aggregate_usable(job.category, options, &aggregate) {
+                    cache
+                        .touch_tier2_last_full_run(job.category)
+                        .map_err(|error| error.to_string())?;
+                    phases.log(job.category);
+                    return Ok(InspectScanSuccess {
+                        scanned_files: scan_files,
+                        contributions: Vec::new(),
+                        aggregate,
+                    });
+                }
             }
         }
 
@@ -1220,16 +1245,18 @@ impl InspectManager {
                 .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
                 .map_err(|error| error.to_string())?
             {
-                cache
-                    .touch_tier2_last_full_run(job.category)
-                    .map_err(|error| error.to_string())?;
-                let contributions = load_contributions(cache, job)?;
-                phases.log(job.category);
-                return Ok(InspectScanSuccess {
-                    scanned_files: scan_files,
-                    contributions,
-                    aggregate,
-                });
+                if cached_tier2_aggregate_usable(job.category, options, &aggregate) {
+                    cache
+                        .touch_tier2_last_full_run(job.category)
+                        .map_err(|error| error.to_string())?;
+                    let contributions = load_contributions(cache, job)?;
+                    phases.log(job.category);
+                    return Ok(InspectScanSuccess {
+                        scanned_files: scan_files,
+                        contributions,
+                        aggregate,
+                    });
+                }
             }
         }
 
@@ -1305,16 +1332,18 @@ impl InspectManager {
                         .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
                         .map_err(|error| error.to_string())?
                     {
-                        cache
-                            .touch_tier2_last_full_run(job.category)
-                            .map_err(|error| error.to_string())?;
-                        let contributions = load_contributions(cache, job)?;
-                        phases.log(job.category);
-                        return Ok(InspectScanSuccess {
-                            scanned_files: scan_files,
-                            contributions,
-                            aggregate,
-                        });
+                        if cached_tier2_aggregate_usable(job.category, options, &aggregate) {
+                            cache
+                                .touch_tier2_last_full_run(job.category)
+                                .map_err(|error| error.to_string())?;
+                            let contributions = load_contributions(cache, job)?;
+                            phases.log(job.category);
+                            return Ok(InspectScanSuccess {
+                                scanned_files: scan_files,
+                                contributions,
+                                aggregate,
+                            });
+                        }
                     }
                 }
             }

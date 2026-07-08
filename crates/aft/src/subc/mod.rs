@@ -1141,7 +1141,8 @@ async fn process_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
-    metrics: &DispatchPathMetrics,
+    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
+    metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
     decrement_counted_channel(&metrics.control_completion_queued);
     handle_route_bind_completion(
@@ -1155,6 +1156,7 @@ async fn process_route_bind_completion(
         pending_binds,
         executor,
         shutdown,
+        maintenance_tx,
         metrics,
     )
     .await
@@ -1172,7 +1174,8 @@ async fn drain_pending_route_bind_completions(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
-    metrics: &DispatchPathMetrics,
+    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
+    metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
     while let Ok(completion) = control_completion_rx.try_recv() {
         process_route_bind_completion(
@@ -1186,6 +1189,7 @@ async fn drain_pending_route_bind_completions(
             pending_binds,
             executor,
             shutdown,
+            maintenance_tx,
             metrics,
         )
         .await?;
@@ -1326,6 +1330,7 @@ where
             &mut pending_binds,
             &executor,
             &shutdown,
+            &maintenance_tx,
             &dispatch_path_metrics,
         )
         .await
@@ -1421,6 +1426,7 @@ where
                     &mut pending_binds,
                     &executor,
                     &shutdown,
+                    &maintenance_tx,
                     &dispatch_path_metrics,
                 )
                 .await
@@ -1888,6 +1894,34 @@ fn rollback_pending_bind_actor(
     }
 }
 
+fn submit_initial_short_maintenance_after_bind(
+    root_id: &ProjectRootId,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Arc<Executor>,
+    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
+    metrics: &Arc<DispatchPathMetrics>,
+) {
+    let Some(meta) = live_roots.get_mut(root_id) else {
+        return;
+    };
+    if meta.maintenance_poisoned || meta.maintenance_pending {
+        return;
+    }
+
+    meta.maintenance_pending = true;
+    meta.maintenance_jobs_in_flight = meta.maintenance_jobs_in_flight.saturating_add(1);
+    meta.maintenance_last_submitted = Some(Instant::now());
+    submit_maintenance_job(
+        executor,
+        root_id.clone(),
+        MaintenanceDrainKind::Short,
+        Vec::new(),
+        maintenance_tx,
+        metrics,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_route_bind_completion(
     tx: &mpsc::Sender<Frame>,
     completion: RouteBindCompletion,
@@ -1899,7 +1933,8 @@ async fn handle_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
-    metrics: &DispatchPathMetrics,
+    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
+    metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
     let route_id = route_key(completion.route_channel);
     let Some(pending) = pending_binds.remove(&route_id) else {
@@ -2032,6 +2067,13 @@ async fn handle_route_bind_completion(
     )
     .map_err(SubcError::FrameBuild)?;
     send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await?;
+    submit_initial_short_maintenance_after_bind(
+        &completion.bind_root_id,
+        live_roots,
+        executor,
+        maintenance_tx,
+        metrics,
+    );
     let replayed = push::replay_buffered_push_frames(
         tx,
         metrics,

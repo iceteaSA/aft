@@ -2108,6 +2108,7 @@ impl AppContext {
                         *guard = Some(Arc::clone(&store));
                     }
                     *self.callgraph_store_rx.lock() = None;
+                    let _ = self.request_tier2_refresh_pull();
                     return CallgraphStoreAccess::Ready(store);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}

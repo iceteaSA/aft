@@ -845,6 +845,18 @@ fn enqueue_semantic_refresh_event_for_test(
     )
 }
 
+fn inspect_dead_code_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
+        other => Response::error(
+            req.id,
+            "unexpected_command",
+            format!("unexpected inspect convergence command: {other}"),
+        ),
+    }
+}
+
 pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = current_bridge_state();
     match req.command.as_str() {
@@ -1702,6 +1714,17 @@ fn subc_bridge_callgraph_maintenance_is_per_root() {
         Duration::from_secs(60),
         drive_callgraph_maintenance_daemon,
         |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_inspect_dead_code_converges_for_bound_git_root() {
+    run_subc_bridge_test_with_dispatch(
+        "subc_bridge_inspect_dead_code_converges_for_bound_git_root",
+        Duration::from_secs(75),
+        drive_inspect_dead_code_convergence_daemon,
+        |_, _, _| {},
+        inspect_dead_code_dispatch,
     );
 }
 
@@ -5136,6 +5159,95 @@ async fn drive_failed_new_root_daemon(input: FakeDaemonInput) {
     expect_error_frame(&mut stream, 5, 550, "route_not_bound").await;
 
     send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_inspect_dead_code_convergence_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        callgraph_root,
+        ..
+    } = open_fake_daemon_session(input).await;
+    init_git_fixture(&callgraph_root);
+
+    send_route_bind_with_doc(
+        &mut stream,
+        3,
+        60,
+        &callgraph_root,
+        json!({
+            "callgraph_store": true,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 60).await;
+
+    // This regressed before subc-bound roots scheduled a callgraph cold build:
+    // polling inspect for the whole budget kept returning dead_code unavailable
+    // because no ready callgraph store ever appeared for the bound root.
+    let dead_code = poll_inspect_dead_code_until_counts(&mut stream, 3, 700).await;
+    assert!(
+        dead_code.get("count").and_then(Value::as_u64).is_some(),
+        "dead_code summary should render real counts once the callgraph store is ready: {dead_code:?}"
+    );
+    assert_ne!(
+        dead_code.get("status").and_then(Value::as_str),
+        Some("unavailable"),
+        "dead_code must converge away from callgraph_unavailable: {dead_code:?}"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+fn init_git_fixture(root: &std::path::Path) {
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap_or_else(|error| panic!("git {args:?} failed to start: {error}"));
+        assert!(status.success(), "git {args:?} failed with {status}");
+    };
+    run(&["init"]);
+    run(&["config", "user.email", "aft-tests@example.invalid"]);
+    run(&["config", "user.name", "AFT Tests"]);
+    run(&["add", "."]);
+    run(&["commit", "-m", "initial fixture"]);
+}
+
+async fn poll_inspect_dead_code_until_counts(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    first_corr: u64,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut corr = first_corr;
+    let mut last_dead_code = Value::Null;
+    while Instant::now() < deadline {
+        send_tool_call(stream, channel, corr, "inspect", json!({})).await;
+        let frame = read_frame_timeout(stream, "inspect convergence response").await;
+        assert_eq!(frame.header.channel, channel);
+        assert_eq!(frame.header.corr, corr);
+        let response = tool_response_json(&frame);
+        assert!(
+            response["success"].as_bool().unwrap_or(false),
+            "inspect response should succeed: {response:?}"
+        );
+        last_dead_code = response["summary"]["dead_code"].clone();
+        if last_dead_code
+            .get("count")
+            .and_then(Value::as_u64)
+            .is_some()
+            && last_dead_code.get("status").and_then(Value::as_str) != Some("unavailable")
+        {
+            return last_dead_code;
+        }
+        corr += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("inspect dead_code did not converge within 30s; last summary: {last_dead_code:?}");
 }
 
 async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {

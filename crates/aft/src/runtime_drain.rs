@@ -263,6 +263,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));
         installed = true;
         status_changed = true;
+        let _ = ctx.request_tier2_refresh_pull();
     }
 
     if disconnected || installed {
