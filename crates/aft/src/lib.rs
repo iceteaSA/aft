@@ -95,6 +95,7 @@ pub mod pty_render;
 pub mod query_shape;
 pub mod readonly_artifacts;
 pub mod response_finalize;
+pub mod root_cache;
 pub mod run_tool_call;
 pub mod runtime_drain;
 pub mod runtime_registry;

@@ -486,7 +486,16 @@ impl InspectManager {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Arc<InspectCache>, String> {
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let project_key = crate::path_identity::project_scope_key(&project_root);
+        let inspect_dir = if inspect_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == project_key)
+        {
+            inspect_dir
+        } else {
+            inspect_dir.join(&project_key)
+        };
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let identity = InspectCacheIdentity {
             sqlite_path,
@@ -1847,10 +1856,10 @@ fn build_tier2_callgraph_snapshot_with_refresh(
         return None;
     }
 
-    let callgraph_dirs = callgraph_store_dirs_from_inspect_dir(&job.inspect_dir);
+    let callgraph_dirs = callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root);
     if callgraph_dirs.is_empty() {
         crate::slog_info!(
-            "tier2 dead_code: inspect_dir has no harness parent ({}); reporting callgraph_unavailable",
+            "tier2 dead_code: inspect_dir has no root-keyed storage parent ({}); reporting callgraph_unavailable",
             job.inspect_dir.display()
         );
         return None;
@@ -1860,7 +1869,9 @@ fn build_tier2_callgraph_snapshot_with_refresh(
         // Background refresh may rebuild call graphs for moved project roots.
         // Direct inspect cannot trigger that rebuild, so it opens without repair
         // and reports callgraph_unavailable when a rebuild is needed.
-        let store = match if allow_cold_build {
+        let store = match if refresh_paths.is_empty() {
+            CallGraphStore::open_readonly(callgraph_dir.clone(), job.project_root.clone())
+        } else if allow_cold_build {
             CallGraphStore::open_ready_repairing(callgraph_dir.clone(), job.project_root.clone())
         } else {
             CallGraphStore::open_ready_no_rebuild(callgraph_dir.clone(), job.project_root.clone())
@@ -1963,37 +1974,28 @@ fn build_tier2_callgraph_snapshot_with_refresh(
     None
 }
 
-fn callgraph_store_dir_from_inspect_dir(inspect_dir: &Path) -> Option<PathBuf> {
-    inspect_dir
-        .parent()
-        .map(|harness_dir| harness_dir.join("callgraph"))
+fn callgraph_store_dir_from_inspect_dir(
+    inspect_dir: &Path,
+    project_root: &Path,
+) -> Option<PathBuf> {
+    let scope_key = crate::path_identity::project_scope_key(project_root);
+    let storage_dir = if inspect_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == scope_key)
+    {
+        inspect_dir.parent()?.parent()?
+    } else {
+        inspect_dir.parent()?
+    };
+    let project_key = crate::search_index::artifact_cache_key(project_root);
+    Some(storage_dir.join("callgraph").join(project_key))
 }
 
-fn callgraph_store_dirs_from_inspect_dir(inspect_dir: &Path) -> Vec<PathBuf> {
-    let Some(primary) = callgraph_store_dir_from_inspect_dir(inspect_dir) else {
-        return Vec::new();
-    };
-    let mut dirs = vec![primary.clone()];
-
-    let Some(harness_dir) = inspect_dir.parent() else {
-        return dirs;
-    };
-    let Some(storage_dir) = harness_dir.parent() else {
-        return dirs;
-    };
-    let Ok(entries) = std::fs::read_dir(storage_dir) else {
-        return dirs;
-    };
-
-    let mut siblings = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("callgraph"))
-        .filter(|dir| dir != &primary && dir.is_dir())
-        .collect::<Vec<_>>();
-    siblings.sort();
-    siblings.dedup();
-    dirs.extend(siblings);
-    dirs
+fn callgraph_store_dirs_from_inspect_dir(inspect_dir: &Path, project_root: &Path) -> Vec<PathBuf> {
+    callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -3528,7 +3530,8 @@ export function bannerUnused() {}
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
         let _store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open empty store");
 
         let snapshot =
@@ -3545,7 +3548,8 @@ export function bannerUnused() {}
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
         let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         store.cold_build(&files).expect("cold build store");
@@ -3554,19 +3558,31 @@ export function bannerUnused() {}
 
         let still_existing_previous_root = root.with_file_name("previous-root-still-exists");
         std::fs::create_dir_all(&still_existing_previous_root).expect("create previous root");
-        let conn = rusqlite::Connection::open(sqlite_path).expect("open store sqlite");
+        let conn = rusqlite::Connection::open(&sqlite_path).expect("open store sqlite");
         conn.execute(
             "UPDATE backend_file_state SET workspace_root = ?1",
             rusqlite::params![still_existing_previous_root.display().to_string()],
         )
         .expect("force root repair rebuild state");
+        drop(conn);
 
         let snapshot =
-            build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true), false);
+            build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true), false)
+                .expect("readonly snapshot should avoid cold-rebuilding the store");
 
-        assert!(
-            snapshot.is_none(),
-            "direct inspect must report callgraph_unavailable instead of cold-rebuilding a root-repair store"
+        assert_eq!(snapshot.files.len(), 3);
+        let conn = rusqlite::Connection::open(&sqlite_path).expect("reopen store sqlite");
+        let stored_root: String = conn
+            .query_row(
+                "SELECT workspace_root FROM backend_file_state LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stored root");
+        assert_eq!(
+            stored_root,
+            still_existing_previous_root.display().to_string(),
+            "direct inspect must not cold-rebuild or re-root a read-only snapshot"
         );
     }
 
@@ -3575,7 +3591,8 @@ export function bannerUnused() {}
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
         let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         store.cold_build(&files).expect("cold build store");
@@ -3589,12 +3606,16 @@ export function bannerUnused() {}
     }
 
     #[test]
-    fn callgraph_snapshot_uses_ready_sibling_harness_store() {
+    fn callgraph_snapshot_uses_ready_root_keyed_store() {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
         let storage_dir = root.join(".aft-cache");
-        let inspect_dir = storage_dir.join("runner").join("inspect");
-        let warm_callgraph_dir = storage_dir.join("opencode").join("callgraph");
+        let inspect_dir = storage_dir
+            .join("inspect")
+            .join(crate::path_identity::project_scope_key(&root));
+        let warm_callgraph_dir = storage_dir
+            .join("callgraph")
+            .join(crate::search_index::artifact_cache_key(&root));
         let store = CallGraphStore::open(warm_callgraph_dir, root.clone()).expect("open store");
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         store.cold_build(&files).expect("cold build store");
@@ -3631,7 +3652,8 @@ export function bannerUnused() {}
         );
 
         let inspect_dir = root.join(".aft-cache").join("opencode").join("inspect");
-        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
         let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
         let project_files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         store.cold_build(&project_files).expect("cold build store");
@@ -3965,7 +3987,8 @@ mod dead_code_projection_tests {
         write_projection_fixture(dir.path());
         let root = canonical_root(dir.path());
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
         let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
         let files = project_files(&root);
         store.cold_build(&files).expect("cold build store");

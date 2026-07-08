@@ -691,6 +691,8 @@ pub struct AppContext {
     is_worktree_bridge: parking_lot::Mutex<bool>,
     git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
     shared_artifacts_read_only: parking_lot::Mutex<bool>,
+    callgraph_writer: AtomicBool,
+    inspect_writer: AtomicBool,
     artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
     artifact_owner_lease: parking_lot::Mutex<Option<ArtifactOwnerLeaseRegistration>>,
     /// Reasons (if any) why heavy AFT subsystems were auto-disabled for the
@@ -909,6 +911,8 @@ impl AppContext {
             is_worktree_bridge: parking_lot::Mutex::new(false),
             git_common_dir: parking_lot::Mutex::new(None),
             shared_artifacts_read_only: parking_lot::Mutex::new(false),
+            callgraph_writer: AtomicBool::new(true),
+            inspect_writer: AtomicBool::new(true),
             artifact_owner_status: parking_lot::Mutex::new(None),
             artifact_owner_lease: parking_lot::Mutex::new(None),
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
@@ -1719,7 +1723,16 @@ impl AppContext {
     }
 
     pub fn inspect_dir(&self) -> PathBuf {
-        self.harness_dir().join("inspect")
+        if let Some(root) = self
+            .canonical_cache_root_opt()
+            .or_else(|| self.config().project_root.clone())
+        {
+            self.storage_dir()
+                .join("inspect")
+                .join(crate::path_identity::project_scope_key(&root))
+        } else {
+            self.storage_dir().join("inspect").join("unconfigured")
+        }
     }
 
     pub fn bash_tasks_dir(&self, session_id: &str) -> PathBuf {
@@ -1763,6 +1776,9 @@ impl AppContext {
     pub fn set_cache_role(&self, is_worktree_bridge: bool, git_common_dir: Option<PathBuf>) {
         *self.is_worktree_bridge.lock() = is_worktree_bridge;
         *self.git_common_dir.lock() = git_common_dir;
+        let artifact_read_only = *self.shared_artifacts_read_only.lock();
+        self.callgraph_writer
+            .store(!is_worktree_bridge && !artifact_read_only, Ordering::SeqCst);
     }
 
     pub fn set_artifact_owner(
@@ -1774,12 +1790,29 @@ impl AppContext {
             .as_ref()
             .is_some_and(|status| status.mode == ArtifactOwnerMode::ReadOnly);
         *self.shared_artifacts_read_only.lock() = read_only;
+        self.callgraph_writer
+            .store(!self.is_worktree_bridge() && !read_only, Ordering::SeqCst);
+        self.inspect_writer.store(true, Ordering::SeqCst);
         *self.artifact_owner_status.lock() = status;
         *self.artifact_owner_lease.lock() = lease.map(crate::artifact_owner::register_heartbeat);
     }
 
+    pub fn set_cache_writer_capabilities(&self, callgraph_writer: bool, inspect_writer: bool) {
+        self.callgraph_writer
+            .store(callgraph_writer, Ordering::SeqCst);
+        self.inspect_writer.store(inspect_writer, Ordering::SeqCst);
+    }
+
+    pub fn callgraph_writer(&self) -> bool {
+        self.callgraph_writer.load(Ordering::SeqCst)
+    }
+
+    pub fn inspect_writer(&self) -> bool {
+        self.inspect_writer.load(Ordering::SeqCst)
+    }
+
     pub fn shared_artifacts_read_only(&self) -> bool {
-        self.is_worktree_bridge() || *self.shared_artifacts_read_only.lock()
+        !self.callgraph_writer()
     }
 
     pub fn artifact_owner_status(&self) -> Option<ArtifactOwnerStatus> {
@@ -1861,12 +1894,12 @@ impl AppContext {
     }
 
     pub fn callgraph_store_dir(&self) -> PathBuf {
-        match self.harness_opt() {
-            Some(harness) => self
-                .storage_dir()
-                .join(harness.storage_segment())
-                .join("callgraph"),
-            None => self.storage_dir().join("callgraph"),
+        if let Some(root) = self.callgraph_project_root() {
+            self.storage_dir()
+                .join("callgraph")
+                .join(self.memoized_artifact_cache_key(&root))
+        } else {
+            self.storage_dir().join("callgraph").join("unconfigured")
         }
     }
 
@@ -1901,7 +1934,7 @@ impl AppContext {
         };
         let callgraph_dir = self.callgraph_store_dir();
         let force_rebuild = self.take_callgraph_store_force_rebuild();
-        let store = if self.is_worktree_bridge() {
+        let store = if !self.callgraph_writer() {
             CallGraphStore::open_readonly(callgraph_dir, project_root)?
         } else if force_rebuild {
             let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
@@ -2018,9 +2051,9 @@ impl AppContext {
         };
         let callgraph_dir = self.callgraph_store_dir();
 
-        // Worktree bridges are read-only: open whatever the main checkout built,
-        // never cold-build here.
-        if self.is_worktree_bridge() {
+        // Read-only callgraph contexts only open an already-built store from disk;
+        // they do not create a new callgraph cache here.
+        if !self.callgraph_writer() {
             match CallGraphStore::open_readonly(callgraph_dir, project_root) {
                 Ok(Some(store)) => {
                     let store = Arc::new(store);
@@ -2136,7 +2169,7 @@ impl AppContext {
         callgraph_dir: PathBuf,
         force_rebuild: bool,
     ) -> bool {
-        if !self.heavy_root_work_allowed() {
+        if !self.heavy_root_work_allowed() || !self.callgraph_writer() {
             return false;
         }
 
@@ -2427,7 +2460,7 @@ impl AppContext {
     }
 
     pub fn request_tier2_refresh_pull(&self) -> bool {
-        let can_schedule = !self.is_worktree_bridge() && self.heavy_root_work_allowed();
+        let can_schedule = self.inspect_writer() && self.heavy_root_work_allowed();
         self.tier2_refresh_scheduler
             .lock()
             .request_pull(can_schedule)
@@ -2447,7 +2480,7 @@ impl AppContext {
         changed_path_count: usize,
     ) -> Option<Tier2TriggerReason> {
         let manager = self.inspect_manager();
-        let can_write = !self.is_worktree_bridge() && self.heavy_root_work_allowed();
+        let can_write = self.inspect_writer() && self.heavy_root_work_allowed();
         let in_flight = manager.tier2_any_in_flight();
         let semantic_cold_seed_active = self.semantic_cold_seed_active();
         let decision = self.tier2_refresh_scheduler.lock().tick_with_semantic_gate(
@@ -2489,7 +2522,7 @@ impl AppContext {
     }
 
     fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
-        if self.is_worktree_bridge()
+        if !self.inspect_writer()
             || !self.heavy_root_work_allowed()
             || !self.config().inspect.enabled
         {
@@ -4360,6 +4393,44 @@ mod harness_path_tests {
             opencode.bash_tasks_dir("ses_same"),
             pi.bash_tasks_dir("ses_same")
         );
+    }
+
+    #[test]
+    fn callgraph_and_inspect_dirs_are_root_keyed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let root = temp.path().join("checkout");
+        std::fs::create_dir_all(&root).expect("create root");
+        let ctx = ctx_with_storage_and_harness(storage.clone(), Harness::Opencode);
+        ctx.set_canonical_cache_root(root.clone());
+
+        assert_eq!(
+            ctx.callgraph_store_dir(),
+            storage
+                .join("callgraph")
+                .join(crate::search_index::artifact_cache_key(&root))
+        );
+        assert_eq!(
+            ctx.inspect_dir(),
+            storage
+                .join("inspect")
+                .join(crate::path_identity::project_scope_key(&root))
+        );
+        assert!(!ctx
+            .callgraph_store_dir()
+            .starts_with(storage.join("opencode")));
+        assert!(!ctx.inspect_dir().starts_with(storage.join("opencode")));
+    }
+
+    #[test]
+    fn per_domain_capability_allows_inspect_writer_when_callgraph_read_only() {
+        let storage = PathBuf::from("/tmp/cortexkit/aft");
+        let ctx = ctx_with_storage_and_harness(storage, Harness::Opencode);
+        ctx.set_cache_writer_capabilities(false, true);
+
+        assert!(ctx.shared_artifacts_read_only());
+        assert!(!ctx.callgraph_writer());
+        assert!(ctx.inspect_writer());
     }
 }
 

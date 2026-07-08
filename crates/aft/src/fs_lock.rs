@@ -81,6 +81,10 @@ struct LockMetadata {
     hostname: String,
     created_at_ms: u64,
     heartbeat_at_ms: u64,
+    /// Fencing nonce for writer leases. The owner re-reads the lock immediately
+    /// before publishing/writing and aborts if a stale guard has been usurped.
+    #[serde(default)]
+    writer_epoch: String,
 }
 
 /// Acquire a filesystem lock at `path`. Blocks until the lock is held.
@@ -96,12 +100,43 @@ pub fn try_acquire(path: &Path, timeout: Duration) -> Result<LockGuard, AcquireE
     acquire_with_config(path, Some(timeout), LockConfig::default())
 }
 
+/// Try one lock acquisition attempt, then check once whether an existing stale
+/// lock can be taken over.
+///
+/// Read-only cache openers use this to switch to writer mode without waiting
+/// behind another process that is still building the cache.
+pub fn try_acquire_once(path: &Path) -> Result<LockGuard, AcquireError> {
+    try_acquire(path, Duration::ZERO)
+}
+
 pub struct LockGuard {
     path: PathBuf,
     metadata: LockMetadata,
     shutdown: Arc<AtomicBool>,
     heartbeat_done: mpsc::Receiver<()>,
     heartbeat: Option<JoinHandle<()>>,
+}
+
+impl LockGuard {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn writer_epoch(&self) -> &str {
+        &self.metadata.writer_epoch
+    }
+
+    /// Re-read the lock file and confirm that this guard still owns the writer
+    /// token. Writers call this right before saving published data or starting
+    /// SQLite writes so they stop if another process has taken over the lock.
+    pub fn verify_writer_epoch(&self) -> io::Result<bool> {
+        match read_lock_metadata(&self.path) {
+            Ok(metadata) => Ok(lock_identity_matches(&metadata, &self.metadata)),
+            Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(ReadLockError::Io(error)) => Err(error),
+            Err(ReadLockError::Malformed(_)) => Ok(false),
+        }
+    }
 }
 
 impl Drop for LockGuard {
@@ -184,13 +219,17 @@ fn acquire_with_config(
     let mut warned_live_owner = false;
     let mut warned_stale_live_owner = false;
     let mut transient_create_failures: u32 = 0;
+    let mut attempted_once = false;
 
     loop {
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                return Err(AcquireError::Timeout);
+        if attempted_once {
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(AcquireError::Timeout);
+                }
             }
         }
+        attempted_once = true;
 
         match create_new_lock(path, &hostname, config) {
             Ok(guard) => return Ok(guard),
@@ -311,6 +350,7 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
         hostname: hostname.to_string(),
         created_at_ms: now,
         heartbeat_at_ms: now,
+        writer_epoch: format!("{}-{}", std::process::id(), now_nanos()),
     };
 
     create_lock_file_atomically(path, &metadata)?;
@@ -488,10 +528,7 @@ fn heartbeat_once(path: &Path, owner: &LockMetadata) -> Result<(), HeartbeatErro
         Err(ReadLockError::Malformed(error)) => return Err(HeartbeatError::Malformed(error)),
     };
 
-    if metadata.pid != owner.pid
-        || metadata.hostname != owner.hostname
-        || metadata.created_at_ms != owner.created_at_ms
-    {
+    if !lock_identity_matches(&metadata, owner) {
         return Err(HeartbeatError::NotOwner);
     }
 
@@ -525,7 +562,7 @@ fn open_new_lock_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o644)
+        .mode(0o600)
         .open(path)
 }
 
@@ -559,10 +596,7 @@ fn create_lock_file_atomically(path: &Path, metadata: &LockMetadata) -> io::Resu
 fn atomic_write_lock_metadata(path: &Path, metadata: &LockMetadata) -> io::Result<()> {
     let tmp_path = temp_path_for_lock(path);
     let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
+        let mut file = open_new_lock_file(&tmp_path)?;
         write_lock_metadata_to_file(&mut file, metadata)?;
         drop(file);
 
@@ -579,7 +613,7 @@ fn atomic_write_lock_metadata(path: &Path, metadata: &LockMetadata) -> io::Resul
 }
 
 #[cfg(windows)]
-fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     // std::fs::rename on Windows maps to MoveFileExW with
     // MOVEFILE_REPLACE_EXISTING, which atomically replaces an existing
     // destination. Try that FIRST: an unconditional `remove_file(to)` before
@@ -614,7 +648,7 @@ fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 
@@ -646,6 +680,13 @@ fn temp_path_for_lock(path: &Path) -> PathBuf {
     ))
 }
 
+fn lock_identity_matches(left: &LockMetadata, right: &LockMetadata) -> bool {
+    left.pid == right.pid
+        && left.hostname == right.hostname
+        && left.created_at_ms == right.created_at_ms
+        && left.writer_epoch == right.writer_epoch
+}
+
 fn remove_lock_if_owned(path: &Path, owner: &LockMetadata) -> io::Result<bool> {
     let metadata = match read_lock_metadata(path) {
         Ok(metadata) => metadata,
@@ -656,10 +697,7 @@ fn remove_lock_if_owned(path: &Path, owner: &LockMetadata) -> io::Result<bool> {
         Err(ReadLockError::Malformed(_)) => return Ok(false),
     };
 
-    if metadata.pid == owner.pid
-        && metadata.hostname == owner.hostname
-        && metadata.created_at_ms == owner.created_at_ms
-    {
+    if lock_identity_matches(&metadata, owner) {
         remove_lock_file(path)?;
         Ok(true)
     } else {
@@ -685,12 +723,12 @@ fn remove_lock_file(path: &Path) -> io::Result<()> {
 /// shrinks the window from the whole judgment/poll duration to a couple of
 /// syscalls — the standard mitigation. Returns true if we removed it.
 fn reclaim_lock_file(path: &Path, judged: &LockMetadata) -> io::Result<bool> {
+    let Some(_token) = acquire_reclaim_token(path)? else {
+        return Ok(false);
+    };
     match read_lock_metadata(path) {
         Ok(current) => {
-            if current.pid == judged.pid
-                && current.hostname == judged.hostname
-                && current.created_at_ms == judged.created_at_ms
-            {
+            if lock_identity_matches(&current, judged) {
                 remove_lock_file(path)?;
                 Ok(true)
             } else {
@@ -704,6 +742,47 @@ fn reclaim_lock_file(path: &Path, judged: &LockMetadata) -> io::Result<bool> {
         Err(ReadLockError::Malformed(_)) => Ok(false),
         Err(ReadLockError::Io(error)) => Err(error),
     }
+}
+
+struct ReclaimTokenGuard {
+    path: PathBuf,
+}
+
+impl Drop for ReclaimTokenGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        sync_parent(&self.path);
+    }
+}
+
+fn acquire_reclaim_token(lock_path: &Path) -> io::Result<Option<ReclaimTokenGuard>> {
+    let token_path = reclaim_token_path(lock_path);
+    let metadata = LockMetadata {
+        pid: std::process::id(),
+        hostname: current_hostname(),
+        created_at_ms: now_ms(),
+        heartbeat_at_ms: now_ms(),
+        writer_epoch: format!("reclaim-{}-{}", std::process::id(), now_nanos()),
+    };
+    let mut file = match open_new_lock_file(&token_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = write_lock_metadata_to_file(&mut file, &metadata) {
+        let _ = fs::remove_file(&token_path);
+        return Err(error);
+    }
+    sync_parent(&token_path);
+    Ok(Some(ReclaimTokenGuard { path: token_path }))
+}
+
+fn reclaim_token_path(lock_path: &Path) -> PathBuf {
+    let file_name = lock_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("lock");
+    lock_path.with_file_name(format!(".{file_name}.reclaim"))
 }
 
 fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result<(), AcquireError> {
@@ -722,7 +801,7 @@ fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result
     Ok(())
 }
 
-fn sync_parent(path: &Path) {
+pub(crate) fn sync_parent(path: &Path) {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
             let _ = dir.sync_all();
@@ -856,6 +935,7 @@ mod tests {
             hostname,
             created_at_ms,
             heartbeat_at_ms: created_at_ms,
+            writer_epoch: format!("synthetic-{pid}-{created_at_ms}"),
         }
     }
 
@@ -873,6 +953,15 @@ mod tests {
         assert_eq!(metadata.pid, std::process::id());
         assert_eq!(metadata.hostname, current_hostname());
         assert_eq!(metadata.created_at_ms, guard.metadata.created_at_ms);
+        assert_eq!(metadata.writer_epoch, guard.metadata.writer_epoch);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         drop(guard);
         assert!(!path.exists());
@@ -934,6 +1023,18 @@ mod tests {
 
         // Reclaiming a now-absent lock is a no-op, not an error.
         assert!(!reclaim_lock_file(&path, &owner).expect("reclaim missing"));
+    }
+
+    #[test]
+    fn try_acquire_once_never_waits_behind_live_owner() {
+        let (_dir, path) = test_lock_path();
+        let _guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
+        let started = Instant::now();
+
+        let result = try_acquire_once(&path);
+
+        assert!(matches!(result, Err(AcquireError::Timeout)));
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[test]
@@ -1087,6 +1188,7 @@ mod tests {
             hostname: format!("{}-other", current_hostname()),
             created_at_ms: now,
             heartbeat_at_ms: now,
+            writer_epoch: format!("cross-host-{now}"),
         };
         write_synthetic_lock(&path, &metadata);
 
@@ -1107,6 +1209,7 @@ mod tests {
             hostname: format!("{}-other", current_hostname()),
             created_at_ms: stale_at,
             heartbeat_at_ms: stale_at,
+            writer_epoch: format!("cross-host-{stale_at}"),
         };
         write_synthetic_lock(&path, &metadata);
 

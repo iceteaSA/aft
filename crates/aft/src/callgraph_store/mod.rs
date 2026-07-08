@@ -75,7 +75,7 @@ impl fmt::Display for CallGraphStoreError {
             Self::Sqlite(error) => write!(formatter, "sqlite error: {error}"),
             Self::Json(error) => write!(formatter, "json error: {error}"),
             Self::Aft(error) => write!(formatter, "callgraph extraction error: {error}"),
-            Self::Lock(error) => write!(formatter, "callgraph build lock error: {error}"),
+            Self::Lock(error) => write!(formatter, "callgraph writer lease error: {error}"),
             Self::MissingCallerData { file } => {
                 write!(formatter, "missing extracted caller data for {file}")
             }
@@ -150,6 +150,8 @@ pub struct CallGraphStore {
     /// another process has published a newer generation so this process can
     /// drop its connection and reopen (see `current_generation`).
     generation: Option<String>,
+    writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
+    _read_marker: Option<crate::root_cache::ReadMarker>,
     conn: Mutex<Connection>,
 }
 
@@ -482,6 +484,7 @@ impl CallGraphStore {
     pub fn open(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
         // path so a brand-new store still gets a writable DB + schema.
@@ -493,11 +496,14 @@ impl CallGraphStore {
             sqlite_path,
             generation,
             true,
+            Some(Arc::clone(&writer_lease)),
+            None,
         )?;
         match root_repair {
             OpenRootRepair::NeedsRebuild { .. } => {
                 log_root_repair_rebuild(&root_repair);
                 drop(store);
+                drop(writer_lease);
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
                     Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
@@ -513,16 +519,19 @@ impl CallGraphStore {
         else {
             return Ok(None);
         };
-        let conn = Connection::open_with_flags(&sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
+        let conn = open_readonly_connection(&sqlite_path)?;
         if !database_ready(&conn).unwrap_or(false) {
             return Ok(None);
         }
+        let marker_label = generation.as_deref().unwrap_or("legacy");
+        let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, marker_label)?;
         Ok(Some(Self::from_connection(
             project_root,
             project_key,
             sqlite_path,
             generation,
+            None,
+            Some(read_marker),
             conn,
         )))
     }
@@ -552,6 +561,7 @@ impl CallGraphStore {
         allow_cold_build: bool,
     ) -> Result<Option<Self>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
             return Ok(None);
@@ -562,11 +572,14 @@ impl CallGraphStore {
             sqlite_path,
             generation,
             true,
+            Some(Arc::clone(&writer_lease)),
+            None,
         )?;
         match root_repair {
             OpenRootRepair::NeedsRebuild { .. } if allow_cold_build => {
                 log_root_repair_rebuild(&root_repair);
                 drop(store);
+                drop(writer_lease);
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
                     Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
@@ -598,16 +611,22 @@ impl CallGraphStore {
     ) -> Result<(Self, ColdBuildStats)> {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::artifact_cache_key(&project_root);
-        let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
-        let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
+        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
         let (stats, generation) = Self::cold_build_publish_locked(
             &callgraph_dir,
             &project_root,
             &project_key,
             files,
             chunk_size,
+            Arc::clone(&writer_lease),
         )?;
-        let store = Self::open_generation(&callgraph_dir, project_root, project_key, generation)?;
+        let store = Self::open_generation(
+            &callgraph_dir,
+            project_root,
+            project_key,
+            generation,
+            writer_lease,
+        )?;
         Ok((store, stats))
     }
 
@@ -627,8 +646,7 @@ impl CallGraphStore {
     ) -> Result<(Self, Option<ColdBuildStats>)> {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::artifact_cache_key(&project_root);
-        let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
-        let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
+        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
         // Another process may have published a ready generation while we waited
         // for the lock — open it instead of rebuilding. If that generation is
         // from this same project at an older filesystem root, repair the root
@@ -643,6 +661,8 @@ impl CallGraphStore {
                 sqlite_path,
                 generation,
                 true,
+                Some(Arc::clone(&writer_lease)),
+                None,
             )?;
             match root_repair {
                 OpenRootRepair::NeedsRebuild { .. } => {
@@ -654,12 +674,14 @@ impl CallGraphStore {
                         &project_key,
                         files,
                         chunk_size,
+                        Arc::clone(&writer_lease),
                     )?;
                     let store = Self::open_generation(
                         &callgraph_dir,
                         project_root,
                         project_key,
                         generation,
+                        writer_lease,
                     )?;
                     return Ok((store, Some(stats)));
                 }
@@ -674,8 +696,15 @@ impl CallGraphStore {
             &project_key,
             files,
             chunk_size,
+            Arc::clone(&writer_lease),
         )?;
-        let store = Self::open_generation(&callgraph_dir, project_root, project_key, generation)?;
+        let store = Self::open_generation(
+            &callgraph_dir,
+            project_root,
+            project_key,
+            generation,
+            writer_lease,
+        )?;
         Ok((store, Some(stats)))
     }
 
@@ -695,6 +724,7 @@ impl CallGraphStore {
         project_key: &str,
         files: &[PathBuf],
         chunk_size: usize,
+        writer_lease: Arc<crate::root_cache::WriterLease>,
     ) -> Result<(ColdBuildStats, String)> {
         let generation = generation_file_name(project_key);
         let gen_path = callgraph_dir.join(&generation);
@@ -712,6 +742,8 @@ impl CallGraphStore {
                 temp_path.clone(),
                 None,
                 false,
+                Some(Arc::clone(&writer_lease)),
+                None,
             )?
             .store;
             let stats = temp_store.cold_build_chunked(files, chunk_size)?;
@@ -719,15 +751,18 @@ impl CallGraphStore {
             stats
         };
 
+        verify_writer_lease(&writer_lease)?;
         // Move the finished build to its final generation path. This target is
         // brand-new and owned by us, so the rename never hits an open file.
         remove_sqlite_file_set(&gen_path);
-        std::fs::rename(&temp_path, &gen_path)?;
+        crate::fs_lock::rename_over(&temp_path, &gen_path)?;
+        crate::fs_lock::sync_parent(&gen_path);
         remove_sqlite_sidecars(&gen_path);
 
         notify_cold_build_swap_observer(&temp_path, &gen_path);
 
         // Atomically publish the new generation, then best-effort GC old ones.
+        verify_writer_lease(&writer_lease)?;
         publish_pointer(callgraph_dir, project_key, &generation)?;
         gc_old_generations(callgraph_dir, project_key, &generation);
         Ok((stats, generation))
@@ -740,9 +775,19 @@ impl CallGraphStore {
         project_root: PathBuf,
         project_key: String,
         generation: String,
+        writer_lease: Arc<crate::root_cache::WriterLease>,
     ) -> Result<Self> {
         let gen_path = callgraph_dir.join(&generation);
-        Ok(Self::open_at_path(project_root, project_key, gen_path, Some(generation), true)?.store)
+        Ok(Self::open_at_path(
+            project_root,
+            project_key,
+            gen_path,
+            Some(generation),
+            true,
+            Some(writer_lease),
+            None,
+        )?
+        .store)
     }
 
     pub fn needs_cold_build(callgraph_dir: &Path, project_root: &Path) -> Result<bool> {
@@ -758,6 +803,8 @@ impl CallGraphStore {
         sqlite_path: PathBuf,
         generation: Option<String>,
         use_wal: bool,
+        writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
+        read_marker: Option<crate::root_cache::ReadMarker>,
     ) -> Result<OpenedStore> {
         if let Some(parent) = sqlite_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -770,13 +817,30 @@ impl CallGraphStore {
         }
         initialize_schema(&conn)?;
         let root_repair = reconcile_workspace_roots(&mut conn, &project_root)?;
-        let store = Self::from_connection(project_root, project_key, sqlite_path, generation, conn);
+        let store = Self::from_connection(
+            project_root,
+            project_key,
+            sqlite_path,
+            generation,
+            writer_lease,
+            read_marker,
+            conn,
+        );
         Ok(OpenedStore { store, root_repair })
     }
 
     fn prepare_for_atomic_swap(&self) -> Result<()> {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        let protected_reader = self.generation.as_deref().is_some_and(|generation| {
+            self.sqlite_path
+                .parent()
+                .is_some_and(|dir| crate::root_cache::protected_read_marker_exists(dir, generation))
+        });
+        if protected_reader {
+            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE); PRAGMA journal_mode=DELETE;")?;
+        } else {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        }
         Ok(())
     }
 
@@ -785,6 +849,8 @@ impl CallGraphStore {
         project_key: String,
         sqlite_path: PathBuf,
         generation: Option<String>,
+        writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
+        read_marker: Option<crate::root_cache::ReadMarker>,
         conn: Connection,
     ) -> Self {
         Self {
@@ -792,6 +858,8 @@ impl CallGraphStore {
             project_key,
             sqlite_path,
             generation,
+            writer_lease,
+            _read_marker: read_marker,
             conn: Mutex::new(conn),
         }
     }
@@ -806,6 +874,19 @@ impl CallGraphStore {
 
     pub fn sqlite_path(&self) -> &Path {
         &self.sqlite_path
+    }
+
+    pub fn writer_epoch_for_test(&self) -> Option<&str> {
+        self.writer_lease.as_ref().map(|lease| lease.epoch())
+    }
+
+    fn verify_writer_lease(&self) -> Result<()> {
+        let Some(lease) = self.writer_lease.as_ref() else {
+            return Err(CallGraphStoreError::Unavailable(
+                "callgraph store opened read-only; write API is unavailable".to_string(),
+            ));
+        };
+        verify_writer_lease(lease)
     }
 
     /// True if this store still reflects the currently-published generation.
@@ -874,6 +955,7 @@ impl CallGraphStore {
                 .count();
 
             let t = Instant::now();
+            self.verify_writer_lease()?;
             let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
             let tx = conn.transaction()?;
             clear_tables(&tx)?;
@@ -933,6 +1015,7 @@ impl CallGraphStore {
         // Chunked implementation: parse and resolve in batches to reduce peak
         // memory during cold build without changing the persisted graph.
         let t = Instant::now();
+        self.verify_writer_lease()?;
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let tx = conn.transaction()?;
         clear_tables(&tx)?;
@@ -1045,6 +1128,7 @@ impl CallGraphStore {
     }
 
     pub fn refresh_files(&self, changed_files: &[PathBuf]) -> Result<IncrementalStats> {
+        self.verify_writer_lease()?;
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let tx = conn.transaction()?;
         ensure_database_ready(&tx)?;
@@ -1214,6 +1298,7 @@ impl CallGraphStore {
     }
 
     pub fn mark_files_stale(&self, files: &[PathBuf]) -> Result<Vec<String>> {
+        self.verify_writer_lease()?;
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let tx = conn.transaction()?;
         let mut marked = Vec::new();
@@ -2202,6 +2287,57 @@ pub fn live_callgraph_edge_snapshot(
     Ok(edges)
 }
 
+fn acquire_writer_lease(
+    callgraph_dir: &Path,
+    project_key: &str,
+) -> Result<Arc<crate::root_cache::WriterLease>> {
+    crate::root_cache::WriterLease::acquire(
+        crate::root_cache::RootCacheDomain::Callgraph,
+        callgraph_dir,
+        project_key,
+        Duration::from_secs(30),
+    )
+    .map(Arc::new)
+    .map_err(CallGraphStoreError::from)
+}
+
+fn verify_writer_lease(lease: &crate::root_cache::WriterLease) -> Result<()> {
+    if lease.verify()? {
+        Ok(())
+    } else {
+        Err(CallGraphStoreError::Unavailable(format!(
+            "callgraph writer lease for key {} lost epoch {}; aborting write",
+            lease.key(),
+            lease.epoch()
+        )))
+    }
+}
+
+fn open_readonly_connection(path: &Path) -> Result<Connection> {
+    let uri = sqlite_readonly_uri(path);
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(reader_busy_timeout())?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
+    Ok(conn)
+}
+
+fn reader_busy_timeout() -> Duration {
+    let jitter = (now_nanos() % 500) as u64;
+    Duration::from_millis(250 + jitter)
+}
+
+fn sqlite_readonly_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    if raw.starts_with('/') {
+        format!("file://{raw}?mode=ro")
+    } else {
+        format!("file:{raw}?mode=ro")
+    }
+}
+
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
@@ -2640,8 +2776,7 @@ fn read_pointer(callgraph_dir: &Path, project_key: &str) -> Option<String> {
 /// `ready` flag). Uses a throwaway read-only connection.
 fn db_path_ready(path: &Path) -> bool {
     (|| -> Result<bool> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
+        let conn = open_readonly_connection(path)?;
         database_ready(&conn)
     })()
     .unwrap_or(false)
@@ -2693,10 +2828,11 @@ fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) ->
         file.write_all(b"\n")?;
         file.sync_all()?;
     }
-    if let Err(error) = std::fs::rename(&tmp, &pointer) {
+    if let Err(error) = crate::fs_lock::rename_over(&tmp, &pointer) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error.into());
     }
+    crate::fs_lock::sync_parent(&pointer);
     Ok(())
 }
 
@@ -7571,6 +7707,7 @@ export function leaf() {}
                 .expect("needs_cold_build after publish"),
             "published store should be ready"
         );
+        drop(_published);
         let (_opened, rebuild_stats) = CallGraphStore::ensure_built_with_lease_chunked(
             published_dir,
             project_root.to_path_buf(),

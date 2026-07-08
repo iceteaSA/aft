@@ -10,12 +10,13 @@
 //!    [`project_scope_key`]. Shared byte-for-byte with subc by construction
 //!    (same crate), so a session attaches to the same root subc routed it to.
 //!
-//! 2. [`crate::search_index::artifact_cache_key`] — the on-disk ARTIFACT cache
-//!    key (search, semantic, symbol, callgraph, inspect). For git repos this is
-//!    the repository ROOT COMMIT, so a linked worktree shares the main
-//!    checkout's index (opened read-only); for non-git it is the canonical
-//!    path. Its value is unchanged from the historical `project_cache_key`, so
-//!    existing on-disk caches are NOT invalidated.
+//! Shared artifact caches are keyed so linked worktrees can reuse the same
+//! search-related cache data: Git repositories use the repository root commit,
+//! and non-Git projects use the canonical filesystem path. This covers search,
+//! semantic search, symbol lookup, and callgraph. Inspect results stay tied to a
+//! single checkout, so inspect uses [`project_scope_key`]. The shared artifact
+//! key remains compatible with the older `project_cache_key` value so existing
+//! caches keep working.
 //!
 //! 3. Operation-target / lexical path handling (create-file fallback, relative
 //!    path joins) — not identity; stays local to its call sites.

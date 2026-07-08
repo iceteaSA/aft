@@ -1067,7 +1067,7 @@ pub fn refresh_project_corpus(
     let config = ctx.config();
     let mut status_changed = false;
 
-    if !ctx.is_worktree_bridge() {
+    if ctx.callgraph_writer() {
         // Do NOT cold-build the callgraph store synchronously here. This function
         // runs on the single-threaded dispatch loop from `drain_watcher_events`,
         // which fires before EVERY request (and on idle ticks). A full O(repo)
@@ -1170,7 +1170,7 @@ pub fn refresh_callgraph_store_for_watcher(
     ctx: &AppContext,
     changed: &HashSet<std::path::PathBuf>,
 ) {
-    if ctx.is_worktree_bridge() || !ctx.heavy_root_work_allowed() {
+    if !ctx.callgraph_writer() || !ctx.heavy_root_work_allowed() {
         return;
     }
     let source_paths = changed
@@ -1351,7 +1351,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_events: usize) -> Drai
         return outcome;
     }
 
-    if heavy_root_work_allowed {
+    if heavy_root_work_allowed && ctx.inspect_writer() {
         ctx.add_pending_tier2_paths(changed.iter().cloned());
     }
 

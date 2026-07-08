@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -353,14 +353,18 @@ pub struct InspectCache {
     project_root: PathBuf,
     project_key: String,
     sqlite_path: PathBuf,
+    writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
+    _read_marker: Option<crate::root_cache::ReadMarker>,
     conn: Mutex<Connection>,
     memory: RwLock<HashMap<JobKey, MemoryAggregate>>,
 }
 
 impl InspectCache {
     pub fn open(inspect_dir: PathBuf, project_root: PathBuf) -> Result<Self, InspectCacheError> {
+        let project_key = crate::path_identity::project_scope_key(&project_root);
+        let inspect_dir = project_inspect_dir(inspect_dir, &project_key);
         std::fs::create_dir_all(&inspect_dir)?;
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let writer_lease = acquire_writer_lease(&inspect_dir, &project_key)?;
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let conn = Connection::open(&sqlite_path)?;
         configure_connection(&conn)?;
@@ -369,6 +373,8 @@ impl InspectCache {
             project_root,
             project_key,
             sqlite_path,
+            Some(writer_lease),
+            None,
             conn,
         ))
     }
@@ -377,17 +383,20 @@ impl InspectCache {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>, InspectCacheError> {
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let project_key = crate::path_identity::project_scope_key(&project_root);
+        let inspect_dir = project_inspect_dir(inspect_dir, &project_key);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         if !sqlite_path.is_file() {
             return Ok(None);
         }
-        let conn = Connection::open_with_flags(&sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
+        let conn = open_readonly_connection(&sqlite_path)?;
+        let read_marker = crate::root_cache::ReadMarker::create(&inspect_dir, "inspect")?;
         Ok(Some(Self::from_connection(
             project_root,
             project_key,
             sqlite_path,
+            None,
+            Some(read_marker),
             conn,
         )))
     }
@@ -396,12 +405,16 @@ impl InspectCache {
         project_root: PathBuf,
         project_key: String,
         sqlite_path: PathBuf,
+        writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
+        read_marker: Option<crate::root_cache::ReadMarker>,
         conn: Connection,
     ) -> Self {
         Self {
             project_root,
             project_key,
             sqlite_path,
+            writer_lease,
+            _read_marker: read_marker,
             conn: Mutex::new(conn),
             memory: RwLock::new(HashMap::new()),
         }
@@ -419,11 +432,33 @@ impl InspectCache {
         &self.sqlite_path
     }
 
+    pub fn writer_epoch_for_test(&self) -> Option<&str> {
+        self.writer_lease.as_ref().map(|lease| lease.epoch())
+    }
+
+    fn verify_writer_lease(&self) -> Result<(), InspectCacheError> {
+        let Some(lease) = self.writer_lease.as_ref() else {
+            return Err(InspectCacheError::Io(std::io::Error::other(
+                "inspect cache opened read-only; write API is unavailable",
+            )));
+        };
+        if lease.verify()? {
+            Ok(())
+        } else {
+            Err(InspectCacheError::Io(std::io::Error::other(format!(
+                "inspect writer lease for key {} lost epoch {}; aborting write",
+                lease.key(),
+                lease.epoch()
+            ))))
+        }
+    }
+
     pub fn store_aggregated(
         &self,
         key: JobKey,
         payload: serde_json::Value,
     ) -> Result<(), InspectCacheError> {
+        self.verify_writer_lease()?;
         self.store_memory_aggregate(key, payload, None)
     }
 
@@ -571,6 +606,7 @@ impl InspectCache {
             return Ok(());
         }
 
+        self.verify_writer_lease()?;
         let now = unix_seconds_now();
         let mut conn = self
             .conn
@@ -670,6 +706,7 @@ impl InspectCache {
         updates: Tier2ContributionUpdates,
         config: Option<&Config>,
     ) -> Result<String, InspectCacheError> {
+        self.verify_writer_lease()?;
         let now = unix_seconds_now();
         let mut conn = self
             .conn
@@ -814,6 +851,7 @@ impl InspectCache {
         &self,
         category: InspectCategory,
     ) -> Result<i64, InspectCacheError> {
+        self.verify_writer_lease()?;
         let mut conn = self
             .conn
             .lock()
@@ -847,6 +885,7 @@ impl InspectCache {
             return Ok(());
         }
 
+        self.verify_writer_lease()?;
         let now = unix_seconds_now();
         let aggregate_blob = serde_json::to_vec(&aggregate)?;
         let mut conn = self
@@ -928,6 +967,7 @@ impl InspectCache {
         category: InspectCategory,
         relative_file: &Path,
     ) -> Result<(), InspectCacheError> {
+        self.verify_writer_lease()?;
         let conn = self
             .conn
             .lock()
@@ -949,6 +989,7 @@ impl InspectCache {
         relative_file: &Path,
         freshness: &FileFreshness,
     ) -> Result<(), InspectCacheError> {
+        self.verify_writer_lease()?;
         let conn = self
             .conn
             .lock()
@@ -1064,6 +1105,57 @@ impl InspectCache {
             .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
             .get(key)
             .map(|entry| entry.generated_at))
+    }
+}
+
+fn project_inspect_dir(inspect_dir: PathBuf, project_key: &str) -> PathBuf {
+    if inspect_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == project_key)
+    {
+        inspect_dir
+    } else {
+        inspect_dir.join(project_key)
+    }
+}
+
+fn acquire_writer_lease(
+    inspect_dir: &Path,
+    project_key: &str,
+) -> Result<Arc<crate::root_cache::WriterLease>, InspectCacheError> {
+    crate::root_cache::WriterLease::acquire(
+        crate::root_cache::RootCacheDomain::Inspect,
+        inspect_dir,
+        project_key,
+        Duration::from_secs(30),
+    )
+    .map(Arc::new)
+    .map_err(|error| InspectCacheError::Io(std::io::Error::other(error.to_string())))
+}
+
+fn open_readonly_connection(path: &Path) -> Result<Connection, InspectCacheError> {
+    let uri = sqlite_readonly_uri(path);
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(reader_busy_timeout())?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
+    Ok(conn)
+}
+
+fn reader_busy_timeout() -> Duration {
+    let jitter = (now_nanos() % 500) as u64;
+    Duration::from_millis(250 + jitter)
+}
+
+fn sqlite_readonly_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    if raw.starts_with('/') {
+        format!("file://{raw}?mode=ro")
+    } else {
+        format!("file:{raw}?mode=ro")
     }
 }
 
@@ -1525,6 +1617,13 @@ fn unix_seconds_now() -> i64 {
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
         .min(i64::MAX as u64) as i64
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos()
 }
 
 #[cfg(test)]

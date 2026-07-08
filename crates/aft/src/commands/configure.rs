@@ -1623,6 +1623,30 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             slog_warn!("{}", note);
         }
     }
+    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let root_cache_storage_ok = match crate::root_cache::storage_allows_root_keyed(&storage_root) {
+        Ok(true) => true,
+        Ok(false) => {
+            degraded_reasons.push("root_cache_network_fs".to_string());
+            slog_warn!(
+                "root-keyed callgraph/inspect writers disabled: storage directory appears to be on a network filesystem ({})",
+                storage_root.display()
+            );
+            false
+        }
+        Err(error) => {
+            degraded_reasons.push("root_cache_fs_probe_failed".to_string());
+            slog_warn!(
+                "root-keyed callgraph/inspect writers disabled: failed to probe storage filesystem {}: {}",
+                storage_root.display(),
+                error
+            );
+            false
+        }
+    };
+    let callgraph_writer_capability =
+        root_cache_storage_ok && !is_worktree_bridge && !artifact_owner_read_only && !home_match;
+    let inspect_writer_capability = root_cache_storage_ok && !home_match;
     let heavy_root_work_allowed =
         !home_match && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
@@ -1645,6 +1669,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     let artifact_owner_lease = artifact_owner_claim.and_then(|claim| claim.lease);
     ctx.set_artifact_owner(artifact_owner_status.clone(), artifact_owner_lease);
+    ctx.set_cache_writer_capabilities(callgraph_writer_capability, inspect_writer_capability);
     // Snapshot degraded-mode state once at configure time so every later
     // heavy-work entry point reads the same cheap gate instead of re-deriving
     // home-root logic independently.

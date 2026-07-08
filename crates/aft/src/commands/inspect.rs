@@ -167,13 +167,13 @@ pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response 
         Err(message) => return invalid_request(&req.id, message),
     };
 
-    if ctx.is_worktree_bridge() {
+    if !ctx.inspect_writer() {
         let skipped = categories
             .iter()
             .map(|category| {
                 serde_json::json!({
                     "category": category.as_str(),
-                    "reason": "worktree_bridge_read_only",
+                    "reason": "inspect_read_only",
                 })
             })
             .collect::<Vec<_>>();

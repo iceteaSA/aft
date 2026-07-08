@@ -25,6 +25,33 @@ use tempfile::tempdir;
 static NEXT_MTIME: AtomicI64 = AtomicI64::new(1_800_000_000);
 
 #[test]
+fn writer_epoch_fence_rejects_usurped_callgraph_write() {
+    let root_dir = tempdir().unwrap();
+    let root = root_dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+
+    let store_dir = tempdir().unwrap();
+    let store = CallGraphStore::open(store_dir.path().to_path_buf(), root.to_path_buf()).unwrap();
+    store.cold_build(&project_files(root)).unwrap();
+
+    let lease_path = store_dir.path().join("writer.lease");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
+    metadata["writer_epoch"] = serde_json::Value::String("usurped-by-test".to_string());
+    fs::write(&lease_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+    let error = store
+        .mark_files_stale(&[root.join("src/lib.rs")])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("lost epoch") || error.contains("unavailable"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn store_trace_data_covers_callgraph_fixtures() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/callgraph");
     let root = std::fs::canonicalize(root).unwrap();
@@ -685,6 +712,7 @@ fn cold_build_with_lease_swaps_atomically_over_old_ready_db() {
             .unwrap();
     let old_edges = store.edge_snapshot().unwrap();
     assert!(!old_edges.is_empty());
+    drop(store);
 
     write_file(
         &dir.path().join("main.ts"),
@@ -732,13 +760,18 @@ fn publish_succeeds_while_old_generation_is_held_open() {
     );
     let store_dir = root.join(".store-gen");
 
-    // Process A: build gen 1 and KEEP its read connection open for the whole test.
-    let (held_reader, _) = CallGraphStore::cold_build_with_lease(
+    // Keep a read-only connection alive so the test simulates one process
+    // holding an older published snapshot while another process later writes.
+    let (writer, _) = CallGraphStore::cold_build_with_lease(
         store_dir.clone(),
         root.clone(),
         &project_files(&root),
     )
     .unwrap();
+    drop(writer);
+    let held_reader = CallGraphStore::open_readonly(store_dir.clone(), root.clone())
+        .unwrap()
+        .unwrap();
     let gen1_tree = held_reader
         .call_tree(Path::new("main.ts"), "entry", 1)
         .unwrap();
@@ -819,7 +852,7 @@ fn app_context_revalidates_to_newer_published_generation() {
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
-    ctx.set_cache_role(false, None);
+    ctx.set_cache_role(true, None);
     let store_dir = ctx.callgraph_store_dir();
 
     // Publish gen 1 out-of-band so the context opens it warm (no background build).
