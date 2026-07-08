@@ -1,23 +1,16 @@
 # Configuration
 
 AFT uses a two-level config system: user-level defaults plus project-level overrides.
-Both files are JSONC (comments allowed). Config paths are harness-specific:
-
-**OpenCode**
+Both files are JSONC (comments allowed). One location serves every harness:
 
 | Scope | Path |
 |---|---|
-| User | `~/.config/opencode/aft.jsonc` |
-| Project | `<project>/.opencode/aft.jsonc` |
+| User | `~/.config/cortexkit/aft.jsonc` |
+| Project | `<project>/.cortexkit/aft.jsonc` |
 
-**Pi**
-
-| Scope | Path |
-|---|---|
-| User | `~/.pi/agent/aft.jsonc` |
-| Project | `<project>/.pi/aft.jsonc` |
-
-The schema is identical across harnesses. Only file location differs.
+Older installs used per-harness paths (`~/.config/opencode/aft.jsonc`, `~/.pi/agent/aft.jsonc`,
+and their project-level equivalents). On first load, the plugin migrates them to the CortexKit
+location automatically and leaves a `.MOVED_READPLEASE` marker behind.
 
 ## Config Options
 
@@ -34,8 +27,9 @@ The schema is identical across harnesses. Only file location differs.
   // tools alongside them under explicit names.
   "hoist_builtin_tools": true,
 
-  // Auto-format files after every edit. Default: true
-  "format_on_edit": true,
+  // Auto-format files after edits. Default: false. When enabled, formatting is
+  // queued and runs after ~90s without further edits to the file.
+  "format_on_edit": false,
 
   // Auto-validate after edits: "syntax" (tree-sitter, fast) or "full" (runs type checker)
   "validate_on_edit": "syntax",
@@ -341,8 +335,8 @@ Configure via `lsp.*`:
 ```
 
 **Trust boundary:** `lsp.auto_install`, `lsp.grace_days`, `lsp.versions`, `lsp.servers`, and
-`lsp.disabled` are **user-only** — values from project config (`.opencode/aft.jsonc` or
-`.pi/aft.jsonc`) are stripped on load. A hostile repository cannot weaken your supply-chain
+`lsp.disabled` are **user-only** — values from project config (`<project>/.cortexkit/aft.jsonc`)
+are stripped on load. A hostile repository cannot weaken your supply-chain
 defenses, redirect AFT to download a different binary, or silently disable LSPs you rely on.
 The plugin logs a warning when it strips a project-level setting.
 

@@ -55,7 +55,7 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | `aft_zoom` | Inspect symbols (same-file or cross-file); opt-in call-graph annotations | `filePath`, `symbols` (string or array), `targets`, `url`, `callgraph` |
 | `aft_import` | Language-aware import add/remove/organize | `op`, `filePath`, `module`, `names[]` |
 | `aft_conflicts` | Show all git merge conflicts with line-numbered regions | `path` (optional) |
-| `aft_search` | Hybrid semantic + lexical code search by meaning | `query`, `topK` |
+| `aft_search` | Hybrid semantic + lexical code search by meaning | `query`, `topK`, `path` |
 | `aft_inspect` | Codebase-health snapshot (TODOs, metrics, dead code, unused exports, duplicates) | `sections`, `scope`, `topK` |
 | `aft_safety` | Undo, history, checkpoints, restore | `op`, `filePath`, `name` |
 
@@ -706,12 +706,46 @@ synthetic "file-summary" chunk that captures filename, parent directory, leading
 comment, and export list — this lifts recall for filename-shaped concept queries like
 *"the bridge spawn helper"*.
 
-Parameters: `query` (required — natural language description), `topK` (optional — default 10).
+Parameters: `query` (required — natural language description), `topK` (optional — default 10),
+`path` (optional — search a different project root, see below).
+
+#### Cross-project search
+
+Pass `path` to search another project on the same machine — a sibling repository, a
+worktree, or any directory AFT has indexed before:
+
+```json
+{ "query": "how does the sidebar discover the RPC endpoint", "path": "~/Work/other-project" }
+```
+
+How it behaves:
+
+- **Read-only borrow.** The session never mutates the other project's caches: indexes are
+  opened with strict read-only loaders, no rebuild or re-embed is triggered, and the other
+  project's watcher/ownership state is untouched. The owning session keeps exclusive write
+  access.
+- **Served with drift disclosure.** The borrowed index reflects the owner's last persisted
+  state. If files changed since (or the checkouts differ in untracked ignore files), results
+  are still served and the response carries a note — `borrowed`, drift count, and
+  `ignore_rules_differ` — with a hint to grep the target root when exact line numbers matter.
+  Owners flush their index on clean shutdown, so drift is normally the owner's uncommitted
+  working set since it last ran.
+- **Semantic lane requires a matching embedding backend.** A borrowed semantic index is only
+  used when its embedding fingerprint matches your session's backend; otherwise the search
+  degrades to the lexical lane for that query.
+- **Nonexistent paths fail loud** with `path_not_found` instead of walking up to an
+  unrelated parent.
+- **Never indexed?** If the target project has never been opened with AFT, there is nothing
+  to borrow and the search reports the index as unavailable — open the project once (any
+  session) to build its index.
+
+Under `restrict_to_project_root: true` (and always for untrusted MCP callers), cross-project
+search outside the session's root is denied.
 
 #### Embedding backends
 
 `aft_search` supports three embedding backends. Set them under the `semantic` block in your
-**user-level** AFT config (`~/.config/opencode/aft.jsonc` or `~/.pi/agent/aft.jsonc`).
+**user-level** AFT config (`~/.config/cortexkit/aft.jsonc`).
 
 > **Trust boundary:** `backend`, `base_url`, and `api_key_env` are user-only. Project-level
 > `aft.jsonc` files cannot inject these — a hostile repository cannot point your embeddings
