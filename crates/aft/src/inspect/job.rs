@@ -388,6 +388,7 @@ pub(crate) fn language_name(language: LangId) -> &'static str {
         LangId::Perl => "perl",
         LangId::Pascal => "pascal",
         LangId::R => "r",
+        LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
     }
 }

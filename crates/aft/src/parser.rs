@@ -427,6 +427,30 @@ const R_QUERY: &str = r#"
 (function_definition) @function.def
 "#;
 
+const GROOVY_QUERY: &str = r#"
+;; types
+(class_declaration
+  name: (identifier) @class.name) @class.def
+(interface_declaration
+  name: (identifier) @interface.name) @interface.def
+(trait_declaration
+  name: (identifier) @trait.name) @trait.def
+(enum_declaration
+  name: (identifier) @enum.name) @enum.def
+
+;; methods and top-level script functions
+(method_declaration
+  name: [(identifier) (quoted_identifier)] @fn.name) @fn.def
+
+;; fields and properties
+(field_declaration
+  (variable_declarator
+    name: (identifier) @var.name)) @var.def
+
+;; Jenkins declarative pipeline root
+(pipeline_statement) @pipeline.def
+"#;
+
 const OBJC_QUERY: &str = r#"
 ;; Objective-C class and protocol containers. The extractor derives names from
 ;; the first identifier child because the grammar does not field-name them.
@@ -655,11 +679,16 @@ pub enum LangId {
     Yaml,
     Pascal,
     R,
+    Groovy,
     ObjC,
 }
 
 /// Maps file extension to language identifier.
 pub fn detect_language(path: &Path) -> Option<LangId> {
+    if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
+        return Some(LangId::Groovy);
+    }
+
     let ext = path.extension()?.to_str()?;
     match ext {
         "ts" | "mts" | "cts" => Some(LangId::TypeScript),
@@ -690,6 +719,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "yaml" | "yml" => Some(LangId::Yaml),
         "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(LangId::Pascal),
         "R" | "r" => Some(LangId::R),
+        "groovy" | "gvy" | "gy" | "gsh" | "gradle" => Some(LangId::Groovy),
         "m" | "mm" => Some(LangId::ObjC),
         _ => None,
     }
@@ -726,6 +756,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Yaml => tree_sitter_yaml::LANGUAGE.into(),
         LangId::Pascal => tree_sitter_pascal::LANGUAGE.into(),
         LangId::R => tree_sitter_r::LANGUAGE.into(),
+        LangId::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
         LangId::ObjC => tree_sitter_objc::LANGUAGE.into(),
     }
 }
@@ -760,6 +791,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Yaml => None, // YAML uses direct tree walking like JSON
         LangId::Pascal => Some(PASCAL_QUERY),
         LangId::R => Some(R_QUERY),
+        LangId::Groovy => Some(GROOVY_QUERY),
         LangId::ObjC => Some(OBJC_QUERY),
     }
 }
@@ -808,6 +840,8 @@ static PERL_QUERY_CACHE: LazyLock<Result<Query, String>> =
 static PASCAL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Pascal));
 static R_QUERY_CACHE: LazyLock<Result<Query, String>> = LazyLock::new(|| compile_query(LangId::R));
+static GROOVY_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Groovy));
 static OBJC_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::ObjC));
 
@@ -843,6 +877,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Perl => Some(&*PERL_QUERY_CACHE),
         LangId::Pascal => Some(&*PASCAL_QUERY_CACHE),
         LangId::R => Some(&*R_QUERY_CACHE),
+        LangId::Groovy => Some(&*GROOVY_QUERY_CACHE),
         LangId::ObjC => Some(&*OBJC_QUERY_CACHE),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => None,
     };
@@ -1461,6 +1496,7 @@ pub fn extract_symbols_from_tree(
         LangId::Perl => extract_perl_symbols(source, &root, query),
         LangId::Pascal => extract_pascal_symbols(source, &root, query),
         LangId::R => extract_r_symbols(source, &root, query),
+        LangId::Groovy => extract_groovy_symbols(source, &root, query),
         LangId::ObjC => extract_objc_symbols(source, &root, query),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => {
             unreachable!("handled before query lookup")
@@ -1558,7 +1594,8 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             | LangId::Java
             | LangId::Kotlin
             | LangId::Swift
-            | LangId::Php => {
+            | LangId::Php
+            | LangId::Groovy => {
                 // Include `///` doc comments and `/** */` doc blocks if immediately above
                 let text = node_text(source, &prev);
                 (kind == "comment" || kind == "line_comment" || kind == "block_comment")
@@ -4473,6 +4510,153 @@ fn extract_r_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sym
     Ok(symbols)
 }
 
+fn extract_groovy_symbols(
+    source: &str,
+    root: &Node,
+    query: &Query,
+) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Groovy;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut class_name_node = None;
+        let mut class_def_node = None;
+        let mut interface_name_node = None;
+        let mut interface_def_node = None;
+        let mut trait_name_node = None;
+        let mut trait_def_node = None;
+        let mut enum_name_node = None;
+        let mut enum_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut pipeline_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "class.name" => class_name_node = Some(cap.node),
+                "class.def" => class_def_node = Some(cap.node),
+                "interface.name" => interface_name_node = Some(cap.node),
+                "interface.def" => interface_def_node = Some(cap.node),
+                "trait.name" => trait_name_node = Some(cap.node),
+                "trait.def" => trait_def_node = Some(cap.node),
+                "enum.name" => enum_name_node = Some(cap.node),
+                "enum.def" => enum_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "pipeline.def" => pipeline_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                groovy_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (interface_name_node, interface_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Interface,
+                groovy_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (trait_name_node, trait_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Interface,
+                groovy_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Enum,
+                groovy_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = groovy_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                scope_chain,
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                groovy_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let Some(def_node) = pipeline_def_node {
+            symbols.push(Symbol {
+                name: "pipeline".to_string(),
+                kind: SymbolKind::Function,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: vec![],
+                exported: true,
+                parent: None,
+            });
+        }
+    }
+
+    collect_groovy_task_symbols(source, root, &mut symbols);
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
 fn r_rightward_function_assignment_symbol(
     source: &str,
     function_node: &Node,
@@ -5455,6 +5639,174 @@ fn push_captured_symbol(
         scope_chain,
         exported,
     });
+}
+
+fn range_spanning_nodes(start_node: &Node, end_node: &Node) -> Range {
+    let start = start_node.start_position();
+    let end = end_node.end_position();
+    Range {
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: end.row as u32,
+        end_col: end.column as u32,
+    }
+}
+
+fn extract_signature_between(source: &str, start_node: &Node, end_node: &Node) -> String {
+    let start = start_node.start_byte();
+    let end = end_node.end_byte();
+    let text = source.get(start..end).unwrap_or_default();
+    let first_line = text.lines().next().unwrap_or(text);
+    let trimmed = first_line.trim_end();
+    let trimmed = trimmed.strip_suffix('{').unwrap_or(trimmed).trim_end();
+    trimmed.to_string()
+}
+
+fn groovy_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "trait_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                chain.push(node_text(source, &name_node).to_string());
+            }
+        }
+        current = parent.parent();
+    }
+
+    chain.reverse();
+    chain
+}
+
+// Gradle's `task foo { ... }` syntax parses as an expression statement for the
+// `task` keyword followed by a separate command-chain node for the task name and
+// body. Pair those adjacent siblings so outline shows the task as one symbol.
+fn groovy_keyword_task_symbol(
+    source: &str,
+    keyword_stmt: Node,
+    declaration: Node,
+) -> Option<Symbol> {
+    if keyword_stmt.kind() != "expression_statement" || declaration.kind() != "command_chain" {
+        return None;
+    }
+
+    let keyword = keyword_stmt.named_child(0)?;
+    if keyword.kind() != "identifier" || node_text(source, &keyword) != "task" {
+        return None;
+    }
+
+    let name_node = declaration.child_by_field_name("receiver")?;
+    if name_node.kind() != "identifier" {
+        return None;
+    }
+
+    let body_node = declaration.child_by_field_name("argument")?;
+    if body_node.kind() != "closure" {
+        return None;
+    }
+
+    Some(Symbol {
+        name: node_text(source, &name_node).to_string(),
+        kind: SymbolKind::Function,
+        range: range_spanning_nodes(&keyword_stmt, &declaration),
+        signature: Some(extract_signature_between(
+            source,
+            &keyword_stmt,
+            &declaration,
+        )),
+        scope_chain: vec![],
+        exported: true,
+        parent: None,
+    })
+}
+
+// `tasks.register("foo") { ... }` likewise arrives as two adjacent siblings:
+// the registration call and a trailing closure expression. Pair them into one
+// task symbol without scanning beyond the immediate statement pair.
+fn groovy_registered_task_symbol(
+    source: &str,
+    invocation_stmt: Node,
+    closure_stmt: Node,
+) -> Option<Symbol> {
+    if invocation_stmt.kind() != "expression_statement"
+        || closure_stmt.kind() != "expression_statement"
+    {
+        return None;
+    }
+
+    let invocation = invocation_stmt.named_child(0)?;
+    if invocation.kind() != "method_invocation" {
+        return None;
+    }
+
+    let function = invocation.child_by_field_name("function")?;
+    if function.kind() != "field_access" {
+        return None;
+    }
+
+    let object = function.child_by_field_name("object")?;
+    let field = function.child_by_field_name("field")?;
+    if node_text(source, &object) != "tasks" || node_text(source, &field) != "register" {
+        return None;
+    }
+
+    let arguments = invocation.child_by_field_name("arguments")?;
+    let name_node = arguments.named_child(0)?;
+    if name_node.kind() != "string_literal" {
+        return None;
+    }
+
+    let closure = closure_stmt.named_child(0)?;
+    if closure.kind() != "closure" {
+        return None;
+    }
+
+    Some(Symbol {
+        name: string_content(source, &name_node)?,
+        kind: SymbolKind::Function,
+        range: range_spanning_nodes(&invocation_stmt, &closure_stmt),
+        signature: Some(extract_signature_between(
+            source,
+            &invocation_stmt,
+            &closure_stmt,
+        )),
+        scope_chain: vec![],
+        exported: true,
+        parent: None,
+    })
+}
+
+fn collect_groovy_task_symbols(source: &str, root: &Node, symbols: &mut Vec<Symbol>) {
+    let children: Vec<Node> = root.named_children(&mut root.walk()).collect();
+    let mut index = 0;
+    while index + 1 < children.len() {
+        if let Some(symbol) =
+            groovy_keyword_task_symbol(source, children[index], children[index + 1])
+        {
+            symbols.push(symbol);
+            index += 2;
+            continue;
+        }
+
+        if let Some(symbol) =
+            groovy_registered_task_symbol(source, children[index], children[index + 1])
+        {
+            symbols.push(symbol);
+            index += 2;
+            continue;
+        }
+
+        index += 1;
+    }
 }
 
 fn java_scope_chain(node: &Node, source: &str) -> Vec<String> {
@@ -7712,6 +8064,54 @@ mod tests {
         assert_eq!(detect_language(Path::new("foo.txt")), None);
     }
 
+    #[test]
+    fn groovy_language_constant_loads_under_workspace_tree_sitter() {
+        let mut parser = Parser::new();
+        let language: Language = dekobon_tree_sitter_groovy::LANGUAGE.into();
+        parser
+            .set_language(&language)
+            .expect("load Groovy grammar under workspace tree-sitter");
+        let tree = parser
+            .parse("class Greeter { def greet() { 'hi' } }", None)
+            .expect("parse Groovy sample");
+        assert!(
+            !tree.root_node().has_error(),
+            "Groovy sample should parse cleanly"
+        );
+    }
+
+    #[test]
+    fn detect_groovy_extensions_and_jenkinsfile() {
+        assert_eq!(
+            detect_language(Path::new("script.groovy")),
+            Some(LangId::Groovy)
+        );
+        assert_eq!(
+            detect_language(Path::new("script.gvy")),
+            Some(LangId::Groovy)
+        );
+        assert_eq!(
+            detect_language(Path::new("script.gy")),
+            Some(LangId::Groovy)
+        );
+        assert_eq!(
+            detect_language(Path::new("shell.gsh")),
+            Some(LangId::Groovy)
+        );
+        assert_eq!(
+            detect_language(Path::new("build.gradle")),
+            Some(LangId::Groovy)
+        );
+        assert_eq!(
+            detect_language(Path::new("build.gradle.kts")),
+            Some(LangId::Kotlin)
+        );
+        assert_eq!(
+            detect_language(Path::new("Jenkinsfile")),
+            Some(LangId::Groovy)
+        );
+    }
+
     // --- Unsupported extension error ---
 
     #[test]
@@ -9249,5 +9649,76 @@ end.
             assert_eq!(m.kind, SymbolKind::Method);
             assert_eq!(m.scope_chain, vec!["TMyClass".to_string()]);
         }
+    }
+
+    #[test]
+    fn groovy_fixture_extracts_types_methods_and_properties() {
+        let provider = TreeSitterProvider::new();
+        let symbols = provider
+            .list_symbols(&fixture_path("sample.groovy"))
+            .unwrap();
+
+        let get = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("missing {name}; got {symbols:?}"))
+        };
+
+        assert_eq!(get("GreeterSupport").kind, SymbolKind::Interface);
+        assert_eq!(get("Named").kind, SymbolKind::Interface);
+        assert_eq!(get("BuildStatus").kind, SymbolKind::Enum);
+        assert_eq!(get("BuildLogic").kind, SymbolKind::Class);
+        assert_eq!(get("action").kind, SymbolKind::Variable);
+        assert_eq!(get("action").scope_chain, vec!["BuildLogic".to_string()]);
+        assert_eq!(get("greet").kind, SymbolKind::Method);
+        assert_eq!(get("greet").scope_chain, vec!["BuildLogic".to_string()]);
+        assert_eq!(get("topLevelHelper").kind, SymbolKind::Function);
+        assert!(get("topLevelHelper").scope_chain.is_empty());
+
+        assert_eq!(get("BuildLogic").range.start_line, 12);
+        assert_eq!(get("BuildLogic").range.end_line, 23);
+        assert_eq!(get("action").range.start_line, 14);
+        assert_eq!(get("action").range.end_line, 14);
+        assert_eq!(get("greet").range.start_line, 16);
+        assert_eq!(get("greet").range.end_line, 18);
+        assert_eq!(get("topLevelHelper").range.start_line, 25);
+        assert_eq!(get("topLevelHelper").range.end_line, 27);
+    }
+
+    #[test]
+    fn groovy_gradle_fixture_extracts_task_declarations() {
+        let provider = TreeSitterProvider::new();
+        let symbols = provider
+            .list_symbols(&fixture_path("build.gradle"))
+            .unwrap();
+
+        let get = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("missing {name}; got {symbols:?}"))
+        };
+
+        assert_eq!(get("smokeTest").kind, SymbolKind::Function);
+        assert_eq!(get("smokeTest").range.start_line, 8);
+        assert_eq!(get("smokeTest").range.end_line, 12);
+        assert_eq!(get("ciCheck").kind, SymbolKind::Function);
+        assert_eq!(get("ciCheck").range.start_line, 14);
+        assert_eq!(get("ciCheck").range.end_line, 18);
+    }
+
+    #[test]
+    fn groovy_jenkinsfile_fixture_extracts_pipeline_block() {
+        let provider = TreeSitterProvider::new();
+        let symbols = provider.list_symbols(&fixture_path("Jenkinsfile")).unwrap();
+
+        let pipeline = symbols
+            .iter()
+            .find(|symbol| symbol.name == "pipeline")
+            .unwrap_or_else(|| panic!("missing pipeline; got {symbols:?}"));
+        assert_eq!(pipeline.kind, SymbolKind::Function);
+        assert_eq!(pipeline.range.start_line, 0);
+        assert_eq!(pipeline.range.end_line, 9);
     }
 }

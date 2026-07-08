@@ -155,6 +155,7 @@ _Coming soon._
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Pascal | ✓ | ✓ | ✓ | ✓ | | |
 | R | ✓ | ✓ | ✓ | ✓ | | |
+| Groovy (incl. Gradle / Jenkinsfile / Spock) | ✓ | ✓ | ✓ | ✓ | | |
 | Objective-C (`.m`, `.mm`) | ✓ | ✓ | ✓ | ✓ | | |
 | Vue | ✓ | ✓ | ✓ | ✓ | ✓ | |
 
@@ -190,7 +191,7 @@ AFT is a Rust binary driven by thin adapter packages per harness. The binary spe
                    │     aft binary         │  ← shared core
                    │       (Rust)           │
                    ├────────────────────────┤
-                   │ • tree-sitter (26 lang)│
+                   │ • tree-sitter (27 lang)│
                    │ • symbols & call graph │
                    │ • diff/format/backup   │
                    │ • LSP client           │

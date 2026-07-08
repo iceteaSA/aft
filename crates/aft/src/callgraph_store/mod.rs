@@ -7107,6 +7107,7 @@ fn lang_label(lang: LangId) -> &'static str {
         LangId::Yaml => "yaml",
         LangId::Pascal => "pascal",
         LangId::R => "r",
+        LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
     }
 }
@@ -7141,6 +7142,7 @@ fn lang_from_label(label: &str) -> Option<LangId> {
         "yaml" => Some(LangId::Yaml),
         "pascal" => Some(LangId::Pascal),
         "r" => Some(LangId::R),
+        "groovy" => Some(LangId::Groovy),
         "objc" => Some(LangId::ObjC),
         _ => None,
     }

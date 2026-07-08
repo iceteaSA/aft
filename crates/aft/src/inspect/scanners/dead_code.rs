@@ -3446,6 +3446,31 @@ mod tests {
             })
     }
 
+    #[test]
+    fn groovy_dead_code_scan_reports_language_skipped_without_fabricated_counts() {
+        let (_temp_dir, root, paths) = fixture_project(&[(
+            "build.gradle",
+            "task smokeTest {\n    doLast {\n        println 'smoke'\n    }\n}\n",
+        )]);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(paths.clone(), Vec::new(), Vec::new()),
+        ));
+
+        assert_eq!(aggregate["count"], 0);
+        assert_eq!(aggregate["total_count"], 0);
+        assert_eq!(
+            aggregate["languages_skipped"],
+            serde_json::json!(["groovy"])
+        );
+        assert_eq!(aggregate["by_language"], serde_json::json!({}));
+        assert!(aggregate["items"]
+            .as_array()
+            .is_some_and(|items| items.is_empty()));
+        assert_eq!(aggregate["complete"], true);
+    }
+
     fn rust_entry_scan(
         files: &[(&str, &str)],
         exports: &[(&str, &str, &str)],

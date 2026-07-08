@@ -36,6 +36,7 @@ pub enum AstGrepLang {
     Perl,
     Pascal,
     R,
+    Groovy,
     ObjC,
 }
 
@@ -115,6 +116,7 @@ impl AstGrepLang {
             "perl" | "pl" | "pm" => Some(Self::Perl),
             "pascal" | "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(Self::Pascal),
             "r" => Some(Self::R),
+            "groovy" => Some(Self::Groovy),
             "objc" | "objective-c" | "objectivec" | "obj-c" => Some(Self::ObjC),
             _ => None,
         }
@@ -169,6 +171,7 @@ impl AstGrepLang {
             Self::Perl => &["pl", "pm", "t"],
             Self::Pascal => &["pas", "pp", "dpr", "dpk", "lpr"],
             Self::R => &["R", "r"],
+            Self::Groovy => &["groovy", "gvy", "gy", "gsh", "gradle"],
             Self::ObjC => &["m", "mm"],
         }
     }
@@ -180,6 +183,12 @@ impl AstGrepLang {
 
     /// Check if a file path matches this language based on its extension.
     pub fn matches_path(&self, path: &std::path::Path) -> bool {
+        if matches!(self, Self::Groovy)
+            && path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile")
+        {
+            return true;
+        }
+
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         self.matches_extension(ext)
     }
@@ -324,7 +333,9 @@ impl Language for AstGrepLang {
             | Self::R
             | Self::ObjC => '\u{00B5}', // µ
             Self::Pascal => '_',
-            // $ is valid in TS, JS, Go, Solidity, and Vue template identifiers
+            // $ is valid in TS, JS, Go, Solidity, Groovy, and Vue template identifiers.
+            // Groovy also uses $ inside GStrings, so keeping $ avoids rejecting
+            // literal interpolation patterns while still letting $NAME meta-vars bind.
             _ => '$',
         }
     }
@@ -356,6 +367,7 @@ impl LanguageExt for AstGrepLang {
             Self::Perl => tree_sitter_perl::LANGUAGE.into(),
             Self::Pascal => tree_sitter_pascal::LANGUAGE.into(),
             Self::R => tree_sitter_r::LANGUAGE.into(),
+            Self::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
             Self::ObjC => tree_sitter_objc::LANGUAGE.into(),
         }
     }
@@ -400,6 +412,7 @@ mod tests {
         assert_eq!(AstGrepLang::from_str("perl"), Some(AstGrepLang::Perl));
         assert_eq!(AstGrepLang::from_str("pascal"), Some(AstGrepLang::Pascal));
         assert_eq!(AstGrepLang::from_str("r"), Some(AstGrepLang::R));
+        assert_eq!(AstGrepLang::from_str("groovy"), Some(AstGrepLang::Groovy));
         assert_eq!(AstGrepLang::from_str("objc"), Some(AstGrepLang::ObjC));
         assert_eq!(
             AstGrepLang::from_str("objective-c"),
@@ -496,6 +509,11 @@ mod tests {
                 AstGrepLang::R,
                 "result <- sum(values)\n",
                 "$NAME <- sum($VALUES)",
+            ),
+            (
+                AstGrepLang::Groovy,
+                "def greet(name) { println \"Hello, $name\" }\n",
+                "def $NAME($$$PARAMS) { $$$BODY }",
             ),
             (
                 AstGrepLang::ObjC,
@@ -611,6 +629,11 @@ helper();
         assert_eq!(AstGrepLang::Vue.expando_char(), '$');
     }
 
+    #[test]
+    fn groovy_expando_char_stays_dollar() {
+        assert_eq!(AstGrepLang::Groovy.expando_char(), '$');
+    }
+
     /// Regression for the Solidity meta-var binding bug that v0.19.5 fixed.
     /// Before the fix, every `$NAME` in a Solidity pattern was rewritten to
     /// `µNAME`, and the grammar rejected the result, so meta-vars never
@@ -685,6 +708,67 @@ helper();
             .find(|child| child.kind() == "identifier")
             .expect("µNAME should parse as one identifier token");
         assert_eq!(identifier.text(), "µNAME");
+    }
+
+    #[test]
+    fn groovy_meta_var_pattern_uses_micro_expando_and_binds_capture() {
+        let lang = AstGrepLang::Groovy;
+        let source = "class Greeter { def greet(name) { println \"Hello, $name\" } }\n";
+        let grep = lang.ast_grep(source);
+        let root = grep.root();
+        let processed = lang.pre_process_pattern("class $NAME { $$$BODY }");
+        assert!(
+            processed.contains("$NAME"),
+            "Groovy meta-var should keep the $ sigil, got {processed:?}"
+        );
+        let found = root.find("class $NAME { $$$BODY }");
+        assert!(
+            found.is_some(),
+            "Groovy meta-var pattern must match class declaration"
+        );
+        let found = found.unwrap();
+        let env = found.get_env();
+        assert_eq!(env.get_match("NAME").unwrap().text(), "Greeter");
+    }
+
+    #[test]
+    fn groovy_gstring_literal_pattern_parses_and_rewrites() {
+        let lang = AstGrepLang::Groovy;
+        let source = "class Greeter { def greet(name) { println \"Hello, $name\" } }\n";
+        let grep = lang.ast_grep(source);
+        let root = grep.root();
+
+        let gstring_pattern = lang
+            .compile_pattern("println \"Hello, $name\"")
+            .expect("Groovy GString literal pattern should compile");
+        assert!(
+            root.find(gstring_pattern).is_some(),
+            "Groovy GString literal pattern should match"
+        );
+
+        let rename_pattern = lang
+            .compile_pattern("class $NAME { $$$BODY }")
+            .expect("Groovy class pattern should compile");
+        let mut edits = grep
+            .root()
+            .replace_all(&rename_pattern, "class Messenger { $$$BODY }");
+        edits.sort_by(|a, b| b.position.cmp(&a.position));
+        let mut rewritten = source.as_bytes().to_vec();
+        for edit in &edits {
+            let start = edit.position;
+            let end = start + edit.deleted_length;
+            rewritten.splice(start..end, edit.inserted_text.iter().copied());
+        }
+        let rewritten = String::from_utf8(rewritten).expect("Groovy rewrite stays UTF-8");
+        assert!(rewritten.contains("class Messenger"));
+        assert!(rewritten.contains("\"Hello, $name\""));
+    }
+
+    #[test]
+    fn groovy_matches_gradle_and_jenkins_paths() {
+        assert!(AstGrepLang::Groovy.matches_path(std::path::Path::new("build.gradle")));
+        assert!(AstGrepLang::Groovy.matches_path(std::path::Path::new("Jenkinsfile")));
+        assert!(!AstGrepLang::Groovy.matches_path(std::path::Path::new("build.gradle.kts")));
     }
 
     #[test]

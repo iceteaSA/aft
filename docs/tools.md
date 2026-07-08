@@ -357,6 +357,7 @@ permission system; bash runs without prompts.
 ### ast_grep_search
 
 Search for structural code patterns using meta-variables. Patterns must be complete AST nodes.
+Groovy path filtering covers `.groovy`, `.gvy`, `.gy`, `.gsh`, `*.gradle`, and `Jenkinsfile` when `lang` is `groovy`.
 
 ```json
 { "pattern": "console.log($MSG)", "lang": "typescript" }
@@ -383,6 +384,7 @@ returned no matches.
 ### ast_grep_replace
 
 Replace structural code patterns across files. Applies changes by default — set `dryRun: true` to preview.
+Groovy replacements use the same `lang: "groovy"` path rules as `ast_grep_search`, including `*.gradle` and `Jenkinsfile`.
 
 ```json
 { "pattern": "console.log($MSG)", "rewrite": "logger.info($MSG)", "lang": "typescript" }

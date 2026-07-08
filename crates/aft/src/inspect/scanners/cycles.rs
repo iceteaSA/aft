@@ -808,6 +808,7 @@ fn language_name(language: LangId) -> &'static str {
         LangId::Yaml => "yaml",
         LangId::Pascal => "pascal",
         LangId::R => "r",
+        LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
     }
 }

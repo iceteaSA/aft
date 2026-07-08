@@ -3331,6 +3331,10 @@ fn parser_for(
 }
 
 pub fn is_semantic_indexed_extension(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
+        return true;
+    }
+
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
         Some(
@@ -3377,6 +3381,11 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "t"
                 | "r"
                 | "R"
+                | "groovy"
+                | "gvy"
+                | "gy"
+                | "gsh"
+                | "gradle"
                 | "m"
                 | "mm",
         )
@@ -3690,6 +3699,24 @@ mod tests {
                 "{file} should be semantic-index eligible"
             );
         }
+    }
+
+    #[test]
+    fn semantic_index_includes_groovy_extensions_and_jenkinsfile() {
+        for file in [
+            "script.groovy",
+            "script.gvy",
+            "script.gy",
+            "shell.gsh",
+            "build.gradle",
+            "Jenkinsfile",
+        ] {
+            assert!(
+                is_semantic_indexed_extension(Path::new(file)),
+                "{file} should be semantic-index eligible"
+            );
+        }
+        assert!(is_semantic_indexed_extension(Path::new("build.gradle.kts")));
     }
 
     #[test]
