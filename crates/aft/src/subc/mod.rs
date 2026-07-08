@@ -979,6 +979,12 @@ fn replay_key_for_session(
 /// table). Invoked only inside executor jobs in subc mode.
 pub type DispatchFn = fn(RawRequest, &AppContext) -> Response;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleLoopExit {
+    Graceful,
+    SkipSearchFlush,
+}
+
 /// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
 /// owns an isolated current-thread tokio runtime for the async transport.
 /// Returns `Err` (fail-loud) on any connect/auth/protocol failure — we never
@@ -1038,12 +1044,24 @@ fn run_subc_mode_inner(
         .await
     });
 
-    for actor_ctx in executor.actor_contexts() {
+    let actor_contexts = executor.actor_contexts();
+    if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
+        // EOF/Goodbye teardown flushes each root's in-memory trigram delta.
+        // Fatal/panic-driven connection teardown skips this best-effort disk work.
+        flush_actor_search_indexes_on_graceful_shutdown(&actor_contexts);
+    }
+    for actor_ctx in &actor_contexts {
         actor_ctx.lsp().shutdown_all();
         actor_ctx.bash_background().detach();
     }
 
-    loop_result
+    loop_result.map(|_| ())
+}
+
+fn flush_actor_search_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) {
+    for actor_ctx in actor_contexts {
+        let _ = actor_ctx.flush_search_index_on_graceful_shutdown();
+    }
 }
 
 /// Test-only entry that enables the non-manifest native-command passthrough on
@@ -1186,7 +1204,7 @@ async fn run_module_loop<R, W>(
     dispatch: DispatchFn,
     user_config_path: Option<PathBuf>,
     allow_native_passthrough: bool,
-) -> Result<(), SubcError>
+) -> Result<ModuleLoopExit, SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -1278,7 +1296,7 @@ where
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
 
-    let loop_result: Result<(), SubcError> = loop {
+    let loop_result: Result<ModuleLoopExit, SubcError> = loop {
         dispatch_path_metrics.mark_frame_loop_tick();
         if let Err(error) = expire_pending_bash_asks(
             &writer_tx,
@@ -1412,13 +1430,13 @@ where
             }
             _ = shutdown.notified() => {
                 log::warn!("subc attach: fatal executor response requested teardown");
-                break Ok(());
+                break Ok(ModuleLoopExit::SkipSearchFlush);
             }
             maybe_frame = reader_rx.recv() => {
                 let frame = match maybe_frame {
                     None => {
                         log::info!("subc attach: daemon closed connection");
-                        break Ok(());
+                        break Ok(ModuleLoopExit::Graceful);
                     }
                     Some(Err(error)) => break Err(error),
                     Some(Ok(frame)) => frame,
@@ -1443,7 +1461,7 @@ where
                     }
                     FrameType::Goodbye if frame.header.channel == 0 => {
                         log::info!("subc attach: received channel-0 Goodbye");
-                        break Ok(());
+                        break Ok(ModuleLoopExit::Graceful);
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel);
@@ -1776,7 +1794,7 @@ where
     reader_task.abort();
     drop(writer_tx);
     let writer_result = finish_writer_task(writer_task).await;
-    loop_result.and(writer_result)
+    loop_result.and_then(|exit| writer_result.map(|_| exit))
 }
 
 fn spawn_writer_task<W>(
@@ -3117,6 +3135,93 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::test_root;
     use super::*;
+
+    fn actor_ctx_with_dirty_search_index(
+        root: &Path,
+        storage: &Path,
+        file_name: &str,
+        old_contents: &str,
+        new_contents: &str,
+    ) -> (Arc<AppContext>, PathBuf, PathBuf) {
+        let file = root.join(file_name);
+        std::fs::write(&file, old_contents).expect("write source");
+        let canonical_root = std::fs::canonicalize(root).expect("canonical root");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                storage_dir: Some(storage.to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(canonical_root.clone());
+
+        let cache_dir = crate::search_index::resolve_cache_dir(&canonical_root, Some(storage));
+        let mut index = crate::search_index::SearchIndex::build(&canonical_root);
+        let git_head = index.stored_git_head().map(str::to_owned);
+        index.write_to_disk(&cache_dir, git_head.as_deref());
+
+        std::fs::write(&file, new_contents).expect("edit source");
+        index.update_file(&file);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        (ctx, canonical_root, cache_dir)
+    }
+
+    #[test]
+    fn graceful_shutdown_flushes_every_actor_search_index() {
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let (root1_dir, root1) = test_root("shutdown-flush-root-1");
+        let (root2_dir, root2) = test_root("shutdown-flush-root-2");
+        let (ctx1, canonical_root1, cache_dir1) = actor_ctx_with_dirty_search_index(
+            root1_dir.path(),
+            storage.path(),
+            "alpha.txt",
+            "old actor one token\n",
+            "new actor one token\n",
+        );
+        let (ctx2, canonical_root2, cache_dir2) = actor_ctx_with_dirty_search_index(
+            root2_dir.path(),
+            storage.path(),
+            "beta.txt",
+            "old actor two token\n",
+            "new actor two token\n",
+        );
+
+        let executor = Executor::new();
+        assert!(executor.register_actor(root1.clone(), Arc::clone(&ctx1)));
+        assert!(executor.register_actor(root2.clone(), Arc::clone(&ctx2)));
+
+        std::thread::sleep(Duration::from_millis(20));
+        flush_actor_search_indexes_on_graceful_shutdown(&executor.actor_contexts());
+
+        let mut restored1 =
+            crate::search_index::SearchIndex::read_from_disk(&cache_dir1, &canonical_root1)
+                .expect("load flushed root one index");
+        restored1.ready = true;
+        assert_eq!(
+            restored1
+                .grep("new actor one token", true, &[], &[], &canonical_root1, 10)
+                .matches
+                .len(),
+            1,
+            "graceful subc shutdown should flush the first root's trigram delta"
+        );
+
+        let mut restored2 =
+            crate::search_index::SearchIndex::read_from_disk(&cache_dir2, &canonical_root2)
+                .expect("load flushed root two index");
+        restored2.ready = true;
+        assert_eq!(
+            restored2
+                .grep("new actor two token", true, &[], &[], &canonical_root2, 10)
+                .matches
+                .len(),
+            1,
+            "graceful subc shutdown should flush every registered root"
+        );
+    }
 
     #[test]
     fn due_maintenance_jobs_skip_poisoned_roots() {

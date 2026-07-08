@@ -161,6 +161,7 @@ fn main() {
     const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
     let mut pending = PendingResponses::default();
     let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
+    let mut graceful_stdin_shutdown = false;
     thread::spawn(move || {
         let stdin = io::stdin();
         let reader = stdin.lock();
@@ -196,7 +197,10 @@ fn main() {
                 }
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                graceful_stdin_shutdown = true;
+                break;
+            }
         };
 
         let line = match line_result {
@@ -289,6 +293,12 @@ fn main() {
     }
 
     pending.drain_on_shutdown();
+    if graceful_stdin_shutdown {
+        // Only the natural stdin-EOF path flushes the trigram delta. Signal,
+        // stdout-error, and panic teardown skip disk work so abrupt exits stay
+        // fast and never wait on lock contention or cold-build recovery.
+        flush_search_indexes_on_graceful_shutdown(&registry);
+    }
     for runtime in registry.iter() {
         runtime.lsp().shutdown_all();
         runtime.bash_background().detach();
@@ -307,6 +317,12 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_inspect_events(runtime);
         aft::runtime_drain::drain_watcher_events(runtime);
         aft::runtime_drain::drain_lsp_events(runtime);
+    }
+}
+
+fn flush_search_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
+    for runtime in registry.iter() {
+        let _ = runtime.flush_search_index_on_graceful_shutdown();
     }
 }
 
@@ -1150,6 +1166,166 @@ mod signal_handler_tests {
         let registry = RuntimeRegistry::standalone(app, ctx);
 
         assert_eq!(signal_bg_registries(&registry).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod graceful_shutdown_search_index_tests {
+    use super::{
+        flush_search_indexes_on_graceful_shutdown, App, AppContext, Config, RuntimeRegistry,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn make_runtime_registry(root: &Path, storage: &Path) -> RuntimeRegistry {
+        let app = App::default_shared();
+        let ctx = AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                storage_dir: Some(storage.to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(std::fs::canonicalize(root).expect("canonical root"));
+        RuntimeRegistry::standalone(app, ctx)
+    }
+
+    fn install_resident_search_index(
+        ctx: &AppContext,
+        root: &Path,
+        storage: &Path,
+    ) -> (PathBuf, PathBuf) {
+        let canonical_root = std::fs::canonicalize(root).expect("canonical root");
+        let cache_dir = aft::search_index::resolve_cache_dir(&canonical_root, Some(storage));
+        let mut index = aft::search_index::SearchIndex::build(&canonical_root);
+        let git_head = index.stored_git_head().map(str::to_owned);
+        index.write_to_disk(&cache_dir, git_head.as_deref());
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        (canonical_root, cache_dir)
+    }
+
+    #[test]
+    fn graceful_shutdown_flushes_search_delta_to_disk() {
+        let root = tempfile::tempdir().expect("root tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let file = root.path().join("src.txt");
+        std::fs::write(&file, "old shutdown token\n").expect("write source");
+
+        let registry = make_runtime_registry(root.path(), storage.path());
+        let ctx = registry.current();
+        let (canonical_root, cache_dir) =
+            install_resident_search_index(ctx, root.path(), storage.path());
+
+        std::fs::write(&file, "new shutdown token\n").expect("edit source");
+        {
+            let mut search_index = ctx
+                .search_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            search_index
+                .as_mut()
+                .expect("resident search index")
+                .update_file(&file);
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+        flush_search_indexes_on_graceful_shutdown(&registry);
+
+        let mut restored =
+            aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
+                .expect("load flushed search index");
+        restored.ready = true;
+        assert_eq!(
+            restored
+                .grep("new shutdown token", true, &[], &[], &canonical_root, 10)
+                .matches
+                .len(),
+            1,
+            "graceful shutdown should persist the edited file into cache.bin"
+        );
+        assert!(
+            restored
+                .grep("old shutdown token", true, &[], &[], &canonical_root, 10)
+                .matches
+                .is_empty(),
+            "without the shutdown flush this test goes red because disk still holds the old base"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_skips_read_only_search_flush() {
+        let root = tempfile::tempdir().expect("root tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let file = root.path().join("src.txt");
+        std::fs::write(&file, "old readonly token\n").expect("write source");
+
+        let registry = make_runtime_registry(root.path(), storage.path());
+        let ctx = registry.current();
+        let (_canonical_root, cache_dir) =
+            install_resident_search_index(ctx, root.path(), storage.path());
+
+        std::fs::write(&file, "new readonly token\n").expect("edit source");
+        {
+            let mut search_index = ctx
+                .search_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            search_index
+                .as_mut()
+                .expect("resident search index")
+                .update_file(&file);
+        }
+        let cache_path = cache_dir.join("cache.bin");
+        let before = std::fs::metadata(&cache_path)
+            .expect("cache metadata before shutdown")
+            .modified()
+            .expect("cache mtime before shutdown");
+
+        ctx.set_cache_role(true, None);
+        std::thread::sleep(Duration::from_millis(20));
+        flush_search_indexes_on_graceful_shutdown(&registry);
+
+        let after = std::fs::metadata(&cache_path)
+            .expect("cache metadata after shutdown")
+            .modified()
+            .expect("cache mtime after shutdown");
+        assert_eq!(
+            before, after,
+            "worktree/read-only runtimes must not rewrite shared search artifacts on shutdown"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_skips_empty_search_delta() {
+        let root = tempfile::tempdir().expect("root tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        std::fs::write(root.path().join("src.txt"), "unchanged token\n").expect("write source");
+
+        let registry = make_runtime_registry(root.path(), storage.path());
+        let ctx = registry.current();
+        let (_canonical_root, cache_dir) =
+            install_resident_search_index(ctx, root.path(), storage.path());
+        let cache_path = cache_dir.join("cache.bin");
+        let before = std::fs::metadata(&cache_path)
+            .expect("cache metadata before shutdown")
+            .modified()
+            .expect("cache mtime before shutdown");
+
+        std::thread::sleep(Duration::from_millis(20));
+        flush_search_indexes_on_graceful_shutdown(&registry);
+
+        let after = std::fs::metadata(&cache_path)
+            .expect("cache metadata after shutdown")
+            .modified()
+            .expect("cache mtime after shutdown");
+        assert_eq!(
+            before, after,
+            "shutdown with no trigram delta should leave cache.bin untouched"
+        );
     }
 }
 

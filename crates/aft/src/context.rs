@@ -2284,6 +2284,75 @@ impl AppContext {
         *self.pending_semantic_corpus_refresh.lock() = false;
     }
 
+    /// Flush the owner-side trigram delta during an orderly transport shutdown.
+    /// EOF/Goodbye teardown uses this best-effort path; signal and panic exits
+    /// intentionally skip it so abrupt shutdown never waits on slow recovery work.
+    #[doc(hidden)]
+    pub fn flush_search_index_on_graceful_shutdown(&self) -> bool {
+        if self.shared_artifacts_read_only() {
+            return false;
+        }
+
+        crate::runtime_drain::drain_watcher_events(self);
+        crate::runtime_drain::drain_search_index_events(self);
+
+        if self
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            return false;
+        }
+
+        let Some(canonical_root) = self.canonical_cache_root_opt() else {
+            return false;
+        };
+        let config = self.config();
+        let cache_dir =
+            crate::search_index::resolve_cache_dir(&canonical_root, config.storage_dir.as_deref());
+
+        {
+            let search_index = self
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(index) = search_index.as_ref() else {
+                return false;
+            };
+            if !index.ready || !index.has_pending_disk_changes() {
+                return false;
+            }
+        }
+
+        let _cache_lock = match crate::search_index::CacheLock::try_acquire_for_shutdown(&cache_dir)
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                crate::slog_warn!(
+                    "search index: skipped shutdown flush because cache lock was unavailable: {}",
+                    error
+                );
+                return false;
+            }
+        };
+
+        let mut search_index = self
+            .search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(index) = search_index.as_mut() else {
+            return false;
+        };
+        if !index.ready || !index.has_pending_disk_changes() {
+            return false;
+        }
+
+        let git_head = index.stored_git_head().map(str::to_owned);
+        index.write_to_disk(&cache_dir, git_head.as_deref());
+        true
+    }
+
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
         Arc::clone(&self.inspect_manager)
     }

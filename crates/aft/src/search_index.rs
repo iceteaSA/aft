@@ -47,12 +47,22 @@ pub struct CacheLock {
 
 impl CacheLock {
     pub fn acquire(cache_dir: &Path) -> std::io::Result<Self> {
+        Self::acquire_with_timeout(cache_dir, Duration::from_secs(2))
+    }
+
+    pub fn try_acquire_for_shutdown(cache_dir: &Path) -> std::io::Result<Self> {
+        // Graceful shutdown gets one short best-effort lock attempt so a
+        // sibling writer cannot hold process exit open.
+        Self::acquire_with_timeout(cache_dir, Duration::from_millis(25))
+    }
+
+    fn acquire_with_timeout(cache_dir: &Path, timeout: Duration) -> std::io::Result<Self> {
         fs::create_dir_all(cache_dir)?;
         let path = cache_dir.join("cache.lock");
         let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("search cache lock acquisition mutex poisoned"))?;
-        fs_lock::try_acquire(&path, Duration::from_secs(2))
+        fs_lock::try_acquire(&path, timeout)
             .map(|guard| Self { _guard: guard })
             .map_err(|error| match error {
                 fs_lock::AcquireError::Timeout => {
@@ -133,6 +143,15 @@ impl SearchIndex {
     /// Number of unique trigrams in the combined base index and delta postings.
     pub fn trigram_count(&self) -> usize {
         self.snapshot().trigram_count()
+    }
+
+    /// True when `write_to_disk` would persist changes beyond the current base.
+    /// This covers pure deletions and unindexed file additions, which do not
+    /// always populate `delta_file_trigrams`.
+    pub(crate) fn has_pending_disk_changes(&self) -> bool {
+        !self.delta_postings.is_empty()
+            || !self.superseded.is_empty()
+            || self.path_to_id.len() != self.base_file_count as usize
     }
 
     /// Returns an immutable snapshot for queries. Callers must obtain the
