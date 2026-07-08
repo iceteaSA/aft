@@ -37,21 +37,20 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
     )
 }
 
-/// Internal bg-completion plumbing commands the harness consumer (NOT the agent)
-/// invokes over a bound route to drain and acknowledge background-bash
-/// completions for its session. These are NOT agent-facing tools — they carry no
-/// agent surface and never reach the model — so they're not in the manifest /
-/// `is_subc_agent_core_tool`, but the plugin's bg-notification drain/ack path
-/// (bg-notifications.ts: `bridge.send("bash_drain_completions"|"bash_ack_completions")`)
-/// must reach dispatch over subc, otherwise an idle agent can never drain a
-/// completion the wake lane nudges it about.
+/// These tool calls are allowed here because they only read or update per-session
+/// bookkeeping needed for background shell status, completion acknowledgements,
+/// and previewing file paths for undo/restore. They stay on a small allowlist so
+/// the plugin can use them without being able to change configuration or trust
+/// settings.
 ///
-/// This is a DELIBERATELY TIGHT allowlist, kept separate from the agent
-/// core-tool gate so it cannot widen the fail-closed backstop in
-/// `handle_tool_call`. Every entry is session-scoped (the bind session is
-/// reinjected by `run_tool_call`, overriding any body `session_id`) and
-/// carries NO config/trust surface, so admitting them does not reopen the
-/// `configure`-bypass hole the gate exists to close:
+/// These helpers are safe to allow because `run_tool_call` replaces any request
+/// `session_id` with the session already bound to the caller, so they cannot be
+/// used to act on a different session. Most of them only read data; the only
+/// exception is completion-ack handling, which only updates the completion
+/// registry. That means they do not let the caller change configuration or
+/// bypass the `configure` restriction:
+/// - `bash_status`: per-session snapshot reads used after a background bash
+///   launch; it is read-only and cannot change config or workspace state.
 /// - `bash_drain_completions` / `bash_ack_completions`: per-session completion
 ///   registry plumbing for the bg_events wake lane.
 /// - `undo_preview` / `checkpoint_paths`: read-only permission-preview reads
@@ -59,12 +58,19 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   calls them BEFORE `aft_safety undo`/`restore` to know which paths to ask
 ///   permission for. Without them, safety undo/restore fails over subc.
 ///
-/// Lanes are already assigned in `command_lane` (drain/undo_preview/
-/// checkpoint_paths = PureRead, ack = Mutating).
+/// These calls are grouped by whether they modify session state: `bash_status`,
+/// `bash_drain_completions`, `undo_preview`, and `checkpoint_paths` only read
+/// data, while `bash_ack_completions` updates the completion registry. This
+/// distinction matters because the read-only calls can be allowed more freely
+/// than the one that changes session state.
 pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
     matches!(
         name,
-        "bash_drain_completions" | "bash_ack_completions" | "undo_preview" | "checkpoint_paths"
+        "bash_status"
+            | "bash_drain_completions"
+            | "bash_ack_completions"
+            | "undo_preview"
+            | "checkpoint_paths"
     )
 }
 
@@ -384,6 +390,8 @@ mod tests {
     fn subc_agent_lanes_classify_new_read_tools() {
         assert_eq!(command_lane("callgraph"), Lane::HeavyInit);
         assert_eq!(command_lane("conflicts"), Lane::PureRead);
+        assert_eq!(command_lane("bash_status"), Lane::PureRead);
+        assert!(is_subc_native_plumbing_tool("bash_status"));
     }
 
     #[test]
