@@ -98,6 +98,8 @@ mod state_commands_test;
 mod status_compression_test;
 mod status_disk_scope_test;
 mod subc_bridge_test;
+#[cfg(unix)]
+mod subc_detach_test;
 mod subc_format_test;
 mod subc_storm_test;
 mod subc_translate_test;

@@ -99,6 +99,11 @@ fn main() {
         let app = App::default_shared();
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         let executor = Arc::new(aft::executor::Executor::new());
+        install_subc_signal_handler(
+            Arc::clone(&executor),
+            Arc::clone(&ctx),
+            app.lsp_child_registry(),
+        );
         // Resolve AFT's own CortexKit config home once at the boundary; it is
         // threaded into the per-bind tier composition (W5). Under the gateway
         // there is no plugin to relay on-disk config, so this is how a gateway
@@ -455,6 +460,60 @@ fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspC
             std::process::exit(128 + signal);
         }
     });
+}
+
+#[cfg(unix)]
+fn install_subc_signal_handler(
+    executor: Arc<aft::executor::Executor>,
+    initial_ctx: Arc<AppContext>,
+    lsp_children: LspChildRegistry,
+) {
+    let signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ]);
+    let Ok(mut signals) = signals else {
+        if let Err(error) = signals {
+            aft::slog_error!("failed to install subc signal handlers: {error}");
+        }
+        return;
+    };
+
+    std::thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            // When this process is shutting down during a subc drain, it may
+            // receive SIGTERM before the async cleanup code runs. Detach each
+            // live actor's background registry now so any running bash
+            // subprocesses keep their task metadata and can be recovered after
+            // the process restarts.
+            let mut contexts = executor.actor_contexts();
+            if !contexts.iter().any(|ctx| Arc::ptr_eq(ctx, &initial_ctx)) {
+                contexts.push(Arc::clone(&initial_ctx));
+            }
+            for actor_ctx in &contexts {
+                actor_ctx.bash_background().detach();
+            }
+            aft::artifact_owner::shutdown_heartbeat_thread();
+            let killed = lsp_children.kill_all();
+            if killed > 0 {
+                aft::slog_info!(
+                    "subc signal {}: killed {} LSP child process(es)",
+                    signal,
+                    killed
+                );
+            }
+            std::process::exit(128 + signal);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_subc_signal_handler(
+    _executor: Arc<aft::executor::Executor>,
+    initial_ctx: Arc<AppContext>,
+    lsp_children: LspChildRegistry,
+) {
+    install_signal_handler(vec![initial_ctx.bash_background().clone()], lsp_children);
 }
 
 #[cfg(not(unix))]
