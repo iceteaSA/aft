@@ -12,6 +12,8 @@ import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
 import { probeBinaryVersion } from "./binary-probe.js";
 import { readJsoncFile } from "./jsonc.js";
+import type { LegacyPartitionDuplicationSummary } from "./legacy-storage.js";
+import { summarizeLegacyPartitionDuplication } from "./legacy-storage.js";
 import { getLspCacheReport, type LspCacheReport } from "./lsp-cache.js";
 import {
   detectOrtVersion,
@@ -77,6 +79,7 @@ export interface HarnessDiagnostic {
     /** True when the directory exists and is readable + writable. */
     accessible: boolean;
     sizesByKey: Record<string, number>;
+    legacyDuplication?: LegacyPartitionDuplicationSummary;
   };
   onnxRuntime: {
     required: boolean;
@@ -162,6 +165,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
           adapter as unknown as { describeStorageSubtrees: () => Record<string, number> }
         ).describeStorageSubtrees()
       : {};
+  const legacyDuplication = summarizeLegacyPartitionDuplication(storage);
 
   const semanticEnabled =
     aftEnabled &&
@@ -194,6 +198,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       exists: existsSync(storage),
       accessible: storageAccessible,
       sizesByKey: describeStorage,
+      ...(legacyDuplication.totalPartitions > 0 ? { legacyDuplication } : {}),
     },
     onnxRuntime: {
       required: semanticEnabled,

@@ -80,6 +80,7 @@ pub mod indent;
 pub mod inspect;
 pub mod jsonc;
 pub mod language;
+pub mod legacy_partitions;
 pub mod local_embed;
 pub mod log_ctx;
 pub mod lsp;

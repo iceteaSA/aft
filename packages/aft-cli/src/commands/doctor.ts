@@ -811,7 +811,10 @@ export function formatDoctorStorageStatus(h: DiagnosticReport["harnesses"][numbe
   const state = h.storageDir.exists
     ? h.storageDir.path
     : `${h.storageDir.path} (${h.pluginRegistered ? "not yet created (lazy — created on first tool call)" : "not created"})`;
-  return `${state} (${formatStorageSizes(h.storageDir.sizesByKey)})`;
+  const legacyDuplication = formatLegacyDuplication(h.storageDir.legacyDuplication);
+  return `${state} (${[formatStorageSizes(h.storageDir.sizesByKey), legacyDuplication]
+    .filter((part): part is string => Boolean(part))
+    .join("; ")})`;
 }
 
 async function confirmBinaryDownloadDespitePluginSkew(
@@ -954,6 +957,18 @@ function formatStorageSizes(sizes: Record<string, number>): string {
     .filter(([, size]) => size > 0)
     .map(([key, size]) => `${key}: ${formatBytes(size)}`);
   return parts.length > 0 ? parts.join(", ") : "empty";
+}
+
+function formatLegacyDuplication(
+  summary: DiagnosticReport["harnesses"][number]["storageDir"]["legacyDuplication"],
+): string | null {
+  if (!summary || summary.totalPartitions === 0) return null;
+  const byHarness = summary.byHarness
+    .map(
+      (entry) => `${entry.harness}: ${entry.partitions} partition(s) / ${formatBytes(entry.bytes)}`,
+    )
+    .join("; ");
+  return `legacy duplication: ${summary.totalPartitions} partition(s), ${formatBytes(summary.totalBytes)} total [${byHarness}]`;
 }
 
 interface IssueReviewFile {

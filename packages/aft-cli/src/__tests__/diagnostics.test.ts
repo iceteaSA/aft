@@ -140,4 +140,28 @@ describe("diagnostic issue summaries", () => {
     );
     expect(markdown).toContain("- Plugin version: 0.29.1");
   });
+
+  test("storage markdown includes legacy duplication summary when present", () => {
+    const markdown = renderDiagnosticsMarkdown(
+      makeReport(
+        makeHarness({
+          storageDir: {
+            path: "/tmp/aft-test/storage",
+            exists: true,
+            accessible: true,
+            sizesByKey: { index: 1024 },
+            legacyDuplication: {
+              totalPartitions: 2,
+              totalBytes: 2048,
+              byHarness: [{ harness: "opencode", partitions: 2, bytes: 2048 }],
+            },
+          },
+        }),
+      ),
+    );
+
+    expect(markdown).toContain('"legacyDuplication"');
+    expect(markdown).toContain('"totalPartitions": 2');
+    expect(markdown).toContain('"harness": "opencode"');
+  });
 });

@@ -10,6 +10,7 @@ import {
   type DoctorClearTarget,
   deriveIssueTitleFromBody,
   fixPluginEntries,
+  formatDoctorStorageStatus,
   hasDoctorProblems,
   runDoctor,
 } from "../commands/doctor.js";
@@ -236,6 +237,33 @@ describe("clearDoctorCaches", () => {
     expect(summary.pluginCache).toBeUndefined();
     expect(summary.lspCache).toEqual({ cleared: 1, totalBytes: 2048, errors: 0 });
     expect(summary.hadErrors).toBe(false);
+  });
+});
+
+describe("doctor storage status", () => {
+  test("includes legacy duplication cost per harness in the storage line", () => {
+    const text = formatDoctorStorageStatus(
+      makeHarness({
+        storageDir: {
+          path: "/tmp/aft-test/storage",
+          exists: true,
+          accessible: true,
+          sizesByKey: { index: 1024 },
+          legacyDuplication: {
+            totalPartitions: 3,
+            totalBytes: 3072,
+            byHarness: [
+              { harness: "opencode", partitions: 2, bytes: 2048 },
+              { harness: "pi", partitions: 1, bytes: 1024 },
+            ],
+          },
+        },
+      }),
+    );
+
+    expect(text).toBe(
+      "/tmp/aft-test/storage (index: 1.0 KB; legacy duplication: 3 partition(s), 3.0 KB total [opencode: 2 partition(s) / 2.0 KB; pi: 1 partition(s) / 1.0 KB])",
+    );
   });
 });
 
