@@ -3283,7 +3283,6 @@ mod tests {
         assert!(executor.register_actor(root1.clone(), Arc::clone(&ctx1)));
         assert!(executor.register_actor(root2.clone(), Arc::clone(&ctx2)));
 
-        std::thread::sleep(Duration::from_millis(20));
         flush_actor_search_indexes_on_graceful_shutdown(&executor.actor_contexts());
 
         let mut restored1 =

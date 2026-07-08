@@ -1384,7 +1384,7 @@ mod graceful_shutdown_search_index_tests {
     };
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime};
 
     fn make_runtime_registry(root: &Path, storage: &Path) -> RuntimeRegistry {
         let app = App::default_shared();
@@ -1416,6 +1416,76 @@ mod graceful_shutdown_search_index_tests {
         (canonical_root, cache_dir)
     }
 
+    fn search_rebuild_delay_test_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_search_rebuild_publish_delay_ms<R>(ms: u64, f: impl FnOnce() -> R) -> R {
+        let _guard = search_rebuild_delay_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS");
+        unsafe {
+            std::env::set_var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS", ms.to_string());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS", value),
+                None => std::env::remove_var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS"),
+            }
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn wait_for_next_directory_write_mtime(dir: &Path, baseline: SystemTime) {
+        let probe = dir.join("mtime-probe");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut counter = 0u64;
+        loop {
+            std::fs::write(&probe, counter.to_string()).expect("write mtime probe");
+            let modified = std::fs::metadata(&probe)
+                .expect("mtime probe metadata")
+                .modified()
+                .expect("mtime probe modified time");
+            if modified != baseline {
+                let _ = std::fs::remove_file(&probe);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a later directory write mtime"
+            );
+            counter += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_search_index_build_to_finish(ctx: &AppContext) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            aft::runtime_drain::drain_search_index_events(ctx);
+            if ctx
+                .search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the delayed search rebuild to publish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn graceful_shutdown_flushes_search_delta_to_disk() {
         let root = tempfile::tempdir().expect("root tempdir");
@@ -1440,7 +1510,6 @@ mod graceful_shutdown_search_index_tests {
                 .update_file(&file);
         }
 
-        std::thread::sleep(Duration::from_millis(20));
         flush_search_indexes_on_graceful_shutdown(&registry);
 
         let mut restored =
@@ -1461,6 +1530,75 @@ mod graceful_shutdown_search_index_tests {
                 .matches
                 .is_empty(),
             "without the shutdown flush this test goes red because disk still holds the old base"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_waits_for_inflight_search_rebuild_before_flushing() {
+        let root = tempfile::tempdir().expect("root tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let file = root.path().join("src.txt");
+        std::fs::write(&file, "old delayed shutdown token\n").expect("write source");
+
+        let registry = make_runtime_registry(root.path(), storage.path());
+        let ctx = registry.current();
+        let (canonical_root, cache_dir) =
+            install_resident_search_index(ctx, root.path(), storage.path());
+
+        std::fs::write(&file, "new delayed shutdown token\n").expect("edit source");
+        let (new_matches, old_matches) = with_search_rebuild_publish_delay_ms(100, || {
+            aft::runtime_drain::spawn_search_corpus_refresh(
+                ctx,
+                canonical_root.clone(),
+                ctx.config(),
+            );
+            assert!(
+                ctx.search_index_rx()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some(),
+                "test should exercise graceful shutdown while a search rebuild is still in flight"
+            );
+
+            flush_search_indexes_on_graceful_shutdown(&registry);
+
+            let mut restored =
+                aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
+                    .expect("load search index after delayed rebuild flush");
+            restored.ready = true;
+            let new_matches = restored
+                .grep(
+                    "new delayed shutdown token",
+                    true,
+                    &[],
+                    &[],
+                    &canonical_root,
+                    10,
+                )
+                .matches
+                .len();
+            let old_matches = restored
+                .grep(
+                    "old delayed shutdown token",
+                    true,
+                    &[],
+                    &[],
+                    &canonical_root,
+                    10,
+                )
+                .matches
+                .len();
+            wait_for_search_index_build_to_finish(ctx);
+            (new_matches, old_matches)
+        });
+
+        assert_eq!(
+            new_matches, 1,
+            "graceful shutdown should wait for the in-flight rebuild to publish before flushing"
+        );
+        assert_eq!(
+            old_matches, 0,
+            "shutdown flush should not leave the old cache on disk"
         );
     }
 
@@ -1494,7 +1632,7 @@ mod graceful_shutdown_search_index_tests {
             .expect("cache mtime before shutdown");
 
         ctx.set_cache_role(true, None);
-        std::thread::sleep(Duration::from_millis(20));
+        wait_for_next_directory_write_mtime(&cache_dir, before);
         flush_search_indexes_on_graceful_shutdown(&registry);
 
         let after = std::fs::metadata(&cache_path)
@@ -1523,7 +1661,7 @@ mod graceful_shutdown_search_index_tests {
             .modified()
             .expect("cache mtime before shutdown");
 
-        std::thread::sleep(Duration::from_millis(20));
+        wait_for_next_directory_write_mtime(&cache_dir, before);
         flush_search_indexes_on_graceful_shutdown(&registry);
 
         let after = std::fs::metadata(&cache_path)
