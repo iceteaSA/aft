@@ -137,6 +137,102 @@ impl SemanticIndexFingerprint {
     }
 }
 
+fn redacted_base_url_host(base_url: &str) -> String {
+    if base_url.is_empty() {
+        return "<empty>".to_string();
+    }
+    if base_url == FALLBACK_BACKEND {
+        return FALLBACK_BACKEND.to_string();
+    }
+
+    match Url::parse(base_url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("<missing-host>");
+            match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            }
+        }
+        Err(_) => "<invalid>".to_string(),
+    }
+}
+
+fn format_fingerprint_mismatch_details(
+    cached: Option<&SemanticIndexFingerprint>,
+    current: &SemanticIndexFingerprint,
+) -> String {
+    let Some(cached) = cached else {
+        return format!(
+            "cached fingerprint missing; current backend kind={}, model={}, base_url host={}, dimension={}, chunking version={}",
+            current.backend,
+            current.model,
+            redacted_base_url_host(&current.base_url),
+            current.dimension,
+            current.chunking_version,
+        );
+    };
+
+    let mut diffs = Vec::new();
+    if cached.backend != current.backend {
+        diffs.push(format!(
+            "backend kind cached={} current={}",
+            cached.backend, current.backend
+        ));
+    }
+    if cached.model != current.model {
+        diffs.push(format!(
+            "model cached={} current={}",
+            cached.model, current.model
+        ));
+    }
+    if cached.base_url != current.base_url {
+        let cached_host = redacted_base_url_host(&cached.base_url);
+        let current_host = redacted_base_url_host(&current.base_url);
+        if cached_host == current_host {
+            diffs.push(format!(
+                "base_url host cached={} current={} (credentials/path redacted)",
+                cached_host, current_host
+            ));
+        } else {
+            diffs.push(format!(
+                "base_url host cached={} current={}",
+                cached_host, current_host
+            ));
+        }
+    }
+    if cached.dimension != current.dimension {
+        diffs.push(format!(
+            "dimension cached={} current={}",
+            cached.dimension, current.dimension
+        ));
+    }
+    if cached.chunking_version != current.chunking_version {
+        diffs.push(format!(
+            "chunking version cached={} current={}",
+            cached.chunking_version, current.chunking_version
+        ));
+    }
+
+    if diffs.is_empty() {
+        "fingerprint strings differ but parsed fields match".to_string()
+    } else {
+        diffs.join("; ")
+    }
+}
+
+fn log_fingerprint_mismatch(cached: Option<&SemanticIndexFingerprint>, expected: &str) {
+    match serde_json::from_str::<SemanticIndexFingerprint>(expected) {
+        Ok(current) => slog_warn!(
+            "cached semantic index fingerprint mismatch, rebuilding without deleting the shared artifact: {}",
+            format_fingerprint_mismatch_details(cached, &current)
+        ),
+        Err(error) => slog_warn!(
+            "cached semantic index fingerprint mismatch, rebuilding without deleting the shared artifact: could not parse current fingerprint: {}",
+            error
+        ),
+    }
+}
+
 enum SemanticEmbeddingEngine {
     /// Local ONNX embedder (all-MiniLM-L6-v2 via raw `ort`). The config-facing
     /// backend string stays "fastembed" for index-fingerprint compatibility.
@@ -2392,13 +2488,10 @@ impl SemanticIndex {
         let version = version_buf[0];
         if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
             slog_info!(
-                "cached semantic index version {} is not compatible with {}, rebuilding",
-                version,
-                SEMANTIC_INDEX_VERSION_V7
-            );
-            if !is_worktree_bridge {
-                let _ = fs::remove_file(&data_path);
-            }
+            "cached semantic index version {} is not compatible with {}, rebuilding without deleting the shared artifact",
+            version,
+            SEMANTIC_INDEX_VERSION_V7
+        );
             return None;
         }
         match Self::from_reader_after_version(
@@ -2410,10 +2503,9 @@ impl SemanticIndex {
         ) {
             Ok(index) => {
                 if index.entries.is_empty() {
-                    slog_info!("cached semantic index is empty, will rebuild");
-                    if !is_worktree_bridge {
-                        let _ = fs::remove_file(&data_path);
-                    }
+                    slog_info!(
+                    "cached semantic index is empty, will rebuild without deleting the shared artifact"
+                );
                     return None;
                 }
                 if let Some(expected) = expected_fingerprint {
@@ -2422,10 +2514,7 @@ impl SemanticIndex {
                         .map(|fingerprint| fingerprint.matches_expected(expected))
                         .unwrap_or(false);
                     if !matches {
-                        slog_info!("cached semantic index fingerprint mismatch, rebuilding");
-                        if !is_worktree_bridge {
-                            let _ = fs::remove_file(&data_path);
-                        }
+                        log_fingerprint_mismatch(index.fingerprint(), expected);
                         return None;
                     }
                 }
@@ -5352,6 +5441,13 @@ public class Greeter {
         });
         index.write_to_disk(storage.path(), project_key);
 
+        let data_path = storage
+            .path()
+            .join("semantic")
+            .join(project_key)
+            .join("semantic.bin");
+        let before = fs::read(&data_path).unwrap();
+
         let matching = index.fingerprint().unwrap().as_string();
         assert!(SemanticIndex::read_from_disk(
             storage.path(),
@@ -5378,6 +5474,36 @@ public class Greeter {
             Some(&mismatched),
         )
         .is_none());
+        assert_eq!(fs::read(&data_path).unwrap(), before);
+    }
+
+    #[test]
+    fn fingerprint_mismatch_details_redact_base_url_and_list_changed_fields() {
+        let cached = SemanticIndexFingerprint {
+            backend: "openai_compatible".to_string(),
+            model: "cached-model".to_string(),
+            base_url: "https://user:secret@example.com/v1/embeddings".to_string(),
+            dimension: 3,
+            chunking_version: 2,
+        };
+        let current = SemanticIndexFingerprint {
+            backend: "ollama".to_string(),
+            model: "current-model".to_string(),
+            base_url: "https://example.org/api/embed".to_string(),
+            dimension: 4,
+            chunking_version: 3,
+        };
+
+        let details = format_fingerprint_mismatch_details(Some(&cached), &current);
+
+        assert!(details.contains("backend kind cached=openai_compatible current=ollama"));
+        assert!(details.contains("model cached=cached-model current=current-model"));
+        assert!(details.contains("base_url host cached=example.com current=example.org"));
+        assert!(details.contains("dimension cached=3 current=4"));
+        assert!(details.contains("chunking version cached=2 current=3"));
+        assert!(!details.contains("secret"));
+        assert!(!details.contains("/v1/embeddings"));
+        assert!(!details.contains("/api/embed"));
     }
 
     #[test]
@@ -5418,7 +5544,8 @@ public class Greeter {
 
         let mut bytes = index.to_bytes();
         bytes[0] = SEMANTIC_INDEX_VERSION_V3;
-        fs::write(dir.join("semantic.bin"), bytes).unwrap();
+        let data_path = dir.join("semantic.bin");
+        fs::write(&data_path, &bytes).unwrap();
 
         assert!(SemanticIndex::read_from_disk(
             storage.path(),
@@ -5428,7 +5555,7 @@ public class Greeter {
             Some(&fingerprint.as_string())
         )
         .is_none());
-        assert!(!dir.join("semantic.bin").exists());
+        assert_eq!(fs::read(&data_path).unwrap(), bytes);
     }
 
     fn make_symbol(kind: SymbolKind, name: &str, start: u32, end: u32) -> crate::symbols::Symbol {

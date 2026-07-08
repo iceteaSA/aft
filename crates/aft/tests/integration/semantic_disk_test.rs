@@ -201,6 +201,128 @@ fn semantic_cache_inconsistent_lengths_rebuilds() {
 }
 
 #[test]
+fn mismatched_load_preserves_cache_until_replacement_is_written() {
+    init_test_logger();
+
+    let project = tempfile::tempdir().expect("create project dir");
+    let storage = tempfile::tempdir().expect("create storage dir");
+    let (mut index, _source_file) = build_test_index(project.path());
+    let project_key = "mismatch-project";
+    let semantic_file = storage
+        .path()
+        .join("semantic")
+        .join(project_key)
+        .join("semantic.bin");
+
+    index.set_fingerprint(SemanticIndexFingerprint {
+        backend: "openai_compatible".to_string(),
+        model: "cached-model".to_string(),
+        base_url: "http://127.0.0.1:1234/v1".to_string(),
+        dimension: index.dimension(),
+        chunking_version: 2,
+    });
+    index.write_to_disk(storage.path(), project_key);
+    let original_bytes = fs::read(&semantic_file).expect("read original semantic cache");
+
+    let replacement_fingerprint = SemanticIndexFingerprint {
+        backend: "ollama".to_string(),
+        model: "replacement-model".to_string(),
+        base_url: "http://127.0.0.1:11434".to_string(),
+        dimension: index.dimension(),
+        chunking_version: 3,
+    };
+    assert!(SemanticIndex::read_from_disk(
+        storage.path(),
+        project_key,
+        project.path(),
+        false,
+        Some(&replacement_fingerprint.as_string())
+    )
+    .is_none());
+    assert_eq!(
+        fs::read(&semantic_file).expect("re-read semantic cache after mismatch"),
+        original_bytes,
+        "mismatched load must leave the shared cache file byte-identical"
+    );
+
+    let logs = take_logs();
+    assert!(
+        logs.iter().any(|line| {
+            line.contains("fingerprint mismatch")
+                && line.contains("backend kind")
+                && line.contains("model")
+                && line.contains("base_url host")
+                && line.contains("chunking version")
+        }),
+        "expected detailed fingerprint mismatch warning, got {logs:?}"
+    );
+
+    index.set_fingerprint(replacement_fingerprint.clone());
+    index.write_to_disk(storage.path(), project_key);
+    let replaced_bytes = fs::read(&semantic_file).expect("read replaced semantic cache");
+    assert_ne!(replaced_bytes, original_bytes);
+
+    let restored = SemanticIndex::read_from_disk(
+        storage.path(),
+        project_key,
+        project.path(),
+        false,
+        Some(&replacement_fingerprint.as_string()),
+    )
+    .expect("load replacement semantic cache");
+    assert_eq!(
+        restored
+            .fingerprint()
+            .expect("replacement fingerprint")
+            .as_string(),
+        replacement_fingerprint.as_string()
+    );
+}
+
+#[test]
+fn read_only_mismatch_returns_none_without_touching_shared_cache() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let storage = tempfile::tempdir().expect("create storage dir");
+    let (mut index, _source_file) = build_test_index(project.path());
+    let project_key = "readonly-mismatch-project";
+    let semantic_file = storage
+        .path()
+        .join("semantic")
+        .join(project_key)
+        .join("semantic.bin");
+
+    index.set_fingerprint(SemanticIndexFingerprint {
+        backend: "openai_compatible".to_string(),
+        model: "cached-model".to_string(),
+        base_url: "http://127.0.0.1:1234/v1".to_string(),
+        dimension: index.dimension(),
+        chunking_version: 2,
+    });
+    index.write_to_disk(storage.path(), project_key);
+    let original_bytes = fs::read(&semantic_file).expect("read original semantic cache");
+
+    let mismatched = SemanticIndexFingerprint {
+        backend: "ollama".to_string(),
+        model: "replacement-model".to_string(),
+        base_url: "http://127.0.0.1:11434".to_string(),
+        dimension: index.dimension(),
+        chunking_version: 3,
+    };
+    assert!(SemanticIndex::read_from_disk(
+        storage.path(),
+        project_key,
+        project.path(),
+        true,
+        Some(&mismatched.as_string())
+    )
+    .is_none());
+    assert_eq!(
+        fs::read(&semantic_file).expect("re-read semantic cache after read-only mismatch"),
+        original_bytes
+    );
+}
+
+#[test]
 fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
     let project = tempfile::tempdir().expect("create project dir");
     let old_file = project.path().join("src/old.rs");
@@ -406,6 +528,7 @@ fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
     fs::create_dir_all(&semantic_dir).expect("create semantic dir");
     let semantic_file = semantic_dir.join("semantic.bin");
     fs::write(&semantic_file, &v1_bytes).expect("write v1 semantic index file");
+    let before = fs::read(&semantic_file).expect("read v1 semantic cache");
 
     let expected_fingerprint = SemanticIndexFingerprint {
         backend: "fastembed".to_string(),
@@ -424,9 +547,10 @@ fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
         Some(&expected_fingerprint)
     )
     .is_none());
-    assert!(
-        !semantic_file.exists(),
-        "legacy semantic cache should be deleted after fingerprint mismatch"
+    assert_eq!(
+        fs::read(&semantic_file).expect("re-read v1 semantic cache"),
+        before,
+        "legacy semantic cache should stay on disk until a replacement is written"
     );
 }
 
@@ -490,10 +614,10 @@ fn write_roundtrip_preserves_subsecond_mtime_precision() {
     );
 }
 
-/// Migration: V2 caches must be discarded on disk so persisted snippets are
+/// Migration: V2 caches must be ignored on load so persisted snippets are
 /// rebuilt with V4 range handling. `from_bytes` still parses V2 for low-level
-/// compatibility, but `read_from_disk` rejects old cache files before serving
-/// stale embeddings.
+/// compatibility, but `read_from_disk` rejects old cache files until a newer
+/// writer replaces them.
 #[test]
 fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
     let project = tempfile::tempdir().expect("create project dir");
@@ -545,7 +669,9 @@ fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
 
     let semantic_dir = storage.path().join("semantic").join("v2-project");
     fs::create_dir_all(&semantic_dir).expect("create semantic dir");
-    fs::write(semantic_dir.join("semantic.bin"), &bytes).expect("write v2 cache");
+    let semantic_file = semantic_dir.join("semantic.bin");
+    fs::write(&semantic_file, &bytes).expect("write v2 cache");
+    let before = fs::read(&semantic_file).expect("read v2 semantic cache");
 
     assert!(SemanticIndex::read_from_disk(
         storage.path(),
@@ -555,7 +681,11 @@ fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
         Some(&fp_str)
     )
     .is_none());
-    assert!(!semantic_dir.join("semantic.bin").exists());
+    assert_eq!(
+        fs::read(&semantic_file).expect("re-read v2 semantic cache"),
+        before,
+        "V2 semantic cache should stay on disk until a replacement is written"
+    );
 }
 
 /// Hardening: corrupt / malicious V3 caches must be rejected cleanly,
