@@ -268,6 +268,8 @@ pub struct InspectSnapshot {
     pub inspect_dir: PathBuf,
     pub config: Arc<Config>,
     pub symbol_cache: SharedSymbolCache,
+    pub inspect_writer: bool,
+    pub callgraph_writer: bool,
 }
 
 impl InspectSnapshot {
@@ -277,11 +279,24 @@ impl InspectSnapshot {
         config: Arc<Config>,
         symbol_cache: SharedSymbolCache,
     ) -> Self {
+        Self::new_with_capabilities(project_root, inspect_dir, config, symbol_cache, true, true)
+    }
+
+    pub fn new_with_capabilities(
+        project_root: PathBuf,
+        inspect_dir: PathBuf,
+        config: Arc<Config>,
+        symbol_cache: SharedSymbolCache,
+        inspect_writer: bool,
+        callgraph_writer: bool,
+    ) -> Self {
         Self {
             project_root,
             inspect_dir,
             config,
             symbol_cache,
+            inspect_writer,
+            callgraph_writer,
         }
     }
 }
@@ -315,6 +330,8 @@ pub struct InspectJob {
     pub inspect_dir: PathBuf,
     pub config: Arc<Config>,
     pub symbol_cache: SharedSymbolCache,
+    pub inspect_writer: bool,
+    pub callgraph_writer: bool,
     pub callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
 }
 

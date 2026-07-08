@@ -15,13 +15,14 @@
 //! created `0600` to avoid leaking checkout activity or allowing another local
 //! user to remove a protected reader marker.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ use crate::fs_lock;
 
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RootCacheDomain {
     Callgraph,
     Inspect,
@@ -53,6 +54,19 @@ pub struct WriterLease {
     guard: Mutex<fs_lock::LockGuard>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ProcessLeaseKey {
+    domain: RootCacheDomain,
+    cache_dir: PathBuf,
+}
+
+static PROCESS_LEASES: OnceLock<Mutex<HashMap<ProcessLeaseKey, Weak<WriterLease>>>> =
+    OnceLock::new();
+
+fn process_leases() -> &'static Mutex<HashMap<ProcessLeaseKey, Weak<WriterLease>>> {
+    PROCESS_LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl std::fmt::Debug for WriterLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -66,12 +80,63 @@ impl std::fmt::Debug for WriterLease {
 }
 
 impl WriterLease {
+    pub fn acquire_shared(
+        domain: RootCacheDomain,
+        cache_dir: &Path,
+        key: &str,
+    ) -> Result<Arc<Self>, fs_lock::AcquireError> {
+        let registry_key = ProcessLeaseKey {
+            domain,
+            cache_dir: canonical_process_lease_dir(cache_dir),
+        };
+        {
+            let mut leases = process_leases()
+                .lock()
+                .map_err(|_| fs_lock::AcquireError::Io(io::Error::other("process lease registry poisoned")))?;
+            if let Some(existing) = leases.get(&registry_key).and_then(Weak::upgrade) {
+                if existing.verify()? {
+                    return Ok(existing);
+                }
+                leases.remove(&registry_key);
+            }
+        }
+
+        let lease = Arc::new(Self::acquire(domain, cache_dir, key, Duration::ZERO)?);
+        let mut leases = process_leases()
+            .lock()
+            .map_err(|_| fs_lock::AcquireError::Io(io::Error::other("process lease registry poisoned")))?;
+        if let Some(existing) = leases.get(&registry_key).and_then(Weak::upgrade) {
+            if existing.verify()? {
+                return Ok(existing);
+            }
+        }
+        leases.insert(registry_key, Arc::downgrade(&lease));
+        Ok(lease)
+    }
+
     pub fn acquire(
         domain: RootCacheDomain,
         cache_dir: &Path,
         key: &str,
         timeout: Duration,
     ) -> Result<Self, fs_lock::AcquireError> {
+        if !storage_allows_root_keyed(cache_dir)? {
+            return Err(fs_lock::AcquireError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing root-keyed {} writer lease on a network filesystem at {}",
+                    domain.as_str(),
+                    cache_dir.display()
+                ),
+            )));
+        }
+        if let Some(storage_root) = cache_dir.parent().and_then(Path::parent) {
+            crate::legacy_partitions::guard_new_layout_write_path(
+                storage_root,
+                cache_dir,
+                "root-keyed writer lease",
+            )?;
+        }
         fs::create_dir_all(cache_dir)?;
         let guard = fs_lock::try_acquire(&writer_lease_path(cache_dir), timeout)?;
         if !guard.verify_writer_epoch()? {
@@ -253,6 +318,24 @@ pub fn storage_allows_root_keyed(path: &Path) -> io::Result<bool> {
 
     let probe = existing_ancestor(path);
     filesystem_is_local(&probe)
+}
+
+fn canonical_process_lease_dir(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn existing_ancestor(path: &Path) -> PathBuf {

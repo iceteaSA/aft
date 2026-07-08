@@ -39,6 +39,8 @@ fn duplicates_job(root: &Path) -> InspectJob {
         inspect_dir: root.join(".aft-cache").join("inspect"),
         config: Arc::new(config),
         symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+        inspect_writer: true,
+        callgraph_writer: true,
         callgraph_snapshot: None,
     }
 }

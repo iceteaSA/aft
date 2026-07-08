@@ -6,7 +6,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
-    CallGraphStore, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
+    CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
 };
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
@@ -343,7 +343,7 @@ fn filter_call_tree_tests(node: &mut StoreCallTreeNode) {
 }
 
 pub fn callers_result(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     symbol: &str,
     depth: usize,
@@ -432,7 +432,7 @@ pub fn callers_result(
 }
 
 pub fn call_tree_result(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     symbol: &str,
     depth: usize,
@@ -448,7 +448,7 @@ pub fn call_tree_result(
 }
 
 pub fn impact_result(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     symbol: &str,
     depth: usize,
@@ -572,7 +572,7 @@ pub fn impact_result(
 }
 
 pub fn trace_to_result(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     symbol: &str,
     max_depth: usize,
@@ -722,7 +722,7 @@ pub fn trace_to_result(
 }
 
 pub fn ensure_symbol_resolves(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     symbol: &str,
 ) -> StoreAdapterResult<()> {
@@ -730,14 +730,14 @@ pub fn ensure_symbol_resolves(
 }
 
 pub fn trace_to_symbol_candidates(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     to_symbol: &str,
 ) -> StoreAdapterResult<Vec<TraceToSymbolCandidate>> {
     store.trace_to_symbol_candidates(to_symbol)
 }
 
 pub fn trace_to_symbol_result(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     symbol: &str,
     to_symbol: &str,
@@ -835,7 +835,7 @@ pub fn trace_to_symbol_result(
 }
 
 pub fn trace_data_result(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     symbol: &str,
     expression: &str,
@@ -873,7 +873,7 @@ pub fn trace_data_result(
 
 #[allow(clippy::too_many_arguments)]
 fn trace_data_inner(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     symbol_cache: &SharedSymbolCache,
     file: &Path,
     symbol: &str,
@@ -951,7 +951,7 @@ fn trace_data_inner(
 
 #[allow(clippy::too_many_arguments)]
 fn walk_for_data_flow(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     symbol_cache: &SharedSymbolCache,
     node: Node<'_>,
     source: &str,
@@ -1125,7 +1125,7 @@ fn extract_assignment_info(
 
 #[allow(clippy::too_many_arguments)]
 fn check_call_for_data_flow(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     symbol_cache: &SharedSymbolCache,
     node: Node<'_>,
     source: &str,
@@ -1274,7 +1274,7 @@ fn push_unresolved_parameter_hops(
 }
 
 fn trace_target_node(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     site: &StoreCallSite,
 ) -> StoreAdapterResult<Option<StoreNode>> {
     if let Some(target) = &site.target {
@@ -1285,7 +1285,7 @@ fn trace_target_node(
 }
 
 fn trace_forward_calls_for_nodes(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     nodes: &[StoreNode],
 ) -> StoreAdapterResult<Vec<TraceForwardCall>> {
     let mut calls = Vec::new();
@@ -1491,7 +1491,7 @@ pub fn unavailable_response(req_id: &str, operation: &str, worktree: bool) -> Re
 }
 
 fn resolve_symbol_query(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     symbol: &str,
 ) -> StoreAdapterResult<ResolvedStoreSymbol> {
@@ -1500,7 +1500,7 @@ fn resolve_symbol_query(
 }
 
 fn resolve_exact_symbol(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &str,
     symbol: &str,
     fallback: Option<StoreNode>,
@@ -1520,7 +1520,7 @@ fn resolve_exact_symbol(
 }
 
 fn collapse_symbol_nodes(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &Path,
     query: &str,
     nodes: Vec<StoreNode>,
@@ -1561,7 +1561,7 @@ fn collapse_exact_nodes(mut nodes: Vec<StoreNode>) -> ResolvedStoreSymbol {
 
 #[allow(clippy::too_many_arguments)]
 fn collect_callers_recursive(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &str,
     symbol: &str,
     max_depth: usize,
@@ -1613,7 +1613,7 @@ fn collect_callers_recursive(
 }
 
 fn call_tree_inner(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     current: &ResolvedStoreSymbol,
     max_depth: usize,
     current_depth: usize,
@@ -1715,7 +1715,7 @@ fn call_tree_inner(
 }
 
 fn forward_calls_for_nodes(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     nodes: &[StoreNode],
 ) -> StoreAdapterResult<Vec<ForwardCall>> {
     let mut calls = Vec::new();
@@ -1744,7 +1744,7 @@ fn forward_calls_for_nodes(
 }
 
 fn forward_resolved_callees(
-    store: &CallGraphStore,
+    store: &impl CallGraphRead,
     file: &str,
     symbol: &str,
 ) -> StoreAdapterResult<Vec<(StoreNode, EdgeMarker)>> {
@@ -1846,11 +1846,11 @@ fn read_source_line(path: &Path, line: u32) -> Option<String> {
         .map(|line| line.trim().to_string())
 }
 
-fn display_file_for_error(store: &CallGraphStore, file: &Path) -> String {
+fn display_file_for_error(store: &impl CallGraphRead, file: &Path) -> String {
     absolute_file(store, file).display().to_string()
 }
 
-fn relative_file(store: &CallGraphStore, file: &Path) -> String {
+fn relative_file(store: &impl CallGraphRead, file: &Path) -> String {
     let absolute = absolute_file(store, file);
     absolute
         .strip_prefix(store.project_root())
@@ -1859,7 +1859,7 @@ fn relative_file(store: &CallGraphStore, file: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn absolute_file(store: &CallGraphStore, file: &Path) -> PathBuf {
+fn absolute_file(store: &impl CallGraphRead, file: &Path) -> PathBuf {
     let full_path = if file.is_relative() {
         store.project_root().join(file)
     } else {

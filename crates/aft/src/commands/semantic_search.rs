@@ -2962,7 +2962,7 @@ fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<O
 
 fn warm_callgraph_store(
     ctx: &AppContext,
-) -> Option<std::sync::Arc<crate::callgraph_store::CallGraphStore>> {
+) -> Option<std::sync::Arc<crate::callgraph_store::ReadonlyCallGraphStore>> {
     if ctx.callgraph_store_rx().lock().is_some() {
         return None;
     }
@@ -2975,7 +2975,7 @@ fn warm_callgraph_store(
 }
 
 fn blast_radius_annotation_for_result(
-    store: &crate::callgraph_store::CallGraphStore,
+    store: &crate::callgraph_store::ReadonlyCallGraphStore,
     result: &HybridResult,
 ) -> Option<String> {
     if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
@@ -3248,9 +3248,14 @@ mod tests {
     fn install_warm_callgraph_store(ctx: &AppContext, project_root: &Path) {
         let root = std::fs::canonicalize(project_root).expect("canonical project root");
         let files = walk_project_files(&root).collect::<Vec<_>>();
-        let store = CallGraphStore::open(root.join(".callgraph-store-test"), root)
-            .expect("open callgraph store");
+        let store_dir = root.join(".callgraph-store-test");
+        let store =
+            CallGraphStore::open(store_dir.clone(), root.clone()).expect("open callgraph store");
         store.cold_build(&files).expect("build callgraph store");
+        drop(store);
+        let store = CallGraphStore::open_readonly(store_dir, root)
+            .expect("open read-only callgraph store")
+            .expect("ready callgraph store");
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));

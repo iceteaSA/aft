@@ -16,7 +16,7 @@ use crate::artifact_owner::{
 use crate::backup::hash_session;
 use crate::backup::BackupStore;
 use crate::bash_background::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
-use crate::callgraph_store::{CallGraphStore, CallGraphStoreError};
+use crate::callgraph_store::{CallGraphStore, CallGraphStoreError, ReadonlyCallGraphStore};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::harness::Harness;
@@ -707,7 +707,7 @@ pub struct AppContext {
     /// closes it for degraded home roots and every heavy-work entry point reads
     /// the same atomic so the decision cannot drift after configure returns.
     heavy_root_work_allowed: Arc<AtomicBool>,
-    callgraph_store: RwLock<Option<Arc<CallGraphStore>>>,
+    callgraph_store: RwLock<Option<Arc<ReadonlyCallGraphStore>>>,
     callgraph_store_force_rebuild: parking_lot::Mutex<bool>,
     callgraph_store_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
     pending_callgraph_store_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
@@ -836,7 +836,7 @@ impl Drop for AppContext {
 /// `Building` is only ever seen during a true first cold build.
 pub enum CallgraphStoreAccess {
     /// Store is resident and queryable.
-    Ready(Arc<CallGraphStore>),
+    Ready(Arc<ReadonlyCallGraphStore>),
     /// A cold build is in flight (or was just started); retry shortly.
     Building,
     /// Not configured, or a read-only worktree whose store was never built.
@@ -1878,7 +1878,7 @@ impl AppContext {
     }
 
     /// Access the persisted call graph store.
-    pub fn callgraph_store(&self) -> &RwLock<Option<Arc<CallGraphStore>>> {
+    pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {
         &self.callgraph_store
     }
 
@@ -1905,14 +1905,14 @@ impl AppContext {
 
     pub fn ensure_callgraph_store(
         &self,
-    ) -> Result<Option<Arc<CallGraphStore>>, CallGraphStoreError> {
+    ) -> Result<Option<Arc<ReadonlyCallGraphStore>>, CallGraphStoreError> {
         self.ensure_callgraph_store_with_flag(true)
     }
 
     fn ensure_callgraph_store_with_flag(
         &self,
         respect_config_flag: bool,
-    ) -> Result<Option<Arc<CallGraphStore>>, CallGraphStoreError> {
+    ) -> Result<Option<Arc<ReadonlyCallGraphStore>>, CallGraphStoreError> {
         if respect_config_flag && !self.config().callgraph_store {
             return Ok(None);
         }
@@ -1934,31 +1934,31 @@ impl AppContext {
         };
         let callgraph_dir = self.callgraph_store_dir();
         let force_rebuild = self.take_callgraph_store_force_rebuild();
-        let store = if !self.callgraph_writer() {
-            CallGraphStore::open_readonly(callgraph_dir, project_root)?
+        if self.callgraph_writer() {
+            if force_rebuild {
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+                    callgraph_dir.clone(),
+                    project_root.clone(),
+                    &files,
+                    self.config().callgraph_chunk_size,
+                )?;
+                drop(store);
+            } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let (store, _stats) = CallGraphStore::ensure_built_with_lease_chunked(
+                    callgraph_dir.clone(),
+                    project_root.clone(),
+                    &files,
+                    self.config().callgraph_chunk_size,
+                )?;
+                drop(store);
+            }
         } else if force_rebuild {
-            let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-            let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
-                callgraph_dir,
-                project_root,
-                &files,
-                self.config().callgraph_chunk_size,
-            )?;
-            Some(store)
-        } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
-            let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-            let (store, _stats) = CallGraphStore::ensure_built_with_lease_chunked(
-                callgraph_dir,
-                project_root,
-                &files,
-                self.config().callgraph_chunk_size,
-            )?;
-            Some(store)
-        } else {
-            Some(CallGraphStore::open(callgraph_dir, project_root)?)
-        };
+            return Ok(None);
+        }
 
-        let Some(store) = store else {
+        let Some(store) = CallGraphStore::open_readonly(callgraph_dir, project_root)? else {
             return Ok(None);
         };
         let store = Arc::new(store);
@@ -1974,7 +1974,7 @@ impl AppContext {
 
     /// Resolve the project root used for the callgraph store: prefer the
     /// canonical cache root, falling back to the configured project root.
-    fn callgraph_project_root(&self) -> Option<PathBuf> {
+    pub fn callgraph_project_root(&self) -> Option<PathBuf> {
         self.canonical_cache_root_opt().or_else(|| {
             self.config()
                 .project_root
@@ -2051,10 +2051,9 @@ impl AppContext {
         };
         let callgraph_dir = self.callgraph_store_dir();
 
-        // Read-only callgraph contexts only open an already-built store from disk;
-        // they do not create a new callgraph cache here.
-        if !self.callgraph_writer() {
-            match CallGraphStore::open_readonly(callgraph_dir, project_root) {
+        let force_rebuild = *self.callgraph_store_force_rebuild.lock();
+        if !force_rebuild {
+            match CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone()) {
                 Ok(Some(store)) => {
                     let store = Arc::new(store);
                     {
@@ -2066,32 +2065,23 @@ impl AppContext {
                     }
                     return CallgraphStoreAccess::Ready(store);
                 }
-                Ok(None) | Err(_) => return CallgraphStoreAccess::Unavailable,
-            }
-        }
-
-        let force_rebuild = *self.callgraph_store_force_rebuild.lock();
-        // Warm path: a fresh on-disk DB exists -> open synchronously (cheap, no
-        // "building" delay). Only a genuine cold build goes to the background.
-        if !force_rebuild {
-            match CallGraphStore::needs_cold_build(&callgraph_dir, &project_root) {
-                Ok(false) => match CallGraphStore::open(callgraph_dir, project_root) {
-                    Ok(store) => {
-                        let store = Arc::new(store);
-                        {
-                            let mut guard = self
-                                .callgraph_store
-                                .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            *guard = Some(Arc::clone(&store));
-                        }
-                        return CallgraphStoreAccess::Ready(store);
+                Ok(None) => {
+                    if !self.callgraph_writer() {
+                        return CallgraphStoreAccess::Unavailable;
                     }
-                    Err(error) => return CallgraphStoreAccess::Error(error),
-                },
-                Ok(true) => {}
-                Err(error) => return CallgraphStoreAccess::Error(error),
+                }
+                Err(error) => {
+                    if !self.callgraph_writer() {
+                        return CallgraphStoreAccess::Unavailable;
+                    }
+                    crate::slog_warn!(
+                        "callgraph read-only open failed before writer promotion: {}",
+                        error
+                    );
+                }
             }
+        } else if !self.callgraph_writer() {
+            return CallgraphStoreAccess::Unavailable;
         }
 
         if self.semantic_cold_seed_active() {
@@ -2106,7 +2096,11 @@ impl AppContext {
         // `AFT_CALLGRAPH_BUILD_WAIT_MS` (default 0) optionally waits a bounded
         // window inline for the build to land before returning `Building`; tests
         // set it large so fixture builds resolve to `Ready` synchronously.
-        if !self.spawn_callgraph_store_cold_build(project_root, callgraph_dir, force_rebuild) {
+        if !self.spawn_callgraph_store_cold_build(
+            project_root.clone(),
+            callgraph_dir.clone(),
+            force_rebuild,
+        ) {
             return CallgraphStoreAccess::Building;
         }
 
@@ -2134,17 +2128,25 @@ impl AppContext {
                             let _ = store.mark_files_stale(&pending);
                         }
                     }
-                    let store = Arc::new(store);
+                    drop(store);
+                    let ready = match CallGraphStore::open_readonly(
+                        callgraph_dir.clone(),
+                        project_root.clone(),
+                    ) {
+                        Ok(Some(store)) => Arc::new(store),
+                        Ok(None) => return CallgraphStoreAccess::Building,
+                        Err(error) => return CallgraphStoreAccess::Error(error),
+                    };
                     {
                         let mut guard = self
                             .callgraph_store
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        *guard = Some(Arc::clone(&store));
+                        *guard = Some(Arc::clone(&ready));
                     }
                     *self.callgraph_store_rx.lock() = None;
                     let _ = self.request_tier2_refresh_pull();
-                    return CallgraphStoreAccess::Ready(store);
+                    return CallgraphStoreAccess::Ready(ready);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {

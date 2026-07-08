@@ -113,6 +113,7 @@ pub struct LockGuard {
     path: PathBuf,
     metadata: LockMetadata,
     shutdown: Arc<AtomicBool>,
+    heartbeat_failed: Arc<AtomicBool>,
     heartbeat_done: mpsc::Receiver<()>,
     heartbeat: Option<JoinHandle<()>>,
 }
@@ -130,6 +131,9 @@ impl LockGuard {
     /// token. Writers call this right before saving published data or starting
     /// SQLite writes so they stop if another process has taken over the lock.
     pub fn verify_writer_epoch(&self) -> io::Result<bool> {
+        if self.heartbeat_failed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         match read_lock_metadata(&self.path) {
             Ok(metadata) => Ok(lock_identity_matches(&metadata, &self.metadata)),
             Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -356,19 +360,27 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
     create_lock_file_atomically(path, &metadata)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let heartbeat_failed = Arc::new(AtomicBool::new(false));
     let (done_tx, done_rx) = mpsc::channel();
     let heartbeat_path = path.to_path_buf();
     let heartbeat_metadata = metadata.clone();
     let heartbeat_shutdown = Arc::clone(&shutdown);
+    let heartbeat_failed_for_thread = Arc::clone(&heartbeat_failed);
     let heartbeat = thread::Builder::new()
         .name("aft-fs-lock-heartbeat".to_string())
         .spawn(move || {
-            run_heartbeat(
-                heartbeat_path,
-                heartbeat_metadata,
-                heartbeat_shutdown,
-                config,
-            );
+            let heartbeat_shutdown_for_run = Arc::clone(&heartbeat_shutdown);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_heartbeat(
+                    heartbeat_path,
+                    heartbeat_metadata,
+                    heartbeat_shutdown_for_run,
+                    config,
+                );
+            }));
+            if result.is_err() || !heartbeat_shutdown.load(Ordering::Acquire) {
+                heartbeat_failed_for_thread.store(true, Ordering::Release);
+            }
             let _ = done_tx.send(());
         })?;
 
@@ -378,6 +390,7 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
         path: path.to_path_buf(),
         metadata,
         shutdown,
+        heartbeat_failed,
         heartbeat_done: done_rx,
         heartbeat: Some(heartbeat),
     })

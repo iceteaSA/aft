@@ -140,9 +140,16 @@ fn drain_callgraph_store_for_test(ctx: &AppContext) {
     };
 
     if let Some(store) = latest {
-        *ctx.callgraph_store()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(store));
+        drop(store);
+        if let Some(project_root) = ctx.callgraph_project_root() {
+            let store = CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root)
+                .expect("open read-only callgraph store")
+                .expect("ready callgraph store");
+            *ctx.callgraph_store()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::sync::Arc::new(store));
+        }
         *ctx.callgraph_store_rx().lock() = None;
     } else if disconnected {
         *ctx.callgraph_store_rx().lock() = None;
@@ -954,6 +961,7 @@ fn inspect_command_tier2_changed_file_returns_fresh_without_scheduler_wait() {
         "warm one-file edit should finish before the direct inspect deadline: {response:#}"
     );
     assert_summary_count(&response, "duplicates", 0);
+    eprintln!("debug forced response: {response:#}");
     let top = response["summary"]["unused_exports"]["top"]
         .as_array()
         .expect("unused export preview");

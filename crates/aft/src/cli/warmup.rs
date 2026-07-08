@@ -1,3 +1,4 @@
+use aft::callgraph_store::CallGraphStore;
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus};
 use aft::parser::TreeSitterProvider;
@@ -609,10 +610,18 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                 let _ = store.mark_files_stale(&pending);
             }
         }
-        *ctx.callgraph_store()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(store));
-        installed = true;
+        drop(store);
+        if let Some(project_root) = ctx.callgraph_project_root() {
+            if let Ok(Some(store)) =
+                CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root)
+            {
+                *ctx.callgraph_store()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::sync::Arc::new(store));
+                installed = true;
+            }
+        }
     }
 
     if disconnected || installed {

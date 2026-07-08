@@ -30,6 +30,8 @@ fn scan(project_root: &Path, scope_files: Vec<PathBuf>) -> aft::inspect::Inspect
         inspect_dir: project_root.join(".aft-cache").join("inspect"),
         config: Arc::new(config),
         symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+        inspect_writer: true,
+        callgraph_writer: true,
         callgraph_snapshot: None,
     };
 

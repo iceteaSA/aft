@@ -45,6 +45,9 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         InspectCategory::Duplicates,
         InspectCategory::Cycles,
     ] {
+        if !ctx.inspect_writer() {
+            continue;
+        }
         let manager = manager.clone();
         let snapshot = snapshot.clone();
         let scope = scope.clone();
@@ -72,13 +75,18 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
             // InspectManager's rayon worker path.
             run_diagnostics_category(ctx, &snapshot, &scope, scope_was_provided)
         } else if category.is_tier2() {
-            let direct = tier2_receivers
-                .remove(category)
-                .map(|rx| receive_direct_tier2(rx, tier2_deadline))
-                .unwrap_or_else(|| DirectTier2RunOutcome {
-                    outcome: JobOutcome::Pending { in_flight: true },
+            let direct = if let Some(rx) = tier2_receivers.remove(category) {
+                receive_direct_tier2(rx, tier2_deadline)
+            } else {
+                DirectTier2RunOutcome {
+                    outcome: manager.tier2_read_cached_readonly(
+                        snapshot.clone(),
+                        *category,
+                        scope.clone(),
+                    ),
                     force_paths_completed: false,
-                });
+                }
+            };
             if direct.force_paths_completed && matches!(direct.outcome, JobOutcome::Fresh { .. }) {
                 force_paths_completed.insert(*category);
             }
@@ -273,11 +281,13 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
-    Ok(InspectSnapshot::new(
+    Ok(InspectSnapshot::new_with_capabilities(
         project_root,
         ctx.inspect_dir(),
         config,
         ctx.symbol_cache(),
+        ctx.inspect_writer(),
+        ctx.callgraph_writer(),
     ))
 }
 
@@ -1249,7 +1259,10 @@ fn summary_for(category: InspectCategory, outcome: Option<&JobOutcome>) -> Value
         // real `count`. All Tier-2 stale categories are count-based, so a
         // payload without one is malformed — fall through to the sentinel rather
         // than render a fabricated `0` that would read as "clean".
-        if payload.get("count").and_then(Value::as_u64).is_some() {
+        if payload.get("count").and_then(Value::as_u64).is_some()
+            || payload.get("total_count").and_then(Value::as_u64).is_some()
+            || payload.get("top").is_some()
+        {
             let mut summary = computed_summary_for(category, Some(payload));
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("stale".to_string(), Value::Bool(true));

@@ -359,15 +359,56 @@ pub struct InspectCache {
     memory: RwLock<HashMap<JobKey, MemoryAggregate>>,
 }
 
+#[derive(Debug)]
+pub struct ReadonlyInspectCache {
+    inner: InspectCache,
+}
+
+pub trait InspectCacheRead {
+    fn get_aggregated_for_config(
+        &self,
+        key: &JobKey,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError>;
+    fn latest_aggregate_any_hash(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError>;
+    fn contribution_freshness(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<(PathBuf, FileFreshness)>, InspectCacheError>;
+    fn load_tier2_contributions(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<ContributionRecord>, InspectCacheError>;
+    fn contribution_set_hash_for_config(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<String, InspectCacheError>;
+    fn last_full_run(&self, category: InspectCategory) -> Result<Option<i64>, InspectCacheError>;
+}
+
 impl InspectCache {
     pub fn open(inspect_dir: PathBuf, project_root: PathBuf) -> Result<Self, InspectCacheError> {
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let inspect_dir = project_inspect_dir(inspect_dir, &project_key);
-        std::fs::create_dir_all(&inspect_dir)?;
         let writer_lease = acquire_writer_lease(&inspect_dir, &project_key)?;
+        if !writer_lease.verify().map_err(InspectCacheError::from)? {
+            return Err(InspectCacheError::Io(std::io::Error::other(
+                "inspect writer lease epoch changed before opening cache",
+            )));
+        }
+        std::fs::create_dir_all(&inspect_dir)?;
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let conn = Connection::open(&sqlite_path)?;
         configure_connection(&conn)?;
+        if !writer_lease.verify().map_err(InspectCacheError::from)? {
+            return Err(InspectCacheError::Io(std::io::Error::other(
+                "inspect writer lease epoch changed before schema initialization",
+            )));
+        }
         initialize_schema(&conn)?;
         Ok(Self::from_connection(
             project_root,
@@ -382,7 +423,7 @@ impl InspectCache {
     pub fn open_readonly(
         inspect_dir: PathBuf,
         project_root: PathBuf,
-    ) -> Result<Option<Self>, InspectCacheError> {
+    ) -> Result<Option<ReadonlyInspectCache>, InspectCacheError> {
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let inspect_dir = project_inspect_dir(inspect_dir, &project_key);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
@@ -391,13 +432,15 @@ impl InspectCache {
         }
         let conn = open_readonly_connection(&sqlite_path)?;
         let read_marker = crate::root_cache::ReadMarker::create(&inspect_dir, "inspect")?;
-        Ok(Some(Self::from_connection(
-            project_root,
-            project_key,
-            sqlite_path,
-            None,
-            Some(read_marker),
-            conn,
+        Ok(Some(ReadonlyInspectCache::from_inner(
+            Self::from_connection(
+                project_root,
+                project_key,
+                sqlite_path,
+                None,
+                Some(read_marker),
+                conn,
+            ),
         )))
     }
 
@@ -1108,6 +1151,183 @@ impl InspectCache {
     }
 }
 
+impl ReadonlyInspectCache {
+    fn from_inner(inner: InspectCache) -> Self {
+        Self { inner }
+    }
+
+    pub fn project_root(&self) -> &Path {
+        self.inner.project_root()
+    }
+
+    pub fn project_key(&self) -> &str {
+        self.inner.project_key()
+    }
+
+    pub fn sqlite_path(&self) -> &Path {
+        self.inner.sqlite_path()
+    }
+
+    pub fn get_aggregated_for_config(
+        &self,
+        key: &JobKey,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.inner.get_aggregated_for_config(key, config)
+    }
+
+    pub fn latest_aggregate_any_hash(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.inner.latest_aggregate_any_hash(category)
+    }
+
+    pub fn contribution_freshness(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<(PathBuf, FileFreshness)>, InspectCacheError> {
+        self.inner.contribution_freshness(category)
+    }
+
+    pub fn load_tier2_contributions(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<ContributionRecord>, InspectCacheError> {
+        self.inner.load_tier2_contributions(category)
+    }
+
+    pub fn contribution_set_hash_for_config(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<String, InspectCacheError> {
+        self.inner
+            .contribution_set_hash_for_config(category, config)
+    }
+
+    pub fn last_full_run(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<i64>, InspectCacheError> {
+        self.inner.last_full_run(category)
+    }
+}
+
+impl InspectCacheRead for InspectCache {
+    fn get_aggregated_for_config(
+        &self,
+        key: &JobKey,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        InspectCache::get_aggregated_for_config(self, key, config)
+    }
+    fn latest_aggregate_any_hash(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        InspectCache::latest_aggregate_any_hash(self, category)
+    }
+    fn contribution_freshness(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<(PathBuf, FileFreshness)>, InspectCacheError> {
+        InspectCache::contribution_freshness(self, category)
+    }
+    fn load_tier2_contributions(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<ContributionRecord>, InspectCacheError> {
+        InspectCache::load_tier2_contributions(self, category)
+    }
+    fn contribution_set_hash_for_config(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<String, InspectCacheError> {
+        InspectCache::contribution_set_hash_for_config(self, category, config)
+    }
+    fn last_full_run(&self, category: InspectCategory) -> Result<Option<i64>, InspectCacheError> {
+        InspectCache::last_full_run(self, category)
+    }
+}
+
+impl<T: InspectCacheRead + ?Sized> InspectCacheRead for Arc<T> {
+    fn get_aggregated_for_config(
+        &self,
+        key: &JobKey,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        (**self).get_aggregated_for_config(key, config)
+    }
+    fn latest_aggregate_any_hash(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        (**self).latest_aggregate_any_hash(category)
+    }
+    fn contribution_freshness(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<(PathBuf, FileFreshness)>, InspectCacheError> {
+        (**self).contribution_freshness(category)
+    }
+    fn load_tier2_contributions(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<ContributionRecord>, InspectCacheError> {
+        (**self).load_tier2_contributions(category)
+    }
+    fn contribution_set_hash_for_config(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<String, InspectCacheError> {
+        (**self).contribution_set_hash_for_config(category, config)
+    }
+    fn last_full_run(&self, category: InspectCategory) -> Result<Option<i64>, InspectCacheError> {
+        (**self).last_full_run(category)
+    }
+}
+
+impl InspectCacheRead for ReadonlyInspectCache {
+    fn get_aggregated_for_config(
+        &self,
+        key: &JobKey,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.get_aggregated_for_config(key, config)
+    }
+    fn latest_aggregate_any_hash(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.latest_aggregate_any_hash(category)
+    }
+    fn contribution_freshness(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<(PathBuf, FileFreshness)>, InspectCacheError> {
+        self.contribution_freshness(category)
+    }
+    fn load_tier2_contributions(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Vec<ContributionRecord>, InspectCacheError> {
+        self.load_tier2_contributions(category)
+    }
+    fn contribution_set_hash_for_config(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<String, InspectCacheError> {
+        self.contribution_set_hash_for_config(category, config)
+    }
+    fn last_full_run(&self, category: InspectCategory) -> Result<Option<i64>, InspectCacheError> {
+        self.last_full_run(category)
+    }
+}
+
 fn project_inspect_dir(inspect_dir: PathBuf, project_key: &str) -> PathBuf {
     if inspect_dir
         .file_name()
@@ -1124,13 +1344,11 @@ fn acquire_writer_lease(
     inspect_dir: &Path,
     project_key: &str,
 ) -> Result<Arc<crate::root_cache::WriterLease>, InspectCacheError> {
-    crate::root_cache::WriterLease::acquire(
+    crate::root_cache::WriterLease::acquire_shared(
         crate::root_cache::RootCacheDomain::Inspect,
         inspect_dir,
         project_key,
-        Duration::from_secs(30),
     )
-    .map(Arc::new)
     .map_err(|error| InspectCacheError::Io(std::io::Error::other(error.to_string())))
 }
 
@@ -1152,11 +1370,27 @@ fn reader_busy_timeout() -> Duration {
 
 fn sqlite_readonly_uri(path: &Path) -> String {
     let raw = path.to_string_lossy().replace('\\', "/");
+    let encoded = percent_encode_sqlite_uri_path(&raw);
     if raw.starts_with('/') {
-        format!("file://{raw}?mode=ro")
+        format!("file://{encoded}?mode=ro")
+    } else if raw.as_bytes().get(1) == Some(&b':') {
+        format!("file:///{encoded}?mode=ro")
     } else {
-        format!("file:{raw}?mode=ro")
+        format!("file:{encoded}?mode=ro")
     }
+}
+
+fn percent_encode_sqlite_uri_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn configure_connection(conn: &Connection) -> Result<(), InspectCacheError> {
@@ -1635,6 +1869,14 @@ mod tests {
 
     fn collect_freshness(path: &Path) -> FileFreshness {
         crate::cache_freshness::collect(path).unwrap()
+    }
+
+    #[test]
+    fn sqlite_readonly_uri_percent_encodes_windows_paths() {
+        assert_eq!(
+            sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
+            "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
+        );
     }
 
     #[test]

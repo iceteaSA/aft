@@ -6,7 +6,7 @@
 //! built and queried directly without going through the in-memory call graph.
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
-use crate::callgraph::{self, EdgeResolution, FileCallData};
+use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidate};
 use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, LangId};
@@ -153,6 +153,51 @@ pub struct CallGraphStore {
     writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
     _read_marker: Option<crate::root_cache::ReadMarker>,
     conn: Mutex<Connection>,
+}
+
+#[derive(Debug)]
+pub struct ReadonlyCallGraphStore {
+    inner: CallGraphStore,
+}
+
+pub trait CallGraphRead {
+    fn project_root(&self) -> &Path;
+    fn project_key(&self) -> &str;
+    fn sqlite_path(&self) -> &Path;
+    fn is_current(&self) -> bool;
+    fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>>;
+    fn indexed_file_count(&self) -> Result<usize>;
+    fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode>;
+    fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>>;
+    fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>>;
+    fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>>;
+    fn callers_of(&self, file_rel: &Path, symbol: &str, depth: usize)
+        -> Result<StoreCallersResult>;
+    fn impact_of(&self, file_rel: &Path, symbol: &str, depth: usize) -> Result<StoreImpactResult>;
+    fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
+    fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
+    fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>>;
+    fn call_tree(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<callgraph::CallTreeNode>;
+    fn trace_to(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToResult>;
+    fn trace_to_symbol_candidates(&self, to_symbol: &str) -> Result<Vec<TraceToSymbolCandidate>>;
+    fn trace_to_symbol(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToSymbolResult>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,7 +558,10 @@ impl CallGraphStore {
         }
     }
 
-    pub fn open_readonly(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Option<Self>> {
+    pub fn open_readonly(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Option<ReadonlyCallGraphStore>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
@@ -525,14 +573,16 @@ impl CallGraphStore {
         }
         let marker_label = generation.as_deref().unwrap_or("legacy");
         let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, marker_label)?;
-        Ok(Some(Self::from_connection(
-            project_root,
-            project_key,
-            sqlite_path,
-            generation,
-            None,
-            Some(read_marker),
-            conn,
+        Ok(Some(ReadonlyCallGraphStore::from_inner(
+            Self::from_connection(
+                project_root,
+                project_key,
+                sqlite_path,
+                generation,
+                None,
+                Some(read_marker),
+                conn,
+            ),
         )))
     }
 
@@ -806,6 +856,9 @@ impl CallGraphStore {
         writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
         read_marker: Option<crate::root_cache::ReadMarker>,
     ) -> Result<OpenedStore> {
+        if let Some(lease) = writer_lease.as_ref() {
+            verify_writer_lease(lease)?;
+        }
         if let Some(parent) = sqlite_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -815,7 +868,13 @@ impl CallGraphStore {
         } else {
             configure_build_connection(&conn)?;
         }
+        if let Some(lease) = writer_lease.as_ref() {
+            verify_writer_lease(lease)?;
+        }
         initialize_schema(&conn)?;
+        if let Some(lease) = writer_lease.as_ref() {
+            verify_writer_lease(lease)?;
+        }
         let root_repair = reconcile_workspace_roots(&mut conn, &project_root)?;
         let store = Self::from_connection(
             project_root,
@@ -1747,6 +1806,365 @@ impl CallGraphStore {
     }
 }
 
+impl ReadonlyCallGraphStore {
+    fn from_inner(inner: CallGraphStore) -> Self {
+        Self { inner }
+    }
+
+    pub fn project_root(&self) -> &Path {
+        self.inner.project_root()
+    }
+
+    pub fn project_key(&self) -> &str {
+        self.inner.project_key()
+    }
+
+    pub fn sqlite_path(&self) -> &Path {
+        self.inner.sqlite_path()
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.inner.is_current()
+    }
+
+    pub fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
+        self.inner.edge_snapshot()
+    }
+
+    pub fn indexed_file_count(&self) -> Result<usize> {
+        self.inner.indexed_file_count()
+    }
+
+    pub fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
+        self.inner.node_for(file_rel, symbol)
+    }
+
+    pub fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.inner.nodes_for(file_rel, symbol)
+    }
+
+    pub fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.inner.nodes_matching(symbol)
+    }
+
+    pub fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
+        self.inner.direct_callers_of(file_rel, symbol)
+    }
+
+    pub fn callers_of(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<StoreCallersResult> {
+        self.inner.callers_of(file_rel, symbol, depth)
+    }
+
+    pub fn impact_of(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<StoreImpactResult> {
+        self.inner.impact_of(file_rel, symbol, depth)
+    }
+
+    pub fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        self.inner.outgoing_calls_of(node)
+    }
+
+    pub fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        self.inner.resolved_self_calls_of(node)
+    }
+
+    pub fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        self.inner.unresolved_calls_of(node)
+    }
+
+    pub fn call_tree(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<callgraph::CallTreeNode> {
+        self.inner.call_tree(file_rel, symbol, depth)
+    }
+
+    pub fn trace_to(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToResult> {
+        self.inner.trace_to(file_rel, symbol, max_depth)
+    }
+
+    pub fn trace_to_symbol_candidates(
+        &self,
+        to_symbol: &str,
+    ) -> Result<Vec<TraceToSymbolCandidate>> {
+        self.inner.trace_to_symbol_candidates(to_symbol)
+    }
+
+    pub fn trace_to_symbol(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToSymbolResult> {
+        self.inner
+            .trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
+    }
+}
+
+impl CallGraphRead for CallGraphStore {
+    fn project_root(&self) -> &Path {
+        CallGraphStore::project_root(self)
+    }
+    fn project_key(&self) -> &str {
+        CallGraphStore::project_key(self)
+    }
+    fn sqlite_path(&self) -> &Path {
+        CallGraphStore::sqlite_path(self)
+    }
+    fn is_current(&self) -> bool {
+        CallGraphStore::is_current(self)
+    }
+    fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
+        CallGraphStore::edge_snapshot(self)
+    }
+    fn indexed_file_count(&self) -> Result<usize> {
+        CallGraphStore::indexed_file_count(self)
+    }
+    fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
+        CallGraphStore::node_for(self, file_rel, symbol)
+    }
+    fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
+        CallGraphStore::nodes_for(self, file_rel, symbol)
+    }
+    fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
+        CallGraphStore::nodes_matching(self, symbol)
+    }
+    fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
+        CallGraphStore::direct_callers_of(self, file_rel, symbol)
+    }
+    fn callers_of(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<StoreCallersResult> {
+        CallGraphStore::callers_of(self, file_rel, symbol, depth)
+    }
+    fn impact_of(&self, file_rel: &Path, symbol: &str, depth: usize) -> Result<StoreImpactResult> {
+        CallGraphStore::impact_of(self, file_rel, symbol, depth)
+    }
+    fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        CallGraphStore::outgoing_calls_of(self, node)
+    }
+    fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        CallGraphStore::resolved_self_calls_of(self, node)
+    }
+    fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        CallGraphStore::unresolved_calls_of(self, node)
+    }
+    fn call_tree(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<callgraph::CallTreeNode> {
+        CallGraphStore::call_tree(self, file_rel, symbol, depth)
+    }
+    fn trace_to(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToResult> {
+        CallGraphStore::trace_to(self, file_rel, symbol, max_depth)
+    }
+    fn trace_to_symbol_candidates(&self, to_symbol: &str) -> Result<Vec<TraceToSymbolCandidate>> {
+        CallGraphStore::trace_to_symbol_candidates(self, to_symbol)
+    }
+    fn trace_to_symbol(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToSymbolResult> {
+        CallGraphStore::trace_to_symbol(self, file_rel, symbol, to_symbol, to_file, max_depth)
+    }
+}
+
+impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
+    fn project_root(&self) -> &Path {
+        (**self).project_root()
+    }
+    fn project_key(&self) -> &str {
+        (**self).project_key()
+    }
+    fn sqlite_path(&self) -> &Path {
+        (**self).sqlite_path()
+    }
+    fn is_current(&self) -> bool {
+        (**self).is_current()
+    }
+    fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
+        (**self).edge_snapshot()
+    }
+    fn indexed_file_count(&self) -> Result<usize> {
+        (**self).indexed_file_count()
+    }
+    fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
+        (**self).node_for(file_rel, symbol)
+    }
+    fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
+        (**self).nodes_for(file_rel, symbol)
+    }
+    fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
+        (**self).nodes_matching(symbol)
+    }
+    fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
+        (**self).direct_callers_of(file_rel, symbol)
+    }
+    fn callers_of(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<StoreCallersResult> {
+        (**self).callers_of(file_rel, symbol, depth)
+    }
+    fn impact_of(&self, file_rel: &Path, symbol: &str, depth: usize) -> Result<StoreImpactResult> {
+        (**self).impact_of(file_rel, symbol, depth)
+    }
+    fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        (**self).outgoing_calls_of(node)
+    }
+    fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        (**self).resolved_self_calls_of(node)
+    }
+    fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        (**self).unresolved_calls_of(node)
+    }
+    fn call_tree(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<callgraph::CallTreeNode> {
+        (**self).call_tree(file_rel, symbol, depth)
+    }
+    fn trace_to(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToResult> {
+        (**self).trace_to(file_rel, symbol, max_depth)
+    }
+    fn trace_to_symbol_candidates(&self, to_symbol: &str) -> Result<Vec<TraceToSymbolCandidate>> {
+        (**self).trace_to_symbol_candidates(to_symbol)
+    }
+    fn trace_to_symbol(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToSymbolResult> {
+        (**self).trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
+    }
+}
+
+impl CallGraphRead for ReadonlyCallGraphStore {
+    fn project_root(&self) -> &Path {
+        self.project_root()
+    }
+    fn project_key(&self) -> &str {
+        self.project_key()
+    }
+    fn sqlite_path(&self) -> &Path {
+        self.sqlite_path()
+    }
+    fn is_current(&self) -> bool {
+        self.is_current()
+    }
+    fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
+        self.edge_snapshot()
+    }
+    fn indexed_file_count(&self) -> Result<usize> {
+        self.indexed_file_count()
+    }
+    fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
+        self.node_for(file_rel, symbol)
+    }
+    fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.nodes_for(file_rel, symbol)
+    }
+    fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.nodes_matching(symbol)
+    }
+    fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
+        self.direct_callers_of(file_rel, symbol)
+    }
+    fn callers_of(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<StoreCallersResult> {
+        self.callers_of(file_rel, symbol, depth)
+    }
+    fn impact_of(&self, file_rel: &Path, symbol: &str, depth: usize) -> Result<StoreImpactResult> {
+        self.impact_of(file_rel, symbol, depth)
+    }
+    fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        self.outgoing_calls_of(node)
+    }
+    fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        self.resolved_self_calls_of(node)
+    }
+    fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        self.unresolved_calls_of(node)
+    }
+    fn call_tree(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<callgraph::CallTreeNode> {
+        self.call_tree(file_rel, symbol, depth)
+    }
+    fn trace_to(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToResult> {
+        self.trace_to(file_rel, symbol, max_depth)
+    }
+    fn trace_to_symbol_candidates(&self, to_symbol: &str) -> Result<Vec<TraceToSymbolCandidate>> {
+        self.trace_to_symbol_candidates(to_symbol)
+    }
+    fn trace_to_symbol(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToSymbolResult> {
+        self.trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
+    }
+}
+
 fn indexed_file_count(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
     Ok(count.max(0) as usize)
@@ -2291,13 +2709,11 @@ fn acquire_writer_lease(
     callgraph_dir: &Path,
     project_key: &str,
 ) -> Result<Arc<crate::root_cache::WriterLease>> {
-    crate::root_cache::WriterLease::acquire(
+    crate::root_cache::WriterLease::acquire_shared(
         crate::root_cache::RootCacheDomain::Callgraph,
         callgraph_dir,
         project_key,
-        Duration::from_secs(30),
     )
-    .map(Arc::new)
     .map_err(CallGraphStoreError::from)
 }
 
@@ -2331,11 +2747,27 @@ fn reader_busy_timeout() -> Duration {
 
 fn sqlite_readonly_uri(path: &Path) -> String {
     let raw = path.to_string_lossy().replace('\\', "/");
+    let encoded = percent_encode_sqlite_uri_path(&raw);
     if raw.starts_with('/') {
-        format!("file://{raw}?mode=ro")
+        format!("file://{encoded}?mode=ro")
+    } else if raw.as_bytes().get(1) == Some(&b':') {
+        format!("file:///{encoded}?mode=ro")
     } else {
-        format!("file:{raw}?mode=ro")
+        format!("file:{encoded}?mode=ro")
     }
+}
+
+fn percent_encode_sqlite_uri_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn configure_connection(conn: &Connection) -> Result<()> {
@@ -7433,6 +7865,14 @@ mod cold_build_insert_tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[test]
+    fn sqlite_readonly_uri_percent_encodes_windows_paths() {
+        assert_eq!(
+            sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
+            "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
+        );
+    }
 
     #[test]
     fn depth_boundary_counts_match_full_fetch_lengths_with_dangling_edges() {

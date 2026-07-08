@@ -8,7 +8,7 @@ use crossbeam_channel::{after, bounded, select, Receiver, Sender};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::cache::{InspectCache, Tier2ContributionUpdates};
+use super::cache::{InspectCache, InspectCacheRead, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 #[cfg(test)]
@@ -725,7 +725,7 @@ impl InspectManager {
         &self,
         key: &JobKey,
         caller_scope: &JobScope,
-        cache: &InspectCache,
+        cache: &(impl InspectCacheRead + ?Sized),
         waiter_rx: Receiver<JobOutcome>,
         snapshot: &InspectSnapshot,
         deadline: Instant,
@@ -821,7 +821,7 @@ impl InspectManager {
         snapshot: &InspectSnapshot,
         category: InspectCategory,
         caller_scope: &JobScope,
-        cache: &InspectCache,
+        cache: &(impl InspectCacheRead + ?Sized),
     ) -> JobOutcome {
         let key = JobKey::for_project_category(category);
         let in_flight = self
@@ -878,7 +878,7 @@ impl InspectManager {
         &self,
         snapshot: &InspectSnapshot,
         category: InspectCategory,
-        cache: &InspectCache,
+        cache: &(impl InspectCacheRead + ?Sized),
     ) -> Result<bool, String> {
         let cached_records = load_contribution_freshness(cache, category)?;
         let cached_relative = cached_records
@@ -977,6 +977,16 @@ impl InspectManager {
             return result;
         }
 
+        if !job.inspect_writer {
+            let result = InspectResult::failed(
+                &job,
+                "inspect writer capability is unavailable for this read-only cache path",
+                started.elapsed(),
+            );
+            log_tier2_benchmark_category_end(&result);
+            return result;
+        }
+
         let project_scope = JobScope::for_project(job.project_root.clone());
         job.scope_files = scope_files(&job.project_root, &project_scope);
         log_tier2_benchmark_category_start(&job);
@@ -1035,6 +1045,8 @@ impl InspectManager {
             inspect_dir: snapshot.inspect_dir,
             config: snapshot.config,
             symbol_cache: snapshot.symbol_cache,
+            inspect_writer: snapshot.inspect_writer,
+            callgraph_writer: snapshot.callgraph_writer,
             callgraph_snapshot,
         }
     }
@@ -1477,6 +1489,8 @@ impl InspectManager {
             inspect_dir: snapshot.inspect_dir,
             config: snapshot.config,
             symbol_cache: snapshot.symbol_cache,
+            inspect_writer: snapshot.inspect_writer,
+            callgraph_writer: snapshot.callgraph_writer,
             callgraph_snapshot,
         };
         self.request_tx
@@ -1525,7 +1539,7 @@ impl InspectManager {
         &self,
         key: &JobKey,
         caller_scope: &JobScope,
-        cache: &InspectCache,
+        cache: &(impl InspectCacheRead + ?Sized),
         snapshot: &InspectSnapshot,
     ) -> JobOutcome {
         match cache.get_aggregated_for_config(key, snapshot.config.as_ref()) {
@@ -1869,34 +1883,62 @@ fn build_tier2_callgraph_snapshot_with_refresh(
         // Background refresh may rebuild call graphs for moved project roots.
         // Direct inspect cannot trigger that rebuild, so it opens without repair
         // and reports callgraph_unavailable when a rebuild is needed.
-        let store = match if refresh_paths.is_empty() {
-            CallGraphStore::open_readonly(callgraph_dir.clone(), job.project_root.clone())
-        } else if allow_cold_build {
-            CallGraphStore::open_ready_repairing(callgraph_dir.clone(), job.project_root.clone())
+        let sqlite_path = if refresh_paths.is_empty() || !job.callgraph_writer {
+            let store = match CallGraphStore::open_readonly(
+                callgraph_dir.clone(),
+                job.project_root.clone(),
+            ) {
+                Ok(Some(store)) => store,
+                Ok(None) => {
+                    crate::slog_info!(
+                        "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
+                        callgraph_dir.display(),
+                        index + 1 < callgraph_dirs.len()
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    crate::slog_warn!(
+                        "tier2 dead_code: failed to open callgraph store read-only at {}: {}; trying fallback={}",
+                        callgraph_dir.display(),
+                        error,
+                        index + 1 < callgraph_dirs.len()
+                    );
+                    continue;
+                }
+            };
+            store.sqlite_path().to_path_buf()
         } else {
-            CallGraphStore::open_ready_no_rebuild(callgraph_dir.clone(), job.project_root.clone())
-        } {
-            Ok(Some(store)) => store,
-            Ok(None) => {
-                crate::slog_info!(
-                    "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
-                    callgraph_dir.display(),
-                    index + 1 < callgraph_dirs.len()
-                );
-                continue;
-            }
-            Err(error) => {
-                crate::slog_warn!(
-                    "tier2 dead_code: failed to open callgraph store at {}: {}; trying fallback={}",
-                    callgraph_dir.display(),
-                    error,
-                    index + 1 < callgraph_dirs.len()
-                );
-                continue;
-            }
-        };
-
-        if !refresh_paths.is_empty() {
+            let store = match if allow_cold_build {
+                CallGraphStore::open_ready_repairing(
+                    callgraph_dir.clone(),
+                    job.project_root.clone(),
+                )
+            } else {
+                CallGraphStore::open_ready_no_rebuild(
+                    callgraph_dir.clone(),
+                    job.project_root.clone(),
+                )
+            } {
+                Ok(Some(store)) => store,
+                Ok(None) => {
+                    crate::slog_info!(
+                        "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
+                        callgraph_dir.display(),
+                        index + 1 < callgraph_dirs.len()
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    crate::slog_warn!(
+                        "tier2 dead_code: failed to open callgraph writer at {}: {}; trying fallback={}",
+                        callgraph_dir.display(),
+                        error,
+                        index + 1 < callgraph_dirs.len()
+                    );
+                    continue;
+                }
+            };
             match store.refresh_files(refresh_paths) {
                 Ok(stats) => {
                     crate::slog_info!(
@@ -1923,9 +1965,10 @@ fn build_tier2_callgraph_snapshot_with_refresh(
                     }
                 }
             }
-        }
+            store.sqlite_path().to_path_buf()
+        };
 
-        let snapshot = match project_dead_code_snapshot(store.sqlite_path()) {
+        let snapshot = match project_dead_code_snapshot(&sqlite_path) {
             Ok(snapshot) => snapshot,
             Err(CallGraphStoreError::Unavailable(message)) => {
                 crate::slog_info!(
@@ -2004,7 +2047,7 @@ fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
 }
 
 fn load_contribution_freshness(
-    cache: &InspectCache,
+    cache: &(impl InspectCacheRead + ?Sized),
     category: InspectCategory,
 ) -> Result<Vec<CachedContributionFreshness>, String> {
     cache
@@ -2033,7 +2076,7 @@ fn relative_cache_key(project_root: &Path, path: &Path) -> String {
 }
 
 fn load_contributions(
-    cache: &InspectCache,
+    cache: &(impl InspectCacheRead + ?Sized),
     job: &InspectJob,
 ) -> Result<Vec<FileContribution>, String> {
     cache
@@ -2048,7 +2091,7 @@ fn load_contributions(
 }
 
 fn dead_code_contributions_need_fact_refresh(
-    cache: &InspectCache,
+    cache: &(impl InspectCacheRead + ?Sized),
     job: &InspectJob,
 ) -> Result<bool, String> {
     let contributions = load_contributions(cache, job)?;
@@ -2077,7 +2120,7 @@ fn dead_code_contribution_needs_fact_refresh(contribution: &FileContribution) ->
 }
 
 fn unused_exports_contributions_need_fact_refresh(
-    cache: &InspectCache,
+    cache: &(impl InspectCacheRead + ?Sized),
     job: &InspectJob,
 ) -> Result<bool, String> {
     let contributions = load_contributions(cache, job)?;
@@ -2091,7 +2134,7 @@ fn unused_exports_contributions_need_fact_refresh(
 /// as 0 and the summary renders "0.0% of 0 analyzed lines". One full rescan
 /// repopulates the counts; fresh contributions always carry line_count.
 fn duplicates_contributions_need_fact_refresh(
-    cache: &InspectCache,
+    cache: &(impl InspectCacheRead + ?Sized),
     job: &InspectJob,
 ) -> Result<bool, String> {
     let contributions = load_contributions(cache, job)?;
@@ -2189,7 +2232,7 @@ fn roll_up_tier2_contributions_with_limit(
 fn scoped_tier2_payload_from_contributions(
     snapshot: &InspectSnapshot,
     category: InspectCategory,
-    cache: &InspectCache,
+    cache: &(impl InspectCacheRead + ?Sized),
     project_payload: Value,
     scope: &JobScope,
 ) -> Result<Value, String> {
@@ -2219,6 +2262,8 @@ fn scoped_tier2_rollup_job(
         inspect_dir: snapshot.inspect_dir.clone(),
         config: Arc::clone(&snapshot.config),
         symbol_cache: Arc::clone(&snapshot.symbol_cache),
+        inspect_writer: snapshot.inspect_writer,
+        callgraph_writer: snapshot.callgraph_writer,
         callgraph_snapshot: None,
     };
 
@@ -2937,7 +2982,7 @@ fn filter_outcome_for_scope_with_contributions(
     outcome: JobOutcome,
     snapshot: &InspectSnapshot,
     category: InspectCategory,
-    cache: &InspectCache,
+    cache: &(impl InspectCacheRead + ?Sized),
     scope: &JobScope,
 ) -> JobOutcome {
     if !category.is_tier2() || scope.is_project_wide() {
@@ -3407,6 +3452,8 @@ mod guard_tests {
                 ..Config::default()
             }),
             symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
             callgraph_snapshot: None,
         }
     }
@@ -3467,6 +3514,8 @@ export function bannerUnused() {}
                 ..Config::default()
             }),
             symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
             callgraph_snapshot: None,
         }
     }
@@ -4010,6 +4059,8 @@ mod dead_code_projection_tests {
             inspect_dir: inspect_dir.clone(),
             config: Arc::clone(&config),
             symbol_cache: Arc::clone(&symbol_cache),
+            inspect_writer: true,
+            callgraph_writer: true,
             callgraph_snapshot: Some(Arc::new(projected)),
         };
         let success = crate::inspect::scanners::dead_code::run_dead_code_scan(&scan_job)
@@ -4400,6 +4451,8 @@ pub fn unrelated() -> u32 { 2 }
                 ..Config::default()
             }),
             symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
             callgraph_snapshot: Some(Arc::new(snapshot)),
         };
         crate::inspect::scanners::dead_code::run_dead_code_scan(&job)

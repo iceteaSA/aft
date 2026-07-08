@@ -1,4 +1,5 @@
 use crate as aft;
+use crate::callgraph_store::CallGraphStore;
 use crate::context::{
     AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
     SemanticRefreshRequest,
@@ -258,11 +259,22 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                 }
             }
         }
-        *ctx.callgraph_store()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));
-        installed = true;
-        status_changed = true;
+        drop(store);
+        if let Some(project_root) = ctx.callgraph_project_root() {
+            match CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root) {
+                Ok(Some(store)) => {
+                    *ctx.callgraph_store()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));
+                    installed = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    crate::slog_warn!("failed to install read-only callgraph store: {}", error);
+                }
+            }
+        }
+        status_changed = installed;
         let _ = ctx.request_tier2_refresh_pull();
     }
 
@@ -1186,23 +1198,34 @@ pub fn refresh_callgraph_store_for_watcher(
     // recorded as pending and replayed against the fresh store (rather than
     // incrementally written into a superseded generation).
     ctx.revalidate_callgraph_store_generation();
-    let store = {
-        let guard = ctx
-            .callgraph_store()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.as_ref().map(Arc::clone)
-    };
-    let Some(store) = store else {
-        // Store not resident yet. If a cold build is in flight, record the
-        // changed paths so they're replayed once the freshly-built store lands
-        // (otherwise mid-build edits would be silently lost). If no build is
-        // running, there's nothing to refresh.
-        if ctx.callgraph_store_rx().lock().is_some() {
-            ctx.add_pending_callgraph_store_paths(source_paths);
-        }
+    let Some(project_root) = ctx.callgraph_project_root() else {
         return;
     };
+    if !ctx.callgraph_writer() {
+        return;
+    }
+    let store =
+        match CallGraphStore::open_ready_repairing(ctx.callgraph_store_dir(), project_root.clone())
+        {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                // Store not resident yet. If a cold build is in flight, record the
+                // changed paths so they're replayed once the freshly-built store lands
+                // (otherwise mid-build edits would be silently lost). If no build is
+                // running, there's nothing to refresh.
+                if ctx.callgraph_store_rx().lock().is_some() {
+                    ctx.add_pending_callgraph_store_paths(source_paths);
+                }
+                return;
+            }
+            Err(error) => {
+                aft::slog_warn!(
+                    "callgraph store writer open failed during refresh: {}",
+                    error
+                );
+                return;
+            }
+        };
     if let Err(error) = store.refresh_files(&source_paths) {
         aft::slog_warn!("callgraph store refresh failed: {}", error);
         match store.mark_files_stale(&source_paths) {

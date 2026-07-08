@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::handle_inspect;
 use aft::config::Config;
@@ -84,9 +85,16 @@ fn drain_callgraph_store_for_test(ctx: &AppContext) {
     };
 
     if let Some(store) = latest {
-        *ctx.callgraph_store()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(store));
+        drop(store);
+        if let Some(project_root) = ctx.callgraph_project_root() {
+            let store = CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root)
+                .expect("open read-only callgraph store")
+                .expect("ready callgraph store");
+            *ctx.callgraph_store()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::sync::Arc::new(store));
+        }
         *ctx.callgraph_store_rx().lock() = None;
     } else if disconnected {
         *ctx.callgraph_store_rx().lock() = None;

@@ -51,6 +51,8 @@ fn job(
             ..Config::default()
         }),
         symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+        inspect_writer: true,
+        callgraph_writer: true,
         callgraph_snapshot: callgraph_snapshot.map(Arc::new),
     }
 }

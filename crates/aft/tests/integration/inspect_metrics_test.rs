@@ -75,6 +75,8 @@ fn metrics_job(root: &Path, files: Vec<PathBuf>, symbol_cache: SharedSymbolCache
             ..Config::default()
         }),
         symbol_cache,
+        inspect_writer: true,
+        callgraph_writer: true,
         callgraph_snapshot: None,
     }
 }

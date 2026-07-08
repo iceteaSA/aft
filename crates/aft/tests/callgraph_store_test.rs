@@ -1645,6 +1645,8 @@ fn dead_code_job(
             ..Config::default()
         }),
         symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+        inspect_writer: true,
+        callgraph_writer: true,
         callgraph_snapshot: Some(Arc::new(snapshot)),
     }
 }
@@ -2026,4 +2028,51 @@ fn peak_rss_bytes() -> Option<u64> {
 #[cfg(not(unix))]
 fn peak_rss_bytes() -> Option<u64> {
     None
+}
+
+#[test]
+fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { leaf(); }\nfunction leaf() {}\n",
+    );
+    let storage = root.join("storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    ctx.set_harness(Harness::Opencode);
+    ctx.set_canonical_cache_root(root.clone());
+    ctx.set_cache_role(false, None);
+    let store_dir = ctx.callgraph_store_dir();
+
+    let (writer, _) = CallGraphStore::cold_build_with_lease(
+        store_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .expect("initial callgraph build");
+    drop(writer);
+    let _held_writer = CallGraphStore::open(store_dir, root.clone()).expect("hold writer lease");
+
+    match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => {
+            let tree = store.call_tree(Path::new("main.ts"), "entry", 1).unwrap();
+            assert_eq!(tree.children[0].name, "leaf");
+        }
+        CallgraphStoreAccess::Error(error) => {
+            panic!("warm read must not fail on writer lease: {error}")
+        }
+        CallgraphStoreAccess::Building => panic!("expected ready read-only store, got building"),
+        CallgraphStoreAccess::Unavailable => {
+            panic!("expected ready read-only store, got unavailable")
+        }
+    }
 }

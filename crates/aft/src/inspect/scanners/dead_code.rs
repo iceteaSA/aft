@@ -3371,6 +3371,8 @@ mod tests {
                 ..Config::default()
             }),
             symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
             callgraph_snapshot: Some(Arc::new(snapshot)),
         }
     }
