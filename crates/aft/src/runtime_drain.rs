@@ -1209,10 +1209,10 @@ pub fn refresh_callgraph_store_for_watcher(
         {
             Ok(Some(store)) => store,
             Ok(None) => {
-                // Store not resident yet. If a cold build is in flight, record the
-                // changed paths so they're replayed once the freshly-built store lands
-                // (otherwise mid-build edits would be silently lost). If no build is
-                // running, there's nothing to refresh.
+                // The callgraph store is not loaded into memory yet. If a build is
+                // already creating it, save the changed paths so they can be replayed
+                // after the new store is available; otherwise, there is no store to
+                // update.
                 if ctx.callgraph_store_rx().lock().is_some() {
                     ctx.add_pending_callgraph_store_paths(source_paths);
                 }

@@ -760,8 +760,9 @@ fn publish_succeeds_while_old_generation_is_held_open() {
     );
     let store_dir = root.join(".store-gen");
 
-    // Keep a read-only connection alive so the test simulates one process
-    // holding an older published snapshot while another process later writes.
+    // Keep a read-only connection open so the test can simulate one process
+    // still reading an older published snapshot while another process writes and
+    // publishes a newer snapshot.
     let (writer, _) = CallGraphStore::cold_build_with_lease(
         store_dir.clone(),
         root.clone(),

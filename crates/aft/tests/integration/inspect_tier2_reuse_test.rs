@@ -152,7 +152,8 @@ fn rebuild_dead_code_callgraph_store(project_root: &Path, inspect_dir: &Path) {
     let store_dir = inspect_dir
         .parent()
         .expect("inspect dir has parent")
-        .join("callgraph");
+        .join("callgraph")
+        .join(aft::search_index::artifact_cache_key(project_root));
     let store = CallGraphStore::open(store_dir, project_root.to_path_buf()).expect("open store");
     let files = project_source_files(project_root);
     store

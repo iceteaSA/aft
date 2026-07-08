@@ -10,13 +10,12 @@
 //!    [`project_scope_key`]. Shared byte-for-byte with subc by construction
 //!    (same crate), so a session attaches to the same root subc routed it to.
 //!
-//! Shared artifact caches are keyed so linked worktrees can reuse the same
-//! search-related cache data: Git repositories use the repository root commit,
-//! and non-Git projects use the canonical filesystem path. This covers search,
-//! semantic search, symbol lookup, and callgraph. Inspect results stay tied to a
-//! single checkout, so inspect uses [`project_scope_key`]. The shared artifact
-//! key remains compatible with the older `project_cache_key` value so existing
-//! caches keep working.
+//! Use one shared cache key for data that can be reused across all worktrees of
+//! the same Git repository, and a separate key for checkout-specific inspect
+//! data. For Git repositories, derive the shared key from the repository's root
+//! commit so every worktree can reuse the same search cache; for non-Git
+//! projects, derive it from the canonical filesystem path. Keep the previous
+//! `project_cache_key` format for compatibility with existing caches.
 //!
 //! 3. Operation-target / lexical path handling (create-file fallback, relative
 //!    path joins) — not identity; stays local to its call sites.

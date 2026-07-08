@@ -1,19 +1,20 @@
-//! Root-keyed cache lease and read-marker primitives.
+//! These files coordinate safe access to a project-root cache: a writer lease
+//! ensures only one process updates the cache at a time, and read-marker files
+//! let cleanup see which readers are still using the cache.
 //!
-//! Writer leases live inside the root-keyed cache domain directory:
-//! `<storage>/callgraph/<artifact_cache_key>/writer.lease` and
-//! `<storage>/inspect/<project_scope_key>/writer.lease`. The lease file is the
-//! `fs_lock` JSON with a `writer_epoch` fencing nonce; writers re-read that
-//! nonce immediately before durable publish points and SQLite write transactions.
+//! Writer leases are stored at `<storage>/callgraph/<artifact_cache_key>/writer.lease`
+//! and `<storage>/inspect/<project_scope_key>/writer.lease`. They use the
+//! `fs_lock` JSON format with a `writer_epoch` nonce so a writer can detect if
+//! another process has taken over before publishing changes or starting SQLite
+//! write transactions.
 //!
-//! Read markers are per SQLite connection and live below
-//! `<cache-domain>/readers/<generation-label>/<pid>.<hostname>.<created_at_ms>.<seq>.json`.
-//! The marker JSON format is intentionally small and frozen for the Lane-B GC:
-//! `{ "pid": u32, "hostname": String, "created_at_ms": u64 }`.
-//! The marker file's mtime is the heartbeat/touch signal for cross-host readers;
-//! same-host protection is PID-authoritative in the GC lane. Marker files are
-//! created `0600` to avoid leaking checkout activity or allowing another local
-//! user to remove a protected reader marker.
+//! Read markers track active SQLite readers so cache cleanup can tell when it is
+//! safe to remove old data. They are stored under
+//! `<cache-domain>/readers/<generation-label>/<pid>.<hostname>.<created_at_ms>.<seq>.json`;
+//! the JSON records the process identity and creation time, mtime is used as a
+//! heartbeat for cleanup across hosts, and the PID is used for cleanup on the
+//! same host. Marker files are created `0600` so they do not expose checkout
+//! activity or let another local user delete a protected marker.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -89,27 +90,17 @@ impl WriterLease {
             domain,
             cache_dir: canonical_process_lease_dir(cache_dir),
         };
-        {
-            let mut leases = process_leases()
-                .lock()
-                .map_err(|_| fs_lock::AcquireError::Io(io::Error::other("process lease registry poisoned")))?;
-            if let Some(existing) = leases.get(&registry_key).and_then(Weak::upgrade) {
-                if existing.verify()? {
-                    return Ok(existing);
-                }
-                leases.remove(&registry_key);
-            }
-        }
-
-        let lease = Arc::new(Self::acquire(domain, cache_dir, key, Duration::ZERO)?);
-        let mut leases = process_leases()
-            .lock()
-            .map_err(|_| fs_lock::AcquireError::Io(io::Error::other("process lease registry poisoned")))?;
+        let mut leases = process_leases().lock().map_err(|_| {
+            fs_lock::AcquireError::Io(io::Error::other("process lease registry poisoned"))
+        })?;
         if let Some(existing) = leases.get(&registry_key).and_then(Weak::upgrade) {
             if existing.verify()? {
                 return Ok(existing);
             }
+            leases.remove(&registry_key);
         }
+
+        let lease = Arc::new(Self::acquire(domain, cache_dir, key, Duration::ZERO)?);
         leases.insert(registry_key, Arc::downgrade(&lease));
         Ok(lease)
     }
@@ -321,7 +312,29 @@ pub fn storage_allows_root_keyed(path: &Path) -> io::Result<bool> {
 }
 
 fn canonical_process_lease_dir(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let normalized = lexical_normalize(path);
+    let mut missing_components = Vec::new();
+    let mut current = normalized.as_path();
+    while !current.exists() {
+        let Some(name) = current.file_name() else {
+            return normalized;
+        };
+        missing_components.push(name.to_os_string());
+        let Some(parent) = current.parent() else {
+            return normalized;
+        };
+        current = parent;
+    }
+
+    let mut canonical = std::fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+    for component in missing_components.iter().rev() {
+        canonical.push(component);
+    }
+    canonical
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -466,6 +479,53 @@ mod tests {
                 fs::metadata(marker.path()).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_lease_dir_canonicalizes_existing_ancestor_before_cache_dir_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let missing_cache_dir = link.join("inspect").join("project");
+        let before_create = canonical_process_lease_dir(&missing_cache_dir);
+        fs::create_dir_all(&missing_cache_dir).unwrap();
+        let after_create = canonical_process_lease_dir(&missing_cache_dir);
+
+        assert_eq!(before_create, after_create);
+        assert!(before_create.starts_with(std::fs::canonicalize(&real).unwrap()));
+    }
+
+    #[test]
+    fn writer_lease_acquire_shared_reuses_single_process_lease_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("inspect").join("project");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let cache_dir = cache_dir.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                WriterLease::acquire_shared(RootCacheDomain::Inspect, &cache_dir, "project")
+                    .map_err(|error| error.to_string())
+            }));
+        }
+
+        let leases = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        let epoch = leases[0].epoch().to_string();
+        let path = leases[0].path().to_path_buf();
+        for lease in &leases {
+            assert_eq!(lease.epoch(), epoch);
+            assert_eq!(lease.path(), path.as_path());
+            assert!(lease.verify().unwrap());
         }
     }
 

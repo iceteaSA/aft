@@ -657,7 +657,11 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
         "export function unused() { return 1; }\n",
     );
     let inspect_dir = root.join(".aft-cache").join("inspect");
-    let callgraph_dir = inspect_dir.parent().expect("harness dir").join("callgraph");
+    let callgraph_dir = inspect_dir
+        .parent()
+        .expect("storage dir")
+        .join("callgraph")
+        .join(aft::search_index::artifact_cache_key(&root));
     let _not_ready_store =
         CallGraphStore::open(callgraph_dir, root.clone()).expect("open non-ready callgraph store");
 
@@ -961,7 +965,6 @@ fn inspect_command_tier2_changed_file_returns_fresh_without_scheduler_wait() {
         "warm one-file edit should finish before the direct inspect deadline: {response:#}"
     );
     assert_summary_count(&response, "duplicates", 0);
-    eprintln!("debug forced response: {response:#}");
     let top = response["summary"]["unused_exports"]["top"]
         .as_array()
         .expect("unused export preview");
