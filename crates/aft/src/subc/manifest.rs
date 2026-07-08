@@ -37,32 +37,29 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
     )
 }
 
-/// These tool calls are allowed here because they only read or update per-session
-/// bookkeeping needed for background shell status, completion acknowledgements,
-/// and previewing file paths for undo/restore. They stay on a small allowlist so
-/// the plugin can use them without being able to change configuration or trust
-/// settings.
+/// Internal plumbing commands the harness consumer (NOT the agent) invokes over
+/// a bound route. These are NOT agent-facing tools — they carry no agent surface
+/// and never reach the model — so they're not in the manifest /
+/// `is_subc_agent_core_tool`, but the plugin must reach dispatch with them over
+/// subc for background-bash delivery and safety undo/restore to work.
 ///
-/// These helpers are safe to allow because `run_tool_call` replaces any request
-/// `session_id` with the session already bound to the caller, so they cannot be
-/// used to act on a different session. Most of them only read data; the only
-/// exception is completion-ack handling, which only updates the completion
-/// registry. That means they do not let the caller change configuration or
-/// bypass the `configure` restriction:
-/// - `bash_status`: per-session snapshot reads used after a background bash
-///   launch; it is read-only and cannot change config or workspace state.
+/// This is a DELIBERATELY TIGHT allowlist, kept separate from the agent
+/// core-tool gate so it cannot widen the fail-closed backstop in
+/// `handle_tool_call`. Every entry is session-scoped (the bind session is
+/// reinjected by `run_tool_call`, overriding any body `session_id`) and carries
+/// NO config/trust surface, so admitting them does not reopen the
+/// `configure`-bypass hole the gate exists to close. The untrusted-bind bash
+/// denial fires BEFORE this allowlist (`is_bash_family_tool` matches every
+/// `bash_*` name), so untrusted binds still cannot observe bash state:
+/// - `bash_status`: read-only per-session task snapshot; required so a
+///   respawned module can report rehydrated detached tasks by task id.
 /// - `bash_drain_completions` / `bash_ack_completions`: per-session completion
-///   registry plumbing for the bg_events wake lane.
+///   registry plumbing for the bg_events wake lane (drain = PureRead,
+///   ack = Mutating in `command_lane`).
 /// - `undo_preview` / `checkpoint_paths`: read-only permission-preview reads
 ///   over the session's own backup/checkpoint state — the plugin safety tool
 ///   calls them BEFORE `aft_safety undo`/`restore` to know which paths to ask
 ///   permission for. Without them, safety undo/restore fails over subc.
-///
-/// These calls are grouped by whether they modify session state: `bash_status`,
-/// `bash_drain_completions`, `undo_preview`, and `checkpoint_paths` only read
-/// data, while `bash_ack_completions` updates the completion registry. This
-/// distinction matters because the read-only calls can be allowed more freely
-/// than the one that changes session state.
 pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
     matches!(
         name,
