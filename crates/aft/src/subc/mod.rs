@@ -286,7 +286,6 @@ struct RouteBindCompletion {
     bind_root_id: ProjectRootId,
     inserted_new_actor: bool,
     configure_response: Response,
-    drain_response: Option<Response>,
     diagnostics_on_edit: bool,
     ver: u8,
     corr: u64,
@@ -2029,15 +2028,6 @@ async fn handle_route_bind_completion(
             &completion.configure_response,
             "configure failed during route bind",
         ))
-    } else if let Some(drain_response) = completion.drain_response.as_ref() {
-        if drain_response.success {
-            None
-        } else {
-            Some((
-                drain_response,
-                "build-completion drain failed during route bind",
-            ))
-        }
     } else {
         None
     };
@@ -2392,7 +2382,6 @@ async fn handle_control_request(
             );
 
             let completion_tx = control_completion_tx.clone();
-            let completion_executor = Arc::clone(executor);
             let completion_identity = route_identity;
             let completion_root = bind_root_id.clone();
             let completion_route_channel = route_channel;
@@ -2404,30 +2393,16 @@ async fn handle_control_request(
                 let _response_task = ResponseTaskGuard::new(&completion_metrics);
                 let configure_response =
                     await_executor_response(configure_rx, configure_request_id.clone()).await;
-                let drain_response = if configure_response.success && !root_was_live {
-                    let drain_request_id = format!("subc-bind-drain-{completion_route_channel}");
-                    let drain_response_id = drain_request_id.clone();
-                    let drain_rx = completion_executor.submit_async(
-                        completion_root.clone(),
-                        Lane::Mutating,
-                        drain_request_id.clone(),
-                        Box::new(move |ctx| {
-                            runtime_drain::drain_build_completions(ctx);
-                            Response::success(drain_response_id, json!({ "drained": true }))
-                        }),
-                    );
-                    Some(await_executor_response(drain_rx, drain_request_id).await)
-                } else {
-                    None
-                };
-
+                // Send the route-bind acknowledgment as soon as configure succeeds.
+                // Installing completed search or callgraph builds only refreshes cached
+                // read data, so a later maintenance pass can do it without delaying the
+                // daemon's confirmation that the route is usable.
                 let completion = RouteBindCompletion {
                     route_channel: completion_route_channel,
                     identity: completion_identity,
                     bind_root_id: completion_root,
                     inserted_new_actor,
                     configure_response,
-                    drain_response,
                     diagnostics_on_edit,
                     ver: completion_ver,
                     corr: completion_corr,
