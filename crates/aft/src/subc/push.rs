@@ -110,12 +110,19 @@ pub(super) fn progress_sender_for_root(
     Arc::new(Box::new(move |frame: PushFrame| {
         // Emitters can run on executor workers, maintenance jobs, watcher drains,
         // semantic refresh workers, or bg-bash watchdog threads. Never block any
-        // of them on subc routing/backpressure: reliable frames take an
-        // unbounded non-blocking lane; lossy frames stay bounded and coalesced.
+        // of them on subc routing/backpressure: reliable frames use an unbounded
+        // non-blocking channel, while lossy frames use a bounded channel and keep
+        // only the newest update when that channel fills up.
         if frame_is_reliable(&frame) {
             let _ = push_senders.reliable_tx.send((root_id.clone(), frame));
         } else {
-            let _ = push_senders.lossy_tx.try_send((root_id.clone(), frame));
+            enqueue_lossy_push_frame(
+                &push_senders.lossy_tx,
+                &push_senders.lossy_overflow,
+                &push_senders.lossy_seq,
+                root_id.clone(),
+                frame,
+            );
         }
     }))
 }
@@ -147,6 +154,46 @@ enum LossyPushKey {
     },
 }
 
+#[derive(Debug, Default)]
+pub(super) struct LossyOverflow {
+    inner: std::sync::Mutex<LossyOverflowInner>,
+}
+
+#[derive(Debug, Default)]
+struct LossyOverflowInner {
+    slots: Vec<LossyPushEnvelope>,
+    latest: HashMap<(ProjectRootId, LossyPushKey), usize>,
+}
+
+impl LossyOverflow {
+    fn push_latest(&self, order: u64, root: ProjectRootId, frame: PushFrame) {
+        let Some(lossy_key) = lossy_push_key(&frame) else {
+            return;
+        };
+        let map_key = (root.clone(), lossy_key);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = inner.latest.get(&map_key).copied() {
+            inner.slots[slot] = (order, root, frame);
+        } else {
+            let slot = inner.slots.len();
+            inner.latest.insert(map_key, slot);
+            inner.slots.push((order, root, frame));
+        }
+    }
+
+    pub(super) fn drain(&self) -> Vec<LossyPushEnvelope> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.latest.clear();
+        std::mem::take(&mut inner.slots)
+    }
+}
+
 fn lossy_push_key(frame: &PushFrame) -> Option<LossyPushKey> {
     match frame {
         PushFrame::Progress(progress) => Some(LossyPushKey::Progress {
@@ -160,6 +207,26 @@ fn lossy_push_key(frame: &PushFrame) -> Option<LossyPushKey> {
         PushFrame::BashCompleted(_)
         | PushFrame::BashPatternMatch(_)
         | PushFrame::ConfigureWarnings(_) => None,
+    }
+}
+
+pub(super) fn enqueue_lossy_push_frame(
+    tx: &mpsc::Sender<LossyPushEnvelope>,
+    overflow: &LossyOverflow,
+    sequence: &AtomicU64,
+    root: ProjectRootId,
+    frame: PushFrame,
+) {
+    let order = sequence.fetch_add(1, Ordering::Relaxed);
+    match tx.try_send((order, root, frame)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full((order, root, frame))) => {
+            // The bounded lossy channel protects emitters from blocking. When the
+            // channel is saturated, keep the newest coalescable frame out-of-band
+            // so a full channel drops stale status/progress, not the latest update.
+            overflow.push_latest(order, root, frame);
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
     }
 }
 
@@ -826,6 +893,50 @@ pub(super) fn process_lossy_push_frame(
     let _ = fan_out_lossy_push_frame(writer_tx, metrics, routes, root_channels, &root, &frame);
 }
 
+pub(super) fn process_lossy_push_batch(
+    writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    completed_tasks: &CompletedTaskIds,
+    batch: Vec<PushEnvelope>,
+) {
+    for (root, frame) in coalesce_push_batch(batch) {
+        process_lossy_push_frame(
+            writer_tx,
+            metrics,
+            routes,
+            root_channels,
+            completed_tasks,
+            root,
+            frame,
+        );
+    }
+}
+
+pub(super) fn process_lossy_push_envelope_batch(
+    writer_tx: &mpsc::Sender<Frame>,
+    metrics: &DispatchPathMetrics,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    completed_tasks: &CompletedTaskIds,
+    mut batch: Vec<LossyPushEnvelope>,
+) {
+    batch.sort_by_key(|(order, _, _)| *order);
+    let batch = batch
+        .into_iter()
+        .map(|(_, root, frame)| (root, frame))
+        .collect();
+    process_lossy_push_batch(
+        writer_tx,
+        metrics,
+        routes,
+        root_channels,
+        completed_tasks,
+        batch,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
@@ -1236,14 +1347,62 @@ mod tests {
     }
 
     #[test]
+    fn lossy_overflow_coalesces_after_saturated_channel_backlog() {
+        let (_root_dir, root) = test_root("subc-lossy-overflow-root");
+        let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1);
+        let lossy_overflow = LossyOverflow::default();
+        let lossy_seq = AtomicU64::new(0);
+
+        enqueue_lossy_push_frame(
+            &lossy_tx,
+            &lossy_overflow,
+            &lossy_seq,
+            root.clone(),
+            status_frame(1),
+        );
+        enqueue_lossy_push_frame(
+            &lossy_tx,
+            &lossy_overflow,
+            &lossy_seq,
+            root.clone(),
+            status_frame(2),
+        );
+        enqueue_lossy_push_frame(
+            &lossy_tx,
+            &lossy_overflow,
+            &lossy_seq,
+            root.clone(),
+            status_frame(3),
+        );
+
+        let mut batch = vec![lossy_rx.try_recv().expect("first lossy frame queued")];
+        batch.extend(lossy_overflow.drain());
+        batch.sort_by_key(|(order, _, _)| *order);
+        let statuses: Vec<_> = coalesce_push_batch(
+            batch
+                .into_iter()
+                .map(|(_, root, frame)| (root, frame))
+                .collect(),
+        )
+        .iter()
+        .filter_map(|(_, frame)| status_seq(frame))
+        .collect();
+
+        assert_eq!(statuses, vec![3]);
+    }
+
+    #[test]
     fn progress_sender_keeps_reliable_off_saturated_lossy_funnel_without_blocking() {
         let (_root_dir, root) = test_root("subc-push-full-root");
-        let (lossy_tx, mut lossy_rx) = mpsc::channel::<PushEnvelope>(1);
+        let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1);
+        let lossy_overflow = Arc::new(LossyOverflow::default());
         let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
         let sender = progress_sender_for_root(
             PushSenders {
                 lossy_tx,
                 reliable_tx,
+                lossy_overflow: Arc::clone(&lossy_overflow),
+                lossy_seq: Arc::new(AtomicU64::new(0)),
             },
             root.clone(),
         );
@@ -1257,14 +1416,18 @@ mod tests {
             "saturated push sender must return immediately"
         );
 
-        let (received_root, received_frame) =
+        let (_, received_root, received_frame) =
             lossy_rx.try_recv().expect("first lossy frame queued");
         assert_eq!(received_root, root);
         assert_eq!(status_seq(&received_frame), Some(1));
         assert!(
             lossy_rx.try_recv().is_err(),
-            "second lossy frame should be dropped"
+            "full lossy channel should keep later frames in overflow"
         );
+        let overflow_batch = lossy_overflow.drain();
+        assert_eq!(overflow_batch.len(), 1);
+        assert_eq!(overflow_batch[0].1, root);
+        assert_eq!(status_seq(&overflow_batch[0].2), Some(2));
 
         let (reliable_root, reliable_frame) = reliable_rx
             .try_recv()

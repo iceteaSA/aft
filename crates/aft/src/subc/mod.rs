@@ -115,6 +115,7 @@ const BASH_ELICITATION_CREATE_METHOD: &str = "elicitation/create";
 
 type RouteChannel = u32;
 type PushEnvelope = (ProjectRootId, PushFrame);
+type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod bash;
 mod health;
@@ -138,8 +139,10 @@ use self::wire::{
 
 #[derive(Clone)]
 struct PushSenders {
-    lossy_tx: mpsc::Sender<PushEnvelope>,
+    lossy_tx: mpsc::Sender<LossyPushEnvelope>,
     reliable_tx: mpsc::UnboundedSender<PushEnvelope>,
+    lossy_overflow: Arc<push::LossyOverflow>,
+    lossy_seq: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -1276,11 +1279,15 @@ where
     let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
         mpsc::channel::<RouteBindCompletion>(256);
-    let (lossy_tx, mut lossy_rx) = mpsc::channel::<PushEnvelope>(1024);
+    let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1024);
+    let lossy_overflow = Arc::new(push::LossyOverflow::default());
+    let lossy_seq = Arc::new(AtomicU64::new(0));
     let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
+        lossy_overflow: Arc::clone(&lossy_overflow),
+        lossy_seq,
     };
     let connection_cancel = PersistentCancelSignal::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
@@ -1410,6 +1417,47 @@ where
                 );
             }
             next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
+        }
+
+        // A lossy emitter may place its newest update in the overflow buffer
+        // when the bounded channel is full, while this receive loop is draining
+        // the channel. Drain overflow before selecting again so that raced
+        // update is delivered on the next timer tick instead of waiting for
+        // another lossy enqueue.
+        let overflow_batch = lossy_overflow.drain();
+        if !overflow_batch.is_empty() {
+            let (_, deferred) = push::drain_reliable_push_turn(
+                &writer_tx,
+                &dispatch_path_metrics,
+                &routes,
+                &root_channels,
+                &session_identity,
+                &mut retry_buffer,
+                &mut push_buffer,
+                &mut completed_tasks,
+                &bg_sub_by_session,
+                &mut bg_wake_pending,
+                &mut bg_wake_epoch,
+                &mut reliable_rx,
+                None,
+            );
+            if deferred {
+                tokio::task::yield_now().await;
+            }
+
+            let mut batch = Vec::new();
+            while let Ok(item) = lossy_rx.try_recv() {
+                batch.push(item);
+            }
+            batch.extend(overflow_batch);
+            push::process_lossy_push_envelope_batch(
+                &writer_tx,
+                &dispatch_path_metrics,
+                &routes,
+                &root_channels,
+                &completed_tasks,
+                batch,
+            );
         }
 
         tokio::select! {
@@ -1672,7 +1720,7 @@ where
                     tokio::task::yield_now().await;
                 }
             }
-            Some((root_id, frame)) = lossy_rx.recv() => {
+            Some((order, root_id, frame)) = lossy_rx.recv() => {
                 // When both push lanes have work, handle a small reliable slice before lossy work.
                 // That ordering lets completed task ids suppress stale BashLongRunning frames.
                 // The slice stays bounded so reliable bursts cannot monopolize this loop turn.
@@ -1696,24 +1744,24 @@ where
                 }
 
                 // Drain the currently queued burst in one loop turn so lossy
-                // status/progress classes coalesce before reaching subc's shared
-                // egress queue.
-                let mut batch = vec![(root_id, frame)];
+                // status/progress updates can be merged before reaching subc's
+                // shared egress queue. Each lossy frame gets a sequence number
+                // before it goes to the channel or overflow buffer, so the
+                // combined batch is sorted back into producer order before
+                // coalescing drops stale updates for the same key.
+                let mut batch = vec![(order, root_id, frame)];
                 while let Ok(item) = lossy_rx.try_recv() {
                     batch.push(item);
                 }
-
-                for (root, frame) in push::coalesce_push_batch(batch) {
-                    push::process_lossy_push_frame(
-                        &writer_tx,
-                        &dispatch_path_metrics,
-                        &routes,
-                        &root_channels,
-                        &completed_tasks,
-                        root,
-                        frame,
-                    );
-                }
+                batch.extend(lossy_overflow.drain());
+                push::process_lossy_push_envelope_batch(
+                    &writer_tx,
+                    &dispatch_path_metrics,
+                    &routes,
+                    &root_channels,
+                    &completed_tasks,
+                    batch,
+                );
             }
             Some(done) = bash_deferred_rx.recv() => {
                 decrement_counted_channel(&dispatch_path_metrics.bash_deferred_queued);
