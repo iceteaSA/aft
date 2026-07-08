@@ -449,6 +449,59 @@ fn due_maintenance_jobs(
     (jobs, deferred)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn submit_due_maintenance_jobs(
+    executor: &Arc<Executor>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
+    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
+    metrics: &Arc<DispatchPathMetrics>,
+) {
+    let pending_bind_roots = pending_binds
+        .values()
+        .map(|pending| pending.bind_root_id.clone())
+        .collect::<HashSet<_>>();
+    let (due_jobs, deferred_jobs) =
+        due_maintenance_jobs(live_roots, MAINTENANCE_SUBMIT_BUDGET, &pending_bind_roots);
+    if deferred_jobs {
+        metrics
+            .maintenance_budget_deferrals
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    for (root_id, kind) in due_jobs {
+        let bg_sessions_to_check = if kind == MaintenanceDrainKind::Short {
+            bg_sub_by_session
+                .iter()
+                .filter_map(|((root, session), _)| {
+                    if root == &root_id {
+                        Some((
+                            session.clone(),
+                            bg_wake_epoch
+                                .get(&(root_id.clone(), session.clone()))
+                                .copied()
+                                .unwrap_or(0),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        submit_maintenance_job(
+            executor,
+            root_id,
+            kind,
+            bg_sessions_to_check,
+            maintenance_tx,
+            metrics,
+        );
+    }
+}
+
 fn note_maintenance_completion(
     meta: &mut RootMeta,
     requeue_kind: Option<MaintenanceDrainKind>,
@@ -1143,7 +1196,6 @@ async fn process_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
-    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
     decrement_counted_channel(&metrics.control_completion_queued);
@@ -1158,7 +1210,6 @@ async fn process_route_bind_completion(
         pending_binds,
         executor,
         shutdown,
-        maintenance_tx,
         metrics,
     )
     .await
@@ -1176,9 +1227,9 @@ async fn drain_pending_route_bind_completions(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
-    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
-) -> Result<(), SubcError> {
+) -> Result<usize, SubcError> {
+    let mut drained = 0;
     while let Ok(completion) = control_completion_rx.try_recv() {
         process_route_bind_completion(
             writer_tx,
@@ -1191,12 +1242,12 @@ async fn drain_pending_route_bind_completions(
             pending_binds,
             executor,
             shutdown,
-            maintenance_tx,
             metrics,
         )
         .await?;
+        drained += 1;
     }
-    Ok(())
+    Ok(drained)
 }
 
 /// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
@@ -1272,6 +1323,7 @@ where
     // delivery deadline. The pre-turn check cannot be starved by arm order;
     // the sleep_until arm below only exists to wake an otherwise-idle loop.
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
+    let mut next_maintenance_at = next_drain_at;
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
@@ -1325,7 +1377,7 @@ where
         // RouteBind completions are control-plane unblockers. Drain any completed
         // binds before entering other branch work so Push and maintenance bursts
         // can only add one loop-turn of latency.
-        if let Err(error) = drain_pending_route_bind_completions(
+        match drain_pending_route_bind_completions(
             &mut control_completion_rx,
             &writer_tx,
             &mut routes,
@@ -1336,12 +1388,16 @@ where
             &mut pending_binds,
             &executor,
             &shutdown,
-            &maintenance_tx,
             &dispatch_path_metrics,
         )
         .await
         {
-            break Err(error);
+            Ok(drained) => {
+                if drained > 0 {
+                    next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
+                }
+            }
+            Err(error) => break Err(error),
         }
 
         if tokio::time::Instant::now() >= next_drain_at {
@@ -1371,50 +1427,6 @@ where
                 );
             }
 
-            let pending_bind_roots = pending_binds
-                .values()
-                .map(|pending| pending.bind_root_id.clone())
-                .collect::<HashSet<_>>();
-            let (due_jobs, deferred_jobs) = due_maintenance_jobs(
-                &mut live_roots,
-                MAINTENANCE_SUBMIT_BUDGET,
-                &pending_bind_roots,
-            );
-            if deferred_jobs {
-                dispatch_path_metrics
-                    .maintenance_budget_deferrals
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            for (root_id, kind) in due_jobs {
-                let bg_sessions_to_check = if kind == MaintenanceDrainKind::Short {
-                    bg_sub_by_session
-                        .iter()
-                        .filter_map(|((root, session), _)| {
-                            if root == &root_id {
-                                Some((
-                                    session.clone(),
-                                    bg_wake_epoch
-                                        .get(&(root_id.clone(), session.clone()))
-                                        .copied()
-                                        .unwrap_or(0),
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                submit_maintenance_job(
-                    &executor,
-                    root_id,
-                    kind,
-                    bg_sessions_to_check,
-                    &maintenance_tx,
-                    &dispatch_path_metrics,
-                );
-            }
             next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
         }
 
@@ -1473,13 +1485,13 @@ where
                     &mut pending_binds,
                     &executor,
                     &shutdown,
-                    &maintenance_tx,
                     &dispatch_path_metrics,
                 )
                 .await
                 {
                     break Err(error);
                 }
+                next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
             }
             _ = shutdown.notified() => {
                 log::warn!("subc attach: fatal executor response requested teardown");
@@ -1820,6 +1832,22 @@ where
                 // Wakes an otherwise-idle loop so the pre-turn drain check
                 // above runs on schedule; the drain work itself lives there.
             }
+            _ = tokio::time::sleep_until(next_maintenance_at) => {
+                // Delay cache-draining maintenance until any already-ready
+                // inbound route/control messages and push completions have run,
+                // so maintenance does not block the actor from handling the
+                // first request that arrives after a route bind is acknowledged.
+                submit_due_maintenance_jobs(
+                    &executor,
+                    &mut live_roots,
+                    &pending_binds,
+                    &bg_sub_by_session,
+                    &bg_wake_epoch,
+                    &maintenance_tx,
+                    &dispatch_path_metrics,
+                );
+                next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
+            }
         }
     };
 
@@ -1941,12 +1969,9 @@ fn rollback_pending_bind_actor(
     }
 }
 
-fn submit_initial_short_maintenance_after_bind(
+fn queue_initial_short_maintenance_after_bind(
     root_id: &ProjectRootId,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    executor: &Arc<Executor>,
-    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
-    metrics: &Arc<DispatchPathMetrics>,
 ) {
     let Some(meta) = live_roots.get_mut(root_id) else {
         return;
@@ -1956,16 +1981,8 @@ fn submit_initial_short_maintenance_after_bind(
     }
 
     meta.maintenance_pending = true;
-    meta.maintenance_jobs_in_flight = meta.maintenance_jobs_in_flight.saturating_add(1);
-    meta.maintenance_last_submitted = Some(Instant::now());
-    submit_maintenance_job(
-        executor,
-        root_id.clone(),
-        MaintenanceDrainKind::Short,
-        Vec::new(),
-        maintenance_tx,
-        metrics,
-    );
+    meta.maintenance_queued_kinds
+        .push_back(MaintenanceDrainKind::Short);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1980,7 +1997,6 @@ async fn handle_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
-    maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
     let route_id = route_key(completion.route_channel);
@@ -2105,13 +2121,7 @@ async fn handle_route_bind_completion(
     )
     .map_err(SubcError::FrameBuild)?;
     send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await?;
-    submit_initial_short_maintenance_after_bind(
-        &completion.bind_root_id,
-        live_roots,
-        executor,
-        maintenance_tx,
-        metrics,
-    );
+    queue_initial_short_maintenance_after_bind(&completion.bind_root_id, live_roots);
     let replayed = push::replay_buffered_push_frames(
         tx,
         metrics,
@@ -3309,6 +3319,34 @@ mod tests {
             INITIAL_MAINTENANCE_JOB_COUNT
         );
         assert!(!live_roots[&poisoned_root].maintenance_pending);
+    }
+
+    #[test]
+    fn initial_short_maintenance_is_queued_without_starting_actor_work() {
+        let (_dir, root) = test_root("maintenance-initial-short");
+        let mut live_roots = HashMap::new();
+        live_roots.insert(root.clone(), RootMeta::new(Instant::now()));
+
+        queue_initial_short_maintenance_after_bind(&root, &mut live_roots);
+
+        let meta = live_roots.get(&root).expect("root metadata");
+        assert!(meta.maintenance_pending);
+        assert_eq!(meta.maintenance_jobs_in_flight, 0);
+        assert_eq!(
+            meta.maintenance_queued_kinds
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![MaintenanceDrainKind::Short]
+        );
+
+        let (due, deferred) =
+            due_maintenance_jobs(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET, &HashSet::new());
+
+        assert_eq!(due, vec![(root.clone(), MaintenanceDrainKind::Short)]);
+        assert!(!deferred);
+        assert_eq!(live_roots[&root].maintenance_jobs_in_flight, 1);
+        assert!(live_roots[&root].maintenance_queued_kinds.is_empty());
     }
 
     #[test]
