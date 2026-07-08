@@ -1,4 +1,4 @@
-import { AftRpcClient, type AftRpcEndpoint } from "../shared/rpc-client";
+import { AftRpcClient, type AftRpcEndpoint, subscribeRpcRedirects } from "../shared/rpc-client";
 import { resolveCortexKitStorageRoot } from "../shared/storage-paths";
 
 export interface SocketNotification {
@@ -86,7 +86,30 @@ export function startAftTuiSocket(options: TuiSocketOptions): void {
   opts = options;
   closed = false;
   generation += 1;
+  ensureRedirectSubscription();
   void reconcileSocketScope();
+}
+
+/**
+ * Re-home the socket when a status call learns a verified-directory redirect
+ * (see rpc-client). The socket may already be connected to this directory's
+ * bridgeless instance — which authenticates and accepts hello but will never
+ * push a status-changed frame, because the session's bridge lives in another
+ * process. Drop it and reconnect; resolveEndpoint now follows the redirect.
+ */
+let redirectUnsubscribe: (() => void) | null = null;
+function ensureRedirectSubscription(): void {
+  if (redirectUnsubscribe) return;
+  redirectUnsubscribe = subscribeRpcRedirects((from) => {
+    if (closed) return;
+    const scope = currentScope();
+    if (!scope || scope.directory !== from) return;
+    generation += 1;
+    connectingGeneration = null;
+    connectingScope = null;
+    closeCurrentSocket(false);
+    void connect(scope, generation);
+  });
 }
 
 export function stopAftTuiSocket(): void {
@@ -94,6 +117,10 @@ export function stopAftTuiSocket(): void {
   generation += 1;
   connectingGeneration = null;
   connectingScope = null;
+  if (redirectUnsubscribe) {
+    redirectUnsubscribe();
+    redirectUnsubscribe = null;
+  }
   if (reconnectTimer) {
     deps.clearTimeout(reconnectTimer);
     reconnectTimer = undefined;

@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { __recordRpcRedirectForTest, __resetRpcRedirectsForTest } from "../shared/rpc-client.js";
 import {
   __resetAftTuiSocketForTest,
   __setAftTuiSocketDepsForTest,
@@ -59,11 +60,13 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 beforeEach(() => {
   FakeWebSocket.instances = [];
   __resetAftTuiSocketForTest();
+  __resetRpcRedirectsForTest();
 });
 
 afterEach(() => {
   stopAftTuiSocket();
   __resetAftTuiSocketForTest();
+  __resetRpcRedirectsForTest();
 });
 
 describe("TUI notification socket", () => {
@@ -91,6 +94,53 @@ describe("TUI notification socket", () => {
     await flush();
 
     expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  test("learned verified-directory redirect re-homes a connected socket", async () => {
+    // The socket is connected to the TUI directory's own (bridgeless)
+    // instance. When a status call learns that the session's bridge lives in
+    // another directory's process, the socket must drop and reconnect so it
+    // subscribes to the instance that will actually push status-changed
+    // frames — staying on the bridgeless instance means silence forever.
+    const endpoints = new Map<string, { port: number; token: string }>([
+      ["/home", { port: 1111, token: "home-token" }],
+      ["/project", { port: 2222, token: "project-token" }],
+    ]);
+    const resolvedFor: string[] = [];
+
+    __setAftTuiSocketDepsForTest({
+      createClient: (directory: string) =>
+        ({
+          resolveEndpoint: async () => {
+            resolvedFor.push(directory);
+            return endpoints.get(directory) ?? null;
+          },
+          reset: () => {},
+        }) as any,
+      WebSocketCtor: FakeWebSocket as any,
+    });
+
+    startAftTuiSocket({
+      getDirectory: () => "/home",
+      getSessionId: () => "ses_A",
+      onNotification: () => true,
+    });
+    await flush();
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    const first = FakeWebSocket.instances[0] as FakeWebSocket;
+    expect(first.url).toContain(":1111");
+    first.open();
+
+    // A status fetch (sidebar refresh) learns the redirect.
+    __recordRpcRedirectForTest("/home", "/project");
+    await flush();
+
+    // Old socket dropped, new one dialed. The fake createClient stands in for
+    // the real resolveEndpoint redirect-following, so the reconnect resolving
+    // through /home again is fine — the assertion is drop-and-reconnect.
+    expect(first.readyState).toBe(3);
+    expect(FakeWebSocket.instances.length).toBe(2);
   });
 
   test("status-change pushes coalesce into one debounced status fetch", async () => {

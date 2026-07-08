@@ -778,9 +778,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       if (bridge) {
         servedDirectory = verifiedDir;
       } else if (verifiedDir !== input.directory) {
+        // No bridge for the session's project in THIS process. Hand the
+        // SDK-verified directory back so the caller (TUI sidebar in a
+        // different-cwd process, e.g. attached to a serve/Desktop host) can
+        // re-scan that directory's port files and reach the process that
+        // actually hosts the session's bridge.
         return {
           success: true,
           status: "not_initialized",
+          verified_directory: verifiedDir,
           message:
             "AFT bridge is now spawned lazily, information here will be populated after first tool call.",
         };
@@ -794,6 +800,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       return {
         success: true,
         status: "not_initialized",
+        ...(verifiedDir ? { verified_directory: verifiedDir } : {}),
         message:
           "AFT bridge is now spawned lazily, information here will be populated after first tool call.",
       };

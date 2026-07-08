@@ -25,6 +25,61 @@ export interface AftRpcCallOptions {
    * placeholder wins.
    */
   accept?: (result: unknown) => boolean;
+  /**
+   * Internal one-hop guard for verified-directory redirects. A redirected
+   * call must never redirect again (placeholder chains would otherwise
+   * ping-pong between two bridgeless instances).
+   */
+  noRedirect?: boolean;
+}
+
+/**
+ * Verified-directory redirect registry (module-level, shared by every client
+ * in this process).
+ *
+ * Why it exists: the TUI process can run in a DIFFERENT directory than the
+ * process hosting the session's warm bridge (TUI attached to `opencode
+ * serve` / Desktop, launched from $HOME). Port-file discovery is keyed by
+ * hash(directory), so the TUI's client only ever finds its own bridgeless
+ * instance — which answers the lazy placeholder forever. The placeholder now
+ * carries `verified_directory` (the session's SDK-verified project root);
+ * `call()` follows it once, to the port files of the instance that actually
+ * owns the session's bridge.
+ *
+ * The registry remembers learned redirects so `resolveEndpoint()` (the
+ * persistent notification WebSocket) can aim at the same instance, and
+ * notifies listeners so an already-connected socket re-homes instead of
+ * staying subscribed to the bridgeless instance that will never push.
+ */
+const redirectTargets = new Map<string, string>();
+const redirectListeners = new Set<(from: string, to: string) => void>();
+
+export function subscribeRpcRedirects(listener: (from: string, to: string) => void): () => void {
+  redirectListeners.add(listener);
+  return () => {
+    redirectListeners.delete(listener);
+  };
+}
+
+function recordRedirect(from: string, to: string): void {
+  if (redirectTargets.get(from) === to) return;
+  redirectTargets.set(from, to);
+  for (const listener of redirectListeners) {
+    try {
+      listener(from, to);
+    } catch {
+      // one listener must not block the others
+    }
+  }
+}
+
+export function __resetRpcRedirectsForTest(): void {
+  redirectTargets.clear();
+  redirectListeners.clear();
+}
+
+export function __recordRpcRedirectForTest(from: string, to: string): void {
+  recordRedirect(from, to);
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -59,8 +114,12 @@ export class AftRpcClient {
   private portsDir: string;
   private legacyPortFile: string;
   private stalePortFailures = new Map<string, number>();
+  private storageDir: string;
+  private directory: string;
 
   constructor(storageDir: string, directory: string) {
+    this.storageDir = storageDir;
+    this.directory = directory;
     this.portsDir = rpcPortFileDir(storageDir, directory);
     this.legacyPortFile = rpcPortFilePath(storageDir, directory);
   }
@@ -110,10 +169,52 @@ export class AftRpcClient {
       }
     }
 
-    // All ports returned placeholder OR failed. Use placeholder if we have
-    // one (sidebar then shows the lazy-spawn UI); otherwise rethrow last error.
-    if (placeholder !== null) return placeholder;
+    // All ports returned placeholder OR failed. Before settling for the
+    // placeholder, follow its verified_directory once: the session's warm
+    // bridge may live in another process registered under a different
+    // directory hash (TUI attached to a serve/Desktop host). See the
+    // redirect registry doc above.
+    if (placeholder !== null) {
+      const redirected = await this.followVerifiedDirectory<T>(
+        method,
+        params,
+        options,
+        placeholder,
+      );
+      if (redirected !== null) return redirected;
+      return placeholder;
+    }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  /**
+   * One-hop redirect to the instance that owns the session's bridge. Returns
+   * null (caller keeps the placeholder) unless the redirected call produced a
+   * warm response — a placeholder from the target is not an improvement, and
+   * failures must not mask the original placeholder.
+   */
+  private async followVerifiedDirectory<T>(
+    method: string,
+    params: Record<string, unknown>,
+    options: AftRpcCallOptions,
+    placeholder: T,
+  ): Promise<T | null> {
+    if (options.noRedirect) return null;
+    const verified = (placeholder as Record<string, unknown> | null)?.verified_directory;
+    if (typeof verified !== "string" || verified.length === 0 || verified === this.directory) {
+      return null;
+    }
+    const target = new AftRpcClient(this.storageDir, verified);
+    try {
+      const result = await target.call<T>(method, params, { ...options, noRedirect: true });
+      if (this.looksLikePlaceholder(result)) return null;
+      // Only remember (and re-home the notification socket) once the target
+      // actually served warm data — a dead redirect must stay unlearned.
+      recordRedirect(this.directory, verified);
+      return result;
+    } catch {
+      return null;
+    }
   }
 
   private async callOne<T>(
@@ -159,8 +260,19 @@ export class AftRpcClient {
     }
   }
 
-  /** Resolve the freshest live endpoint for the persistent TUI WebSocket. */
+  /** Resolve the freshest live endpoint for the persistent TUI WebSocket.
+   *  Follows a learned verified-directory redirect so the socket subscribes
+   *  to the instance that owns the session's bridge (the one that will
+   *  actually push status-changed frames), not this directory's bridgeless
+   *  placeholder instance. */
   async resolveEndpoint(signal?: AbortSignal): Promise<AftRpcEndpoint | null> {
+    const redirect = redirectTargets.get(this.directory);
+    if (redirect) {
+      const target = new AftRpcClient(this.storageDir, redirect);
+      const [info] = await target.resolvePortInfos(signal);
+      if (info) return { port: info.port, token: info.token };
+      // Redirect target gone (process exited) — fall through to own ports.
+    }
     const [info] = await this.resolvePortInfos(signal);
     if (!info) return null;
     return { port: info.port, token: info.token };
