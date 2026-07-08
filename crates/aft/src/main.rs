@@ -859,6 +859,13 @@ fn write_push_frame(writer: &mut impl Write, frame: &PushFrame) -> io::Result<()
 }
 
 #[cfg(test)]
+fn global_gitignore_env_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
 mod pending_response_tests {
     use super::{drain_runtime_events_and_write_pending_to_writer, write_ready_pending_to_writer};
     use aft::bash_background::persistence::{task_paths, write_task, PersistedTask};
@@ -1380,7 +1387,8 @@ mod signal_handler_tests {
 #[cfg(test)]
 mod graceful_shutdown_search_index_tests {
     use super::{
-        flush_search_indexes_on_graceful_shutdown, App, AppContext, Config, RuntimeRegistry,
+        flush_search_indexes_on_graceful_shutdown, global_gitignore_env_test_lock, App, AppContext,
+        Config, RuntimeRegistry,
     };
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1466,6 +1474,12 @@ mod graceful_shutdown_search_index_tests {
         }
     }
 
+    fn stable_global_gitignore_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        global_gitignore_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn wait_for_search_index_build_to_finish(ctx: &AppContext) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -1488,6 +1502,11 @@ mod graceful_shutdown_search_index_tests {
 
     #[test]
     fn graceful_shutdown_flushes_search_delta_to_disk() {
+        // Search cache reads validate the global git-ignore fingerprint stamped
+        // at write time. Keep HOME/XDG_CONFIG_HOME stable while this test writes
+        // and reloads cache.bin, because other bin tests temporarily redirect
+        // those environment variables to neutralize developer-global ignores.
+        let _global_gitignore_env_guard = stable_global_gitignore_env_guard();
         let root = tempfile::tempdir().expect("root tempdir");
         let storage = tempfile::tempdir().expect("storage tempdir");
         let file = root.path().join("src.txt");
@@ -1535,6 +1554,7 @@ mod graceful_shutdown_search_index_tests {
 
     #[test]
     fn graceful_shutdown_waits_for_inflight_search_rebuild_before_flushing() {
+        let _global_gitignore_env_guard = stable_global_gitignore_env_guard();
         let root = tempfile::tempdir().expect("root tempdir");
         let storage = tempfile::tempdir().expect("storage tempdir");
         let file = root.path().join("src.txt");
@@ -1891,14 +1911,11 @@ mod watcher_filter_tests {
     /// ignore → None" baseline is only deterministic when BOTH discovery
     /// roots point at an empty directory — neutralizing only
     /// `XDG_CONFIG_HOME` still finds a `~/.gitconfig` `core.excludesfile`.
-    /// Serialized by a process-local mutex (bin tests run in their own
-    /// process, so no cross-crate lock is needed); env is restored before
-    /// the closure result is used.
+    /// Serialized by the same process-local mutex used by search-cache tests:
+    /// otherwise a cache written while HOME points here can be rejected when it
+    /// is read after HOME is restored.
     fn with_neutralized_global_gitignore<R>(f: impl FnOnce() -> R) -> R {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK
-            .get_or_init(|| Mutex::new(()))
+        let _guard = super::global_gitignore_env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
