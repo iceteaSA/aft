@@ -1,0 +1,6 @@
+# Blacksmith runner tags are GitHub Actions custom runner labels. Keep them
+# here so the workflow lint gate can validate testbox.yml without ignoring the
+# rest of the workflow.
+self-hosted-runner:
+  labels:
+    - blacksmith-4vcpu-ubuntu-2204

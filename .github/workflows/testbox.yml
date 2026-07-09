@@ -1,0 +1,48 @@
+name: Blacksmith Testbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to hydrate; defaults to the dispatched ref"
+        required: false
+        type: string
+
+# This workflow is intentionally separate from the merge/release gates. The
+# Blacksmith Testbox CLI dispatches it to hydrate a warm runner, then runs
+# flake-hunt commands against that runner while the final step idles.
+jobs:
+  warmup:
+    name: Warm Rust testbox
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-testbox-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-testbox-
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Prime Rust test binaries
+        run: cargo nextest run --no-run -p agent-file-tools
+
+      - name: Idle for Blacksmith Testbox runs
+        run: |
+          echo "Testbox is hydrated; waiting for blacksmith testbox run commands."
+          while true; do
+            sleep 300
+            date -u '+testbox still warm at %Y-%m-%dT%H:%M:%SZ'
+          done
