@@ -3101,13 +3101,13 @@ fn newest_superseded_legacy_generation(
     let Some((_modified, sqlite_path, generation)) = candidates.into_iter().next() else {
         return Ok(None);
     };
-    let fingerprint = sqlite_file_set_fingerprint(&sqlite_path)?;
+    let source_bytes = sqlite_file_set_size(&sqlite_path)?;
     Ok(Some(LegacyCallgraphTarget {
         partition: partition.clone(),
         sqlite_path,
         generation: Some(generation),
-        source_bytes: fingerprint.bytes,
-        source_blake3: fingerprint.blake3,
+        source_bytes,
+        source_blake3: String::new(),
     }))
 }
 
@@ -3149,26 +3149,26 @@ fn ready_legacy_target(
     if let Some(generation) = read_pointer(&partition.dir, &partition.key) {
         let sqlite_path = partition.dir.join(&generation);
         if sqlite_path.is_file() && db_path_ready(&sqlite_path) {
-            let fingerprint = sqlite_file_set_fingerprint(&sqlite_path)?;
+            let source_bytes = sqlite_file_set_size(&sqlite_path)?;
             return Ok(Some(LegacyCallgraphTarget {
                 partition: partition.clone(),
                 sqlite_path,
                 generation: Some(generation),
-                source_bytes: fingerprint.bytes,
-                source_blake3: fingerprint.blake3,
+                source_bytes,
+                source_blake3: String::new(),
             }));
         }
     }
 
     let sqlite_path = legacy_sqlite_path(&partition.dir, &partition.key);
     if sqlite_path.is_file() && db_path_ready(&sqlite_path) {
-        let fingerprint = sqlite_file_set_fingerprint(&sqlite_path)?;
+        let source_bytes = sqlite_file_set_size(&sqlite_path)?;
         return Ok(Some(LegacyCallgraphTarget {
             partition: partition.clone(),
             sqlite_path,
             generation: None,
-            source_bytes: fingerprint.bytes,
-            source_blake3: fingerprint.blake3,
+            source_bytes,
+            source_blake3: String::new(),
         }));
     }
     Ok(None)
@@ -3185,12 +3185,17 @@ fn publish_generation_copy_migration(
     remove_sqlite_file_set(&temp_path);
     copy_sqlite_file_set(&source.sqlite_path, &temp_path)?;
     fail_after_temp_copy_for_test()?;
+
+    let mut source = source.clone();
+    let fingerprint = sqlite_file_set_fingerprint(&temp_path)?;
+    source.source_bytes = fingerprint.bytes;
+    source.source_blake3 = fingerprint.blake3;
     publish_migrated_generation(
         callgraph_dir,
         project_key,
         &generation,
         &temp_path,
-        source,
+        &source,
         writer_lease,
         "generation_copy",
     )
@@ -3326,6 +3331,18 @@ fn rename_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn sqlite_file_set_size(path: &Path) -> Result<u64> {
+    let mut bytes = 0_u64;
+    for suffix in SQLITE_FILE_SET_SUFFIXES {
+        let member = sqlite_file_set_path(path, suffix);
+        if !member.is_file() {
+            continue;
+        }
+        bytes = bytes.saturating_add(member.metadata()?.len());
+    }
+    Ok(bytes)
+}
+
 fn sqlite_file_set_fingerprint(path: &Path) -> Result<SourceFingerprint> {
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0_u64;
@@ -3361,7 +3378,10 @@ fn sqlite_file_set_path(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn sync_file(path: &Path) -> Result<()> {
-    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     file.sync_all()?;
     Ok(())
 }
