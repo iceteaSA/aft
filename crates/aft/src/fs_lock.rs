@@ -866,7 +866,7 @@ fn current_hostname() -> String {
 }
 
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
@@ -880,7 +880,10 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     let filter = format!("PID eq {pid}");
     let Ok(output) = std::process::Command::new("tasklist")
         .args(["/FI", &filter, "/FO", "CSV", "/NH"])
@@ -912,7 +915,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_alive(_pid: u32) -> bool {
+pub(crate) fn process_alive(_pid: u32) -> bool {
     true
 }
 

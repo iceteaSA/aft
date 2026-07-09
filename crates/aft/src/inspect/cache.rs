@@ -356,7 +356,7 @@ pub struct InspectCache {
     project_key: String,
     sqlite_path: PathBuf,
     writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
-    _read_marker: Option<crate::root_cache::ReadMarker>,
+    read_marker: Option<crate::root_cache::ReadMarker>,
     conn: Mutex<Connection>,
     memory: RwLock<HashMap<JobKey, MemoryAggregate>>,
 }
@@ -473,7 +473,7 @@ impl InspectCache {
             project_key,
             sqlite_path,
             writer_lease,
-            _read_marker: read_marker,
+            read_marker,
             conn: Mutex::new(conn),
             memory: RwLock::new(HashMap::new()),
         }
@@ -510,6 +510,13 @@ impl InspectCache {
                 lease.epoch()
             ))))
         }
+    }
+
+    fn refresh_read_marker(&self) -> Result<(), InspectCacheError> {
+        if let Some(marker) = self.read_marker.as_ref() {
+            marker.touch_if_due()?;
+        }
+        Ok(())
     }
 
     pub fn store_aggregated(
@@ -561,6 +568,7 @@ impl InspectCache {
         key: &JobKey,
         config: Option<&Config>,
     ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.refresh_read_marker()?;
         if !key.category.is_tier2() {
             return Ok(self
                 .memory
@@ -851,6 +859,7 @@ impl InspectCache {
         category: InspectCategory,
         contribution_set_hash: &str,
     ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.refresh_read_marker()?;
         let payload = {
             let conn = self
                 .conn
@@ -883,6 +892,7 @@ impl InspectCache {
         &self,
         category: InspectCategory,
     ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.refresh_read_marker()?;
         let payload = {
             let conn = self
                 .conn
@@ -982,6 +992,7 @@ impl InspectCache {
         &self,
         category: InspectCategory,
     ) -> Result<Vec<ContributionRecord>, InspectCacheError> {
+        self.refresh_read_marker()?;
         let conn = self
             .conn
             .lock()
@@ -1073,6 +1084,7 @@ impl InspectCache {
         &self,
         category: InspectCategory,
     ) -> Result<Vec<(PathBuf, FileFreshness)>, InspectCacheError> {
+        self.refresh_read_marker()?;
         let conn = self
             .conn
             .lock()
@@ -1127,6 +1139,7 @@ impl InspectCache {
         category: InspectCategory,
         config: Option<&Config>,
     ) -> Result<String, InspectCacheError> {
+        self.refresh_read_marker()?;
         let conn = self
             .conn
             .lock()
@@ -1144,6 +1157,7 @@ impl InspectCache {
         &self,
         category: InspectCategory,
     ) -> Result<Option<i64>, InspectCacheError> {
+        self.refresh_read_marker()?;
         let conn = self
             .conn
             .lock()
@@ -1158,6 +1172,7 @@ impl InspectCache {
     }
 
     pub fn memory_generated_at(&self, key: &JobKey) -> Result<Option<i64>, InspectCacheError> {
+        self.refresh_read_marker()?;
         Ok(self
             .memory
             .read()
