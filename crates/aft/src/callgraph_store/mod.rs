@@ -15,6 +15,7 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, Transaction};
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,12 @@ const PROVENANCE_TYPE_MATCH: &str = "type_match";
 const NAME_MATCH_SCORE_THRESHOLD: f64 = 2.0;
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+const MIGRATION_MANIFEST_VERSION: u32 = 1;
+const MIGRATION_GENERATION_TAG: &str = ".migrated.";
+const MIGRATION_BACKUP_PAGES_PER_STEP: i32 = 128;
+const MIGRATION_BACKUP_RETRY_BUDGET: usize = 25;
+const MIGRATION_BACKUP_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(10);
+const SQLITE_FILE_SET_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 // THREAD-LOCAL, not a process-global: the observer fires synchronously on the
@@ -39,6 +46,11 @@ type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 thread_local! {
     static COLD_BUILD_SWAP_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildSwapObserver>>> =
         const { std::cell::RefCell::new(None) };
+    static MIGRATION_AVAILABLE_DISK_OVERRIDE: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+    static MIGRATION_FAIL_AFTER_TEMP_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MIGRATION_FORCE_BACKUP_BUDGET_EXHAUSTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 mod dead_code_projection;
@@ -47,6 +59,21 @@ pub use dead_code_projection::project_dead_code_snapshot;
 #[doc(hidden)]
 pub fn set_cold_build_swap_observer(observer: Option<Arc<ColdBuildSwapObserver>>) {
     COLD_BUILD_SWAP_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[doc(hidden)]
+pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
+    MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow_mut() = bytes);
+}
+
+#[doc(hidden)]
+pub fn set_legacy_migration_fail_after_temp_copy_for_test(enabled: bool) {
+    MIGRATION_FAIL_AFTER_TEMP_COPY.with(|slot| slot.set(enabled));
+}
+
+#[doc(hidden)]
+pub fn set_legacy_migration_backup_budget_exhausted_for_test(enabled: bool) {
+    MIGRATION_FORCE_BACKUP_BUDGET_EXHAUSTED.with(|slot| slot.set(enabled));
 }
 
 fn notify_cold_build_swap_observer(temp_path: &Path, target_path: &Path) {
@@ -214,6 +241,30 @@ enum OpenRootRepair {
 struct OpenedStore {
     store: CallGraphStore,
     root_repair: OpenRootRepair,
+}
+
+#[derive(Clone, Debug)]
+struct LegacyCallgraphPartition {
+    harness: String,
+    dir: PathBuf,
+    key: String,
+    bytes: u64,
+    freshness: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug)]
+struct LegacyCallgraphTarget {
+    partition: LegacyCallgraphPartition,
+    sqlite_path: PathBuf,
+    generation: Option<String>,
+    source_bytes: u64,
+    source_blake3: String,
+}
+
+#[derive(Clone, Debug)]
+struct SourceFingerprint {
+    bytes: u64,
+    blake3: String,
 }
 
 #[derive(Debug, Clone)]
@@ -563,22 +614,48 @@ impl CallGraphStore {
         project_root: PathBuf,
     ) -> Result<Option<ReadonlyCallGraphStore>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
-        let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
-        else {
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        {
+            let conn = open_readonly_connection(&sqlite_path)?;
+            if !database_ready(&conn).unwrap_or(false) {
+                return Ok(None);
+            }
+            let marker_label = generation.as_deref().unwrap_or("legacy");
+            let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, marker_label)?;
+            return Ok(Some(ReadonlyCallGraphStore::from_inner(
+                Self::from_connection(
+                    project_root,
+                    project_key,
+                    sqlite_path,
+                    generation,
+                    None,
+                    Some(read_marker),
+                    conn,
+                ),
+            )));
+        }
+
+        let Some(target) = freshest_legacy_fallback_target(&callgraph_dir, &project_key)? else {
             return Ok(None);
         };
-        let conn = open_readonly_connection(&sqlite_path)?;
+        crate::slog_warn!(
+            "root-keyed callgraph store is empty; serving read-only fallback from legacy {} partition {}",
+            target.partition.harness,
+            target.sqlite_path.display()
+        );
+        let conn = open_readonly_connection(&target.sqlite_path)?;
         if !database_ready(&conn).unwrap_or(false) {
             return Ok(None);
         }
-        let marker_label = generation.as_deref().unwrap_or("legacy");
-        let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, marker_label)?;
+        let marker_label =
+            legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
+        let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, &marker_label)?;
         Ok(Some(ReadonlyCallGraphStore::from_inner(
             Self::from_connection(
                 project_root,
                 project_key,
-                sqlite_path,
-                generation,
+                target.sqlite_path,
+                target.generation,
                 None,
                 Some(read_marker),
                 conn,
@@ -697,6 +774,7 @@ impl CallGraphStore {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
+        cleanup_incomplete_migrations(&callgraph_dir, &project_key);
         // Another process may have published a ready generation while we waited
         // for the lock — open it instead of rebuilding. If that generation is
         // from this same project at an older filesystem root, repair the root
@@ -739,6 +817,14 @@ impl CallGraphStore {
                     return Ok((store, None));
                 }
             }
+        }
+        if let Some(store) = try_legacy_migration_or_fallback(
+            &callgraph_dir,
+            &project_root,
+            &project_key,
+            Arc::clone(&writer_lease),
+        )? {
+            return Ok((store, None));
         }
         let (stats, generation) = Self::cold_build_publish_locked(
             &callgraph_dir,
@@ -2729,6 +2815,666 @@ fn verify_writer_lease(lease: &crate::root_cache::WriterLease) -> Result<()> {
     }
 }
 
+fn try_legacy_migration_or_fallback(
+    callgraph_dir: &Path,
+    project_root: &Path,
+    project_key: &str,
+    writer_lease: Arc<crate::root_cache::WriterLease>,
+) -> Result<Option<CallGraphStore>> {
+    let partitions = legacy_callgraph_partitions(callgraph_dir, project_key)?;
+    if partitions.is_empty() {
+        return Ok(None);
+    }
+
+    for partition in &partitions {
+        if let Some(source) = newest_superseded_legacy_generation(partition)? {
+            if !migration_disk_floor_allows(&source, callgraph_dir)? {
+                return open_legacy_fallback_store(
+                    callgraph_dir,
+                    project_root,
+                    project_key,
+                    &partitions,
+                );
+            }
+            match publish_generation_copy_migration(
+                callgraph_dir,
+                project_key,
+                &source,
+                Arc::clone(&writer_lease),
+            ) {
+                Ok(generation) => {
+                    crate::slog_info!(
+                        "migrated root-keyed callgraph store for key {} from superseded legacy generation {}",
+                        project_key,
+                        source.sqlite_path.display()
+                    );
+                    return CallGraphStore::open_generation(
+                        callgraph_dir,
+                        project_root.to_path_buf(),
+                        project_key.to_string(),
+                        generation,
+                        writer_lease,
+                    )
+                    .map(Some);
+                }
+                Err(error) => {
+                    crate::slog_warn!(
+                        "root-keyed callgraph generation-copy migration failed from {}: {}",
+                        source.sqlite_path.display(),
+                        error
+                    );
+                    return open_legacy_fallback_store(
+                        callgraph_dir,
+                        project_root,
+                        project_key,
+                        &partitions,
+                    );
+                }
+            }
+        }
+
+        if let Some(source) = current_legacy_generation(partition)? {
+            if !migration_disk_floor_allows(&source, callgraph_dir)? {
+                return open_legacy_fallback_store(
+                    callgraph_dir,
+                    project_root,
+                    project_key,
+                    &partitions,
+                );
+            }
+            match publish_backup_migration(
+                callgraph_dir,
+                project_key,
+                &source,
+                Arc::clone(&writer_lease),
+            ) {
+                Ok(generation) => {
+                    crate::slog_info!(
+                        "migrated root-keyed callgraph store for key {} with SQLite backup from legacy {}",
+                        project_key,
+                        source.sqlite_path.display()
+                    );
+                    return CallGraphStore::open_generation(
+                        callgraph_dir,
+                        project_root.to_path_buf(),
+                        project_key.to_string(),
+                        generation,
+                        writer_lease,
+                    )
+                    .map(Some);
+                }
+                Err(error) => {
+                    crate::slog_warn!(
+                        "root-keyed callgraph backup migration failed from {}: {}",
+                        source.sqlite_path.display(),
+                        error
+                    );
+                    return open_legacy_fallback_store(
+                        callgraph_dir,
+                        project_root,
+                        project_key,
+                        &partitions,
+                    );
+                }
+            }
+        }
+    }
+
+    open_legacy_fallback_store(callgraph_dir, project_root, project_key, &partitions)
+}
+
+fn open_legacy_fallback_store(
+    callgraph_dir: &Path,
+    project_root: &Path,
+    project_key: &str,
+    partitions: &[LegacyCallgraphPartition],
+) -> Result<Option<CallGraphStore>> {
+    let Some(target) = first_ready_legacy_target(partitions)? else {
+        return Ok(None);
+    };
+    crate::slog_warn!(
+        "root-keyed callgraph migration unavailable; serving read-only fallback from legacy {} partition {}",
+        target.partition.harness,
+        target.sqlite_path.display()
+    );
+    let conn = open_readonly_connection(&target.sqlite_path)?;
+    if !database_ready(&conn).unwrap_or(false) {
+        return Ok(None);
+    }
+    let marker_label = legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
+    let read_marker = crate::root_cache::ReadMarker::create(callgraph_dir, &marker_label)?;
+    Ok(Some(CallGraphStore::from_connection(
+        project_root.to_path_buf(),
+        project_key.to_string(),
+        target.sqlite_path,
+        target.generation,
+        None,
+        Some(read_marker),
+        conn,
+    )))
+}
+
+fn migration_disk_floor_allows(
+    source: &LegacyCallgraphTarget,
+    callgraph_dir: &Path,
+) -> Result<bool> {
+    let available = migration_available_disk(callgraph_dir)?;
+    let decision = crate::legacy_partitions::evaluate_root_keyed_copy_disk_floor(
+        source.source_bytes,
+        available,
+    );
+    if decision.should_skip_copy() {
+        crate::slog_warn!(
+            "{}",
+            decision.warning_message(&source.sqlite_path, callgraph_dir)
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn migration_available_disk(path: &Path) -> Result<u64> {
+    if let Some(bytes) = MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow()) {
+        return Ok(bytes);
+    }
+    crate::legacy_partitions::available_disk_for(path).map_err(CallGraphStoreError::from)
+}
+
+fn legacy_callgraph_partitions(
+    callgraph_dir: &Path,
+    project_key: &str,
+) -> Result<Vec<LegacyCallgraphPartition>> {
+    let Some(storage_root) = root_storage_dir(callgraph_dir) else {
+        return Ok(Vec::new());
+    };
+    let inventory = crate::legacy_partitions::inventory_legacy_partitions(&storage_root)?;
+    let mut partitions = inventory
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == crate::legacy_partitions::LegacyPartitionKind::Callgraph
+                && entry.key == project_key
+        })
+        .map(|entry| {
+            let dir = if entry.path.is_dir() {
+                entry.path.clone()
+            } else {
+                entry
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| entry.path.clone())
+            };
+            LegacyCallgraphPartition {
+                harness: entry.harness,
+                dir,
+                key: entry.key,
+                bytes: entry.bytes,
+                freshness: entry.callgraph_pointer_mtime,
+            }
+        })
+        .collect::<Vec<_>>();
+    partitions.sort_by(|left, right| {
+        right
+            .freshness
+            .cmp(&left.freshness)
+            .then_with(|| right.bytes.cmp(&left.bytes))
+            .then_with(|| left.harness.cmp(&right.harness))
+    });
+    Ok(partitions)
+}
+
+fn root_storage_dir(callgraph_dir: &Path) -> Option<PathBuf> {
+    let domain_dir = callgraph_dir.parent()?;
+    if domain_dir.file_name().and_then(|name| name.to_str()) != Some("callgraph") {
+        return None;
+    }
+    domain_dir.parent().map(Path::to_path_buf)
+}
+
+fn newest_superseded_legacy_generation(
+    partition: &LegacyCallgraphPartition,
+) -> Result<Option<LegacyCallgraphTarget>> {
+    let Some(current) = read_pointer(&partition.dir, &partition.key) else {
+        return Ok(None);
+    };
+    let prefix = format!("{}.g", partition.key);
+    let Ok(entries) = std::fs::read_dir(&partition.dir) else {
+        return Ok(None);
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == current
+            || name.contains(".tmp.")
+            || !name.starts_with(&prefix)
+            || !name.ends_with(".sqlite")
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !db_path_ready(&path) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((modified, path, name));
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    let Some((_modified, sqlite_path, generation)) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    let fingerprint = sqlite_file_set_fingerprint(&sqlite_path)?;
+    Ok(Some(LegacyCallgraphTarget {
+        partition: partition.clone(),
+        sqlite_path,
+        generation: Some(generation),
+        source_bytes: fingerprint.bytes,
+        source_blake3: fingerprint.blake3,
+    }))
+}
+
+fn current_legacy_generation(
+    partition: &LegacyCallgraphPartition,
+) -> Result<Option<LegacyCallgraphTarget>> {
+    let Some(target) = ready_legacy_target(partition)? else {
+        return Ok(None);
+    };
+    let has_superseded = newest_superseded_legacy_generation(partition)?.is_some();
+    if has_superseded {
+        return Ok(None);
+    }
+    Ok(Some(target))
+}
+
+fn freshest_legacy_fallback_target(
+    callgraph_dir: &Path,
+    project_key: &str,
+) -> Result<Option<LegacyCallgraphTarget>> {
+    let partitions = legacy_callgraph_partitions(callgraph_dir, project_key)?;
+    first_ready_legacy_target(&partitions)
+}
+
+fn first_ready_legacy_target(
+    partitions: &[LegacyCallgraphPartition],
+) -> Result<Option<LegacyCallgraphTarget>> {
+    for partition in partitions {
+        if let Some(target) = ready_legacy_target(partition)? {
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
+}
+
+fn ready_legacy_target(
+    partition: &LegacyCallgraphPartition,
+) -> Result<Option<LegacyCallgraphTarget>> {
+    if let Some(generation) = read_pointer(&partition.dir, &partition.key) {
+        let sqlite_path = partition.dir.join(&generation);
+        if sqlite_path.is_file() && db_path_ready(&sqlite_path) {
+            let fingerprint = sqlite_file_set_fingerprint(&sqlite_path)?;
+            return Ok(Some(LegacyCallgraphTarget {
+                partition: partition.clone(),
+                sqlite_path,
+                generation: Some(generation),
+                source_bytes: fingerprint.bytes,
+                source_blake3: fingerprint.blake3,
+            }));
+        }
+    }
+
+    let sqlite_path = legacy_sqlite_path(&partition.dir, &partition.key);
+    if sqlite_path.is_file() && db_path_ready(&sqlite_path) {
+        let fingerprint = sqlite_file_set_fingerprint(&sqlite_path)?;
+        return Ok(Some(LegacyCallgraphTarget {
+            partition: partition.clone(),
+            sqlite_path,
+            generation: None,
+            source_bytes: fingerprint.bytes,
+            source_blake3: fingerprint.blake3,
+        }));
+    }
+    Ok(None)
+}
+
+fn publish_generation_copy_migration(
+    callgraph_dir: &Path,
+    project_key: &str,
+    source: &LegacyCallgraphTarget,
+    writer_lease: Arc<crate::root_cache::WriterLease>,
+) -> Result<String> {
+    let generation = migration_generation_file_name(project_key, "copy");
+    let temp_path = migration_temp_path(callgraph_dir, &generation);
+    remove_sqlite_file_set(&temp_path);
+    copy_sqlite_file_set(&source.sqlite_path, &temp_path)?;
+    fail_after_temp_copy_for_test()?;
+    publish_migrated_generation(
+        callgraph_dir,
+        project_key,
+        &generation,
+        &temp_path,
+        source,
+        writer_lease,
+        "generation_copy",
+    )
+}
+
+fn publish_backup_migration(
+    callgraph_dir: &Path,
+    project_key: &str,
+    source: &LegacyCallgraphTarget,
+    writer_lease: Arc<crate::root_cache::WriterLease>,
+) -> Result<String> {
+    if MIGRATION_FORCE_BACKUP_BUDGET_EXHAUSTED.with(|slot| slot.get()) {
+        return Err(CallGraphStoreError::Unavailable(
+            "legacy callgraph backup migration budget exhausted by test seam".to_string(),
+        ));
+    }
+
+    let generation = migration_generation_file_name(project_key, "backup");
+    let temp_path = migration_temp_path(callgraph_dir, &generation);
+    remove_sqlite_file_set(&temp_path);
+
+    let source_conn = open_readonly_connection(&source.sqlite_path)?;
+    let mut destination = Connection::open(&temp_path)?;
+    destination.busy_timeout(Duration::from_secs(5))?;
+    let backup = rusqlite::backup::Backup::new(&source_conn, &mut destination)?;
+    let started = Instant::now();
+    let mut retries = 0;
+    loop {
+        match backup.step(MIGRATION_BACKUP_PAGES_PER_STEP)? {
+            rusqlite::backup::StepResult::Done => break,
+            rusqlite::backup::StepResult::More => std::thread::sleep(Duration::from_millis(5)),
+            rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                retries += 1;
+                if retries > MIGRATION_BACKUP_RETRY_BUDGET
+                    || started.elapsed() > MIGRATION_BACKUP_WALL_CLOCK_BUDGET
+                {
+                    return Err(CallGraphStoreError::Unavailable(format!(
+                        "legacy callgraph backup migration exceeded retry/wall-clock budget after {retries} retries"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                return Err(CallGraphStoreError::Unavailable(
+                    "legacy callgraph backup returned an unknown step result".to_string(),
+                ));
+            }
+        }
+    }
+    drop(backup);
+
+    let integrity: String =
+        destination.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(CallGraphStoreError::Unavailable(format!(
+            "legacy callgraph backup produced a database that failed integrity_check: {integrity}"
+        )));
+    }
+    if !database_ready(&destination)? {
+        return Err(CallGraphStoreError::Unavailable(
+            "legacy callgraph backup produced a database without ready metadata".to_string(),
+        ));
+    }
+    destination.execute_batch("PRAGMA optimize;")?;
+    drop(destination);
+    sync_file(&temp_path)?;
+    fail_after_temp_copy_for_test()?;
+
+    let mut source = source.clone();
+    let fingerprint = sqlite_file_set_fingerprint(&temp_path)?;
+    source.source_bytes = fingerprint.bytes;
+    source.source_blake3 = fingerprint.blake3;
+    publish_migrated_generation(
+        callgraph_dir,
+        project_key,
+        &generation,
+        &temp_path,
+        &source,
+        writer_lease,
+        "sqlite_backup",
+    )
+}
+
+fn publish_migrated_generation(
+    callgraph_dir: &Path,
+    project_key: &str,
+    generation: &str,
+    temp_path: &Path,
+    source: &LegacyCallgraphTarget,
+    writer_lease: Arc<crate::root_cache::WriterLease>,
+    method: &str,
+) -> Result<String> {
+    verify_writer_lease(&writer_lease)?;
+    let gen_path = callgraph_dir.join(generation);
+    remove_sqlite_file_set(&gen_path);
+    rename_sqlite_file_set(temp_path, &gen_path)?;
+    crate::fs_lock::sync_parent(&gen_path);
+
+    verify_writer_lease(&writer_lease)?;
+    publish_pointer(callgraph_dir, project_key, generation)?;
+    write_migration_manifest(callgraph_dir, generation, source, method)?;
+    Ok(generation.to_string())
+}
+
+fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    for suffix in SQLITE_FILE_SET_SUFFIXES {
+        let source_path = sqlite_file_set_path(source, suffix);
+        if !source_path.is_file() {
+            continue;
+        }
+        let destination_path = sqlite_file_set_path(destination, suffix);
+        std::fs::copy(&source_path, &destination_path)?;
+        sync_file(&destination_path)?;
+    }
+    Ok(())
+}
+
+fn rename_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
+    for suffix in SQLITE_FILE_SET_SUFFIXES {
+        let source_path = sqlite_file_set_path(source, suffix);
+        if !source_path.exists() {
+            continue;
+        }
+        let destination_path = sqlite_file_set_path(destination, suffix);
+        if let Err(error) = crate::fs_lock::rename_over(&source_path, &destination_path) {
+            let _ = std::fs::remove_file(&source_path);
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_file_set_fingerprint(path: &Path) -> Result<SourceFingerprint> {
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    for suffix in SQLITE_FILE_SET_SUFFIXES {
+        let member = sqlite_file_set_path(path, suffix);
+        if !member.is_file() {
+            continue;
+        }
+        hasher.update(suffix.as_bytes());
+        let mut file = std::fs::File::open(&member)?;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes = bytes.saturating_add(read as u64);
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(SourceFingerprint {
+        bytes,
+        blake3: hash_to_hex(hasher.finalize()),
+    })
+}
+
+fn sqlite_file_set_path(path: &Path, suffix: &str) -> PathBuf {
+    if suffix.is_empty() {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(format!("{}{suffix}", path.display()))
+    }
+}
+
+fn sync_file(path: &Path) -> Result<()> {
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn fail_after_temp_copy_for_test() -> Result<()> {
+    if MIGRATION_FAIL_AFTER_TEMP_COPY.with(|slot| slot.get()) {
+        return Err(CallGraphStoreError::Unavailable(
+            "legacy callgraph migration stopped after temp copy by test seam".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn migration_generation_file_name(project_key: &str, method: &str) -> String {
+    format!(
+        "{project_key}.g{}.{}{}{}.sqlite",
+        now_nanos(),
+        std::process::id(),
+        MIGRATION_GENERATION_TAG,
+        method
+    )
+}
+
+fn migration_temp_path(callgraph_dir: &Path, generation: &str) -> PathBuf {
+    callgraph_dir.join(format!(
+        "{generation}.tmp.{}.{}",
+        std::process::id(),
+        now_nanos()
+    ))
+}
+
+fn write_migration_manifest(
+    callgraph_dir: &Path,
+    generation: &str,
+    source: &LegacyCallgraphTarget,
+    method: &str,
+) -> Result<()> {
+    let manifest_path = migration_manifest_path(callgraph_dir, generation);
+    let temp_path = manifest_path.with_extension(format!(
+        "migration.json.tmp.{}.{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    let manifest = serde_json::json!({
+        "version": MIGRATION_MANIFEST_VERSION,
+        "method": method,
+        "target_generation": generation,
+        "source_harness": source.partition.harness,
+        "source_path": source.sqlite_path.display().to_string(),
+        "source_generation": source.generation,
+        "source_bytes": source.source_bytes,
+        "source_blake3": source.source_blake3,
+    });
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&temp_path)?;
+        file.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    if let Err(error) = crate::fs_lock::rename_over(&temp_path, &manifest_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    crate::fs_lock::sync_parent(&manifest_path);
+    Ok(())
+}
+
+fn migration_manifest_path(callgraph_dir: &Path, generation: &str) -> PathBuf {
+    callgraph_dir.join(format!("{generation}.migration.json"))
+}
+
+fn migration_generation_requires_manifest(generation: &str) -> bool {
+    generation.contains(MIGRATION_GENERATION_TAG)
+}
+
+fn migration_manifest_valid(callgraph_dir: &Path, generation: &str) -> bool {
+    if !migration_generation_requires_manifest(generation) {
+        return true;
+    }
+    let path = migration_manifest_path(callgraph_dir, generation);
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    value.get("version").and_then(serde_json::Value::as_u64)
+        == Some(MIGRATION_MANIFEST_VERSION as u64)
+        && value
+            .get("target_generation")
+            .and_then(serde_json::Value::as_str)
+            == Some(generation)
+        && value
+            .get("source_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|bytes| bytes > 0)
+        && value
+            .get("source_blake3")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|hash| hash.len() == 64)
+}
+
+fn cleanup_incomplete_migrations(callgraph_dir: &Path, project_key: &str) {
+    let pointer_generation = read_pointer(callgraph_dir, project_key);
+    if let Some(generation) = pointer_generation.as_deref() {
+        if migration_generation_requires_manifest(generation)
+            && !migration_manifest_valid(callgraph_dir, generation)
+        {
+            let path = callgraph_dir.join(generation);
+            remove_sqlite_file_set(&path);
+            let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, generation));
+            let _ = std::fs::remove_file(pointer_path(callgraph_dir, project_key));
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir(callgraph_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if name.contains(".tmp.") && name.starts_with(&format!("{project_key}.g")) {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        if name.starts_with(&format!("{project_key}.g"))
+            && name.ends_with(".sqlite")
+            && name.contains(MIGRATION_GENERATION_TAG)
+            && pointer_generation.as_deref() != Some(&name)
+            && !migration_manifest_valid(callgraph_dir, &name)
+        {
+            remove_sqlite_file_set(&path);
+            let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, &name));
+        }
+    }
+    crate::fs_lock::sync_parent(callgraph_dir);
+}
+
+fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    if let Some(generation) = generation {
+        hasher.update(generation.as_bytes());
+    }
+    let digest = hash_to_hex(hasher.finalize());
+    format!("legacy-{}", &digest[..16])
+}
+
 fn open_readonly_connection(path: &Path) -> Result<Connection> {
     let uri = sqlite_readonly_uri(path);
     let conn = Connection::open_with_flags(
@@ -3229,7 +3975,9 @@ fn resolve_ready_target(
         if let Some(generation) = read_pointer(callgraph_dir, project_key) {
             let gen_path = callgraph_dir.join(&generation);
             if gen_path.is_file() {
-                return db_path_ready(&gen_path).then_some((gen_path, Some(generation)));
+                return (migration_manifest_valid(callgraph_dir, &generation)
+                    && db_path_ready(&gen_path))
+                .then_some((gen_path, Some(generation)));
             }
             // Pointer names a missing generation (a GC/publish race): re-read the
             // pointer and retry rather than failing the reader.
@@ -3327,6 +4075,9 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
             continue;
         }
         remove_sqlite_file_set(&path);
+        if let Some(generation) = path.file_name().and_then(|name| name.to_str()) {
+            let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, generation));
+        }
     }
 }
 
