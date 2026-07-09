@@ -1590,6 +1590,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     let artifact_owner_claim = if home_match {
         None
+    } else if is_worktree_bridge {
+        Some(crate::artifact_owner::open_read_only_borrow(
+            next_config.storage_dir.as_deref(),
+            &canonical_cache_root,
+            &project_key,
+            &project_scope_key,
+        ))
     } else {
         match crate::artifact_owner::claim_or_open_read_only(
             next_config.storage_dir.as_deref(),
@@ -1651,6 +1658,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         !home_match && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
     // Commit phase: no validation returns after this point.
+    let semantic_fingerprint_generation =
+        if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
+            ctx.advance_semantic_fingerprint_generation()
+        } else {
+            ctx.semantic_fingerprint_generation()
+        };
     ctx.set_config(next_config.clone());
     ctx.set_harness(harness.clone());
     {
@@ -2097,6 +2110,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
             let semantic_generation = configure_generation;
             let semantic_generation_flag = ctx.configure_generation_flag();
+            let semantic_fingerprint_generation_flag = ctx.semantic_fingerprint_generation_flag();
             let session_id_for_bg2 = log_ctx::current_session();
             thread::spawn(move || {
                 log_ctx::with_session(session_id_for_bg2, || {
@@ -2131,8 +2145,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         let _ = tx_progress.send(SemanticIndexEvent::ColdSeedGateCleared);
                     };
 
-                    let build_once =
-                    || -> Result<(SemanticIndex, crate::semantic_index::EmbeddingModel), String> {
+                    struct SemanticBuildReady {
+                        index: SemanticIndex,
+                        model: crate::semantic_index::EmbeddingModel,
+                        persist_to_disk: bool,
+                    }
+
+                    let build_once = || -> Result<SemanticBuildReady, String> {
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "initializing_embedding_model".to_string(),
                             files: None,
@@ -2232,20 +2251,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                                 cached.len(),
                                             );
                                             cached.set_fingerprint(fingerprint);
-                                            if !is_worktree_bridge_for_semantic {
-                                                if let Some(ref dir) = semantic_storage {
-                                                    cached
-                                                        .write_to_disk(dir, &semantic_project_key);
-                                                }
-                                            }
                                         }
+                                        let persist_to_disk = !summary.is_noop();
                                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                             stage: "loaded_cached_index".to_string(),
                                             files: None,
                                             entries_done: Some(cached.entry_count()),
                                             entries_total: Some(cached.entry_count()),
                                         });
-                                        return Ok((cached, model));
+                                        return Ok(SemanticBuildReady {
+                                            index: cached,
+                                            model,
+                                            persist_to_disk,
+                                        });
                                     }
                                     Err(error) => {
                                         if crate::semantic_index::embedding_failure_is_transient(
@@ -2271,7 +2289,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                                 "incremental refresh hit a transient backend error ({}); keeping the cached index instead of full-rebuilding",
                                                 clean
                                             );
-                                            return Ok((cached, model));
+                                            return Ok(SemanticBuildReady {
+                                                index: cached,
+                                                model,
+                                                persist_to_disk: false,
+                                            });
                                         }
                                         // Permanent failure (dimension mismatch, etc.): the
                                         // cache is genuinely unusable, drop it and full-rebuild.
@@ -2356,13 +2378,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             entries_total: Some(index.len()),
                         });
 
-                        if !is_worktree_bridge_for_semantic {
-                            if let Some(ref dir) = semantic_storage {
-                                index.write_to_disk(dir, &semantic_project_key);
-                            }
-                        }
-
-                        Ok((index, model))
+                        Ok(SemanticBuildReady {
+                            index,
+                            model,
+                            persist_to_disk: true,
+                        })
                     };
 
                     // Build-level retry: if the embedding backend is unreachable or
@@ -2424,8 +2444,71 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         }
                     };
 
-                    let event = match build_result {
-                        Ok(Ok((index, model))) => {
+                    enum SemanticBuildOutcome {
+                        Ready(SemanticBuildReady),
+                        Failed(String),
+                    }
+
+                    let outcome = match build_result {
+                        Ok(Ok(ready)) => SemanticBuildOutcome::Ready(ready),
+                        Ok(Err(error)) => {
+                            slog_warn!("failed to build semantic index: {}", error);
+                            SemanticBuildOutcome::Failed(error)
+                        }
+                        Err(_) => {
+                            let error = "semantic index build panicked".to_string();
+                            slog_warn!("{}", error);
+                            SemanticBuildOutcome::Failed(error)
+                        }
+                    };
+
+                    let persist_completed_index = |index: &SemanticIndex, reason: &str| {
+                        if is_worktree_bridge_for_semantic {
+                            return;
+                        }
+                        let Some(dir) = semantic_storage.as_ref() else {
+                            return;
+                        };
+                        if semantic_fingerprint_generation_flag
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            != semantic_fingerprint_generation
+                        {
+                            slog_info!(
+                                "semantic index persistence skipped for {reason}: semantic fingerprint changed after generation {} started",
+                                semantic_generation
+                            );
+                            return;
+                        }
+                        index.write_to_disk(dir, &semantic_project_key);
+                    };
+
+                    if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        != semantic_generation
+                    {
+                        if let SemanticBuildOutcome::Ready(ready) = &outcome {
+                            if ready.persist_to_disk {
+                                persist_completed_index(&ready.index, "stale generation discard");
+                            }
+                        }
+                        SEMANTIC_STALE_GENERATION_DISCARDS.fetch_add(1, Ordering::SeqCst);
+                        slog_info!(
+                            "semantic index build result discarded for stale generation {}",
+                            semantic_generation
+                        );
+                        clear_cold_seed_active();
+                        return;
+                    }
+
+                    let event = match outcome {
+                        SemanticBuildOutcome::Ready(ready) => {
+                            let SemanticBuildReady {
+                                index,
+                                model,
+                                persist_to_disk,
+                            } = ready;
+                            if persist_to_disk {
+                                persist_completed_index(&index, "current generation publish");
+                            }
                             let worker_index = index.clone();
                             let worker_handle = spawn_semantic_refresh_worker(
                                 root_clone.clone(),
@@ -2442,28 +2525,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             }
                             SemanticIndexEvent::Ready(index)
                         }
-                        Ok(Err(error)) => {
-                            slog_warn!("failed to build semantic index: {}", error);
-                            SemanticIndexEvent::Failed(error)
-                        }
-                        Err(_) => {
-                            let error = "semantic index build panicked".to_string();
-                            slog_warn!("{}", error);
-                            SemanticIndexEvent::Failed(error)
-                        }
+                        SemanticBuildOutcome::Failed(error) => SemanticIndexEvent::Failed(error),
                     };
-
-                    if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        != semantic_generation
-                    {
-                        SEMANTIC_STALE_GENERATION_DISCARDS.fetch_add(1, Ordering::SeqCst);
-                        slog_info!(
-                            "semantic index build result discarded for stale generation {}",
-                            semantic_generation
-                        );
-                        clear_cold_seed_active();
-                        return;
-                    }
 
                     if tx.send(event).is_err() {
                         clear_cold_seed_active();
@@ -2753,10 +2816,12 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
 mod tests {
     use serde_json::json;
     use std::ffi::OsString;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
-    use std::sync::{mpsc, Arc, Barrier};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{
@@ -2930,6 +2995,193 @@ mod tests {
             "storage_dir": storage,
             "config": [user_tier(json!({ "search_index": true, "semantic_search": false }))],
         }))
+    }
+
+    fn configure_semantic_with_storage(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        base_url: &str,
+        semantic_search: bool,
+    ) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": semantic_search,
+                "callgraph_store": false,
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "counting-test-embedding",
+                    "base_url": base_url,
+                    "timeout_ms": 5_000,
+                    "max_batch_size": 64,
+                    "max_files": 1_000
+                }
+            }))],
+        }))
+    }
+
+    fn owner_manifest_from_response(
+        response: &Response,
+    ) -> crate::artifact_owner::ArtifactOwnerManifest {
+        let manifest_path = response.data["artifact_owner"]["manifest_path"]
+            .as_str()
+            .expect("artifact owner manifest path");
+        let bytes = std::fs::read(manifest_path).expect("read owner manifest");
+        serde_json::from_slice(&bytes).expect("parse owner manifest")
+    }
+
+    fn semantic_cache_file(
+        storage: &std::path::Path,
+        root: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let project_key = crate::search_index::artifact_cache_key(root);
+        storage
+            .join("semantic")
+            .join(project_key)
+            .join("semantic.bin")
+    }
+
+    struct CountingEmbeddingServer {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CountingEmbeddingServer {
+        fn start(delay: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
+            let addr = listener.local_addr().expect("embedding mock addr");
+            listener
+                .set_nonblocking(true)
+                .expect("embedding mock nonblocking");
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop_for_thread = Arc::clone(&stop);
+            let requests_for_thread = Arc::clone(&requests);
+            let handle = std::thread::spawn(move || {
+                while !stop_for_thread.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let requests = Arc::clone(&requests_for_thread);
+                            std::thread::spawn(move || {
+                                handle_counting_embedding_request(stream, delay, requests)
+                            });
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("embedding mock accept failed: {error}"),
+                    }
+                }
+            });
+            Self {
+                base_url: format!("http://{addr}"),
+                stop,
+                requests,
+                handle: Some(handle),
+            }
+        }
+
+        fn non_probe_input_count(&self) -> usize {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .filter(|text| text.as_str() != "semantic index fingerprint probe")
+                .count()
+        }
+    }
+
+    impl Drop for CountingEmbeddingServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = std::net::TcpStream::connect(self.base_url.trim_start_matches("http://"));
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("embedding mock joins");
+            }
+        }
+    }
+
+    fn handle_counting_embedding_request(
+        mut stream: std::net::TcpStream,
+        delay: Duration,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        stream
+            .set_nonblocking(false)
+            .expect("embedding request stream blocking mode");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone embedding stream"));
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).expect("read embedding header");
+            if read == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).expect("read embedding body");
+        let request_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let inputs = match request_body.get("input") {
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect::<Vec<_>>(),
+            Some(serde_json::Value::String(value)) => vec![value.clone()],
+            _ => vec![String::new()],
+        };
+        requests.lock().unwrap().push(inputs.clone());
+        std::thread::sleep(delay);
+        let data = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let base = index as f64 + 1.0;
+                json!({
+                    "embedding": [base, base + 0.1, base + 0.2],
+                    "index": index,
+                })
+            })
+            .collect::<Vec<_>>();
+        let response_body = json!({ "data": data }).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write embedding response");
+    }
+
+    fn wait_for_semantic_build_ready(ctx: &AppContext, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            crate::runtime_drain::drain_build_completions(ctx);
+            let ready = ctx
+                .semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            if ready && ctx.semantic_index_rx().lock().is_none() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for semantic build"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -3203,6 +3455,276 @@ mod tests {
             .unwrap()
             .contains("shared artifacts opened read-only"));
         assert!(sibling_ctx.search_index_rx().read().unwrap().is_none());
+    }
+
+    #[test]
+    fn detect_worktree_bridge_returns_common_dir_for_main_and_linked_worktree() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
+        let (main_is_worktree, main_common) = super::detect_worktree_bridge(&canonical_main);
+        let (linked_is_worktree, linked_common) =
+            super::detect_worktree_bridge(&canonical_worktree);
+
+        assert!(!main_is_worktree);
+        assert!(linked_is_worktree);
+        let expected_common = canonical_main.join(".git");
+        assert_eq!(main_common.as_deref(), Some(expected_common.as_path()));
+        assert_eq!(linked_common, main_common);
+    }
+
+    #[test]
+    fn worktree_then_main_claim_sequence_ends_with_main_owner() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let worktree_ctx = test_context();
+        let worktree_response =
+            handle_configure_for_test(&configure_with_storage(&worktree, &storage), &worktree_ctx);
+        assert!(worktree_response.success);
+        assert_eq!(worktree_ctx.cache_role(), "worktree");
+        assert!(worktree_ctx.shared_artifacts_read_only());
+        let borrowed_manifest_path = worktree_response.data["artifact_owner"]["manifest_path"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !std::path::Path::new(borrowed_manifest_path).exists(),
+            "linked worktree must not create the family owner manifest"
+        );
+
+        let main_ctx = test_context();
+        let main_response =
+            handle_configure_for_test(&configure_with_storage(&main, &storage), &main_ctx);
+        assert!(main_response.success);
+        assert_eq!(main_ctx.cache_role(), "main");
+        assert!(!main_ctx.shared_artifacts_read_only());
+        assert_eq!(main_response.data["artifact_owner"]["mode"], json!("owner"));
+        let manifest = owner_manifest_from_response(&main_response);
+        assert_eq!(
+            manifest.checkout_path,
+            std::fs::canonicalize(&main).unwrap().display().to_string()
+        );
+    }
+
+    #[test]
+    fn main_then_worktree_keeps_main_owner_and_worktree_borrows_read_only() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let main_ctx = test_context();
+        let main_response =
+            handle_configure_for_test(&configure_with_storage(&main, &storage), &main_ctx);
+        assert!(main_response.success);
+        assert_eq!(main_response.data["artifact_owner"]["mode"], json!("owner"));
+        let main_manifest = owner_manifest_from_response(&main_response);
+
+        let worktree_ctx = test_context();
+        let worktree_response =
+            handle_configure_for_test(&configure_with_storage(&worktree, &storage), &worktree_ctx);
+        assert!(worktree_response.success);
+        assert_eq!(worktree_ctx.cache_role(), "worktree");
+        assert!(worktree_ctx.shared_artifacts_read_only());
+        assert_eq!(
+            worktree_response.data["artifact_owner"]["mode"],
+            json!("read_only")
+        );
+        let manifest_after_worktree = owner_manifest_from_response(&main_response);
+        assert_eq!(
+            manifest_after_worktree.project_scope_key,
+            main_manifest.project_scope_key
+        );
+        assert_eq!(
+            manifest_after_worktree.checkout_path,
+            main_manifest.checkout_path
+        );
+    }
+
+    #[test]
+    fn main_bind_self_heals_live_worktree_owner_manifest() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
+        let project_key = crate::search_index::artifact_cache_key(&canonical_main);
+        let worktree_scope = crate::path_identity::project_scope_key(&canonical_worktree);
+        let (_, common_dir) = super::detect_worktree_bridge(&canonical_worktree);
+        let common_dir = common_dir.expect("linked worktree common dir");
+        crate::artifact_owner::write_synthetic_manifest_with_git_common_dir_for_test(
+            &storage,
+            &canonical_worktree,
+            &project_key,
+            &worktree_scope,
+            std::process::id(),
+            0,
+            Some(&common_dir),
+        );
+
+        let main_ctx = test_context();
+        let main_response =
+            handle_configure_for_test(&configure_with_storage(&main, &storage), &main_ctx);
+        assert!(main_response.success);
+        assert_eq!(main_response.data["artifact_owner"]["mode"], json!("owner"));
+        assert_eq!(main_ctx.cache_role(), "main");
+        let manifest = owner_manifest_from_response(&main_response);
+        assert_eq!(manifest.checkout_path, canonical_main.display().to_string());
+        assert_eq!(
+            manifest.project_scope_key,
+            crate::path_identity::project_scope_key(&canonical_main)
+        );
+        let common_dir_string = common_dir.display().to_string();
+        assert_eq!(
+            manifest.git_common_dir.as_deref(),
+            Some(common_dir_string.as_str())
+        );
+    }
+
+    #[test]
+    fn stale_generation_semantic_build_persists_and_followup_refreshes_incrementally() {
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        super::reset_semantic_stale_generation_discards_for_test();
+        let server = CountingEmbeddingServer::start(Duration::from_millis(50));
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            std::fs::write(
+                project.join("src").join(format!("{name}.rs")),
+                format!("pub fn {name}_symbol() -> usize {{ 1 }}\n"),
+            )
+            .unwrap();
+        }
+        let semantic_file = semantic_cache_file(&storage, &project);
+
+        let first_ctx = test_context();
+        let first_response = handle_configure_for_test(
+            &configure_semantic_with_storage(&project, &storage, &server.base_url, true),
+            &first_ctx,
+        );
+        assert!(
+            first_response.success,
+            "configure failed: {:?}",
+            first_response.data
+        );
+        let disabled_response = handle_configure_for_test(
+            &configure_semantic_with_storage(&project, &storage, &server.base_url, false),
+            &first_ctx,
+        );
+        assert!(
+            disabled_response.success,
+            "disable configure failed: {:?}",
+            disabled_response.data
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if super::semantic_stale_generation_discards_for_test() > 0 && semantic_file.is_file() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for stale semantic build to persist"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let initial_non_probe_inputs = server.non_probe_input_count();
+        assert!(
+            initial_non_probe_inputs >= 4,
+            "initial build should embed the corpus, saw {initial_non_probe_inputs} inputs"
+        );
+
+        std::fs::write(
+            project.join("src").join("epsilon.rs"),
+            "pub fn epsilon_symbol() -> usize { 5 }\n",
+        )
+        .unwrap();
+
+        let before_followup_inputs = server.non_probe_input_count();
+        let second_ctx = test_context();
+        let second_response = handle_configure_for_test(
+            &configure_semantic_with_storage(&project, &storage, &server.base_url, true),
+            &second_ctx,
+        );
+        assert!(
+            second_response.success,
+            "second configure failed: {:?}",
+            second_response.data
+        );
+        wait_for_semantic_build_ready(&second_ctx, Duration::from_secs(5));
+        let followup_inputs = server
+            .non_probe_input_count()
+            .saturating_sub(before_followup_inputs);
+        assert!(
+            followup_inputs < initial_non_probe_inputs,
+            "follow-up build should use the persisted index and embed only the delta; initial={initial_non_probe_inputs}, followup={followup_inputs}"
+        );
+        assert!(
+            followup_inputs <= 2,
+            "expected only the new file's semantic chunks to be embedded, got {followup_inputs}"
+        );
+        super::reset_semantic_stale_generation_discards_for_test();
     }
 
     #[test]

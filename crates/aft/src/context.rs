@@ -728,6 +728,7 @@ pub struct AppContext {
     /// Monotonic generation that prevents a superseded semantic worker from
     /// reopening the cold-seed gate after a later configure has reset it.
     semantic_cold_seed_generation: Arc<AtomicU64>,
+    semantic_fingerprint_generation: Arc<AtomicU64>,
     semantic_callgraph_warm_deferred: AtomicBool,
     pending_semantic_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     pending_semantic_corpus_refresh: parking_lot::Mutex<bool>,
@@ -935,6 +936,7 @@ impl AppContext {
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
             semantic_cold_seed_active: Arc::new(AtomicBool::new(false)),
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
+            semantic_fingerprint_generation: Arc::new(AtomicU64::new(0)),
             semantic_callgraph_warm_deferred: AtomicBool::new(false),
             pending_semantic_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             pending_semantic_corpus_refresh: parking_lot::Mutex::new(false),
@@ -1595,6 +1597,20 @@ impl AppContext {
 
     pub fn configure_generation_flag(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.configure_generation)
+    }
+
+    pub fn advance_semantic_fingerprint_generation(&self) -> u64 {
+        self.semantic_fingerprint_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub fn semantic_fingerprint_generation(&self) -> u64 {
+        self.semantic_fingerprint_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn semantic_fingerprint_generation_flag(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.semantic_fingerprint_generation)
     }
 
     pub fn configure_warnings_sender(

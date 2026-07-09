@@ -96,10 +96,12 @@ pub fn claim_or_open_read_only(
         match read_manifest(&path) {
             Ok(existing) => {
                 let same_checkout = existing.project_scope_key == project_scope_key;
-                let linked_worktree = existing.git_common_dir.is_some()
-                    && existing.git_common_dir == git_common_dir
-                    && git_common_dir.is_some();
-                if same_checkout || linked_worktree {
+                let same_git_family = existing
+                    .git_common_dir
+                    .as_deref()
+                    .zip(git_common_dir.as_deref())
+                    .is_some_and(|(existing, current)| existing == current);
+                if same_checkout || same_git_family {
                     return write_owner_manifest(
                         &path,
                         project_key,
@@ -150,6 +152,60 @@ pub fn claim_or_open_read_only(
             }
             Err(ReadManifestError::Io(error)) => return Err(error),
         }
+    }
+}
+
+pub fn open_read_only_borrow(
+    storage_dir: Option<&Path>,
+    project_root: &Path,
+    project_key: &str,
+    project_scope_key: &str,
+) -> ArtifactOwnerClaim {
+    let manifest_dir = resolve_manifest_dir(storage_dir, project_root, project_key);
+    let path = manifest_dir.join("owner.json");
+    let fallback_checkout = project_root.display().to_string();
+
+    let (owner_project_scope_key, owner_checkout_path, note) = match read_manifest(&path) {
+        Ok(existing) => {
+            let note = format!(
+                "shared artifacts opened read-only: cache key {project_key} is owned by checkout {} (scope {}, pid {})",
+                existing.checkout_path, existing.project_scope_key, existing.pid
+            );
+            (existing.project_scope_key, existing.checkout_path, note)
+        }
+        Err(ReadManifestError::NotFound) => (
+            project_scope_key.to_string(),
+            fallback_checkout.clone(),
+            format!(
+                "shared artifacts opened read-only: linked worktree will not claim cache key {project_key}; waiting for the main checkout to publish shared artifacts"
+            ),
+        ),
+        Err(ReadManifestError::Malformed) => (
+            project_scope_key.to_string(),
+            fallback_checkout.clone(),
+            format!(
+                "shared artifacts opened read-only: owner manifest for cache key {project_key} is malformed; not repairing it from a linked worktree"
+            ),
+        ),
+        Err(ReadManifestError::Io(error)) => (
+            project_scope_key.to_string(),
+            fallback_checkout.clone(),
+            format!(
+                "shared artifacts opened read-only: failed to inspect owner manifest for cache key {project_key}: {error}"
+            ),
+        ),
+    };
+
+    ArtifactOwnerClaim {
+        status: ArtifactOwnerStatus {
+            mode: ArtifactOwnerMode::ReadOnly,
+            project_key: project_key.to_string(),
+            manifest_path: path.display().to_string(),
+            owner_project_scope_key,
+            owner_checkout_path,
+            note: Some(note),
+        },
+        lease: None,
     }
 }
 
@@ -610,6 +666,27 @@ pub(crate) fn write_synthetic_manifest_for_test(
     pid: u32,
     heartbeat_at_ms: u64,
 ) {
+    write_synthetic_manifest_with_git_common_dir_for_test(
+        storage_dir,
+        project_root,
+        project_key,
+        project_scope_key,
+        pid,
+        heartbeat_at_ms,
+        None,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn write_synthetic_manifest_with_git_common_dir_for_test(
+    storage_dir: &Path,
+    project_root: &Path,
+    project_key: &str,
+    project_scope_key: &str,
+    pid: u32,
+    heartbeat_at_ms: u64,
+    git_common_dir: Option<&Path>,
+) {
     let dir = resolve_manifest_dir(Some(storage_dir), project_root, project_key);
     fs::create_dir_all(&dir).unwrap();
     let now = now_ms();
@@ -617,7 +694,7 @@ pub(crate) fn write_synthetic_manifest_for_test(
         schema_version: SCHEMA_VERSION,
         project_scope_key: project_scope_key.to_string(),
         checkout_path: project_root.display().to_string(),
-        git_common_dir: None,
+        git_common_dir: git_common_dir.map(|path| path.display().to_string()),
         pid,
         hostname: current_hostname(),
         created_at_ms: now,
