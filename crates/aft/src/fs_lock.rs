@@ -224,10 +224,15 @@ fn acquire_with_config(
     let mut warned_stale_live_owner = false;
     let mut transient_create_failures: u32 = 0;
     let mut attempted_once = false;
+    // A zero-timeout acquire still gets one immediate retry after it removes a
+    // stale lock; otherwise it would reap the dead owner and report Timeout.
+    let mut immediate_retry_budget = 0_u8;
 
     loop {
         if attempted_once {
-            if let Some(deadline) = deadline {
+            if immediate_retry_budget > 0 {
+                immediate_retry_budget -= 1;
+            } else if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
                     return Err(AcquireError::Timeout);
                 }
@@ -258,7 +263,10 @@ fn acquire_with_config(
 
         let metadata = match read_lock_metadata(path) {
             Ok(metadata) => metadata,
-            Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                immediate_retry_budget = 1;
+                continue;
+            }
             Err(ReadLockError::Io(error)) => return Err(error.into()),
             Err(ReadLockError::Malformed(error)) => {
                 // A just-created O_EXCL file is visible before its owner has
@@ -279,6 +287,7 @@ fn acquire_with_config(
                     error
                 );
                 remove_lock_file(path)?;
+                immediate_retry_budget = 1;
                 continue;
             }
         };
@@ -298,7 +307,9 @@ fn acquire_with_config(
                 );
                 // Compare-and-delete: only remove if it's still the SAME stale
                 // owner (a fresh owner may have acquired it in the gap).
-                reclaim_lock_file(path, &metadata)?;
+                if reclaim_lock_file(path, &metadata)? {
+                    immediate_retry_budget = 1;
+                }
                 continue;
             }
             sleep_until_retry(deadline, config.poll_interval_ms)?;
@@ -314,7 +325,9 @@ fn acquire_with_config(
             // Compare-and-delete: only remove if it's still this dead owner's
             // lock. A fresh owner could have written a new lock (with a recycled
             // or different PID) between our liveness check and the unlink.
-            reclaim_lock_file(path, &metadata)?;
+            if reclaim_lock_file(path, &metadata)? {
+                immediate_retry_budget = 1;
+            }
             continue;
         }
 
@@ -1151,6 +1164,19 @@ mod tests {
 
         let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
             .expect("reclaim dead pid lock");
+        let metadata = read_lock_metadata(&path).expect("read reclaimed lock");
+        assert_eq!(metadata.pid, std::process::id());
+        drop(guard);
+    }
+
+    #[test]
+    fn zero_timeout_dead_pid_reclaim_acquires_after_removing_stale_file() {
+        let (_dir, path) = test_lock_path();
+        let metadata = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        write_synthetic_lock(&path, &metadata);
+
+        let guard = acquire_with_config(&path, Some(Duration::ZERO), test_config())
+            .expect("zero-timeout acquire should claim the reaped stale lock");
         let metadata = read_lock_metadata(&path).expect("read reclaimed lock");
         assert_eq!(metadata.pid, std::process::id());
         drop(guard);
