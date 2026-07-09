@@ -684,7 +684,7 @@ async fn drive_route_bind_deadline_daemon(input: FakeDaemonInput) {
     );
     assert_eq!(
         error.get("code").and_then(Value::as_str),
-        Some("config_divergence")
+        Some("actor_not_ready")
     );
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1286,9 +1286,29 @@ async fn expect_tool_response(
     corr: u64,
     timeout: Duration,
 ) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut skipped = Vec::new();
     loop {
-        let frame = read_frame_from_rx(rx, timeout, "tool response").await;
-        if frame.header.ty == FrameType::Response && frame.header.corr == corr {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for tool response corr {corr}; skipped frames: {skipped:?}"
+        );
+        let frame = read_frame_from_rx(rx, remaining, "tool response").await;
+        if frame.header.corr != corr {
+            skipped.push(format!(
+                "{:?}/ch{}/corr{}",
+                frame.header.ty, frame.header.channel, frame.header.corr
+            ));
+            continue;
+        }
+        if frame.header.ty == FrameType::Error {
+            let body: Value = serde_json::from_slice(&frame.body).expect("tool error body");
+            panic!("tool corr {corr} returned error frame: {body:?}");
+        }
+        if frame.header.ty == FrameType::Response {
             let body: Value = serde_json::from_slice(&frame.body).expect("tool body");
             assert_ne!(
                 body.get("isError").and_then(Value::as_bool),

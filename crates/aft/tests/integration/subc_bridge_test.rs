@@ -1441,6 +1441,51 @@ fn subc_bridge_goodbye_cancels_pending_bind() {
 }
 
 #[test]
+fn subc_bridge_cancelled_first_bind_does_not_orphan_later_bind() {
+    run_subc_bridge_test(
+        "subc_bridge_cancelled_first_bind_does_not_orphan_later_bind",
+        Duration::from_secs(45),
+        drive_cancelled_first_bind_does_not_orphan_later_bind_daemon,
+        |state, _, _| {
+            state.assert_same_context("subc-bind-21", "subc-bind-22");
+        },
+    );
+}
+
+#[test]
+fn subc_bridge_bind_deadline_rolls_back_and_fresh_bind_succeeds() {
+    run_subc_bridge_test(
+        "subc_bridge_bind_deadline_rolls_back_and_fresh_bind_succeeds",
+        Duration::from_secs(60),
+        drive_bind_deadline_recovery_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_route_close_recreates_unregistered_actor_on_fresh_bind() {
+    run_subc_bridge_test(
+        "subc_bridge_route_close_recreates_unregistered_actor_on_fresh_bind",
+        Duration::from_secs(45),
+        drive_route_close_recreates_unregistered_actor_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_route_close_preserves_sibling_and_allows_join() {
+    run_subc_bridge_test(
+        "subc_bridge_route_close_preserves_sibling_and_allows_join",
+        Duration::from_secs(45),
+        drive_route_close_preserves_sibling_daemon,
+        |state, _, _| {
+            state.assert_same_context("subc-bind-1", "subc-bind-4");
+            state.assert_same_context("subc-bind-4", "subc-bind-6");
+        },
+    );
+}
+
+#[test]
 fn subc_bridge_l3_coalesces_already_bound_route_burst() {
     run_subc_bridge_test(
         "subc_bridge_l3_coalesces_already_bound_route_burst",
@@ -3446,6 +3491,155 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
     tokio::time::sleep(Duration::from_millis(150)).await;
     send_tool_call(&mut stream, 10, 1111, "echo", json!({ "case": "fast" })).await;
     expect_error_frame_skipping_optional_ack(&mut stream, 10, 1111, "route_not_bound", 110).await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_cancelled_first_bind_does_not_orphan_later_bind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    let slow_bind_base = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        20,
+        200,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("slow route 20 configure started", |inner| {
+        inner.slow_configure_started > slow_bind_base
+    });
+
+    send_route_bind(&mut stream, 21, 210, &slow_root).await;
+    send_route_goodbye(&mut stream, 20, 201).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    state.release_slow_configures();
+    state.wait_for_slow_configure_finished(slow_bind_base + 1);
+    expect_route_bind_ack(&mut stream, 210).await;
+    send_tool_call(&mut stream, 21, 211, "echo", json!({ "case": "fast" })).await;
+    let joined = read_frame_timeout(&mut stream, "post-cancel sibling bind response").await;
+    assert_eq!(joined.header.channel, 21);
+    assert_eq!(joined.header.corr, 211);
+    assert_eq!(tool_response_json(&joined)["success"].as_bool(), Some(true));
+
+    send_route_goodbye(&mut stream, 21, 212).await;
+    send_route_bind(&mut stream, 22, 220, &slow_root).await;
+    expect_route_bind_ack(&mut stream, 220).await;
+    send_tool_call(&mut stream, 22, 221, "echo", json!({ "case": "fast" })).await;
+    let fresh = read_frame_timeout(&mut stream, "fresh bind after cancelled first bind").await;
+    assert_eq!(fresh.header.channel, 22);
+    assert_eq!(fresh.header.corr, 221);
+    assert_eq!(tool_response_json(&fresh)["success"].as_bool(), Some(true));
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bind_deadline_recovery_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    let slow_bind_base = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        30,
+        300,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("deadline route 30 configure started", |inner| {
+        inner.slow_configure_started > slow_bind_base
+    });
+    expect_route_bind_error(&mut stream, 300, "actor_not_ready").await;
+    state.release_slow_configures();
+    state.wait_for_slow_configure_finished(slow_bind_base + 1);
+
+    send_route_bind(&mut stream, 31, 310, &slow_root).await;
+    expect_route_bind_ack(&mut stream, 310).await;
+    send_tool_call(&mut stream, 31, 311, "echo", json!({ "case": "fast" })).await;
+    let fresh = read_frame_timeout(&mut stream, "fresh bind after deadline response").await;
+    assert_eq!(fresh.header.channel, 31);
+    assert_eq!(fresh.header.corr, 311);
+    assert_eq!(tool_response_json(&fresh)["success"].as_bool(), Some(true));
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_route_close_recreates_unregistered_actor_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    bind_route1(&mut stream, &root1).await;
+    send_route_goodbye(&mut stream, 1, 101).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    executor.remove_actor(&root_id);
+    assert!(!executor.actor_registered(&root_id));
+
+    send_route_bind(&mut stream, 2, 20, &root1).await;
+    expect_route_bind_ack(&mut stream, 20).await;
+    send_tool_call(&mut stream, 2, 21, "echo", json!({ "case": "fast" })).await;
+    let rebound = read_frame_timeout(&mut stream, "fresh bind after actor removal").await;
+    assert_eq!(rebound.header.channel, 2);
+    assert_eq!(rebound.header.corr, 21);
+    assert_eq!(
+        tool_response_json(&rebound)["success"].as_bool(),
+        Some(true)
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_route_close_preserves_sibling_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+
+    bind_routes_1_and_4(&mut stream, &root1).await;
+    send_route_goodbye(&mut stream, 1, 101).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    send_tool_call(&mut stream, 4, 410, "echo", json!({ "case": "fast" })).await;
+    let sibling = read_frame_timeout(&mut stream, "sibling route after route close").await;
+    assert_eq!(sibling.header.channel, 4);
+    assert_eq!(sibling.header.corr, 410);
+    assert_eq!(
+        tool_response_json(&sibling)["success"].as_bool(),
+        Some(true)
+    );
+
+    send_route_bind(&mut stream, 6, 60, &root1).await;
+    expect_route_bind_ack(&mut stream, 60).await;
+    send_tool_call(&mut stream, 6, 610, "echo", json!({ "case": "fast" })).await;
+    let joined = read_frame_timeout(&mut stream, "new route after sibling close").await;
+    assert_eq!(joined.header.channel, 6);
+    assert_eq!(joined.header.corr, 610);
+    assert_eq!(tool_response_json(&joined)["success"].as_bool(), Some(true));
 
     send_connection_goodbye(&mut stream).await;
 }

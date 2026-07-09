@@ -1958,14 +1958,104 @@ async fn finish_writer_task(
     }
 }
 
+fn register_actor_for_bind(
+    shared_app: &Arc<App>,
+    executor: &Arc<Executor>,
+    push_senders: &PushSenders,
+    bind_root_id: &ProjectRootId,
+    route_channel: u16,
+    root_was_live: bool,
+) -> bool {
+    if executor.actor_registered(bind_root_id) {
+        log::debug!(
+            "subc attach: reusing actor for route {} root {}",
+            route_channel,
+            bind_root_id.as_path().display()
+        );
+        return false;
+    }
+
+    if root_was_live {
+        log::warn!(
+            "subc attach: recreating missing actor for live root {} on route {}",
+            bind_root_id.as_path().display(),
+            route_channel
+        );
+    }
+
+    let actor_ctx = Arc::new(AppContext::from_app(
+        Arc::clone(shared_app),
+        Config::default(),
+    ));
+    install_bash_compressor(&actor_ctx);
+    actor_ctx.set_progress_sender(Some(push::progress_sender_for_root(
+        push_senders.clone(),
+        bind_root_id.clone(),
+    )));
+    let inserted = executor.register_actor(bind_root_id.clone(), Arc::clone(&actor_ctx));
+    drop(actor_ctx);
+    if inserted {
+        // Do not insert into live_roots until configure succeeds: live_roots
+        // drives maintenance, and a half-configured new actor must not be
+        // maintenance-eligible before its route/session identity exists.
+        log::debug!(
+            "subc attach: registered actor for route {} root {}",
+            route_channel,
+            bind_root_id.as_path().display()
+        );
+    } else {
+        log::debug!(
+            "subc attach: actor appeared while binding route {} root {}; reusing it",
+            route_channel,
+            bind_root_id.as_path().display()
+        );
+    }
+    inserted
+}
+
 fn rollback_pending_bind_actor(
     executor: &Arc<Executor>,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     root_id: &ProjectRootId,
     inserted_new_actor: bool,
 ) {
-    if inserted_new_actor && !live_roots.contains_key(root_id) {
-        executor.remove_actor(root_id);
+    if !inserted_new_actor || live_roots.contains_key(root_id) {
+        return;
+    }
+
+    if let Some((route, pending)) = pending_binds
+        .iter_mut()
+        .find(|(_, pending)| &pending.bind_root_id == root_id)
+    {
+        pending.inserted_new_actor = true;
+        log::debug!(
+            "subc attach: transferred rollback ownership for root {} to pending route {}",
+            root_id.as_path().display(),
+            route
+        );
+        return;
+    }
+
+    executor.remove_actor(root_id);
+}
+
+fn route_bind_error_code_for_configure_response(response: &Response) -> &'static str {
+    match response.data.get("code").and_then(|code| code.as_str()) {
+        // Preserve typed configure rejections across the bind boundary: a
+        // malformed fed fingerprint means a federation-module bug or
+        // fingerprint-format drift, and the fed side matches on the code rather
+        // than parsing prose.
+        Some("bad_harness_fingerprint") => "bad_harness_fingerprint",
+        // Cache-key probe failures are transient (fd pressure, git spawn
+        // contention); the client retries the bind rather than treating the
+        // root as permanently divergent.
+        Some("cache_key_probe_failed") => "cache_key_probe_failed",
+        // Actor lifecycle gaps are transient from the daemon/client viewpoint:
+        // a fresh bind can create or join a healthy actor, so do not classify
+        // them as permanent config divergence.
+        Some("actor_not_registered" | "actor_fatal") => "actor_not_ready",
+        _ => "config_divergence",
     }
 }
 
@@ -2008,6 +2098,7 @@ async fn handle_route_bind_completion(
         rollback_pending_bind_actor(
             executor,
             live_roots,
+            pending_binds,
             &completion.bind_root_id,
             completion.inserted_new_actor,
         );
@@ -2028,6 +2119,7 @@ async fn handle_route_bind_completion(
         rollback_pending_bind_actor(
             executor,
             live_roots,
+            pending_binds,
             &completion.bind_root_id,
             inserted_new_actor,
         );
@@ -2052,21 +2144,13 @@ async fn handle_route_bind_completion(
         rollback_pending_bind_actor(
             executor,
             live_roots,
+            pending_binds,
             &completion.bind_root_id,
             inserted_new_actor,
         );
         let message = response_message(response, fallback);
         let fatal = response_is_fatal_panic(response);
-        // Preserve typed configure rejections across the bind boundary. Fed
-        // fingerprint failures are caller bugs, and cache-key probe failures
-        // are retryable root binds; both callers match on codes rather than
-        // parsing prose.
-        let response_code = response.data.get("code").and_then(|c| c.as_str());
-        let error_code = match response_code {
-            Some("bad_harness_fingerprint") => "bad_harness_fingerprint",
-            Some("cache_key_probe_failed") => "cache_key_probe_failed",
-            _ => "config_divergence",
-        };
+        let error_code = route_bind_error_code_for_configure_response(response);
         send_route_bind_error_parts(
             tx,
             completion.ver,
@@ -2183,7 +2267,7 @@ async fn expire_overdue_route_binds(
             ver,
             corr,
             flags,
-            "config_divergence",
+            "actor_not_ready",
             &format!("route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms)"),
             metrics,
         )
@@ -2328,36 +2412,14 @@ async fn handle_control_request(
             };
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
-            let inserted_new_actor = if root_was_live {
-                log::debug!(
-                    "subc attach: reusing actor for route {} root {}",
-                    route_channel,
-                    bind_root_id.as_path().display()
-                );
-                false
-            } else {
-                let actor_ctx = Arc::new(AppContext::from_app(
-                    Arc::clone(shared_app),
-                    Config::default(),
-                ));
-                install_bash_compressor(&actor_ctx);
-                actor_ctx.set_progress_sender(Some(push::progress_sender_for_root(
-                    push_senders.clone(),
-                    bind_root_id.clone(),
-                )));
-                let inserted =
-                    executor.register_actor(bind_root_id.clone(), Arc::clone(&actor_ctx));
-                drop(actor_ctx);
-                // Do not insert into live_roots until configure succeeds: live_roots
-                // drives maintenance, and a half-configured new actor must not be
-                // maintenance-eligible before its route/session identity exists.
-                log::debug!(
-                    "subc attach: registered actor for route {} root {}",
-                    route_channel,
-                    bind_root_id.as_path().display()
-                );
-                inserted
-            };
+            let inserted_new_actor = register_actor_for_bind(
+                shared_app,
+                executor,
+                push_senders,
+                &bind_root_id,
+                route_channel,
+                root_was_live,
+            );
 
             let configure_request_id = configure_req.id.clone();
             pending_binds.insert(

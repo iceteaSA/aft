@@ -268,6 +268,12 @@ impl Executor {
         self.wake_scheduler();
     }
 
+    /// Return whether scheduler state currently has an actor for this root.
+    pub fn actor_registered(&self, root_id: &ProjectRootId) -> bool {
+        let state = self.inner.state.lock();
+        state.actors.contains_key(root_id)
+    }
+
     /// Snapshot the registered actor contexts.
     ///
     /// The returned [`Arc`]s keep contexts alive after the scheduler lock is
