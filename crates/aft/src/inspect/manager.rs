@@ -496,9 +496,8 @@ impl InspectManager {
         } else {
             inspect_dir.join(&project_key)
         };
-        let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let identity = InspectCacheIdentity {
-            sqlite_path,
+            sqlite_path: inspect_dir.join(format!("{project_key}.current")),
             project_root: project_root.clone(),
         };
         let mut caches = self

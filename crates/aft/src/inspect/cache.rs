@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const INSPECT_SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
+
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
@@ -401,7 +403,8 @@ impl InspectCache {
             )));
         }
         std::fs::create_dir_all(&inspect_dir)?;
-        let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
+        let (sqlite_path, generation, needs_publish) =
+            resolve_or_create_inspect_target(&inspect_dir, &project_key);
         let conn = Connection::open(&sqlite_path)?;
         configure_connection(&conn)?;
         if !writer_lease.verify().map_err(InspectCacheError::from)? {
@@ -410,6 +413,18 @@ impl InspectCache {
             )));
         }
         initialize_schema(&conn)?;
+        if needs_publish {
+            if !writer_lease.verify().map_err(InspectCacheError::from)? {
+                return Err(InspectCacheError::Io(std::io::Error::other(
+                    "inspect writer lease epoch changed before pointer publish",
+                )));
+            }
+            publish_inspect_pointer(
+                &inspect_dir,
+                &project_key,
+                generation.as_deref().unwrap_or_default(),
+            )?;
+        }
         Ok(Self::from_connection(
             project_root,
             project_key,
@@ -426,12 +441,13 @@ impl InspectCache {
     ) -> Result<Option<ReadonlyInspectCache>, InspectCacheError> {
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let inspect_dir = project_inspect_dir(inspect_dir, &project_key);
-        let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
-        if !sqlite_path.is_file() {
+        let Some((sqlite_path, generation)) = resolve_inspect_target(&inspect_dir, &project_key)
+        else {
             return Ok(None);
-        }
+        };
         let conn = open_readonly_connection(&sqlite_path)?;
-        let read_marker = crate::root_cache::ReadMarker::create(&inspect_dir, "inspect")?;
+        let marker_label = generation.as_deref().unwrap_or("legacy");
+        let read_marker = crate::root_cache::ReadMarker::create(&inspect_dir, marker_label)?;
         Ok(Some(ReadonlyInspectCache::from_inner(
             Self::from_connection(
                 project_root,
@@ -1340,6 +1356,103 @@ fn project_inspect_dir(inspect_dir: PathBuf, project_key: &str) -> PathBuf {
     }
 }
 
+fn resolve_or_create_inspect_target(
+    inspect_dir: &Path,
+    project_key: &str,
+) -> (PathBuf, Option<String>, bool) {
+    if let Some((path, generation)) = resolve_inspect_target(inspect_dir, project_key) {
+        return (path, generation, false);
+    }
+    let generation = inspect_generation_file_name(project_key);
+    (inspect_dir.join(&generation), Some(generation), true)
+}
+
+fn resolve_inspect_target(
+    inspect_dir: &Path,
+    project_key: &str,
+) -> Option<(PathBuf, Option<String>)> {
+    for _ in 0..5 {
+        if let Some(generation) = read_inspect_pointer(inspect_dir, project_key) {
+            let path = inspect_dir.join(&generation);
+            if path.is_file() {
+                return Some((path, Some(generation)));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let legacy = inspect_legacy_sqlite_path(inspect_dir, project_key);
+        return legacy.is_file().then_some((legacy, None));
+    }
+    None
+}
+
+fn inspect_generation_file_name(project_key: &str) -> String {
+    format!(
+        "{project_key}.g{}.{}.sqlite",
+        now_nanos(),
+        std::process::id()
+    )
+}
+
+fn inspect_pointer_path(inspect_dir: &Path, project_key: &str) -> PathBuf {
+    inspect_dir.join(format!("{project_key}.current"))
+}
+
+fn inspect_legacy_sqlite_path(inspect_dir: &Path, project_key: &str) -> PathBuf {
+    inspect_dir.join(format!("{project_key}.sqlite"))
+}
+
+fn read_inspect_pointer(inspect_dir: &Path, project_key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(inspect_pointer_path(inspect_dir, project_key)).ok()?;
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn publish_inspect_pointer(
+    inspect_dir: &Path,
+    project_key: &str,
+    generation: &str,
+) -> Result<(), InspectCacheError> {
+    let pointer = inspect_pointer_path(inspect_dir, project_key);
+    let tmp = inspect_dir.join(format!(
+        "{project_key}.current.tmp.{}.{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(generation.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    if let Err(error) = crate::fs_lock::rename_over(&tmp, &pointer) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    crate::fs_lock::sync_parent(&pointer);
+    gc_old_inspect_generations(inspect_dir, project_key, generation);
+    Ok(())
+}
+
+fn gc_old_inspect_generations(inspect_dir: &Path, project_key: &str, current: &str) {
+    let Ok(entries) = std::fs::read_dir(inspect_dir) else {
+        return;
+    };
+    let prefix = format!("{project_key}.g");
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == current || !name.starts_with(&prefix) || !name.ends_with(".sqlite") {
+            continue;
+        }
+        let path = entry.path();
+        let _ = std::fs::remove_file(&path);
+        for suffix in INSPECT_SQLITE_SIDECAR_SUFFIXES {
+            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", path.display())));
+        }
+    }
+}
+
 fn acquire_writer_lease(
     inspect_dir: &Path,
     project_key: &str,
@@ -1877,6 +1990,44 @@ mod tests {
             sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
             "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
         );
+    }
+
+    #[test]
+    fn inspect_cache_publishes_pointer_generation_and_reopens_after_crash_redo() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("checkout");
+        fs::create_dir_all(&project_root).unwrap();
+        let inspect_dir = temp.path().join("inspect");
+        let project_key = crate::path_identity::project_scope_key(&project_root);
+
+        fs::create_dir_all(inspect_dir.join("leftover-nonempty-dir")).unwrap();
+        let cache = InspectCache::open(inspect_dir.clone(), project_root.clone()).unwrap();
+        assert!(cache.sqlite_path().is_file());
+        assert_ne!(
+            cache.sqlite_path(),
+            inspect_dir
+                .join(&project_key)
+                .join(format!("{project_key}.sqlite"))
+        );
+        let pointer = inspect_dir
+            .join(&project_key)
+            .join(format!("{project_key}.current"));
+        let generation = fs::read_to_string(&pointer).unwrap();
+        assert_eq!(
+            inspect_dir.join(&project_key).join(generation.trim()),
+            cache.sqlite_path()
+        );
+        drop(cache);
+
+        let reopened = InspectCache::open(inspect_dir.clone(), project_root.clone()).unwrap();
+        assert_eq!(
+            inspect_dir.join(&project_key).join(generation.trim()),
+            reopened.sqlite_path()
+        );
+        let readonly = InspectCache::open_readonly(inspect_dir, project_root)
+            .unwrap()
+            .expect("pointer-published inspect cache should reopen read-only");
+        assert_eq!(readonly.inner.sqlite_path(), reopened.sqlite_path());
     }
 
     #[test]

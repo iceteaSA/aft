@@ -20,7 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, RwLock,
 };
 use tempfile::tempdir;
@@ -835,6 +835,379 @@ fn publish_succeeds_while_old_generation_is_held_open() {
 /// A resident store on a superseded generation is dropped and reopened on the
 /// current generation when the AppContext serves a store-backed op, so a process
 /// that did not run the rebuild still converges to the latest data.
+#[test]
+fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
+    let dir = tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\n",
+    );
+    let storage = root.join("storage");
+    let legacy_dir = storage.join("opencode/callgraph");
+    let legacy_build_dir = root.join(".legacy-callgraph-build");
+
+    CallGraphStore::cold_build_with_lease(
+        legacy_build_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .unwrap();
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { newLeaf(); }\nfunction newLeaf() {}\n",
+    );
+    CallGraphStore::cold_build_with_lease(
+        legacy_build_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .unwrap();
+    copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
+
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    ctx.set_harness(Harness::Opencode);
+    ctx.set_canonical_cache_root(root.clone());
+    ctx.set_cache_role(false, None);
+
+    let migrated = ctx
+        .ensure_callgraph_store()
+        .unwrap()
+        .expect("legacy generation should be migrated instead of cold-built");
+    assert!(migrated
+        .sqlite_path()
+        .starts_with(ctx.callgraph_store_dir()));
+    assert_eq!(
+        migrated
+            .call_tree(Path::new("main.ts"), "entry", 1)
+            .unwrap()
+            .children[0]
+            .name,
+        "oldLeaf",
+        "generation-copy migration intentionally starts one generation stale"
+    );
+
+    drop(migrated);
+    let writer = CallGraphStore::open(ctx.callgraph_store_dir(), root.clone()).unwrap();
+    writer.refresh_files(&[root.join("main.ts")]).unwrap();
+    let refreshed = CallGraphStore::open_readonly(ctx.callgraph_store_dir(), root.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        refreshed
+            .call_tree(Path::new("main.ts"), "entry", 1)
+            .unwrap()
+            .children[0]
+            .name,
+        "newLeaf",
+        "incremental refresh catches the migrated generation up to current source"
+    );
+}
+
+#[test]
+fn root_keyed_migration_disk_floor_skips_to_legacy_fallback_without_cold_build() {
+    let dir = tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { leaf(); }\nfunction leaf() {}\n",
+    );
+    let storage = root.join("storage");
+    let legacy_dir = storage.join("opencode/callgraph");
+    let legacy_build_dir = root.join(".legacy-callgraph-build");
+    CallGraphStore::cold_build_with_lease(
+        legacy_build_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .unwrap();
+    copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
+
+    let cold_build_ran = Arc::new(AtomicBool::new(false));
+    let cold_build_ran_for_hook = Arc::clone(&cold_build_ran);
+    aft::callgraph_store::set_cold_build_swap_observer(Some(Arc::new(move |_tmp, _target| {
+        cold_build_ran_for_hook.store(true, Ordering::SeqCst);
+    })));
+    aft::callgraph_store::set_legacy_migration_available_disk_for_test(Some(0));
+
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    ctx.set_harness(Harness::Opencode);
+    ctx.set_canonical_cache_root(root.clone());
+    ctx.set_cache_role(false, None);
+
+    let store = ctx
+        .ensure_callgraph_store()
+        .unwrap()
+        .expect("fallback should serve while migration is skipped");
+    aft::callgraph_store::set_legacy_migration_available_disk_for_test(None);
+    aft::callgraph_store::set_cold_build_swap_observer(None);
+
+    assert_eq!(
+        store
+            .call_tree(Path::new("main.ts"), "entry", 1)
+            .unwrap()
+            .children[0]
+            .name,
+        "leaf"
+    );
+    assert!(
+        store
+            .sqlite_path()
+            .starts_with(storage.join("opencode/callgraph")),
+        "fallback reader must hold the legacy DB, not a cold-built root-keyed DB"
+    );
+    assert!(!ctx
+        .callgraph_store_dir()
+        .join(format!("{}.current", artifact_cache_key_for_test(&root)))
+        .exists());
+    assert!(!cold_build_ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn root_keyed_migration_backup_budget_failure_serves_legacy_without_cold_build() {
+    let dir = tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { leaf(); }\nfunction leaf() {}\n",
+    );
+    let storage = root.join("storage");
+    let legacy_dir = storage.join("opencode/callgraph");
+    let legacy_build_dir = root.join(".legacy-callgraph-build");
+    CallGraphStore::cold_build_with_lease(
+        legacy_build_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .unwrap();
+    copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
+
+    let cold_build_ran = Arc::new(AtomicBool::new(false));
+    let cold_build_ran_for_hook = Arc::clone(&cold_build_ran);
+    aft::callgraph_store::set_cold_build_swap_observer(Some(Arc::new(move |_tmp, _target| {
+        cold_build_ran_for_hook.store(true, Ordering::SeqCst);
+    })));
+    aft::callgraph_store::set_legacy_migration_backup_budget_exhausted_for_test(true);
+
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    ctx.set_harness(Harness::Opencode);
+    ctx.set_canonical_cache_root(root.clone());
+    ctx.set_cache_role(false, None);
+    let fallback = ctx.ensure_callgraph_store().unwrap().unwrap();
+
+    aft::callgraph_store::set_legacy_migration_backup_budget_exhausted_for_test(false);
+    aft::callgraph_store::set_cold_build_swap_observer(None);
+
+    assert!(fallback
+        .sqlite_path()
+        .starts_with(storage.join("opencode/callgraph")));
+    assert_eq!(
+        fallback
+            .call_tree(Path::new("main.ts"), "entry", 1)
+            .unwrap()
+            .children[0]
+            .name,
+        "leaf"
+    );
+    assert!(!ctx
+        .callgraph_store_dir()
+        .join(format!("{}.current", artifact_cache_key_for_test(&root)))
+        .exists());
+    assert!(!cold_build_ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn root_keyed_migration_redoes_partial_copy_without_valid_manifest() {
+    let dir = tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\n",
+    );
+    let storage = root.join("storage");
+    let legacy_dir = storage.join("opencode/callgraph");
+    let legacy_build_dir = root.join(".legacy-callgraph-build");
+    CallGraphStore::cold_build_with_lease(
+        legacy_build_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .unwrap();
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { newLeaf(); }\nfunction newLeaf() {}\n",
+    );
+    CallGraphStore::cold_build_with_lease(
+        legacy_build_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .unwrap();
+    copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
+
+    aft::callgraph_store::set_legacy_migration_fail_after_temp_copy_for_test(true);
+    let failing_ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    failing_ctx.set_harness(Harness::Opencode);
+    failing_ctx.set_canonical_cache_root(root.clone());
+    failing_ctx.set_cache_role(false, None);
+    let fallback = failing_ctx.ensure_callgraph_store().unwrap().unwrap();
+    assert!(fallback
+        .sqlite_path()
+        .starts_with(storage.join("opencode/callgraph")));
+    assert!(!failing_ctx
+        .callgraph_store_dir()
+        .join(format!("{}.current", artifact_cache_key_for_test(&root)))
+        .exists());
+
+    aft::callgraph_store::set_legacy_migration_fail_after_temp_copy_for_test(false);
+    let retry_ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    retry_ctx.set_harness(Harness::Opencode);
+    retry_ctx.set_canonical_cache_root(root.clone());
+    retry_ctx.set_cache_role(false, None);
+    let migrated = retry_ctx.ensure_callgraph_store().unwrap().unwrap();
+    assert!(migrated
+        .sqlite_path()
+        .starts_with(retry_ctx.callgraph_store_dir()));
+    let generation = fs::read_to_string(
+        retry_ctx
+            .callgraph_store_dir()
+            .join(format!("{}.current", artifact_cache_key_for_test(&root))),
+    )
+    .unwrap();
+    let generation = generation.trim();
+    assert!(retry_ctx
+        .callgraph_store_dir()
+        .join(format!("{generation}.migration.json"))
+        .is_file());
+}
+
+#[test]
+fn root_keyed_migration_uses_sqlite_backup_for_only_current_legacy_generation() {
+    let dir = tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { leaf(); }\nfunction leaf() {}\n",
+    );
+    let storage = root.join("storage");
+    let legacy_dir = storage.join("opencode/callgraph");
+    let legacy_build_dir = root.join(".legacy-callgraph-build");
+    CallGraphStore::cold_build_with_lease(
+        legacy_build_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .unwrap();
+    copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
+    let key = artifact_cache_key_for_test(&root);
+    let current = fs::read_to_string(legacy_dir.join(format!("{key}.current"))).unwrap();
+    let legacy_sqlite = legacy_dir.join(current.trim());
+    {
+        let conn = Connection::open(&legacy_sqlite).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS writer_noise (id INTEGER PRIMARY KEY, note TEXT);",
+        )
+        .unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_writer = Arc::clone(&stop);
+    let writer_path = legacy_sqlite.clone();
+    let writer = std::thread::spawn(move || {
+        let conn = Connection::open(writer_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut i = 0_i64;
+        while !stop_writer.load(Ordering::SeqCst) {
+            let _ = conn.execute(
+                "INSERT INTO writer_noise (note) VALUES (?1)",
+                params![format!("row-{i}")],
+            );
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    ctx.set_harness(Harness::Opencode);
+    ctx.set_canonical_cache_root(root.clone());
+    ctx.set_cache_role(false, None);
+    let migrated = ctx.ensure_callgraph_store().unwrap().unwrap();
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+
+    assert!(migrated
+        .sqlite_path()
+        .starts_with(ctx.callgraph_store_dir()));
+    let conn = Connection::open(migrated.sqlite_path()).unwrap();
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let noise_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM writer_noise", [], |row| row.get(0))
+        .unwrap();
+    assert!(noise_rows >= 0);
+    let pointer =
+        fs::read_to_string(ctx.callgraph_store_dir().join(format!("{key}.current"))).unwrap();
+    let manifest = fs::read_to_string(
+        ctx.callgraph_store_dir()
+            .join(format!("{}.migration.json", pointer.trim())),
+    )
+    .unwrap();
+    assert!(manifest.contains("sqlite_backup"));
+}
+
 #[test]
 fn app_context_revalidates_to_newer_published_generation() {
     let dir = tempdir().unwrap();
