@@ -32,6 +32,18 @@ use crate::fs_lock;
 
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Read-marker heartbeats refresh no more often than the filesystem lock
+/// heartbeat. Active readers piggyback this on normal read paths instead of
+/// spawning a thread per connection.
+pub const READ_MARKER_TOUCH_INTERVAL_MS: u64 = fs_lock::HEARTBEAT_INTERVAL_MS;
+/// Cross-host markers cannot use local PID liveness, so they expire after the
+/// same conservative 5x stale-heartbeat window used by filesystem locks.
+pub const READ_MARKER_CROSS_HOST_STALE_MS: u64 = fs_lock::STALE_HEARTBEAT_MS * 5;
+// Process start timestamps are not always millisecond-precise across OS APIs.
+// A one-second grace keeps a marker created immediately after process launch
+// attached to that process while still identifying clear PID reuse.
+const PROCESS_START_TIME_GRACE_MS: u64 = 1_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RootCacheDomain {
     Callgraph,
@@ -267,6 +279,7 @@ pub struct ReadMarkerMetadata {
 pub struct ReadMarker {
     path: PathBuf,
     metadata: ReadMarkerMetadata,
+    last_touched_at_ms: AtomicU64,
 }
 
 impl ReadMarker {
@@ -287,11 +300,27 @@ impl ReadMarker {
             seq
         ));
         write_marker_file(&path, &metadata)?;
-        Ok(Self { path, metadata })
+        let last_touched_at_ms = AtomicU64::new(metadata.created_at_ms);
+        Ok(Self {
+            path,
+            metadata,
+            last_touched_at_ms,
+        })
     }
 
     pub fn touch(&self) -> io::Result<()> {
-        write_marker_file(&self.path, &self.metadata)
+        write_marker_file(&self.path, &self.metadata)?;
+        self.last_touched_at_ms.store(now_ms(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn touch_if_due(&self) -> io::Result<()> {
+        let now = now_ms();
+        let last = self.last_touched_at_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < READ_MARKER_TOUCH_INTERVAL_MS {
+            return Ok(());
+        }
+        self.touch()
     }
 
     pub fn path(&self) -> &Path {
@@ -314,11 +343,112 @@ pub fn read_marker_dir(cache_dir: &Path, generation_label: &str) -> PathBuf {
     cache_dir.join("readers").join(generation_label)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadMarkerSweep {
+    pub protected: bool,
+    pub removed_stale: usize,
+}
+
 pub fn protected_read_marker_exists(cache_dir: &Path, generation_label: &str) -> bool {
+    read_marker_protection(cache_dir, generation_label, false).protected
+}
+
+pub fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarkerSweep {
+    read_marker_protection(cache_dir, generation_label, true)
+}
+
+fn read_marker_protection(
+    cache_dir: &Path,
+    generation_label: &str,
+    remove_stale: bool,
+) -> ReadMarkerSweep {
     let dir = read_marker_dir(cache_dir, generation_label);
-    fs::read_dir(dir)
-        .map(|mut entries| entries.any(|entry| entry.is_ok()))
-        .unwrap_or(false)
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return ReadMarkerSweep::default(),
+        Err(_) => {
+            return ReadMarkerSweep {
+                protected: true,
+                removed_stale: 0,
+            };
+        }
+    };
+
+    let hostname = current_hostname();
+    let now = now_ms();
+    let mut sweep = ReadMarkerSweep::default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match marker_file_is_protected(&path, now, &hostname) {
+            MarkerProtection::Protected => sweep.protected = true,
+            MarkerProtection::Stale | MarkerProtection::Malformed => {
+                if remove_stale && fs::remove_file(&path).is_ok() {
+                    fs_lock::sync_parent(&path);
+                    sweep.removed_stale += 1;
+                }
+            }
+        }
+    }
+    sweep
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerProtection {
+    Protected,
+    Stale,
+    Malformed,
+}
+
+fn marker_file_is_protected(path: &Path, now: u64, current_host: &str) -> MarkerProtection {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return MarkerProtection::Stale,
+        Err(_) => return MarkerProtection::Protected,
+    };
+    let metadata: ReadMarkerMetadata = match serde_json::from_slice(&bytes) {
+        Ok(metadata) => metadata,
+        Err(_) => return MarkerProtection::Malformed,
+    };
+    if metadata.hostname != current_host {
+        let Ok(file_metadata) = fs::metadata(path) else {
+            return MarkerProtection::Protected;
+        };
+        let mtime_ms = file_metadata
+            .modified()
+            .ok()
+            .map(system_time_ms)
+            .unwrap_or(now);
+        let age_ms = now.saturating_sub(mtime_ms);
+        return if age_ms <= READ_MARKER_CROSS_HOST_STALE_MS {
+            MarkerProtection::Protected
+        } else {
+            MarkerProtection::Stale
+        };
+    }
+
+    if !fs_lock::process_alive(metadata.pid) {
+        return MarkerProtection::Stale;
+    }
+    if marker_matches_live_process_instance(&metadata) {
+        MarkerProtection::Protected
+    } else {
+        MarkerProtection::Stale
+    }
+}
+
+fn marker_matches_live_process_instance(metadata: &ReadMarkerMetadata) -> bool {
+    // Same-host PID liveness is authoritative for the process instance. When the
+    // OS can tell us the live PID started after this marker was created, the PID
+    // has been reused and the marker belongs to a dead prior process; otherwise
+    // a live PID protects the marker without consulting marker mtime.
+    process_start_time_ms(metadata.pid)
+        .map(|started_at_ms| {
+            started_at_ms
+                <= metadata
+                    .created_at_ms
+                    .saturating_add(PROCESS_START_TIME_GRACE_MS)
+        })
+        .unwrap_or(true)
 }
 
 fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<()> {
@@ -502,8 +632,11 @@ fn filesystem_is_local(_path: &Path) -> io::Result<bool> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    system_time_ms(SystemTime::now())
+}
+
+fn system_time_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_millis() as u64
 }
@@ -513,6 +646,100 @@ fn now_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_nanos()
+}
+
+#[cfg(test)]
+static PROCESS_START_TIME_OVERRIDES: OnceLock<Mutex<HashMap<u32, Option<u64>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn set_process_start_time_for_test(pid: u32, started_at_ms: Option<u64>) {
+    PROCESS_START_TIME_OVERRIDES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("process start override mutex")
+        .insert(pid, started_at_ms);
+}
+
+#[cfg(test)]
+fn clear_process_start_time_for_test(pid: u32) {
+    if let Some(overrides) = PROCESS_START_TIME_OVERRIDES.get() {
+        overrides
+            .lock()
+            .expect("process start override mutex")
+            .remove(&pid);
+    }
+}
+
+#[cfg(test)]
+fn process_start_time_override(pid: u32) -> Option<Option<u64>> {
+    PROCESS_START_TIME_OVERRIDES
+        .get()
+        .and_then(|overrides| overrides.lock().ok()?.get(&pid).copied())
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time_ms(pid: u32) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(override_value) = process_start_time_override(pid) {
+        return override_value;
+    }
+
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let fields = after_comm.split_whitespace().collect::<Vec<_>>();
+    let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    let boot_time_secs = fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let ticks_per_second = ticks_per_second as u64;
+    Some(
+        boot_time_secs
+            .saturating_mul(1_000)
+            .saturating_add(start_ticks.saturating_mul(1_000) / ticks_per_second),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_time_ms(pid: u32) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(override_value) = process_start_time_override(pid) {
+        return override_value;
+    }
+
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let info_size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            info_size,
+        )
+    };
+    if bytes != info_size {
+        return None;
+    }
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000)
+            .saturating_add(info.pbi_start_tvusec / 1_000),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_time_ms(pid: u32) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(override_value) = process_start_time_override(pid) {
+        return override_value;
+    }
+    let _ = pid;
+    None
 }
 
 #[cfg(unix)]
@@ -562,6 +789,85 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn same_host_live_marker_ignores_stale_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = ReadMarker::create(dir.path(), "current").unwrap();
+        filetime::set_file_mtime(marker.path(), filetime::FileTime::from_unix_time(0, 0)).unwrap();
+
+        assert!(protected_read_marker_exists(dir.path(), "current"));
+    }
+
+    #[test]
+    fn sweep_removes_dead_same_host_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = read_marker_dir(dir.path(), "old").join("dead.json");
+        let metadata = ReadMarkerMetadata {
+            pid: 0,
+            hostname: current_hostname(),
+            created_at_ms: now_ms(),
+        };
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        write_marker_file(&marker_path, &metadata).unwrap();
+
+        let sweep = sweep_read_markers(dir.path(), "old");
+
+        assert!(!sweep.protected);
+        assert_eq!(sweep.removed_stale, 1);
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn sweep_removes_reused_pid_marker_when_created_at_predates_process_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = read_marker_dir(dir.path(), "old").join("reused.json");
+        let pid = std::process::id();
+        let metadata = ReadMarkerMetadata {
+            pid,
+            hostname: current_hostname(),
+            created_at_ms: 1_000,
+        };
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        write_marker_file(&marker_path, &metadata).unwrap();
+        set_process_start_time_for_test(pid, Some(10_000));
+
+        let sweep = sweep_read_markers(dir.path(), "old");
+        clear_process_start_time_for_test(pid);
+
+        assert!(!sweep.protected);
+        assert_eq!(sweep.removed_stale, 1);
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn sweep_removes_expired_cross_host_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = read_marker_dir(dir.path(), "old").join("cross-host.json");
+        let metadata = ReadMarkerMetadata {
+            pid: 123,
+            hostname: format!("other-{}", current_hostname()),
+            created_at_ms: now_ms(),
+        };
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        write_marker_file(&marker_path, &metadata).unwrap();
+        let stale_time = SystemTime::now()
+            .checked_sub(Duration::from_millis(
+                READ_MARKER_CROSS_HOST_STALE_MS.saturating_add(1_000),
+            ))
+            .unwrap_or(UNIX_EPOCH);
+        filetime::set_file_mtime(
+            &marker_path,
+            filetime::FileTime::from_system_time(stale_time),
+        )
+        .unwrap();
+
+        let sweep = sweep_read_markers(dir.path(), "old");
+
+        assert!(!sweep.protected);
+        assert_eq!(sweep.removed_stale, 1);
+        assert!(!marker_path.exists());
     }
 
     #[cfg(unix)]

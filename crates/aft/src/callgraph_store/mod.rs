@@ -28,6 +28,11 @@ const PROVENANCE_TYPE_MATCH: &str = "type_match";
 const NAME_MATCH_SCORE_THRESHOLD: f64 = 2.0;
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+/// Marker-protected generations older than this absolute age are reclaimed even
+/// if a stale reader marker remains. Current and newest-previous generations are
+/// always retained, bounding the root-keyed callgraph store to roughly two or
+/// three large generations without adding user-visible configuration.
+const MARKED_GENERATION_RETENTION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 // THREAD-LOCAL, not a process-global: the observer fires synchronously on the
@@ -151,7 +156,7 @@ pub struct CallGraphStore {
     /// drop its connection and reopen (see `current_generation`).
     generation: Option<String>,
     writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
-    _read_marker: Option<crate::root_cache::ReadMarker>,
+    read_marker: Option<crate::root_cache::ReadMarker>,
     conn: Mutex<Connection>,
 }
 
@@ -876,6 +881,13 @@ impl CallGraphStore {
             verify_writer_lease(lease)?;
         }
         let root_repair = reconcile_workspace_roots(&mut conn, &project_root)?;
+        let read_marker = match (read_marker, generation.as_deref(), sqlite_path.parent()) {
+            (Some(marker), _, _) => Some(marker),
+            (None, Some(label), Some(cache_dir)) => {
+                Some(crate::root_cache::ReadMarker::create(cache_dir, label)?)
+            }
+            (None, _, _) => None,
+        };
         let store = Self::from_connection(
             project_root,
             project_key,
@@ -890,17 +902,21 @@ impl CallGraphStore {
 
     fn prepare_for_atomic_swap(&self) -> Result<()> {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        conn.execute_batch(self.atomic_swap_checkpoint_sql())?;
+        Ok(())
+    }
+
+    fn atomic_swap_checkpoint_sql(&self) -> &'static str {
         let protected_reader = self.generation.as_deref().is_some_and(|generation| {
             self.sqlite_path
                 .parent()
                 .is_some_and(|dir| crate::root_cache::protected_read_marker_exists(dir, generation))
         });
         if protected_reader {
-            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE); PRAGMA journal_mode=DELETE;")?;
+            "PRAGMA wal_checkpoint(PASSIVE); PRAGMA journal_mode=DELETE;"
         } else {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+            "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"
         }
-        Ok(())
     }
 
     fn from_connection(
@@ -918,7 +934,7 @@ impl CallGraphStore {
             sqlite_path,
             generation,
             writer_lease,
-            _read_marker: read_marker,
+            read_marker,
             conn: Mutex::new(conn),
         }
     }
@@ -948,12 +964,20 @@ impl CallGraphStore {
         verify_writer_lease(lease)
     }
 
+    fn refresh_read_marker(&self) -> Result<()> {
+        if let Some(marker) = self.read_marker.as_ref() {
+            marker.touch_if_due()?;
+        }
+        Ok(())
+    }
+
     /// True if this store still reflects the currently-published generation.
     /// Cheap (one small pointer-file read). When false, another process (or a
     /// local cold rebuild) has published a newer generation and the holder
     /// should drop this store and reopen via the pointer to converge. A missing
     /// pointer keeps the current store (legacy DB still valid, or transient).
     pub fn is_current(&self) -> bool {
+        let _ = self.refresh_read_marker();
         let Some(dir) = self.sqlite_path.parent() else {
             return true;
         };
@@ -1381,6 +1405,7 @@ impl CallGraphStore {
     }
 
     pub fn stale_files(&self) -> Result<Vec<String>> {
+        self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT DISTINCT file_path FROM backend_file_state
@@ -1396,6 +1421,7 @@ impl CallGraphStore {
     }
 
     pub fn backend_status_for_file(&self, file: &Path) -> Result<Option<String>> {
+        self.refresh_read_marker()?;
         let rel_path = relative_path(
             &self.project_root,
             &normalize_file_path(&self.project_root, file)?,
@@ -1417,18 +1443,21 @@ impl CallGraphStore {
     }
 
     pub fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
+        self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         edge_snapshot_with_conn(&conn)
     }
 
     pub fn indexed_file_count(&self) -> Result<usize> {
+        self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         indexed_file_count(&conn)
     }
 
     pub fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
+        self.refresh_read_marker()?;
         let abs_path = normalize_file_path(&self.project_root, file_rel)?;
         let rel_path = relative_path(&self.project_root, &abs_path);
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
@@ -1441,6 +1470,7 @@ impl CallGraphStore {
     /// Consumers that need legacy compatibility can collapse these by
     /// `StoreNode::symbol` before deciding whether a query is ambiguous.
     pub fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.refresh_read_marker()?;
         let abs_path = normalize_file_path(&self.project_root, file_rel)?;
         let rel_path = relative_path(&self.project_root, &abs_path);
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
@@ -1450,6 +1480,7 @@ impl CallGraphStore {
 
     /// Return all positional nodes matching a symbol query anywhere in the store.
     pub fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         nodes_matching_symbol(&conn, symbol)
@@ -1457,6 +1488,7 @@ impl CallGraphStore {
 
     /// Return direct callers for an already-resolved `(file, scoped_symbol)` tuple.
     pub fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
+        self.refresh_read_marker()?;
         let abs_path = normalize_file_path(&self.project_root, file_rel)?;
         let rel_path = relative_path(&self.project_root, &abs_path);
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
@@ -1549,6 +1581,7 @@ impl CallGraphStore {
     }
 
     pub fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         outgoing_calls_for_node(&conn, node)
@@ -1556,12 +1589,14 @@ impl CallGraphStore {
 
     /// Return resolved direct self-call refs suppressed from the general edge table.
     pub fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         resolved_self_calls_for_node(&conn, node)
     }
 
     pub fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         unresolved_calls_for_node(&conn, node)
@@ -1703,6 +1738,7 @@ impl CallGraphStore {
         &self,
         to_symbol: &str,
     ) -> Result<Vec<callgraph::TraceToSymbolCandidate>> {
+        self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         let mut candidates_by_file: HashMap<String, u32> = HashMap::new();
@@ -3268,14 +3304,23 @@ fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) ->
     Ok(())
 }
 
-/// Best-effort GC of superseded generation files. Never touches the current
-/// generation; keeps the most-recent previous generation (so an in-flight
-/// reader that resolved just before a flip can still open it) and a 60s grace
-/// window for the rest. Deletion failures (e.g. a still-open generation on
-/// Windows) are ignored and retried on a later build.
+#[derive(Clone, Debug)]
+struct GenerationGcCandidate {
+    name: String,
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+/// Best-effort GC of superseded generation files. The current pointer target and
+/// newest previous generation are always retained. Older generations are removed
+/// when they have no protected read marker, or after the absolute retention TTL
+/// even if an ultra-stale marker remains. Stale marker files are reclaimed during
+/// every sweep so dead-PID and expired cross-host readers do not pin disk forever.
 fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
-    let grace = Duration::from_secs(60);
+    let temp_grace = Duration::from_secs(60);
     let now = SystemTime::now();
+    let pointer_current =
+        read_pointer(callgraph_dir, project_key).unwrap_or_else(|| current.to_string());
     let gen_prefix = format!("{project_key}.g");
     let tmp_prefixes = [
         format!("{project_key}.g"), // generation build temps (<key>.g...sqlite.tmp.*)
@@ -3285,15 +3330,12 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
     let Ok(entries) = std::fs::read_dir(callgraph_dir) else {
         return;
     };
-    let mut gens: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let mut gens: Vec<GenerationGcCandidate> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or_else(|_| SystemTime::now());
-        let aged_out = now.duration_since(mtime).unwrap_or(Duration::ZERO) >= grace;
+        let name = name.to_string_lossy().to_string();
+        let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(now);
+        let aged_out = now.duration_since(mtime).unwrap_or(Duration::ZERO) >= temp_grace;
 
         // Orphaned temp files from a crashed build/publish: remove once aged out.
         if name.contains(".tmp.") {
@@ -3305,28 +3347,52 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
 
         // Superseded legacy single-file DB: best-effort delete once a generation
         // is published (ignored if another process still holds it open).
-        if *name == *format!("{project_key}.sqlite") {
+        if name == format!("{project_key}.sqlite") {
             remove_sqlite_file_set(&entry.path());
             continue;
         }
 
-        if name.starts_with(&gen_prefix) && name.ends_with(".sqlite") && name != current {
-            gens.push((entry.path(), mtime));
+        if name.starts_with(&gen_prefix) && name.ends_with(".sqlite") {
+            gens.push(GenerationGcCandidate {
+                name,
+                path: entry.path(),
+                modified: mtime,
+            });
         }
     }
-    // Keep the newest superseded generation as a safety net for readers that
-    // resolved the pointer just before the flip; GC the rest after the grace
-    // window. Deletion of a still-open generation (Windows) fails silently and
-    // is retried on a later build.
-    gens.sort_by(|a, b| b.1.cmp(&a.1));
-    for (index, (path, mtime)) in gens.into_iter().enumerate() {
-        if index == 0 {
+
+    let mut superseded = gens
+        .iter()
+        .filter(|generation| generation.name != pointer_current)
+        .collect::<Vec<_>>();
+    superseded.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| right.name.cmp(&left.name))
+    });
+    let previous = superseded.first().map(|generation| generation.name.clone());
+
+    for generation in gens {
+        let sweep = crate::root_cache::sweep_read_markers(callgraph_dir, &generation.name);
+        if generation.name == pointer_current
+            || Some(generation.name.as_str()) == previous.as_deref()
+        {
             continue;
         }
-        if now.duration_since(mtime).unwrap_or(Duration::ZERO) < grace {
+
+        let age = now
+            .duration_since(generation.modified)
+            .unwrap_or(Duration::ZERO);
+        if sweep.protected && age < MARKED_GENERATION_RETENTION_TTL {
             continue;
         }
-        remove_sqlite_file_set(&path);
+
+        remove_sqlite_file_set(&generation.path);
+        let _ = std::fs::remove_dir_all(crate::root_cache::read_marker_dir(
+            callgraph_dir,
+            &generation.name,
+        ));
     }
 }
 
@@ -7872,6 +7938,107 @@ mod cold_build_insert_tests {
             sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
             "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
         );
+    }
+
+    fn write_generation_with_age(
+        dir: &Path,
+        project_key: &str,
+        ordinal: u64,
+        age: Duration,
+    ) -> String {
+        let generation = format!("{project_key}.g{ordinal}.1.sqlite");
+        let path = dir.join(&generation);
+        fs::write(&path, b"sqlite placeholder").unwrap();
+        let mtime = SystemTime::now().checked_sub(age).unwrap_or(UNIX_EPOCH);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(mtime)).unwrap();
+        generation
+    }
+
+    #[test]
+    fn gc_old_generations_preserves_live_reader_until_marker_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_key = "project";
+        let current = write_generation_with_age(dir.path(), project_key, 400, Duration::ZERO);
+        let previous =
+            write_generation_with_age(dir.path(), project_key, 300, Duration::from_secs(1));
+        let pinned =
+            write_generation_with_age(dir.path(), project_key, 200, Duration::from_secs(2));
+        let marker = crate::root_cache::ReadMarker::create(dir.path(), &pinned).unwrap();
+
+        gc_old_generations(dir.path(), project_key, &current);
+
+        assert!(dir.path().join(&previous).is_file());
+        assert!(dir.path().join(&pinned).is_file());
+
+        drop(marker);
+        gc_old_generations(dir.path(), project_key, &current);
+
+        assert!(dir.path().join(&previous).is_file());
+        assert!(!dir.path().join(&pinned).exists());
+    }
+
+    #[test]
+    fn gc_old_generations_ignores_same_host_marker_mtime_for_live_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_key = "project";
+        let current = write_generation_with_age(dir.path(), project_key, 400, Duration::ZERO);
+        let _previous =
+            write_generation_with_age(dir.path(), project_key, 300, Duration::from_secs(1));
+        let pinned =
+            write_generation_with_age(dir.path(), project_key, 200, Duration::from_secs(2));
+        let marker = crate::root_cache::ReadMarker::create(dir.path(), &pinned).unwrap();
+        filetime::set_file_mtime(marker.path(), filetime::FileTime::from_unix_time(0, 0)).unwrap();
+
+        gc_old_generations(dir.path(), project_key, &current);
+
+        assert!(dir.path().join(&pinned).is_file());
+    }
+
+    #[test]
+    fn gc_old_generations_applies_retention_ttl_to_marked_old_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_key = "project";
+        let expired = MARKED_GENERATION_RETENTION_TTL + Duration::from_secs(60);
+        let current = write_generation_with_age(dir.path(), project_key, 400, Duration::ZERO);
+        let previous = write_generation_with_age(dir.path(), project_key, 300, expired);
+        let old = write_generation_with_age(
+            dir.path(),
+            project_key,
+            200,
+            expired + Duration::from_secs(60),
+        );
+        let _marker = crate::root_cache::ReadMarker::create(dir.path(), &old).unwrap();
+
+        gc_old_generations(dir.path(), project_key, &current);
+
+        assert!(dir.path().join(&current).is_file());
+        assert!(dir.path().join(&previous).is_file());
+        assert!(!dir.path().join(&old).exists());
+    }
+
+    #[test]
+    fn atomic_swap_checkpoint_uses_passive_when_live_marker_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_key = "project".to_string();
+        let generation = write_generation_with_age(dir.path(), &project_key, 100, Duration::ZERO);
+        let sqlite_path = dir.path().join(&generation);
+        fs::remove_file(&sqlite_path).unwrap();
+        let conn = Connection::open(&sqlite_path).unwrap();
+        let store = CallGraphStore::from_connection(
+            dir.path().to_path_buf(),
+            project_key,
+            sqlite_path,
+            Some(generation.clone()),
+            None,
+            None,
+            conn,
+        );
+
+        let marker = crate::root_cache::ReadMarker::create(dir.path(), &generation).unwrap();
+        assert!(store.atomic_swap_checkpoint_sql().contains("PASSIVE"));
+
+        drop(marker);
+        assert!(store.atomic_swap_checkpoint_sql().contains("TRUNCATE"));
     }
 
     #[test]
