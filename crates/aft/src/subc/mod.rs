@@ -2057,16 +2057,15 @@ async fn handle_route_bind_completion(
         );
         let message = response_message(response, fallback);
         let fatal = response_is_fatal_panic(response);
-        // Preserve typed configure rejections across the bind boundary: a
-        // malformed fed fingerprint means a federation-module bug or
-        // fingerprint-format drift, and the fed side matches on the code
-        // rather than parsing prose.
-        let error_code = if response.data.get("code").and_then(|c| c.as_str())
-            == Some("bad_harness_fingerprint")
-        {
-            "bad_harness_fingerprint"
-        } else {
-            "config_divergence"
+        // Preserve typed configure rejections across the bind boundary. Fed
+        // fingerprint failures are caller bugs, and cache-key probe failures
+        // are retryable root binds; both callers match on codes rather than
+        // parsing prose.
+        let response_code = response.data.get("code").and_then(|c| c.as_str());
+        let error_code = match response_code {
+            Some("bad_harness_fingerprint") => "bad_harness_fingerprint",
+            Some("cache_key_probe_failed") => "cache_key_probe_failed",
+            _ => "config_divergence",
         };
         send_route_bind_error_parts(
             tx,

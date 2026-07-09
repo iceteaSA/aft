@@ -8,8 +8,9 @@ use std::process::Command;
 // for that project.
 use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
 use crate::search_index::{
-    artifact_cache_key, build_path_filters, resolve_cache_dir, walk_project_files,
-    walk_project_files_bounded_matching, SearchIndex,
+    artifact_cache_key_with_memo, build_path_filters, resolve_cache_dir,
+    resolve_cache_dir_with_key, walk_project_files, walk_project_files_bounded_matching,
+    SearchIndex,
 };
 use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex};
 
@@ -65,7 +66,18 @@ pub(crate) fn open_search_index_read_only(
     project_root: &Path,
     storage_dir: Option<&Path>,
 ) -> ReadOnlyArtifact<SearchIndex> {
-    let cache_dir = resolve_cache_dir(project_root, storage_dir);
+    let cache_dir = match storage_dir {
+        Some(storage_dir) => {
+            match artifact_cache_key_with_memo(project_root, project_root, storage_dir, None) {
+                Ok(project_key) => resolve_cache_dir_with_key(&project_key, Some(storage_dir)),
+                Err(error) => {
+                    crate::slog_warn!("read-only search index unavailable: {}", error);
+                    return ReadOnlyArtifact::Absent;
+                }
+            }
+        }
+        None => resolve_cache_dir(project_root, None),
+    };
     if !cache_dir.join("cache.bin").is_file() {
         return ReadOnlyArtifact::Absent;
     }
@@ -96,7 +108,14 @@ pub(crate) fn open_semantic_index_read_only(
     let Some(storage_dir) = storage_dir else {
         return ReadOnlyArtifact::Absent;
     };
-    let project_key = artifact_cache_key(project_root);
+    let project_key =
+        match artifact_cache_key_with_memo(project_root, project_root, storage_dir, None) {
+            Ok(project_key) => project_key,
+            Err(error) => {
+                crate::slog_warn!("read-only semantic index unavailable: {}", error);
+                return ReadOnlyArtifact::Absent;
+            }
+        };
     let data_path = storage_dir
         .join("semantic")
         .join(&project_key)
@@ -255,6 +274,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::search_index::artifact_cache_key;
     use crate::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
 
     #[derive(Debug, PartialEq, Eq)]
@@ -465,6 +485,8 @@ mod tests {
         let storage = tempfile::tempdir().expect("storage");
         let search_cache_dir = build_search_artifact(&root, storage.path());
         build_semantic_artifact(&root, storage.path());
+        artifact_cache_key_with_memo(&root, &root, storage.path(), None)
+            .expect("seed cache-key memo before read-only snapshot");
         let semantic_cache_dir = storage
             .path()
             .join("semantic")

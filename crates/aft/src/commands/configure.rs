@@ -23,8 +23,8 @@ use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    build_path_filters, current_git_head, resolve_cache_dir, walk_project_files_bounded_matching,
-    CacheLock, SearchIndex,
+    build_path_filters, current_git_head, resolve_cache_dir_with_key,
+    walk_project_files_bounded_matching, CacheLock, SearchIndex,
 };
 use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
 use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
@@ -1586,35 +1586,66 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let format_tool_cache_clear_needed = previous_project_root.as_ref() != Some(&root_path);
 
-    let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
-    let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
-    let artifact_owner_claim = if home_match {
-        None
-    } else if is_worktree_bridge {
-        Some(crate::artifact_owner::open_read_only_borrow(
-            next_config.storage_dir.as_deref(),
-            &canonical_cache_root,
-            &project_key,
-            &project_scope_key,
-        ))
+    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let artifact_key_needed = !home_match
+        && (next_config.search_index || next_config.semantic_search || next_config.callgraph_store);
+    let project_key = if artifact_key_needed {
+        Some(
+            match ctx.memoized_artifact_cache_key_for_configure(
+                &root_path,
+                &canonical_cache_root,
+                &storage_root,
+                git_common_dir.as_deref(),
+            ) {
+                Ok(key) => key,
+                Err(error) => {
+                    return Response::error_with_data(
+                        &req.id,
+                        "cache_key_probe_failed",
+                        error.to_string(),
+                        json!({
+                            "retryable": true,
+                            "root": error.root().display().to_string(),
+                            "detail": error.detail(),
+                        }),
+                    );
+                }
+            },
+        )
     } else {
-        match crate::artifact_owner::claim_or_open_read_only(
-            next_config.storage_dir.as_deref(),
-            &canonical_cache_root,
-            &project_key,
-            &project_scope_key,
-            git_common_dir.as_deref(),
-        ) {
-            Ok(claim) => Some(claim),
-            Err(error) => {
-                return Response::error(
-                    &req.id,
-                    "artifact_owner_unavailable",
-                    format!("failed to claim artifact owner manifest: {error}"),
-                );
+        None
+    };
+    let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
+    let artifact_owner_claim = if let Some(project_key) = project_key.as_ref() {
+        if is_worktree_bridge {
+            Some(crate::artifact_owner::open_read_only_borrow(
+                next_config.storage_dir.as_deref(),
+                &canonical_cache_root,
+                project_key,
+                &project_scope_key,
+            ))
+        } else {
+            match crate::artifact_owner::claim_or_open_read_only(
+                next_config.storage_dir.as_deref(),
+                &canonical_cache_root,
+                project_key,
+                &project_scope_key,
+                git_common_dir.as_deref(),
+            ) {
+                Ok(claim) => Some(claim),
+                Err(error) => {
+                    return Response::error(
+                        &req.id,
+                        "artifact_owner_unavailable",
+                        format!("failed to claim artifact owner manifest: {error}"),
+                    );
+                }
             }
         }
+    } else {
+        None
     };
+    let project_key = project_key.unwrap_or_default();
     let artifact_owner_status = artifact_owner_claim
         .as_ref()
         .map(|claim| claim.status.clone());
@@ -1630,7 +1661,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             slog_warn!("{}", note);
         }
     }
-    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
     let root_cache_storage_ok = match crate::root_cache::storage_allows_root_keyed(&storage_root) {
         Ok(true) => true,
         Ok(false) => {
@@ -1826,7 +1856,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let storage_dir = ctx.config().storage_dir.clone();
 
         if search_index {
-            let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
+            let cache_dir = resolve_cache_dir_with_key(&project_key, storage_dir.as_deref());
             let current_head = current_git_head(&canonical_cache_root);
 
             let root_for_prewarm = canonical_cache_root.clone();
@@ -3416,6 +3446,45 @@ mod tests {
     }
 
     #[test]
+    fn handle_configure_rejects_git_like_root_when_cache_key_probe_fails_without_memo() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("create git marker");
+        let storage = temp.path().join("storage");
+        let canonical_root = std::fs::canonicalize(&root).expect("canonical root");
+        let _override =
+            crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+                vec![root.clone(), canonical_root],
+                "spawn failed: Too many open files (os error 24)",
+            );
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": root.clone(),
+            "harness": "opencode",
+            "storage_dir": storage.clone(),
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false,
+            }))],
+        }));
+
+        let response = handle_configure_for_test(&req, &ctx);
+
+        assert!(
+            !response.success,
+            "configure must reject ambiguous git identity"
+        );
+        assert_eq!(response.data["code"], "cache_key_probe_failed");
+        assert_eq!(response.data["retryable"], true);
+        let path_key = crate::search_index::artifact_path_identity_key_for_test(&root);
+        assert!(!storage.join("index").join(&path_key).exists());
+        assert!(!storage.join("semantic").join(&path_key).exists());
+        assert!(!storage.join("callgraph").join(&path_key).exists());
+    }
+
+    #[test]
     fn sibling_clone_same_artifact_key_opens_shared_artifacts_read_only() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
@@ -3841,7 +3910,10 @@ mod tests {
             ctx.tsconfig_membership_clear_generation_for_test();
         let filter_rebuilds_after_first = ctx.filter_registry_rebuild_count_for_test();
         let artifact_derivations_after_first = ctx.artifact_cache_key_derivation_count_for_test();
-        assert_eq!(artifact_derivations_after_first, 1);
+        assert_eq!(
+            artifact_derivations_after_first, 0,
+            "configure should not derive an unused artifact key when artifact-backed features are disabled"
+        );
         for _ in 0..5 {
             let response = handle_configure_for_test(&req, &ctx);
             assert!(response.success);

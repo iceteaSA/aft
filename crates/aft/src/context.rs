@@ -1586,6 +1586,38 @@ impl AppContext {
         key
     }
 
+    pub fn memoized_artifact_cache_key_for_configure(
+        &self,
+        raw_root: &Path,
+        canonical_root: &Path,
+        storage_root: &Path,
+        git_common_dir: Option<&Path>,
+    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+        {
+            let keys = self.artifact_cache_keys.lock();
+            if let Some(key) = keys
+                .get(canonical_root)
+                .or_else(|| keys.get(raw_root))
+                .cloned()
+            {
+                return Ok(key);
+            }
+        }
+
+        let key = crate::search_index::artifact_cache_key_with_memo(
+            canonical_root,
+            raw_root,
+            storage_root,
+            git_common_dir,
+        )?;
+        self.artifact_cache_key_derivations
+            .fetch_add(1, Ordering::SeqCst);
+        let mut keys = self.artifact_cache_keys.lock();
+        keys.insert(canonical_root.to_path_buf(), key.clone());
+        keys.insert(raw_root.to_path_buf(), key.clone());
+        Ok(key)
+    }
+
     #[cfg(test)]
     pub fn artifact_cache_key_derivation_count_for_test(&self) -> u64 {
         self.artifact_cache_key_derivations.load(Ordering::SeqCst)
@@ -2385,8 +2417,11 @@ impl AppContext {
             return false;
         };
         let config = self.config();
-        let cache_dir =
-            crate::search_index::resolve_cache_dir(&canonical_root, config.storage_dir.as_deref());
+        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let cache_dir = crate::search_index::resolve_cache_dir_with_key(
+            &project_key,
+            config.storage_dir.as_deref(),
+        );
 
         {
             let search_index = self

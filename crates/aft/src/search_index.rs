@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,7 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use regex::bytes::Regex;
 use regex_syntax::hir::{Hir, HirKind};
+use serde::{Deserialize, Serialize};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::fs_lock;
@@ -39,7 +40,29 @@ const MAX_ENTRIES: usize = 10_000_000;
 const MIN_FILE_ENTRY_BYTES: usize = 57;
 const LOOKUP_ENTRY_BYTES: usize = 16;
 const POSTING_BYTES: usize = 6;
+const ARTIFACT_CACHE_KEY_MEMO_FILE: &str = "cache-keys.json";
 static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
+static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
+
+#[cfg(test)]
+type RootCommitProbeOverride =
+    Arc<dyn Fn(&Path) -> Option<RootCommitProbe> + Send + Sync + 'static>;
+
+#[cfg(test)]
+static GIT_ROOT_COMMIT_PROBE_OVERRIDE: OnceLock<Mutex<Option<RootCommitProbeOverride>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ArtifactCacheKeyMemoEntry {
+    key: String,
+    git_root_commit: String,
+    recorded_at_ms: u64,
+}
+
+#[derive(Default)]
+struct ArtifactCacheKeyMemoState {
+    by_storage_root: BTreeMap<PathBuf, BTreeMap<String, ArtifactCacheKeyMemoEntry>>,
+}
 
 pub struct CacheLock {
     _guard: fs_lock::LockGuard,
@@ -2863,23 +2886,7 @@ fn lexical_score_snapshot(
 }
 
 pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> PathBuf {
-    // Respect AFT_CACHE_DIR for testing — prevents tests from polluting the user's storage
-    if let Some(override_dir) = std::env::var_os("AFT_CACHE_DIR") {
-        return PathBuf::from(override_dir)
-            .join("index")
-            .join(artifact_cache_key(project_root));
-    }
-    // Use configured storage dir (from plugin, XDG-compliant)
-    if let Some(dir) = storage_dir {
-        return dir.join("index").join(artifact_cache_key(project_root));
-    }
-    // No configured dir: use the same CortexKit shared data root the plugins
-    // inject, so plugin-less invocations (daemon module, bare CLI) share one
-    // storage universe with plugin sessions instead of splitting caches and
-    // artifact-owner manifests across two roots.
-    crate::bash_background::storage_dir(None)
-        .join("index")
-        .join(artifact_cache_key(project_root))
+    resolve_cache_dir_with_key(&artifact_cache_key(project_root), storage_dir)
 }
 
 pub(crate) fn build_path_filters(
@@ -3242,26 +3249,296 @@ pub(crate) fn current_git_head(root: &Path) -> Option<String> {
     run_git(root, &["rev-parse", "HEAD"])
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactCacheKeyProbeError {
+    root: PathBuf,
+    detail: String,
+}
+
+impl ArtifactCacheKeyProbeError {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for ArtifactCacheKeyProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "artifact cache key probe failed for {}: {}",
+            self.root.display(),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for ArtifactCacheKeyProbeError {}
+
 pub fn artifact_cache_key(project_root: &Path) -> String {
+    match repo_root_commit_with_retry(project_root) {
+        RootCommitResolution::Commit(root_commit) => artifact_key_from_git_identity(&root_commit),
+        RootCommitResolution::NotARepo => artifact_key_from_path_identity(project_root),
+        RootCommitResolution::Failed(detail) => {
+            crate::slog_warn!(
+                "artifact cache key: git root-commit probe failed after retries ({}); \
+                 falling back to path identity for {}",
+                detail,
+                project_root.display()
+            );
+            artifact_key_from_path_identity(project_root)
+        }
+    }
+}
+
+pub fn artifact_cache_key_with_memo(
+    probe_root: &Path,
+    memo_root: &Path,
+    storage_root: &Path,
+    git_common_dir: Option<&Path>,
+) -> Result<String, ArtifactCacheKeyProbeError> {
+    let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
+    let git_marker_state = root_git_marker_state(probe_root, git_common_dir);
+    if git_marker_state == GitMarkerState::Absent {
+        return Ok(artifact_key_from_path_identity(probe_root));
+    }
+
+    match repo_root_commit_with_retry(probe_root) {
+        RootCommitResolution::Commit(root_commit) => {
+            let key = artifact_key_from_git_identity(&root_commit);
+            if let Err(error) =
+                record_artifact_cache_key_memo(storage_root, &memo_root_key, &key, &root_commit)
+            {
+                crate::slog_warn!(
+                    "artifact cache key: failed to persist memo for {} in {}: {}",
+                    memo_root.display(),
+                    storage_root.display(),
+                    error
+                );
+            }
+            Ok(key)
+        }
+        RootCommitResolution::NotARepo => Ok(artifact_key_from_path_identity(probe_root)),
+        RootCommitResolution::Failed(detail) => {
+            if let Some(entry) = lookup_artifact_cache_key_memo(storage_root, &memo_root_key) {
+                crate::slog_warn!(
+                    "artifact cache key: probe failed, using memoized key {} for {}",
+                    entry.key,
+                    memo_root.display()
+                );
+                return Ok(entry.key);
+            }
+
+            match git_marker_state {
+                GitMarkerState::Absent => Ok(artifact_key_from_path_identity(probe_root)),
+                GitMarkerState::Present => Err(ArtifactCacheKeyProbeError {
+                    root: memo_root.to_path_buf(),
+                    detail,
+                }),
+                GitMarkerState::Unknown(marker_detail) => Err(ArtifactCacheKeyProbeError {
+                    root: memo_root.to_path_buf(),
+                    detail: format!("{detail}; {marker_detail}"),
+                }),
+            }
+        }
+    }
+}
+
+pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>) -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("AFT_CACHE_DIR") {
+        return PathBuf::from(override_dir).join("index").join(project_key);
+    }
+    if let Some(dir) = storage_dir {
+        return dir.join("index").join(project_key);
+    }
+    crate::bash_background::storage_dir(None)
+        .join("index")
+        .join(project_key)
+}
+
+fn artifact_key_from_git_identity(root_commit: &str) -> String {
+    artifact_hash16(root_commit.as_bytes())
+}
+
+fn artifact_key_from_path_identity(project_root: &Path) -> String {
+    let canonical_root = canonicalize_or_normalize(project_root);
+    artifact_hash16(canonical_root.to_string_lossy().as_bytes())
+}
+
+#[cfg(test)]
+pub(crate) fn artifact_path_identity_key_for_test(project_root: &Path) -> String {
+    artifact_key_from_path_identity(project_root)
+}
+
+fn artifact_hash16(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
-
-    match repo_root_commit_with_retry(project_root) {
-        Some(root_commit) => {
-            // Git repo: root commit is the unique identity.
-            // Same repo cloned anywhere produces the same key.
-            hasher.update(root_commit.as_bytes());
-        }
-        None => {
-            // Non-git project: use the canonical filesystem path as identity.
-            let canonical_root = canonicalize_or_normalize(project_root);
-            hasher.update(canonical_root.to_string_lossy().as_bytes());
-        }
-    }
-
+    hasher.update(bytes);
     let digest = format!("{:x}", hasher.finalize());
     digest[..16].to_string()
+}
+
+fn artifact_cache_key_memo_root_key(root: &Path) -> String {
+    root.to_string_lossy().into_owned()
+}
+
+fn artifact_cache_key_memo_path(storage_root: &Path) -> PathBuf {
+    storage_root.join(ARTIFACT_CACHE_KEY_MEMO_FILE)
+}
+
+fn artifact_cache_key_memo_state() -> &'static Mutex<ArtifactCacheKeyMemoState> {
+    ARTIFACT_CACHE_KEY_MEMO_STATE.get_or_init(|| Mutex::new(ArtifactCacheKeyMemoState::default()))
+}
+
+impl ArtifactCacheKeyMemoState {
+    fn entries_for_storage_root(
+        &mut self,
+        storage_root: &Path,
+    ) -> &mut BTreeMap<String, ArtifactCacheKeyMemoEntry> {
+        if !self.by_storage_root.contains_key(storage_root) {
+            let entries = read_artifact_cache_key_memo_file(storage_root);
+            self.by_storage_root
+                .insert(storage_root.to_path_buf(), entries);
+        }
+        self.by_storage_root
+            .get_mut(storage_root)
+            .expect("memo storage root inserted")
+    }
+}
+
+fn lookup_artifact_cache_key_memo(
+    storage_root: &Path,
+    memo_root_key: &str,
+) -> Option<ArtifactCacheKeyMemoEntry> {
+    let mut state = artifact_cache_key_memo_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+        .entries_for_storage_root(storage_root)
+        .get(memo_root_key)
+        .cloned()
+}
+
+fn record_artifact_cache_key_memo(
+    storage_root: &Path,
+    memo_root_key: &str,
+    key: &str,
+    git_root_commit: &str,
+) -> std::io::Result<()> {
+    let mut state = artifact_cache_key_memo_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entries = state.entries_for_storage_root(storage_root);
+    if entries
+        .get(memo_root_key)
+        .is_some_and(|entry| entry.key == key && entry.git_root_commit == git_root_commit)
+    {
+        return Ok(());
+    }
+    entries.insert(
+        memo_root_key.to_string(),
+        ArtifactCacheKeyMemoEntry {
+            key: key.to_string(),
+            git_root_commit: git_root_commit.to_string(),
+            recorded_at_ms: current_time_millis(),
+        },
+    );
+    write_artifact_cache_key_memo_file(storage_root, entries)
+}
+
+fn read_artifact_cache_key_memo_file(
+    storage_root: &Path,
+) -> BTreeMap<String, ArtifactCacheKeyMemoEntry> {
+    let path = artifact_cache_key_memo_path(storage_root);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return BTreeMap::new(),
+    };
+    let entries =
+        match serde_json::from_slice::<BTreeMap<String, ArtifactCacheKeyMemoEntry>>(&bytes) {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::slog_warn!(
+                    "artifact cache key: ignoring corrupt memo file {}: {}",
+                    path.display(),
+                    error
+                );
+                return BTreeMap::new();
+            }
+        };
+    entries
+        .into_iter()
+        .filter(|(root, entry)| {
+            !root.is_empty()
+                && artifact_key_looks_valid(&entry.key)
+                && !entry.git_root_commit.trim().is_empty()
+        })
+        .collect()
+}
+
+fn write_artifact_cache_key_memo_file(
+    storage_root: &Path,
+    entries: &BTreeMap<String, ArtifactCacheKeyMemoEntry>,
+) -> std::io::Result<()> {
+    fs::create_dir_all(storage_root)?;
+    let path = artifact_cache_key_memo_path(storage_root);
+    let temp_path = storage_root.join(format!(
+        ".{ARTIFACT_CACHE_KEY_MEMO_FILE}.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let bytes = serde_json::to_vec_pretty(entries).map_err(std::io::Error::other)?;
+    {
+        let mut file = File::create(&temp_path)?;
+        file.write_all(&bytes)?;
+    }
+    if let Err(error) = fs::rename(&temp_path, &path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn artifact_key_looks_valid(key: &str) -> bool {
+    key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GitMarkerState {
+    Present,
+    Absent,
+    Unknown(String),
+}
+
+fn root_git_marker_state(project_root: &Path, git_common_dir: Option<&Path>) -> GitMarkerState {
+    if git_common_dir.is_some() {
+        return GitMarkerState::Present;
+    }
+    let git_marker = project_root.join(".git");
+    match fs::symlink_metadata(&git_marker) {
+        Ok(_) => GitMarkerState::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitMarkerState::Absent,
+        Err(error) => GitMarkerState::Unknown(format!(
+            "failed to inspect git marker {}: {}",
+            git_marker.display(),
+            error
+        )),
+    }
 }
 
 /// Resolve the repository root commit, retrying transient git failures.
@@ -3270,39 +3547,58 @@ pub fn artifact_cache_key(project_root: &Path) -> String {
 /// one repo that key differently (one by commit, one by path) each claim
 /// artifact ownership and write the shared cache concurrently. A git
 /// invocation that fails under load (spawn failure, resource exhaustion) must
-/// therefore be retried, and only deterministic outcomes (not a repo, no
-/// commits yet) may fall back to path identity silently.
-fn repo_root_commit_with_retry(project_root: &Path) -> Option<String> {
+/// therefore be retried, and callers that need stable identity can refuse path
+/// fallback when the result is still ambiguous after retry.
+fn repo_root_commit_with_retry(project_root: &Path) -> RootCommitResolution {
     for attempt in 0..3u32 {
         match git_root_commit_once(project_root) {
-            RootCommitProbe::Commit(commit) => return Some(commit),
-            RootCommitProbe::NotARepo => return None,
+            RootCommitProbe::Commit(commit) => return RootCommitResolution::Commit(commit),
+            RootCommitProbe::NotARepo => return RootCommitResolution::NotARepo,
+            RootCommitProbe::NoCommit => return RootCommitResolution::NotARepo,
             RootCommitProbe::Transient(detail) => {
                 if attempt == 2 {
-                    crate::slog_warn!(
-                        "artifact cache key: git root-commit probe failed after retries ({}); \
-                         falling back to path identity for {}",
-                        detail,
-                        project_root.display()
-                    );
-                    return None;
+                    return RootCommitResolution::Failed(detail);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
             }
         }
     }
-    None
+    RootCommitResolution::Failed("git root-commit probe retry loop exhausted".to_string())
+}
+
+enum RootCommitResolution {
+    Commit(String),
+    NotARepo,
+    Failed(String),
 }
 
 enum RootCommitProbe {
     Commit(String),
-    /// Deterministic: not a git work tree, or a repo with no commits yet.
+    /// Deterministic: not a git work tree.
     NotARepo,
+    /// Deterministic but still git-like: a repository exists but has no commit identity yet.
+    NoCommit,
     /// Ambiguous failure (spawn error, killed, unexpected git error): retry.
     Transient(String),
 }
 
 fn git_root_commit_once(project_root: &Path) -> RootCommitProbe {
+    #[cfg(test)]
+    if let Some(override_probe) = GIT_ROOT_COMMIT_PROBE_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        if let Some(result) = override_probe(project_root) {
+            return result;
+        }
+    }
+
+    git_root_commit_once_real(project_root)
+}
+
+fn git_root_commit_once_real(project_root: &Path) -> RootCommitProbe {
     let output = match Command::new("git")
         .arg("-C")
         .arg(project_root)
@@ -3316,24 +3612,91 @@ fn git_root_commit_once(project_root: &Path) -> RootCommitProbe {
     if output.status.success() {
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if value.is_empty() {
-            return RootCommitProbe::NotARepo;
+            return RootCommitProbe::NoCommit;
         }
         return RootCommitProbe::Commit(value);
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("not a git repository")
-        || stderr.contains("unknown revision")
+    if stderr.contains("not a git repository") {
+        return RootCommitProbe::NotARepo;
+    }
+    if stderr.contains("unknown revision")
         || stderr.contains("bad revision")
         || stderr.contains("ambiguous argument 'HEAD'")
     {
-        return RootCommitProbe::NotARepo;
+        return RootCommitProbe::NoCommit;
     }
     RootCommitProbe::Transient(format!(
         "exit {:?}: {}",
         output.status.code(),
         stderr.trim().chars().take(200).collect::<String>()
     ))
+}
+
+#[cfg(test)]
+pub(crate) struct GitRootCommitProbeOverrideGuard {
+    previous: Option<RootCommitProbeOverride>,
+}
+
+#[cfg(test)]
+impl Drop for GitRootCommitProbeOverrideGuard {
+    fn drop(&mut self) {
+        set_git_root_commit_probe_override_for_test(self.previous.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn git_root_commit_probe_override_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) fn force_git_root_commit_probe_transient_for_paths_for_test(
+    roots: Vec<PathBuf>,
+    detail: impl Into<String>,
+) -> GitRootCommitProbeOverrideGuard {
+    let detail = Arc::new(detail.into());
+    install_git_root_commit_probe_override_for_test(move |project_root| {
+        roots
+            .iter()
+            .any(|root| root == project_root)
+            .then(|| RootCommitProbe::Transient((*detail).clone()))
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn force_git_root_commit_probe_commits_for_test(
+    commits_by_root: BTreeMap<PathBuf, String>,
+) -> GitRootCommitProbeOverrideGuard {
+    install_git_root_commit_probe_override_for_test(move |project_root| {
+        commits_by_root
+            .get(project_root)
+            .cloned()
+            .map(RootCommitProbe::Commit)
+    })
+}
+
+#[cfg(test)]
+fn install_git_root_commit_probe_override_for_test(
+    override_probe: impl Fn(&Path) -> Option<RootCommitProbe> + Send + Sync + 'static,
+) -> GitRootCommitProbeOverrideGuard {
+    let previous = set_git_root_commit_probe_override_for_test(Some(Arc::new(override_probe)));
+    GitRootCommitProbeOverrideGuard { previous }
+}
+
+#[cfg(test)]
+fn set_git_root_commit_probe_override_for_test(
+    override_probe: Option<RootCommitProbeOverride>,
+) -> Option<RootCommitProbeOverride> {
+    let mut slot = GIT_ROOT_COMMIT_PROBE_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::replace(&mut *slot, override_probe)
 }
 
 /// Fingerprint corpus-shaping ignore rules that are not represented by git HEAD.
@@ -4550,6 +4913,170 @@ mod tests {
         assert_eq!(clone_key.len(), 16);
         // Same repo (same root commit) → same cache key regardless of clone path
         assert_eq!(source_key, clone_key);
+    }
+
+    fn read_cache_key_memo(storage_root: &Path) -> BTreeMap<String, ArtifactCacheKeyMemoEntry> {
+        let bytes = fs::read(artifact_cache_key_memo_path(storage_root)).expect("read memo file");
+        serde_json::from_slice(&bytes).expect("parse memo file")
+    }
+
+    fn git_like_root(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        let root = dir.path().join(name);
+        fs::create_dir_all(root.join(".git")).expect("create git marker");
+        root
+    }
+
+    #[test]
+    fn artifact_cache_key_success_writes_memo() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let root = git_like_root(&dir, "repo");
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let mut commits = BTreeMap::new();
+        commits.insert(root.clone(), commit.clone());
+        let _override = force_git_root_commit_probe_commits_for_test(commits);
+
+        let key = artifact_cache_key_with_memo(&root, &root, &storage, None)
+            .expect("cache key from successful probe");
+
+        assert_eq!(key, artifact_key_from_git_identity(&commit));
+        let memo = read_cache_key_memo(&storage);
+        let entry = memo
+            .get(root.to_string_lossy().as_ref())
+            .expect("memo entry for root");
+        assert_eq!(entry.key, key);
+        assert_eq!(entry.git_root_commit, commit);
+        assert!(entry.recorded_at_ms > 0);
+    }
+
+    #[test]
+    fn artifact_cache_key_probe_failure_uses_memoized_key() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let root = git_like_root(&dir, "repo");
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let expected_key = artifact_key_from_git_identity(&commit);
+        {
+            let mut commits = BTreeMap::new();
+            commits.insert(root.clone(), commit);
+            let _override = force_git_root_commit_probe_commits_for_test(commits);
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None).expect("initial key"),
+                expected_key
+            );
+        }
+        let _override = force_git_root_commit_probe_transient_for_paths_for_test(
+            vec![root.clone()],
+            "spawn failed: Too many open files (os error 24)",
+        );
+
+        let rescued = artifact_cache_key_with_memo(&root, &root, &storage, None)
+            .expect("memo should rescue transient probe failure");
+
+        assert_eq!(rescued, expected_key);
+        assert_ne!(rescued, artifact_key_from_path_identity(&root));
+    }
+
+    #[test]
+    fn artifact_cache_key_probe_failure_without_memo_rejects_git_like_root() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let root = git_like_root(&dir, "repo");
+        let _override = force_git_root_commit_probe_transient_for_paths_for_test(
+            vec![root.clone()],
+            "spawn failed: Too many open files (os error 24)",
+        );
+
+        let error = artifact_cache_key_with_memo(&root, &root, &storage, None)
+            .expect_err("git-like root without memo must not use path identity");
+
+        assert_eq!(error.root(), root.as_path());
+        assert!(error.detail().contains("Too many open files"));
+    }
+
+    #[test]
+    fn artifact_cache_key_probe_failure_without_git_marker_uses_path_identity() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let root = dir.path().join("plain");
+        fs::create_dir_all(&root).expect("create non-git root");
+        let _override = force_git_root_commit_probe_transient_for_paths_for_test(
+            vec![root.clone()],
+            "spawn failed: Too many open files (os error 24)",
+        );
+
+        let key = artifact_cache_key_with_memo(&root, &root, &storage, None)
+            .expect("non-git root keeps legacy path identity fallback");
+
+        assert_eq!(key, artifact_key_from_path_identity(&root));
+    }
+
+    #[test]
+    fn artifact_cache_key_corrupt_memo_is_absent_not_a_path_identity_escape() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        fs::create_dir_all(&storage).expect("create storage root");
+        fs::write(artifact_cache_key_memo_path(&storage), b"not json").expect("write corrupt memo");
+        let root = git_like_root(&dir, "repo");
+        let _override = force_git_root_commit_probe_transient_for_paths_for_test(
+            vec![root.clone()],
+            "spawn failed: Too many open files (os error 24)",
+        );
+
+        let error = artifact_cache_key_with_memo(&root, &root, &storage, None)
+            .expect_err("corrupt memo is treated as absent");
+
+        assert!(error.detail().contains("Too many open files"));
+    }
+
+    #[test]
+    fn artifact_cache_key_concurrent_memo_writes_keep_valid_json() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let root_a = git_like_root(&dir, "repo-a");
+        let root_b = git_like_root(&dir, "repo-b");
+        let commit_a = "cccccccccccccccccccccccccccccccccccccccc".to_string();
+        let commit_b = "dddddddddddddddddddddddddddddddddddddddd".to_string();
+        let mut commits = BTreeMap::new();
+        commits.insert(root_a.clone(), commit_a.clone());
+        commits.insert(root_b.clone(), commit_b.clone());
+        let _override = force_git_root_commit_probe_commits_for_test(commits);
+
+        let storage_a = storage.clone();
+        let thread_a = std::thread::spawn({
+            let root_a = root_a.clone();
+            move || artifact_cache_key_with_memo(&root_a, &root_a, &storage_a, None)
+        });
+        let storage_b = storage.clone();
+        let thread_b = std::thread::spawn({
+            let root_b = root_b.clone();
+            move || artifact_cache_key_with_memo(&root_b, &root_b, &storage_b, None)
+        });
+
+        let key_a = thread_a.join().expect("join writer a").expect("key a");
+        let key_b = thread_b.join().expect("join writer b").expect("key b");
+        let memo = read_cache_key_memo(&storage);
+
+        assert_eq!(
+            memo.get(root_a.to_string_lossy().as_ref())
+                .expect("root a memo")
+                .key,
+            key_a
+        );
+        assert_eq!(
+            memo.get(root_b.to_string_lossy().as_ref())
+                .expect("root b memo")
+                .key,
+            key_b
+        );
+        assert_eq!(key_a, artifact_key_from_git_identity(&commit_a));
+        assert_eq!(key_b, artifact_key_from_git_identity(&commit_b));
     }
 
     #[test]

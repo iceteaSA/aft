@@ -1031,11 +1031,14 @@ pub fn spawn_search_corpus_refresh(
     ctx.reset_symbol_cache();
 
     let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
+    let project_key = ctx.memoized_artifact_cache_key(&root);
     let session_id = log_ctx::current_session();
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
-            let cache_dir =
-                aft::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
+            let cache_dir = aft::search_index::resolve_cache_dir_with_key(
+                &project_key,
+                config.storage_dir.as_deref(),
+            );
             let _cache_lock = if shared_artifacts_read_only {
                 None
             } else {
