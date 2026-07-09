@@ -339,6 +339,18 @@ mod tests {
     }
 
     #[test]
+    fn truncate_at_char_boundary_at_40_bytes_mid_em_dash() {
+        let mut line = "x".repeat(38);
+        line.push('—');
+        line.push('z');
+        assert_eq!(line.len(), 42);
+        assert!(!line.is_char_boundary(40));
+        let safe = crate::grep_executor::truncate_at_char_boundary(&line, 40);
+        assert!(safe.is_char_boundary(safe.len()));
+        assert_eq!(safe.len(), 38);
+    }
+
+    #[test]
     fn grep_groups_truncates_and_adds_footer() {
         let long_line = format!("{}xyz", "a".repeat(220));
         let result = grep_result(

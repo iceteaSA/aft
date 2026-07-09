@@ -196,6 +196,37 @@ fn grep_fallback_returns_relative_paths_and_counts() {
 }
 
 #[test]
+fn grep_regex_over_em_dash_does_not_panic() {
+    let project = setup_project(&[(
+        "src/notes.md",
+        "Intro — the em dash here can confuse byte offsets\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-em-dash",
+            "command": "grep",
+            "pattern": "—",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert!(
+        response["total_matches"].as_u64().unwrap_or(0) >= 1,
+        "expected at least one match: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn grep_reports_empty_scope_separately() {
     let project = setup_project(&[]);
     let mut aft = AftProcess::spawn();

@@ -838,7 +838,23 @@ pub fn line_starts(content: &str) -> Vec<usize> {
     starts
 }
 
+/// Floor a byte index to the nearest valid `str` char boundary (never panics).
+pub fn floor_char_boundary_str(content: &str, mut index: usize) -> usize {
+    index = index.min(content.len());
+    while index > 0 && !content.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Prefix of `content` with at most `max_bytes` UTF-8 bytes, truncated on a char boundary.
+pub fn truncate_at_char_boundary<'a>(content: &'a str, max_bytes: usize) -> &'a str {
+    let end = floor_char_boundary_str(content, max_bytes);
+    &content[..end]
+}
+
 pub fn line_details(content: &str, line_starts: &[usize], offset: usize) -> (u32, u32, String) {
+    let offset = floor_char_boundary_str(content, offset);
     let line_index = match line_starts.binary_search(&offset) {
         Ok(index) => index,
         Err(index) => index.saturating_sub(1),
@@ -1032,5 +1048,64 @@ mod tests {
             1,
         );
         assert!(many.truncated);
+    }
+
+    #[test]
+    fn line_details_floors_offset_inside_multibyte_char() {
+        let content = "before—after";
+        let starts = line_starts(content);
+        let dash_byte = content.find('—').expect("em dash");
+        let mid_byte = dash_byte + 1;
+        assert!(!content.is_char_boundary(mid_byte));
+        let (line, column, line_text) = line_details(content, &starts, mid_byte);
+        assert_eq!(line, 1);
+        assert_eq!(column, content[..dash_byte].chars().count() as u32 + 1);
+        assert!(line_text.contains('—'));
+    }
+
+    #[test]
+    fn line_details_clamps_offset_past_end() {
+        let content = "short";
+        let starts = line_starts(content);
+        let (line, column, _) = line_details(content, &starts, content.len() + 100);
+        assert_eq!(line, 1);
+        assert_eq!(column, 6);
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_floors_mid_multibyte_at_byte_cap() {
+        let mut prefix = "a".repeat(38);
+        prefix.push('—');
+        prefix.push_str("tail");
+        assert_eq!(prefix.len(), 45);
+        assert!(!prefix.is_char_boundary(40));
+        let truncated = truncate_at_char_boundary(&prefix, 40);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.ends_with('a'));
+        assert!(!truncated.contains('—'));
+    }
+
+    #[test]
+    fn regex_byte_match_start_mid_char_does_not_panic_in_line_details() {
+        use crate::pattern_compile::{CompileOpts, CompileResult};
+
+        let content = "xy—zz";
+        let starts = line_starts(content);
+        let compiled = match crate::pattern_compile::compile(
+            ".",
+            CompileOpts {
+                multi_line: false,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(compiled) => compiled,
+            other => panic!("expected compiled pattern, got {other:?}"),
+        };
+        let crate::pattern_compile::CompiledPattern::Regex { compiled, .. } = compiled else {
+            panic!("expected regex pattern");
+        };
+        for matched in compiled.find_iter(content.as_bytes()) {
+            let _ = line_details(content, &starts, matched.start());
+        }
     }
 }
