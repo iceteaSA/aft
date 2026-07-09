@@ -63,10 +63,82 @@ struct ProcessLeaseKey {
 
 static PROCESS_LEASES: OnceLock<Mutex<HashMap<ProcessLeaseKey, Weak<WriterLease>>>> =
     OnceLock::new();
+// Same-root callers share this short-lived gate so only one thread performs the
+// filesystem lease attempt, while different roots do not wait on the registry
+// mutex during stat/probe/create/heartbeat work.
+static PROCESS_LEASE_ACQUISITIONS: OnceLock<Mutex<HashMap<ProcessLeaseKey, Weak<Mutex<()>>>>> =
+    OnceLock::new();
 
 fn process_leases() -> &'static Mutex<HashMap<ProcessLeaseKey, Weak<WriterLease>>> {
     PROCESS_LEASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+fn process_lease_acquisitions() -> &'static Mutex<HashMap<ProcessLeaseKey, Weak<Mutex<()>>>> {
+    PROCESS_LEASE_ACQUISITIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn shared_process_lease(
+    registry_key: &ProcessLeaseKey,
+) -> Result<Option<Arc<WriterLease>>, fs_lock::AcquireError> {
+    let mut leases = process_leases().lock().map_err(|_| {
+        fs_lock::AcquireError::Io(io::Error::other("process lease registry poisoned"))
+    })?;
+    if let Some(existing) = leases.get(registry_key).and_then(Weak::upgrade) {
+        if existing.verify()? {
+            return Ok(Some(existing));
+        }
+        leases.remove(registry_key);
+    }
+    Ok(None)
+}
+
+fn process_lease_acquisition_lock(
+    registry_key: &ProcessLeaseKey,
+) -> Result<Arc<Mutex<()>>, fs_lock::AcquireError> {
+    let mut acquisitions = process_lease_acquisitions().lock().map_err(|_| {
+        fs_lock::AcquireError::Io(io::Error::other(
+            "process lease acquisition registry poisoned",
+        ))
+    })?;
+    if let Some(existing) = acquisitions.get(registry_key).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+    if acquisitions.len() > 1024 {
+        acquisitions.retain(|_, lock| lock.strong_count() > 0);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    acquisitions.insert(registry_key.clone(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+#[cfg(test)]
+type AcquireSharedHook = Arc<dyn Fn(RootCacheDomain, &Path, &str) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static ACQUIRE_SHARED_HOOK: OnceLock<Mutex<Option<AcquireSharedHook>>> = OnceLock::new();
+
+#[cfg(test)]
+fn set_acquire_shared_hook_for_test(hook: Option<AcquireSharedHook>) {
+    *ACQUIRE_SHARED_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("acquire shared hook mutex") = hook;
+}
+
+#[cfg(test)]
+fn run_acquire_shared_hook_for_test(domain: RootCacheDomain, cache_dir: &Path, key: &str) {
+    let hook = ACQUIRE_SHARED_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("acquire shared hook mutex")
+        .clone();
+    if let Some(hook) = hook {
+        hook(domain, cache_dir, key);
+    }
+}
+
+#[cfg(not(test))]
+fn run_acquire_shared_hook_for_test(_domain: RootCacheDomain, _cache_dir: &Path, _key: &str) {}
 
 impl std::fmt::Debug for WriterLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -90,18 +162,28 @@ impl WriterLease {
             domain,
             cache_dir: canonical_process_lease_dir(cache_dir),
         };
-        let mut leases = process_leases().lock().map_err(|_| {
-            fs_lock::AcquireError::Io(io::Error::other("process lease registry poisoned"))
-        })?;
-        if let Some(existing) = leases.get(&registry_key).and_then(Weak::upgrade) {
-            if existing.verify()? {
-                return Ok(existing);
-            }
-            leases.remove(&registry_key);
+        if let Some(existing) = shared_process_lease(&registry_key)? {
+            return Ok(existing);
         }
 
+        let acquisition_lock = process_lease_acquisition_lock(&registry_key)?;
+        let _acquisition_guard = acquisition_lock.lock().map_err(|_| {
+            fs_lock::AcquireError::Io(io::Error::other("process lease acquisition poisoned"))
+        })?;
+
+        if let Some(existing) = shared_process_lease(&registry_key)? {
+            return Ok(existing);
+        }
+
+        run_acquire_shared_hook_for_test(domain, cache_dir, key);
+
         let lease = Arc::new(Self::acquire(domain, cache_dir, key, Duration::ZERO)?);
-        leases.insert(registry_key, Arc::downgrade(&lease));
+        process_leases()
+            .lock()
+            .map_err(|_| {
+                fs_lock::AcquireError::Io(io::Error::other("process lease registry poisoned"))
+            })?
+            .insert(registry_key, Arc::downgrade(&lease));
         Ok(lease)
     }
 
@@ -498,6 +580,62 @@ mod tests {
 
         assert_eq!(before_create, after_create);
         assert!(before_create.starts_with(std::fs::canonicalize(&real).unwrap()));
+    }
+
+    #[test]
+    fn writer_lease_acquire_shared_does_not_serialize_different_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_cache_dir = dir.path().join("callgraph").join("blocked");
+        let free_cache_dir = dir.path().join("callgraph").join("free");
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                set_acquire_shared_hook_for_test(None);
+            }
+        }
+
+        set_acquire_shared_hook_for_test(Some(Arc::new(move |_, _, key| {
+            if key == "blocked" {
+                blocked_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        })));
+        let _hook_guard = HookGuard;
+
+        let blocked_handle = std::thread::spawn(move || {
+            WriterLease::acquire_shared(RootCacheDomain::Callgraph, &blocked_cache_dir, "blocked")
+                .map_err(|error| error.to_string())
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocked root should reach acquisition hook");
+
+        let (free_tx, free_rx) = std::sync::mpsc::channel();
+        let free_handle = std::thread::spawn(move || {
+            let result =
+                WriterLease::acquire_shared(RootCacheDomain::Callgraph, &free_cache_dir, "free")
+                    .map_err(|error| error.to_string());
+            free_tx.send(result).unwrap();
+        });
+        let free_lease = free_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("free root should not wait behind another root's acquisition")
+            .expect("free root should acquire while another root is in acquisition");
+        assert!(free_lease.verify().unwrap());
+        free_handle
+            .join()
+            .expect("free root thread should not panic");
+
+        release_tx.send(()).unwrap();
+        let blocked_lease = blocked_handle
+            .join()
+            .expect("blocked root thread should not panic")
+            .expect("blocked root should acquire after release");
+        assert!(blocked_lease.verify().unwrap());
     }
 
     #[test]
