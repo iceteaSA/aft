@@ -858,6 +858,9 @@ export class SubcTransportPool implements AftTransportPool {
   /** No-op over subc: config is read locally by AFT (wire tiers are ignored). */
   setConfigureOverride(_key: string, _value: unknown): void {}
 
+  /** No-op over subc: the daemon owns the live module's configure lifecycle. */
+  async reconfigure(_projectRoot: string, _overrides: Record<string, unknown>): Promise<void> {}
+
   /** No-op over subc: the daemon supervises the binary, not the plugin. */
   async replaceBinary(path: string): Promise<string> {
     return path;

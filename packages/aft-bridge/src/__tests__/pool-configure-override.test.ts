@@ -23,6 +23,30 @@ import { describe, expect, test } from "bun:test";
 import { BridgePool } from "../pool.js";
 
 describe("BridgePool.setConfigureOverride", () => {
+  test("reconfigure pushes changed paths to an existing bridge", async () => {
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
+    const bridge = pool.getBridge("/project/a");
+    const requests: Array<{ command: string; params: Record<string, unknown> }> = [];
+    bridge.isAlive = () => true;
+    bridge.send = async (command, params = {}) => {
+      requests.push({ command, params });
+      return { success: true };
+    };
+
+    await pool.reconfigure("/project/a", { lsp_paths_extra: ["/cache/bin"] });
+
+    expect(requests).toEqual([
+      {
+        command: "configure",
+        params: {
+          project_root: "/project/a",
+          lsp_paths_extra: ["/cache/bin"],
+        },
+      },
+    ]);
+    expect(pool._testGetConfigOverrides().lsp_paths_extra).toEqual(["/cache/bin"]);
+  });
+
   test("setting an override updates the future-spawn map", () => {
     const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
 

@@ -4,7 +4,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
-import { type AutoInstallConfig, ensureInstallAnchor, runAutoInstall } from "../lsp-auto-install";
+import {
+  type AutoInstallConfig,
+  ensureInstallAnchor,
+  pushLspPathsAfterAutoInstall,
+  runAutoInstall,
+} from "../lsp-auto-install";
 import { lspBinaryPath, writeInstalledMeta } from "../lsp-cache";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -79,6 +84,29 @@ function fakeInstalled(npmPackage: string, binary: string): string {
 }
 
 describe("runAutoInstall", () => {
+  test("pushes refreshed paths to live bridges and future spawns", async () => {
+    const overrides: Record<string, unknown> = {};
+    const reconfigures: Array<{ root: string; params: Record<string, unknown> }> = [];
+    const pool = {
+      setConfigureOverride(key: string, value: unknown) {
+        overrides[key] = value;
+      },
+      async reconfigure(root: string, params: Record<string, unknown>) {
+        reconfigures.push({ root, params });
+      },
+    };
+
+    await pushLspPathsAfterAutoInstall(pool, tempProject, ["/cache/a", "/cache/a", "/cache/b"]);
+
+    expect(overrides.lsp_paths_extra).toEqual(["/cache/a", "/cache/b"]);
+    expect(reconfigures).toEqual([
+      {
+        root: tempProject,
+        params: { lsp_paths_extra: ["/cache/a", "/cache/b"] },
+      },
+    ]);
+  });
+
   test("returns no cached paths when nothing is installed", async () => {
     // Empty project — no relevant servers, nothing to install.
     const result = await runAutoInstall(tempProject, defaultConfig(), fakeFetch());

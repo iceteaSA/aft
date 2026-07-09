@@ -1136,6 +1136,8 @@ export interface GithubAutoInstallResult {
    * Plugin startup ignores this; tests await it.
    */
   installsComplete: Promise<void>;
+  /** Re-scan the cache after background installs settle. */
+  getCachedBinDirs: () => string[];
 }
 
 interface InFlightGithubInstall {
@@ -1203,6 +1205,7 @@ export function runGithubAutoInstall(
       installingBinaries: [],
       skipped,
       installsComplete: Promise.resolve(),
+      getCachedBinDirs: () => [...cachedBinDirs],
     };
   }
 
@@ -1264,6 +1267,15 @@ export function runGithubAutoInstall(
     },
     skipped,
     installsComplete: Promise.all(installPromises).then(() => {}),
+    getCachedBinDirs: () => {
+      const currentHost = detectHostPlatform();
+      if (!currentHost) return [];
+      return GITHUB_LSP_TABLE.filter(
+        (spec) =>
+          isGithubInstalled(spec, currentHost.platform) &&
+          validateCachedGithubInstall(spec, currentHost.platform),
+      ).map((spec) => ghBinDir(spec));
+    },
   };
 }
 

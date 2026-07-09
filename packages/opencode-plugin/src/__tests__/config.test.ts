@@ -771,8 +771,14 @@ describe("loadAftConfig", () => {
     }
   });
 
-  test("strict cutover rejects manually re-added old keys", () => {
-    expect(AftConfigSchema.safeParse({ experimental_search_index: true }).success).toBe(false);
+  test("strict schema still rejects keys outside both harnesses", () => {
+    expect(AftConfigSchema.safeParse({ genuinely_unknown_key: true }).success).toBe(false);
+  });
+
+  test("OpenCode-only keys remain available to OpenCode", () => {
+    expect(
+      AftConfigSchema.parse({ hoist_builtin_tools: false, auto_update: false }),
+    ).toMatchObject({ hoist_builtin_tools: false, auto_update: false });
   });
 
   test("loads semantic config block and propagates nested fields", () => {

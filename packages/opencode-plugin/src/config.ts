@@ -6,7 +6,9 @@ import {
   readConfigTiers,
   resolveCortexKitConfigPaths,
   resolveLegacyAftConfigSources,
+  stripHarnessSpecificConfigKeys,
   stripJsoncSymbols,
+  PI_ONLY_KEYS,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { z } from "zod";
@@ -240,8 +242,9 @@ const BackupConfigSchema = z.object({
   max_file_size: z.number().int().positive().optional(),
 });
 
-export const AftConfigSchema = z
-  .object({
+export const AftConfigSchema = z.preprocess(
+  (value) => stripHarnessSpecificConfigKeys(value, PI_ONLY_KEYS),
+  z.object({
     /**
      * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
      * runtime — only present so VS Code/Cursor/etc. pick up the published
@@ -350,8 +353,8 @@ export const AftConfigSchema = z
     bridge: BridgeConfigSchema.optional(),
     /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
     subc: SubcConfigSchema.optional(),
-  })
-  .strict();
+  }).strict(),
+);
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
 

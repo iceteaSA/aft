@@ -40,7 +40,11 @@ import {
 } from "./configure-warnings.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
-import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
+import {
+  abortInFlightAutoInstalls,
+  pushLspPathsAfterAutoInstall,
+  runAutoInstall,
+} from "./lsp-auto-install.js";
 import {
   abortInFlightGithubInstalls,
   discoverRelevantGithubServers,
@@ -319,6 +323,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     bash_permissions: true,
     storage_dir: storageDir,
   });
+  let lspInstallCompletion: Promise<string[] | null> | null = null;
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 
@@ -415,7 +420,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     if (lspInflightInstalls.length > 0) {
       configOverrides.lsp_inflight_installs = lspInflightInstalls;
     }
-    if (npmResult.installsStarted > 0 || ghResult.installsStarted > 0) {
+    const installsWereStarted = npmResult.installsStarted > 0 || ghResult.installsStarted > 0;
+    if (installsWereStarted) {
       log(
         `[lsp] auto-install: ${npmResult.installsStarted} npm + ${ghResult.installsStarted} github install(s) running in background`,
       );
@@ -434,8 +440,22 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // "not relevant to project" or "already installed" which are routine.
     //
     // Fire-and-forget; never block plugin startup.
-    Promise.all([npmResult.installsComplete, ghResult.installsComplete])
+    const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
       .then(() => {
+        if (installsWereStarted) {
+          const updatedPaths = [
+            ...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()]),
+          ];
+          if (updatedPaths.length > 0) {
+            configOverrides.lsp_paths_extra = updatedPaths;
+          } else {
+            delete configOverrides.lsp_paths_extra;
+          }
+          return updatedPaths;
+        }
+        return null;
+      })
+      .then((updatedPaths) => {
         const actionable = [...npmResult.skipped, ...ghResult.skipped].filter((s) => {
           const r = s.reason.toLowerCase();
           // Routine skips — don't notify.
@@ -446,21 +466,24 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           if (r === "another install in progress") return false;
           return true;
         });
-        if (actionable.length === 0) return;
-
-        const lines = actionable.map((s) => `  • ${s.id}: ${s.reason}`).join("\n");
-        const message =
-          `AFT skipped or failed to install ${actionable.length} LSP server(s):\n${lines}\n\n` +
-          "See `/aft-status` for details, or check the plugin log. " +
-          'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
-          "or set `lsp.auto_install: false` to suppress this entirely.";
-        sendWarning({ client: input.client, directory: input.directory }, message).catch((err) => {
-          warn(`[lsp] failed to deliver install summary: ${err}`);
-        });
+        if (actionable.length > 0) {
+          const lines = actionable.map((s) => `  • ${s.id}: ${s.reason}`).join("\n");
+          const message =
+            `AFT skipped or failed to install ${actionable.length} LSP server(s):\n${lines}\n\n` +
+            "See `/aft-status` for details, or check the plugin log. " +
+            'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
+            "or set `lsp.auto_install: false` to suppress this entirely.";
+          sendWarning({ client: input.client, directory: input.directory }, message).catch((err) => {
+            warn(`[lsp] failed to deliver install summary: ${err}`);
+          });
+        }
+        return updatedPaths;
       })
       .catch((err) => {
         warn(`[lsp] install-summary aggregation failed: ${err}`);
+        return null;
       });
+    if (installsWereStarted) lspInstallCompletion = installCompletion;
   } catch (err) {
     // Auto-install failures must never block plugin startup.
     warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -616,6 +639,20 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       });
     },
   });
+  if (lspInstallCompletion) {
+    lspInstallCompletion.then((updatedPaths) => {
+      if (!updatedPaths) return;
+      void pushLspPathsAfterAutoInstall(pool, input.directory, updatedPaths)
+        .then(() => {
+          log(
+            `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
+          );
+        })
+        .catch((err) => {
+          warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
+        });
+    });
+  }
   pool.setConfigureOverride("harness", "opencode");
   const ctx: PluginContext = {
     pool,

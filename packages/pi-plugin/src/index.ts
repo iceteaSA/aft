@@ -64,7 +64,11 @@ import {
   resolveBridgePoolTransportOptions,
 } from "./config.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
-import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
+import {
+  abortInFlightAutoInstalls,
+  pushLspPathsAfterAutoInstall,
+  runAutoInstall,
+} from "./lsp-auto-install.js";
 import {
   abortInFlightGithubInstalls,
   discoverRelevantGithubServers,
@@ -530,6 +534,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const configOverrides = buildConfigTierConfigureParams(projectRoot, {
     storage_dir: storageDir,
   });
+  let lspInstallCompletion: Promise<string[] | null> | null = null;
   // _ort_dylib_dir is patched in asynchronously below once ensureOnnxRuntime
   // settles. Bridges spawned before that resolution don't get ORT and
   // semantic search returns "still building" until they restart.
@@ -576,7 +581,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     if (lspInflightInstalls.length > 0) {
       configOverrides.lsp_inflight_installs = lspInflightInstalls;
     }
-    if (npmResult.installsStarted > 0 || ghResult.installsStarted > 0) {
+    const installsWereStarted = npmResult.installsStarted > 0 || ghResult.installsStarted > 0;
+    if (installsWereStarted) {
       log(
         `[lsp] auto-install: ${npmResult.installsStarted} npm + ${ghResult.installsStarted} github install(s) running in background`,
       );
@@ -590,8 +596,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     // `warn()` (visible at WARN level) so users running with default logging
     // see them. Routine skips (already-installed, not-relevant, disabled)
     // stay out of the warning summary.
-    Promise.all([npmResult.installsComplete, ghResult.installsComplete])
+    const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
       .then(() => {
+        if (installsWereStarted) {
+          const updatedPaths = [
+            ...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()]),
+          ];
+          if (updatedPaths.length > 0) {
+            configOverrides.lsp_paths_extra = updatedPaths;
+          } else {
+            delete configOverrides.lsp_paths_extra;
+          }
+          return updatedPaths;
+        }
+        return null;
+      })
+      .then((updatedPaths) => {
         const actionable = [...npmResult.skipped, ...ghResult.skipped].filter((s) => {
           const r = s.reason.toLowerCase();
           if (r === "auto_install: false") return false;
@@ -601,17 +621,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           if (r === "another install in progress") return false;
           return true;
         });
-        if (actionable.length === 0) return;
-        const lines = actionable.map((s) => `  • ${s.id}: ${s.reason}`).join("\n");
-        warn(
-          `[lsp] skipped or failed to install ${actionable.length} server(s):\n${lines}\n` +
-            'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
-            "or set `lsp.auto_install: false` to suppress.",
-        );
+        if (actionable.length > 0) {
+          const lines = actionable.map((s) => `  • ${s.id}: ${s.reason}`).join("\n");
+          warn(
+            `[lsp] skipped or failed to install ${actionable.length} server(s):\n${lines}\n` +
+              'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
+              "or set `lsp.auto_install: false` to suppress.",
+          );
+        }
+        return updatedPaths;
       })
       .catch((err) => {
         warn(`[lsp] install-summary aggregation failed: ${err}`);
+        return null;
       });
+    if (installsWereStarted) lspInstallCompletion = installCompletion;
   } catch (err) {
     warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -699,6 +723,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       });
     },
   });
+  if (lspInstallCompletion) {
+    lspInstallCompletion.then((updatedPaths) => {
+      if (!updatedPaths) return;
+      void pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths)
+        .then(() => {
+          log(
+            `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
+          );
+        })
+        .catch((err) => {
+          warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
+        });
+    });
+  }
   pool.setConfigureOverride("harness", "pi");
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer steers there (vs the grep tool). Set before the eager

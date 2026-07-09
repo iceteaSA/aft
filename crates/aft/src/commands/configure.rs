@@ -12,7 +12,7 @@ use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
-use crate::config::SemanticBackendConfig;
+use crate::config::{Config, SemanticBackendConfig};
 use crate::context::{
     AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticIndexEvent,
     SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
@@ -565,6 +565,17 @@ fn semantic_fingerprint_config_changed(
     previous.backend != next.backend
         || previous.model != next.model
         || previous.base_url != next.base_url
+}
+
+fn should_clear_failed_spawns(
+    previous: &Config,
+    next: &Config,
+    equivalent_warm_config: bool,
+) -> bool {
+    !equivalent_warm_config
+        || previous.lsp_paths_extra != next.lsp_paths_extra
+        || previous.lsp_auto_install_binaries != next.lsp_auto_install_binaries
+        || previous.lsp_inflight_installs != next.lsp_inflight_installs
 }
 
 fn workspace_manifest_fingerprint(project_root: &Path) -> String {
@@ -2609,10 +2620,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let refresh_project_runtime = !equivalent_warm_config || project_root_changed;
     let sync_bash_compress_flag = !equivalent_warm_config
         || previous_config.experimental_bash_compress != next_config.experimental_bash_compress;
-    let clear_failed_spawns = !equivalent_warm_config
-        || previous_config.lsp_paths_extra != next_config.lsp_paths_extra
-        || previous_config.lsp_auto_install_binaries != next_config.lsp_auto_install_binaries
-        || previous_config.lsp_inflight_installs != next_config.lsp_inflight_installs;
+    let clear_failed_spawns = should_clear_failed_spawns(
+        &previous_config,
+        &next_config,
+        equivalent_warm_config,
+    );
     ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
         root_path: root_path.clone(),
@@ -2890,7 +2902,6 @@ mod tests {
     use std::ffi::OsString;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    #[cfg(unix)]
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Barrier, Mutex};
@@ -2898,7 +2909,7 @@ mod tests {
 
     use super::{
         external_ignore_watch_paths, install_project_watcher_with, parse_lsp_paths_extra,
-        semantic_build_retry_backoff, validate_storage_dir,
+        semantic_build_retry_backoff, should_clear_failed_spawns, validate_storage_dir,
     };
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -4846,5 +4857,15 @@ mod tests {
     #[test]
     fn semantic_max_files_defaults_to_20k() {
         assert_eq!(SemanticBackendConfig::default().max_files, 20_000);
+    }
+
+    #[test]
+    fn lsp_paths_extra_change_clears_failed_spawns_for_retry() {
+        let previous = Config::default();
+        let mut next = previous.clone();
+        next.lsp_paths_extra.push(PathBuf::from("/cache/lsp/.bin"));
+
+        assert!(should_clear_failed_spawns(&previous, &next, true));
+        assert!(!should_clear_failed_spawns(&previous, &previous, true));
     }
 }

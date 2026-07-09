@@ -52,6 +52,12 @@ export {
   isEmptyParam,
 } from "./coerce.js";
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
+// --- shared harness config keys ---
+export {
+  OPENCODE_ONLY_KEYS,
+  PI_ONLY_KEYS,
+  stripHarnessSpecificConfigKeys,
+} from "./config-keys.js";
 // --- config tiers ---
 export type { ConfigTier } from "./config-tiers.js";
 export { formatDroppedKeyWarnings, inlineUserConfigTier, readConfigTiers } from "./config-tiers.js";

@@ -235,15 +235,7 @@ export class BridgePool implements AftTransportPool {
     // project's `.opencode/aft.jsonc` was visible at plugin init for ALL
     // sessions, ignoring the actual session's project config. See the
     // `projectConfigLoader` doc-comment on PoolOptions.
-    let projectOverrides: Record<string, unknown> = {};
-    if (this.projectConfigLoader) {
-      try {
-        projectOverrides = this.projectConfigLoader(key) ?? {};
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.error(`projectConfigLoader failed; using global overrides only: ${message}`);
-      }
-    }
+    const projectOverrides = this.loadProjectOverrides(key);
     const mergedOverrides = { ...this.configOverrides, ...projectOverrides };
 
     const bridge = new BinaryBridge(this.binaryPath, key, this.bridgeOptions, mergedOverrides);
@@ -407,6 +399,47 @@ export class BridgePool implements AftTransportPool {
       delete this.configOverrides[key];
     } else {
       this.configOverrides[key] = value;
+    }
+  }
+
+  /**
+   * Reapply configure overrides to a live bridge without replacing it.
+   *
+   * Async resources such as the LSP install cache can become available after a
+   * bridge has configured. Sending a normal configure request keeps the bridge's
+   * warm Rust state while allowing those process-state paths to take effect.
+   */
+  async reconfigure(projectRoot: string, overrides: Record<string, unknown>): Promise<void> {
+    const key = normalizeKey(projectRoot);
+    for (const [name, value] of Object.entries(overrides)) {
+      this.setConfigureOverride(name, value);
+    }
+
+    const bridge = this.getActiveBridgeForRoot(key);
+    if (!bridge) return;
+
+    const projectOverrides = this.loadProjectOverrides(key);
+    const response = await bridge.send("configure", {
+      project_root: key,
+      ...this.configOverrides,
+      ...projectOverrides,
+      ...overrides,
+    });
+    if (response.success === false) {
+      throw new Error(
+        `configure refresh failed for ${key}: ${String(response.message ?? "unknown error")}`,
+      );
+    }
+  }
+
+  private loadProjectOverrides(key: string): Record<string, unknown> {
+    if (!this.projectConfigLoader) return {};
+    try {
+      return this.projectConfigLoader(key) ?? {};
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.error(`projectConfigLoader failed; using global overrides only: ${message}`);
+      return {};
     }
   }
 

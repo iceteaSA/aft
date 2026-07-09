@@ -499,6 +499,7 @@ export function harnessPool(harness: E2EHarness): AftTransportPool {
     toolCall: (_projectRoot, runtime, name, rawArgs, options) =>
       harness.bridge.toolCall(runtime.sessionID, name, rawArgs, options),
     setConfigureOverride: () => {},
+    reconfigure: async () => {},
     replaceBinary: async (path) => path,
     shutdown: async () => {},
     closeSession: async () => {},

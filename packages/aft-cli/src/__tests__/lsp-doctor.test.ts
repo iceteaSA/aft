@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
-import { printLspDoctorHelp, renderLspInspection, runLspDoctor } from "../commands/lsp.js";
+import {
+  printLspDoctorHelp,
+  renderLspInspection,
+  runLspDoctor,
+  typescriptPackageWarning,
+} from "../commands/lsp.js";
 import type { AftRequest, AftResponse } from "../lib/aft-bridge.js";
 
 function makeAdapter(opts: { kind?: "opencode" | "pi" } = {}): HarnessAdapter {
@@ -109,6 +114,46 @@ describe("doctor lsp", () => {
 
     expect(code).toBe(0);
     expect(seenArgv[0]).toEqual(["./sample.py", "--harness", "pi"]);
+  });
+
+  test("warns when a spawned TypeScript server cannot resolve the project package", () => {
+    const projectRoot = tempRoot("aft-lsp-ts-project-");
+    const response = {
+      success: true as const,
+      file: `${projectRoot}/main.ts`,
+      extension: "ts",
+      project_root: projectRoot,
+      matching_servers: [
+        {
+          id: "typescript",
+          name: "TypeScript Language Server",
+          kind: "typescript",
+          extensions: ["ts"],
+          root_markers: ["package.json"],
+          binary_name: "typescript-language-server",
+          binary_path: "/cache/typescript-language-server",
+          binary_source: "lsp_paths_extra",
+          workspace_root: projectRoot,
+          spawn_status: "ok",
+          args: ["--stdio"],
+        },
+      ],
+      diagnostics_count: 0,
+      diagnostics: [],
+    };
+    expect(typescriptPackageWarning(response)).toBe(
+      "typescript package not resolvable from project — server will produce no diagnostics",
+    );
+
+    const output = renderLspInspection("./main.ts", {
+      ...response,
+      typescript_package_warning:
+        "typescript package not resolvable from project — server will produce no diagnostics",
+    });
+
+    expect(output).toContain(
+      "Warning: typescript package not resolvable from project — server will produce no diagnostics",
+    );
   });
 
   test("renders structured lsp_inspect response as human text", () => {

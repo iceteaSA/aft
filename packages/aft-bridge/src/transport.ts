@@ -60,6 +60,8 @@ export interface AftTransportPool {
     options?: ToolCallOptions,
   ): Promise<ToolCallResult>;
   setConfigureOverride(key: string, value: unknown): void;
+  /** Reapply configure-time overrides to an already-live project bridge. */
+  reconfigure(projectRoot: string, overrides: Record<string, unknown>): Promise<void>;
   replaceBinary(path: string): Promise<string>;
   /** True when this pool instance has reached its terminal shutdown state. */
   isShutdown(): boolean;

@@ -879,6 +879,17 @@ describe("loadAftConfig", () => {
     }
   });
 
+  test("silently strips OpenCode-only keys but still rejects unknown keys", () => {
+    const otherHarness = AftConfigSchema.safeParse({
+      hoist_builtin_tools: true,
+      auto_update: false,
+    });
+    expect(otherHarness.success).toBe(true);
+    if (otherHarness.success) expect(otherHarness.data).toEqual({});
+
+    expect(AftConfigSchema.safeParse({ genuinely_unknown_key: true }).success).toBe(false);
+  });
+
   test("strict cutover rejects manually re-added old keys", () => {
     expect(AftConfigSchema.safeParse({ experimental_search_index: true }).success).toBe(false);
   });

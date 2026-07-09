@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { readConfigTiers } from "@cortexkit/aft-bridge";
@@ -32,6 +33,7 @@ export interface LspInspectResponse {
   matching_servers?: LspServerInspection[];
   diagnostics_count?: number;
   diagnostics?: LspDiagnostic[];
+  typescript_package_warning?: string;
 }
 
 export interface LspServerInspection {
@@ -164,7 +166,14 @@ export async function runLspDoctor(options: LspDoctorOptions): Promise<number> {
     return 1;
   }
 
-  console.log(renderLspInspection(file, inspect as LspInspectResponse));
+  const inspection = inspect as LspInspectResponse;
+  const typescriptWarning = typescriptPackageWarning(inspection);
+  console.log(
+    renderLspInspection(file, {
+      ...inspection,
+      ...(typescriptWarning ? { typescript_package_warning: typescriptWarning } : {}),
+    }),
+  );
   return 0;
 }
 
@@ -204,6 +213,11 @@ export function renderLspInspection(inputFile: string, response: LspInspectRespo
     if (server.binary_source === "not_found") {
       lines.push(`    Action: ${installHint(server.binary_name)}`);
     }
+  }
+
+  if (response.typescript_package_warning) {
+    lines.push("");
+    lines.push(`Warning: ${response.typescript_package_warning}`);
   }
 
   const diagnostics = response.diagnostics ?? [];
@@ -308,6 +322,21 @@ function formatSpawnStatus(server: LspServerInspection): string {
 
 function formatList(values: string[]): string {
   return values.length === 0 ? "(none)" : values.join(", ");
+}
+
+export function typescriptPackageWarning(response: LspInspectResponse): string | null {
+  const typescriptServerSpawned = response.matching_servers?.some(
+    (server) => server.id === "typescript" && server.spawn_status === "ok",
+  );
+  const diagnosticsCount = response.diagnostics_count ?? response.diagnostics?.length ?? 0;
+  if (!typescriptServerSpawned || !response.project_root || diagnosticsCount > 0) return null;
+
+  try {
+    createRequire(join(response.project_root, "package.json")).resolve("typescript");
+    return null;
+  } catch {
+    return "typescript package not resolvable from project — server will produce no diagnostics";
+  }
 }
 
 function installHint(binaryName: string): string {

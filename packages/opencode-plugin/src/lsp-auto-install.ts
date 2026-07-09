@@ -41,7 +41,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
+import { npmSpawnEnv, resolveNpm, type AftTransportPool } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
   isInstalled,
@@ -104,6 +104,8 @@ export interface AutoInstallResult {
    * the array shared with the synchronous return value).
    */
   installsComplete: Promise<void>;
+  /** Re-scan the cache after background installs settle. */
+  getCachedBinDirs: () => string[];
 }
 
 /**
@@ -596,9 +598,9 @@ function validateCachedNpmInstall(spec: NpmServerSpec): boolean {
  * have an installed binary AND kicks off background installs for missing
  * packages relevant to this project.
  *
- * Caller passes `cachedBinDirs` to Rust as `lsp_paths_extra`. The result
- * is correct on first launch even though some installs may still be
- * running — those binaries appear in the cache on the NEXT session.
+ * Caller passes `cachedBinDirs` to Rust as `lsp_paths_extra`. When a background
+ * install settles, the plugin calls `getCachedBinDirs()` to refresh the list and
+ * reconfigures live bridges; future bridges use the pool override.
  */
 export function runAutoInstall(
   projectRoot: string,
@@ -675,5 +677,20 @@ export function runAutoInstall(
     },
     skipped,
     installsComplete: Promise.all(installPromises).then(() => {}),
+    getCachedBinDirs: () =>
+      NPM_LSP_TABLE.filter(
+        (spec) => isInstalled(spec.npm, spec.binary) && validateCachedNpmInstall(spec),
+      ).map((spec) => lspBinDir(spec.npm)),
   };
+}
+
+/** Apply newly discovered cache paths to both future and live bridge config. */
+export async function pushLspPathsAfterAutoInstall(
+  pool: Pick<AftTransportPool, "setConfigureOverride" | "reconfigure">,
+  projectRoot: string,
+  cachedBinDirs: readonly string[],
+): Promise<void> {
+  const paths = [...new Set(cachedBinDirs)];
+  pool.setConfigureOverride("lsp_paths_extra", paths);
+  await pool.reconfigure(projectRoot, { lsp_paths_extra: paths });
 }
