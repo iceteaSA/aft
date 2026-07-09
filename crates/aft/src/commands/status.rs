@@ -165,15 +165,28 @@ impl AppContext {
                 let key_root = self
                     .canonical_cache_root_opt()
                     .unwrap_or_else(|| root.clone());
-                let key = self.memoized_artifact_cache_key(&key_root);
-                let trigram_size = dir_size(&dir.join("index").join(&key));
-                let semantic_size = dir_size(&dir.join("semantic").join(&key));
-                serde_json::json!({
-                    "storage_dir": dir.display().to_string(),
-                    "project_cache_key": key,
-                    "trigram_disk_bytes": trigram_size,
-                    "semantic_disk_bytes": semantic_size,
-                })
+                // Passive read only: status must never trigger a key
+                // derivation (git probe). Artifact-backed features derive and
+                // memoize the key at configure; when none are enabled there is
+                // no per-project artifact slice to size.
+                match self.cached_artifact_cache_key(&key_root) {
+                    Some(key) => {
+                        let trigram_size = dir_size(&dir.join("index").join(&key));
+                        let semantic_size = dir_size(&dir.join("semantic").join(&key));
+                        serde_json::json!({
+                            "storage_dir": dir.display().to_string(),
+                            "project_cache_key": key,
+                            "trigram_disk_bytes": trigram_size,
+                            "semantic_disk_bytes": semantic_size,
+                        })
+                    }
+                    None => serde_json::json!({
+                        "storage_dir": dir.display().to_string(),
+                        "project_cache_key": null,
+                        "trigram_disk_bytes": 0,
+                        "semantic_disk_bytes": 0,
+                    }),
+                }
             }
             (Some(dir), None) => serde_json::json!({
                 "storage_dir": dir.display().to_string(),

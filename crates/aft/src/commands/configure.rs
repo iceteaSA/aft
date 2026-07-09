@@ -1527,6 +1527,16 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
     }
+    if next_config.storage_dir.is_none() {
+        // Plugin-less consumers (the daemon-supervised module, MCP hosts)
+        // never send the plugin-computed storage_dir param. Resolve the
+        // shared CortexKit storage root here so every artifact lane keys off
+        // one concrete path. Leaving this None made lanes that gate writes on
+        // `Some(storage_dir)` (semantic persistence) silently RAM-only under
+        // the daemon while lanes with their own fallback (trigram) persisted,
+        // splitting the storage universe by transport.
+        next_config.storage_dir = Some(crate::bash_background::storage_dir(None));
+    }
     if let Some(raw) = params.get("max_background_bash_tasks") {
         let parsed = raw.as_u64().filter(|v| *v >= 1);
         match parsed.and_then(|v| usize::try_from(v).ok()) {
@@ -2497,6 +2507,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             return;
                         }
                         let Some(dir) = semantic_storage.as_ref() else {
+                            // Should be unreachable now that configure defaults
+                            // storage_dir; keep it loud in case a path regresses.
+                            slog_warn!(
+                                "semantic index persistence skipped for {reason}: no storage_dir resolved"
+                            );
                             return;
                         };
                         if semantic_fingerprint_generation_flag
@@ -3016,6 +3031,39 @@ mod tests {
             .status()
             .unwrap()
             .success());
+    }
+
+    #[test]
+    fn configure_without_storage_dir_defaults_to_shared_storage_root() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        init_git_fixture(temp.path());
+
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))],
+        }));
+        let response = handle_configure_for_test(&req, &ctx);
+        assert!(response.success);
+
+        // Plugin-less consumers never send storage_dir; the resolved config
+        // must still carry a concrete storage root so artifact lanes that
+        // gate persistence on `Some(storage_dir)` (semantic index) write to
+        // the same universe as lanes with their own fallback (trigram).
+        let resolved = ctx.config().storage_dir.clone();
+        assert_eq!(
+            resolved,
+            Some(crate::bash_background::storage_dir(None)),
+            "configure must default storage_dir to the shared storage root"
+        );
     }
 
     fn configure_with_storage(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {

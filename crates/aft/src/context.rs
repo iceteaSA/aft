@@ -1574,6 +1574,12 @@ impl AppContext {
         self.configure_maintenance_jobs.lock().drain(..).collect()
     }
 
+    /// Peek the memoized artifact key without deriving it. Passive readers
+    /// (status snapshots) use this so reporting never spawns a git probe.
+    pub fn cached_artifact_cache_key(&self, canonical_root: &Path) -> Option<String> {
+        self.artifact_cache_keys.lock().get(canonical_root).cloned()
+    }
+
     pub fn memoized_artifact_cache_key(&self, canonical_root: &Path) -> String {
         let mut keys = self.artifact_cache_keys.lock();
         if let Some(key) = keys.get(canonical_root).cloned() {
