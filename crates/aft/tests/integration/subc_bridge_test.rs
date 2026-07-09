@@ -5695,7 +5695,8 @@ async fn expect_manifest_tool_frame(
     arguments: Value,
 ) -> (String, bool) {
     send_tool_call(stream, 1, corr, name, arguments).await;
-    let frame = read_frame_timeout(stream, "manifest reachability tool response").await;
+    let label = format!("manifest reachability tool response ({name}, corr={corr})");
+    let frame = read_frame_timeout(stream, &label).await;
     assert_eq!(frame.header.channel, 1, "unexpected channel for {name}");
     assert_eq!(frame.header.corr, corr, "unexpected corr for {name}");
     let text = tool_result_text(&frame);
