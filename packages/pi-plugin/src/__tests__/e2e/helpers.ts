@@ -17,8 +17,8 @@ import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { BridgePool, inlineUserConfigTier, setActiveLogger } from "@cortexkit/aft-bridge";
-import { bridgeLogger } from "../../logger.js";
 import { hermeticGitChildEnv, withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
+import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
 // "[aft] invalidated 7 files") into $TMPDIR/aft-pi-test.log instead of

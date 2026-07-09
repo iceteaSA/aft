@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { withHermeticGitEnv } from "../helpers/git-env.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { withHermeticGitEnv } from "../helpers/git-env.js";
 import {
   cleanupPiIsolatedEnv,
   createPiIsolatedEnv,

@@ -10,8 +10,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { hermeticGitChildEnv } from "../../helpers/git-env.js";
 import { dirname, join, resolve } from "node:path";
+import { hermeticGitChildEnv } from "../../helpers/git-env.js";
 import { createRpcClient, type RpcClient } from "./rpc-client";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../..");

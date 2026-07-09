@@ -10,7 +10,7 @@
 - Use `packages/aft-bridge/src/transport-factory.ts` to instantiate either `BridgePool` (standalone NDJSON bridge, isolating one `aft` process per project root) or `SubcTransportPool` (daemon-backed transport) satisfying the shared `AftTransportPool` interface.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular, with `crates/aft/src/commands/tool_call.rs` acting as the single endpoint for tool invocation routing.
-- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/inspect/` (including codebase-health scanners and the `oxc_engine/` liveness solver), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, `crates/aft/src/lsp/`, `crates/aft/src/artifact_owner.rs`, and `crates/aft/src/readonly_artifacts.rs` as shared engines behind multiple commands.
+- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/inspect/` (including codebase-health scanners and the `oxc_engine/` liveness solver), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, `crates/aft/src/lsp/`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, and `crates/aft/src/legacy_partitions.rs` as shared engines behind multiple commands.
 
 ## Layers
 
@@ -59,21 +59,21 @@
 **Protocol and command layer:**
 - Purpose: Accept NDJSON requests, route tool calls via the unified `tool_call` command, and dispatch them to focused command handlers.
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`
-- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, server-rendered agent-facing text formatting, control channel 0 health check responder, and standalone command handlers for read/write/edit/apply_patch/delete_file/move_file/outline/zoom/bash/bash_orchestrate/bash_status/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
+- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, server-rendered agent-facing text formatting, control channel 0 health check responder, and standalone command handlers for read/write/edit/apply_patch/delete_file/move_file/outline/zoom/bash/bash_orchestrate/bash_status/bash_wait_detach/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
 - Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
 **Analysis and mutation engine layer:**
 - Purpose: Parse code, compute call graphs, apply edits, format files, manage imports, index code semantically, and search with trigram indexes.
 - Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/callgraph_store/dead_code_projection.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/inspect/` (including `oxc_engine/` and `scanners/`), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`
-- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, semantic embedding index (covering Java, Kotlin, Scala, Swift, Ruby, PHP, Lua, Perl, R, Objective-C, and other supported languages), disk-backed trigram search index, disk-backed symbol cache, persisted SQLite callgraph store builder, AST-grep integration, patch parsing (Add, Delete, and Update hunks) and matching engine, vt100 terminal rendering for PTY screen snapshots, codebase-health scanners, NestJS framework route and decorator spec entry point detection, same-file export liveness propagation, Go interface method liveness matching, and manifest-derived signal tiering for ranking/down-ranking findings (Product, Test, Tooling) and generated-file filtering
+- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue, Groovy), refactor helpers, semantic embedding index (covering Java, Kotlin, Scala, Swift, Ruby, PHP, Lua, Perl, R, Objective-C, Groovy, and other supported languages), disk-backed trigram search index, disk-backed symbol cache, persisted SQLite callgraph store builder, AST-grep integration, patch parsing (Add, Delete, and Update hunks) and matching engine, vt100 terminal rendering for PTY screen snapshots, codebase-health scanners, NestJS framework route and decorator spec entry point detection, same-file export liveness propagation, Go interface method liveness matching, and manifest-derived signal tiering for ranking/down-ranking findings (Product, Test, Tooling) and generated-file filtering
 - Depends on: tree-sitter grammars, ast-grep, vt100, external formatter and checker processes, ONNX Runtime (optional), fastembed / OpenAI-compatible / Ollama backends (optional)
 - Used by: `crates/aft/src/commands/*.rs`
 
 **State and diagnostics layer:**
-- Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
-- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/response_finalize.rs`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`
-- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), Windows verbatim path normalization via `canonicalize_normalized` to eliminate path comparison asymmetry, undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store (which tracks and masks watcher-stale diagnostics for caching and pull reuse), document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels, main-loop pending responses registry, and artifact owner lease registry (writing an owner manifest containing PID and hostname to detect and reclaim stale leases, falling back to read-only mode if a lease is actively owned by another session)
+- Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, file-system locking, and root-keyed writer leases.
+- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/response_finalize.rs`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, `crates/aft/src/legacy_partitions.rs`
+- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), Windows verbatim path normalization via `canonicalize_normalized` to eliminate path comparison asymmetry, undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store (which tracks and masks watcher-stale diagnostics for caching and pull reuse), document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels, main-loop pending responses registry, root-keyed writer leases and reader marker file coordination (protecting active reader processes from index removal), and legacy harness coexistence guards (refusing writes into legacy layout partitions and validating migration space thresholds)
 - Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `db/` and `callgraph_store/`), `serde`
 - Used by: All command handlers through `AppContext`
 
@@ -98,7 +98,7 @@
 **Call-graph and navigation flow:**
 
 1. Configure project root and initialize file watching -- `crates/aft/src/commands/configure.rs`
-2. Query workspace-wide call dependencies via the persisted background-built callgraph store -- `crates/aft/src/callgraph_store/mod.rs`
+2. Query workspace-wide call dependencies via the persisted background-built callgraph store -- `crates/aft/src/callgraph_store/mod.rs`. Under read-only mode, queries run via `ReadonlyCallGraphStore` directly against the SQLite database without write or rebuild operations.
 3. Serve navigation commands such as callers, call-tree, impact, trace-to, and trace-data using the callgraph store adapter -- `crates/aft/src/commands/call_tree.rs`, `crates/aft/src/commands/callers.rs`, `crates/aft/src/commands/impact.rs`, `crates/aft/src/commands/trace_data.rs`, `crates/aft/src/commands/trace_to.rs`, `crates/aft/src/commands/trace_to_symbol.rs`, `crates/aft/src/commands/callgraph_store_adapter.rs`. By default, hide test files from results (controlled via the `includeTests` parameter) and collapse unresolved stdlib or external leaf calls in `call_tree` unless `includeUnresolved` is active. Truncate and return a summary (`hub_summary`) when results exceed 20 entries to save token context cost.
 4. Serve symbol-level zoom inspection (`aft_zoom`), which fetches a symbol's implementation. If the target is a large container (class, struct, interface, etc., exceeding 150 lines), it renders a member-signature menu instead of the full body. For standard functions, it dedupes outgoing (`calls_out`) and incoming (`called_by`) call sites by name, aggregating duplicate occurrences under `extra_count` to minimize context token cost.
 
@@ -119,7 +119,7 @@
 
 1. Rewrite high-level commands (cat to read, grep to grep tool) -- `crates/aft/src/bash_rewrite/`
 2. Scan for dangerous commands and prompt for permission -- `crates/aft/src/bash_permissions/`
-3. Execute foreground, background, PTY, or synchronous wait/foreground modes. Foreground bash executions are orchestrated with a wait window (defaulting to 15s, clamped to config) and deferred to background tasks if they exceed the budget, while wait mode (`wait: true`) blocks to completion using the timeout budget without background promotion, polling state and optionally rendering PTY screens with vt100 parsing -- `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_status.rs`, `crates/aft/src/pty_render.rs`, `crates/aft/src/bash_background/`
+3. Execute foreground, background, PTY, or synchronous wait/foreground modes. Foreground bash executions are orchestrated with a wait window (defaulting to 15s, clamped to config) and deferred to background tasks if they exceed the budget, while wait mode (`wait: true`) blocks to completion using the timeout budget, but detaches to a background task immediately if a `bash_wait_detach` signal is received (such as when a new user message is processed to prevent blocking agent interaction) -- `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_status.rs`, `crates/aft/src/commands/bash_wait_detach.rs`, `crates/aft/src/pty_render.rs`, `crates/aft/src/bash_background/`
 4. Compress output through the tiered compressor -- `crates/aft/src/compress/`
 
 **Background completion wake flow:**
@@ -137,12 +137,14 @@
 
 **Artifact ownership and read-only caching flow:**
 
-1. During `configure`, verify repository and cache directory scopes, and request a write lease -- `crates/aft/src/commands/configure.rs`, `crates/aft/src/artifact_owner.rs`.
+1. During `configure`, verify repository scopes, and resolve root-keyed cache directories: `<storage>/callgraph/<artifact_cache_key>` and `<storage>/inspect/<project_scope_key>` -- `crates/aft/src/commands/configure.rs`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/root_cache.rs`.
 2. Write an `owner.json` manifest to the cache directory carrying the current checkout's scope key, path, PID, and hostname.
 3. If no manifest exists, or if the existing manifest belongs to the same checkout, or if the owning process is dead (stale heartbeat or inactive process ID/hostname), reclaim and write a new lease ("Owner" mode).
 4. If an active process on another checkout owns the manifest, claim "ReadOnly" mode.
-5. In "ReadOnly" mode, heavy operations like cold callgraph builds, search index generation, and semantic index warming are disabled. Any search or semantic search queries read the cached index files using strict read-only openers -- `crates/aft/src/readonly_artifacts.rs`.
-6. The active "Owner" session emits periodic heartbeat file-writes to the lease manifest file during its event loop tick -- `crates/aft/src/main.rs`.
+5. Coordinate concurrent cache writes by acquiring a domain-specific `WriterLease` via `WriterLease::acquire_shared`. In "ReadOnly" mode or when a write lease cannot be acquired, heavy operations like cold callgraph builds, search index generation, and semantic index warming are disabled. Any search or semantic search queries read the cached index files using strict read-only openers (including `ReadonlyCallGraphStore` for callgraph reads) -- `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, `crates/aft/src/callgraph_store/mod.rs`.
+6. Write a `0600` read-marker file under `<domain>/readers/<generation-label>/` to register active reader sessions and prevent garbage collection cleanup from deleting active database files -- `crates/aft/src/root_cache.rs`.
+7. Enforce coexistence guards using `legacy_partitions.rs` to refuse write operations into legacy harness-scoped folders (`<storage>/<harness>/<domain>/<key>`) and check free space requirements using a 1.5× disk-floor preflight before copying legacy folders to the new root-keyed layout.
+8. The active "Owner" session emits periodic heartbeat file-writes to the lease manifest file during its event loop tick -- `crates/aft/src/main.rs`.
 
 ## Key Abstractions
 
@@ -201,7 +203,7 @@
 **CallGraphStore:**
 - Purpose: Persisted SQLite database of project-wide call dependencies.
 - Location: `crates/aft/src/callgraph_store/mod.rs`
-- Pattern: Background-built SQLite schema containing resolved and name-only call edges, refreshed incrementally on file edits, and queried by navigation commands. Returns a `Building` status during cold builds. Cold-build warming is deferred while a cold semantic index seed is actively collecting or embedding.
+- Pattern: Background-built SQLite schema containing resolved and name-only call edges, refreshed incrementally on file edits, and queried by navigation commands. Under read-only mode, queries read the SQLite file via `ReadonlyCallGraphStore` to prevent write collisions. Returns a `Building` status during cold builds. Cold-build warming is deferred while a cold semantic index seed is actively collecting or embedding.
 
 **Oxc Liveness Engine:**
 - Purpose: Perform liveness and dead-code analysis for JavaScript/TypeScript and other supported files.
@@ -266,6 +268,18 @@
 - Location: `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`
 - Pattern: File-system lease with active process liveness tracking.
 - Contains: Unique process identification (`pid`, `hostname`), heartbeat updates during the event loop to preserve the lease, stale lease reclamation, and read-only index adapters that query the cached search and semantic indexes without trigger-building or modifying files.
+
+**WriterLease / ReadMarker:**
+- Purpose: Coordinate safe multi-session access to the root-keyed project cache.
+- Location: `crates/aft/src/root_cache.rs`
+- Pattern: File-locked writer lease ensuring single-writer exclusivity combined with private read-marker JSON files (created `0600` under `<domain>/readers/`) to track active reader processes.
+- Contains: `WriterLease` domain mapping (`RootCacheDomain::Callgraph` or `RootCacheDomain::Inspect`), epoch validation, and process identification metadata for reader heartbeat cleanup.
+
+**LegacyPartitionGuards:**
+- Purpose: Protect legacy harness-scoped folders and manage space limits during layout migration.
+- Location: `crates/aft/src/legacy_partitions.rs`
+- Pattern: Coexistence write filters and space preflight check.
+- Contains: Layout checkers preventing writes to legacy partition structures, disk space size scanning, and 1.5× disk-floor verification before copying files to the new root-keyed cache location.
 
 ## Entry Points
 
@@ -381,4 +395,4 @@
 
 **Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, cache call-graph state in `crates/aft/src/callgraph.rs`, cache trigram search indexes on disk via `crates/aft/src/search_index.rs`, cache semantic embeddings on disk via `crates/aft/src/semantic_index.rs`, and cache symbol data on disk via `crates/aft/src/symbol_cache_disk.rs`.
 
-**Storage:** Store undo snapshots in `crates/aft/src/backup.rs` using the append-only v2 layout (indexing files under `<session_hash>/<path_hash>/` with locks to support multi-session project-shared bridges) governed by configured backup policies (`backup.enabled`, `backup.max_depth`, `backup.max_file_size`). Store named checkpoints in `crates/aft/src/checkpoint.rs`, database tables (backups, bash tasks, compression events, state, callgraph edges and nodes) in `crates/aft/src/db/`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`. Storage lives under the CortexKit shared root (`~/.local/share/cortexkit/aft/`), migrated from the legacy path via `crates/aft/src/migrate_storage.rs`.
+**Storage:** Store undo snapshots in `crates/aft/src/backup.rs` using the append-only v2 layout (indexing files under `<session_hash>/<path_hash>/` with locks to support multi-session project-shared bridges) governed by configured backup policies (`backup.enabled`, `backup.max_depth`, `backup.max_file_size`). Store named checkpoints in `crates/aft/src/checkpoint.rs`, database tables (backups, bash tasks, compression events, state) in `crates/aft/src/db/`, callgraph database in `crates/aft/src/callgraph_store/mod.rs`, inspect diagnostics cache in `crates/aft/src/inspect/cache.rs`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`. Storage lives under the CortexKit shared root (`~/.local/share/cortexkit/aft/`), migrated from the legacy path via `crates/aft/src/migrate_storage.rs`.

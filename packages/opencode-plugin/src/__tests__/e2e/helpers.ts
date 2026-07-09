@@ -12,13 +12,13 @@ import {
   inlineUserConfigTier,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
+import { hermeticGitChildEnv } from "../../../../../tests/helpers/git-env.js";
 import {
   type PreparedSubcLane,
   prepareSubcLane,
   type SubcRig,
   startSubcRig,
 } from "../../../../aft-bridge/src/__tests__/e2e/subc-rig.js";
-import { hermeticGitChildEnv } from "../../../../../tests/helpers/git-env.js";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like

@@ -2,13 +2,13 @@
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 import { existsSync, readdirSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 
 import { semanticTools } from "../../tools/semantic.js";
 import type { PluginContext } from "../../types.js";

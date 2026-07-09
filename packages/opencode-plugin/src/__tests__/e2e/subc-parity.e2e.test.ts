@@ -2,10 +2,10 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 import { writeFile } from "node:fs/promises";
 import { sep } from "node:path";
 import { promisify } from "node:util";
+import { withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 import {
   cleanupHarnesses,
   cleanupSharedSubcRig,
@@ -149,10 +149,11 @@ async function seedParityFixture(harness: E2EHarness): Promise<void> {
 }
 
 async function gitInitFixture(root: string): Promise<void> {
-  const git = (args: string[]) => execFileAsync("git", args, {
-    cwd: root,
-    env: withHermeticGitEnv(),
-  });
+  const git = (args: string[]) =>
+    execFileAsync("git", args, {
+      cwd: root,
+      env: withHermeticGitEnv(),
+    });
   await git(["init"]);
   await git(["config", "user.email", "aft-tests@example.invalid"]);
   await git(["config", "user.name", "AFT Tests"]);
