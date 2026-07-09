@@ -3337,8 +3337,14 @@ mod guard_tests {
                 .is_some_and(|file| file.starts_with("src/in/"))));
     }
 
+    fn artifact_cache_key_for_test(project_root: &std::path::Path) -> String {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        crate::search_index::artifact_cache_key(project_root)
+    }
+
     #[test]
     fn cache_for_paths_rebinds_same_project_key_to_current_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source");
         std::fs::create_dir_all(&source).expect("create source repo");
@@ -3349,35 +3355,42 @@ mod guard_tests {
         .expect("write source manifest");
         std::fs::write(source.join("index.ts"), "export const source = 1;\n")
             .expect("write source file");
-        assert!(std::process::Command::new("git")
-            .current_dir(&source)
-            .arg("init")
-            .status()
-            .expect("git init source repo")
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&source)
-            .args(["add", "."])
-            .status()
-            .expect("git add source repo")
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&source)
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "-m",
-                "initial",
-            ])
-            .status()
-            .expect("git commit source repo")
-            .success());
+        let mut init = std::process::Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(init.current_dir(&source))
+                .arg("init")
+                .status()
+                .expect("git init source repo")
+                .success()
+        );
+        let mut add = std::process::Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(add.current_dir(&source))
+                .args(["add", "."])
+                .status()
+                .expect("git add source repo")
+                .success()
+        );
+        let mut commit = std::process::Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(commit.current_dir(&source))
+                .args([
+                    "-c",
+                    "user.name=AFT Tests",
+                    "-c",
+                    "user.email=aft-tests@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ])
+                .status()
+                .expect("git commit source repo")
+                .success()
+        );
 
         let clone = dir.path().join("clone");
-        assert!(std::process::Command::new("git")
+        let mut clone_command = std::process::Command::new("git");
+        assert!(crate::test_env::apply_hermetic_git_env(&mut clone_command)
             .args(["clone", "--quiet"])
             .arg(&source)
             .arg(&clone)
@@ -3390,8 +3403,8 @@ mod guard_tests {
         )
         .expect("write clone manifest edit");
         assert_eq!(
-            crate::search_index::artifact_cache_key(&source),
-            crate::search_index::artifact_cache_key(&clone),
+            artifact_cache_key_for_test(&source),
+            artifact_cache_key_for_test(&clone),
             "clones with the same root commit should share the sqlite project key"
         );
 
@@ -3656,6 +3669,7 @@ export function bannerUnused() {}
 
     #[test]
     fn callgraph_snapshot_uses_ready_root_keyed_store() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
         let storage_dir = root.join(".aft-cache");
@@ -3664,7 +3678,7 @@ export function bannerUnused() {}
             .join(crate::path_identity::project_scope_key(&root));
         let warm_callgraph_dir = storage_dir
             .join("callgraph")
-            .join(crate::search_index::artifact_cache_key(&root));
+            .join(artifact_cache_key_for_test(&root));
         let store = CallGraphStore::open(warm_callgraph_dir, root.clone()).expect("open store");
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         store.cold_build(&files).expect("cold build store");

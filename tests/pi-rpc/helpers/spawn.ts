@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
+import { hermeticGitChildEnv } from "../../helpers/git-env.js";
 import { dirname, join, resolve } from "node:path";
 import { createRpcClient, type RpcClient } from "./rpc-client";
 
@@ -107,7 +108,7 @@ function childEnv(configDir: string): Record<string, string> {
   // instead of racing the background build. Matches the determinism knob the
   // other e2e harnesses use; see AppContext::callgraph_build_wait_window.
   result.AFT_CALLGRAPH_BUILD_WAIT_MS = "15000";
-  return result;
+  return { ...result, ...hermeticGitChildEnv() };
 }
 
 /**

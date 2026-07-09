@@ -142,9 +142,14 @@ mod tests {
     /// were the same root-commit key, so worktree A's tasks/undo bled into B.
     #[test]
     fn worktree_shares_artifact_key_but_has_distinct_scope_key() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         use std::process::Command;
 
-        let git_ok = Command::new("git").arg("--version").output().is_ok();
+        let mut git_version = Command::new("git");
+        let git_ok = crate::test_env::apply_hermetic_git_env(&mut git_version)
+            .arg("--version")
+            .output()
+            .is_ok();
         if !git_ok {
             eprintln!("skipping: git not available");
             return;
@@ -162,9 +167,9 @@ mod tests {
         fs::create_dir_all(&main).expect("create main checkout");
 
         let run = |args: &[&str], cwd: &std::path::Path| {
+            let mut command = Command::new("git");
             assert!(
-                Command::new("git")
-                    .current_dir(cwd)
+                crate::test_env::apply_hermetic_git_env(command.current_dir(cwd))
                     .args(args)
                     .status()
                     .expect("run git")

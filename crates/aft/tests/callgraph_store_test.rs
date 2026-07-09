@@ -1,3 +1,6 @@
+#[path = "helpers/mod.rs"]
+mod test_helpers;
+
 use aft::callgraph::walk_project_files;
 use aft::callgraph_store::{
     live_callgraph_edge_snapshot, project_dead_code_snapshot, CallGraphStore, StoredEdge,
@@ -1138,8 +1141,8 @@ fn store_cold_rebuilds_when_concurrent_clone_root_still_exists() {
     );
     assert_ne!(root_a, root_b);
     assert_eq!(
-        aft::search_index::artifact_cache_key(&root_a),
-        aft::search_index::artifact_cache_key(&root_b),
+        artifact_cache_key_for_test(&root_a),
+        artifact_cache_key_for_test(&root_b),
         "clone fixture must share the git-root cache key"
     );
 
@@ -1464,18 +1467,16 @@ const TEST_STORE_DATA_PATH_COLUMNS: &[(&str, &str)] = &[
     ("backend_file_state", "file_path"),
 ];
 
+fn artifact_cache_key_for_test(root: &Path) -> String {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    aft::search_index::artifact_cache_key(root)
+}
+
 fn init_git_repo(root: &Path) {
     let git = |args: &[&str]| {
+        let mut command = Command::new("git");
         assert!(
-            Command::new("git")
-                .current_dir(root)
-                // Hermetic: ignore the machine's global/system git config. A
-                // user-level `core.fsmonitor = true` would spawn a daemon that
-                // drops a unix socket into `.git/`, which `copy_dir_all`
-                // cannot fs::copy; other global settings can skew fixtures
-                // the same way.
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            crate::test_helpers::apply_hermetic_git_env(command.current_dir(root))
                 .args(args)
                 .status()
                 .unwrap()
@@ -1517,10 +1518,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 fn legacy_sqlite_path_for_root(store_dir: &Path, root: &Path) -> PathBuf {
-    store_dir.join(format!(
-        "{}.sqlite",
-        aft::search_index::artifact_cache_key(root)
-    ))
+    store_dir.join(format!("{}.sqlite", artifact_cache_key_for_test(root)))
 }
 
 fn copy_sqlite_file_set_to_legacy_root(

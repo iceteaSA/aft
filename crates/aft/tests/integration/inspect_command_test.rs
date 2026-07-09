@@ -648,6 +648,11 @@ fn dead_code_tier2_snapshot(project_root: &Path, inspect_dir: &Path) -> InspectS
     )
 }
 
+fn artifact_cache_key_for_test(project_root: &std::path::Path) -> String {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    aft::search_index::artifact_cache_key(project_root)
+}
+
 #[test]
 fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
     let (_temp_dir, root) = fixture_project();
@@ -661,7 +666,7 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
         .parent()
         .expect("storage dir")
         .join("callgraph")
-        .join(aft::search_index::artifact_cache_key(&root));
+        .join(artifact_cache_key_for_test(&root));
     let _not_ready_store =
         CallGraphStore::open(callgraph_dir, root.clone()).expect("open non-ready callgraph store");
 

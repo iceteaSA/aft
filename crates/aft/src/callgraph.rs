@@ -2986,9 +2986,9 @@ export function main() {
         .unwrap();
 
         // Init git repo for .gitignore to work
-        std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(command.current_dir(dir.path()))
             .args(["init"])
-            .current_dir(dir.path())
             .output()
             .unwrap();
 

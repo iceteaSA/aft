@@ -263,37 +263,38 @@ mod tests {
         hash: blake3::Hash,
     }
 
+    fn git_command(root: &Path) -> Command {
+        let mut command = Command::new("git");
+        crate::test_env::apply_hermetic_git_env(command.current_dir(root));
+        command
+    }
+
     fn init_git(root: &Path) {
-        let status = Command::new("git")
+        let status = git_command(root)
             .args(["init"])
-            .current_dir(root)
             .status()
             .expect("run git init");
         assert!(status.success(), "git init failed");
-        let status = Command::new("git")
+        let status = git_command(root)
             .args(["config", "user.email", "test@example.com"])
-            .current_dir(root)
             .status()
             .expect("configure git email");
         assert!(status.success(), "git config email failed");
-        let status = Command::new("git")
+        let status = git_command(root)
             .args(["config", "user.name", "AFT Test"])
-            .current_dir(root)
             .status()
             .expect("configure git name");
         assert!(status.success(), "git config name failed");
     }
 
     fn commit_all(root: &Path) {
-        let status = Command::new("git")
+        let status = git_command(root)
             .args(["add", "."])
-            .current_dir(root)
             .status()
             .expect("git add");
         assert!(status.success(), "git add failed");
-        let status = Command::new("git")
+        let status = git_command(root)
             .args(["commit", "-m", "initial"])
-            .current_dir(root)
             .status()
             .expect("git commit");
         assert!(status.success(), "git commit failed");
@@ -360,7 +361,8 @@ mod tests {
             .to_string_lossy()
             .trim_start_matches(r"\\?\")
             .to_string();
-        let status = Command::new("git")
+        let mut command = Command::new("git");
+        let status = crate::test_env::apply_hermetic_git_env(&mut command)
             .arg("clone")
             .arg("--quiet")
             .arg(&clone_source)
@@ -391,6 +393,7 @@ mod tests {
 
     #[test]
     fn search_opener_reports_fresh_stale_absent() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_project, root) = fixture_project();
         let storage = tempfile::tempdir().expect("storage");
 
@@ -422,6 +425,7 @@ mod tests {
 
     #[test]
     fn search_opener_marks_cross_checkout_ignore_rule_mismatch_as_stale() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_project, root) = fixture_project();
         let storage = tempfile::tempdir().expect("storage");
         let owner_only_ignore = root.join(".foo/.gitignore");
@@ -442,6 +446,7 @@ mod tests {
 
     #[test]
     fn owner_search_loader_stays_strict_on_ignore_rule_mismatch() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_project, root) = fixture_project();
         let storage = tempfile::tempdir().expect("storage");
         let cache_dir = build_search_artifact(&root, storage.path());
@@ -455,6 +460,7 @@ mod tests {
 
     #[test]
     fn read_only_openers_never_modify_artifact_directory() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_project, root) = fixture_project();
         let storage = tempfile::tempdir().expect("storage");
         let search_cache_dir = build_search_artifact(&root, storage.path());

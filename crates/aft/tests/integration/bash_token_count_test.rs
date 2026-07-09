@@ -161,20 +161,25 @@ fn bash_completed_frame_tokenizes_tail_above_cap() {
 
 #[test]
 fn bash_completed_frame_compressed_tokens_reflect_compression() {
-    let git_version = Command::new("git").arg("--version").output();
+    let mut git_version_command = Command::new("git");
+    let git_version = crate::test_helpers::apply_hermetic_git_env(&mut git_version_command)
+        .arg("--version")
+        .output();
     if !git_version.is_ok_and(|output| output.status.success()) {
         eprintln!("skipping git compression token test because git is unavailable");
         return;
     }
 
     let project = tempfile::tempdir().unwrap();
-    assert!(Command::new("git")
-        .arg("init")
-        .current_dir(project.path())
-        .output()
-        .unwrap()
-        .status
-        .success());
+    let mut command = Command::new("git");
+    assert!(
+        crate::test_helpers::apply_hermetic_git_env(command.current_dir(project.path()))
+            .arg("init")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     for index in 0..80 {
         fs::write(
             project.path().join(format!("file_{index}.txt")),

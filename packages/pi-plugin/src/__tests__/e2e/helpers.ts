@@ -18,6 +18,7 @@ import { join, relative, resolve } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { BridgePool, inlineUserConfigTier, setActiveLogger } from "@cortexkit/aft-bridge";
 import { bridgeLogger } from "../../logger.js";
+import { hermeticGitChildEnv, withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
 // "[aft] invalidated 7 files") into $TMPDIR/aft-pi-test.log instead of
@@ -275,10 +276,10 @@ export async function createHarness(
       // background store build finishes (default 0 = non-blocking, returns
       // callgraph_building). Tests need the store ready synchronously; fixtures
       // are tiny so a few seconds is ample headroom.
-      childEnv: {
+      childEnv: hermeticGitChildEnv({
         AFT_CACHE_DIR: join(tempDir, ".aft-cache"),
         AFT_CALLGRAPH_BUILD_WAIT_MS: "15000",
-      },
+      }),
     },
     // Forward the full config to configure so indexing/restrict/etc. match prod.
     configureParamsFromLegacyOverrides({
@@ -427,7 +428,11 @@ async function runGitCapture(
   args: string[],
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolveCmd) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("git", args, {
+      cwd,
+      env: withHermeticGitEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", (c: Buffer) => {

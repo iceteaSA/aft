@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { withHermeticGitEnv } from "../helpers/git-env.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -51,7 +52,7 @@ function resultText(event: Record<string, unknown>): string {
 
 async function setupMergeConflict(env: PiIsolatedEnv): Promise<void> {
   const runGit = (args: string[]) =>
-    execFileSync("git", args, { cwd: env.workdir, stdio: "ignore" });
+    execFileSync("git", args, { cwd: env.workdir, env: withHermeticGitEnv(), stdio: "ignore" });
   runGit(["init"]);
   runGit(["config", "user.email", "pi@example.test"]);
   runGit(["config", "user.name", "Pi Test"]);

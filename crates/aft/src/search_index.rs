@@ -4343,8 +4343,15 @@ mod tests {
         );
     }
 
+    fn git_command_for_test(root: &Path) -> Command {
+        let mut command = Command::new("git");
+        crate::test_env::apply_hermetic_git_env(command.arg("-C").arg(root));
+        command
+    }
+
     #[test]
     fn refresh_after_head_change_removes_renames_and_detects_local_files() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project dir");
@@ -4352,31 +4359,24 @@ mod tests {
         fs::write(project.join("old.txt"), "old token\n").expect("write old");
         fs::write(project.join("unchanged.txt"), "before\n").expect("write unchanged");
 
-        Command::new("git")
-            .arg("init")
-            .arg(&project)
+        let mut init = Command::new("git");
+        crate::test_env::apply_hermetic_git_env(init.arg("init").arg(&project))
             .status()
             .expect("git init");
         for args in [
             ["config", "user.email", "aft@example.invalid"],
             ["config", "user.name", "AFT Test"],
         ] {
-            Command::new("git")
-                .arg("-C")
-                .arg(&project)
+            git_command_for_test(&project)
                 .args(args)
                 .status()
                 .expect("git config");
         }
-        Command::new("git")
-            .arg("-C")
-            .arg(&project)
+        git_command_for_test(&project)
             .args(["add", "."])
             .status()
             .expect("git add initial");
-        Command::new("git")
-            .arg("-C")
-            .arg(&project)
+        git_command_for_test(&project)
             .args(["commit", "-m", "initial"])
             .status()
             .expect("git commit initial");
@@ -4385,15 +4385,11 @@ mod tests {
         baseline.git_head = Some(previous.clone());
 
         fs::rename(project.join("old.txt"), project.join("new.txt")).expect("rename file");
-        Command::new("git")
-            .arg("-C")
-            .arg(&project)
+        git_command_for_test(&project)
             .args(["add", "-A"])
             .status()
             .expect("git add rename");
-        Command::new("git")
-            .arg("-C")
-            .arg(&project)
+        git_command_for_test(&project)
             .args(["commit", "-m", "rename"])
             .status()
             .expect("git commit rename");
@@ -4504,25 +4500,26 @@ mod tests {
 
     #[test]
     fn artifact_cache_key_shared_across_clones_of_same_repo() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let dir = tempfile::tempdir().expect("create temp dir");
         let source = dir.path().join("source");
         fs::create_dir_all(&source).expect("create source repo dir");
         fs::write(source.join("tracked.txt"), "content\n").expect("write tracked file");
 
-        assert!(Command::new("git")
-            .current_dir(&source)
-            .args(["init"])
-            .status()
-            .expect("init git repo")
-            .success());
-        assert!(Command::new("git")
-            .current_dir(&source)
+        let mut init = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(init.current_dir(&source))
+                .args(["init"])
+                .status()
+                .expect("init git repo")
+                .success()
+        );
+        assert!(git_command_for_test(&source)
             .args(["add", "."])
             .status()
             .expect("git add")
             .success());
-        assert!(Command::new("git")
-            .current_dir(&source)
+        assert!(git_command_for_test(&source)
             .args([
                 "-c",
                 "user.name=AFT Tests",
@@ -4537,7 +4534,8 @@ mod tests {
             .success());
 
         let clone = dir.path().join("clone");
-        assert!(Command::new("git")
+        let mut clone_command = Command::new("git");
+        assert!(crate::test_env::apply_hermetic_git_env(&mut clone_command)
             .args(["clone", "--quiet"])
             .arg(&source)
             .arg(&clone)
@@ -4556,25 +4554,26 @@ mod tests {
 
     #[test]
     fn git_head_unchanged_picks_up_local_edits() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("repo");
         fs::create_dir_all(&project).expect("create repo dir");
         let file = project.join("tracked.txt");
         fs::write(&file, "oldtoken\n").expect("write file");
-        assert!(Command::new("git")
-            .current_dir(&project)
-            .arg("init")
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .current_dir(&project)
+        let mut init = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(init.current_dir(&project))
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(git_command_for_test(&project)
             .args(["add", "."])
             .status()
             .unwrap()
             .success());
-        assert!(Command::new("git")
-            .current_dir(&project)
+        assert!(git_command_for_test(&project)
             .args([
                 "-c",
                 "user.name=AFT Tests",
@@ -4885,6 +4884,7 @@ mod tests {
 
     #[test]
     fn ignore_rule_discovery_respects_gitignore() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
         fs::create_dir_all(project.join("src")).expect("mkdir src");
@@ -4897,31 +4897,24 @@ mod tests {
                 .expect("write ignored file");
         }
 
-        Command::new("git")
-            .arg("init")
-            .arg(&project)
+        let mut init = Command::new("git");
+        crate::test_env::apply_hermetic_git_env(init.arg("init").arg(&project))
             .status()
             .expect("git init");
         for args in [
             ["config", "user.email", "aft@example.invalid"],
             ["config", "user.name", "AFT Test"],
         ] {
-            Command::new("git")
-                .arg("-C")
-                .arg(&project)
+            git_command_for_test(&project)
                 .args(args)
                 .status()
                 .expect("git config");
         }
-        Command::new("git")
-            .arg("-C")
-            .arg(&project)
+        git_command_for_test(&project)
             .args(["add", "."])
             .status()
             .expect("git add");
-        Command::new("git")
-            .arg("-C")
-            .arg(&project)
+        git_command_for_test(&project)
             .args(["commit", "-m", "initial"])
             .status()
             .expect("git commit");

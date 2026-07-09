@@ -752,33 +752,39 @@ fn create_storm_roots(count: usize) -> (Vec<tempfile::TempDir>, Vec<PathBuf>) {
 }
 
 fn init_git(root: &Path) {
-    assert!(Command::new("git")
-        .current_dir(root)
-        .args(["init", "--quiet"])
-        .status()
-        .expect("git init")
-        .success());
-    assert!(Command::new("git")
-        .current_dir(root)
-        .args(["add", "."])
-        .status()
-        .expect("git add")
-        .success());
-    assert!(Command::new("git")
-        .current_dir(root)
-        .args([
-            "-c",
-            "user.name=AFT Tests",
-            "-c",
-            "user.email=aft-tests@example.com",
-            "commit",
-            "--quiet",
-            "-m",
-            "initial"
-        ])
-        .status()
-        .expect("git commit")
-        .success());
+    let mut init = Command::new("git");
+    assert!(
+        crate::test_helpers::apply_hermetic_git_env(init.current_dir(root))
+            .args(["init", "--quiet"])
+            .status()
+            .expect("git init")
+            .success()
+    );
+    let mut add = Command::new("git");
+    assert!(
+        crate::test_helpers::apply_hermetic_git_env(add.current_dir(root))
+            .args(["add", "."])
+            .status()
+            .expect("git add")
+            .success()
+    );
+    let mut commit = Command::new("git");
+    assert!(
+        crate::test_helpers::apply_hermetic_git_env(commit.current_dir(root))
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial"
+            ])
+            .status()
+            .expect("git commit")
+            .success()
+    );
 }
 
 fn touch_between_rebinds(root: &Path, count: usize) {

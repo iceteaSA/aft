@@ -218,7 +218,8 @@ fn restart_drops_search_cache_entry_after_global_gitignore_change() {
     let xdg = tempfile::tempdir().expect("create xdg dir");
     let home = tempfile::tempdir().expect("create home dir");
     fs::create_dir_all(project.path().join("src")).expect("create src");
-    let git_init = std::process::Command::new("git")
+    let mut git_init = std::process::Command::new("git");
+    let git_init = crate::test_helpers::apply_hermetic_git_env(&mut git_init)
         .arg("init")
         .arg(project.path())
         .status();

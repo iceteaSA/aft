@@ -6,12 +6,14 @@ use serde_json::{json, Value};
 
 use super::helpers::AftProcess;
 
+fn git_command(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(command.current_dir(repo));
+    command
+}
+
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("run git");
+    let output = git_command(repo).args(args).output().expect("run git");
     assert!(
         output.status.success(),
         "git {args:?} failed\nstdout: {}\nstderr: {}",
@@ -21,9 +23,8 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn repo_toplevel(repo: &Path) -> String {
-    let output = Command::new("git")
+    let output = git_command(repo)
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(repo)
         .output()
         .expect("git toplevel");
     assert!(output.status.success(), "git rev-parse failed");
@@ -34,11 +35,7 @@ fn repo_toplevel(repo: &Path) -> String {
 }
 
 fn git_allow_fail(repo: &Path, args: &[&str]) -> Output {
-    Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("run git")
+    git_command(repo).args(args).output().expect("run git")
 }
 
 fn write_file(repo: &Path, relative: &str, content: &str) {
@@ -51,9 +48,8 @@ fn init_repo(repo: &Path) -> String {
     git(repo, &["init"]);
     git(repo, &["config", "user.email", "aft@example.com"]);
     git(repo, &["config", "user.name", "AFT Test"]);
-    let output = Command::new("git")
+    let output = git_command(repo)
         .args(["symbolic-ref", "--short", "HEAD"])
-        .current_dir(repo)
         .output()
         .expect("current branch");
     assert!(output.status.success(), "git symbolic-ref failed");

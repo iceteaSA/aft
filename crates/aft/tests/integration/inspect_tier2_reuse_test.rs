@@ -148,12 +148,17 @@ fn project_source_files(project_root: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn artifact_cache_key_for_test(project_root: &Path) -> String {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    aft::search_index::artifact_cache_key(project_root)
+}
+
 fn rebuild_dead_code_callgraph_store(project_root: &Path, inspect_dir: &Path) {
     let store_dir = inspect_dir
         .parent()
         .expect("inspect dir has parent")
         .join("callgraph")
-        .join(aft::search_index::artifact_cache_key(project_root));
+        .join(artifact_cache_key_for_test(project_root));
     let store = CallGraphStore::open(store_dir, project_root.to_path_buf()).expect("open store");
     let files = project_source_files(project_root);
     store

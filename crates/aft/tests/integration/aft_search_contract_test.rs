@@ -102,20 +102,21 @@ fn test_context_with_storage(project_root: &Path, storage_dir: &Path) -> AppCont
     )
 }
 
+fn git_command(root: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(command.current_dir(root));
+    command
+}
+
 fn init_git(root: &Path) {
-    let status = std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(root)
-        .status()
-        .expect("git init");
+    let status = git_command(root).args(["init"]).status().expect("git init");
     assert!(status.success(), "git init failed");
     for (key, value) in [
         ("user.email", "test@example.com"),
         ("user.name", "AFT Test"),
     ] {
-        let status = std::process::Command::new("git")
+        let status = git_command(root)
             .args(["config", key, value])
-            .current_dir(root)
             .status()
             .expect("git config");
         assert!(status.success(), "git config {key} failed");
@@ -123,15 +124,13 @@ fn init_git(root: &Path) {
 }
 
 fn commit_all(root: &Path) {
-    let status = std::process::Command::new("git")
+    let status = git_command(root)
         .args(["add", "."])
-        .current_dir(root)
         .status()
         .expect("git add");
     assert!(status.success(), "git add failed");
-    let status = std::process::Command::new("git")
+    let status = git_command(root)
         .args(["commit", "--no-gpg-sign", "-m", "initial"])
-        .current_dir(root)
         .status()
         .expect("git commit");
     assert!(status.success(), "git commit failed");
@@ -145,9 +144,8 @@ fn git_project_with_needle() -> (tempfile::TempDir, std::path::PathBuf, &'static
 }
 
 fn git_head(root: &Path) -> String {
-    let output = std::process::Command::new("git")
+    let output = git_command(root)
         .args(["rev-parse", "HEAD"])
-        .current_dir(root)
         .output()
         .expect("git rev-parse HEAD");
     assert!(output.status.success(), "git rev-parse HEAD failed");
@@ -160,7 +158,8 @@ fn git_head(root: &Path) -> String {
 fn clone_checkout(root: &Path) -> (tempfile::TempDir, std::path::PathBuf) {
     let temp = tempfile::tempdir().expect("create clone dir");
     let clone_root = temp.path().join("clone");
-    let status = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    let status = crate::test_helpers::apply_hermetic_git_env(&mut command)
         .arg("clone")
         .arg("--quiet")
         .arg(root)
@@ -193,6 +192,7 @@ fn persist_semantic_index_with_fingerprint(
     let mut index = SemanticIndex::build(&canonical_root, &[canonical_source], &mut embed, 8)
         .expect("build semantic index");
     index.set_fingerprint(fingerprint);
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     index.write_to_disk(storage_dir, &artifact_cache_key(&canonical_root));
 }
 
@@ -637,6 +637,7 @@ fn external_missing_path_returns_path_not_found() {
 
 #[test]
 fn external_absent_cache_returns_not_indexed() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, _external_source, _source) = git_project_with_needle();
     let session_project = tempfile::tempdir().expect("session project");
     let storage = tempfile::tempdir().expect("storage");
@@ -659,6 +660,7 @@ fn external_absent_cache_returns_not_indexed() {
 
 #[test]
 fn same_root_path_param_is_byte_identical_to_default_search() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (project, _source_file, _source) = git_project_with_needle();
     let ctx = test_context(project.path());
     *ctx.semantic_index_status()
@@ -683,6 +685,7 @@ fn same_root_path_param_is_byte_identical_to_default_search() {
 
 #[test]
 fn external_ignore_rule_mismatch_serves_borrowed_results_with_warning() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (owner_project, _owner_source, _source) = git_project_with_needle();
     let storage = tempfile::tempdir().expect("storage");
     let owner_only_ignore = owner_project.path().join(".foo/.gitignore");
@@ -725,6 +728,7 @@ fn external_ignore_rule_mismatch_serves_borrowed_results_with_warning() {
 
 #[test]
 fn external_semantic_search_serves_drifted_borrowed_indexes_with_note() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, external_source, _source) = git_project_with_needle();
     let storage = tempfile::tempdir().expect("storage");
     persist_search_index(external_project.path(), storage.path());
@@ -776,6 +780,7 @@ fn external_semantic_search_serves_drifted_borrowed_indexes_with_note() {
 
 #[test]
 fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, external_source, _source) = git_project_with_needle();
     let session_project = tempfile::tempdir().expect("session project");
     let storage = tempfile::tempdir().expect("storage");
@@ -825,6 +830,7 @@ fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
 
 #[test]
 fn external_path_obeys_force_restrict_guard() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, _external_source, _source) = git_project_with_needle();
     let session_project = tempfile::tempdir().expect("session project");
     let storage = tempfile::tempdir().expect("storage");

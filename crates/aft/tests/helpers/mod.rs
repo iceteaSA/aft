@@ -1,9 +1,17 @@
 #![allow(dead_code)]
 
-//! Shared test helpers for integration tests.
-//!
-//! Provides `AftProcess` — a handle to a running aft binary with piped I/O —
-//! and `fixture_path` for resolving test fixture files.
+#[path = "../../src/test_env.rs"]
+mod shared_test_env;
+
+// Shared test helpers for integration tests.
+//
+// Provides `AftProcess` — a handle to a running aft binary with piped I/O —
+// and `fixture_path` for resolving test fixture files.
+
+#[allow(unused_imports)]
+pub(crate) use shared_test_env::{
+    apply_hermetic_git_env, hermetic_git_env, hermetic_git_env_guard,
+};
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -122,6 +130,7 @@ impl AftProcess {
         let cache_dir = tempfile::tempdir().expect("create aft test cache dir");
         let mut command = Command::new(binary);
         command
+            .envs(hermetic_git_env())
             .env("AFT_CACHE_DIR", cache_dir.path())
             // Integration tests often run from a linked git worktree, but their
             // fixture projects need to exercise main-checkout demand builds.

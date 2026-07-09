@@ -1213,6 +1213,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
     let _serial = bridge_test_serial_guard();
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let _env_guards = env_setup();
     let state = Arc::new(BridgeState::default());
     install_bridge_state(Arc::clone(&state));
@@ -5202,7 +5203,8 @@ async fn drive_inspect_dead_code_convergence_daemon(input: FakeDaemonInput) {
 
 fn init_git_fixture(root: &std::path::Path) {
     let run = |args: &[&str]| {
-        let status = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        let status = crate::test_helpers::apply_hermetic_git_env(&mut command)
             .arg("-C")
             .arg(root)
             .args(args)
@@ -5657,7 +5659,8 @@ fn prepare_manifest_reachability_fixture(root: &std::path::Path) {
     std::fs::write(root.join("patch-target.txt"), "old\n").expect("write patch fixture");
     std::fs::write(root.join("delete-target.txt"), "delete me\n").expect("write delete fixture");
     std::fs::write(root.join("move-source.txt"), "move me\n").expect("write move fixture");
-    let status = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    let status = crate::test_helpers::apply_hermetic_git_env(&mut command)
         .arg("init")
         .arg("-q")
         .current_dir(root)

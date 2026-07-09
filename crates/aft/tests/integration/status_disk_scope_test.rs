@@ -41,6 +41,7 @@ fn write_fake_cache_for_project(
 
 #[test]
 fn status_disk_bytes_only_count_current_project() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
     // Set up two fake project caches under one shared storage_dir, where
     // project A is what we'll configure aft against and project B is a
     // sibling that should NOT contribute to A's disk numbers.

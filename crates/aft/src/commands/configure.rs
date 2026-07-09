@@ -2766,11 +2766,22 @@ mod tests {
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
-    use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest};
+    use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use std::process::Command;
 
     fn test_context() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    fn git_command(root: &std::path::Path) -> Command {
+        let mut command = Command::new("git");
+        crate::test_env::apply_hermetic_git_env(command.current_dir(root));
+        command
+    }
+
+    fn handle_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        super::handle_configure(req, ctx)
     }
 
     struct EnvVarGuard {
@@ -2886,20 +2897,17 @@ mod tests {
             format!("// fixture:{}\nfn tracked() {{}}\n", root.display()),
         )
         .unwrap();
-        assert!(Command::new("git")
-            .current_dir(root)
+        assert!(git_command(root)
             .args(["init", "--quiet"])
             .status()
             .unwrap()
             .success());
-        assert!(Command::new("git")
-            .current_dir(root)
+        assert!(git_command(root)
             .args(["add", "."])
             .status()
             .unwrap()
             .success());
-        assert!(Command::new("git")
-            .current_dir(root)
+        assert!(git_command(root)
             .args([
                 "-c",
                 "user.name=AFT Tests",
@@ -2940,7 +2948,7 @@ mod tests {
             ]
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().format_on_edit);
         assert!(!ctx.config().url_fetch_allow_private);
@@ -2964,7 +2972,7 @@ mod tests {
             ]
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(ctx.config().url_fetch_allow_private);
         assert_eq!(ctx.config().callgraph_chunk_size, 7);
@@ -2991,7 +2999,7 @@ mod tests {
             ]
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().format_on_edit);
         assert!(!ctx.config().url_fetch_allow_private);
@@ -3013,7 +3021,7 @@ mod tests {
             ]
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().format_on_edit);
         assert!(ctx.config().url_fetch_allow_private);
@@ -3033,7 +3041,7 @@ mod tests {
             ]
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().format_on_edit);
         assert_eq!(ctx.config().callgraph_chunk_size, 13);
@@ -3056,7 +3064,7 @@ mod tests {
             ]
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
 
         // Core-resolved field applied: user search_index=true survived.
@@ -3087,7 +3095,7 @@ mod tests {
         let ctx = test_context();
         let req = configure_request_with_params(json!({ "project_root": temp.path() }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         assert!(!response.success);
         assert_eq!(response.data["code"], "invalid_request");
@@ -3106,7 +3114,7 @@ mod tests {
             "harness": "claude_code"
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         assert!(!response.success);
         assert_eq!(response.data["code"], "invalid_request");
@@ -3121,7 +3129,7 @@ mod tests {
             "harness": "pi"
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         assert!(response.success);
         assert_eq!(ctx.harness(), crate::harness::Harness::Pi);
@@ -3133,7 +3141,7 @@ mod tests {
         let ctx = test_context();
         let req = configure_request(json!("relative/path"));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         assert!(!response.success);
         assert_eq!(response.data["code"], "invalid_request");
@@ -3145,7 +3153,7 @@ mod tests {
         let ctx = test_context();
         let req = configure_request(json!(temp.path()));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         assert!(response.success);
         assert_eq!(
@@ -3157,13 +3165,15 @@ mod tests {
 
     #[test]
     fn sibling_clone_same_artifact_key_opens_shared_artifacts_read_only() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let owner = temp.path().join("owner");
         init_git_fixture(&owner);
         let sibling = temp.path().join("sibling");
-        assert!(Command::new("git")
+        let mut clone_command = Command::new("git");
+        assert!(crate::test_env::apply_hermetic_git_env(&mut clone_command)
             .args(["clone", "--quiet"])
             .arg(&owner)
             .arg(&sibling)
@@ -3173,13 +3183,13 @@ mod tests {
 
         let owner_ctx = test_context();
         let owner_response =
-            super::handle_configure(&configure_with_storage(&owner, &storage), &owner_ctx);
+            handle_configure_for_test(&configure_with_storage(&owner, &storage), &owner_ctx);
         assert!(owner_response.success);
         assert_eq!(owner_ctx.cache_role(), "main");
 
         let sibling_ctx = test_context();
         let sibling_response =
-            super::handle_configure(&configure_with_storage(&sibling, &storage), &sibling_ctx);
+            handle_configure_for_test(&configure_with_storage(&sibling, &storage), &sibling_ctx);
 
         assert!(sibling_response.success);
         assert_eq!(sibling_ctx.cache_role(), "read_only");
@@ -3198,20 +3208,22 @@ mod tests {
     #[test]
     fn linked_worktree_configure_schedules_no_cold_warm_builds() {
         let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         init_git_fixture(&main);
         let worktree = temp.path().join("worktree");
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(["worktree", "add", "--detach", "--quiet"])
-            .arg(&worktree)
-            .arg("HEAD")
-            .status()
-            .unwrap()
-            .success());
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let ctx = test_context();
         let req = configure_request_with_params(json!({
@@ -3224,7 +3236,7 @@ mod tests {
             }))]
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         assert!(response.success);
         assert_eq!(ctx.cache_role(), "worktree");
@@ -3236,6 +3248,7 @@ mod tests {
     #[test]
     fn configure_defers_large_tree_file_walk_until_after_ack() {
         let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let _delay_walk = EnvVarGuard::set("AFT_TEST_CONFIGURE_DEFERRED_WALK_DELAY_MS", "400");
         let temp = tempfile::tempdir().unwrap();
@@ -3261,7 +3274,7 @@ mod tests {
         }));
 
         let start = Instant::now();
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
         let elapsed = start.elapsed();
 
         assert!(response.success);
@@ -3282,6 +3295,7 @@ mod tests {
     #[test]
     fn equivalent_reconfigure_keeps_warm_work_adopted_and_idempotent() {
         let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let temp = tempfile::tempdir().unwrap();
         init_git_fixture(temp.path());
@@ -3296,7 +3310,7 @@ mod tests {
             }))]
         }));
 
-        let first = super::handle_configure(&req, &ctx);
+        let first = handle_configure_for_test(&req, &ctx);
         assert!(first.success);
         super::drain_deferred_configure_maintenance(&ctx);
 
@@ -3307,7 +3321,7 @@ mod tests {
         let artifact_derivations_after_first = ctx.artifact_cache_key_derivation_count_for_test();
         assert_eq!(artifact_derivations_after_first, 1);
         for _ in 0..5 {
-            let response = super::handle_configure(&req, &ctx);
+            let response = handle_configure_for_test(&req, &ctx);
             assert!(response.success);
             super::drain_deferred_configure_maintenance(&ctx);
         }
@@ -3347,7 +3361,7 @@ mod tests {
                 "callgraph_store": false
             }))]
         }));
-        let response = super::handle_configure(&changed, &ctx);
+        let response = handle_configure_for_test(&changed, &ctx);
         assert!(response.success);
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(ctx.configure_generation(), generation_after_first + 1);
@@ -3364,6 +3378,7 @@ mod tests {
     #[test]
     fn equivalent_reconfigure_replays_new_sessions_but_not_same_session_rebinds() {
         let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         super::reset_configure_replay_session_calls_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -3380,12 +3395,12 @@ mod tests {
         });
 
         let session_a = configure_request_with_session(params.clone(), "session-a");
-        let response = super::handle_configure(&session_a, &ctx);
+        let response = handle_configure_for_test(&session_a, &ctx);
         assert!(response.success);
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(super::configure_replay_session_calls_for_test(), 1);
 
-        let response = super::handle_configure(&session_a, &ctx);
+        let response = handle_configure_for_test(&session_a, &ctx);
         assert!(response.success);
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(
@@ -3395,7 +3410,7 @@ mod tests {
         );
 
         let session_b = configure_request_with_session(params, "session-b");
-        let response = super::handle_configure(&session_b, &ctx);
+        let response = handle_configure_for_test(&session_b, &ctx);
         assert!(response.success);
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(
@@ -3407,13 +3422,15 @@ mod tests {
 
     #[test]
     fn dead_artifact_owner_manifest_is_taken_over_on_configure() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let owner = temp.path().join("owner");
         init_git_fixture(&owner);
         let sibling = temp.path().join("sibling");
-        assert!(Command::new("git")
+        let mut clone_command = Command::new("git");
+        assert!(crate::test_env::apply_hermetic_git_env(&mut clone_command)
             .args(["clone", "--quiet"])
             .arg(&owner)
             .arg(&sibling)
@@ -3432,7 +3449,7 @@ mod tests {
 
         let sibling_ctx = test_context();
         let sibling_response =
-            super::handle_configure(&configure_with_storage(&sibling, &storage), &sibling_ctx);
+            handle_configure_for_test(&configure_with_storage(&sibling, &storage), &sibling_ctx);
 
         assert!(sibling_response.success);
         assert_eq!(sibling_ctx.cache_role(), "main");
@@ -3598,7 +3615,7 @@ mod tests {
     /// `resolve_home_dir()` here and produce flaky failures. A module-local
     /// mutex is not enough: the lock must be shared with every other test
     /// that touches these variables.
-    fn home_env_mutex() -> std::sync::MutexGuard<'static, ()> {
+    fn home_env_mutex() -> crate::test_env::ProcessEnvLockGuard {
         crate::test_env::process_env_lock()
     }
 
@@ -3651,7 +3668,7 @@ mod tests {
             "harness": "opencode",
             "config": [user_tier(json!({ "search_index": true, "semantic_search": true }))],
         }));
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         // Restore env immediately so a later assertion failure doesn't leak.
         unsafe {
@@ -3716,7 +3733,7 @@ mod tests {
             "harness": "opencode",
             "config": [user_tier(json!({ "search_index": true }))],
         }));
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         unsafe {
             match prev_home {
@@ -4048,7 +4065,7 @@ mod tests {
             "harness": "opencode",
             "config": [user_tier(json!({ "format_on_edit": true }))]
         }));
-        let first_response = super::handle_configure(&first_req, &ctx);
+        let first_response = handle_configure_for_test(&first_req, &ctx);
         assert!(first_response.success);
         let canonical_before = ctx.canonical_cache_root();
 
@@ -4057,7 +4074,7 @@ mod tests {
             "harness": "pi",
             "max_background_bash_tasks": 0
         }));
-        let invalid_response = super::handle_configure(&invalid_req, &ctx);
+        let invalid_response = handle_configure_for_test(&invalid_req, &ctx);
 
         assert!(!invalid_response.success);
         assert_eq!(invalid_response.data["code"], "invalid_request");
@@ -4081,7 +4098,7 @@ mod tests {
                 "checker": { "typescript": "tsc" }
             }))]
         }));
-        assert!(super::handle_configure(&first_req, &ctx).success);
+        assert!(handle_configure_for_test(&first_req, &ctx).success);
 
         let second_req = configure_request_with_params(json!({
             "project_root": root.path(),
@@ -4091,7 +4108,7 @@ mod tests {
                 "checker": { "go": "go" }
             }))]
         }));
-        assert!(super::handle_configure(&second_req, &ctx).success);
+        assert!(handle_configure_for_test(&second_req, &ctx).success);
 
         let config = ctx.config();
         assert_eq!(
@@ -4114,7 +4131,7 @@ mod tests {
             "max_background_bash_tasks": 0
         }));
 
-        let response = super::handle_configure(&req, &ctx);
+        let response = handle_configure_for_test(&req, &ctx);
 
         assert!(!response.success);
         assert_eq!(response.data["code"], "invalid_request");
@@ -4131,11 +4148,11 @@ mod tests {
             "harness": "opencode",
             "max_background_bash_tasks": 0
         }));
-        assert!(!super::handle_configure(&invalid_req, &ctx).success);
+        assert!(!handle_configure_for_test(&invalid_req, &ctx).success);
         assert_eq!(ctx.configure_generation(), 0);
 
         let valid_req = configure_request(json!(root.path()));
-        assert!(super::handle_configure(&valid_req, &ctx).success);
+        assert!(handle_configure_for_test(&valid_req, &ctx).success);
         assert_eq!(ctx.configure_generation(), 1);
     }
 

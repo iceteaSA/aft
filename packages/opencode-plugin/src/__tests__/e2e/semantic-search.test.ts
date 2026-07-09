@@ -2,6 +2,7 @@
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 import { existsSync, readdirSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -301,15 +302,10 @@ async function createFixtureProject(root: string): Promise<void> {
 }
 
 function initGit(root: string): void {
-  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
-  execFileSync("git", ["config", "user.email", "test@example.com"], {
-    cwd: root,
-    stdio: "ignore",
-  });
-  execFileSync("git", ["config", "user.name", "AFT Test"], { cwd: root, stdio: "ignore" });
-  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
-  execFileSync("git", ["commit", "--no-gpg-sign", "-m", "initial"], {
-    cwd: root,
-    stdio: "ignore",
-  });
+  const options = { cwd: root, env: withHermeticGitEnv(), stdio: "ignore" as const };
+  execFileSync("git", ["init"], options);
+  execFileSync("git", ["config", "user.email", "test@example.com"], options);
+  execFileSync("git", ["config", "user.name", "AFT Test"], options);
+  execFileSync("git", ["add", "."], options);
+  execFileSync("git", ["commit", "--no-gpg-sign", "-m", "initial"], options);
 }
