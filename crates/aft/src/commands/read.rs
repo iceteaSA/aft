@@ -7,7 +7,6 @@
 use std::fs;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -83,29 +82,6 @@ fn is_binary(content: &[u8]) -> bool {
     content_inspector::inspect(content).is_binary()
 }
 
-fn media_worker_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
-            .div_ceil(2)
-            .clamp(1, 4);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|index| format!("aft-read-media-{index}"))
-            .stack_size(8 * 1024 * 1024)
-            .build()
-            .unwrap_or_else(|_| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .thread_name(|index| format!("aft-read-media-fallback-{index}"))
-                    .stack_size(8 * 1024 * 1024)
-                    .build()
-                    .expect("single-thread media worker pool must build")
-            })
-    })
-}
 
 fn read_magic(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut file = fs::File::open(path)?;
@@ -303,9 +279,19 @@ fn process_image_with_timeout(
     kind: ImageKind,
 ) -> Result<ProcessedImage, String> {
     let (tx, rx) = crossbeam_channel::bounded(1);
-    media_worker_pool().spawn(move || {
-        let _ = tx.send(process_image(raw_bytes, kind));
-    });
+    // One dedicated thread per request instead of a shared bounded pool: the
+    // timeout below must measure image processing itself. With a shared pool,
+    // queue wait counted against the budget, so unrelated parallel reads could
+    // time out an image that never started processing.
+    let spawned = std::thread::Builder::new()
+        .name("aft-read-media".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let _ = tx.send(process_image(raw_bytes, kind));
+        });
+    if let Err(error) = spawned {
+        return Err(format!("failed to start image processing: {error}"));
+    }
 
     match rx.recv_timeout(IMAGE_PROCESS_TIMEOUT) {
         Ok(result) => result,
