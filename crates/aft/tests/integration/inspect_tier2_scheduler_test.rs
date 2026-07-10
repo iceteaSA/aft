@@ -1,15 +1,17 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
-use aft::commands::inspect::handle_inspect;
+use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run};
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY;
-use aft::inspect::Tier2TriggerReason;
+use aft::inspect::{InspectCache, InspectCategory, InspectSnapshot, Tier2TriggerReason};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
 use serde_json::{json, Value};
@@ -35,12 +37,19 @@ fn request(payload: Value) -> RawRequest {
 }
 
 fn configured_context(root: &Path) -> AppContext {
+    configured_context_with_storage(root, &root.join(".aft-test-storage"), true)
+}
+
+fn configured_context_with_storage(
+    root: &Path,
+    storage_dir: &Path,
+    callgraph_store: bool,
+) -> AppContext {
     crate::helpers::disable_in_process_file_watcher();
-    let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         Config {
-            storage_dir: Some(storage_dir.clone()),
+            storage_dir: Some(storage_dir.to_path_buf()),
             ..Config::default()
         },
     );
@@ -53,14 +62,90 @@ fn configured_context(root: &Path) -> AppContext {
         "config": crate::helpers::user_config(serde_json::json!({
             "search_index": false,
             "semantic_search": false,
-            "callgraph_store": true
+            "callgraph_store": callgraph_store
         })),
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
-    ensure_callgraph_store_ready(&ctx);
+    if callgraph_store {
+        ensure_callgraph_store_ready(&ctx);
+    }
     ctx
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("run git fixture command");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn linked_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project");
+    let worktree_root = temp_dir.path().join("linked-worktree");
+    let storage_dir = temp_dir.path().join("storage");
+    fs::create_dir_all(&root).expect("create project root");
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }\n",
+    );
+    write_file(
+        &root,
+        "src/copy.ts",
+        "export function unusedCopy() { return 1; }\n",
+    );
+    git(&root, &["init"]);
+    git(&root, &["config", "user.name", "AFT Test"]);
+    git(&root, &["config", "user.email", "aft-test@example.com"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fixture"]);
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked-inspect-test",
+            worktree_root.to_str().expect("UTF-8 worktree path"),
+        ],
+    );
+    (temp_dir, root, worktree_root, storage_dir)
+}
+
+fn tier2_aggregate_bytes(ctx: &AppContext, root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let cache = InspectCache::open_readonly(ctx.inspect_dir(), root.to_path_buf())
+        .expect("open inspect cache")
+        .expect("inspect cache exists");
+    [
+        InspectCategory::DeadCode,
+        InspectCategory::UnusedExports,
+        InspectCategory::Duplicates,
+        InspectCategory::Cycles,
+    ]
+    .into_iter()
+    .map(|category| {
+        let aggregate = cache
+            .latest_aggregate_any_hash(category)
+            .expect("read Tier-2 aggregate")
+            .expect("Tier-2 aggregate exists");
+        (
+            category.as_str().to_string(),
+            serde_json::to_vec(&aggregate).expect("serialize aggregate"),
+        )
+    })
+    .collect()
 }
 
 fn drain_callgraph_store_for_test(ctx: &AppContext) {
@@ -250,4 +335,121 @@ fn direct_inspect_cold_tier2_computes_without_scheduler_pull() {
         ctx.tick_tier2_refresh_scheduler_at(base + Duration::from_secs(1), 0),
         None
     );
+}
+
+#[test]
+fn linked_worktree_skips_automatic_tier2_and_leaves_parent_gate_open() {
+    let (_temp_dir, root, worktree_root, storage_dir) = linked_worktree_fixture();
+    let parent_ctx = configured_context_with_storage(&root, &storage_dir, false);
+    let worktree_ctx = configured_context_with_storage(&worktree_root, &storage_dir, false);
+
+    assert!(!parent_ctx.is_worktree_bridge());
+    assert!(worktree_ctx.is_worktree_bridge());
+    assert!(
+        worktree_ctx.build_status_snapshot()["status_bar"].is_null(),
+        "an unscanned worktree must not fabricate Tier-2 status counts"
+    );
+
+    let worktree_base = Instant::now();
+    worktree_ctx.reset_tier2_refresh_scheduler_at(worktree_base);
+    assert!(!worktree_ctx.request_tier2_refresh_pull());
+    assert_eq!(
+        worktree_ctx
+            .tick_tier2_refresh_scheduler_at(worktree_base + TIER2_REFRESH_COLD_CACHE_DELAY, 0,),
+        None
+    );
+    let manager_submission = worktree_ctx
+        .inspect_manager()
+        .submit_tier2_run_with_reuse_background(
+            InspectSnapshot::new_with_capabilities(
+                worktree_root.clone(),
+                worktree_ctx.inspect_dir(),
+                worktree_ctx.config(),
+                worktree_ctx.symbol_cache(),
+                true,
+                false,
+            ),
+            InspectCategory::Duplicates,
+        )
+        .expect("manager worktree gate is not an error");
+    assert!(manager_submission.is_none());
+
+    let warm_response = serde_json::to_value(handle_inspect_tier2_run(
+        &request(json!({
+            "id": "worktree-tier2-warm",
+            "command": "inspect_tier2_run",
+            "categories": ["dead_code", "unused_exports", "duplicates", "cycles"],
+        })),
+        &worktree_ctx,
+    ))
+    .expect("Tier-2 warm response serializes");
+    assert_eq!(warm_response["success"], true);
+    assert_eq!(warm_response["queued_categories"], json!([]));
+    assert_eq!(
+        worktree_ctx
+            .inspect_manager()
+            .automatic_tier2_schedule_count_for_test(),
+        0,
+        "no automatic Tier-2 scheduling path may reach the manager for a linked worktree"
+    );
+
+    assert!(
+        parent_ctx
+            .inspect_manager()
+            .automatic_tier2_refresh_allowed(),
+        "linked-worktree detection must not close the parent root's scheduling gate"
+    );
+}
+
+#[test]
+fn linked_worktree_explicit_inspect_keeps_parent_aggregates_byte_identical() {
+    let (_temp_dir, root, worktree_root, storage_dir) = linked_worktree_fixture();
+    let parent_ctx = configured_context_with_storage(&root, &storage_dir, false);
+    let worktree_ctx = configured_context_with_storage(&worktree_root, &storage_dir, false);
+
+    let parent_response = inspect(&parent_ctx);
+    assert_eq!(
+        parent_response["success"], true,
+        "parent inspect failed: {parent_response:#}"
+    );
+    let parent_before = tier2_aggregate_bytes(&parent_ctx, &root);
+    assert!(
+        worktree_ctx.build_status_snapshot()["status_bar"].is_null(),
+        "worktree status must remain absent until explicit demand produces real counts"
+    );
+
+    let worktree_response = inspect(&worktree_ctx);
+    assert_eq!(
+        worktree_response["success"], true,
+        "worktree inspect failed: {worktree_response:#}"
+    );
+    let pending = scanner_state_categories(&worktree_response, "pending_categories");
+    assert!(
+        ["dead_code", "unused_exports", "duplicates", "cycles"]
+            .iter()
+            .all(|category| !pending.iter().any(|pending| pending == category)),
+        "explicit worktree inspect should complete its Tier-2 demand scan: {worktree_response:#}"
+    );
+    assert!(
+        worktree_response["summary"]["unused_exports"]["count"].is_number(),
+        "explicit worktree inspect should return computed Tier-2 data: {worktree_response:#}"
+    );
+
+    let parent_after = tier2_aggregate_bytes(&parent_ctx, &root);
+    assert_eq!(
+        parent_after, parent_before,
+        "a worktree demand scan must not alter any parent Tier-2 aggregate bytes"
+    );
+    assert_ne!(
+        parent_ctx.inspect_dir(),
+        worktree_ctx.inspect_dir(),
+        "absolute root identity must keep parent and worktree inspect generations separate"
+    );
+    let parent_cache = InspectCache::open_readonly(parent_ctx.inspect_dir(), root)
+        .expect("open parent inspect cache")
+        .expect("parent inspect cache exists");
+    let worktree_cache = InspectCache::open_readonly(worktree_ctx.inspect_dir(), worktree_root)
+        .expect("open worktree inspect cache")
+        .expect("worktree inspect cache exists");
+    assert_ne!(parent_cache.project_key(), worktree_cache.project_key());
 }

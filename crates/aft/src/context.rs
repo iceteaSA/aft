@@ -2001,7 +2001,22 @@ impl AppContext {
 
     pub fn set_canonical_cache_root(&self, root: PathBuf) {
         debug_assert!(root.is_absolute());
-        *self.canonical_cache_root.lock() = Some(root);
+        let root_changed = {
+            let mut current = self.canonical_cache_root.lock();
+            let changed = current.as_deref() != Some(root.as_path());
+            *current = Some(root);
+            changed
+        };
+        if root_changed {
+            *self
+                .status_bar_tier2
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = StatusBarTier2::default();
+            *self
+                .status_bar_last_emitted
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
     }
 
     pub fn canonical_cache_root(&self) -> PathBuf {
@@ -2018,6 +2033,11 @@ impl AppContext {
     pub fn set_cache_role(&self, is_worktree_bridge: bool, git_common_dir: Option<PathBuf>) {
         *self.is_worktree_bridge.lock() = is_worktree_bridge;
         *self.git_common_dir.lock() = git_common_dir;
+        // The configure-time worktree probe already applies the test seam, so
+        // automatic Tier-2 scheduling follows the same effective root role as
+        // callgraph cold-build gating while explicit inspect demand stays enabled.
+        self.inspect_manager
+            .set_automatic_tier2_refresh_allowed(!is_worktree_bridge);
         let artifact_read_only = *self.shared_artifacts_read_only.lock();
         self.callgraph_writer
             .store(!is_worktree_bridge && !artifact_read_only, Ordering::SeqCst);
@@ -2815,7 +2835,9 @@ impl AppContext {
     }
 
     pub fn request_tier2_refresh_pull(&self) -> bool {
-        let can_schedule = self.inspect_writer() && self.heavy_root_work_allowed();
+        let can_schedule = self.inspect_writer()
+            && self.heavy_root_work_allowed()
+            && self.inspect_manager.automatic_tier2_refresh_allowed();
         self.tier2_refresh_scheduler
             .lock()
             .request_pull(can_schedule)
@@ -2835,7 +2857,9 @@ impl AppContext {
         changed_path_count: usize,
     ) -> Option<Tier2TriggerReason> {
         let manager = self.inspect_manager();
-        let can_write = self.inspect_writer() && self.heavy_root_work_allowed();
+        let can_write = self.inspect_writer()
+            && self.heavy_root_work_allowed()
+            && manager.automatic_tier2_refresh_allowed();
         let in_flight = manager.tier2_any_in_flight();
         let semantic_cold_seed_active = self.semantic_cold_seed_active();
         let decision = self.tier2_refresh_scheduler.lock().tick_with_semantic_gate(
@@ -2879,6 +2903,7 @@ impl AppContext {
     fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
         if !self.inspect_writer()
             || !self.heavy_root_work_allowed()
+            || !manager.automatic_tier2_refresh_allowed()
             || !self.config().inspect.enabled
         {
             return;
@@ -4574,6 +4599,26 @@ mod status_bar_tests {
         // Errors/warnings are read live from an empty LSP store → 0.
         assert_eq!(counts.errors, 0);
         assert_eq!(counts.warnings, 0);
+    }
+
+    #[test]
+    fn changing_root_clears_project_scoped_status_counts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        std::fs::create_dir_all(&first_root).expect("create first root");
+        std::fs::create_dir_all(&second_root).expect("create second root");
+        let ctx = ctx();
+        ctx.set_canonical_cache_root(first_root);
+        ctx.update_status_bar_tier2(Some(5), Some(3), Some(7), Some(2), false);
+        assert!(ctx.status_bar_counts().is_some());
+
+        ctx.set_canonical_cache_root(second_root);
+
+        assert!(
+            ctx.status_bar_counts().is_none(),
+            "counts from the previous root must not appear in a newly bound root"
+        );
     }
 
     #[test]

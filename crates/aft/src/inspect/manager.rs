@@ -129,6 +129,9 @@ pub struct InspectManager {
     soft_deadline: Duration,
     next_job_id: AtomicU64,
     heavy_root_work_allowed: Arc<AtomicBool>,
+    automatic_tier2_refresh_allowed: AtomicBool,
+    automatic_tier2_skip_logged: AtomicBool,
+    automatic_tier2_schedule_count: AtomicU64,
     /// Monotonic count of Tier-2 completions delivered via the reuse path
     /// (watcher-driven scheduler runs). These bypass `result_rx`/
     /// `drain_completions`, so the `&AppContext`-side drain polls this counter
@@ -171,12 +174,39 @@ impl InspectManager {
             soft_deadline,
             next_job_id: AtomicU64::new(1),
             heavy_root_work_allowed,
+            automatic_tier2_refresh_allowed: AtomicBool::new(true),
+            automatic_tier2_skip_logged: AtomicBool::new(false),
+            automatic_tier2_schedule_count: AtomicU64::new(0),
             reuse_completions: AtomicU64::new(0),
         }
     }
 
     fn heavy_root_work_allowed(&self) -> bool {
         self.heavy_root_work_allowed.load(Ordering::SeqCst)
+    }
+
+    pub fn set_automatic_tier2_refresh_allowed(&self, allowed: bool) {
+        self.automatic_tier2_refresh_allowed
+            .store(allowed, Ordering::SeqCst);
+        self.automatic_tier2_skip_logged
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub fn automatic_tier2_refresh_allowed(&self) -> bool {
+        let allowed = self.automatic_tier2_refresh_allowed.load(Ordering::SeqCst);
+        if !allowed
+            && !self
+                .automatic_tier2_skip_logged
+                .swap(true, Ordering::SeqCst)
+        {
+            crate::slog_debug!("automatic Tier-2 scan scheduling skipped for linked worktree root");
+        }
+        allowed
+    }
+
+    #[doc(hidden)]
+    pub fn automatic_tier2_schedule_count_for_test(&self) -> u64 {
+        self.automatic_tier2_schedule_count.load(Ordering::SeqCst)
     }
 
     fn category_needs_heavy_root_work(category: InspectCategory) -> bool {
@@ -276,7 +306,7 @@ impl InspectManager {
         self: &Arc<Self>,
         snapshot: InspectSnapshot,
         category: InspectCategory,
-    ) -> Result<JobKey, String> {
+    ) -> Result<Option<JobKey>, String> {
         if !category.is_active() {
             return Err(format!(
                 "inspect category '{category}' is disabled in v0.33"
@@ -290,6 +320,11 @@ impl InspectManager {
         if !self.heavy_root_work_allowed() {
             return Err(Self::heavy_root_work_block_message(category));
         }
+        if !self.automatic_tier2_refresh_allowed() {
+            return Ok(None);
+        }
+        self.automatic_tier2_schedule_count
+            .fetch_add(1, Ordering::SeqCst);
 
         let job = self.tier2_reuse_job(snapshot, category, None);
         let key = job.key.clone();
@@ -298,7 +333,7 @@ impl InspectManager {
             .lock()
             .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
         if in_flight.contains_key(&key) {
-            return Ok(key);
+            return Ok(Some(key));
         }
         let Some(permit) = cold_build_limiter::try_acquire() else {
             return Err(format!(
@@ -317,7 +352,7 @@ impl InspectManager {
             manager.route_tier2_reuse_completion(result);
         });
 
-        Ok(key)
+        Ok(Some(key))
     }
 
     pub fn submit_tier2_run_with_reuse_serial_background(
@@ -358,6 +393,11 @@ impl InspectManager {
             }
             return submission;
         }
+        if !self.automatic_tier2_refresh_allowed() {
+            return submission;
+        }
+        self.automatic_tier2_schedule_count
+            .fetch_add(requested.len() as u64, Ordering::SeqCst);
 
         let mut in_flight = match self.in_flight.lock() {
             Ok(in_flight) => in_flight,
