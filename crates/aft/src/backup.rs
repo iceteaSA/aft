@@ -2,9 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::LazyLock;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use rusqlite::Connection;
 
@@ -24,6 +22,9 @@ type RestoreBeforeLockHook = Box<dyn FnMut(usize) -> bool + Send>;
 #[cfg(test)]
 static RESTORE_BEFORE_LOCK_HOOKS: LazyLock<Mutex<HashMap<String, RestoreBeforeLockHook>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static BACKUP_MAINTENANCE_KEYS: LazyLock<Mutex<HashSet<(PathBuf, Option<String>)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[cfg(test)]
 fn set_restore_before_lock_hook_for_tests(
@@ -252,8 +253,8 @@ impl Default for BackupPolicy {
 ///   `<storage_dir>/backups/<session_hash>/<path_hash>/bak_<order>_<id>.bak` — append-only content
 ///
 /// Legacy layouts from before sessionization (flat `<path_hash>/` directly under
-/// `backups/`) are migrated on first `set_storage_dir` call into the default
-/// session namespace.
+/// `backups/`) are migrated by process-wide maintenance on the first backup
+/// mutation or restore, never during configure.
 #[derive(Debug)]
 pub struct BackupStore {
     /// session -> path -> entry stack
@@ -265,10 +266,13 @@ pub struct BackupStore {
     counter: AtomicU64,
     storage_dir: Option<PathBuf>,
     storage_harness: Option<String>,
+    maintenance_ttl_hours: u32,
     db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     db_harness: RwLock<Option<String>>,
     db_project_key: RwLock<Option<String>>,
     policy: BackupPolicy,
+    #[cfg(test)]
+    disk_io_count: AtomicU64,
     #[cfg(test)]
     fail_next_disk_write: bool,
 }
@@ -295,10 +299,13 @@ impl BackupStore {
             counter: AtomicU64::new(0),
             storage_dir: None,
             storage_harness: None,
+            maintenance_ttl_hours: 0,
             db_pool: RwLock::new(None),
             db_harness: RwLock::new(None),
             db_project_key: RwLock::new(None),
             policy: BackupPolicy::default(),
+            #[cfg(test)]
+            disk_io_count: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_disk_write: false,
         }
@@ -361,11 +368,10 @@ impl BackupStore {
         }
     }
 
-    /// Set storage directory for disk persistence (called during configure).
+    /// Select the storage namespace used for lazy backup persistence.
     ///
-    /// Loads the disk index for all session namespaces, removes stale session
-    /// directories, and migrates any legacy pre-session (flat) layout into the
-    /// default namespace.
+    /// Configuration never scans backup sessions. Each `(session, path)` stack
+    /// is hydrated under its disk lock when that stack is first read or changed.
     pub fn set_storage_dir(&mut self, dir: PathBuf, ttl_hours: u32) {
         self.set_storage_dir_inner(dir, None, ttl_hours);
     }
@@ -380,16 +386,51 @@ impl BackupStore {
     }
 
     fn set_storage_dir_inner(&mut self, dir: PathBuf, harness: Option<String>, ttl_hours: u32) {
+        if self.storage_dir.as_ref() == Some(&dir) && self.storage_harness == harness {
+            return;
+        }
+
         self.storage_dir = Some(dir);
         self.storage_harness = harness;
+        self.maintenance_ttl_hours = ttl_hours;
         self.entries.clear();
         self.disk_index.clear();
         self.session_meta.clear();
-        self.repair_root_backups_if_needed();
-        self.gc_stale_sessions(ttl_hours);
-        self.migrate_legacy_layout_if_needed();
-        self.load_disk_index();
     }
+
+    /// Run namespace repair, stale-session GC, and legacy migration at most once
+    /// per process for the selected storage namespace.
+    ///
+    /// Configure deliberately does not invoke this. The first backup mutation or
+    /// restore pays this one-time maintenance cost, while ordinary binds remain
+    /// independent of harness-wide history.
+    pub fn run_process_maintenance_once(&mut self) {
+        let Some(storage_dir) = self.storage_dir.clone() else {
+            return;
+        };
+        let key = (storage_dir, self.storage_harness.clone());
+        if !BACKUP_MAINTENANCE_KEYS.lock().unwrap().insert(key) {
+            return;
+        }
+
+        self.record_disk_io_for_tests();
+        self.repair_root_backups_if_needed();
+        self.gc_stale_sessions(self.maintenance_ttl_hours);
+        self.migrate_legacy_layout_if_needed();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disk_io_count_for_tests(&self) -> u64 {
+        self.disk_io_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn record_disk_io_for_tests(&self) {
+        self.disk_io_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(not(test))]
+    fn record_disk_io_for_tests(&self) {}
 
     /// Snapshot the current contents of `path` under the given session namespace.
     pub fn snapshot(
@@ -414,6 +455,7 @@ impl BackupStore {
         if !self.should_snapshot_path(path)? {
             return Ok(None);
         }
+        self.run_process_maintenance_once();
         let key = canonicalize_key(path);
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
         // Hydrate any prior on-disk history before appending, so a snapshot
@@ -459,6 +501,7 @@ impl BackupStore {
         if !self.policy.enabled {
             return Ok(None);
         }
+        self.run_process_maintenance_once();
         let key = canonicalize_key(path);
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
         self.ensure_stack_hydrated_locked(session, &key)?;
@@ -503,6 +546,7 @@ impl BackupStore {
     /// Restore every top-of-stack backup entry belonging to the most recent
     /// operation in this session.
     pub fn restore_last_operation(&mut self, session: &str) -> Result<RestoredOperation, AftError> {
+        self.run_process_maintenance_once();
         let mut candidate_keys = self.restore_operation_candidate_keys(session)?;
         if candidate_keys.is_empty() {
             self.load_latest_operation_from_db_or_log(session);
@@ -694,6 +738,7 @@ impl BackupStore {
         session: &str,
         path: &Path,
     ) -> Result<(BackupEntry, Option<String>), AftError> {
+        self.run_process_maintenance_once();
         let key = canonicalize_key(path);
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
 
@@ -1859,107 +1904,6 @@ impl BackupStore {
         }
     }
 
-    fn load_disk_index(&mut self) {
-        let backups_dir = match self.backups_dir() {
-            Some(d) if d.exists() => d,
-            _ => return,
-        };
-        let session_dirs = match std::fs::read_dir(&backups_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut total_entries = 0usize;
-        let mut skipped_legacy = 0usize;
-        for session_entry in session_dirs.flatten() {
-            let session_dir = session_entry.path();
-            if !session_dir.is_dir() {
-                continue;
-            }
-            // Recover the session_id from session.json if present, otherwise skip
-            // (can't invert the hash to recover the original).
-            let session_id = match Self::read_session_marker(&session_dir) {
-                Some(session_id) => session_id,
-                None => {
-                    crate::slog_warn!(
-                        "skipping backup session dir without readable session marker: {}",
-                        session_dir.display()
-                    );
-                    continue;
-                }
-            };
-
-            let path_dirs = match std::fs::read_dir(&session_dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let per_session = self.disk_index.entry(session_id.clone()).or_default();
-            for path_entry in path_dirs.flatten() {
-                let path_dir = path_entry.path();
-                if !path_dir.is_dir() {
-                    continue;
-                }
-                let meta_path = path_dir.join("meta.json");
-                if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let (Some(path_str), Some(count)) = (
-                            meta.get("path").and_then(|v| v.as_str()),
-                            meta_entry_count(&meta).map(|count| count as u64),
-                        ) {
-                            let key = PathBuf::from(path_str);
-                            if !is_loadable_backup_path(&key, &path_dir) {
-                                // Legacy/relocated backup dirs whose folder name came
-                                // from an older path-hash scheme can never be loaded by
-                                // the current hasher. They are harmless dead husks
-                                // (active undo is DB-backed), so skip quietly and
-                                // summarize once at debug instead of warning per entry.
-                                skipped_legacy += 1;
-                                crate::slog_debug!(
-                                    "skipping backup entry with invalid path metadata: {}",
-                                    meta_path.display()
-                                );
-                                continue;
-                            }
-                            per_session.insert(
-                                key,
-                                DiskMeta {
-                                    dir: path_dir.clone(),
-                                    count: count as usize,
-                                },
-                            );
-                            total_entries += 1;
-                        }
-                    }
-                }
-            }
-            if per_session.is_empty() {
-                self.disk_index.remove(&session_id);
-            }
-        }
-        if skipped_legacy > 0 {
-            crate::slog_debug!(
-                "skipped {} legacy backup entries with mismatched path-hash directories",
-                skipped_legacy
-            );
-        }
-        if total_entries > 0 {
-            crate::slog_info!(
-                "loaded {} backup entries across {} session(s) from disk",
-                total_entries,
-                self.disk_index.len()
-            );
-        }
-    }
-
-    fn read_session_marker(session_dir: &Path) -> Option<String> {
-        let marker = session_dir.join("session.json");
-        let content = std::fs::read_to_string(&marker).ok()?;
-        let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-        parsed
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-
     fn read_session_last_accessed(session_dir: &Path) -> Option<u64> {
         let marker = session_dir.join("session.json");
         let content = std::fs::read_to_string(&marker).ok()?;
@@ -2021,6 +1965,7 @@ impl BackupStore {
         let Some(session_dir) = self.session_dir(session) else {
             return Ok(None);
         };
+        self.record_disk_io_for_tests();
         let lock_dir = session_dir.join(".locks");
         std::fs::create_dir_all(&lock_dir).map_err(|error| AftError::IoError {
             path: lock_dir.display().to_string(),
@@ -2567,8 +2512,9 @@ impl BackupStore {
     }
 
     fn prune_disk_stacks_to_depth(&mut self, max_depth: usize) -> HashSet<(String, PathBuf)> {
-        self.disk_index.clear();
-        self.load_disk_index();
+        // Only prune stacks already discovered by lazy per-path hydration.
+        // Loading every session here would turn a configure-time policy change
+        // back into an O(all backup history) scan.
         let disk_keys = self
             .disk_index
             .iter()
@@ -3765,9 +3711,67 @@ mod tests {
     }
 
     #[test]
+    fn fresh_store_defers_backup_io_until_first_snapshot_and_preserves_undo() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = project.path().join("lazy-history.txt");
+        fs::write(&path, "v0").unwrap();
+
+        {
+            let mut store = BackupStore::new();
+            store.set_storage_dir(storage.path().to_path_buf(), 72);
+            assert_eq!(store.disk_io_count_for_tests(), 0);
+            store.snapshot("session-a", &path, "captures v0").unwrap();
+            fs::write(&path, "v1").unwrap();
+        }
+
+        let mut fresh = BackupStore::new();
+        fresh.set_storage_dir(storage.path().to_path_buf(), 72);
+        assert_eq!(
+            fresh.disk_io_count_for_tests(),
+            0,
+            "binding a fresh store must not inspect backup directories"
+        );
+
+        fresh.snapshot("session-a", &path, "captures v1").unwrap();
+        assert!(fresh.disk_io_count_for_tests() > 0);
+        fs::write(&path, "v2").unwrap();
+
+        fresh.restore_latest("session-a", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v1");
+        fresh.restore_latest("session-a", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v0");
+    }
+
+    #[test]
+    fn same_namespace_bind_is_idempotent_and_session_history_survives() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = project.path().join("session-isolation.txt");
+        fs::write(&path, "v0").unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(storage.path().to_path_buf(), Harness::Opencode, 72);
+        assert_eq!(store.disk_io_count_for_tests(), 0);
+        store.snapshot("session-a", &path, "session A").unwrap();
+        fs::write(&path, "v1").unwrap();
+
+        let io_before_rebind = store.disk_io_count_for_tests();
+        store.set_storage_dir_for_harness(storage.path().to_path_buf(), Harness::Opencode, 72);
+        assert_eq!(store.disk_io_count_for_tests(), io_before_rebind);
+        assert_eq!(store.disk_history_count("session-a", &path), 1);
+
+        store.snapshot("session-b", &path, "session B").unwrap();
+        fs::write(&path, "v2").unwrap();
+        store.restore_latest("session-a", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v0");
+        assert_eq!(store.disk_history_count("session-b", &path), 1);
+    }
+
+    #[test]
     fn legacy_flat_layout_migrates_to_default_session() {
-        // Simulate a pre-session on-disk layout (schema v1) and verify it's
-        // moved under the default session namespace on set_storage_dir.
+        // Simulate a pre-session on-disk layout (schema v1) and verify
+        // process-wide backup maintenance moves it into the default namespace.
         let dir = std::env::temp_dir().join("aft_backup_migration_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -3792,6 +3796,8 @@ mod tests {
         // Run migration.
         let mut store = BackupStore::new();
         store.set_storage_dir(dir.clone(), 72);
+        assert_eq!(store.disk_io_count_for_tests(), 0);
+        store.run_process_maintenance_once();
 
         // After migration, the legacy dir should be gone from the top level,
         // and the entry should now live under the default-session hash dir.
@@ -3811,7 +3817,7 @@ mod tests {
     }
 
     #[test]
-    fn set_storage_dir_removes_stale_backup_sessions() {
+    fn process_maintenance_removes_stale_backup_sessions() {
         let dir = std::env::temp_dir().join("aft_backup_gc_test");
         let _ = fs::remove_dir_all(&dir);
         let backups = dir.join("backups");
@@ -3832,6 +3838,8 @@ mod tests {
 
         let mut store = BackupStore::new();
         store.set_storage_dir(dir.clone(), 1);
+        assert_eq!(store.disk_io_count_for_tests(), 0);
+        store.run_process_maintenance_once();
 
         assert!(!stale_session_dir.exists());
         let _ = fs::remove_dir_all(&dir);
@@ -4220,7 +4228,7 @@ mod tests {
     }
 
     #[test]
-    fn load_disk_index_skips_tampered_meta_path_hash_mismatch() {
+    fn lazy_stack_read_skips_tampered_meta_path_hash_mismatch() {
         let dir = std::env::temp_dir().join("aft_backup_tampered_meta_skip_test");
         let _ = fs::remove_dir_all(&dir);
         let backups = dir.join("backups");
@@ -4261,6 +4269,12 @@ mod tests {
         let mut store = BackupStore::new();
         store.set_storage_dir(dir.clone(), 72);
 
+        assert!(store
+            .history(
+                DEFAULT_SESSION_ID,
+                Path::new("/tmp/aft-malicious-overwrite-target.txt")
+            )
+            .is_empty());
         assert!(store.sessions_with_backups().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1685,6 +1685,14 @@ impl AppContext {
         (generation, equivalent)
     }
 
+    pub(crate) fn configure_warm_key_matches(&self, key: &str) -> bool {
+        self.configure_warm_state
+            .lock()
+            .key
+            .as_deref()
+            .is_some_and(|current| current == key)
+    }
+
     pub fn note_configure_session_binding(&self, root: PathBuf, session_id: String) -> bool {
         self.configured_session_roots
             .lock()

@@ -293,7 +293,7 @@ fn backup_restore_preserves_unix_permissions() {
 }
 
 #[test]
-fn backup_set_storage_dir_for_harness_repairs_legacy_root_backups() {
+fn backup_process_maintenance_repairs_legacy_root_backups() {
     let storage = tempfile::tempdir().unwrap();
     let legacy = storage.path().join("backups").join("legacy-session");
     fs::create_dir_all(&legacy).unwrap();
@@ -301,6 +301,7 @@ fn backup_set_storage_dir_for_harness_repairs_legacy_root_backups() {
 
     let mut store = BackupStore::new();
     store.set_storage_dir_for_harness(storage.path().to_path_buf(), Harness::Opencode, 72);
+    store.run_process_maintenance_once();
 
     assert!(
         storage

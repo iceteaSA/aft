@@ -1418,6 +1418,56 @@ fn resolve_config_tiers_for_configure(
     Ok(tiers)
 }
 
+fn configure_fingerprint(
+    canonical_root: &Path,
+    harness: &Harness,
+    session_id: &str,
+    config: &Config,
+) -> Value {
+    let mut effective_config =
+        serde_json::to_value(config).unwrap_or_else(|_| serde_json::Value::Null);
+    if let Some(fields) = effective_config.as_object_mut() {
+        // Root and harness have canonical, explicit fingerprint fields below.
+        fields.remove("project_root");
+        fields.remove("harness");
+    }
+    json!({
+        "canonical_root": canonical_root,
+        "harness": harness,
+        "session_id": session_id,
+        "effective_config": effective_config,
+        // These process-state fields are intentionally omitted from Config's
+        // serialized form, so include them explicitly in configure identity.
+        "foreground_wait_window_ms": config.foreground_wait_window_ms,
+        "diagnostics_on_edit": config.diagnostics_on_edit,
+    })
+}
+
+fn configure_warm_key(
+    canonical_root: &Path,
+    config: &Config,
+    home_match: bool,
+    is_worktree_bridge: bool,
+    shared_artifacts_read_only: bool,
+) -> String {
+    format!(
+        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};callgraph={}:{};inspect={};manifests={}",
+        canonical_root,
+        config.storage_dir,
+        home_match,
+        is_worktree_bridge,
+        shared_artifacts_read_only,
+        config.search_index,
+        config.search_index_max_file_size,
+        config.semantic_search,
+        config.semantic,
+        config.callgraph_store,
+        config.callgraph_chunk_size,
+        config.inspect.enabled,
+        workspace_manifest_fingerprint(canonical_root),
+    )
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -1632,23 +1682,119 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
     }
 
-    if home_match {
-        if next_config.search_index {
-            next_config.search_index = false;
-            slog_warn!(
-                "search_index auto-disabled: project root is the user home directory \
-                 ({}). Open a project subdirectory for full features.",
-                canonical_cache_root.display()
+    let search_disabled_for_home = home_match && next_config.search_index;
+    let semantic_disabled_for_home = home_match && next_config.semantic_search;
+    if search_disabled_for_home {
+        next_config.search_index = false;
+    }
+    if semantic_disabled_for_home {
+        next_config.semantic_search = false;
+    }
+
+    let requested_fingerprint =
+        configure_fingerprint(&canonical_cache_root, &harness, req.session(), &next_config);
+    let current_harness = ctx.harness_opt();
+    let current_fingerprint = previous_canonical_cache_root
+        .as_deref()
+        .zip(current_harness.as_ref())
+        .map(|(canonical_root, current_harness)| {
+            configure_fingerprint(
+                canonical_root,
+                current_harness,
+                req.session(),
+                previous_config.as_ref(),
+            )
+        });
+    let effective_configure_changed = current_fingerprint.as_ref() != Some(&requested_fingerprint);
+    let preflight_warm_key = configure_warm_key(
+        &canonical_cache_root,
+        &next_config,
+        home_match,
+        is_worktree_bridge,
+        ctx.shared_artifacts_read_only(),
+    );
+    if ctx.configure_generation() > 0
+        && current_fingerprint.as_ref() == Some(&requested_fingerprint)
+        && ctx.configure_warm_key_matches(&preflight_warm_key)
+        && ctx.is_worktree_bridge() == is_worktree_bridge
+        && ctx.git_common_dir() == git_common_dir
+    {
+        let first_session_bind = ctx.note_configure_session_binding(
+            canonical_cache_root.clone(),
+            req.session().to_string(),
+        );
+        let generation = ctx.configure_generation();
+        if first_session_bind {
+            let storage_root =
+                crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+            ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
+                generation,
+                root_path: root_path.clone(),
+                canonical_cache_root: canonical_cache_root.clone(),
+                harness: harness.clone(),
+                storage_root: storage_root.clone(),
+                harness_dir: storage_root.join(harness.storage_segment()),
+                session_id: req.session().to_string(),
+                home_match,
+                format_tool_cache_clear_needed: false,
+                run_bash_replay: true,
+                refresh_project_runtime: false,
+                sync_bash_compress_flag: false,
+                reset_filter_registry: false,
+                clear_failed_spawns: false,
+                warm_callgraph_store: false,
+            });
+            slog_debug!(
+                "equivalent configure registered session {} for generation {}",
+                req.session(),
+                generation
+            );
+        } else {
+            slog_debug!(
+                "equivalent configure no-op for session {} at generation {}",
+                req.session(),
+                generation
             );
         }
-        if next_config.semantic_search {
-            next_config.semantic_search = false;
-            slog_warn!(
-                "semantic_search auto-disabled: project root is the user home directory \
-                 ({}). Open a project subdirectory for full features.",
-                canonical_cache_root.display()
-            );
-        }
+
+        let artifact_owner_status = ctx.artifact_owner_status();
+        let search_index_cache_reused = next_config.search_index
+            && ctx
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+        return Response::success(
+            &req.id,
+            json!({
+                "project_root": root_path.display().to_string(),
+                "warnings": [],
+                "warnings_pending": false,
+                "search_index_cache_reused": search_index_cache_reused,
+                "artifact_owner": artifact_owner_status
+                    .as_ref()
+                    .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null)),
+                "config_dropped_keys": config_dropped_keys
+                    .iter()
+                    .map(|d| json!({ "key": d.key, "tier": d.tier, "reason": d.reason }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    if search_disabled_for_home {
+        slog_warn!(
+            "search_index auto-disabled: project root is the user home directory \
+             ({}). Open a project subdirectory for full features.",
+            canonical_cache_root.display()
+        );
+    }
+    if semantic_disabled_for_home {
+        slog_warn!(
+            "semantic_search auto-disabled: project root is the user home directory \
+             ({}). Open a project subdirectory for full features.",
+            canonical_cache_root.display()
+        );
     }
 
     let format_tool_cache_clear_needed = previous_project_root.as_ref() != Some(&root_path);
@@ -1785,21 +1931,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // home-root logic independently.
     ctx.set_degraded_reasons(degraded_reasons.clone());
     ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
-    let warm_key = format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};callgraph={}:{};inspect={};manifests={}",
-        canonical_cache_root,
-        next_config.storage_dir,
+    let warm_key = configure_warm_key(
+        &canonical_cache_root,
+        &next_config,
         home_match,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
-        next_config.search_index,
-        next_config.search_index_max_file_size,
-        next_config.semantic_search,
-        next_config.semantic,
-        next_config.callgraph_store,
-        next_config.callgraph_chunk_size,
-        next_config.inspect.enabled,
-        workspace_manifest_fingerprint(&canonical_cache_root),
     );
     let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
     let first_session_bind =
@@ -2653,14 +2790,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         crate::callgraph::clear_workspace_package_cache();
     }
 
-    let refresh_project_runtime = !equivalent_warm_config || project_root_changed;
+    let refresh_project_runtime =
+        !equivalent_warm_config || project_root_changed || effective_configure_changed;
     let sync_bash_compress_flag = !equivalent_warm_config
         || previous_config.experimental_bash_compress != next_config.experimental_bash_compress;
-    let clear_failed_spawns = should_clear_failed_spawns(
-        &previous_config,
-        &next_config,
-        equivalent_warm_config,
-    );
+    let clear_failed_spawns =
+        should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
     ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
         root_path: root_path.clone(),
@@ -2751,6 +2886,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     response
 }
 
+fn replay_configure_session(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
+    crate::bash_background::repair_legacy_root_tasks(&job.storage_root, job.harness.clone());
+    #[cfg(test)]
+    CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
+    if let Err(error) = ctx.bash_background().replay_session_for_project(
+        &job.harness_dir,
+        &job.session_id,
+        &job.root_path,
+    ) {
+        slog_warn!("failed to replay background bash tasks: {error}");
+    }
+}
+
 pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     for job in ctx.drain_configure_maintenance() {
         if ctx.configure_generation() != job.generation {
@@ -2766,6 +2914,18 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             if job.run_bash_replay {
                 ctx.forget_configure_session_binding(&job.canonical_cache_root, &job.session_id);
             }
+            continue;
+        }
+
+        let session_only = job.run_bash_replay
+            && !job.format_tool_cache_clear_needed
+            && !job.refresh_project_runtime
+            && !job.sync_bash_compress_flag
+            && !job.reset_filter_registry
+            && !job.clear_failed_spawns
+            && !job.warm_callgraph_store;
+        if session_only {
+            replay_configure_session(ctx, &job);
             continue;
         }
 
@@ -2858,19 +3018,7 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
         drop(config);
 
         if job.run_bash_replay {
-            crate::bash_background::repair_legacy_root_tasks(
-                &job.storage_root,
-                job.harness.clone(),
-            );
-            #[cfg(test)]
-            CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
-            if let Err(error) = ctx.bash_background().replay_session_for_project(
-                &job.harness_dir,
-                &job.session_id,
-                &job.root_path,
-            ) {
-                slog_warn!("failed to replay background bash tasks: {error}");
-            }
+            replay_configure_session(ctx, &job);
         }
 
         if job.refresh_project_runtime {
@@ -4094,11 +4242,13 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
         init_git_fixture(temp.path());
         let ctx = test_context();
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
+            "storage_dir": storage.path(),
             "config": [user_tier(json!({
                 "search_index": false,
                 "semantic_search": false,
@@ -4111,6 +4261,11 @@ mod tests {
         super::drain_deferred_configure_maintenance(&ctx);
 
         let generation_after_first = ctx.configure_generation();
+        assert_eq!(
+            ctx.backup().lock().disk_io_count_for_tests(),
+            0,
+            "initial configure maintenance must not inspect backup directories"
+        );
         let tsconfig_clear_generation_after_first =
             ctx.tsconfig_membership_clear_generation_for_test();
         let filter_rebuilds_after_first = ctx.filter_registry_rebuild_count_for_test();
@@ -4125,6 +4280,11 @@ mod tests {
             super::drain_deferred_configure_maintenance(&ctx);
         }
 
+        assert_eq!(
+            ctx.backup().lock().disk_io_count_for_tests(),
+            0,
+            "equivalent configures must not inspect backup directories"
+        );
         assert!(ctx.search_index_rx().read().unwrap().is_none());
         assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(ctx.callgraph_store_rx().lock().is_none());
@@ -4164,6 +4324,7 @@ mod tests {
         assert!(response.success);
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(ctx.configure_generation(), generation_after_first + 1);
+        assert!(ctx.config().search_index, "changed config must apply fully");
         assert_eq!(
             ctx.tsconfig_membership_clear_generation_for_test(),
             tsconfig_clear_generation_after_first + 1
@@ -4181,11 +4342,13 @@ mod tests {
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         super::reset_configure_replay_session_calls_for_test();
         let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
         init_git_fixture(temp.path());
         let ctx = test_context();
         let params = json!({
             "project_root": temp.path(),
             "harness": "opencode",
+            "storage_dir": storage.path(),
             "config": [user_tier(json!({
                 "search_index": false,
                 "semantic_search": false,
@@ -4198,6 +4361,7 @@ mod tests {
         assert!(response.success);
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(super::configure_replay_session_calls_for_test(), 1);
+        assert_eq!(ctx.backup().lock().disk_io_count_for_tests(), 0);
 
         let response = handle_configure_for_test(&session_a, &ctx);
         assert!(response.success);
@@ -4216,6 +4380,11 @@ mod tests {
             super::configure_replay_session_calls_for_test(),
             2,
             "a new session on an equivalent warm root still needs session replay"
+        );
+        assert_eq!(
+            ctx.backup().lock().disk_io_count_for_tests(),
+            0,
+            "a fresh-session bind must not inspect backup directories"
         );
     }
 

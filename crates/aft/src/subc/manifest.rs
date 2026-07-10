@@ -92,6 +92,7 @@ pub(super) fn command_lane(command: &str) -> Lane {
         | "echo"
         | "bash_drain_completions"
         | "bash_regex_match"
+        | "bash_wait_detach"
         | "db_get_state"
         | "db_get_host_state"
         | "read"
@@ -127,7 +128,6 @@ pub(super) fn command_lane(command: &str) -> Lane {
         | "bash_notify"
         | "bash_unnotify"
         | "bash_promote"
-        | "bash_wait_detach"
         | "bash_kill"
         | "bash_write"
         | "db_set_state"
@@ -403,6 +403,7 @@ mod tests {
         assert_eq!(command_lane("callgraph"), Lane::HeavyInit);
         assert_eq!(command_lane("conflicts"), Lane::PureRead);
         assert_eq!(command_lane("bash_status"), Lane::PureRead);
+        assert_eq!(command_lane("bash_wait_detach"), Lane::PureRead);
         assert!(is_subc_native_plumbing_tool("bash_status"));
     }
 
