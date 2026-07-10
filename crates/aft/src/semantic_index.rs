@@ -68,19 +68,29 @@ const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
 static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct SemanticIndexLock {
-    _guard: fs_lock::LockGuard,
+    _guard: Option<fs_lock::LockGuard>,
 }
 
 impl SemanticIndexLock {
-    pub fn acquire(storage_dir: &Path, project_key: &str) -> std::io::Result<Self> {
+    pub fn acquire(
+        storage_dir: &Path,
+        project_key: &str,
+        project_root: &Path,
+    ) -> std::io::Result<Self> {
         let dir = storage_dir.join("semantic").join(project_key);
-        fs::create_dir_all(&dir)?;
         let path = dir.join("cache.lock");
+        let access = crate::root_cache::ArtifactAccess::for_root(project_root);
+        if !access.allows_write(project_key, &path) {
+            return Ok(Self { _guard: None });
+        }
+        fs::create_dir_all(&dir)?;
         let _acquire_guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("semantic cache lock acquisition mutex poisoned"))?;
         fs_lock::try_acquire(&path, Duration::from_secs(2))
-            .map(|guard| Self { _guard: guard })
+            .map(|guard| Self {
+                _guard: Some(guard),
+            })
             .map_err(|error| match error {
                 fs_lock::AcquireError::Timeout => {
                     std::io::Error::other("timed out acquiring semantic cache lock")
@@ -2415,11 +2425,15 @@ impl SemanticIndex {
             return;
         }
         let dir = storage_dir.join("semantic").join(project_key);
+        let data_path = dir.join("semantic.bin");
+        let access = crate::root_cache::ArtifactAccess::for_root(&self.project_root);
+        if !access.allows_write(project_key, &data_path) {
+            return;
+        }
         if let Err(e) = fs::create_dir_all(&dir) {
             slog_warn!("failed to create semantic cache dir: {}", e);
             return;
         }
-        let data_path = dir.join("semantic.bin");
         let tmp_path = dir.join(format!(
             "semantic.bin.tmp.{}.{}",
             std::process::id(),
@@ -4123,6 +4137,27 @@ Connection: close
             .iter()
             .find(|entry| entry.chunk.file == file && entry.chunk.kind == SymbolKind::FileSummary)
             .unwrap_or_else(|| panic!("missing file-summary entry in {}", file.display()))
+    }
+
+    #[test]
+    fn borrow_only_root_skips_semantic_lock_and_persist() {
+        let project = tempfile::tempdir().expect("project");
+        let source = project.path().join("lib.rs");
+        write_rust_file(&source, "borrow_only_symbol");
+        let project_key = "shared-artifact-key".to_string();
+        let storage = tempfile::tempdir().expect("storage");
+        crate::root_cache::configure_artifact_access(project.path(), &project_key, true);
+
+        let _lock = SemanticIndexLock::acquire(storage.path(), &project_key, project.path())
+            .expect("borrow-only lock downgrade");
+        let cache_dir = storage.path().join("semantic").join(&project_key);
+        assert!(!cache_dir.join("cache.lock").exists());
+
+        let index = build_test_index(project.path(), &[source]);
+        index.write_to_disk(storage.path(), &project_key);
+
+        assert!(!cache_dir.join("semantic.bin").exists());
+        assert!(!cache_dir.exists());
     }
 
     #[test]

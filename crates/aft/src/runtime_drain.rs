@@ -1042,7 +1042,7 @@ pub fn spawn_search_corpus_refresh(
             let _cache_lock = if shared_artifacts_read_only {
                 None
             } else {
-                match aft::search_index::CacheLock::acquire(&cache_dir) {
+                match aft::search_index::CacheLock::acquire(&cache_dir, &root) {
                     Ok(lock) => Some(lock),
                     Err(error) => {
                         aft::slog_warn!(

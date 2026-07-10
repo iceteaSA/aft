@@ -1922,6 +1922,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         backup.set_db_harness(harness.clone());
     }
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
+    crate::root_cache::configure_artifact_access(
+        &canonical_cache_root,
+        &project_key,
+        is_worktree_bridge,
+    );
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     let artifact_owner_lease = artifact_owner_claim.and_then(|claim| claim.lease);
     ctx.set_artifact_owner(artifact_owner_status.clone(), artifact_owner_lease);
@@ -2154,7 +2159,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 let _cache_lock = if is_worktree_bridge_for_search {
                                     None
                                 } else {
-                                    CacheLock::acquire(&cache_dir).ok()
+                                    CacheLock::acquire(&cache_dir, &root_for_prewarm).ok()
                                 };
                                 verified.verify_against_disk(head_for_verify);
                                 let symbol_files = search_index_symbol_files(&verified);
@@ -2214,7 +2219,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     let _cache_lock = if is_worktree_bridge_for_search {
                                         None
                                     } else {
-                                        match CacheLock::acquire(&cache_dir) {
+                                        match CacheLock::acquire(&cache_dir, &root_clone) {
                                             Ok(lock) => Some(lock),
                                             Err(error) => {
                                                 slog_warn!(
@@ -2411,7 +2416,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             .then(|| ())
                             .and_then(|_| semantic_storage.as_ref())
                             .and_then(|dir| {
-                                match SemanticIndexLock::acquire(dir, &semantic_project_key) {
+                                match SemanticIndexLock::acquire(
+                                    dir,
+                                    &semantic_project_key,
+                                    &root_clone,
+                                ) {
                                     Ok(lock) => Some(lock),
                                     Err(error) => {
                                         slog_warn!(

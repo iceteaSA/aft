@@ -64,28 +64,40 @@ struct ArtifactCacheKeyMemoState {
 }
 
 pub struct CacheLock {
-    _guard: fs_lock::LockGuard,
+    _guard: Option<fs_lock::LockGuard>,
 }
 
 impl CacheLock {
-    pub fn acquire(cache_dir: &Path) -> std::io::Result<Self> {
-        Self::acquire_with_timeout(cache_dir, Duration::from_secs(2))
+    pub fn acquire(cache_dir: &Path, project_root: &Path) -> std::io::Result<Self> {
+        Self::acquire_with_timeout(cache_dir, project_root, Duration::from_secs(2))
     }
 
-    pub fn try_acquire_for_shutdown(cache_dir: &Path) -> std::io::Result<Self> {
+    pub fn try_acquire_for_shutdown(
+        cache_dir: &Path,
+        project_root: &Path,
+    ) -> std::io::Result<Self> {
         // Graceful shutdown gets one short best-effort lock attempt so a
         // sibling writer cannot hold process exit open.
-        Self::acquire_with_timeout(cache_dir, Duration::from_millis(25))
+        Self::acquire_with_timeout(cache_dir, project_root, Duration::from_millis(25))
     }
 
-    fn acquire_with_timeout(cache_dir: &Path, timeout: Duration) -> std::io::Result<Self> {
-        fs::create_dir_all(cache_dir)?;
+    fn acquire_with_timeout(
+        cache_dir: &Path,
+        project_root: &Path,
+        timeout: Duration,
+    ) -> std::io::Result<Self> {
         let path = cache_dir.join("cache.lock");
+        if !artifact_write_allowed(project_root, cache_dir, &path) {
+            return Ok(Self { _guard: None });
+        }
+        fs::create_dir_all(cache_dir)?;
         let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("search cache lock acquisition mutex poisoned"))?;
         fs_lock::try_acquire(&path, timeout)
-            .map(|guard| Self { _guard: guard })
+            .map(|guard| Self {
+                _guard: Some(guard),
+            })
             .map_err(|error| match error {
                 fs_lock::AcquireError::Timeout => {
                     std::io::Error::other("timed out acquiring search cache lock")
@@ -93,6 +105,14 @@ impl CacheLock {
                 fs_lock::AcquireError::Io(error) => error,
             })
     }
+}
+
+fn artifact_write_allowed(project_root: &Path, cache_dir: &Path, write_path: &Path) -> bool {
+    let artifact_key = cache_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    crate::root_cache::ArtifactAccess::for_root(project_root).allows_write(artifact_key, write_path)
 }
 
 #[derive(Clone, Debug)]
@@ -472,6 +492,12 @@ impl SearchIndex {
         cache_dir: &Path,
     ) -> Self {
         let started = std::time::Instant::now();
+        if !artifact_write_allowed(root, cache_dir, &cache_dir.join("cache.bin")) {
+            let mut index = Self::new();
+            index.project_root = root.to_path_buf();
+            index.max_file_size = max_file_size;
+            return index;
+        }
         match build_streaming_index(root, max_file_size, cache_dir) {
             Ok((mut index, indexed)) => {
                 index.ready = true;
@@ -767,6 +793,9 @@ impl SearchIndex {
     }
 
     pub fn write_to_disk(&mut self, cache_dir: &Path, git_head: Option<&str>) {
+        if !artifact_write_allowed(&self.project_root, cache_dir, &cache_dir.join("cache.bin")) {
+            return;
+        }
         let Some(plan) = CacheWritePlan::from_index(self, git_head) else {
             return;
         };
@@ -1055,7 +1084,7 @@ impl SearchIndex {
         };
 
         if migrated_counts && allow_legacy_repair {
-            if let Ok(_lock) = CacheLock::acquire(cache_dir) {
+            if let Ok(_lock) = CacheLock::acquire(cache_dir, current_canonical_root) {
                 let head = index.git_head.clone();
                 index.write_to_disk(cache_dir, head.as_deref());
             }
@@ -4519,6 +4548,28 @@ mod tests {
     }
 
     #[test]
+    fn borrow_only_root_skips_shared_lock_persist_and_streaming_spills() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(project.join("source.txt"), "borrow only search index").expect("source file");
+        let project_key = "shared-artifact-key".to_string();
+        let cache_dir = dir.path().join("index").join(&project_key);
+        crate::root_cache::configure_artifact_access(&project, &project_key, true);
+
+        let _lock = CacheLock::acquire(&cache_dir, &project).expect("borrow-only lock downgrade");
+        assert!(!cache_dir.join("cache.lock").exists());
+
+        let mut index =
+            SearchIndex::build_with_limit_to_cache_dir(&project, DEFAULT_MAX_FILE_SIZE, &cache_dir);
+        assert!(!index.ready);
+        index.write_to_disk(&cache_dir, None);
+
+        assert!(!cache_dir.join("cache.bin").exists());
+        assert!(!cache_dir.exists());
+    }
+
+    #[test]
     fn write_to_disk_compacts_base_and_delta() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
@@ -4833,14 +4884,14 @@ mod tests {
         let a_project = project.clone();
         let a_cache = cache_dir.clone();
         let a = std::thread::spawn(move || {
-            let _lock = CacheLock::acquire(&a_cache).expect("acquire cache lock a");
+            let _lock = CacheLock::acquire(&a_cache, &a_project).expect("acquire cache lock a");
             let mut index = SearchIndex::build(&a_project);
             index.write_to_disk(&a_cache, None);
         });
         let b_project = project.clone();
         let b_cache = cache_dir.clone();
         let b = std::thread::spawn(move || {
-            let _lock = CacheLock::acquire(&b_cache).expect("acquire cache lock b");
+            let _lock = CacheLock::acquire(&b_cache, &b_project).expect("acquire cache lock b");
             let mut index = SearchIndex::build(&b_project);
             index.write_to_disk(&b_cache, None);
         });

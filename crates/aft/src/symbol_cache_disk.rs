@@ -28,19 +28,29 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SYMBOL_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct SymbolCacheLock {
-    _guard: fs_lock::LockGuard,
+    _guard: Option<fs_lock::LockGuard>,
 }
 
 impl SymbolCacheLock {
-    pub fn acquire(storage_dir: &Path, project_key: &str) -> std::io::Result<Self> {
+    pub fn acquire(
+        storage_dir: &Path,
+        project_key: &str,
+        project_root: &Path,
+    ) -> std::io::Result<Self> {
         let dir = storage_dir.join("symbols").join(project_key);
-        fs::create_dir_all(&dir)?;
         let path = dir.join("symbols.lock");
+        let access = crate::root_cache::ArtifactAccess::for_root(project_root);
+        if !access.allows_write(project_key, &path) {
+            return Ok(Self { _guard: None });
+        }
+        fs::create_dir_all(&dir)?;
         let _acquire_guard = SYMBOL_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("symbol cache lock acquisition mutex poisoned"))?;
         fs_lock::try_acquire(&path, Duration::from_secs(2))
-            .map(|guard| Self { _guard: guard })
+            .map(|guard| Self {
+                _guard: Some(guard),
+            })
             .map_err(|error| match error {
                 fs_lock::AcquireError::Timeout => {
                     std::io::Error::other("timed out acquiring symbol cache lock")
@@ -114,11 +124,14 @@ pub fn write_to_disk(
         std::io::Error::other("symbol cache project root is not set; cannot persist relative paths")
     })?;
 
-    let _cache_lock = SymbolCacheLock::acquire(storage_dir, project_key)?;
     let dir = storage_dir.join("symbols").join(project_key);
-    fs::create_dir_all(&dir)?;
-
     let data_path = dir.join("symbols.bin");
+    let access = crate::root_cache::ArtifactAccess::for_root(&project_root);
+    if !access.allows_write(project_key, &data_path) {
+        return Ok(());
+    }
+    let _cache_lock = SymbolCacheLock::acquire(storage_dir, project_key, &project_root)?;
+    fs::create_dir_all(&dir)?;
     let tmp_path = dir.join(format!(
         "symbols.bin.tmp.{}.{}.{}",
         std::process::id(),
@@ -400,6 +413,25 @@ mod tests {
             vec![test_symbol(file_name)],
         );
         cache
+    }
+
+    #[test]
+    fn borrow_only_root_skips_symbol_lock_and_persist() {
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let project_key = "shared-artifact-key".to_string();
+        crate::root_cache::configure_artifact_access(project.path(), &project_key, true);
+        let cache = test_cache(project.path(), "lib.rs");
+
+        let _lock = SymbolCacheLock::acquire(storage.path(), &project_key, project.path())
+            .expect("borrow-only lock downgrade");
+        let cache_dir = storage.path().join("symbols").join(&project_key);
+        assert!(!cache_dir.join("symbols.lock").exists());
+
+        write_to_disk(&cache, storage.path(), &project_key).expect("borrow-only persist downgrade");
+
+        assert!(!cache_dir.join("symbols.bin").exists());
+        assert!(!cache_dir.exists());
     }
 
     #[test]

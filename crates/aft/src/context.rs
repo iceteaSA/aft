@@ -2766,8 +2766,10 @@ impl AppContext {
             }
         }
 
-        let _cache_lock = match crate::search_index::CacheLock::try_acquire_for_shutdown(&cache_dir)
-        {
+        let _cache_lock = match crate::search_index::CacheLock::try_acquire_for_shutdown(
+            &cache_dir,
+            &canonical_root,
+        ) {
             Ok(lock) => lock,
             Err(error) => {
                 crate::slog_warn!(

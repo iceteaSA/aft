@@ -253,6 +253,17 @@ fn subc_storm_rebinds_stay_live_under_build_and_tool_traffic() {
 }
 
 #[test]
+fn fresh_worktree_bind_does_not_starve_parent_reads_or_acquire_parent_writers() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "fresh_worktree_bind_does_not_starve_parent_reads_or_acquire_parent_writers",
+        Duration::from_secs(40),
+        drive_fresh_worktree_borrow_only_daemon,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
 fn subc_storm_heavy_init_saturation_does_not_delay_fresh_bind() {
     subc_bridge_test::run_subc_bridge_test_with_dispatch_and_executor_config(
         "subc_storm_heavy_init_saturation_does_not_delay_fresh_bind",
@@ -312,6 +323,136 @@ fn subc_storm_route_bind_deadline_errors_and_retry_recovers() {
         |_, _, _| {},
         storm_dispatch,
     );
+}
+
+async fn drive_fresh_worktree_borrow_only_daemon(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let (tx, mut rx) = start_io(session.stream);
+    let (fixture, parent_root, worktree_root) = create_parent_and_linked_worktree();
+    let storage_dir = fixture.path().join("artifact-storage");
+    let mut corr = 20_000_u64;
+
+    send_bind(
+        &tx,
+        1,
+        corr,
+        &parent_root,
+        "storm-parent",
+        artifact_storm_config(&storage_dir),
+    );
+    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+
+    let roots = vec![parent_root.clone()];
+    wait_for_ready_health(&tx, &mut rx, &mut corr, &roots, &HashSet::new()).await;
+    let shared_key = aft::search_index::artifact_cache_key(&parent_root);
+    assert_eq!(
+        shared_key,
+        aft::search_index::artifact_cache_key(&worktree_root),
+        "linked worktree must borrow the parent's artifact key"
+    );
+    aft::root_cache::reset_writer_lease_acquisition_counts_for_test();
+
+    corr += 1;
+    let bind_corr = corr;
+    let started = Instant::now();
+    send_bind(
+        &tx,
+        2,
+        bind_corr,
+        &worktree_root,
+        "storm-worktree",
+        artifact_storm_config(&storage_dir),
+    );
+    corr += 1;
+    let read_corr = corr;
+    send_tool(
+        &tx,
+        1,
+        read_corr,
+        "read",
+        json!({ "filePath": "README.md", "limit": 20 }),
+    );
+    corr += 1;
+    let grep_corr = corr;
+    send_tool(
+        &tx,
+        1,
+        grep_corr,
+        "grep",
+        json!({ "pattern": "root_alpha", "path": "src" }),
+    );
+
+    let mut bind_done = false;
+    let mut read_done = false;
+    let mut grep_done = false;
+    let parent_read_bound = Duration::from_secs(2 * DEBUG_BOUND_MULTIPLIER as u64);
+    let deadline = Instant::now() + parent_read_bound;
+    while !(bind_done && read_done && grep_done) {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        assert!(
+            !remaining.is_zero(),
+            "fresh worktree bind starved parent reads for more than {parent_read_bound:?}"
+        );
+        let frame = read_frame_from_rx(&mut rx, remaining, "worktree bind and parent reads").await;
+        if is_ack(&frame, bind_corr) {
+            bind_done = true;
+            continue;
+        }
+        if frame.header.ty == FrameType::Error
+            && (frame.header.corr == read_corr || frame.header.corr == grep_corr)
+        {
+            let body: Value = serde_json::from_slice(&frame.body).expect("tool error body");
+            panic!("parent read failed during worktree bind: {body:?}");
+        }
+        if frame.header.ty == FrameType::Response && frame.header.corr == read_corr {
+            read_done = true;
+        }
+        if frame.header.ty == FrameType::Response && frame.header.corr == grep_corr {
+            grep_done = true;
+        }
+    }
+    assert!(
+        started.elapsed() <= parent_read_bound,
+        "fresh worktree bind and parent reads took {:?}, exceeding {:?}",
+        started.elapsed(),
+        parent_read_bound
+    );
+
+    let worktree_writer_acquisitions = || {
+        let callgraph = aft::root_cache::writer_lease_acquisition_count_for_test(
+            aft::root_cache::RootCacheDomain::Callgraph,
+            &shared_key,
+            &worktree_root,
+        );
+        let inspect = aft::root_cache::writer_lease_acquisition_count_for_test(
+            aft::root_cache::RootCacheDomain::Inspect,
+            &shared_key,
+            &worktree_root,
+        );
+        (callgraph, inspect)
+    };
+    let (callgraph_acquisitions, inspect_acquisitions) = worktree_writer_acquisitions();
+    assert_eq!(
+        callgraph_acquisitions + inspect_acquisitions,
+        0,
+        "linked worktree session acquired writer capability on shared key {shared_key}: callgraph={callgraph_acquisitions}, inspect={inspect_acquisitions}"
+    );
+
+    let callgraph_dir = storage_dir.join("callgraph").join(&shared_key);
+    let _ = aft::callgraph_store::CallGraphStore::open_ready_no_rebuild(
+        callgraph_dir,
+        worktree_root.clone(),
+    )
+    .expect("worktree API should degrade to the ready read-only callgraph store");
+    let (callgraph_acquisitions, inspect_acquisitions) = worktree_writer_acquisitions();
+    assert_eq!(
+        callgraph_acquisitions + inspect_acquisitions,
+        0,
+        "borrow-only artifact API handed out writer capability on shared key {shared_key}: callgraph={callgraph_acquisitions}, inspect={inspect_acquisitions}"
+    );
+    send_goodbye_and_wait(&tx).await;
 }
 
 async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
@@ -822,6 +963,34 @@ fn build_route_specs(scale: &StormScale, roots: &[PathBuf]) -> Vec<RouteSpec> {
     routes
 }
 
+fn create_parent_and_linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let fixture = tempfile::tempdir().expect("worktree storm fixture");
+    let parent_root = fixture.path().join("parent");
+    let worktree_root = fixture.path().join("linked-worktree");
+    std::fs::create_dir_all(parent_root.join("src")).expect("parent source dir");
+    std::fs::write(
+        parent_root.join("src/lib.rs"),
+        "pub fn root_alpha() -> usize { 1 }\npub fn root_beta() -> usize { root_alpha() + 1 }\n",
+    )
+    .expect("parent source");
+    std::fs::write(parent_root.join("README.md"), "# parent root\n").expect("parent readme");
+    init_git(&parent_root);
+
+    let mut worktree = Command::new("git");
+    assert!(
+        crate::test_helpers::apply_hermetic_git_env(worktree.current_dir(&parent_root))
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&worktree_root)
+            .arg("HEAD")
+            .status()
+            .expect("git worktree add")
+            .success(),
+        "failed to create linked git worktree"
+    );
+
+    (fixture, parent_root, worktree_root)
+}
+
 fn create_storm_roots(count: usize) -> (Vec<tempfile::TempDir>, Vec<PathBuf>) {
     let mut dirs = Vec::new();
     let mut paths = Vec::new();
@@ -911,6 +1080,17 @@ fn write_user_semantic_config(path: &Path, base_url: &str) {
         .to_string(),
     )
     .expect("write user semantic config");
+}
+
+fn artifact_storm_config(storage_dir: &Path) -> Value {
+    json!({
+        "storage_dir": storage_dir,
+        "search_index": true,
+        "semantic_search": false,
+        "callgraph_store": true,
+        "inspect": { "enabled": true },
+        "tool_surface": "all",
+    })
 }
 
 fn storm_project_config(

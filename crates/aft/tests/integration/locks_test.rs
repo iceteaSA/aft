@@ -155,7 +155,7 @@ fn search_lock_acquires_when_uncontended() {
     let cache_dir = search_cache_dir(dir.path());
     let lock_path = cache_dir.join("cache.lock");
 
-    let guard = CacheLock::acquire(&cache_dir).expect("acquire search lock");
+    let guard = CacheLock::acquire(&cache_dir, dir.path()).expect("acquire search lock");
     assert!(lock_path.exists());
     drop(guard);
     assert!(!lock_path.exists());
@@ -169,7 +169,7 @@ fn search_lock_serializes_concurrent_callers() {
 
     assert_serializes_concurrent_callers({
         let cache_dir = Arc::clone(&cache_dir);
-        move || CacheLock::acquire(&cache_dir)
+        move || CacheLock::acquire(&cache_dir, &cache_dir)
     });
 
     assert!(!lock_path.exists());
@@ -182,7 +182,7 @@ fn search_lock_reclaims_dead_owner() {
     let lock_path = cache_dir.join("cache.lock");
     write_synthetic_lock(&lock_path, dead_owner_metadata());
 
-    let guard = CacheLock::acquire(&cache_dir).expect("reclaim dead search owner");
+    let guard = CacheLock::acquire(&cache_dir, dir.path()).expect("reclaim dead search owner");
     assert!(lock_path.exists());
     drop(guard);
     assert!(!lock_path.exists());
@@ -195,7 +195,7 @@ fn search_lock_blocks_cross_host() {
     let lock_path = cache_dir.join("cache.lock");
     write_synthetic_lock(&lock_path, cross_host_metadata());
 
-    let error = match CacheLock::acquire(&cache_dir) {
+    let error = match CacheLock::acquire(&cache_dir, dir.path()) {
         Ok(_) => panic!("cross-host search lock should block"),
         Err(error) => error,
     };
@@ -210,7 +210,8 @@ fn symbol_lock_acquires_when_uncontended() {
     let storage = tempfile::tempdir().expect("create temp dir");
     let lock_path = symbol_lock_path(storage.path(), "project");
 
-    let guard = SymbolCacheLock::acquire(storage.path(), "project").expect("acquire symbol lock");
+    let guard = SymbolCacheLock::acquire(storage.path(), "project", storage.path())
+        .expect("acquire symbol lock");
     assert!(lock_path.exists());
     drop(guard);
     assert!(!lock_path.exists());
@@ -224,7 +225,7 @@ fn symbol_lock_serializes_concurrent_callers() {
 
     assert_serializes_concurrent_callers({
         let root = Arc::clone(&root);
-        move || SymbolCacheLock::acquire(&root, "project")
+        move || SymbolCacheLock::acquire(&root, "project", &root)
     });
 
     assert!(!lock_path.exists());
@@ -236,8 +237,8 @@ fn symbol_lock_reclaims_dead_owner() {
     let lock_path = symbol_lock_path(storage.path(), "project");
     write_synthetic_lock(&lock_path, dead_owner_metadata());
 
-    let guard =
-        SymbolCacheLock::acquire(storage.path(), "project").expect("reclaim dead symbol owner");
+    let guard = SymbolCacheLock::acquire(storage.path(), "project", storage.path())
+        .expect("reclaim dead symbol owner");
     assert!(lock_path.exists());
     drop(guard);
     assert!(!lock_path.exists());
@@ -249,7 +250,7 @@ fn symbol_lock_blocks_cross_host() {
     let lock_path = symbol_lock_path(storage.path(), "project");
     write_synthetic_lock(&lock_path, cross_host_metadata());
 
-    let error = match SymbolCacheLock::acquire(storage.path(), "project") {
+    let error = match SymbolCacheLock::acquire(storage.path(), "project", storage.path()) {
         Ok(_) => panic!("cross-host symbol lock should block"),
         Err(error) => error,
     };
@@ -264,8 +265,8 @@ fn semantic_lock_acquires_when_uncontended() {
     let storage = tempfile::tempdir().expect("create temp dir");
     let lock_path = semantic_lock_path(storage.path(), "project");
 
-    let guard =
-        SemanticIndexLock::acquire(storage.path(), "project").expect("acquire semantic lock");
+    let guard = SemanticIndexLock::acquire(storage.path(), "project", storage.path())
+        .expect("acquire semantic lock");
     assert!(lock_path.exists());
     drop(guard);
     assert!(!lock_path.exists());
@@ -279,7 +280,7 @@ fn semantic_lock_serializes_concurrent_callers() {
 
     assert_serializes_concurrent_callers({
         let root = Arc::clone(&root);
-        move || SemanticIndexLock::acquire(&root, "project")
+        move || SemanticIndexLock::acquire(&root, "project", &root)
     });
 
     assert!(!lock_path.exists());
@@ -291,8 +292,8 @@ fn semantic_lock_reclaims_dead_owner() {
     let lock_path = semantic_lock_path(storage.path(), "project");
     write_synthetic_lock(&lock_path, dead_owner_metadata());
 
-    let guard =
-        SemanticIndexLock::acquire(storage.path(), "project").expect("reclaim dead semantic owner");
+    let guard = SemanticIndexLock::acquire(storage.path(), "project", storage.path())
+        .expect("reclaim dead semantic owner");
     assert!(lock_path.exists());
     drop(guard);
     assert!(!lock_path.exists());
@@ -304,7 +305,7 @@ fn semantic_lock_blocks_cross_host() {
     let lock_path = semantic_lock_path(storage.path(), "project");
     write_synthetic_lock(&lock_path, cross_host_metadata());
 
-    let error = match SemanticIndexLock::acquire(storage.path(), "project") {
+    let error = match SemanticIndexLock::acquire(storage.path(), "project", storage.path()) {
         Ok(_) => panic!("cross-host semantic lock should block"),
         Err(error) => error,
     };

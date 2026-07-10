@@ -597,9 +597,15 @@ impl CallGraphStore {
     }
 
     pub fn open(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Self> {
-        std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::artifact_cache_key(&project_root);
-        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
+        let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
+        else {
+            return match Self::open_readonly(callgraph_dir.clone(), project_root.clone())? {
+                Some(store) => Ok(store.into_inner()),
+                None => Self::borrow_only_empty(callgraph_dir, project_root, project_key),
+            };
+        };
+        std::fs::create_dir_all(&callgraph_dir)?;
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
         // path so a brand-new store still gets a writable DB + schema.
@@ -711,7 +717,11 @@ impl CallGraphStore {
         allow_cold_build: bool,
     ) -> Result<Option<Self>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
-        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
+        let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
+        else {
+            return Self::open_readonly(callgraph_dir, project_root)
+                .map(|store| store.map(ReadonlyCallGraphStore::into_inner));
+        };
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
             return Ok(None);
@@ -759,9 +769,26 @@ impl CallGraphStore {
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<(Self, ColdBuildStats)> {
-        std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::artifact_cache_key(&project_root);
-        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
+        let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
+        else {
+            let store = match Self::open_readonly(callgraph_dir.clone(), project_root.clone())? {
+                Some(store) => store.into_inner(),
+                None => Self::borrow_only_empty(callgraph_dir, project_root, project_key)?,
+            };
+            return Ok((
+                store,
+                ColdBuildStats {
+                    files: 0,
+                    nodes: 0,
+                    refs: 0,
+                    edges: 0,
+                    failed_files: Vec::new(),
+                    elapsed_ms: 0,
+                },
+            ));
+        };
+        std::fs::create_dir_all(&callgraph_dir)?;
         let (stats, generation) = Self::cold_build_publish_locked(
             &callgraph_dir,
             &project_root,
@@ -794,9 +821,16 @@ impl CallGraphStore {
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<(Self, Option<ColdBuildStats>)> {
-        std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::artifact_cache_key(&project_root);
-        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
+        let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
+        else {
+            return match Self::open_readonly(callgraph_dir.clone(), project_root.clone())? {
+                Some(store) => Ok((store.into_inner(), None)),
+                None => Self::borrow_only_empty(callgraph_dir, project_root, project_key)
+                    .map(|store| (store, None)),
+            };
+        };
+        std::fs::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
         // Another process may have published a ready generation while we waited
         // for the lock — open it instead of rebuilding. If that generation is
@@ -877,9 +911,12 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::artifact_cache_key(&project_root);
-        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
+        let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
+        else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
 
         // Another writer may have completed the migration while this worker was
@@ -1059,6 +1096,27 @@ impl CallGraphStore {
             conn,
         );
         Ok(OpenedStore { store, root_repair })
+    }
+
+    fn borrow_only_empty(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        project_key: String,
+    ) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        initialize_schema(&conn)?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self::from_connection(
+            project_root,
+            project_key.clone(),
+            callgraph_dir.join(format!("{project_key}.borrow-only")),
+            callgraph_dir,
+            false,
+            None,
+            None,
+            None,
+            conn,
+        ))
     }
 
     fn prepare_for_atomic_swap(&self) -> Result<()> {
@@ -2028,6 +2086,10 @@ impl ReadonlyCallGraphStore {
         Self { inner }
     }
 
+    fn into_inner(self) -> CallGraphStore {
+        self.inner
+    }
+
     pub fn project_root(&self) -> &Path {
         self.inner.project_root()
     }
@@ -2930,11 +2992,13 @@ pub fn live_callgraph_edge_snapshot(
 fn acquire_writer_lease(
     callgraph_dir: &Path,
     project_key: &str,
-) -> Result<Arc<crate::root_cache::WriterLease>> {
+    project_root: &Path,
+) -> Result<Option<Arc<crate::root_cache::WriterLease>>> {
     crate::root_cache::WriterLease::acquire_shared(
         crate::root_cache::RootCacheDomain::Callgraph,
         callgraph_dir,
         project_key,
+        project_root,
     )
     .map_err(CallGraphStoreError::from)
 }

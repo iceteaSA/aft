@@ -395,8 +395,16 @@ pub trait InspectCacheRead {
 impl InspectCache {
     pub fn open(inspect_dir: PathBuf, project_root: PathBuf) -> Result<Self, InspectCacheError> {
         let project_key = crate::path_identity::project_scope_key(&project_root);
-        let inspect_dir = project_inspect_dir(inspect_dir, &project_key);
-        let writer_lease = acquire_writer_lease(&inspect_dir, &project_key)?;
+        let project_inspect_dir = project_inspect_dir(inspect_dir.clone(), &project_key);
+        let Some(writer_lease) =
+            acquire_writer_lease(&project_inspect_dir, &project_key, &project_root)?
+        else {
+            return match Self::open_readonly(inspect_dir, project_root.clone())? {
+                Some(cache) => Ok(cache.into_inner()),
+                None => Self::borrow_only_empty(project_inspect_dir, project_root, project_key),
+            };
+        };
+        let inspect_dir = project_inspect_dir;
         if !writer_lease.verify().map_err(InspectCacheError::from)? {
             return Err(InspectCacheError::Io(std::io::Error::other(
                 "inspect writer lease epoch changed before opening cache",
@@ -458,6 +466,24 @@ impl InspectCache {
                 conn,
             ),
         )))
+    }
+
+    fn borrow_only_empty(
+        inspect_dir: PathBuf,
+        project_root: PathBuf,
+        project_key: String,
+    ) -> Result<Self, InspectCacheError> {
+        let conn = Connection::open_in_memory()?;
+        initialize_schema(&conn)?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self::from_connection(
+            project_root,
+            project_key.clone(),
+            inspect_dir.join(format!("{project_key}.borrow-only")),
+            None,
+            None,
+            conn,
+        ))
     }
 
     fn from_connection(
@@ -1187,6 +1213,10 @@ impl ReadonlyInspectCache {
         Self { inner }
     }
 
+    fn into_inner(self) -> InspectCache {
+        self.inner
+    }
+
     pub fn project_root(&self) -> &Path {
         self.inner.project_root()
     }
@@ -1471,11 +1501,13 @@ fn gc_old_inspect_generations(inspect_dir: &Path, project_key: &str, current: &s
 fn acquire_writer_lease(
     inspect_dir: &Path,
     project_key: &str,
-) -> Result<Arc<crate::root_cache::WriterLease>, InspectCacheError> {
+    project_root: &Path,
+) -> Result<Option<Arc<crate::root_cache::WriterLease>>, InspectCacheError> {
     crate::root_cache::WriterLease::acquire_shared(
         crate::root_cache::RootCacheDomain::Inspect,
         inspect_dir,
         project_key,
+        project_root,
     )
     .map_err(|error| InspectCacheError::Io(std::io::Error::other(error.to_string())))
 }
