@@ -76,6 +76,10 @@ pub struct AftProcess {
 }
 
 impl AftProcess {
+    pub fn cache_dir(&self) -> &Path {
+        self._cache_dir.path()
+    }
+
     /// Spawn the aft binary with piped stdin/stdout/stderr.
     /// Sets AFT_CACHE_DIR to a temp path so tests don't pollute the user's cache.
     pub fn spawn() -> Self {

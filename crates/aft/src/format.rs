@@ -151,7 +151,7 @@ pub fn run_external_tool(
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = Command::new(command);
+    let mut cmd = crate::effective_path::new_command(command);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(dir) = working_dir {
@@ -547,7 +547,7 @@ fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
         Some(command) => command,
         None => return false,
     };
-    let output = match Command::new(&command)
+    let output = match crate::effective_path::new_command(&command)
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1496,7 +1496,7 @@ pub fn run_external_tool_capture(
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = Command::new(command);
+    let mut cmd = crate::effective_path::new_command(command);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(dir) = working_dir {

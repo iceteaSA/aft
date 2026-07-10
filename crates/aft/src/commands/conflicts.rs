@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
@@ -24,7 +23,7 @@ struct ConflictRegion {
 
 /// Resolve the git toplevel for `base_dir`.
 fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
-    let output = Command::new("git")
+    let output = crate::effective_path::new_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(base_dir)
         .output()
@@ -53,7 +52,7 @@ fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<String>), 
     let mut files: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
 
-    let output = Command::new("git")
+    let output = crate::effective_path::new_command("git")
         .args(["ls-files", "--unmerged"])
         .current_dir(&toplevel)
         .output()
@@ -78,7 +77,7 @@ fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<String>), 
         }
     }
 
-    let grep_output = Command::new("git")
+    let grep_output = crate::effective_path::new_command("git")
         .args(["grep", "-lE", r"^(<<<<<<< |>>>>>>> )"])
         .current_dir(&toplevel)
         .output()

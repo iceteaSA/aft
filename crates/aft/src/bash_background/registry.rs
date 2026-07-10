@@ -3742,7 +3742,7 @@ fn write_unix_command_script(command: &str, paths: &TaskPaths) -> Result<PathBuf
 #[cfg(unix)]
 fn detached_shell_command(command_script: &Path, exit_path: &Path) -> Command {
     let shell = resolve_posix_shell();
-    let mut cmd = Command::new(&shell);
+    let mut cmd = crate::effective_path::new_command(&shell);
     // Keep the user-provided command body out of argv and shell `-c` parsing.
     // The direct child is still a tiny wrapper so it can write the authoritative
     // exit marker after the command script exits (including if that script calls

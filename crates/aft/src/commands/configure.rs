@@ -1,7 +1,6 @@
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -553,7 +552,7 @@ fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Optio
     // stable until the root's `.git` marker changes.
     #[cfg(test)]
     ctx.record_worktree_bridge_probe_spawn_for_test();
-    let output = Command::new("git")
+    let output = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(project_root)
         .args([

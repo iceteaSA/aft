@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, OnceLock,
@@ -3599,7 +3598,7 @@ fn git_root_commit_once(project_root: &Path) -> RootCommitProbe {
 }
 
 fn git_root_commit_once_real(project_root: &Path) -> RootCommitProbe {
-    let output = match Command::new("git")
+    let output = match crate::effective_path::new_command("git")
         .arg("-C")
         .arg(project_root)
         .args(["rev-list", "--max-parents=0", "HEAD"])
@@ -4209,7 +4208,7 @@ fn remaining_bytes<R: Seek>(reader: &mut R, total_len: usize) -> Option<usize> {
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(root)
         .args(args)
@@ -4229,7 +4228,7 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
 
 fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: &str) -> bool {
     let diff_range = format!("{}..{}", from, to);
-    let output = match Command::new("git")
+    let output = match crate::effective_path::new_command("git")
         .arg("-C")
         .arg(root)
         .args(["diff", "--name-status", "-M", &diff_range])

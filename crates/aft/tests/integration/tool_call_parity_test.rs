@@ -81,8 +81,16 @@ fn tool_call_matches_direct_spine_envelopes() {
             .as_str()
             .unwrap_or_else(|| panic!("tool_call response missing text for {}", case.label));
         assert_eq!(
-            normalize_text(&expected_text, direct_project.path()),
-            normalize_text(actual_text, tool_call_project.path()),
+            normalize_text(
+                &expected_text,
+                direct_project.path(),
+                direct_aft.cache_dir()
+            ),
+            normalize_text(
+                actual_text,
+                tool_call_project.path(),
+                tool_call_aft.cache_dir()
+            ),
             "formatted text mismatch for {}",
             case.label
         );
@@ -93,8 +101,16 @@ fn tool_call_matches_direct_spine_envelopes() {
             .expect("direct response is object")
             .insert("text".to_string(), Value::String(expected_text));
 
-        let expected_envelope = normalized_envelope(expected_envelope, direct_project.path());
-        let actual_envelope = normalized_envelope(tool_call_response, tool_call_project.path());
+        let expected_envelope = normalized_envelope(
+            expected_envelope,
+            direct_project.path(),
+            direct_aft.cache_dir(),
+        );
+        let actual_envelope = normalized_envelope(
+            tool_call_response,
+            tool_call_project.path(),
+            tool_call_aft.cache_dir(),
+        );
         assert_eq!(
             expected_envelope, actual_envelope,
             "full envelope mismatch for {}",
@@ -416,17 +432,17 @@ fn response_from_wire(value: &Value) -> Response {
     }
 }
 
-fn normalized_envelope(mut value: Value, project_root: &Path) -> Value {
-    normalize_value(&mut value, project_root);
+fn normalized_envelope(mut value: Value, project_root: &Path, cache_dir: &Path) -> Value {
+    normalize_value(&mut value, project_root, cache_dir);
     value
 }
 
-fn normalize_value(value: &mut Value, project_root: &Path) {
+fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
     match value {
-        Value::String(text) => *text = normalize_text(text, project_root),
+        Value::String(text) => *text = normalize_text(text, project_root, cache_dir),
         Value::Array(items) => {
             for item in items {
-                normalize_value(item, project_root);
+                normalize_value(item, project_root, cache_dir);
             }
         }
         Value::Object(map) => {
@@ -455,18 +471,24 @@ fn normalize_value(value: &mut Value, project_root: &Path) {
                 }
             }
             for value in map.values_mut() {
-                normalize_value(value, project_root);
+                normalize_value(value, project_root, cache_dir);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-fn normalize_text(text: &str, project_root: &Path) -> String {
+fn normalize_text(text: &str, project_root: &Path, cache_dir: &Path) -> String {
     // Base root forms: the raw path plus its canonicalized form (macOS /var ->
     // /private/var, Windows verbatim prefixes, etc.).
-    let mut base_roots = vec![project_root.to_string_lossy().to_string()];
+    let mut base_roots = vec![
+        project_root.to_string_lossy().to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    ];
     if let Ok(canonical) = fs::canonicalize(project_root) {
+        base_roots.push(canonical.to_string_lossy().to_string());
+    }
+    if let Ok(canonical) = fs::canonicalize(cache_dir) {
         base_roots.push(canonical.to_string_lossy().to_string());
     }
 

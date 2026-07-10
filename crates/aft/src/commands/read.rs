@@ -82,7 +82,6 @@ fn is_binary(content: &[u8]) -> bool {
     content_inspector::inspect(content).is_binary()
 }
 
-
 fn read_magic(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut file = fs::File::open(path)?;
     let mut magic = [0u8; MEDIA_MAGIC_BYTES];

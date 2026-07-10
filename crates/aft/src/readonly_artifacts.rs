@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // These openers borrow cache artifacts that may be owned by a different AFT
 // session. They therefore only read and verify the opened snapshot; any repair,
@@ -242,7 +241,7 @@ fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
 }
 
 fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
-    let output = Command::new("git")
+    let output = crate::effective_path::new_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(base_dir)
         .output()
@@ -270,6 +269,7 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::fs;
+    use std::process::Command;
     use std::time::SystemTime;
 
     use tempfile::TempDir;

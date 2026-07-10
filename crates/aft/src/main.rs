@@ -979,18 +979,18 @@ mod pending_response_tests {
     ) -> BgTaskSnapshot {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(snapshot) = ctx.bash_background().status(
-                task_id,
-                session_id,
-                Some(root),
-                Some(storage),
-                1024,
-            ) {
+            if let Some(snapshot) =
+                ctx.bash_background()
+                    .status(task_id, session_id, Some(root), Some(storage), 1024)
+            {
                 if predicate(&snapshot) {
                     return snapshot;
                 }
             }
-            assert!(Instant::now() < deadline, "timed out waiting for snapshot for {task_id}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for snapshot for {task_id}"
+            );
             thread::sleep(Duration::from_millis(25));
         }
     }
@@ -1107,7 +1107,8 @@ mod pending_response_tests {
         assert!(spawn_response.success);
         assert_eq!(spawn_response.data["status"], serde_json::json!("running"));
         let task_id = spawn_response.data["task_id"].as_str().unwrap().to_string();
-        let outcome = aft::commands::bash_orchestrate::build_bash_outcome(&request, &ctx, spawn_response);
+        let outcome =
+            aft::commands::bash_orchestrate::build_bash_outcome(&request, &ctx, spawn_response);
         let mut pending = PendingResponses::default();
         match outcome {
             aft::response_finalize::DispatchOutcome::Deferred(pending_response) => {
@@ -1119,7 +1120,10 @@ mod pending_response_tests {
         }
 
         let mut writer = Vec::new();
-        assert_eq!(write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(), 0);
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            0
+        );
         assert!(writer.is_empty());
 
         let detach = super::dispatch(
@@ -1135,7 +1139,10 @@ mod pending_response_tests {
         assert!(detach.success);
         assert_eq!(detach.data["detached"], serde_json::json!(true));
 
-        assert_eq!(write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(), 1);
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
         let values = line_values(&writer);
         let response = values.last().unwrap();
         let output = response["output"].as_str().unwrap();

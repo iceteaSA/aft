@@ -98,7 +98,7 @@
 **Call-graph and navigation flow:**
 
 1. Configure project root and initialize file watching -- `crates/aft/src/commands/configure.rs`
-2. Query workspace-wide call dependencies via the persisted background-built callgraph store -- `crates/aft/src/callgraph_store/mod.rs`. Under read-only mode, queries run via `ReadonlyCallGraphStore` directly against the SQLite database without write or rebuild operations.
+2. Query workspace-wide call dependencies via the persisted background-built callgraph store -- `crates/aft/src/callgraph_store/mod.rs`. The active database file is resolved dynamically via generation pointers (`.current` files) to allow atomic swaps and non-blocking reads. Under read-only mode, queries run via `ReadonlyCallGraphStore` directly against the SQLite database without write or rebuild operations.
 3. Serve navigation commands such as callers, call-tree, impact, trace-to, and trace-data using the callgraph store adapter -- `crates/aft/src/commands/call_tree.rs`, `crates/aft/src/commands/callers.rs`, `crates/aft/src/commands/impact.rs`, `crates/aft/src/commands/trace_data.rs`, `crates/aft/src/commands/trace_to.rs`, `crates/aft/src/commands/trace_to_symbol.rs`, `crates/aft/src/commands/callgraph_store_adapter.rs`. By default, hide test files from results (controlled via the `includeTests` parameter) and collapse unresolved stdlib or external leaf calls in `call_tree` unless `includeUnresolved` is active. Truncate and return a summary (`hub_summary`) when results exceed 20 entries to save token context cost.
 4. Serve symbol-level zoom inspection (`aft_zoom`), which fetches a symbol's implementation. If the target is a large container (class, struct, interface, etc., exceeding 150 lines), it renders a member-signature menu instead of the full body. For standard functions, it dedupes outgoing (`calls_out`) and incoming (`called_by`) call sites by name, aggregating duplicate occurrences under `extra_count` to minimize context token cost.
 
@@ -137,13 +137,13 @@
 
 **Artifact ownership and read-only caching flow:**
 
-1. During `configure`, verify repository scopes, and resolve root-keyed cache directories: `<storage>/callgraph/<artifact_cache_key>` and `<storage>/inspect/<project_scope_key>` -- `crates/aft/src/commands/configure.rs`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/root_cache.rs`.
+1. During `configure`, verify repository scopes, and resolve root-keyed cache directories: `<storage>/callgraph/<artifact_cache_key>` and `<storage>/inspect/<project_scope_key>` -- `crates/aft/src/commands/configure.rs`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/root_cache.rs`. If the `storage_dir` parameter is not supplied (e.g. daemon connections), default it to the shared CortexKit storage root `~/.local/share/cortexkit/aft/` to prevent RAM-only fallback and index regeneration. Retrieve or record the cache key in `<storage>/cache-keys.json` to memoize the mapping and avoid spawning redundant git process probes.
 2. Write an `owner.json` manifest to the cache directory carrying the current checkout's scope key, path, PID, and hostname.
 3. If no manifest exists, or if the existing manifest belongs to the same checkout, or if the owning process is dead (stale heartbeat or inactive process ID/hostname), reclaim and write a new lease ("Owner" mode).
 4. If an active process on another checkout owns the manifest, claim "ReadOnly" mode.
 5. Coordinate concurrent cache writes by acquiring a domain-specific `WriterLease` via `WriterLease::acquire_shared`. In "ReadOnly" mode or when a write lease cannot be acquired, heavy operations like cold callgraph builds, search index generation, and semantic index warming are disabled. Any search or semantic search queries read the cached index files using strict read-only openers (including `ReadonlyCallGraphStore` for callgraph reads) -- `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, `crates/aft/src/callgraph_store/mod.rs`.
-6. Write a `0600` read-marker file under `<domain>/readers/<generation-label>/` to register active reader sessions and prevent garbage collection cleanup from deleting active database files -- `crates/aft/src/root_cache.rs`.
-7. Enforce coexistence guards using `legacy_partitions.rs` to refuse write operations into legacy harness-scoped folders (`<storage>/<harness>/<domain>/<key>`) and check free space requirements using a 1.5× disk-floor preflight before copying legacy folders to the new root-keyed layout.
+6. Write a `0600` read-marker file under `<domain>/readers/<generation-label>/` to register active reader sessions -- `crates/aft/src/root_cache.rs`. Active readers touch their markers to update heartbeats (at most once every 5 seconds). During sweeps, garbage collection removes old generation SQLite databases unless they have a protected read marker, or if their age exceeds the absolute retention limit of 6 hours (`MARKED_GENERATION_RETENTION_TTL`).
+7. Enforce coexistence guards using `legacy_partitions.rs` to refuse write operations into legacy layout partitions and check free space requirements using a 1.5× disk-floor preflight before copying legacy folders to the new root-keyed layout. If a legacy callgraph partition is detected, migrate it using the non-blocking, online SQLite backup API (`rusqlite::Connection::backup`) running page-by-page (128 pages per step) under retry and wall-clock budgets.
 8. The active "Owner" session emits periodic heartbeat file-writes to the lease manifest file during its event loop tick -- `crates/aft/src/main.rs`.
 
 ## Key Abstractions
@@ -203,7 +203,7 @@
 **CallGraphStore:**
 - Purpose: Persisted SQLite database of project-wide call dependencies.
 - Location: `crates/aft/src/callgraph_store/mod.rs`
-- Pattern: Background-built SQLite schema containing resolved and name-only call edges, refreshed incrementally on file edits, and queried by navigation commands. Under read-only mode, queries read the SQLite file via `ReadonlyCallGraphStore` to prevent write collisions. Returns a `Building` status during cold builds. Cold-build warming is deferred while a cold semantic index seed is actively collecting or embedding.
+- Pattern: Background-built SQLite schema containing resolved and name-only call edges, refreshed incrementally on file edits, and queried by navigation commands. Stores are resolved dynamically via generation pointers (`.current` files) to allow safe atomic swaps and non-blocking reads. Under read-only mode, queries read the SQLite file via `ReadonlyCallGraphStore` to prevent write collisions. Returns a `Building` status during cold builds. Cold-build warming is deferred while a cold semantic index seed is actively collecting or embedding.
 
 **Oxc Liveness Engine:**
 - Purpose: Perform liveness and dead-code analysis for JavaScript/TypeScript and other supported files.
@@ -273,7 +273,7 @@
 - Purpose: Coordinate safe multi-session access to the root-keyed project cache.
 - Location: `crates/aft/src/root_cache.rs`
 - Pattern: File-locked writer lease ensuring single-writer exclusivity combined with private read-marker JSON files (created `0600` under `<domain>/readers/`) to track active reader processes.
-- Contains: `WriterLease` domain mapping (`RootCacheDomain::Callgraph` or `RootCacheDomain::Inspect`), epoch validation, and process identification metadata for reader heartbeat cleanup.
+- Contains: `WriterLease` domain mapping (`RootCacheDomain::Callgraph` or `RootCacheDomain::Inspect`), epoch validation, and process identification metadata for reader heartbeat cleanup. Sweeps clean up dead-PID and expired cross-host markers and delete old SQLite generation files.
 
 **LegacyPartitionGuards:**
 - Purpose: Protect legacy harness-scoped folders and manage space limits during layout migration.
