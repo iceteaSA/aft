@@ -575,6 +575,7 @@ Mode priority: appendContent > edits > symbol (without oldString) > oldString (f
 2. **Batch edits** — pass \`filePath\` + \`edits\` array
    Multiple edits in one file atomically. Each edit is either:
    - \`{ "oldString": "old", "newString": "new" }\` — find/replace
+   - \`{ "oldString": "old", "newString": "new", "replaceAll": true }\` — replace every match
    - \`{ "startLine": 5, "endLine": 7, "content": "new lines" }\` — replace line range (1-based, both inclusive)
    Set content to empty string to delete lines.
 
@@ -637,10 +638,32 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .optional()
         .describe("Text to append to the end of filePath; creates the file if needed"),
       edits: z
-        .array(z.record(z.string(), z.unknown()))
+        .array(
+          z.object({
+            oldString: z.string().optional().describe("Text to find for a batch find/replace edit"),
+            newString: z
+              .string()
+              .optional()
+              .describe("Replacement text for a batch find/replace edit"),
+            replaceAll: z
+              .boolean()
+              .optional()
+              .describe("Replace every occurrence for this batch item"),
+            occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+              "0-indexed occurrence for this batch item",
+            ),
+            startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+              "1-based start line for a batch line-range edit",
+            ),
+            endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+              "1-based end line for a batch line-range edit",
+            ),
+            content: z.string().optional().describe("Replacement text for a batch line-range edit"),
+          }),
+        )
         .optional()
         .describe(
-          "Batch edits — array of { oldString: string, newString: string } or { startLine: number (1-based), endLine: number (1-based, inclusive), content: string }",
+          "Batch edits — array of { oldString, newString }, { oldString, newString, replaceAll: true }, or { startLine, endLine, content } objects",
         ),
     },
     execute: async (args, context): Promise<ToolResult> => {
@@ -681,15 +704,19 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       );
 
       const rawArgs: Record<string, unknown> = { filePath: file };
-      for (const key of [
-        "appendContent",
-        "edits",
-        "symbol",
-        "content",
-        "oldString",
-        "newString",
-      ] as const) {
+      for (const key of ["appendContent", "symbol", "content", "oldString", "newString"] as const) {
         if (argsRecord[key] !== undefined) rawArgs[key] = argsRecord[key];
+      }
+      if (Array.isArray(argsRecord.edits)) {
+        rawArgs.edits = argsRecord.edits.map((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+          const batchItem = item as Record<string, unknown>;
+          return batchItem.replaceAll === undefined
+            ? batchItem
+            : { ...batchItem, replaceAll: coerceBoolean(batchItem.replaceAll) };
+        });
+      } else if (argsRecord.edits !== undefined) {
+        rawArgs.edits = argsRecord.edits;
       }
       if (argsRecord.replaceAll !== undefined) {
         rawArgs.replaceAll = coerceBoolean(argsRecord.replaceAll);

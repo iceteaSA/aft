@@ -165,18 +165,50 @@
         "type": "string"
       },
       "edits": {
-        "description": "Batch edits — array of { oldString: string, newString: string } or { startLine: number (1-based), endLine: number (1-based, inclusive), content: string }",
+        "description": "Batch edits — array of { oldString, newString }, { oldString, newString, replaceAll: true }, or { startLine, endLine, content } objects",
         "type": "array",
         "items": {
           "type": "object",
-          "propertyNames": {
-            "type": "string"
-          },
-          "additionalProperties": {}
+          "properties": {
+            "oldString": {
+              "description": "Text to find for a batch find/replace edit",
+              "type": "string"
+            },
+            "newString": {
+              "description": "Replacement text for a batch find/replace edit",
+              "type": "string"
+            },
+            "replaceAll": {
+              "description": "Replace every occurrence for this batch item",
+              "type": "boolean"
+            },
+            "occurrence": {
+              "description": "0-indexed occurrence for this batch item",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "startLine": {
+              "description": "1-based start line for a batch line-range edit",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "endLine": {
+              "description": "1-based end line for a batch line-range edit",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "content": {
+              "description": "Replacement text for a batch line-range edit",
+              "type": "string"
+            }
+          }
         }
       }
     },
-    "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nMode priority: appendContent > edits > symbol (without oldString) > oldString (find/replace). If none match, the call is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `filePath` + `appendContent`\n   Appends text to the end of a file, creating the file if it does not exist.\n   Example: `{ \"filePath\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `filePath` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type) with new content.\n   Includes decorators, attributes, and doc comments in the replacement range.\n   **Important:** You must NOT provide `oldString` when using symbol mode — if present, the tool silently falls back to find/replace mode.\n   Example: `{ \"filePath\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — pass `filePath` + `oldString` + `newString`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify which one with `occurrence` or use `replaceAll: true`.\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"const x = 1\", \"newString\": \"const x = 2\" }`\n\n5. **Replace all occurrences** — add `replaceAll: true`\n   Replaces every occurrence of `oldString` in the file.\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"oldName\", \"newString\": \"newName\", \"replaceAll\": true }`\n\n6. **Select specific occurrence** — add `occurrence: N` (0-indexed)\n   When multiple matches exist, select the Nth one (0 = first, 1 = second, etc.).\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"TODO\", \"newString\": \"DONE\", \"occurrence\": 0 }`\n\nNote: Modes 5 and 6 are options on mode 4 (find/replace) — they require `oldString`.\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available."
+    "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nMode priority: appendContent > edits > symbol (without oldString) > oldString (find/replace). If none match, the call is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `filePath` + `appendContent`\n   Appends text to the end of a file, creating the file if it does not exist.\n   Example: `{ \"filePath\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `filePath` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type) with new content.\n   Includes decorators, attributes, and doc comments in the replacement range.\n   **Important:** You must NOT provide `oldString` when using symbol mode — if present, the tool silently falls back to find/replace mode.\n   Example: `{ \"filePath\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — pass `filePath` + `oldString` + `newString`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify which one with `occurrence` or use `replaceAll: true`.\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"const x = 1\", \"newString\": \"const x = 2\" }`\n\n5. **Replace all occurrences** — add `replaceAll: true`\n   Replaces every occurrence of `oldString` in the file.\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"oldName\", \"newString\": \"newName\", \"replaceAll\": true }`\n\n6. **Select specific occurrence** — add `occurrence: N` (0-indexed)\n   When multiple matches exist, select the Nth one (0 = first, 1 = second, etc.).\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"TODO\", \"newString\": \"DONE\", \"occurrence\": 0 }`\n\nNote: Modes 5 and 6 are options on mode 4 (find/replace) — they require `oldString`.\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available."
   },
   "apply_patch": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

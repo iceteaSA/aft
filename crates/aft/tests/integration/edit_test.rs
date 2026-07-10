@@ -1366,6 +1366,164 @@ fn batch_fuzzy_matching_covers_all_progressive_passes() {
 }
 
 #[test]
+fn batch_replace_all_replaces_every_occurrence() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_replace_all.txt");
+    fs::write(&target, "hello hello hello\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-replace-all",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "hello", "replacement": "bye", "replaceAll": true }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "batch should succeed: {resp:?}");
+    assert_eq!(resp["edits_applied"], 1);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "bye bye bye\n");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_replace_all_and_plain_edit_apply_atomically() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_replace_all_mixed.txt");
+    fs::write(&target, "red red blue\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-replace-all-mixed",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "red", "replacement": "green", "replace_all": true },
+            { "match": "blue", "replacement": "cyan" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "batch should succeed: {resp:?}");
+    assert_eq!(resp["edits_applied"], 2);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "green green cyan\n");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_replace_all_and_occurrence_are_mutually_exclusive() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_replace_all_occurrence.txt");
+    let original = "same same\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-replace-all-occurrence",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "same", "replacement": "new", "replaceAll": true, "occurrence": 0 }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], false, "batch should fail: {resp:?}");
+    assert_eq!(resp["code"], "invalid_request");
+    assert!(resp["message"]
+        .as_str()
+        .unwrap()
+        .contains("mutually exclusive"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_replace_all_expansion_uses_overlap_guard() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_replace_all_overlap.txt");
+    let original = "alpha alpha\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-replace-all-overlap",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "alpha", "replacement": "A", "replaceAll": true },
+            { "match": "alpha alpha", "replacement": "B", "replaceAll": true }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], false, "batch should fail: {resp:?}");
+    assert_eq!(resp["code"], "overlapping_edits");
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_replace_all_supports_empty_replacement_deletion() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_replace_all_delete.txt");
+    fs::write(&target, "drop keep drop\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-replace-all-delete",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "oldString": "drop", "newString": "", "replace_all": true }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "batch should succeed: {resp:?}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), " keep \n");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_ambiguity_error_mentions_occurrence_and_replace_all() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_ambiguous.txt");
+    let original = "same same\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-ambiguous",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [{ "match": "same", "replacement": "new" }]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], false, "batch should fail: {resp:?}");
+    let message = resp["message"].as_str().unwrap();
+    assert!(message.contains("'occurrence' (0-indexed)"));
+    assert!(message.contains("'replaceAll': true"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn edit_match_replace_all_replaces_multiple_occurrences() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();

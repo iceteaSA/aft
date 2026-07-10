@@ -78,7 +78,7 @@ describe("hoisted tool adapters", () => {
       schemaAccepts(editSchema, {
         filePath: "batch.ts",
         edits: [
-          { oldString: "before", newString: "after" },
+          { oldString: "before", newString: "after", replaceAll: true },
           { startLine: 2, endLine: 3, content: "replacement" },
         ],
       }),
@@ -89,6 +89,10 @@ describe("hoisted tool adapters", () => {
         edits: [{ startLine: "2", endLine: "3", content: "replacement" }],
       }),
     ).toBe(true);
+
+    const batchReplaceAllSchema = editSchema.properties?.edits?.items?.properties?.replaceAll;
+    expect(batchReplaceAllSchema?.type).toBe("boolean");
+    expect(batchReplaceAllSchema?.description).toContain("every occurrence");
 
     const batchStartLineSchema = editSchema.properties?.edits?.items?.properties?.startLine;
     expect(batchStartLineSchema?.description).toBe(
@@ -307,7 +311,7 @@ describe("hoisted tool adapters", () => {
     });
   });
 
-  test("edit batch mode forwards a two-edit camelCase payload through tool_call", async () => {
+  test("edit batch mode coerces stringified item replaceAll through tool_call", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({
       success: true,
@@ -326,7 +330,11 @@ describe("hoisted tool adapters", () => {
     const result = (await executeTool(tools.get("edit")!, {
       filePath: "batch.ts",
       edits: [
-        { oldString: "before", newString: "after" },
+        {
+          oldString: "before",
+          newString: "after",
+          replaceAll: "true" as unknown as boolean,
+        },
         { startLine: 4, endLine: 6, content: "replacement" },
       ],
     })) as { content: Array<{ text: string }>; details: { editsApplied?: number } };
@@ -338,7 +346,7 @@ describe("hoisted tool adapters", () => {
     expect(toolArgs(calls[0])).toEqual({
       filePath: "batch.ts",
       edits: [
-        { oldString: "before", newString: "after" },
+        { oldString: "before", newString: "after", replaceAll: true },
         { startLine: 4, endLine: 6, content: "replacement" },
       ],
     });

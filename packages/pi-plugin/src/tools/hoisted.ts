@@ -266,6 +266,10 @@ const BatchEditParams = Type.Object({
   newString: Type.Optional(
     Type.String({ description: "Replacement text for a batch find/replace edit" }),
   ),
+  replaceAll: Type.Optional(
+    Type.Boolean({ description: "Replace every occurrence for this batch item" }),
+  ),
+  occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER, "0-based occurrence for this batch item"),
   startLine: optionalInt(
     1,
     Number.MAX_SAFE_INTEGER,
@@ -309,7 +313,7 @@ const EditParams = Type.Object({
   edits: Type.Optional(
     Type.Array(BatchEditParams, {
       description:
-        "Batch edits — array of { oldString, newString } or { startLine, endLine, content } objects applied atomically to one file.",
+        "Batch edits — array of { oldString, newString }, { oldString, newString, replaceAll: true }, or { startLine, endLine, content } objects applied atomically.",
     }),
   ),
 });
@@ -595,7 +599,7 @@ export function registerHoistedTools(
       name: "edit",
       label: "edit",
       description:
-        "Edit part of a file via `appendContent`, batch `edits[]`, or `oldString`/`newString` find-and-replace. Mode priority: appendContent > edits > oldString. Find/replace errors on multiple matches — use `occurrence` or `replaceAll: true`.",
+        "Edit part of a file via `appendContent`, batch `edits[]`, or `oldString`/`newString` find-and-replace. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Mode priority: appendContent > edits > oldString.",
       promptSnippet:
         "Partial file edits via appendContent, edits[], or oldString/newString (mode priority: appendContent > edits > oldString).",
       promptGuidelines: [
@@ -636,8 +640,19 @@ export function registerHoistedTools(
         });
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const rawArgs: Record<string, unknown> = { filePath: filePathArg };
-        for (const key of ["appendContent", "edits", "oldString", "newString"] as const) {
+        for (const key of ["appendContent", "oldString", "newString"] as const) {
           if (argsRecord[key] !== undefined) rawArgs[key] = argsRecord[key];
+        }
+        if (Array.isArray(argsRecord.edits)) {
+          rawArgs.edits = argsRecord.edits.map((item) => {
+            if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+            const batchItem = item as Record<string, unknown>;
+            return batchItem.replaceAll === undefined
+              ? batchItem
+              : { ...batchItem, replaceAll: coerceBoolean(batchItem.replaceAll) };
+          });
+        } else if (argsRecord.edits !== undefined) {
+          rawArgs.edits = argsRecord.edits;
         }
         // Coerce at the boundary: stringified replaceAll must forward true (coerceBoolean).
         if (params.replaceAll !== undefined) rawArgs.replaceAll = coerceBoolean(params.replaceAll);

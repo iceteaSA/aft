@@ -84,7 +84,7 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     for (i, edit_val) in edits.iter().enumerate() {
         match resolve_edit(&source, edit_val, i, &req.id) {
-            Ok(r) => resolved.push(r),
+            Ok(item_edits) => resolved.extend(item_edits),
             Err(resp) => return resp,
         }
     }
@@ -206,13 +206,13 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
 /// Resolve a single edit object to byte offsets against the original source.
 ///
-/// Returns `Ok(ResolvedEdit)` on success, `Err(Response)` on validation failure.
+/// Returns one or more resolved edits on success, or `Err(Response)` on validation failure.
 fn resolve_edit(
     source: &str,
     edit_val: &serde_json::Value,
     index: usize,
     req_id: &str,
-) -> Result<ResolvedEdit, Response> {
+) -> Result<Vec<ResolvedEdit>, Response> {
     // Detect edit type: match-replace or line-range
     // Accept both "match"/"replacement" and "oldString"/"newString" (backward compat)
     let match_str = edit_val
@@ -227,6 +227,24 @@ fn resolve_edit(
             .or_else(|| edit_val.get("newString"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let occurrence = edit_val.get("occurrence").and_then(|v| v.as_u64());
+        let replace_all = edit_val
+            .get("replace_all")
+            .or_else(|| edit_val.get("replaceAll"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if replace_all && edit_val.get("occurrence").is_some() {
+            return Err(Response::error(
+                req_id,
+                "invalid_request",
+                format!(
+                    "batch: edit[{}] 'replaceAll' and 'occurrence' are mutually exclusive",
+                    index
+                ),
+            ));
+        }
+
         let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(source, match_str);
 
         // Fuzzy passes (>= 2) are line-based and set the byte range to include
@@ -269,34 +287,45 @@ fn resolve_edit(
             );
         }
 
-        if fuzzy_matches.len() > 1 {
-            // Check if an occurrence index is specified to disambiguate
-            if let Some(occ) = edit_val.get("occurrence").and_then(|v| v.as_u64()) {
-                let occ = occ as usize;
-                if occ >= fuzzy_matches.len() {
-                    return Err(Response::error(
-                        req_id,
-                        "batch_edit_failed",
-                        format!(
-                            "batch: edit[{}] occurrence {} out of range (found {} occurrences)",
-                            index,
-                            occ,
-                            fuzzy_matches.len()
-                        ),
-                    ));
-                }
-                let m = &fuzzy_matches[occ];
-                return Ok(ResolvedEdit {
+        if replace_all {
+            return Ok(fuzzy_matches
+                .iter()
+                .map(|m| ResolvedEdit {
                     byte_start: m.byte_start,
                     byte_end: m.byte_start + m.byte_len,
                     replacement: effective_replacement(m),
-                });
+                })
+                .collect());
+        }
+
+        if let Some(occ) = occurrence {
+            let occ = occ as usize;
+            if occ >= fuzzy_matches.len() {
+                return Err(Response::error(
+                    req_id,
+                    "batch_edit_failed",
+                    format!(
+                        "batch: edit[{}] occurrence {} out of range (found {} occurrences)",
+                        index,
+                        occ,
+                        fuzzy_matches.len()
+                    ),
+                ));
             }
+            let m = &fuzzy_matches[occ];
+            return Ok(vec![ResolvedEdit {
+                byte_start: m.byte_start,
+                byte_end: m.byte_start + m.byte_len,
+                replacement: effective_replacement(m),
+            }]);
+        }
+
+        if fuzzy_matches.len() > 1 {
             return Err(Response::error(
                 req_id,
                 "batch_edit_failed",
                 format!(
-                    "batch: edit[{}] match '{}' is ambiguous ({} occurrences, expected 1). Use 'occurrence' field (0-indexed) to select which one.",
+                    "batch: edit[{}] match '{}' is ambiguous ({} occurrences, expected 1). Use 'occurrence' (0-indexed) to select one, or 'replaceAll': true to replace every occurrence.",
                     index,
                     match_str,
                     fuzzy_matches.len()
@@ -305,11 +334,11 @@ fn resolve_edit(
         }
 
         let m = &fuzzy_matches[0];
-        Ok(ResolvedEdit {
+        Ok(vec![ResolvedEdit {
             byte_start: m.byte_start,
             byte_end: m.byte_start + m.byte_len,
             replacement: effective_replacement(m),
-        })
+        }])
     } else if edit_val.get("line_start").is_some() {
         // Line-range replacement
         let line_start_1based = edit_val
@@ -388,11 +417,11 @@ fn resolve_edit(
             if !replacement_str.ends_with('\n') {
                 replacement_str.push('\n');
             }
-            return Ok(ResolvedEdit {
+            return Ok(vec![ResolvedEdit {
                 byte_start: byte_pos,
                 byte_end: byte_pos,
                 replacement: replacement_str,
-            });
+            }]);
         }
 
         // Allow pure insert: line_start == line_end + 1 means insert before line_start
@@ -423,11 +452,11 @@ fn resolve_edit(
             if !replacement_str.ends_with('\n') {
                 replacement_str.push('\n');
             }
-            return Ok(ResolvedEdit {
+            return Ok(vec![ResolvedEdit {
                 byte_start: byte_pos,
                 byte_end: byte_pos,
                 replacement: replacement_str,
-            });
+            }]);
         }
 
         // Clamp line_end to last valid line instead of hard error
@@ -455,11 +484,11 @@ fn resolve_edit(
             }
         }
 
-        Ok(ResolvedEdit {
+        Ok(vec![ResolvedEdit {
             byte_start,
             byte_end,
             replacement: replacement_str,
-        })
+        }])
     } else {
         Err(Response::error(
             req_id,

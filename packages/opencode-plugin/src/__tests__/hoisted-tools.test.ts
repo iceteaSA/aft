@@ -845,7 +845,7 @@ describe("Hoisted tool execute handlers", () => {
     ).rejects.toThrow("Destination already exists");
   });
 
-  test("edit batch mode forwards raw camelCase fields through tool_call", async () => {
+  test("edit batch schema accepts replaceAll and coerces stringified item values", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -854,13 +854,24 @@ describe("Hoisted tool execute handlers", () => {
         ? previewResponse()
         : { success: true, edits_applied: 2, text: "Edited (+0/-0, 2 edits)." },
     );
+    const editsSchema = tools.edit.args.edits as unknown as {
+      safeParse: (value: unknown) => { success: boolean };
+    };
+    expect(
+      editsSchema.safeParse([{ oldString: "before", newString: "after", replaceAll: true }])
+        .success,
+    ).toBe(true);
 
     const result = text(
       await tools.edit.execute(
         {
           filePath: "batch.ts",
           edits: [
-            { oldString: "before", newString: "after" },
+            {
+              oldString: "before",
+              newString: "after",
+              replaceAll: "true" as unknown as boolean,
+            },
             { startLine: 4, endLine: 6, content: "replacement" },
           ],
         },
@@ -876,7 +887,7 @@ describe("Hoisted tool execute handlers", () => {
       params: {
         filePath: "batch.ts",
         edits: [
-          { oldString: "before", newString: "after" },
+          { oldString: "before", newString: "after", replaceAll: true },
           { startLine: 4, endLine: 6, content: "replacement" },
         ],
       },
@@ -887,7 +898,7 @@ describe("Hoisted tool execute handlers", () => {
       params: {
         filePath: "batch.ts",
         edits: [
-          { oldString: "before", newString: "after" },
+          { oldString: "before", newString: "after", replaceAll: true },
           { startLine: 4, endLine: 6, content: "replacement" },
         ],
       },
