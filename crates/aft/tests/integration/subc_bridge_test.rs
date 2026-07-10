@@ -1123,6 +1123,16 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
+fn bridge_executor_config() -> ExecutorConfig {
+    ExecutorConfig {
+        pool_size: 4,
+        read_cap: 3,
+        actor_cap: 3,
+        heavy_permits: 2,
+        drr_quantum: 1,
+    }
+}
+
 fn run_subc_bridge_test<F, Fut, A>(name: &'static str, watchdog: Duration, driver: F, after: A)
 where
     F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
@@ -1160,6 +1170,7 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
         after,
         true,
         bridge_dispatch,
+        bridge_executor_config(),
     );
 }
 
@@ -1181,6 +1192,7 @@ fn run_subc_bridge_production_test<F, Fut, A>(
         after,
         false,
         bridge_dispatch,
+        bridge_executor_config(),
     );
 }
 
@@ -1195,7 +1207,40 @@ pub(super) fn run_subc_bridge_test_with_dispatch<F, Fut, A>(
     Fut: Future<Output = ()> + 'static,
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
-    run_subc_bridge_test_inner(name, watchdog, Vec::new, driver, after, true, dispatch);
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        true,
+        dispatch,
+        bridge_executor_config(),
+    );
+}
+
+pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    driver: F,
+    after: A,
+    dispatch: aft::subc::DispatchFn,
+    executor_config: ExecutorConfig,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        true,
+        dispatch,
+        executor_config,
+    );
 }
 
 fn run_subc_bridge_test_inner<E, F, Fut, A>(
@@ -1206,6 +1251,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     after: A,
     allow_native_passthrough: bool,
     dispatch: aft::subc::DispatchFn,
+    executor_config: ExecutorConfig,
 ) where
     E: FnOnce() -> Vec<EnvVarGuard>,
     F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
@@ -1229,13 +1275,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
             ..Config::default()
         },
     ));
-    let executor = Arc::new(Executor::with_config(ExecutorConfig {
-        pool_size: 4,
-        read_cap: 3,
-        actor_cap: 3,
-        heavy_permits: 2,
-        drr_quantum: 1,
-    }));
+    let executor = Arc::new(Executor::with_config(executor_config));
     let executor_for_daemon = Arc::clone(&executor);
     let executor_for_check = Arc::clone(&executor);
 

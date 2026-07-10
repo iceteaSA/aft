@@ -11,6 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::context::AppContext;
+use aft::executor::{ExecutorConfig, Lane};
+use aft::path_identity::ProjectRootId;
 use aft::protocol::{RawRequest, Response};
 use serde_json::{json, Value};
 use subc_protocol::session::{HealthReport, ModuleControlRequest, ModuleControlResponse};
@@ -251,6 +253,24 @@ fn subc_storm_rebinds_stay_live_under_build_and_tool_traffic() {
 }
 
 #[test]
+fn subc_storm_heavy_init_saturation_does_not_delay_fresh_bind() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch_and_executor_config(
+        "subc_storm_heavy_init_saturation_does_not_delay_fresh_bind",
+        Duration::from_secs(30),
+        drive_heavy_init_saturation_daemon,
+        |_, _, _| {},
+        storm_dispatch,
+        ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 2,
+            drr_quantum: 1,
+        },
+    );
+}
+
+#[test]
 fn subc_storm_completion_channel_saturation_does_not_delay_binds() {
     subc_bridge_test::run_subc_bridge_test_with_dispatch(
         "subc_storm_completion_channel_saturation_does_not_delay_binds",
@@ -467,6 +487,83 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
         stats.max_completion_latency,
         COMPLETION_PUSH_BOUND
     );
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_heavy_init_saturation_daemon(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let executor = Arc::clone(&session.executor);
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 1_500_u64;
+
+    for (channel, root) in [(1_u16, &session.root1), (2_u16, &session.root2)] {
+        send_bind(
+            &tx,
+            channel,
+            corr,
+            root,
+            &format!("heavy-init-{channel}"),
+            storm_project_config(false, false, false, 0),
+        );
+        expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+        corr += 1;
+    }
+
+    assert_eq!(
+        executor.heavy_permits(),
+        1,
+        "two-worker storm rigs reserve one worker for RouteBind admission"
+    );
+    let (started_tx, started_rx) = crossbeam_channel::bounded(2);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(2);
+    let mut heavy_jobs = Vec::new();
+    for (index, root) in [&session.root1, &session.root2].into_iter().enumerate() {
+        let root_id = ProjectRootId::from_path(root).expect("bound heavy root id");
+        let started_tx = started_tx.clone();
+        let release_rx = release_rx.clone();
+        heavy_jobs.push(executor.submit(
+            root_id,
+            Lane::HeavyInit,
+            format!("storm-heavy-init-{index}"),
+            Box::new(move |_| {
+                started_tx
+                    .send(index)
+                    .expect("signal injected HeavyInit delay");
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release injected HeavyInit delay");
+                Response::success(format!("storm-heavy-init-{index}"), json!({ "ok": true }))
+            }),
+        ));
+    }
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("one HeavyInit job starts");
+    assert!(
+        started_rx.recv_timeout(Duration::from_millis(75)).is_err(),
+        "HeavyInit storm must leave a worker free for a bind"
+    );
+
+    let fresh_root = tempfile::tempdir().expect("fresh bind root");
+    corr += 1;
+    send_bind(
+        &tx,
+        3,
+        corr,
+        fresh_root.path(),
+        "heavy-init-fresh-bind",
+        storm_project_config(false, false, false, 0),
+    );
+    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+
+    for _ in 0..heavy_jobs.len() {
+        release_tx.send(()).expect("release HeavyInit storm job");
+    }
+    for heavy in heavy_jobs {
+        heavy
+            .recv_timeout(Duration::from_secs(2))
+            .expect("HeavyInit storm completion");
+    }
     send_goodbye_and_wait(&tx).await;
 }
 

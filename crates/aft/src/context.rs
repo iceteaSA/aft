@@ -3,7 +3,7 @@ use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
@@ -736,6 +736,50 @@ const _: fn() = || {
     assert_send::<crate::semantic_index::EmbeddingModel>();
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitEntryKind {
+    Missing,
+    File,
+    Directory,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitEntrySignature {
+    kind: GitEntryKind,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug)]
+struct WorktreeBridgeCacheEntry {
+    git_entry: GitEntrySignature,
+    is_worktree_bridge: bool,
+    git_common_dir: Option<PathBuf>,
+}
+
+fn git_entry_signature(project_root: &Path) -> GitEntrySignature {
+    match std::fs::symlink_metadata(project_root.join(".git")) {
+        Ok(metadata) => GitEntrySignature {
+            kind: if metadata.file_type().is_file() {
+                GitEntryKind::File
+            } else if metadata.file_type().is_dir() {
+                GitEntryKind::Directory
+            } else {
+                GitEntryKind::Other
+            },
+            modified: metadata.modified().ok(),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => GitEntrySignature {
+            kind: GitEntryKind::Missing,
+            modified: None,
+        },
+        Err(_) => GitEntrySignature {
+            kind: GitEntryKind::Other,
+            modified: None,
+        },
+    }
+}
+
 /// Shared application context threaded through all command handlers.
 ///
 /// Holds the language provider, backup/checkpoint stores, and configuration.
@@ -819,6 +863,13 @@ pub struct AppContext {
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     artifact_cache_key_derivations: AtomicU64,
+    /// Successful git worktree probes, keyed by canonical root and guarded by
+    /// the root's `.git` entry shape and modification time.
+    worktree_bridge_cache: parking_lot::Mutex<BTreeMap<PathBuf, WorktreeBridgeCacheEntry>>,
+    #[cfg(test)]
+    worktree_bridge_probe_spawns: AtomicU64,
+    #[cfg(test)]
+    force_worktree_bridge_reprobe: AtomicBool,
     /// Last-seen value of `InspectManager::reuse_completion_count()`, so the
     /// per-request inspect drain can detect watcher-driven Tier-2 scans that
     /// finished since the previous tick and refresh the status bar (#3).
@@ -1034,6 +1085,11 @@ impl AppContext {
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
+            worktree_bridge_cache: parking_lot::Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            worktree_bridge_probe_spawns: AtomicU64::new(0),
+            #[cfg(test)]
+            force_worktree_bridge_reprobe: AtomicBool::new(false),
             last_seen_reuse_completions: AtomicU64::new(0),
             configure_warnings_tx,
             configure_warnings_rx,
@@ -1656,6 +1712,60 @@ impl AppContext {
     /// (status snapshots) use this so reporting never spawns a git probe.
     pub fn cached_artifact_cache_key(&self, canonical_root: &Path) -> Option<String> {
         self.artifact_cache_keys.lock().get(canonical_root).cloned()
+    }
+
+    /// Return a worktree probe result only while the root's `.git` marker still
+    /// matches the marker present when the successful probe was cached.
+    pub(crate) fn cached_worktree_bridge(
+        &self,
+        canonical_root: &Path,
+    ) -> Option<(bool, Option<PathBuf>)> {
+        #[cfg(test)]
+        if self.force_worktree_bridge_reprobe.load(Ordering::SeqCst) {
+            return None;
+        }
+
+        let signature = git_entry_signature(canonical_root);
+        self.worktree_bridge_cache
+            .lock()
+            .get(canonical_root)
+            .filter(|entry| entry.git_entry == signature)
+            .map(|entry| (entry.is_worktree_bridge, entry.git_common_dir.clone()))
+    }
+
+    /// Cache only successful git worktree probes. Failed probes remain retryable
+    /// because a transient process or filesystem error must not become sticky.
+    pub(crate) fn cache_worktree_bridge(
+        &self,
+        canonical_root: &Path,
+        is_worktree_bridge: bool,
+        git_common_dir: PathBuf,
+    ) {
+        self.worktree_bridge_cache.lock().insert(
+            canonical_root.to_path_buf(),
+            WorktreeBridgeCacheEntry {
+                git_entry: git_entry_signature(canonical_root),
+                is_worktree_bridge,
+                git_common_dir: Some(git_common_dir),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_worktree_bridge_probe_spawn_for_test(&self) {
+        self.worktree_bridge_probe_spawns
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worktree_bridge_probe_spawns_for_test(&self) -> u64 {
+        self.worktree_bridge_probe_spawns.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_worktree_bridge_reprobe_for_test(&self, enabled: bool) {
+        self.force_worktree_bridge_reprobe
+            .store(enabled, Ordering::SeqCst);
     }
 
     pub fn memoized_artifact_cache_key(&self, canonical_root: &Path) -> String {

@@ -5,6 +5,7 @@ use super::{
     Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
     DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
+use crate::executor::BindBlockerSnapshot;
 
 pub(super) struct DispatchPathMetrics {
     pub(super) origin: Instant,
@@ -127,18 +128,45 @@ pub(super) fn warn_slow_pending_binds(
             continue;
         }
         pending.warned_half_deadline = true;
-        let configure_state = executor
-            .try_mutating_job_state_label(&pending.bind_root_id, &pending.configure_request_id)
-            .unwrap_or("scheduler_busy");
+        let snapshot = executor
+            .try_bind_blocker_snapshot(&pending.bind_root_id, &pending.configure_request_id)
+            .unwrap_or_else(|| BindBlockerSnapshot {
+                configure_state: "scheduler_busy",
+                blockers: vec!["scheduler_busy".to_string()],
+            });
         crate::slog_warn!(
-            "subc attach: pending RouteBind route {} for root {} crossed {}ms (configure_request_id={}, configure_state={})",
-            route,
-            pending.bind_root_id.as_path().display(),
-            duration_millis_u64(age),
-            pending.configure_request_id,
-            configure_state
+            "{}",
+            pending_bind_breadcrumb(
+                *route,
+                &pending.bind_root_id,
+                age,
+                &pending.configure_request_id,
+                &snapshot,
+            )
         );
     }
+}
+
+fn pending_bind_breadcrumb(
+    route: RouteChannel,
+    root_id: &crate::path_identity::ProjectRootId,
+    age: Duration,
+    configure_request_id: &str,
+    snapshot: &BindBlockerSnapshot,
+) -> String {
+    let blockers = if snapshot.blockers.is_empty() {
+        "none".to_string()
+    } else {
+        snapshot.blockers.join(", ")
+    };
+    format!(
+        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, blockers=[{}])",
+        root_id.as_path().display(),
+        duration_millis_u64(age),
+        configure_request_id,
+        snapshot.configure_state,
+        blockers,
+    )
 }
 
 fn mutating_lanes_metrics(executor: &Executor) -> Value {
@@ -229,6 +257,34 @@ mod tests {
     use super::super::{Lane, Response};
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pending_bind_breadcrumb_names_every_blocker_class() {
+        let (_dir, root) = test_root("breadcrumb-blockers");
+        let cases = [
+            "queued_behind_configure(2)",
+            "queued_behind_maintenance(job=subc-maintenance-drain-watcher lane=Mutating root=/tmp/a age_ms=1)",
+            "waiting_on_readers",
+            "idle_workers==0(job=subc-bind-other lane=Mutating root=/tmp/b age_ms=2)",
+        ];
+
+        for blocker in cases {
+            let breadcrumb = pending_bind_breadcrumb(
+                7,
+                &root,
+                Duration::from_secs(6),
+                "subc-bind-7",
+                &BindBlockerSnapshot {
+                    configure_state: "queued",
+                    blockers: vec![blocker.to_string()],
+                },
+            );
+            assert!(
+                breadcrumb.contains(blocker),
+                "breadcrumb omitted blocker class: {breadcrumb}"
+            );
+        }
+    }
 
     #[test]
     fn health_report_includes_nonblocking_dispatch_liveness_for_queued_interactive() {

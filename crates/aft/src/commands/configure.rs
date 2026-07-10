@@ -540,10 +540,19 @@ fn has_parent_component(path: &Path) -> bool {
         .any(|component| matches!(component, Component::ParentDir))
 }
 
-fn detect_worktree_bridge(project_root: &Path) -> (bool, Option<PathBuf>) {
+fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Option<PathBuf>) {
     if std::env::var_os("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD").is_some() {
         return (false, None);
     }
+    if let Some(result) = ctx.cached_worktree_bridge(project_root) {
+        return result;
+    }
+
+    // This is intentionally separate from artifact-cache-key memoization. The
+    // cache key must validate the current HEAD, while worktree topology is
+    // stable until the root's `.git` marker changes.
+    #[cfg(test)]
+    ctx.record_worktree_bridge_probe_spawn_for_test();
     let output = Command::new("git")
         .arg("-C")
         .arg(project_root)
@@ -570,7 +579,9 @@ fn detect_worktree_bridge(project_root: &Path) -> (bool, Option<PathBuf>) {
     };
     let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
     let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
-    (git_dir != common_dir, Some(common_dir))
+    let is_worktree_bridge = git_dir != common_dir;
+    ctx.cache_worktree_bridge(project_root, is_worktree_bridge, common_dir.clone());
+    (is_worktree_bridge, Some(common_dir))
 }
 
 fn semantic_fingerprint_config_changed(
@@ -1480,7 +1491,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let canonical_cache_root =
         std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
     debug_assert!(canonical_cache_root.is_absolute());
-    let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(&canonical_cache_root);
+    let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(ctx, &canonical_cache_root);
 
     let previous_config = ctx.config();
     let previous_project_root = previous_config.project_root.clone();
@@ -1914,6 +1925,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
         if search_index {
             let cache_dir = resolve_cache_dir_with_key(&project_key, storage_dir.as_deref());
+            // Unlike worktree topology, HEAD is a cache-freshness input and may
+            // change between equivalent rebinds, so this probe remains live.
             let current_head = current_git_head(&canonical_cache_root);
 
             let root_for_prewarm = canonical_cache_root.clone();
@@ -3548,6 +3561,56 @@ mod tests {
     }
 
     #[test]
+    fn configure_reuses_cached_worktree_probe_until_forced_to_reprobe() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        init_git_fixture(&root);
+        let ctx = test_context();
+        let request = || {
+            configure_request_with_params(json!({
+                "project_root": root.clone(),
+                "harness": "opencode",
+                "storage_dir": storage.clone(),
+                "config": [user_tier(json!({
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false,
+                }))],
+            }))
+        };
+
+        assert!(handle_configure_for_test(&request(), &ctx).success);
+        assert_eq!(ctx.worktree_bridge_probe_spawns_for_test(), 1);
+        assert!(handle_configure_for_test(&request(), &ctx).success);
+        assert_eq!(
+            ctx.worktree_bridge_probe_spawns_for_test(),
+            1,
+            "an equivalent configure must reuse the successful git topology probe"
+        );
+
+        filetime::set_file_mtime(
+            root.join(".git"),
+            filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() + Duration::from_secs(5),
+            ),
+        )
+        .expect("advance root git marker mtime");
+        assert!(handle_configure_for_test(&request(), &ctx).success);
+        assert_eq!(
+            ctx.worktree_bridge_probe_spawns_for_test(),
+            2,
+            "a changed root .git marker must invalidate the cached topology"
+        );
+
+        ctx.force_worktree_bridge_reprobe_for_test(true);
+        assert!(handle_configure_for_test(&request(), &ctx).success);
+        assert_eq!(ctx.worktree_bridge_probe_spawns_for_test(), 3);
+        ctx.force_worktree_bridge_reprobe_for_test(false);
+    }
+
+    #[test]
     fn handle_configure_rejects_git_like_root_when_cache_key_probe_fails_without_memo() {
         let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -3648,15 +3711,27 @@ mod tests {
 
         let canonical_main = std::fs::canonicalize(&main).unwrap();
         let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
-        let (main_is_worktree, main_common) = super::detect_worktree_bridge(&canonical_main);
+        let ctx = test_context();
+        let (main_is_worktree, main_common) = super::detect_worktree_bridge(&ctx, &canonical_main);
         let (linked_is_worktree, linked_common) =
-            super::detect_worktree_bridge(&canonical_worktree);
+            super::detect_worktree_bridge(&ctx, &canonical_worktree);
 
         assert!(!main_is_worktree);
         assert!(linked_is_worktree);
         let expected_common = canonical_main.join(".git");
         assert_eq!(main_common.as_deref(), Some(expected_common.as_path()));
         assert_eq!(linked_common, main_common);
+        assert_eq!(ctx.worktree_bridge_probe_spawns_for_test(), 2);
+
+        let repeated_main = super::detect_worktree_bridge(&ctx, &canonical_main);
+        let repeated_worktree = super::detect_worktree_bridge(&ctx, &canonical_worktree);
+        assert_eq!(repeated_main, (main_is_worktree, main_common));
+        assert_eq!(repeated_worktree, (linked_is_worktree, linked_common));
+        assert_eq!(
+            ctx.worktree_bridge_probe_spawns_for_test(),
+            2,
+            "main and linked-worktree roots must each retain their own cached result"
+        );
     }
 
     #[test]
@@ -3778,7 +3853,9 @@ mod tests {
         let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
         let project_key = crate::search_index::artifact_cache_key(&canonical_main);
         let worktree_scope = crate::path_identity::project_scope_key(&canonical_worktree);
-        let (_, common_dir) = super::detect_worktree_bridge(&canonical_worktree);
+        let worktree_probe_ctx = test_context();
+        let (_, common_dir) =
+            super::detect_worktree_bridge(&worktree_probe_ctx, &canonical_worktree);
         let common_dir = common_dir.expect("linked worktree common dir");
         crate::artifact_owner::write_synthetic_manifest_with_git_common_dir_for_test(
             &storage,

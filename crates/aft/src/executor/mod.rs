@@ -98,7 +98,14 @@ impl ExecutorConfig {
         let max_actor_cap = pool_size.saturating_sub(1).max(1);
         let actor_cap = self.actor_cap.max(1).min(max_actor_cap);
         let read_cap = self.read_cap.max(1).min(actor_cap).min(4);
-        let heavy_permits = self.heavy_permits.clamp(2, 3);
+        // HeavyInit jobs share workers with RouteBind/configure. Keep one worker
+        // available even in a two-worker pool so a heavy-init storm cannot hold
+        // a fresh bind behind every executor worker.
+        let heavy_permits = self
+            .heavy_permits
+            .max(1)
+            .min(pool_size.saturating_sub(1).max(1))
+            .min(3);
         let drr_quantum = self.drr_quantum.max(1);
         let deficit_cap = (actor_cap.max(1) as isize) * 4;
         let interactive_reserve = if pool_size >= 4 { 2 } else { 1 };
@@ -164,6 +171,23 @@ pub struct MutatingLaneSnapshot {
     pub request_id: String,
     pub command: String,
     pub started_age_ms: u64,
+}
+
+/// Non-blocking scheduler explanation attached to a delayed RouteBind warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindBlockerSnapshot {
+    pub configure_state: &'static str,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RunningJob {
+    root_id: ProjectRootId,
+    request_id: String,
+    command: String,
+    job_class: JobClass,
+    lane: Lane,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +502,20 @@ impl Executor {
             .map(|state| state.mutating_job_state_label(root_id, request_id))
     }
 
+    /// Snapshot RouteBind blockers without waiting on scheduler state. The subc
+    /// health path uses this only for a delayed-bind breadcrumb, so contention
+    /// is reported as scheduler busy rather than delaying the transport loop.
+    pub fn try_bind_blocker_snapshot(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> Option<BindBlockerSnapshot> {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.bind_blocker_snapshot(root_id, request_id))
+    }
+
     pub fn nonrunnable_dispatch_count(&self) -> usize {
         self.inner.nonrunnable_dispatches.load(Ordering::Acquire)
     }
@@ -535,6 +573,7 @@ struct SchedulerState {
     interactive_inflight: usize,
     maintenance_inflight: usize,
     config: EffectiveConfig,
+    running_jobs: HashMap<(ProjectRootId, String), RunningJob>,
 }
 
 impl SchedulerState {
@@ -547,6 +586,7 @@ impl SchedulerState {
             interactive_inflight: 0,
             maintenance_inflight: 0,
             config,
+            running_jobs: HashMap::new(),
         }
     }
 
@@ -613,6 +653,78 @@ impl SchedulerState {
         }
         "not_found"
     }
+
+    fn bind_blocker_snapshot(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> BindBlockerSnapshot {
+        let configure_state = self.mutating_job_state_label(root_id, request_id);
+        let mut blockers = Vec::new();
+
+        if let Some(actor) = self.actors.get(root_id) {
+            if configure_state == "queued" {
+                let configure_count = actor.pending_configure_count();
+                if configure_count > 0 {
+                    blockers.push(format!("queued_behind_configure({configure_count})"));
+                }
+                if actor.read_inflight > 0 || actor.lsp_inflight {
+                    blockers.push("waiting_on_readers".to_string());
+                }
+            }
+        }
+
+        if configure_state == "queued" {
+            let maintenance: Vec<_> = self
+                .running_jobs
+                .values()
+                .filter(|job| job.job_class == JobClass::Maintenance)
+                .collect();
+            if !maintenance.is_empty() {
+                blockers.push(format!(
+                    "queued_behind_maintenance({})",
+                    format_running_jobs(&maintenance)
+                ));
+            }
+        }
+
+        if self.idle_workers == 0 {
+            let running: Vec<_> = self.running_jobs.values().collect();
+            blockers.push(format!(
+                "idle_workers==0({})",
+                format_running_jobs(&running)
+            ));
+        }
+
+        BindBlockerSnapshot {
+            configure_state,
+            blockers,
+        }
+    }
+}
+
+fn is_configure_request(request_id: &str) -> bool {
+    request_id.starts_with("subc-bind-")
+}
+
+fn format_running_jobs(jobs: &[&RunningJob]) -> String {
+    let now = Instant::now();
+    let mut labels: Vec<_> = jobs
+        .iter()
+        .map(|job| {
+            format!(
+                "job={} command={} lane={:?} root={} age_ms={}",
+                job.request_id,
+                job.command,
+                job.lane,
+                job.root_id.as_path().display(),
+                duration_millis_u64(now.saturating_duration_since(job.started_at))
+            )
+        })
+        .collect();
+    labels.sort();
+    labels.truncate(4);
+    labels.join("; ")
 }
 
 #[derive(Default)]
@@ -724,6 +836,15 @@ impl ActorState {
         self.interactive.has_queued_mutating_job(request_id)
             || self.maintenance.has_queued_mutating_job(request_id)
     }
+
+    fn pending_configure_count(&self) -> usize {
+        usize::from(
+            self.mutating_inflight
+                .as_ref()
+                .is_some_and(|job| is_configure_request(&job.request_id)),
+        ) + self.interactive.queued_configure_count()
+            + self.maintenance.queued_configure_count()
+    }
 }
 
 struct ClassQueues {
@@ -783,6 +904,13 @@ impl ClassQueues {
 
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
         self.mutating.iter().any(|job| job.request_id == request_id)
+    }
+
+    fn queued_configure_count(&self) -> usize {
+        self.mutating
+            .iter()
+            .filter(|job| is_configure_request(&job.request_id))
+            .count()
     }
 
     fn queue(&self, lane: Lane) -> &VecDeque<QueuedJob> {
@@ -888,6 +1016,7 @@ struct RunJob {
 
 struct CompletionEvent {
     root_id: ProjectRootId,
+    request_id: String,
     job_class: JobClass,
     lane: Lane,
     heavy_permit: Option<HeavyPermit>,
@@ -944,11 +1073,13 @@ fn process_scheduler_event(event: SchedulerEvent, state: &mut SchedulerState) ->
 fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
     let CompletionEvent {
         root_id,
+        request_id,
         job_class,
         lane,
         heavy_permit,
         panicked,
     } = event;
+    state.running_jobs.remove(&(root_id.clone(), request_id));
 
     match job_class {
         JobClass::Interactive => {
@@ -1083,6 +1214,17 @@ fn dispatch_runnable_class(
         };
 
         if let Some(run_job) = run_job {
+            state.running_jobs.insert(
+                (run_job.root_id.clone(), run_job.request_id.clone()),
+                RunningJob {
+                    root_id: run_job.root_id.clone(),
+                    request_id: run_job.request_id.clone(),
+                    command: run_job.command.clone(),
+                    job_class: run_job.job_class,
+                    lane: run_job.lane,
+                    started_at: Instant::now(),
+                },
+            );
             state.idle_workers -= 1;
             match job_class {
                 JobClass::Interactive => state.interactive_inflight += 1,
@@ -1209,6 +1351,7 @@ fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
         }
         let completion = CompletionEvent {
             root_id: run_job.root_id,
+            request_id: run_job.request_id,
             job_class: run_job.job_class,
             lane: run_job.lane,
             heavy_permit: run_job.heavy_permit.take(),

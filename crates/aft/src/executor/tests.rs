@@ -342,6 +342,216 @@ fn heavy_bound() {
 }
 
 #[test]
+fn heavy_init_storm_leaves_a_worker_for_a_fresh_route_bind() {
+    let executor = test_executor(2, 1, 1, 2);
+    assert_eq!(
+        executor.heavy_permits(),
+        1,
+        "HeavyInit must leave a worker available for RouteBind/configure"
+    );
+
+    let mut dirs = Vec::new();
+    let mut roots = Vec::new();
+    for label in ["heavy-a", "heavy-b", "fresh-bind"] {
+        let (dir, root) = test_root(label);
+        executor.register_actor(root.clone(), test_ctx());
+        dirs.push(dir);
+        roots.push(root);
+    }
+
+    let (heavy_started_tx, heavy_started_rx) = crossbeam_channel::bounded(2);
+    let (release_heavy_tx, release_heavy_rx) = crossbeam_channel::bounded(2);
+    let mut heavy_jobs = Vec::new();
+    for (index, root) in roots[..2].iter().cloned().enumerate() {
+        let started_tx = heavy_started_tx.clone();
+        let release_rx = release_heavy_rx.clone();
+        heavy_jobs.push(executor.submit(
+            root,
+            Lane::HeavyInit,
+            format!("heavy-storm-{index}"),
+            Box::new(move |_| {
+                started_tx.send(index).expect("signal injected heavy delay");
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release injected heavy delay");
+                ok(format!("heavy-storm-{index}"))
+            }),
+        ));
+    }
+    heavy_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("one HeavyInit job starts");
+    assert!(
+        heavy_started_rx
+            .recv_timeout(Duration::from_millis(75))
+            .is_err(),
+        "the HeavyInit cap must leave one worker idle"
+    );
+
+    let (bind_started_tx, bind_started_rx) = crossbeam_channel::bounded(1);
+    let bind = executor.submit(
+        roots[2].clone(),
+        Lane::Mutating,
+        "subc-bind-fresh-root".to_string(),
+        Box::new(move |_| {
+            bind_started_tx
+                .send(())
+                .expect("signal fresh RouteBind start");
+            ok("fresh-route-bind")
+        }),
+    );
+    bind_started_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("fresh RouteBind starts during the HeavyInit storm");
+    bind.recv_timeout(Duration::from_secs(1))
+        .expect("fresh RouteBind acknowledgement");
+
+    for _ in 0..heavy_jobs.len() {
+        release_heavy_tx
+            .send(())
+            .expect("release injected heavy delay");
+    }
+    for heavy in heavy_jobs {
+        heavy
+            .recv_timeout(Duration::from_secs(1))
+            .expect("HeavyInit completion response");
+    }
+    assert_eq!(executor.nonrunnable_dispatch_count(), 0);
+    assert_eq!(dirs.len(), 3);
+}
+
+#[test]
+fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_reader_dir, reader_root) = test_root("blocker-reader");
+    executor.register_actor(reader_root.clone(), test_ctx());
+    let (reader_started_tx, reader_started_rx) = crossbeam_channel::bounded(1);
+    let (release_reader_tx, release_reader_rx) = crossbeam_channel::bounded(1);
+    let reader = executor.submit(
+        reader_root.clone(),
+        Lane::PureRead,
+        "reader".to_string(),
+        Box::new(move |_| {
+            reader_started_tx.send(()).expect("reader starts");
+            release_reader_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release reader");
+            ok("reader")
+        }),
+    );
+    reader_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("reader starts before queued configure jobs");
+    let first_bind = executor.submit(
+        reader_root.clone(),
+        Lane::Mutating,
+        "subc-bind-first".to_string(),
+        Box::new(|_| ok("first-bind")),
+    );
+    let second_bind = executor.submit(
+        reader_root.clone(),
+        Lane::Mutating,
+        "subc-bind-second".to_string(),
+        Box::new(|_| ok("second-bind")),
+    );
+    let reader_snapshot = executor
+        .try_bind_blocker_snapshot(&reader_root, "subc-bind-second")
+        .expect("nonblocking reader snapshot");
+    assert_eq!(reader_snapshot.configure_state, "queued");
+    assert!(reader_snapshot
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "queued_behind_configure(2)"));
+    assert!(reader_snapshot
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "waiting_on_readers"));
+
+    release_reader_tx.send(()).expect("release reader");
+    reader
+        .recv_timeout(Duration::from_secs(1))
+        .expect("reader completion");
+    first_bind
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first configure completion");
+    second_bind
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second configure completion");
+
+    let executor = test_executor(2, 1, 1, 2);
+    let (_maintenance_dir, maintenance_root) = test_root("blocker-maintenance");
+    let (_occupied_dir, occupied_root) = test_root("blocker-occupied");
+    let (_target_dir, target_root) = test_root("blocker-target");
+    for root in [&maintenance_root, &occupied_root, &target_root] {
+        executor.register_actor(root.clone(), test_ctx());
+    }
+    let (maintenance_started_tx, maintenance_started_rx) = crossbeam_channel::bounded(1);
+    let (release_maintenance_tx, release_maintenance_rx) = crossbeam_channel::bounded(1);
+    let maintenance = executor.submit_maintenance_async(
+        maintenance_root,
+        Lane::Mutating,
+        "subc-maintenance-drain-watcher".to_string(),
+        Box::new(move |_| {
+            maintenance_started_tx.send(()).expect("maintenance starts");
+            release_maintenance_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release maintenance");
+            ok("maintenance")
+        }),
+    );
+    maintenance_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("maintenance starts");
+    let (occupied_started_tx, occupied_started_rx) = crossbeam_channel::bounded(1);
+    let (release_occupied_tx, release_occupied_rx) = crossbeam_channel::bounded(1);
+    let occupied = executor.submit(
+        occupied_root,
+        Lane::PureRead,
+        "occupied-worker".to_string(),
+        Box::new(move |_| {
+            occupied_started_tx.send(()).expect("occupied read starts");
+            release_occupied_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release occupied read");
+            ok("occupied")
+        }),
+    );
+    occupied_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second worker starts");
+    let target_bind = executor.submit(
+        target_root.clone(),
+        Lane::Mutating,
+        "subc-bind-target".to_string(),
+        Box::new(|_| ok("target-bind")),
+    );
+    let pressure_snapshot = executor
+        .try_bind_blocker_snapshot(&target_root, "subc-bind-target")
+        .expect("nonblocking pressure snapshot");
+    assert_eq!(pressure_snapshot.configure_state, "queued");
+    assert!(pressure_snapshot
+        .blockers
+        .iter()
+        .any(|blocker| blocker.starts_with("queued_behind_maintenance(")));
+    assert!(pressure_snapshot
+        .blockers
+        .iter()
+        .any(|blocker| blocker.starts_with("idle_workers==0(")));
+
+    release_maintenance_tx
+        .send(())
+        .expect("release maintenance");
+    release_occupied_tx.send(()).expect("release occupied read");
+    assert!(recv_async(maintenance).success);
+    occupied
+        .recv_timeout(Duration::from_secs(1))
+        .expect("occupied completion");
+    target_bind
+        .recv_timeout(Duration::from_secs(1))
+        .expect("target bind completion");
+}
+
+#[test]
 fn single_flight() {
     let flight = Arc::new(SingleFlight::<String, usize>::new());
     let build_count = Arc::new(AtomicUsize::new(0));
