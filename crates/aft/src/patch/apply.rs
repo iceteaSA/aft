@@ -4,16 +4,12 @@
 //! `packages/opencode-plugin/src/patch-parser.ts`.
 
 use crate::patch::matcher::{
-    normalize_indent, normalize_unicode, seek_sequence_tiered, SequenceMatch,
+    find_nearest_miss, seek_sequence_tiered, NearestMiss, NearestMissSearch, SequenceMatch,
+    NEAREST_MISS_MAX_FILE_BYTES,
 };
 use crate::patch::parser::UpdateFileChunk;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClosestPartialMatch {
-    pub line_number: usize,
-    pub matched_lines: usize,
-    pub first_divergence: usize,
-}
+const NEAREST_MISS_RENDER_LINES: usize = 20;
 
 /// Return only the matched line index for diagnostics that do not need the full tiered match details.
 pub fn seek_sequence(
@@ -28,64 +24,6 @@ pub fn seek_sequence(
 
 fn line_refs(lines: &[String]) -> Vec<&str> {
     lines.iter().map(String::as_str).collect()
-}
-
-fn compare_any(a: &str, b: &str) -> bool {
-    if a == b || a.trim_end() == b.trim_end() || a.trim() == b.trim() {
-        return true;
-    }
-
-    let normalized_a_indent = normalize_indent(a);
-    let normalized_b_indent = normalize_indent(b);
-    if normalized_a_indent.trim_end() == normalized_b_indent.trim_end() {
-        return true;
-    }
-
-    normalize_unicode(a.trim()) == normalize_unicode(b.trim())
-}
-
-/// Find the closest partial match and report where the candidate first diverges for failure diagnostics.
-pub fn find_closest_partial_match(lines: &[&str], pattern: &[&str]) -> Option<ClosestPartialMatch> {
-    if pattern.is_empty() || lines.is_empty() {
-        return None;
-    }
-
-    let mut candidates = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        if compare_any(line, pattern[0]) {
-            candidates.push(index);
-            if candidates.len() >= 16 {
-                break;
-            }
-        }
-    }
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let mut best: Option<ClosestPartialMatch> = None;
-    for start in candidates {
-        let mut matched = 0;
-        for (offset, expected) in pattern.iter().enumerate() {
-            let Some(actual) = lines.get(start + offset) else {
-                break;
-            };
-            if !compare_any(actual, expected) {
-                break;
-            }
-            matched += 1;
-        }
-
-        if best.is_none_or(|current| matched > current.matched_lines) {
-            best = Some(ClosestPartialMatch {
-                line_number: start + 1,
-                matched_lines: matched,
-                first_divergence: matched,
-            });
-        }
-    }
-
-    best
 }
 
 fn seek_sequence_tiered_strings(
@@ -110,8 +48,69 @@ fn seek_sequence_strings(
     seek_sequence(&line_refs, &pattern_refs, start_index, eof)
 }
 
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).expect("serializing a string to JSON should not fail")
+fn inline_code(value: &str) -> String {
+    format!("`{}`", value.replace('`', "\\`"))
+}
+
+fn render_found_nearest_miss(lines: &[&str], pattern: &[&str], nearest: NearestMiss) -> String {
+    let start_line = nearest.start + 1;
+    let end_line = nearest.end;
+    let mut rendered = format!(
+        "Nearest miss at lines {start_line}-{end_line} (matched {}/{} context lines):",
+        nearest.matched_lines,
+        pattern.len()
+    );
+    let line_number_width = end_line.to_string().len();
+    let available_lines = nearest.end.saturating_sub(nearest.start);
+    for (offset, line) in lines[nearest.start..nearest.end]
+        .iter()
+        .take(NEAREST_MISS_RENDER_LINES)
+        .enumerate()
+    {
+        let line_number = nearest.start + offset + 1;
+        rendered.push_str(&format!(
+            "\n  {line_number:>line_number_width$} | {line}",
+            line_number_width = line_number_width
+        ));
+    }
+    if available_lines > NEAREST_MISS_RENDER_LINES {
+        rendered.push_str(&format!(
+            "\n  ... ({} more candidate lines truncated)",
+            available_lines - NEAREST_MISS_RENDER_LINES
+        ));
+    }
+
+    if nearest.first_divergence < pattern.len() {
+        let wanted_line = pattern[nearest.first_divergence];
+        let file_line_number = nearest.start + nearest.first_divergence + 1;
+        let actual_line = lines
+            .get(nearest.start + nearest.first_divergence)
+            .copied()
+            .unwrap_or("<EOF>");
+        rendered.push_str(&format!(
+            "\nFirst divergence: wanted line {} {} vs file line {file_line_number} {}",
+            nearest.first_divergence + 1,
+            inline_code(wanted_line),
+            inline_code(actual_line)
+        ));
+    } else {
+        rendered.push_str(
+            "\nFirst divergence: none within the candidate window; the hunk placement constraint did not match.",
+        );
+    }
+
+    rendered
+}
+
+fn render_nearest_miss(lines: &[&str], pattern: &[&str], file_size_bytes: usize) -> String {
+    match find_nearest_miss(lines, pattern, file_size_bytes) {
+        NearestMissSearch::Found(nearest) => render_found_nearest_miss(lines, pattern, nearest),
+        NearestMissSearch::NoSimilarRegion => "Nearest miss: no similar region found.".to_owned(),
+        NearestMissSearch::SkippedLargeFile => format!(
+            "Nearest miss skipped: file is {file_size_bytes} bytes, above the {} MiB diagnostic limit.",
+            NEAREST_MISS_MAX_FILE_BYTES / (1024 * 1024)
+        ),
+    }
 }
 
 /// Apply parsed update chunks to original file content, returning the patched text or an error string.
@@ -202,28 +201,8 @@ pub fn apply_update_chunks(
 
             let line_refs = line_refs(&original_lines);
             let pattern_refs: Vec<&str> = pattern.iter().map(String::as_str).collect();
-            let closest = find_closest_partial_match(&line_refs, &pattern_refs);
-            let mut closest_hint = String::new();
-            if let Some(closest) = closest.filter(|closest| closest.matched_lines > 0) {
-                let file_line_no = closest.line_number + closest.first_divergence;
-                let expected_line = pattern.get(closest.first_divergence).map(String::as_str);
-                let expected_json =
-                    expected_line.map_or_else(|| "undefined".to_owned(), json_string);
-                let actual_line = original_lines
-                    .get(file_line_no.saturating_sub(1))
-                    .map(String::as_str)
-                    .unwrap_or("<EOF>");
-                closest_hint = format!(
-                    "\n\nClosest match starts at line {} ({} of {} lines matched).\n\
-                     First divergence at line {file_line_no}:\n  expected: {}\n  actual:   {}",
-                    closest.line_number,
-                    closest.matched_lines,
-                    pattern.len(),
-                    expected_json,
-                    json_string(actual_line)
-                );
-            }
-
+            let nearest_miss =
+                render_nearest_miss(&line_refs, &pattern_refs, original_content.len());
             let tried_tiers =
                 "exact, trimEnd, trim, indent (tab/space), unicode, reflow (whitespace-normalized)";
             let already_applied_hint = if already_applied {
@@ -236,7 +215,7 @@ pub fn apply_update_chunks(
 
             return Err(format!(
                 "Failed to find expected lines in {file_path}:\n{}\n\n\
-                 Tried match tiers: {tried_tiers}.{closest_hint}{already_applied_hint}",
+                 Tried match tiers: {tried_tiers}.\n\n{nearest_miss}{already_applied_hint}",
                 chunk.old_lines.join("\n")
             ));
         }
@@ -306,7 +285,8 @@ mod tests {
         assert_eq!(
             assert_apply_error("alpha\nbeta\n", "src/example.ts", &chunks),
             "Failed to find expected lines in src/example.ts:\nmissing line\n\n\
-             Tried match tiers: exact, trimEnd, trim, indent (tab/space), unicode, reflow (whitespace-normalized)."
+             Tried match tiers: exact, trimEnd, trim, indent (tab/space), unicode, reflow (whitespace-normalized).\n\n\
+             Nearest miss: no similar region found."
         );
     }
 
@@ -365,11 +345,13 @@ mod tests {
         )];
 
         let message = assert_apply_error(file, "src/foo.ts", &chunks);
-        assert!(message.contains("Closest match starts at line 2"));
-        assert!(message.contains("2 of 3 lines matched"));
-        assert!(message.contains("First divergence at line 4"));
-        assert!(message.contains("expected: \"  const Q = 99;\""));
-        assert!(message.contains("actual:   \"  const z = 3;\""));
+        assert!(message.contains("Nearest miss at lines 2-4 (matched 2/3 context lines):"));
+        assert!(message.contains("  2 |   const x = 1;"));
+        assert!(message.contains("  3 |   const y = 2;"));
+        assert!(message.contains("  4 |   const z = 3;"));
+        assert!(message.contains(
+            "First divergence: wanted line 3 `  const Q = 99;` vs file line 4 `  const z = 3;`"
+        ));
     }
 
     #[test]
@@ -382,6 +364,16 @@ mod tests {
         assert!(message.contains("trim"));
         assert!(message.contains("indent"));
         assert!(message.contains("unicode"));
+    }
+
+    #[test]
+    fn oversized_file_failure_explains_that_nearest_miss_was_skipped() {
+        let synthetic_file = "x".repeat(NEAREST_MISS_MAX_FILE_BYTES + 1);
+        let chunks = [chunk(&["wanted content"], &["replacement"])];
+
+        let message = assert_apply_error(&synthetic_file, "src/large.txt", &chunks);
+        assert!(message.contains("Nearest miss skipped: file is"));
+        assert!(message.contains("above the 2 MiB diagnostic limit"));
     }
 
     #[test]

@@ -3,10 +3,36 @@
 //! This module intentionally does not reuse `fuzzy_match`: edit matching works in byte
 //! ranges, while apply_patch needs line indexes, EOF anchoring, and unique-only reflow.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Allow candidate reflow windows to differ by up to eight non-whitespace characters before exact normalized comparison.
 pub const REFLOW_NON_WS_TOLERANCE: usize = 8;
+/// Avoid spending diagnostic work or memory on files too large to render usefully in an error.
+pub const NEAREST_MISS_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+const NEAREST_MISS_ANCHOR_COUNT: usize = 3;
+const NEAREST_MISS_MAX_CANDIDATES: usize = 512;
+const NEAREST_MISS_MAX_POSITIONS_PER_ANCHOR: usize = 192;
+const NEAREST_MISS_MAX_LINE_COMPARISONS: usize = 100_000;
+const NEAREST_MISS_MAX_FUZZY_CHARS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NearestMiss {
+    /// Zero-based first line of the candidate window.
+    pub start: usize,
+    /// Zero-based exclusive end of the available candidate window.
+    pub end: usize,
+    pub matched_lines: usize,
+    /// Zero-based wanted-line offset of the first mismatch.
+    pub first_divergence: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NearestMissSearch {
+    Found(NearestMiss),
+    NoSimilarRegion,
+    SkippedLargeFile,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchTier {
@@ -291,6 +317,206 @@ pub fn seek_sequence_tiered(
     })
 }
 
+fn add_sampled_candidates(
+    candidates: &mut HashSet<usize>,
+    positions: &[usize],
+    wanted_offset: usize,
+    candidate_limit: usize,
+) {
+    let remaining = candidate_limit.saturating_sub(candidates.len());
+    let sample_count = positions
+        .len()
+        .min(NEAREST_MISS_MAX_POSITIONS_PER_ANCHOR)
+        .min(remaining);
+    if sample_count == 0 {
+        return;
+    }
+
+    for sample in 0..sample_count {
+        let position_index = if sample_count == 1 {
+            0
+        } else {
+            sample * (positions.len() - 1) / (sample_count - 1)
+        };
+        let file_position = positions[position_index];
+        if let Some(start) = file_position.checked_sub(wanted_offset) {
+            candidates.insert(start);
+        }
+    }
+}
+
+fn score_nearest_miss(lines: &[&str], pattern: &[&str], start: usize) -> NearestMiss {
+    let end = (start + pattern.len()).min(lines.len());
+    let matched_lines = pattern
+        .iter()
+        .enumerate()
+        .filter(|(offset, expected)| {
+            lines
+                .get(start + offset)
+                .is_some_and(|actual| actual.trim() == expected.trim())
+        })
+        .count();
+    let first_divergence = pattern
+        .iter()
+        .enumerate()
+        .find(|(offset, expected)| {
+            lines
+                .get(start + offset)
+                .is_none_or(|actual| actual.trim() != expected.trim())
+        })
+        .map_or(pattern.len(), |(offset, _)| offset);
+
+    NearestMiss {
+        start,
+        end,
+        matched_lines,
+        first_divergence,
+    }
+}
+
+fn is_better_nearest_miss(candidate: NearestMiss, current: NearestMiss) -> bool {
+    candidate.matched_lines > current.matched_lines
+        || (candidate.matched_lines == current.matched_lines
+            && (candidate.first_divergence > current.first_divergence
+                || (candidate.first_divergence == current.first_divergence
+                    && candidate.start < current.start)))
+}
+
+fn best_scored_candidate(
+    lines: &[&str],
+    pattern: &[&str],
+    candidates: HashSet<usize>,
+) -> Option<NearestMiss> {
+    candidates
+        .into_iter()
+        .filter(|start| *start < lines.len())
+        .map(|start| score_nearest_miss(lines, pattern, start))
+        .fold(None, |best, candidate| match best {
+            Some(current) if !is_better_nearest_miss(candidate, current) => Some(current),
+            _ => Some(candidate),
+        })
+}
+
+fn normalize_fuzzy_line(line: &str) -> String {
+    normalize_unicode(&normalize_reflow_whitespace(line))
+}
+
+fn normalized_prefix_score(normalized_wanted: &str, actual: &str) -> Option<usize> {
+    let actual = normalize_fuzzy_line(actual);
+    let wanted_len = normalized_wanted
+        .chars()
+        .take(NEAREST_MISS_MAX_FUZZY_CHARS)
+        .count();
+    if wanted_len < 4 {
+        return None;
+    }
+
+    let common = normalized_wanted
+        .chars()
+        .zip(actual.chars())
+        .take(NEAREST_MISS_MAX_FUZZY_CHARS)
+        .take_while(|(wanted_char, actual_char)| wanted_char == actual_char)
+        .count();
+    (common >= 4 && common * 2 >= wanted_len).then_some(common)
+}
+
+fn rarest_wanted_line<'a>(pattern: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    let mut frequencies: HashMap<&str, usize> = HashMap::new();
+    for line in pattern
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+    {
+        *frequencies.entry(line).or_default() += 1;
+    }
+
+    pattern
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| (offset, line.trim()))
+        .filter(|(_, line)| !line.is_empty())
+        .min_by_key(|(offset, line)| {
+            (
+                frequencies.get(line).copied().unwrap_or(usize::MAX),
+                std::cmp::Reverse(line.chars().count()),
+                *offset,
+            )
+        })
+}
+
+/// Find a bounded best-effort candidate after every accepted match tier has failed.
+pub fn find_nearest_miss(
+    lines: &[&str],
+    pattern: &[&str],
+    file_size_bytes: usize,
+) -> NearestMissSearch {
+    if file_size_bytes > NEAREST_MISS_MAX_FILE_BYTES {
+        return NearestMissSearch::SkippedLargeFile;
+    }
+    if lines.is_empty() || pattern.is_empty() {
+        return NearestMissSearch::NoSimilarRegion;
+    }
+
+    let mut line_index: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (position, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            line_index.entry(trimmed).or_default().push(position);
+        }
+    }
+
+    let candidate_limit = NEAREST_MISS_MAX_CANDIDATES
+        .min((NEAREST_MISS_MAX_LINE_COMPARISONS / pattern.len().max(1)).max(1));
+    let mut anchor_positions: Vec<(usize, &[usize])> = pattern
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .take(NEAREST_MISS_ANCHOR_COUNT)
+        .filter_map(|(offset, line)| {
+            line_index
+                .get(line.trim())
+                .map(|positions| (offset, positions.as_slice()))
+        })
+        .collect();
+    anchor_positions.sort_by_key(|(offset, positions)| (positions.len(), *offset));
+
+    let mut candidates = HashSet::new();
+    for (wanted_offset, positions) in anchor_positions {
+        add_sampled_candidates(&mut candidates, positions, wanted_offset, candidate_limit);
+        if candidates.len() >= candidate_limit {
+            break;
+        }
+    }
+    if let Some(best) = best_scored_candidate(lines, pattern, candidates) {
+        return NearestMissSearch::Found(best);
+    }
+
+    let Some((wanted_offset, wanted_line)) = rarest_wanted_line(pattern) else {
+        return NearestMissSearch::NoSimilarRegion;
+    };
+    let normalized_wanted = normalize_fuzzy_line(wanted_line);
+    let mut best_prefix = 0;
+    let mut fuzzy_candidates = HashSet::new();
+    for (file_position, actual_line) in lines.iter().enumerate() {
+        let Some(start) = file_position.checked_sub(wanted_offset) else {
+            continue;
+        };
+        let Some(prefix_score) = normalized_prefix_score(&normalized_wanted, actual_line) else {
+            continue;
+        };
+        if prefix_score > best_prefix {
+            best_prefix = prefix_score;
+            fuzzy_candidates.clear();
+        }
+        if prefix_score == best_prefix && fuzzy_candidates.len() < candidate_limit {
+            fuzzy_candidates.insert(start);
+        }
+    }
+
+    best_scored_candidate(lines, pattern, fuzzy_candidates)
+        .map_or(NearestMissSearch::NoSimilarRegion, NearestMissSearch::Found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +732,77 @@ mod tests {
         assert_eq!(
             try_match(&["a", "b", "a", "b"], &["a", "b"], 3, |a, b| a == b, true),
             None
+        );
+    }
+
+    #[test]
+    fn nearest_miss_scores_matching_lines_across_the_candidate_window() {
+        let lines = [
+            "header",
+            "  const first = 1;",
+            "  const actual = 2;",
+            "  return first;",
+            "separator",
+            "  const first = 1;",
+            "  unrelated",
+            "  unrelated",
+        ];
+        let pattern = [
+            "  const first = 1;",
+            "  const expected = 2;",
+            "  return first;",
+        ];
+
+        assert_eq!(
+            find_nearest_miss(&lines, &pattern, 128),
+            NearestMissSearch::Found(NearestMiss {
+                start: 1,
+                end: 4,
+                matched_lines: 2,
+                first_divergence: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn nearest_miss_uses_a_strong_prefix_when_no_anchor_matches_exactly() {
+        assert_eq!(
+            find_nearest_miss(
+                &["header", "const expected_value = 2;", "footer"],
+                &["const expected_value = 1;"],
+                42,
+            ),
+            NearestMissSearch::Found(NearestMiss {
+                start: 1,
+                end: 2,
+                matched_lines: 0,
+                first_divergence: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn nearest_miss_reports_no_region_when_anchors_and_prefixes_are_absent() {
+        assert_eq!(
+            find_nearest_miss(
+                &["alpha", "beta", "gamma"],
+                &["completely unrelated line"],
+                17,
+            ),
+            NearestMissSearch::NoSimilarRegion
+        );
+    }
+
+    #[test]
+    fn nearest_miss_skips_files_larger_than_the_diagnostic_limit() {
+        let synthetic_file = "x".repeat(NEAREST_MISS_MAX_FILE_BYTES + 1);
+        assert_eq!(
+            find_nearest_miss(
+                &[synthetic_file.as_str()],
+                &["wanted content"],
+                synthetic_file.len(),
+            ),
+            NearestMissSearch::SkippedLargeFile
         );
     }
 }

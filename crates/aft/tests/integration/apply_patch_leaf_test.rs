@@ -186,7 +186,11 @@ fn apply_patch_partial_keeps_successful_hunks_and_reports_failure() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(root, "one.txt", "old\n");
-    write_file(root, "two.txt", "actual\n");
+    write_file(
+        root,
+        "two.txt",
+        "header\nfunction two() {\n  const first = 1;\n  const actual = 2;\n  return first;\n}\n",
+    );
     let mut aft = configured_aft(root);
 
     let patch = r#"*** Begin Patch
@@ -196,8 +200,12 @@ fn apply_patch_partial_keeps_successful_hunks_and_reports_failure() {
 +new
 *** Update File: two.txt
 @@
--missing
-+replacement
+ function two() {
+   const first = 1;
+-  const expected = 2;
++  const replacement = 2;
+   return first;
+ }
 *** End Patch"#;
 
     let resp = apply(&mut aft, "apply-partial", patch);
@@ -211,12 +219,16 @@ fn apply_patch_partial_keeps_successful_hunks_and_reports_failure() {
     assert_eq!(fs::read_to_string(root.join("one.txt")).unwrap(), "new\n");
     assert_eq!(
         fs::read_to_string(root.join("two.txt")).unwrap(),
-        "actual\n"
+        "header\nfunction two() {\n  const first = 1;\n  const actual = 2;\n  return first;\n}\n"
     );
-    assert!(resp["failures"][0]["error"]
-        .as_str()
-        .unwrap()
-        .contains("Failed to find expected lines"));
+    let failure = resp["failures"][0]["error"].as_str().unwrap();
+    assert!(failure.contains("Failed to find expected lines"));
+    assert!(failure.contains("Nearest miss at lines 2-6 (matched 4/5 context lines)"));
+    assert!(failure.contains("  4 |   const actual = 2;"));
+    assert!(failure.contains(
+        "First divergence: wanted line 3 `  const expected = 2;` vs file line 4 `  const actual = 2;`"
+    ));
+    assert!(resp["output"].as_str().unwrap().contains("Nearest miss"));
 
     assert!(aft.shutdown().success());
 }
@@ -225,14 +237,19 @@ fn apply_patch_partial_keeps_successful_hunks_and_reports_failure() {
 fn apply_patch_total_failure_returns_error_envelope_without_writes() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write_file(root, "target.txt", "actual\n");
+    let original = "preamble\nfn target() {\n  let first = 1;\n  let actual = 2;\n  return first;\n}\ntrailer\n";
+    write_file(root, "target.txt", original);
     let mut aft = configured_aft(root);
 
     let patch = r#"*** Begin Patch
 *** Update File: target.txt
 @@
--missing
-+replacement
+ fn target() {
+   let first = 1;
+-  let expected = 2;
++  let replacement = 2;
+   return first;
+ }
 *** End Patch"#;
 
     let resp = apply(&mut aft, "apply-total-failure", patch);
@@ -247,8 +264,18 @@ fn apply_patch_total_failure_returns_error_envelope_without_writes() {
     assert_eq!(resp["metadata"]["files"].as_array().unwrap().len(), 0);
     assert_eq!(
         fs::read_to_string(root.join("target.txt")).unwrap(),
-        "actual\n"
+        original
     );
+
+    let nearest_block = "Nearest miss at lines 2-6 (matched 4/5 context lines):";
+    assert!(resp["message"].as_str().unwrap().contains(nearest_block));
+    assert!(resp["output"].as_str().unwrap().contains(nearest_block));
+    let failure = resp["failures"][0]["error"].as_str().unwrap();
+    assert!(failure.contains(nearest_block));
+    assert!(failure.contains("  4 |   let actual = 2;"));
+    assert!(failure.contains(
+        "First divergence: wanted line 3 `  let expected = 2;` vs file line 4 `  let actual = 2;`"
+    ));
 
     assert!(aft.shutdown().success());
 }
