@@ -1031,13 +1031,22 @@ fn handle_single_file_edit_match(
     if !replace_all {
         if let Some(occ) = occurrence {
             if occ >= positions.len() {
+                // The most common miss is 1-based thinking: `occurrence: 1`
+                // aimed at the only (or Nth) match. Teach the indexing instead
+                // of just rejecting.
+                let hint = if occ == positions.len() {
+                    format!(" 'occurrence' is 0-indexed: the last occurrence is {}.", occ - 1)
+                } else {
+                    format!(" 'occurrence' is 0-indexed (valid range: 0-{}).", positions.len() - 1)
+                };
                 return Response::error(
                     &req.id,
                     "invalid_request",
                     format!(
-                        "edit_match: occurrence {} out of range, file has {} occurrence(s)",
+                        "edit_match: occurrence {} out of range, file has {} occurrence(s).{}",
                         occ,
-                        positions.len()
+                        positions.len(),
+                        hint
                     ),
                 );
             }

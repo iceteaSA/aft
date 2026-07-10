@@ -305,7 +305,7 @@ fn resolve_edit(
                     req_id,
                     "batch_edit_failed",
                     format!(
-                        "batch: edit[{}] occurrence {} out of range (found {} occurrences)",
+                        "batch: edit[{}] occurrence {} out of range (found {} occurrences; 'occurrence' is 0-indexed)",
                         index,
                         occ,
                         fuzzy_matches.len()
