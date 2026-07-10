@@ -199,7 +199,7 @@ where
     D: FnMut(&Path) -> bool,
 {
     let current_entries: Vec<PathBuf> = std::env::split_paths(current).collect();
-    user_standard_path_dirs(home).into_iter().any(|dir| {
+    core_standard_path_dirs(home).into_iter().any(|dir| {
         dir_exists(&dir)
             && !current_entries
                 .iter()
@@ -207,8 +207,13 @@ where
     })
 }
 
+/// Core tool dirs whose absence from PATH signals an impoverished daemon
+/// environment worth paying a login-shell probe for. Deliberately excludes
+/// the interactive-gated extras below: those are appended unconditionally by
+/// `append_missing_standard_dirs`, so missing them alone never justifies a
+/// probe.
 #[cfg(unix)]
-fn user_standard_path_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
+fn core_standard_path_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
@@ -217,6 +222,18 @@ fn user_standard_path_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
         let home = PathBuf::from(home);
         dirs.push(home.join(".cargo/bin"));
         dirs.push(home.join(".local/bin"));
+    }
+    dirs
+}
+
+/// All dirs merged into every constructed PATH when present on disk. Includes
+/// installers that only amend interactive shell rc blocks (bun, pnpm, mise,
+/// deno, volta), which even a successful login-shell probe cannot see.
+#[cfg(unix)]
+fn user_standard_path_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut dirs = core_standard_path_dirs(home);
+    if let Some(home) = home {
+        let home = PathBuf::from(home);
         dirs.push(home.join(".bun/bin"));
         dirs.push(home.join("Library/pnpm"));
         dirs.push(home.join(".local/share/pnpm"));
@@ -644,9 +661,11 @@ mod tests {
         let _candidates_guard =
             EnvVarGuard::set("AFT_TEST_LOGIN_SHELL_CANDIDATES", "/nonexistent/shell");
 
-        // First call: probe fails, no memo, falls back to impoverished PATH
+        // First call: probe fails, no memo, falls back to the impoverished
+        // PATH (plus whatever standard dirs exist on the test machine, which
+        // the unconditional append may add — assert the prefix, not equality).
         let path1 = effective_path();
-        assert_eq!(path1, "/usr/bin:/bin");
+        assert!(path1.to_string_lossy().starts_with("/usr/bin:/bin"));
 
         {
             let guard = EFFECTIVE_PATH_STATE
@@ -659,7 +678,7 @@ mod tests {
 
         // Second call immediately: should NOT retry probe (returns cached fallback)
         let path2 = effective_path();
-        assert_eq!(path2, "/usr/bin:/bin");
+        assert_eq!(path2, path1);
 
         // Simulate 61 seconds passing by modifying last_probe_attempt
         {
