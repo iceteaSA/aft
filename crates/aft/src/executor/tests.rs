@@ -454,9 +454,22 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         "subc-bind-second".to_string(),
         Box::new(|_| ok("second-bind")),
     );
-    let reader_snapshot = executor
-        .try_bind_blocker_snapshot(&reader_root, "subc-bind-second")
-        .expect("nonblocking reader snapshot");
+    // try_bind_blocker_snapshot is try-lock-only by contract and may lose to
+    // the dispatcher's own scheduler-lock windows; retry briefly rather than
+    // demanding the first attempt wins the race.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let reader_snapshot = loop {
+        if let Some(snapshot) =
+            executor.try_bind_blocker_snapshot(&reader_root, "subc-bind-second")
+        {
+            break snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bind blocker snapshot stayed lock-contended for 2s"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
     assert_eq!(reader_snapshot.configure_state, "queued");
     assert!(reader_snapshot
         .blockers

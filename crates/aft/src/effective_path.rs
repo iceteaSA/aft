@@ -66,13 +66,18 @@ pub fn initialize_process_path() -> &'static OsStr {
 }
 
 /// Create a new `Command` with the effective PATH set on Unix.
+#[cfg(unix)]
 pub fn new_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
-    #[cfg(unix)]
-    {
-        cmd.env("PATH", effective_path());
-    }
+    cmd.env("PATH", effective_path());
     cmd
+}
+
+/// On Windows the process PATH is already correct (registry-backed
+/// environment block); pass through without touching the child env.
+#[cfg(not(unix))]
+pub fn new_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
+    std::process::Command::new(program)
 }
 
 /// Return the cached PATH that subprocesses should inherit.

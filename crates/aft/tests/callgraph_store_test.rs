@@ -965,8 +965,11 @@ fn writer_access_serves_legacy_fallback_while_background_migration_and_refresh_c
     );
 
     // Snapshot after the fallback reader is open so SQLite's read-only WAL setup
-    // is not mistaken for a migration or incremental-write mutation.
-    let legacy_before = directory_file_snapshot(&legacy_dir);
+    // is not mistaken for a migration or incremental-write mutation. WAL/shm
+    // sidecars stay excluded entirely: any read-only connection open/close
+    // (e.g. migration candidate readiness probes) rewrites them by design, and
+    // the preservation invariant is about the data files.
+    let legacy_before = without_wal_sidecars(directory_file_snapshot(&legacy_dir));
     write_file(
         &source,
         "export function entry() { migratedLeaf(); }\nfunction migratedLeaf() {}\n",
@@ -988,9 +991,9 @@ fn writer_access_serves_legacy_fallback_while_background_migration_and_refresh_c
         .starts_with(ctx.callgraph_store_dir()));
     assert_eq!(entry_leaf_from_store(migrated.as_ref()), "migratedLeaf");
     assert_eq!(
-        directory_file_snapshot(&legacy_dir),
+        without_wal_sidecars(directory_file_snapshot(&legacy_dir)),
         legacy_before,
-        "migration and watcher refresh must leave every legacy SQLite byte untouched"
+        "migration and watcher refresh must leave every legacy SQLite data byte untouched"
     );
 
     let key = artifact_cache_key_for_test(&root);
@@ -2036,6 +2039,19 @@ fn wait_for_root_keyed_callgraph(ctx: &AppContext, budget: Duration) {
             .is_some_and(|store| !store.is_legacy_fallback()),
         "background legacy migration did not publish and install a root-keyed store"
     );
+}
+
+/// Drop `-wal`/`-shm` sidecars from a snapshot: SQLite rewrites them on any
+/// connection open/close, including strictly read-only ones, so byte-equality
+/// assertions about source preservation must compare only the data files.
+fn without_wal_sidecars(files: Vec<(PathBuf, Vec<u8>)>) -> Vec<(PathBuf, Vec<u8>)> {
+    files
+        .into_iter()
+        .filter(|(path, _)| {
+            let name = path.to_string_lossy();
+            !name.ends_with("-wal") && !name.ends_with("-shm")
+        })
+        .collect()
 }
 
 fn directory_file_snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
