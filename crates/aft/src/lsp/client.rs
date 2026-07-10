@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+#[cfg(windows)]
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -156,7 +158,6 @@ impl LspClient {
         } else {
             Command::new(binary)
         };
-        #[cfg(not(windows))]
         #[cfg(not(windows))]
         let mut command = crate::effective_path::new_command(binary);
         command
