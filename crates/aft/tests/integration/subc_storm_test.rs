@@ -33,6 +33,11 @@ use super::subc_bridge_test::{self, FakeDaemonInput};
 // failure ran 60s+, not 2-4s), while unoptimized-build overhead does not.
 const DEBUG_BOUND_MULTIPLIER: u32 = if cfg!(debug_assertions) { 4 } else { 1 };
 const BIND_ACK_BOUND: Duration = Duration::from_secs(2 * DEBUG_BOUND_MULTIPLIER as u64);
+/// Bound for setup binds that are not themselves under test: a cold first bind
+/// legitimately pays topology probes, owner claim, and index setup, so setup
+/// waits use the production route-bind deadline rather than the tight storm
+/// assertion bound.
+const SETUP_BIND_BOUND: Duration = Duration::from_secs(12);
 const TOOL_BOUND: Duration = Duration::from_secs(5 * DEBUG_BOUND_MULTIPLIER as u64);
 const HEALTH_BOUND: Duration = Duration::from_millis(500 * DEBUG_BOUND_MULTIPLIER as u64);
 const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(700 * DEBUG_BOUND_MULTIPLIER as u64);
@@ -340,7 +345,11 @@ async fn drive_fresh_worktree_borrow_only_daemon(input: FakeDaemonInput) {
         "storm-parent",
         artifact_storm_config(&storage_dir),
     );
-    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+    // Setup bind: this test asserts the WORKTREE bind's behavior below, not
+    // cold parent-bind latency. A cold first bind legitimately pays topology
+    // probes, owner claim, and index setup, so give it the production
+    // route-bind deadline instead of the tight storm assertion bound.
+    expect_ack_within(&mut rx, corr, SETUP_BIND_BOUND).await;
 
     let roots = vec![parent_root.clone()];
     wait_for_ready_health(&tx, &mut rx, &mut corr, &roots, &HashSet::new()).await;

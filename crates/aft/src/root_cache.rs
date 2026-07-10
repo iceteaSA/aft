@@ -124,12 +124,18 @@ impl ArtifactAccess {
         {
             return access;
         }
-        let shared_key = crate::search_index::artifact_cache_key(&project_root);
-        Self::configured(
-            &project_root,
-            &shared_key,
-            detect_linked_worktree(&project_root),
-        )
+        // Unregistered root: fail closed without spawning git probes. Configure
+        // registers every bound root before any store acquisition, so landing
+        // here means a direct artifact-API caller on an unconfigured root —
+        // treating it as borrow-only keeps shared artifacts safe and keeps this
+        // path subprocess-free (a git probe here has unbounded latency and can
+        // run on latency-critical threads).
+        crate::slog_warn!(
+            "artifact access requested for unconfigured root {}; defaulting to borrow-only",
+            project_root.display()
+        );
+        let shared_key = crate::path_identity::project_scope_key(&project_root);
+        Self::configured(&project_root, &shared_key, true)
     }
 
     /// Return whether this root may write the keyed artifact, logging the first
@@ -177,8 +183,14 @@ fn configured_artifact_access() -> &'static Mutex<HashMap<PathBuf, ArtifactAcces
 pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_only_shared: bool) {
     let access = ArtifactAccess::configured(project_root, shared_key, borrow_only_shared);
     if let Ok(mut configured) = configured_artifact_access().lock() {
+        // Bounded, but never a wholesale clear: dropping still-live roots'
+        // capabilities would silently flip them onto the fail-closed
+        // (borrow-only) fallback. Evict an arbitrary other entry instead —
+        // any evicted-but-live root re-registers on its next configure.
         if configured.len() >= 4_096 && !configured.contains_key(&access.project_root) {
-            configured.clear();
+            if let Some(evict) = configured.keys().next().cloned() {
+                configured.remove(&evict);
+            }
         }
         configured.insert(access.project_root.clone(), access);
     }
