@@ -9,10 +9,7 @@ export const OPENCODE_ONLY_KEYS = ["hoist_builtin_tools", "auto_update"] as cons
 export const PI_ONLY_KEYS = [] as const;
 
 /** Strip only known top-level keys owned by the other harness. */
-export function stripHarnessSpecificConfigKeys(
-  value: unknown,
-  keys: readonly string[],
-): unknown {
+export function stripHarnessSpecificConfigKeys(value: unknown, keys: readonly string[]): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const stripped = { ...(value as Record<string, unknown>) };
   for (const key of keys) delete stripped[key];

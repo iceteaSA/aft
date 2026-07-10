@@ -3,12 +3,12 @@ import {
   type AftConfigFileMigrationResult,
   type ConfigTier,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
+  OPENCODE_ONLY_KEYS,
   readConfigTiers,
   resolveCortexKitConfigPaths,
   resolveLegacyAftConfigSources,
   stripHarnessSpecificConfigKeys,
   stripJsoncSymbols,
-  OPENCODE_ONLY_KEYS,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { z } from "zod";
@@ -493,49 +493,51 @@ const BackupConfigSchema = z.object({
 
 export const AftConfigSchema = z.preprocess(
   (value) => stripHarnessSpecificConfigKeys(value, OPENCODE_ONLY_KEYS),
-  z.object({
-    /**
-     * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
-     * runtime — only present so VS Code/Cursor/etc. pick up the published
-     * schema for autocomplete + validation. `aft setup` auto-inserts this.
-     */
-    $schema: z.string().optional(),
-    /** Master switch for AFT. Default true. Project config may set it because turning AFT off is not a privilege escalation. */
-    enabled: z.boolean().optional(),
-    /**
-     * Whether to auto-format files after edits. Default: false — formatting can
-     * reflow the file under the agent and stale the next edit's context. Opt in
-     * with `true` if you want AFT to format after edits.
-     */
-    format_on_edit: z.boolean().optional(),
-    formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
-    validate_on_edit: z.enum(["syntax", "full"]).optional(),
-    formatter: z.record(z.string(), FormatterEnum).optional(),
-    checker: z.record(z.string(), CheckerEnum).optional(),
-    configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
-    tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
-    disabled_tools: z.array(z.string()).optional(),
-    restrict_to_project_root: z.boolean().optional(),
-    search_index: z.boolean().optional(),
-    semantic_search: z.boolean().optional(),
-    callgraph_store: z.boolean().optional(),
-    callgraph_chunk_size: z.number().optional(),
-    inspect: InspectConfigSchema.optional(),
-    backup: BackupConfigSchema.optional(),
-    /**
-     * Bash tool family (hoist + rewrite + compress + background execution).
-     * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
-     * Three shapes: `true`, `false`, or `{ rewrite?, compress?, background?, ... }`.
-     * Replaces `experimental.bash.*` (still accepted for backward compat).
-     */
-    bash: BashConfigSchema.optional(),
-    experimental: ExperimentalConfigSchema.optional(),
-    lsp: LspConfigSchema.optional(),
-    url_fetch_allow_private: z.boolean().optional(),
-    semantic: SemanticConfigSchema.optional(),
-    bridge: BridgeConfigSchema.optional(),
-    subc: SubcConfigSchema.optional(),
-  }).strict(),
+  z
+    .object({
+      /**
+       * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
+       * runtime — only present so VS Code/Cursor/etc. pick up the published
+       * schema for autocomplete + validation. `aft setup` auto-inserts this.
+       */
+      $schema: z.string().optional(),
+      /** Master switch for AFT. Default true. Project config may set it because turning AFT off is not a privilege escalation. */
+      enabled: z.boolean().optional(),
+      /**
+       * Whether to auto-format files after edits. Default: false — formatting can
+       * reflow the file under the agent and stale the next edit's context. Opt in
+       * with `true` if you want AFT to format after edits.
+       */
+      format_on_edit: z.boolean().optional(),
+      formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
+      validate_on_edit: z.enum(["syntax", "full"]).optional(),
+      formatter: z.record(z.string(), FormatterEnum).optional(),
+      checker: z.record(z.string(), CheckerEnum).optional(),
+      configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
+      tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
+      disabled_tools: z.array(z.string()).optional(),
+      restrict_to_project_root: z.boolean().optional(),
+      search_index: z.boolean().optional(),
+      semantic_search: z.boolean().optional(),
+      callgraph_store: z.boolean().optional(),
+      callgraph_chunk_size: z.number().optional(),
+      inspect: InspectConfigSchema.optional(),
+      backup: BackupConfigSchema.optional(),
+      /**
+       * Bash tool family (hoist + rewrite + compress + background execution).
+       * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
+       * Three shapes: `true`, `false`, or `{ rewrite?, compress?, background?, ... }`.
+       * Replaces `experimental.bash.*` (still accepted for backward compat).
+       */
+      bash: BashConfigSchema.optional(),
+      experimental: ExperimentalConfigSchema.optional(),
+      lsp: LspConfigSchema.optional(),
+      url_fetch_allow_private: z.boolean().optional(),
+      semantic: SemanticConfigSchema.optional(),
+      bridge: BridgeConfigSchema.optional(),
+      subc: SubcConfigSchema.optional(),
+    })
+    .strict(),
 );
 
 function normalizeLspExtension(extension: string): string {

@@ -473,9 +473,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
             "See `/aft-status` for details, or check the plugin log. " +
             'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
             "or set `lsp.auto_install: false` to suppress this entirely.";
-          sendWarning({ client: input.client, directory: input.directory }, message).catch((err) => {
-            warn(`[lsp] failed to deliver install summary: ${err}`);
-          });
+          sendWarning({ client: input.client, directory: input.directory }, message).catch(
+            (err) => {
+              warn(`[lsp] failed to deliver install summary: ${err}`);
+            },
+          );
         }
         return updatedPaths;
       })

@@ -3,12 +3,12 @@ import {
   type AftConfigFileMigrationResult,
   type ConfigTier,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
+  PI_ONLY_KEYS,
   readConfigTiers,
   resolveCortexKitConfigPaths,
   resolveLegacyAftConfigSources,
   stripHarnessSpecificConfigKeys,
   stripJsoncSymbols,
-  PI_ONLY_KEYS,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { z } from "zod";
@@ -244,116 +244,118 @@ const BackupConfigSchema = z.object({
 
 export const AftConfigSchema = z.preprocess(
   (value) => stripHarnessSpecificConfigKeys(value, PI_ONLY_KEYS),
-  z.object({
-    /**
-     * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
-     * runtime — only present so VS Code/Cursor/etc. pick up the published
-     * schema for autocomplete + validation. `aft setup` auto-inserts this.
-     */
-    $schema: z.string().optional(),
-    /**
-     * Master switch for AFT in this config scope. Default: true. Set false in
-     * user config to disable AFT everywhere, or in project config to disable it
-     * only for that project. Project config may set this field because turning
-     * AFT off is not a privilege escalation.
-     */
-    enabled: z.boolean().optional(),
-    /**
-     * Whether to auto-format files after edits. Default: false — formatting can
-     * reflow the file under the agent and stale the next edit's context. Opt in
-     * with `true` if you want AFT to format after edits.
-     */
-    format_on_edit: z.boolean().optional(),
-    /**
-     * Maximum seconds an external formatter is allowed to run before AFT
-     * kills it and reports `format_skipped_reason: "timeout"`. Bounded
-     * 1..=600. Default: 10. Raise for slow formatters (e.g. ruff in large
-     * Python projects); lower for tighter test loops.
-     */
-    formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
-    /** Auto-validate after edits: "syntax" (tree-sitter) or "full" (runs type checker). */
-    validate_on_edit: z.enum(["syntax", "full"]).optional(),
-    /** Per-language formatter overrides. Keys: "typescript", "python", "rust", "go". */
-    formatter: z.record(z.string(), FormatterEnum).optional(),
-    /** Per-language type checker overrides. Keys: "typescript", "python", "rust", "go". */
-    checker: z.record(z.string(), CheckerEnum).optional(),
-    /**
-     * How missing formatter/checker/LSP warnings are shown after configure.
-     * - `toast`: 10s TUI toast (or HTTP show-toast when available); no session chat
-     * - `log`: plugin log only
-     * - `chat`: legacy ignored user messages in the session transcript
-     *
-     * There is no top-level `formatters` key — use `format_on_edit`, `formatter`, and
-     * `checker` instead.
-     */
-    configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
-    /**
-     * Replace opencode's built-in read/write/edit/apply_patch tools with AFT's
-     * faster Rust implementations. Adds backup tracking, auto-formatting,
-     * inline diagnostics, and permission checks. Default: true.
-     */
-    hoist_builtin_tools: z.boolean().optional(),
-    /**
-     * Tool surface level. Controls which tools are registered:
-     * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
-     * - "recommended": minimal + hoisted read/write/edit/apply_patch
-     *                  + ast_grep_search/replace + aft_import (default)
-     * - "all":         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
-     */
-    tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
-    /**
-     * List of tool names to disable. Disabled tools are not registered with
-     * OpenCode and will be invisible to agents. Use exact tool names, e.g.
-     * ["aft_callgraph", "aft_refactor"]. Hoisted names ("read", "edit") and
-     * aft-prefixed names both work. Applied after tool_surface filtering.
-     */
-    disabled_tools: z.array(z.string()).optional(),
-    /**
-     * Restrict file operations to within the project root directory.
-     * When true, write-capable commands reject paths outside project_root.
-     * Default: false (matches OpenCode's built-in behavior).
-     */
-    restrict_to_project_root: z.boolean().optional(),
-    /** Enable indexed search for grep and glob hoisting. Default: false. */
-    search_index: z.boolean().optional(),
-    /** Enable semantic search. Default: false. */
-    semantic_search: z.boolean().optional(),
-    /** Enable the persisted callgraph store substrate. Default: true. */
-    callgraph_store: z.boolean().optional(),
-    /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
-    callgraph_chunk_size: z.number().optional(),
-    /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
-    inspect: InspectConfigSchema.optional(),
-    /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
-    backup: BackupConfigSchema.optional(),
-    /**
-     * Bash tool family (hoist + rewrite + compress + background execution).
-     * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
-     *
-     * Accepts three shapes:
-     *   - `true`  — all sub-features on, hoist enabled
-     *   - `false` — hoist disabled entirely; OpenCode's native bash stays
-     *   - `{ rewrite?, compress?, background?, ... }` — partial override;
-     *     missing sub-keys default to `true`
-     *
-     * Replaces `experimental.bash.*` (still accepted for backward compat).
-     */
-    bash: BashConfigSchema.optional(),
-    /** Experimental opt-in features. Default: all false. */
-    experimental: ExperimentalConfigSchema.optional(),
-    /** User-defined and built-in LSP server configuration. */
-    lsp: LspConfigSchema.optional(),
-    /** Allow URL fetch tools to request private/link-local hosts. Default: false. */
-    url_fetch_allow_private: z.boolean().optional(),
-    /** External semantic backend configuration for embedding and retrieval. */
-    semantic: SemanticConfigSchema.optional(),
-    /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
-    auto_update: z.boolean().optional(),
-    /** Per-bridge transport timeout and hang-escalation (USER-only; shared pool). */
-    bridge: BridgeConfigSchema.optional(),
-    /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
-    subc: SubcConfigSchema.optional(),
-  }).strict(),
+  z
+    .object({
+      /**
+       * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
+       * runtime — only present so VS Code/Cursor/etc. pick up the published
+       * schema for autocomplete + validation. `aft setup` auto-inserts this.
+       */
+      $schema: z.string().optional(),
+      /**
+       * Master switch for AFT in this config scope. Default: true. Set false in
+       * user config to disable AFT everywhere, or in project config to disable it
+       * only for that project. Project config may set this field because turning
+       * AFT off is not a privilege escalation.
+       */
+      enabled: z.boolean().optional(),
+      /**
+       * Whether to auto-format files after edits. Default: false — formatting can
+       * reflow the file under the agent and stale the next edit's context. Opt in
+       * with `true` if you want AFT to format after edits.
+       */
+      format_on_edit: z.boolean().optional(),
+      /**
+       * Maximum seconds an external formatter is allowed to run before AFT
+       * kills it and reports `format_skipped_reason: "timeout"`. Bounded
+       * 1..=600. Default: 10. Raise for slow formatters (e.g. ruff in large
+       * Python projects); lower for tighter test loops.
+       */
+      formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
+      /** Auto-validate after edits: "syntax" (tree-sitter) or "full" (runs type checker). */
+      validate_on_edit: z.enum(["syntax", "full"]).optional(),
+      /** Per-language formatter overrides. Keys: "typescript", "python", "rust", "go". */
+      formatter: z.record(z.string(), FormatterEnum).optional(),
+      /** Per-language type checker overrides. Keys: "typescript", "python", "rust", "go". */
+      checker: z.record(z.string(), CheckerEnum).optional(),
+      /**
+       * How missing formatter/checker/LSP warnings are shown after configure.
+       * - `toast`: 10s TUI toast (or HTTP show-toast when available); no session chat
+       * - `log`: plugin log only
+       * - `chat`: legacy ignored user messages in the session transcript
+       *
+       * There is no top-level `formatters` key — use `format_on_edit`, `formatter`, and
+       * `checker` instead.
+       */
+      configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
+      /**
+       * Replace opencode's built-in read/write/edit/apply_patch tools with AFT's
+       * faster Rust implementations. Adds backup tracking, auto-formatting,
+       * inline diagnostics, and permission checks. Default: true.
+       */
+      hoist_builtin_tools: z.boolean().optional(),
+      /**
+       * Tool surface level. Controls which tools are registered:
+       * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
+       * - "recommended": minimal + hoisted read/write/edit/apply_patch
+       *                  + ast_grep_search/replace + aft_import (default)
+       * - "all":         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
+       */
+      tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
+      /**
+       * List of tool names to disable. Disabled tools are not registered with
+       * OpenCode and will be invisible to agents. Use exact tool names, e.g.
+       * ["aft_callgraph", "aft_refactor"]. Hoisted names ("read", "edit") and
+       * aft-prefixed names both work. Applied after tool_surface filtering.
+       */
+      disabled_tools: z.array(z.string()).optional(),
+      /**
+       * Restrict file operations to within the project root directory.
+       * When true, write-capable commands reject paths outside project_root.
+       * Default: false (matches OpenCode's built-in behavior).
+       */
+      restrict_to_project_root: z.boolean().optional(),
+      /** Enable indexed search for grep and glob hoisting. Default: false. */
+      search_index: z.boolean().optional(),
+      /** Enable semantic search. Default: false. */
+      semantic_search: z.boolean().optional(),
+      /** Enable the persisted callgraph store substrate. Default: true. */
+      callgraph_store: z.boolean().optional(),
+      /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
+      callgraph_chunk_size: z.number().optional(),
+      /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
+      inspect: InspectConfigSchema.optional(),
+      /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
+      backup: BackupConfigSchema.optional(),
+      /**
+       * Bash tool family (hoist + rewrite + compress + background execution).
+       * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
+       *
+       * Accepts three shapes:
+       *   - `true`  — all sub-features on, hoist enabled
+       *   - `false` — hoist disabled entirely; OpenCode's native bash stays
+       *   - `{ rewrite?, compress?, background?, ... }` — partial override;
+       *     missing sub-keys default to `true`
+       *
+       * Replaces `experimental.bash.*` (still accepted for backward compat).
+       */
+      bash: BashConfigSchema.optional(),
+      /** Experimental opt-in features. Default: all false. */
+      experimental: ExperimentalConfigSchema.optional(),
+      /** User-defined and built-in LSP server configuration. */
+      lsp: LspConfigSchema.optional(),
+      /** Allow URL fetch tools to request private/link-local hosts. Default: false. */
+      url_fetch_allow_private: z.boolean().optional(),
+      /** External semantic backend configuration for embedding and retrieval. */
+      semantic: SemanticConfigSchema.optional(),
+      /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
+      auto_update: z.boolean().optional(),
+      /** Per-bridge transport timeout and hang-escalation (USER-only; shared pool). */
+      bridge: BridgeConfigSchema.optional(),
+      /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
+      subc: SubcConfigSchema.optional(),
+    })
+    .strict(),
 );
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;

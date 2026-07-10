@@ -776,9 +776,9 @@ describe("loadAftConfig", () => {
   });
 
   test("OpenCode-only keys remain available to OpenCode", () => {
-    expect(
-      AftConfigSchema.parse({ hoist_builtin_tools: false, auto_update: false }),
-    ).toMatchObject({ hoist_builtin_tools: false, auto_update: false });
+    expect(AftConfigSchema.parse({ hoist_builtin_tools: false, auto_update: false })).toMatchObject(
+      { hoist_builtin_tools: false, auto_update: false },
+    );
   });
 
   test("loads semantic config block and propagates nested fields", () => {

@@ -41,7 +41,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { npmSpawnEnv, resolveNpm, type AftTransportPool } from "@cortexkit/aft-bridge";
+import { type AftTransportPool, npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
   isInstalled,

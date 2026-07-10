@@ -70,6 +70,15 @@ export class RevivableTransportPool implements AftTransportPool {
     this.activePool.setConfigureOverride(key, value);
   }
 
+  async reconfigure(projectRoot: string, overrides: Record<string, unknown>): Promise<void> {
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) this.configureOverrides.delete(key);
+      else this.configureOverrides.set(key, value);
+    }
+    const pool = await this.ensureActivePool();
+    await pool.reconfigure(projectRoot, overrides);
+  }
+
   async replaceBinary(path: string): Promise<string> {
     const replaced = await this.activePool.replaceBinary(path);
     this.onBinaryReplaced?.(replaced);
