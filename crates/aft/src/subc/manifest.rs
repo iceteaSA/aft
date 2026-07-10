@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn native_plumbing_allowlist_admits_exactly_drain_ack_and_safety_previews() {
+    fn native_plumbing_allowlist_admits_exactly_the_plugin_consumer_surface() {
         // BC2: the route gate admits a name when it's an agent core tool OR a
         // native plumbing command. These carry no agent surface and no
         // config/trust surface, so they're admitted to dispatch over a bound
@@ -418,12 +418,21 @@ mod tests {
         // these, aft_safety undo/restore breaks over the subc transport.
         assert!(is_subc_native_plumbing_tool("undo_preview"));
         assert!(is_subc_native_plumbing_tool("checkpoint_paths"));
+        // The rest of the plugins' background-bash consumer surface plus the
+        // Tier-2 refresh trigger (each was shipped plugin-side without a gate
+        // entry and silently rejected in prod; see subc_plumbing_drift_test).
+        assert!(is_subc_native_plumbing_tool("bash_kill"));
+        assert!(is_subc_native_plumbing_tool("bash_write"));
+        assert!(is_subc_native_plumbing_tool("bash_notify"));
+        assert!(is_subc_native_plumbing_tool("bash_unnotify"));
+        assert!(is_subc_native_plumbing_tool("bash_wait_detach"));
+        assert!(is_subc_native_plumbing_tool("inspect_tier2_run"));
 
         // The allowlist is TIGHT — it must not admit the config-bypass vector
-        // the fail-closed gate exists to block, nor any other native command.
+        // the fail-closed gate exists to block, nor mutation commands the
+        // plugins never send natively.
         assert!(!is_subc_native_plumbing_tool("configure"));
         assert!(!is_subc_native_plumbing_tool("bash"));
-        assert!(!is_subc_native_plumbing_tool("bash_kill"));
         assert!(!is_subc_native_plumbing_tool("db_set_state"));
         assert!(!is_subc_native_plumbing_tool("undo"));
 
