@@ -6,8 +6,6 @@
 //! terminal would provide.
 
 use std::ffi::{OsStr, OsString};
-
-#[cfg(not(unix))]
 use std::sync::OnceLock;
 
 #[cfg(unix)]
@@ -93,6 +91,16 @@ pub fn effective_path() -> &'static OsStr {
 
 #[cfg(unix)]
 pub fn effective_path() -> &'static OsStr {
+    // Test seam: integration tests construct exact PATHs (e.g. to simulate a
+    // missing formatter binary); probing and enrichment would re-add real tool
+    // dirs from the host and break that isolation. Checked at runtime because
+    // the spawned test binary is a production build.
+    if std::env::var_os("AFT_TEST_RAW_PATH").is_some() {
+        static RAW: OnceLock<OsString> = OnceLock::new();
+        return RAW
+            .get_or_init(|| std::env::var_os("PATH").unwrap_or_default())
+            .as_os_str();
+    }
     let mut guard = EFFECTIVE_PATH_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner());

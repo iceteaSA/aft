@@ -870,8 +870,10 @@ impl CallGraphStore {
     /// Migrate a legacy harness-partition store without falling through to a
     /// cold build. This is used after a query has already opened a read-only
     /// fallback: the caller runs it on the same limited background lane as cold
-    /// builds while queries continue using that fallback.
-    pub(crate) fn migrate_legacy_with_lease(
+    /// builds while queries continue using that fallback. Public so crash/retry
+    /// tests can drive the migration synchronously on a thread where the
+    /// thread-local failure seams apply.
+    pub fn migrate_legacy_with_lease(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {

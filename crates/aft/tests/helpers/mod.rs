@@ -154,6 +154,12 @@ impl AftProcess {
             // opt back in via spawn_with_real_watcher (which overrides this to
             // "0"). Explicit `envs` below can override it.
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+            // Keep the child's PATH exactly what the test constructed. The
+            // production login-shell probe + standard-dir enrichment would
+            // re-add real tool dirs (e.g. /usr/local/bin on CI runners),
+            // breaking tests that simulate missing formatters/checkers by
+            // building an impoverished PATH.
+            .env("AFT_TEST_RAW_PATH", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if pipe_stderr || diag_enabled {

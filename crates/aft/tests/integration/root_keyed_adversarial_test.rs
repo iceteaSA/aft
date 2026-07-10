@@ -194,13 +194,27 @@ fn root_keyed_migration_mid_crash_cleans_partial_and_preserves_legacy_source() {
     let legacy_parts_before = sqlite_file_set_parts(&legacy_source);
     let legacy_hash_before = sqlite_file_set_hash(&legacy_source);
 
+    // Migration now runs on a background maintenance lane in production, so
+    // the crash/retry mechanics are driven synchronously here: the failure
+    // seam is thread-local and must fire on the thread running the migration.
+    let ctx_for_dirs = root_keyed_context(&root, &storage);
+    let root_keyed_dir = ctx_for_dirs.callgraph_store_dir();
+
     aft::callgraph_store::set_legacy_migration_fail_after_temp_copy_for_test(true);
     let _fail_reset = MigrationFailReset;
-    let failing_ctx = root_keyed_context(&root, &storage);
-    let fallback = failing_ctx
-        .ensure_callgraph_store()
+    // A failing migration is swallowed into the legacy-fallback path by
+    // design (queries must keep working); the direct entry point reports it
+    // as Ok(None) because the fallback duplicate is filtered for callers that
+    // already hold one.
+    let failed = CallGraphStore::migrate_legacy_with_lease(root_keyed_dir.clone(), root.clone());
+    assert!(
+        matches!(failed, Ok(None)),
+        "fail-after-temp-copy seam should abort the migration (got a published store instead): {failed:?}"
+    );
+    // While migration is failing, readers still get the legacy fallback.
+    let fallback = CallGraphStore::open_readonly(root_keyed_dir.clone(), root.clone())
         .unwrap()
-        .expect("failed migration should fall back to legacy data");
+        .expect("failed migration should leave legacy data readable via fallback");
     assert!(fallback.sqlite_path().starts_with(&legacy_dir));
     drop(fallback);
     assert_eq!(
@@ -210,7 +224,6 @@ fn root_keyed_migration_mid_crash_cleans_partial_and_preserves_legacy_source() {
         sqlite_file_set_parts(&legacy_source)
     );
 
-    let root_keyed_dir = failing_ctx.callgraph_store_dir();
     let partials_after_failure = incomplete_migration_artifacts(&root_keyed_dir, &root);
     assert!(
         !partials_after_failure.is_empty(),
@@ -218,14 +231,10 @@ fn root_keyed_migration_mid_crash_cleans_partial_and_preserves_legacy_source() {
     );
     aft::callgraph_store::set_legacy_migration_fail_after_temp_copy_for_test(false);
 
-    let retry_ctx = root_keyed_context(&root, &storage);
-    let migrated = retry_ctx
-        .ensure_callgraph_store()
+    let migrated = CallGraphStore::migrate_legacy_with_lease(root_keyed_dir.clone(), root.clone())
         .unwrap()
         .expect("retry should clean the partial copy and migrate cleanly");
-    assert!(migrated
-        .sqlite_path()
-        .starts_with(retry_ctx.callgraph_store_dir()));
+    assert!(migrated.sqlite_path().starts_with(&root_keyed_dir));
     assert_eq!(entry_leaf(&migrated), "oldLeaf");
     drop(migrated);
 
@@ -236,12 +245,11 @@ fn root_keyed_migration_mid_crash_cleans_partial_and_preserves_legacy_source() {
         sqlite_file_set_parts(&legacy_source)
     );
     assert!(
-        incomplete_migration_artifacts(&retry_ctx.callgraph_store_dir(), &root).is_empty(),
+        incomplete_migration_artifacts(&root_keyed_dir, &root).is_empty(),
         "cleanup_incomplete_migrations should remove stale temp/unmanifested files before retry"
     );
-    let generation = current_generation(&retry_ctx.callgraph_store_dir(), &root);
-    assert!(retry_ctx
-        .callgraph_store_dir()
+    let generation = current_generation(&root_keyed_dir, &root);
+    assert!(root_keyed_dir
         .join(format!("{generation}.migration.json"))
         .is_file());
 }
@@ -300,11 +308,29 @@ fn root_keyed_old_binary_legacy_writer_does_not_corrupt_or_delete_legacy_data() 
     copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
 
     let ctx = root_keyed_context(&root, &storage);
+    // First access serves the legacy fallback and schedules the migration on
+    // the background lane; poll until the migrated root-keyed store installs.
+    let first = ctx
+        .ensure_callgraph_store()
+        .unwrap()
+        .expect("legacy fallback should be readable while migration runs");
+    assert!(first.is_legacy_fallback());
+    drop(first);
+    wait_until(Duration::from_secs(20), || {
+        // The background result installs via the main loop's drain in
+        // production; drive it here like the runtime would.
+        aft::runtime_drain::drain_callgraph_store_events(&ctx);
+        matches!(
+            ctx.ensure_callgraph_store(),
+            Ok(Some(store)) if !store.is_legacy_fallback()
+        )
+    })
+    .expect("background legacy migration should publish a root-keyed generation");
     let migrated = ctx
         .ensure_callgraph_store()
         .unwrap()
         .expect("root-keyed side should migrate from legacy");
-    assert_eq!(entry_leaf(&migrated), "migratedLeaf");
+    assert_eq!(entry_leaf(migrated.as_ref()), "migratedLeaf");
     let root_keyed_generation = current_generation(&ctx.callgraph_store_dir(), &root);
     let root_keyed_sqlite = ctx.callgraph_store_dir().join(&root_keyed_generation);
     drop(migrated);
