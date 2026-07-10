@@ -563,6 +563,7 @@ fn symbol_cache_state(search_index: &SubsystemState) -> SubsystemState {
 /// build error).
 fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
     match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(_) if ctx.callgraph_store_rx().lock().is_some() => None,
         CallgraphStoreAccess::Ready(_) => Some(SubsystemState::Ready),
         // Building (or just-started cold build) -> drive to completion via the
         // wait loop draining `callgraph_store_rx`.
@@ -639,6 +640,9 @@ fn callgraph_store_state(
     if let Some(state) = override_state {
         return state.clone();
     }
+    if ctx.callgraph_store_rx().lock().is_some() {
+        return SubsystemState::Pending("building".to_string());
+    }
     if ctx
         .callgraph_store()
         .read()
@@ -646,9 +650,6 @@ fn callgraph_store_state(
         .is_some()
     {
         return SubsystemState::Ready;
-    }
-    if ctx.callgraph_store_rx().lock().is_some() {
-        return SubsystemState::Pending("building".to_string());
     }
     // No store, no in-flight build: the cold build finished without producing a
     // store (failure already drained) — report ready so warmup doesn't hang.

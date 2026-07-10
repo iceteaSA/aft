@@ -177,6 +177,14 @@ pub struct CallGraphStore {
     /// scheme this is `<dir>/<key>.g<...>.sqlite` (resolved via the pointer) or,
     /// for a pre-generation store, the legacy `<dir>/<key>.sqlite`.
     sqlite_path: PathBuf,
+    /// Root-keyed directory whose pointer controls this store. For a legacy
+    /// fallback this intentionally differs from `sqlite_path.parent()`, so a
+    /// newly published root-keyed generation invalidates the fallback reader.
+    publication_dir: PathBuf,
+    /// True only when the root-keyed read path opened data from a legacy
+    /// harness partition. Writer-capable callers use this to schedule migration
+    /// without making read-only/worktree callers acquire a writer lease.
+    legacy_fallback: bool,
     /// The generation file NAME this store opened (e.g. `<key>.g<nanos>.<pid>.sqlite`),
     /// or `None` when it opened the legacy single-file DB. Used to detect when
     /// another process has published a newer generation so this process can
@@ -270,6 +278,12 @@ struct LegacyCallgraphTarget {
 struct SourceFingerprint {
     bytes: u64,
     blake3: String,
+}
+
+#[derive(Clone, Debug)]
+struct PublishedLegacyMigration {
+    generation: String,
+    migrated_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -632,6 +646,8 @@ impl CallGraphStore {
                     project_root,
                     project_key,
                     sqlite_path,
+                    callgraph_dir,
+                    false,
                     generation,
                     None,
                     Some(read_marker),
@@ -660,6 +676,8 @@ impl CallGraphStore {
                 project_root,
                 project_key,
                 target.sqlite_path,
+                callgraph_dir,
+                true,
                 target.generation,
                 None,
                 Some(read_marker),
@@ -849,6 +867,55 @@ impl CallGraphStore {
         Ok((store, Some(stats)))
     }
 
+    /// Migrate a legacy harness-partition store without falling through to a
+    /// cold build. This is used after a query has already opened a read-only
+    /// fallback: the caller runs it on the same limited background lane as cold
+    /// builds while queries continue using that fallback.
+    pub(crate) fn migrate_legacy_with_lease(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Option<Self>> {
+        std::fs::create_dir_all(&callgraph_dir)?;
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let writer_lease = acquire_writer_lease(&callgraph_dir, &project_key)?;
+        cleanup_incomplete_migrations(&callgraph_dir, &project_key);
+
+        // Another writer may have completed the migration while this worker was
+        // waiting for the lease. Adopt its root-keyed generation rather than
+        // copying the legacy source a second time.
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        {
+            let OpenedStore { store, root_repair } = Self::open_at_path(
+                project_root,
+                project_key,
+                sqlite_path,
+                generation,
+                true,
+                Some(writer_lease),
+                None,
+            )?;
+            return match root_repair {
+                OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(Some(store)),
+                OpenRootRepair::NeedsRebuild { reason, .. } => {
+                    Err(CallGraphStoreError::Unavailable(format!(
+                        "root-keyed store discovered during legacy migration requires a cold rebuild: {reason}"
+                    )))
+                }
+            };
+        }
+
+        let store = try_legacy_migration_or_fallback(
+            &callgraph_dir,
+            &project_root,
+            &project_key,
+            writer_lease,
+        )?;
+        // A disk-floor or backup-budget failure returns a readable legacy store.
+        // Keep the already-resident fallback instead of sending this duplicate
+        // reader through the background-install channel.
+        Ok(store.filter(|store| !store.is_legacy_fallback()))
+    }
+
     /// Build a fresh DB and publish it as a new generation, then atomically flip
     /// the `<key>.current` pointer to it. NEVER replaces an open DB file, so it
     /// succeeds even when other processes hold an older generation open (the
@@ -974,10 +1041,16 @@ impl CallGraphStore {
             }
             (None, _, _) => None,
         };
+        let publication_dir = sqlite_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let store = Self::from_connection(
             project_root,
             project_key,
             sqlite_path,
+            publication_dir,
+            false,
             generation,
             writer_lease,
             read_marker,
@@ -1009,6 +1082,8 @@ impl CallGraphStore {
         project_root: PathBuf,
         project_key: String,
         sqlite_path: PathBuf,
+        publication_dir: PathBuf,
+        legacy_fallback: bool,
         generation: Option<String>,
         writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
         read_marker: Option<crate::root_cache::ReadMarker>,
@@ -1018,6 +1093,8 @@ impl CallGraphStore {
             project_root,
             project_key,
             sqlite_path,
+            publication_dir,
+            legacy_fallback,
             generation,
             writer_lease,
             read_marker,
@@ -1035,6 +1112,19 @@ impl CallGraphStore {
 
     pub fn sqlite_path(&self) -> &Path {
         &self.sqlite_path
+    }
+
+    /// Whether this store is reading from a legacy harness partition because
+    /// the root-keyed store has not published a generation yet.
+    pub fn is_legacy_fallback(&self) -> bool {
+        self.legacy_fallback
+    }
+
+    pub(crate) fn is_legacy_migration(&self) -> bool {
+        self.generation.as_deref().is_some_and(|generation| {
+            migration_generation_requires_manifest(generation)
+                && migration_manifest_valid(&self.publication_dir, generation)
+        })
     }
 
     pub fn writer_epoch_for_test(&self) -> Option<&str> {
@@ -1064,10 +1154,13 @@ impl CallGraphStore {
     /// pointer keeps the current store (legacy DB still valid, or transient).
     pub fn is_current(&self) -> bool {
         let _ = self.refresh_read_marker();
-        let Some(dir) = self.sqlite_path.parent() else {
-            return true;
-        };
-        match (read_pointer(dir, &self.project_key), &self.generation) {
+        match (
+            read_pointer(&self.publication_dir, &self.project_key),
+            &self.generation,
+        ) {
+            // Even when both generations happen to have the same filename, the
+            // root-keyed pointer names a different directory from the fallback.
+            (Some(_), _) if self.legacy_fallback => false,
             (Some(published), Some(opened)) => &published == opened,
             // A generation now supersedes the legacy single-file DB we opened.
             (Some(_), None) => false,
@@ -1943,6 +2036,11 @@ impl ReadonlyCallGraphStore {
 
     pub fn sqlite_path(&self) -> &Path {
         self.inner.sqlite_path()
+    }
+
+    /// Whether this reader is temporarily serving a legacy harness partition.
+    pub fn is_legacy_fallback(&self) -> bool {
+        self.inner.is_legacy_fallback()
     }
 
     pub fn is_current(&self) -> bool {
@@ -2851,6 +2949,29 @@ fn verify_writer_lease(lease: &crate::root_cache::WriterLease) -> Result<()> {
     }
 }
 
+fn legacy_migration_completion_line(
+    project_key: &str,
+    method: &str,
+    legacy_bytes: u64,
+    migrated_bytes: u64,
+) -> String {
+    format!(
+        "migrated root-keyed callgraph store key={project_key} method={method} legacy={legacy_bytes} migrated={migrated_bytes}"
+    )
+}
+
+fn log_legacy_migration_completion(
+    project_key: &str,
+    method: &str,
+    legacy_bytes: u64,
+    migrated_bytes: u64,
+) {
+    crate::slog_info!(
+        "{}",
+        legacy_migration_completion_line(project_key, method, legacy_bytes, migrated_bytes)
+    );
+}
+
 fn try_legacy_migration_or_fallback(
     callgraph_dir: &Path,
     project_root: &Path,
@@ -2878,17 +2999,18 @@ fn try_legacy_migration_or_fallback(
                 &source,
                 Arc::clone(&writer_lease),
             ) {
-                Ok(generation) => {
-                    crate::slog_info!(
-                        "migrated root-keyed callgraph store for key {} from superseded legacy generation {}",
+                Ok(published) => {
+                    log_legacy_migration_completion(
                         project_key,
-                        source.sqlite_path.display()
+                        "generation_copy",
+                        source.source_bytes,
+                        published.migrated_bytes,
                     );
                     return CallGraphStore::open_generation(
                         callgraph_dir,
                         project_root.to_path_buf(),
                         project_key.to_string(),
-                        generation,
+                        published.generation,
                         writer_lease,
                     )
                     .map(Some);
@@ -2924,17 +3046,18 @@ fn try_legacy_migration_or_fallback(
                 &source,
                 Arc::clone(&writer_lease),
             ) {
-                Ok(generation) => {
-                    crate::slog_info!(
-                        "migrated root-keyed callgraph store for key {} with SQLite backup from legacy {}",
+                Ok(published) => {
+                    log_legacy_migration_completion(
                         project_key,
-                        source.sqlite_path.display()
+                        "sqlite_backup",
+                        source.source_bytes,
+                        published.migrated_bytes,
                     );
                     return CallGraphStore::open_generation(
                         callgraph_dir,
                         project_root.to_path_buf(),
                         project_key.to_string(),
-                        generation,
+                        published.generation,
                         writer_lease,
                     )
                     .map(Some);
@@ -2983,6 +3106,8 @@ fn open_legacy_fallback_store(
         project_root.to_path_buf(),
         project_key.to_string(),
         target.sqlite_path,
+        callgraph_dir.to_path_buf(),
+        true,
         target.generation,
         None,
         Some(read_marker),
@@ -3065,6 +3190,39 @@ fn root_storage_dir(callgraph_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     domain_dir.parent().map(Path::to_path_buf)
+}
+
+pub(crate) fn all_legacy_partitions_migrated_for_keys(
+    callgraph_dir: &Path,
+    configured_keys: &BTreeSet<String>,
+) -> Result<bool> {
+    let Some(storage_root) = root_storage_dir(callgraph_dir) else {
+        return Ok(false);
+    };
+    let legacy_keys = crate::legacy_partitions::inventory_legacy_partitions(&storage_root)?
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == crate::legacy_partitions::LegacyPartitionKind::Callgraph
+                && configured_keys.contains(&entry.key)
+        })
+        .map(|entry| entry.key)
+        .collect::<BTreeSet<_>>();
+    if legacy_keys.is_empty() {
+        return Ok(false);
+    }
+
+    for key in legacy_keys {
+        let migrated_dir = storage_root.join("callgraph").join(&key);
+        let Some(generation) = read_pointer(&migrated_dir, &key) else {
+            return Ok(false);
+        };
+        if !migration_generation_requires_manifest(&generation)
+            || !migration_manifest_valid(&migrated_dir, &generation)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn newest_superseded_legacy_generation(
@@ -3179,7 +3337,7 @@ fn publish_generation_copy_migration(
     project_key: &str,
     source: &LegacyCallgraphTarget,
     writer_lease: Arc<crate::root_cache::WriterLease>,
-) -> Result<String> {
+) -> Result<PublishedLegacyMigration> {
     let generation = migration_generation_file_name(project_key, "copy");
     let temp_path = migration_temp_path(callgraph_dir, &generation);
     remove_sqlite_file_set(&temp_path);
@@ -3188,17 +3346,21 @@ fn publish_generation_copy_migration(
 
     let mut source = source.clone();
     let fingerprint = sqlite_file_set_fingerprint(&temp_path)?;
-    source.source_bytes = fingerprint.bytes;
     source.source_blake3 = fingerprint.blake3;
-    publish_migrated_generation(
+    let generation = publish_migrated_generation(
         callgraph_dir,
         project_key,
         &generation,
         &temp_path,
         &source,
+        fingerprint.bytes,
         writer_lease,
         "generation_copy",
-    )
+    )?;
+    Ok(PublishedLegacyMigration {
+        generation,
+        migrated_bytes: fingerprint.bytes,
+    })
 }
 
 fn publish_backup_migration(
@@ -3206,7 +3368,7 @@ fn publish_backup_migration(
     project_key: &str,
     source: &LegacyCallgraphTarget,
     writer_lease: Arc<crate::root_cache::WriterLease>,
-) -> Result<String> {
+) -> Result<PublishedLegacyMigration> {
     if MIGRATION_FORCE_BACKUP_BUDGET_EXHAUSTED.with(|slot| slot.get()) {
         return Err(CallGraphStoreError::Unavailable(
             "legacy callgraph backup migration budget exhausted by test seam".to_string(),
@@ -3266,17 +3428,21 @@ fn publish_backup_migration(
 
     let mut source = source.clone();
     let fingerprint = sqlite_file_set_fingerprint(&temp_path)?;
-    source.source_bytes = fingerprint.bytes;
     source.source_blake3 = fingerprint.blake3;
-    publish_migrated_generation(
+    let generation = publish_migrated_generation(
         callgraph_dir,
         project_key,
         &generation,
         &temp_path,
         &source,
+        fingerprint.bytes,
         writer_lease,
         "sqlite_backup",
-    )
+    )?;
+    Ok(PublishedLegacyMigration {
+        generation,
+        migrated_bytes: fingerprint.bytes,
+    })
 }
 
 fn publish_migrated_generation(
@@ -3285,6 +3451,7 @@ fn publish_migrated_generation(
     generation: &str,
     temp_path: &Path,
     source: &LegacyCallgraphTarget,
+    migrated_bytes: u64,
     writer_lease: Arc<crate::root_cache::WriterLease>,
     method: &str,
 ) -> Result<String> {
@@ -3296,7 +3463,7 @@ fn publish_migrated_generation(
 
     verify_writer_lease(&writer_lease)?;
     publish_pointer(callgraph_dir, project_key, generation)?;
-    write_migration_manifest(callgraph_dir, generation, source, method)?;
+    write_migration_manifest(callgraph_dir, generation, source, migrated_bytes, method)?;
     Ok(generation.to_string())
 }
 
@@ -3417,6 +3584,7 @@ fn write_migration_manifest(
     callgraph_dir: &Path,
     generation: &str,
     source: &LegacyCallgraphTarget,
+    migrated_bytes: u64,
     method: &str,
 ) -> Result<()> {
     let manifest_path = migration_manifest_path(callgraph_dir, generation);
@@ -3434,6 +3602,7 @@ fn write_migration_manifest(
         "source_generation": source.generation,
         "source_bytes": source.source_bytes,
         "source_blake3": source.source_blake3,
+        "migrated_bytes": migrated_bytes,
     });
     {
         use std::io::Write as _;
@@ -8709,6 +8878,14 @@ mod cold_build_insert_tests {
         );
     }
 
+    #[test]
+    fn legacy_migration_completion_log_has_operator_fields() {
+        assert_eq!(
+            legacy_migration_completion_line("abc123", "generation_copy", 176, 177),
+            "migrated root-keyed callgraph store key=abc123 method=generation_copy legacy=176 migrated=177"
+        );
+    }
+
     fn write_generation_with_age(
         dir: &Path,
         project_key: &str,
@@ -8797,6 +8974,8 @@ mod cold_build_insert_tests {
             dir.path().to_path_buf(),
             project_key,
             sqlite_path,
+            dir.path().to_path_buf(),
+            false,
             Some(generation.clone()),
             None,
             None,

@@ -778,6 +778,7 @@ pub struct AppContext {
     callgraph_store: RwLock<Option<Arc<ReadonlyCallGraphStore>>>,
     callgraph_store_force_rebuild: parking_lot::Mutex<bool>,
     callgraph_store_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
+    callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     search_index: RwLock<Option<SearchIndex>>,
     search_index_rx: RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>>,
@@ -915,6 +916,13 @@ pub enum CallgraphStoreAccess {
     Error(CallGraphStoreError),
 }
 
+#[derive(Clone, Copy)]
+enum CallgraphBackgroundWork {
+    Ensure,
+    ForceRebuild,
+    LegacyMigration,
+}
+
 /// Inline wait window for a callgraph-store cold build before returning
 /// `Building`. Default `0` (pure-async: never block the request thread).
 /// Tests set `AFT_CALLGRAPH_BUILD_WAIT_MS` large so small fixture builds
@@ -990,6 +998,7 @@ impl AppContext {
             callgraph_store: RwLock::new(None),
             callgraph_store_force_rebuild: parking_lot::Mutex::new(false),
             callgraph_store_rx: parking_lot::Mutex::new(None),
+            callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: parking_lot::Mutex::new(BTreeSet::new()),
             search_index: RwLock::new(None),
             search_index_rx: RwLock::new(None),
@@ -2042,6 +2051,7 @@ impl AppContext {
         if !self.heavy_root_work_allowed() {
             return Ok(None);
         }
+        self.revalidate_callgraph_store_generation();
         if let Some(store) = {
             let guard = self
                 .callgraph_store
@@ -2049,6 +2059,11 @@ impl AppContext {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.as_ref().map(Arc::clone)
         } {
+            self.schedule_legacy_callgraph_migration_if_needed(
+                store.as_ref(),
+                store.project_root().to_path_buf(),
+                self.callgraph_store_dir(),
+            );
             return Ok(Some(store));
         }
 
@@ -2057,28 +2072,51 @@ impl AppContext {
         };
         let callgraph_dir = self.callgraph_store_dir();
         let force_rebuild = self.take_callgraph_store_force_rebuild();
-        if self.callgraph_writer() {
-            if force_rebuild {
-                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
-                    callgraph_dir.clone(),
-                    project_root.clone(),
-                    &files,
-                    self.config().callgraph_chunk_size,
-                )?;
-                drop(store);
-            } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
-                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                let (store, _stats) = CallGraphStore::ensure_built_with_lease_chunked(
-                    callgraph_dir.clone(),
-                    project_root.clone(),
-                    &files,
-                    self.config().callgraph_chunk_size,
-                )?;
-                drop(store);
+
+        // Preserve a readable legacy fallback while writer-capable processes
+        // migrate it on the cold-build lane. Opening before the writer path is
+        // also the cheap fast path for an already-published root generation.
+        if !force_rebuild {
+            if let Some(store) =
+                CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone())?
+            {
+                let store = Arc::new(store);
+                {
+                    let mut guard = self
+                        .callgraph_store
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *guard = Some(Arc::clone(&store));
+                }
+                self.schedule_legacy_callgraph_migration_if_needed(
+                    store.as_ref(),
+                    project_root,
+                    callgraph_dir,
+                );
+                return Ok(Some(store));
             }
-        } else if force_rebuild {
+        }
+
+        if !self.callgraph_writer() {
             return Ok(None);
+        }
+        let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+        if force_rebuild {
+            let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.clone(),
+                project_root.clone(),
+                &files,
+                self.config().callgraph_chunk_size,
+            )?;
+            drop(store);
+        } else {
+            let (store, _stats) = CallGraphStore::ensure_built_with_lease_chunked(
+                callgraph_dir.clone(),
+                project_root.clone(),
+                &files,
+                self.config().callgraph_chunk_size,
+            )?;
+            drop(store);
         }
 
         let Some(store) = CallGraphStore::open_readonly(callgraph_dir, project_root)? else {
@@ -2106,43 +2144,34 @@ impl AppContext {
         })
     }
 
-    /// Access the persisted callgraph store for the five store-backed edge-query
-    /// ops **without ever blocking the request thread on a cold build**.
-    ///
-    /// - Store resident          -> `Ready`.
-    /// - Warm on-disk DB present  -> opened synchronously (cheap) -> `Ready`.
-    /// - Genuine cold build needed -> kicked off in the background, returns
-    ///   `Building`; the watcher keeps the store fresh once it lands.
-    /// - Worktree without a built store, or not configured -> `Unavailable`.
-    ///
-    /// A build already in flight (`callgraph_store_rx` set) also returns
-    /// `Building` without starting a second build.
-    /// Drop the resident callgraph store when another process (or a local cold
-    /// rebuild) has published a newer generation, so the next access reopens via
-    /// the pointer. No-op when no store is resident, a build is in flight, or the
-    /// store is still current. Must run before serving ops AND before any
-    /// incremental write, so every process converges on the current generation
-    /// rather than writing to a stale one.
+    /// Drop a cached reader when another process published a newer generation.
+    /// The next access reopens through the pointer and converges to that
+    /// generation instead of serving a stale long-lived connection.
     pub fn revalidate_callgraph_store_generation(&self) {
-        // Never disturb the store while a background build's result is pending
-        // install (the rx-install path replaces it wholesale).
-        if self.callgraph_store_rx.lock().is_some() {
-            return;
-        }
-        let superseded = {
+        let (superseded, legacy_fallback) = {
             let guard = self
                 .callgraph_store
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.as_ref().is_some_and(|store| !store.is_current())
+            guard
+                .as_ref()
+                .map(|store| (!store.is_current(), store.is_legacy_fallback()))
+                .unwrap_or((false, false))
         };
-        if superseded {
-            let mut guard = self
-                .callgraph_store
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = None;
+        if !superseded {
+            return;
         }
+        // A local migration publishes its pointer just before sending the new
+        // store to the main-loop drain. Keep queries on the fallback during that
+        // narrow handoff instead of reporting a transient Building state.
+        if legacy_fallback && self.callgraph_store_rx.lock().is_some() {
+            return;
+        }
+        let mut guard = self
+            .callgraph_store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = None;
     }
 
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
@@ -2161,6 +2190,11 @@ impl AppContext {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.as_ref().map(Arc::clone)
         } {
+            self.schedule_legacy_callgraph_migration_if_needed(
+                store.as_ref(),
+                store.project_root().to_path_buf(),
+                self.callgraph_store_dir(),
+            );
             return CallgraphStoreAccess::Ready(store);
         }
 
@@ -2186,6 +2220,11 @@ impl AppContext {
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         *guard = Some(Arc::clone(&store));
                     }
+                    self.schedule_legacy_callgraph_migration_if_needed(
+                        store.as_ref(),
+                        project_root.clone(),
+                        callgraph_dir.clone(),
+                    );
                     return CallgraphStoreAccess::Ready(store);
                 }
                 Ok(None) => {
@@ -2219,11 +2258,13 @@ impl AppContext {
         // `AFT_CALLGRAPH_BUILD_WAIT_MS` (default 0) optionally waits a bounded
         // window inline for the build to land before returning `Building`; tests
         // set it large so fixture builds resolve to `Ready` synchronously.
-        if !self.spawn_callgraph_store_cold_build(
-            project_root.clone(),
-            callgraph_dir.clone(),
-            force_rebuild,
-        ) {
+        let work = if force_rebuild {
+            CallgraphBackgroundWork::ForceRebuild
+        } else {
+            CallgraphBackgroundWork::Ensure
+        };
+        if !self.spawn_callgraph_store_cold_build(project_root.clone(), callgraph_dir.clone(), work)
+        {
             return CallgraphStoreAccess::Building;
         }
 
@@ -2282,17 +2323,52 @@ impl AppContext {
         CallgraphStoreAccess::Building
     }
 
-    /// Atomically mark a cold build in-flight and spawn the background builder.
-    ///
-    /// The `callgraph_store_rx` lock covers the full check + receiver install +
-    /// thread spawn sequence, so concurrent cold callers cannot both observe an
-    /// empty in-flight slot and double-spawn builders. Returns `false` when
-    /// another caller already has a build in flight.
+    fn schedule_legacy_callgraph_migration_if_needed(
+        &self,
+        store: &ReadonlyCallGraphStore,
+        project_root: PathBuf,
+        callgraph_dir: PathBuf,
+    ) {
+        if !store.is_legacy_fallback()
+            || !self.callgraph_writer()
+            || !self.heavy_root_work_allowed()
+        {
+            return;
+        }
+        if self.semantic_cold_seed_active() {
+            self.defer_callgraph_store_warm_for_semantic_cold_seed();
+            return;
+        }
+        let _ = self.spawn_callgraph_store_cold_build(
+            project_root,
+            callgraph_dir,
+            CallgraphBackgroundWork::LegacyMigration,
+        );
+    }
+
+    fn configured_callgraph_keys(&self, current_root: &Path) -> BTreeSet<String> {
+        let mut roots = self
+            .configured_session_roots
+            .lock()
+            .iter()
+            .map(|(root, _session)| root.clone())
+            .collect::<BTreeSet<_>>();
+        roots.insert(current_root.to_path_buf());
+        roots
+            .iter()
+            .map(|root| crate::search_index::artifact_cache_key(root))
+            .collect()
+    }
+
+    /// Atomically mark root-keyed callgraph maintenance in flight and spawn it
+    /// on the cold-build lane. The same receiver/install path handles cold
+    /// builds and legacy migrations, so watcher edits are queued and replayed
+    /// against whichever root-keyed generation publishes.
     fn spawn_callgraph_store_cold_build(
         &self,
         project_root: PathBuf,
         callgraph_dir: PathBuf,
-        force_rebuild: bool,
+        work: CallgraphBackgroundWork,
     ) -> bool {
         if !self.heavy_root_work_allowed() || !self.callgraph_writer() {
             return false;
@@ -2302,6 +2378,8 @@ impl AppContext {
         let chunk_size = self.config().callgraph_chunk_size;
         let build_generation = self.configure_generation();
         let generation_flag = self.configure_generation_flag();
+        let configured_keys = self.configured_callgraph_keys(&project_root);
+        let summary_logged = Arc::clone(&self.callgraph_legacy_migration_summary_logged);
 
         let mut rx_guard = self.callgraph_store_rx.lock();
         if rx_guard.is_some() {
@@ -2310,13 +2388,13 @@ impl AppContext {
 
         let Some(permit) = crate::cold_build_limiter::try_acquire() else {
             crate::slog_info!(
-                "callgraph store cold build deferred by cold build limit ({})",
+                "callgraph store background work deferred by cold build limit ({})",
                 crate::cold_build_limiter::limit()
             );
             return false;
         };
 
-        if force_rebuild {
+        if matches!(work, CallgraphBackgroundWork::ForceRebuild) {
             // Consume the force flag now so a follow-up request doesn't queue a
             // second forced build while this one is in flight.
             self.take_callgraph_store_force_rebuild();
@@ -2329,26 +2407,64 @@ impl AppContext {
         std::thread::spawn(move || {
             let _permit = permit;
             crate::log_ctx::with_session(session_id, || {
-                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                let built = if force_rebuild {
-                    CallGraphStore::cold_build_with_lease_chunked(
-                        callgraph_dir,
-                        project_root,
-                        &files,
-                        chunk_size,
-                    )
-                    .map(|(store, _)| store)
-                } else {
-                    CallGraphStore::ensure_built_with_lease_chunked(
-                        callgraph_dir,
-                        project_root,
-                        &files,
-                        chunk_size,
-                    )
-                    .map(|(store, _)| store)
+                let built = match work {
+                    CallgraphBackgroundWork::LegacyMigration => {
+                        CallGraphStore::migrate_legacy_with_lease(
+                            callgraph_dir.clone(),
+                            project_root.clone(),
+                        )
+                    }
+                    CallgraphBackgroundWork::ForceRebuild => {
+                        let files =
+                            crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                        CallGraphStore::cold_build_with_lease_chunked(
+                            callgraph_dir.clone(),
+                            project_root.clone(),
+                            &files,
+                            chunk_size,
+                        )
+                        .map(|(store, _)| Some(store))
+                    }
+                    CallgraphBackgroundWork::Ensure => {
+                        let files =
+                            crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                        CallGraphStore::ensure_built_with_lease_chunked(
+                            callgraph_dir.clone(),
+                            project_root.clone(),
+                            &files,
+                            chunk_size,
+                        )
+                        .map(|(store, _)| Some(store))
+                    }
                 };
                 match built {
-                    Ok(store) => {
+                    Ok(Some(store)) => {
+                        if store.is_legacy_migration() {
+                            match crate::callgraph_store::all_legacy_partitions_migrated_for_keys(
+                                &callgraph_dir,
+                                &configured_keys,
+                            ) {
+                                Ok(true)
+                                    if summary_logged
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::SeqCst,
+                                            Ordering::SeqCst,
+                                        )
+                                        .is_ok() =>
+                                {
+                                    crate::slog_info!(
+                                        "all legacy callgraph partitions migrated for configured roots"
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(error) => crate::slog_warn!(
+                                    "failed to inspect legacy callgraph migration completion: {}",
+                                    error
+                                ),
+                            }
+                        }
                         if generation_flag.load(Ordering::SeqCst) == build_generation {
                             let _ = tx.send(store);
                         } else {
@@ -2358,10 +2474,11 @@ impl AppContext {
                             );
                         }
                     }
+                    Ok(None) => {}
                     Err(error) => {
-                        crate::slog_warn!("callgraph store cold build failed: {}", error);
+                        crate::slog_warn!("callgraph store background work failed: {}", error);
                         // Dropping tx disconnects the channel; the drain clears
-                        // the receiver so a later op can retry the build.
+                        // the receiver so a later op can retry the work.
                     }
                 }
             });
