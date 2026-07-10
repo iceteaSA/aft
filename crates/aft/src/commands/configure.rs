@@ -2147,13 +2147,22 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         SemanticIndexStatus::ready();
                 }
                 crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                    // Serve the stale snapshot instead of refusing: read-only
+                    // sessions (mason worktrees) cannot rebuild, and drifted
+                    // embeddings still rank far better than no semantic lane.
+                    // Same serve-with-disclosure posture as the trigram lane
+                    // above and the cross-root borrow path.
+                    crate::slog_warn!(
+                        "semantic index is read-only and stale for {} file(s); serving stale snapshot without repairing shared artifacts",
+                        stale.drift_count
+                    );
+                    *ctx.semantic_index()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stale.index);
                     *ctx.semantic_index_status()
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        SemanticIndexStatus::Failed(format!(
-                            "semantic index is read-only and stale for {} file(s)",
-                            stale.drift_count
-                        ));
+                        SemanticIndexStatus::ready();
                 }
                 crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
                     *ctx.semantic_index_status()
