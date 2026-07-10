@@ -3,10 +3,17 @@ name: Blacksmith Testbox
 on:
   workflow_dispatch:
     inputs:
+      testbox_id:
+        description: "Testbox session identifier supplied by the Blacksmith CLI"
+        required: true
+        type: string
       ref:
         description: "Git ref to hydrate; defaults to the dispatched ref"
         required: false
         type: string
+
+permissions:
+  contents: read
 
 # This workflow is intentionally separate from the merge/release gates. The
 # Blacksmith Testbox CLI dispatches it to hydrate a warm runner, then runs
@@ -17,6 +24,11 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2204
     timeout-minutes: 360
     steps:
+      - name: Begin testbox session
+        uses: useblacksmith/begin-testbox@v2
+        with:
+          testbox_id: ${{ inputs.testbox_id }}
+
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -39,10 +51,6 @@ jobs:
       - name: Prime Rust test binaries
         run: cargo nextest run --no-run -p agent-file-tools
 
-      - name: Idle for Blacksmith Testbox runs
-        run: |
-          echo "Testbox is hydrated; waiting for blacksmith testbox run commands."
-          while true; do
-            sleep 300
-            date -u '+testbox still warm at %Y-%m-%dT%H:%M:%SZ'
-          done
+      - name: Run testbox commands
+        uses: useblacksmith/run-testbox@v2
+        if: always()

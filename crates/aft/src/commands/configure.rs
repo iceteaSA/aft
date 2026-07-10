@@ -69,6 +69,27 @@ fn delay_configure_deferred_walk_for_test() {
     sleep_from_env_ms("AFT_TEST_CONFIGURE_DEFERRED_WALK_DELAY_MS");
 }
 
+#[cfg(test)]
+fn signal_configure_deferred_walk_start_for_test() {
+    let Some(path) = std::env::var_os("AFT_TEST_CONFIGURE_DEFERRED_WALK_START_FILE") else {
+        return;
+    };
+    fs::write(path, "started\n").expect("write deferred walk start signal");
+}
+
+#[cfg(not(test))]
+fn signal_configure_deferred_walk_start_for_test() {}
+
+#[cfg(test)]
+fn run_configure_deferred_walk_synchronously_for_test() -> bool {
+    std::env::var_os("AFT_TEST_CONFIGURE_FORCE_SYNCHRONOUS_DEFERRED_WALK").is_some()
+}
+
+#[cfg(not(test))]
+fn run_configure_deferred_walk_synchronously_for_test() -> bool {
+    false
+}
+
 fn delay_configure_deferred_maintenance_for_test() {
     sleep_from_env_ms("AFT_TEST_CONFIGURE_DEFERRED_MAINTENANCE_DELAY_MS");
 }
@@ -2628,9 +2649,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let config_for_bg = config_snapshot.clone();
         let session_id_for_bg = log_ctx::current_session();
         let session_id_for_frame = session_id_for_bg.clone();
-        thread::spawn(move || {
+        let run_deferred_walk = move || {
             log_ctx::with_session(session_id_for_bg, || {
                 delay_configure_deferred_walk_for_test();
+                signal_configure_deferred_walk_start_for_test();
                 let source_files: Vec<PathBuf> =
                     crate::callgraph::walk_project_files(&walk_root).collect();
                 let detected_languages: HashSet<LangId> = source_files
@@ -2651,7 +2673,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
                 let _ = warning_tx.send((warning_generation, frame));
             });
-        });
+        };
+        if run_configure_deferred_walk_synchronously_for_test() {
+            run_deferred_walk();
+        } else {
+            thread::spawn(run_deferred_walk);
+        }
     }
 
     // Return the success response immediately so the plugin can mark the project as
@@ -3889,8 +3916,13 @@ mod tests {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let _delay_walk = EnvVarGuard::set("AFT_TEST_CONFIGURE_DEFERRED_WALK_DELAY_MS", "400");
+        let _delay_walk = EnvVarGuard::set("AFT_TEST_CONFIGURE_DEFERRED_WALK_DELAY_MS", "2000");
         let temp = tempfile::tempdir().unwrap();
+        let walk_start_file = temp.path().join("deferred-walk-start");
+        let _walk_start_signal = EnvVarGuard::set(
+            "AFT_TEST_CONFIGURE_DEFERRED_WALK_START_FILE",
+            walk_start_file.to_str().unwrap(),
+        );
         init_git_fixture(temp.path());
         for dir in 0..10 {
             let dir_path = temp.path().join(format!("bulk-{dir}"));
@@ -3918,16 +3950,29 @@ mod tests {
 
         assert!(response.success);
         assert!(
-            elapsed < Duration::from_millis(200),
-            "configure ack should not wait for delayed deferred walk: {elapsed:?}"
+            elapsed < Duration::from_secs(5),
+            "configure acknowledgement exceeded its generous sanity ceiling: {elapsed:?}"
+        );
+        assert!(
+            !walk_start_file.exists(),
+            "configure acknowledgement was not observed before the deferred file walk started"
         );
         assert!(response.data.get("source_file_count").is_none());
         assert!(ctx.drain_configure_warnings().is_empty());
 
+        let walk_start_deadline = Instant::now() + Duration::from_secs(5);
+        while !walk_start_file.exists() {
+            assert!(
+                Instant::now() < walk_start_deadline,
+                "timed out waiting for the deferred file walk to start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         // The deferred walk still completes and publishes its frame (for
         // missing-binary warnings); only the count field is gone.
         let frame =
-            wait_for_configure_warnings(&ctx, ctx.configure_generation(), Duration::from_secs(2));
+            wait_for_configure_warnings(&ctx, ctx.configure_generation(), Duration::from_secs(5));
         assert_eq!(frame.frame_type, "configure_warnings");
     }
 
