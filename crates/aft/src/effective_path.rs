@@ -95,7 +95,9 @@ pub fn effective_path() -> &'static OsStr {
     // missing formatter binary); probing and enrichment would re-add real tool
     // dirs from the host and break that isolation. Checked at runtime because
     // the spawned test binary is a production build.
-    if std::env::var_os("AFT_TEST_RAW_PATH").is_some() {
+    // "0" reads as unset so the PATH feature's own integration tests can
+    // opt back in to probing under a test harness that defaults the seam on.
+    if std::env::var_os("AFT_TEST_RAW_PATH").is_some_and(|v| v != "0" && !v.is_empty()) {
         static RAW: OnceLock<OsString> = OnceLock::new();
         return RAW
             .get_or_init(|| std::env::var_os("PATH").unwrap_or_default())

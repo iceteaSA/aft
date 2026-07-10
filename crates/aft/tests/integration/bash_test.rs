@@ -69,6 +69,10 @@ exit 64
 
     let login_path = format!("{}:/usr/bin:/bin", fake_bin.display());
     let mut aft = AftProcess::spawn_with_env(&[
+        // The harness defaults AFT_TEST_RAW_PATH=1 (PATH isolation for
+        // formatter/checker tests); this test IS the PATH feature, so opt back
+        // in to the real probe+enrichment pipeline.
+        ("AFT_TEST_RAW_PATH", std::ffi::OsStr::new("0")),
         ("PATH", std::ffi::OsStr::new("/usr/bin:/bin")),
         ("HOME", home.as_os_str()),
         ("SHELL", fake_shell.as_os_str()),
