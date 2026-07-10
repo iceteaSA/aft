@@ -61,6 +61,8 @@ export interface AftTransportPool {
   ): Promise<ToolCallResult>;
   setConfigureOverride(key: string, value: unknown): void;
   replaceBinary(path: string): Promise<string>;
+  /** True when this pool instance has reached its terminal shutdown state. */
+  isShutdown(): boolean;
   shutdown(): Promise<void>;
   /**
    * Release any per-session transport state for `(projectRoot, session)` on

@@ -863,6 +863,11 @@ export class SubcTransportPool implements AftTransportPool {
     return path;
   }
 
+  /** A subc pool instance is terminal after shutdown; ownership revives it outside this class. */
+  isShutdown(): boolean {
+    return this.shuttingDown;
+  }
+
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     const subs: BgSubscription[] = [];

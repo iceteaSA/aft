@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
 import { BridgePool, type PoolOptions } from "./pool.js";
+import { RevivableTransportPool } from "./revivable-transport.js";
 import { SubcTransportPool } from "./subc-transport.js";
 import type { AftTransportPool } from "./transport.js";
 
@@ -57,9 +58,20 @@ function resolveConnectionFilePath(raw: string): string {
  * Construct the transport pool for this plugin process. Async because the subc
  * presence check stats the connection file. Returns a pool satisfying
  * {@link AftTransportPool} either way; the caller's downstream code does not
- * branch on which.
+ * branch on which. The returned ownership layer replaces a terminal subc or
+ * standalone instance when a later tool call arrives after host teardown.
  */
 export async function createAftTransportPool(
+  opts: AftTransportFactoryOptions,
+): Promise<AftTransportPool> {
+  let binaryPath = opts.binaryPath;
+  const createPool = () => createConcreteAftTransportPool({ ...opts, binaryPath });
+  return new RevivableTransportPool(await createPool(), createPool, (path) => {
+    binaryPath = path;
+  });
+}
+
+async function createConcreteAftTransportPool(
   opts: AftTransportFactoryOptions,
 ): Promise<AftTransportPool> {
   const raw = opts.subcConnectionFile?.trim();

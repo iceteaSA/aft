@@ -135,6 +135,7 @@ export type {
   StatusResponse,
 } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
+export { RevivableTransportPool } from "./revivable-transport.js";
 // --- agent status bar (shared by both plugin hosts) ---
 export type { StatusBarCounts, StatusBarEmitState } from "./status-bar.js";
 export {

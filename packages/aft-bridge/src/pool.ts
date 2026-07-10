@@ -140,6 +140,7 @@ export class BridgePool implements AftTransportPool {
     | undefined;
   private readonly logger: Logger | undefined;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private shutdownCalled = false;
 
   constructor(
     binaryPath: string,
@@ -172,10 +173,7 @@ export class BridgePool implements AftTransportPool {
     // Reuse the existing idle-window timer for both idle eviction and binary
     // refresh checks. When idle eviction is disabled, there is no background
     // maintenance loop.
-    if (Number.isFinite(this.idleTimeoutMs)) {
-      this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
-      this.cleanupTimer.unref(); // don't prevent Node from exiting
-    }
+    this.startCleanupTimer();
   }
 
   /**
@@ -189,6 +187,7 @@ export class BridgePool implements AftTransportPool {
    * status from another project's bridge mixes session-isolated state.
    */
   getActiveBridgeForRoot(projectRoot: string): BinaryBridge | null {
+    if (this.shutdownCalled) return null;
     const key = normalizeKey(projectRoot);
     const entry = this.bridges.get(key);
     if (!entry?.bridge.isAlive()) return null;
@@ -205,6 +204,10 @@ export class BridgePool implements AftTransportPool {
    * isolated by `session_id` on the Rust side.
    */
   getBridge(projectRoot: string): BinaryBridge {
+    if (this.shutdownCalled) {
+      this.shutdownCalled = false;
+      this.startCleanupTimer();
+    }
     const key = normalizeKey(projectRoot);
 
     // `$HOME`-rooted spawns are no longer refused here. The Rust
@@ -312,6 +315,7 @@ export class BridgePool implements AftTransportPool {
 
   /** Shut down all bridges and stop the cleanup timer. */
   async shutdown(): Promise<void> {
+    this.shutdownCalled = true;
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
@@ -323,6 +327,11 @@ export class BridgePool implements AftTransportPool {
     this.bridges.clear();
     this.staleBridges.clear();
     await Promise.allSettled(shutdowns);
+  }
+
+  /** A standalone pool can be restarted by its owner after shutdown. */
+  isShutdown(): boolean {
+    return this.shutdownCalled;
   }
 
   /**
@@ -347,6 +356,12 @@ export class BridgePool implements AftTransportPool {
       `Binary path updated to ${newPath}. Active bridges marked stale — next calls will use the new binary.`,
     );
     return newPath;
+  }
+
+  private startCleanupTimer(): void {
+    if (!Number.isFinite(this.idleTimeoutMs) || this.cleanupTimer) return;
+    this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
+    this.cleanupTimer.unref(); // don't prevent Node from exiting
   }
 
   private log(message: string, meta?: LogMeta): void {

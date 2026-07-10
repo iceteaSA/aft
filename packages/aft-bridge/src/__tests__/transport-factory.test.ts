@@ -3,8 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { BridgePool } from "../pool.js";
-import { SubcTransportPool } from "../subc-transport.js";
+import { RevivableTransportPool } from "../revivable-transport.js";
 import { createAftTransportPool } from "../transport-factory.js";
 
 describe("createAftTransportPool", () => {
@@ -24,15 +23,15 @@ describe("createAftTransportPool", () => {
     configOverrides: {},
   });
 
-  test("no subc.connection_file ⇒ standalone BridgePool (the default)", async () => {
+  test("no subc.connection_file ⇒ standalone transport behind the ownership layer (the default)", async () => {
     const pool = await createAftTransportPool(baseOpts());
-    expect(pool).toBeInstanceOf(BridgePool);
+    expect(pool).toBeInstanceOf(RevivableTransportPool);
     await pool.shutdown();
   });
 
   test("empty/whitespace subc.connection_file ⇒ standalone (not subc)", async () => {
     const pool = await createAftTransportPool({ ...baseOpts(), subcConnectionFile: "   " });
-    expect(pool).toBeInstanceOf(BridgePool);
+    expect(pool).toBeInstanceOf(RevivableTransportPool);
     await pool.shutdown();
   });
 
@@ -43,7 +42,7 @@ describe("createAftTransportPool", () => {
       ...baseOpts(),
       subcConnectionFile: connFile,
     });
-    expect(pool).toBeInstanceOf(SubcTransportPool);
+    expect(pool).toBeInstanceOf(RevivableTransportPool);
     await pool.shutdown();
   });
 
