@@ -1,4 +1,4 @@
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 /** `~/.cache/aft/bin/` (or the platform equivalent) — same as plugin's `getCacheDir`. */
@@ -71,10 +71,6 @@ function dataHome(): string {
 }
 
 export function getCortexKitStorageRoot(): string {
+  if (process.env.AFT_CACHE_DIR) return join(process.env.AFT_CACHE_DIR, "aft");
   return join(dataHome(), "cortexkit", "aft");
-}
-
-/** Resolve the plugin log file path. Shared with the plugin's logger. */
-export function getTmpLogPath(filename: string): string {
-  return join(tmpdir(), filename);
 }

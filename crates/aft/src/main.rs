@@ -62,19 +62,7 @@ fn main() {
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| {
-            use std::io::Write;
-            let prefix = if record.target().starts_with("aft::lsp")
-                || record.target().starts_with("aft_lsp")
-            {
-                "[aft-lsp]"
-            } else {
-                "[aft]"
-            };
-            writeln!(buf, "{} {}", prefix, record.args())
-        })
-        .init();
+    aft::logging::init();
 
     if std::env::args().nth(1).as_deref() == Some("warmup") {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
@@ -227,6 +215,7 @@ fn main() {
                 // Drain search index FIRST so watcher events apply to the latest index.
                 // If reversed, watcher updates applied to the old index would be lost
                 // when the background-built index replaces it.
+                aft::logging::note_drain_slice();
                 if let Err(e) = drain_runtime_events_and_write_pending(&registry, &mut pending) {
                     aft::slog_error!("stdout write error: {}", e);
                     break;
@@ -314,6 +303,7 @@ fn main() {
 
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
+        aft::logging::sync_storage_root(runtime.storage_dir());
         aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::runtime_drain::drain_search_index_events(runtime);
         aft::runtime_drain::drain_callgraph_store_events(runtime);
@@ -323,6 +313,7 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_watcher_events(runtime);
         aft::runtime_drain::drain_lsp_events(runtime);
     }
+    aft::logging::perf_tick(None);
 }
 
 fn flush_search_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {

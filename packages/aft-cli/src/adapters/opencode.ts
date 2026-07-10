@@ -3,11 +3,11 @@ import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
+import { resolveAftLogPath, resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
 
 import { dirSize } from "../lib/fs-util.js";
 import { detectJsoncFile, readJsoncFile, writeJsoncFile } from "../lib/jsonc.js";
-import { getCortexKitStorageRoot, getTmpLogPath } from "../lib/paths.js";
+import { getCortexKitStorageRoot } from "../lib/paths.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import type {
   HarnessAdapter,
@@ -361,7 +361,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
   }
 
   getLogFile(): string {
-    return getTmpLogPath("aft-plugin.log");
+    return resolveAftLogPath("aft-plugin.log");
   }
 
   getInstallHint(): string {

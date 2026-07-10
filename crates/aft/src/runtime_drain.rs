@@ -1241,6 +1241,8 @@ pub fn refresh_callgraph_store_for_watcher(
                 mark_error
             ),
         }
+    } else {
+        crate::logging::note_callgraph_invalidations(source_paths.len());
     }
 }
 
@@ -1322,6 +1324,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_events: usize) -> Drai
         }
     }
 
+    crate::logging::note_watcher_events(outcome.processed);
     let mut watcher_status_changed = false;
     if root_deleted {
         ctx.stop_watcher_runtime_in_background();
@@ -1348,6 +1351,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_events: usize) -> Drai
     let mut status_changed = watcher_status_changed;
     let mut project_corpus_refresh_requested = false;
     if rescan_required {
+        crate::logging::note_watcher_overflow();
         aft::slog_warn!("watcher overflow: forcing project rescan");
         if heavy_root_work_allowed {
             ctx.rebuild_gitignore();

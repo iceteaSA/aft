@@ -1,6 +1,4 @@
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+import { RotatingLogSink, resolveAftLogPath } from "@cortexkit/aft-bridge";
 
 const TAG = "[aft-plugin]";
 
@@ -8,11 +6,12 @@ const TAG = "[aft-plugin]";
 // live session log that users read to diagnose problems. Bun sets BUN_TEST=1
 // automatically; NODE_ENV=test covers other test harnesses.
 const isTestEnv = process.env.BUN_TEST === "1" || process.env.NODE_ENV === "test";
-const logFile = path.join(os.tmpdir(), isTestEnv ? "aft-plugin-test.log" : "aft-plugin.log");
+const logFile = resolveAftLogPath(isTestEnv ? "aft-plugin-test.log" : "aft-plugin.log");
+const fileSink = new RotatingLogSink(logFile);
 
 /**
  * When AFT_LOG_STDERR=1, logs go to stderr (useful for subprocess tests that
- * capture stderr output). Otherwise logs go to the temp file.
+ * capture stderr output). Otherwise logs go to the durable AFT log directory.
  */
 const useStderr = process.env.AFT_LOG_STDERR === "1";
 
@@ -29,7 +28,7 @@ function flush(): void {
     if (useStderr) {
       process.stderr.write(data);
     } else {
-      fs.appendFileSync(logFile, data);
+      fileSink.append(data);
     }
   } catch {
     // Intentional: logging must never throw

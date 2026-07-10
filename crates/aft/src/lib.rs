@@ -83,6 +83,7 @@ pub mod language;
 pub mod legacy_partitions;
 pub mod local_embed;
 pub mod log_ctx;
+pub mod logging;
 pub mod lsp;
 pub mod lsp_hints;
 pub mod migrate_storage;

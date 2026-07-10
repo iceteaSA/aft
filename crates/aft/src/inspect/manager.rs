@@ -1734,6 +1734,12 @@ struct Tier2PhaseTimings {
 impl Tier2PhaseTimings {
     fn log(&self, category: InspectCategory) {
         let worked = self.freshness + self.scan + self.snapshot + self.rollup + self.db;
+        if !worked.is_zero() {
+            crate::logging::note_tier2_scan(
+                category.to_string(),
+                worked.as_millis().min(u128::from(u64::MAX)) as u64,
+            );
+        }
         if worked < Duration::from_millis(50) {
             return;
         }

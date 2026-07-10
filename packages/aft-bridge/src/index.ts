@@ -69,6 +69,15 @@ export {
   getCacheDir,
   getCachedBinaryPath,
 } from "./downloader.js";
+export type { RotatingLogOptions } from "./durable-log.js";
+// --- durable module/plugin logs ---
+export {
+  DEFAULT_LOG_BYTES,
+  DEFAULT_LOG_GENERATIONS,
+  RotatingLogSink,
+  resolveAftLogPath,
+  resolveAftStorageRoot,
+} from "./durable-log.js";
 export type { EditSummaryInput } from "./edit-summary.js";
 export { formatEditSummary } from "./edit-summary.js";
 // --- compact UI formatting ---

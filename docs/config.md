@@ -352,6 +352,27 @@ any tag is accepted as-is once it passes the grace window and TLS verification. 
 attacks faster than the grace window are a residual risk. A fully-vetted allowlist is on the
 roadmap.
 
+## Durable logs and performance ticks
+
+AFT keeps its own logs under `<storage_root>/logs/`. The storage root follows the
+same resolution as indexes and other persistent data: configured `storage_dir`,
+then `$AFT_CACHE_DIR/aft`, then the platform CortexKit data directory (normally
+`~/.local/share/cortexkit/aft` on Linux and macOS).
+
+- Rust module processes write `aft-<pid>.log`. Each process file rolls at 20 MB
+  through `.1` to `.5`; files from dead PIDs are removed after seven days.
+- OpenCode and Pi plugin messages share `aft-plugin.log`, which uses the same
+  20 MB / five-generation rotation policy. The `[aft-plugin]` and `[aft-pi]`
+  tags identify the source.
+- Module lines continue to go to stderr as well, so daemon capture remains
+  available while the durable files provide a module-owned history.
+
+When AFT is active, the module emits a `perf tick:` line at most once per minute.
+It summarizes watcher and drain activity, Tier-2 and semantic work, callgraph
+invalidations, executor completions, and oldest queued-job ages since the prior
+tick. Idle intervals stay silent. `RUST_LOG` keeps its existing env_logger
+semantics and defaults to `info`.
+
 ## Working with large repositories
 
 If you point AFT at a very large directory (monorepo root, `~/Work`, `/home`, etc.), certain

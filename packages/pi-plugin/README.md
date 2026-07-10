@@ -131,7 +131,7 @@ Sensitive semantic backend fields (`backend`, `base_url`, `api_key_env`) are onl
 
 ## Logs
 
-Plugin logs go to `$TMPDIR/aft-pi.log`. Rust backend logs are forwarded into the same file with an `[aft]` tag.
+Plugin logs go to `<storage_root>/logs/aft-plugin.log` with an `[aft-pi]` tag. The file rotates at 20 MB through five retained generations; Rust module processes use adjacent `aft-<pid>.log` files.
 
 Set `AFT_LOG_STDERR=1` to route logs to stderr instead (useful for piping or subprocess tests).
 

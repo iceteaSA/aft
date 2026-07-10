@@ -2,11 +2,11 @@ import { execSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
+import { resolveAftLogPath, resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
 
 import { dirSize } from "../lib/fs-util.js";
 import { readJsoncFile } from "../lib/jsonc.js";
-import { getCortexKitStorageRoot, getTmpLogPath } from "../lib/paths.js";
+import { getCortexKitStorageRoot } from "../lib/paths.js";
 import type {
   HarnessAdapter,
   HarnessConfigPaths,
@@ -276,7 +276,7 @@ export class PiAdapter implements HarnessAdapter {
   }
 
   getLogFile(): string {
-    return getTmpLogPath("aft-pi.log");
+    return resolveAftLogPath("aft-plugin.log");
   }
 
   getInstallHint(): string {

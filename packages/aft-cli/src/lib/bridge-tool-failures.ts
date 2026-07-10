@@ -1,6 +1,5 @@
 import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { resolveAftLogPath } from "@cortexkit/aft-bridge";
 import { sanitizeContent } from "./sanitize.js";
 
 /** Newest window: tail of the bridge log by bytes (not full file). */
@@ -15,7 +14,7 @@ const STRUCTURED_CODE_PATTERN = /"code"\s*:\s*"([^"]+)"/;
 
 export function resolveBridgePluginLogPath(): string {
   const isTestEnv = process.env.BUN_TEST === "1" || process.env.NODE_ENV === "test";
-  return join(tmpdir(), isTestEnv ? "aft-plugin-test.log" : "aft-plugin.log");
+  return resolveAftLogPath(isTestEnv ? "aft-plugin-test.log" : "aft-plugin.log");
 }
 
 /** Read up to `maxBytes` from the end of a log file (UTF-8). */

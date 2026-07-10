@@ -1486,11 +1486,16 @@ impl SemanticIndex {
             }
         }
 
+        let collect_ms = collect_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        crate::logging::note_semantic_collect(chunks.len(), file_metadata.len(), collect_ms);
         slog_info!(
             "semantic collect: {} chunks from {} files in {} ms",
             chunks.len(),
             file_metadata.len(),
-            collect_started.elapsed().as_millis()
+            collect_ms
         );
 
         (chunks, file_metadata)

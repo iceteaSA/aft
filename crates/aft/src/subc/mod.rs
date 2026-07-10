@@ -1427,6 +1427,7 @@ where
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
 
     let loop_result: Result<ModuleLoopExit, SubcError> = loop {
+        crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
         if let Err(error) = expire_pending_bash_asks(
             &writer_tx,
