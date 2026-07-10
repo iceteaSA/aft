@@ -274,6 +274,16 @@ impl Executor {
         state.actors.contains_key(root_id)
     }
 
+    /// Snapshot one actor context without retaining the scheduler lock while
+    /// maintenance drops root-scoped resources.
+    pub fn actor_context(&self, root_id: &ProjectRootId) -> Option<Arc<AppContext>> {
+        let state = self.inner.state.lock();
+        state
+            .actors
+            .get(root_id)
+            .map(|actor| Arc::clone(&actor.ctx))
+    }
+
     /// Snapshot the registered actor contexts.
     ///
     /// The returned [`Arc`]s keep contexts alive after the scheduler lock is

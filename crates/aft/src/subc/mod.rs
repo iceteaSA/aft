@@ -72,6 +72,11 @@ const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 /// loop turn so busy select arms cannot starve it.
 const DRAIN_TICK_PERIOD: Duration = Duration::from_millis(250);
 
+/// Root-scoped stores and watcher runtimes are reopened lazily after this
+/// period without tool traffic. Keeping the value fixed avoids per-client
+/// eviction policies competing inside the module loop.
+const IDLE_ROOT_TTL: Duration = Duration::from_secs(30 * 60);
+
 const WRITER_QUEUE_CAPACITY: usize = 256;
 
 /// Keep reliable Push bursts from monopolizing the current-thread subc loop;
@@ -264,6 +269,7 @@ struct RootMeta {
     last_touched: Instant,
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
+    idle_artifacts_evicted: bool,
 }
 
 #[derive(Debug)]
@@ -378,11 +384,13 @@ impl RootMeta {
             last_touched: now,
             diagnostics_on_edit: false,
             active_bash_waits: 0,
+            idle_artifacts_evicted: false,
         }
     }
 
     fn touch(&mut self) {
         self.last_touched = Instant::now();
+        self.idle_artifacts_evicted = false;
     }
 }
 
@@ -447,6 +455,59 @@ fn due_maintenance_jobs(
     }
 
     (jobs, deferred)
+}
+
+/// Reap root-scoped resources from the existing subc maintenance loop. The
+/// actor remains registered so a bound route can continue to receive requests;
+/// only disposable handles are cleared and the next request reopens them.
+fn reap_idle_roots(
+    now: Instant,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    executor: &Arc<Executor>,
+) -> usize {
+    let pending_bind_roots = pending_binds
+        .values()
+        .map(|pending| pending.bind_root_id.clone())
+        .collect::<HashSet<_>>();
+    let candidates = live_roots
+        .iter()
+        .filter_map(|(root_id, meta)| {
+            if meta.idle_artifacts_evicted
+                || now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL
+                || meta.active_bash_waits > 0
+                || meta.maintenance_pending
+                || !meta.maintenance_queued_kinds.is_empty()
+                || pending_bind_roots.contains(root_id)
+            {
+                return None;
+            }
+            Some(root_id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let mut reaped = 0;
+    for root_id in candidates {
+        let Some(ctx) = executor.actor_context(&root_id) else {
+            continue;
+        };
+        if !ctx.evict_idle_artifacts() {
+            continue;
+        }
+        // The watcher backend owns the OS watcher and can block while joining
+        // on macOS. Request shutdown here, but let a dedicated reaper thread
+        // perform the join rather than holding up an executor maintenance lane.
+        ctx.stop_watcher_runtime_in_background();
+        if let Some(meta) = live_roots.get_mut(&root_id) {
+            meta.idle_artifacts_evicted = true;
+        }
+        reaped += 1;
+        log::info!(
+            "subc attach: evicted idle root artifacts for {}",
+            root_id.as_path().display()
+        );
+    }
+    reaped
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1837,6 +1898,15 @@ where
                 // inbound route/control messages and push completions have run,
                 // so maintenance does not block the actor from handling the
                 // first request that arrives after a route bind is acknowledged.
+                let reaped = reap_idle_roots(
+                    Instant::now(),
+                    &mut live_roots,
+                    &pending_binds,
+                    &executor,
+                );
+                if reaped > 0 {
+                    log::debug!("subc attach: reaped {reaped} idle root(s)");
+                }
                 submit_due_maintenance_jobs(
                     &executor,
                     &mut live_roots,
@@ -2179,6 +2249,9 @@ async fn handle_route_bind_completion(
     let replay_key = push::ReplayKey::from_identity(&completion.identity);
     let bind_trust = completion.identity.trust;
     insert_route_channel(routes, root_channels, route_id, completion.identity);
+    let restore_watcher = live_roots
+        .get(&completion.bind_root_id)
+        .is_some_and(|meta| meta.idle_artifacts_evicted);
     live_roots
         .entry(completion.bind_root_id.clone())
         .and_modify(|meta| {
@@ -2190,6 +2263,11 @@ async fn handle_route_bind_completion(
     if let Some(meta) = live_roots.get_mut(&completion.bind_root_id) {
         meta.diagnostics_on_edit = completion.diagnostics_on_edit;
         meta.maintenance_poisoned = false;
+    }
+    if restore_watcher {
+        if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
+            crate::commands::configure::ensure_project_watcher(&ctx);
+        }
     }
 
     let ack =
@@ -2641,8 +2719,16 @@ async fn handle_tool_call(
         )?;
         return send_reliable_writer_frame(tx, metrics, error, "route_not_bound error").await;
     };
+    let restore_watcher = live_roots
+        .get(&identity.root)
+        .is_some_and(|meta| meta.idle_artifacts_evicted);
     if let Some(meta) = live_roots.get_mut(&identity.root) {
         meta.touch();
+    }
+    if restore_watcher {
+        if let Some(ctx) = executor.actor_context(&identity.root) {
+            crate::commands::configure::ensure_project_watcher(&ctx);
+        }
     }
 
     let is_bg_events_subscribe = serde_json::from_slice::<BgEventsProbe>(&frame.body)
@@ -3356,6 +3442,80 @@ mod tests {
             1,
             "graceful subc shutdown should flush every registered root"
         );
+    }
+
+    #[test]
+    fn idle_root_reaper_closes_artifacts_and_stops_watcher() {
+        let (root_dir, root) = test_root("idle-root-reaper");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        std::fs::write(
+            root_dir.path().join("main.rs"),
+            "fn entry() { leaf(); }\nfn leaf() {}\n",
+        )
+        .expect("source file");
+        let canonical_root = std::fs::canonicalize(root_dir.path()).expect("canonical root");
+        let app = App::default_shared();
+        let ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(canonical_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_store: true,
+                search_index: true,
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(canonical_root.clone());
+        assert!(ctx
+            .ensure_callgraph_store()
+            .expect("build callgraph store")
+            .is_some());
+
+        let cache_dir =
+            crate::search_index::resolve_cache_dir(&canonical_root, Some(storage.path()));
+        let mut index = crate::search_index::SearchIndex::build(&canonical_root);
+        let git_head = index.stored_git_head().map(str::to_owned);
+        index.write_to_disk(&cache_dir, git_head.as_deref());
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+
+        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
+        let _dispatch_tx = dispatch_tx;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let join = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+        ctx.install_watcher_runtime(
+            dispatch_rx,
+            crate::watcher_filter::WatcherThreadHandle::new(shutdown, join),
+        );
+        assert_eq!(ctx.watcher_registry_count(), 1);
+
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut live_roots = HashMap::new();
+        let mut meta = RootMeta::new(Instant::now());
+        meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        live_roots.insert(root.clone(), meta);
+
+        assert_eq!(
+            reap_idle_roots(Instant::now(), &mut live_roots, &HashMap::new(), &executor),
+            1
+        );
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert_eq!(ctx.watcher_registry_count(), 0);
+        assert!(
+            crate::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root).is_some()
+        );
+        assert!(ctx
+            .ensure_callgraph_store()
+            .expect("reopen callgraph store")
+            .is_some());
+        assert!(live_roots[&root].idle_artifacts_evicted);
     }
 
     #[test]

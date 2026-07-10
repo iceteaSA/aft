@@ -597,12 +597,29 @@ pub fn default_language_provider_factory() -> Box<dyn LanguageProvider> {
     Box::new(TreeSitterProvider::new())
 }
 
+fn database_path_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    path.file_name()
+        .map(|name| canonical_parent.join(name))
+        .unwrap_or_else(|| canonical_parent.join(path))
+}
+
 /// Process-global services shared by all project actors in this AFT process.
 ///
 /// `App` owns only true process services. Per-root caches and the live
 /// language provider instance stay in [`AppContext`].
 pub struct App {
-    db: parking_lot::Mutex<Option<Arc<Mutex<Connection>>>>,
+    /// One process-wide handle for the current AFT database. Every project
+    /// actor points at this handle so roots do not open duplicate SQLite/WAL
+    /// descriptors for the same database.
+    db: parking_lot::Mutex<Option<(PathBuf, Arc<Mutex<Connection>>)>>,
+    active_watchers: AtomicUsize,
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
     provider_factory: LanguageProviderFactory,
@@ -612,6 +629,7 @@ impl App {
     pub fn new(provider_factory: LanguageProviderFactory) -> Self {
         Self {
             db: parking_lot::Mutex::new(None),
+            active_watchers: AtomicUsize::new(0),
             lsp_child_registry: crate::lsp::child_registry::LspChildRegistry::new(),
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
             provider_factory,
@@ -639,16 +657,66 @@ impl App {
         Arc::clone(&self.stdout_writer)
     }
 
+    /// Return the process-shared database handle, opening it only when the
+    /// requested path is not already resident. The connection mutex serializes
+    /// transactions from all roots; callers never hold the App lock while using
+    /// the returned connection.
+    pub fn open_db(&self, path: &Path) -> Result<Arc<Mutex<Connection>>, crate::db::OpenError> {
+        let key = database_path_key(path);
+        let mut slot = self.db.lock();
+        if let Some((existing_path, conn)) = slot.as_ref() {
+            if existing_path == &key {
+                return Ok(Arc::clone(conn));
+            }
+        }
+
+        let conn = Arc::new(Mutex::new(crate::db::open(path)?));
+        *slot = Some((key, Arc::clone(&conn)));
+        Ok(conn)
+    }
+
     pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
-        *self.db.lock() = Some(conn);
+        *self.db.lock() = Some((PathBuf::new(), conn));
     }
 
     pub fn clear_db(&self) {
         *self.db.lock() = None;
     }
 
+    /// Clear the shared handle only when it still refers to `path`. A failed
+    /// reconfigure for one root must not tear down a database used by another
+    /// root.
+    pub fn clear_db_for_path(&self, path: &Path) {
+        let key = database_path_key(path);
+        let mut slot = self.db.lock();
+        if slot.as_ref().is_some_and(|(existing_path, _)| {
+            existing_path.as_os_str().is_empty() || existing_path == &key
+        }) {
+            *slot = None;
+        }
+    }
+
     pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
-        self.db.lock().clone()
+        self.db.lock().as_ref().map(|(_, conn)| Arc::clone(conn))
+    }
+
+    pub(crate) fn watcher_started(&self) {
+        self.active_watchers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn watcher_stopped(&self) {
+        self.active_watchers
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    /// Number of live watcher filter runtimes registered by this process.
+    /// This is intentionally process-scoped so subc tests and diagnostics can
+    /// verify that idle roots do not retain OS watcher threads.
+    pub fn watcher_count(&self) -> usize {
+        self.active_watchers.load(Ordering::SeqCst)
     }
 }
 
@@ -823,6 +891,7 @@ impl Drop for AppContext {
     fn drop(&mut self) {
         self.artifact_owner_lease.get_mut().take();
         if let Some(runtime) = self.watcher_thread.get_mut().take() {
+            self.app.watcher_stopped();
             runtime.shutdown_and_join();
         }
     }
@@ -2957,18 +3026,95 @@ impl AppContext {
         rx: crossbeam_channel::Receiver<WatcherDispatchEvent>,
         runtime: WatcherThreadHandle,
     ) {
+        let replaced = self.watcher_thread.lock().replace(runtime);
+        if let Some(runtime) = replaced {
+            self.app.watcher_stopped();
+            runtime.shutdown_and_join();
+        } else {
+            self.app.watcher_started();
+        }
         *self.watcher_rx.lock() = Some(rx);
-        *self.watcher_thread.lock() = Some(runtime);
     }
 
     /// Stop the watcher filter thread (if any) and clear the dispatch receiver.
     /// Used on reconfigure, watcher failure, root deletion, and test teardown.
     pub fn stop_watcher_runtime(&self) {
         if let Some(runtime) = self.watcher_thread.lock().take() {
+            self.app.watcher_stopped();
             runtime.shutdown_and_join();
         }
         *self.watcher_rx.lock() = None;
         *self.watcher.lock() = None;
+    }
+
+    /// Request watcher shutdown without joining on the executor lane. Some
+    /// platform watcher backends can block while their OS thread unwinds, so
+    /// idle-root and root-deleted cleanup performs the join on a detached
+    /// reaper thread instead.
+    pub fn stop_watcher_runtime_in_background(&self) {
+        if let Some(runtime) = self.watcher_thread.lock().take() {
+            self.app.watcher_stopped();
+            std::thread::spawn(move || runtime.shutdown_and_join());
+        }
+        *self.watcher_rx.lock() = None;
+        *self.watcher.lock() = None;
+    }
+
+    /// Process-scoped watcher count used by maintenance diagnostics and
+    /// regression tests. The count drops as soon as shutdown is requested.
+    pub fn watcher_registry_count(&self) -> usize {
+        self.app.watcher_count()
+    }
+
+    pub(crate) fn watcher_runtime_active(&self) -> bool {
+        self.watcher_thread.lock().is_some()
+    }
+
+    /// Return whether artifact eviction would discard work that still needs a
+    /// live handle. Callers use this as the single safety gate before clearing
+    /// resident stores and inspect caches.
+    pub fn artifact_eviction_blocked(&self) -> bool {
+        if crate::runtime_drain::any_build_in_flight(self)
+            || self.inspect_manager.tier2_any_in_flight()
+            || !self.bash_background.running_tasks().is_empty()
+            || !self.pending_callgraph_store_paths.lock().is_empty()
+            || !self.pending_search_index_paths.lock().is_empty()
+            || !self.pending_tier2_paths.lock().is_empty()
+            || !self.pending_semantic_index_paths.lock().is_empty()
+            || *self.pending_semantic_corpus_refresh.lock()
+        {
+            return true;
+        }
+
+        let search_has_pending_disk_changes = self
+            .search_index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(SearchIndex::has_pending_disk_changes);
+        search_has_pending_disk_changes
+    }
+
+    /// Drop idle root-scoped artifact handles. Persistent data remains on disk
+    /// and each command's existing lazy-open path recreates the handle later.
+    /// Returns false when an active build, bash task, inspect scan, or pending
+    /// disk update makes eviction unsafe.
+    pub fn evict_idle_artifacts(&self) -> bool {
+        if self.artifact_eviction_blocked() {
+            return false;
+        }
+
+        self.callgraph_store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.search_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.inspect_manager.evict_idle_caches();
+        self.reset_symbol_cache();
+        true
     }
 
     /// Access the LSP manager.
@@ -4490,6 +4636,44 @@ mod harness_path_tests {
         assert!(ctx.shared_artifacts_read_only());
         assert!(!ctx.callgraph_writer());
         assert!(ctx.inspect_writer());
+    }
+}
+
+#[cfg(test)]
+mod shared_db_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn app_contexts_share_one_database_connection() {
+        let storage = tempdir().expect("storage tempdir");
+        let root_one = tempdir().expect("first root tempdir");
+        let root_two = tempdir().expect("second root tempdir");
+        let app = App::default_shared();
+        let ctx_one = AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root_one.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let ctx_two = AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root_two.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let path = storage.path().join("aft.db");
+
+        let first = app.open_db(&path).expect("open shared database");
+        let second = app.open_db(&path).expect("reuse shared database");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(
+            &ctx_one.db().expect("first context database"),
+            &ctx_two.db().expect("second context database")
+        ));
     }
 }
 

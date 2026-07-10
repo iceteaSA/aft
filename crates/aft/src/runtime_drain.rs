@@ -1324,7 +1324,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_events: usize) -> Drai
 
     let mut watcher_status_changed = false;
     if root_deleted {
-        ctx.stop_watcher_runtime();
+        ctx.stop_watcher_runtime_in_background();
         let _ = ctx.add_degraded_reason("project_root_deleted".to_string());
         aft::slog_warn!(
             "project root deleted; dropping watcher to avoid delete-storm: {:?}",
@@ -1334,7 +1334,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_events: usize) -> Drai
         changed.clear();
         rescan_required = false;
     } else if let Some(error) = watcher_failed {
-        ctx.stop_watcher_runtime();
+        ctx.stop_watcher_runtime_in_background();
         let _ = ctx.add_degraded_reason("watcher_unavailable".to_string());
         aft::slog_warn!(
             "file watcher unavailable; continuing without live external-change invalidation: {}",

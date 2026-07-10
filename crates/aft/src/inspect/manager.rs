@@ -423,6 +423,19 @@ impl InspectManager {
             .unwrap_or(false)
     }
 
+    /// Release per-project inspect caches so their SQLite readers and writer
+    /// leases do not remain open after a root has gone idle. Callers must check
+    /// [`Self::tier2_any_in_flight`] first so a running scan never loses its
+    /// cache while it is being used.
+    pub fn evict_idle_caches(&self) {
+        if let Ok(mut caches) = self.caches.lock() {
+            caches.clear();
+        }
+        if let Ok(mut facts) = self.oxc_facts_cache.lock() {
+            *facts = OxcFactsCache::new();
+        }
+    }
+
     pub fn drain_completions(&self) -> usize {
         let mut drained = 0usize;
         while let Ok(result) = self.result_rx.try_recv() {

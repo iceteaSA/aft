@@ -249,6 +249,21 @@ fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
     install_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
 }
 
+/// Restore the watcher after an idle root released its runtime. Artifact stores
+/// are lazy by design, so the first request is the natural point to reattach
+/// external-change invalidation as well.
+pub(crate) fn ensure_project_watcher(ctx: &AppContext) {
+    if ctx.watcher_runtime_active() {
+        return;
+    }
+    let Some(root_path) = ctx.canonical_cache_root_opt() else {
+        return;
+    };
+    if root_path.exists() {
+        install_project_watcher(ctx, &root_path);
+    }
+}
+
 /// Backoff for build-level retries when the embedding backend is unreachable.
 /// Ramps 15s -> 30s -> 60s then holds at 60s. Keeps the retry cadence cheap
 /// (the build re-walks files each attempt) while recovering within a minute of
@@ -2782,15 +2797,16 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
         }
 
         let db_path = job.storage_root.join("aft.db");
-        match crate::db::open(&db_path) {
-            Ok(conn) => {
-                let shared = Arc::new(Mutex::new(conn));
-                ctx.set_db(shared.clone());
+        match ctx.app().open_db(&db_path) {
+            Ok(shared) => {
                 ctx.backup().lock().set_db_pool(shared.clone());
                 ctx.bash_background().set_db_pool(shared);
             }
             Err(err) => {
-                ctx.clear_db();
+                // Do not clear the process-shared handle if another root is
+                // already using it. A failed root configure must not close that
+                // root's SQLite connection and WAL descriptors.
+                ctx.app().clear_db_for_path(&db_path);
                 ctx.backup().lock().clear_db_pool();
                 ctx.bash_background().clear_db_pool();
                 slog_warn!(
