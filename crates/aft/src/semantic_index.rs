@@ -1456,6 +1456,104 @@ impl SemanticIndex {
         self.entries.len()
     }
 
+    /// Estimate resident semantic-index bytes from the vectors and metadata
+    /// actually held by each entry. This intentionally excludes allocator and
+    /// hash-table bucket overhead, which are not cheaply observable.
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        if self.entries.is_empty()
+            && self.file_mtimes.is_empty()
+            && self.file_sizes.is_empty()
+            && self.file_hashes.is_empty()
+            && self.deferred_files.is_empty()
+        {
+            return crate::memory::MemoryEstimate::estimated(0)
+                .count("entries", 0)
+                .count("dimensions", self.dimension)
+                .count("indexed_files", 0)
+                .count_u64("vector_bytes", 0)
+                .count_u64("text_bytes", 0)
+                .count_u64("metadata_bytes", 0)
+                .count_u64("average_text_bytes", 0)
+                .count_u64("average_metadata_bytes", 0);
+        }
+        let vector_bytes = self.entries.iter().fold(0u64, |bytes, entry| {
+            bytes.saturating_add(
+                crate::memory::usize_to_u64(entry.vector.len())
+                    .saturating_mul(std::mem::size_of::<f32>() as u64),
+            )
+        });
+        let text_bytes = self.entries.iter().fold(0u64, |bytes, entry| {
+            let chunk = &entry.chunk;
+            bytes
+                .saturating_add(crate::memory::path_bytes(&chunk.file))
+                .saturating_add(crate::memory::usize_to_u64(chunk.name.len()))
+                .saturating_add(
+                    chunk
+                        .qualified_name
+                        .as_ref()
+                        .map(|name| crate::memory::usize_to_u64(name.len()))
+                        .unwrap_or(0),
+                )
+                .saturating_add(crate::memory::usize_to_u64(chunk.embed_text.len()))
+                .saturating_add(crate::memory::usize_to_u64(chunk.snippet.len()))
+        });
+        let entry_metadata_bytes = crate::memory::usize_to_u64(self.entries.len())
+            .saturating_mul(std::mem::size_of::<EmbeddingEntry>() as u64);
+        let file_metadata_bytes = self
+            .file_mtimes
+            .keys()
+            .chain(self.file_sizes.keys())
+            .chain(self.file_hashes.keys())
+            .chain(self.deferred_files.iter())
+            .map(|path| crate::memory::path_bytes(path))
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(
+                crate::memory::usize_to_u64(self.file_mtimes.len())
+                    .saturating_mul(std::mem::size_of::<SystemTime>() as u64),
+            )
+            .saturating_add(
+                crate::memory::usize_to_u64(self.file_sizes.len())
+                    .saturating_mul(std::mem::size_of::<u64>() as u64),
+            )
+            .saturating_add(
+                crate::memory::usize_to_u64(self.file_hashes.len())
+                    .saturating_mul(std::mem::size_of::<blake3::Hash>() as u64),
+            );
+        let index_metadata_bytes = crate::memory::path_bytes(&self.project_root).saturating_add(
+            self.fingerprint
+                .as_ref()
+                .map(|fingerprint| {
+                    crate::memory::usize_to_u64(fingerprint.backend.len())
+                        .saturating_add(crate::memory::usize_to_u64(fingerprint.model.len()))
+                        .saturating_add(crate::memory::usize_to_u64(fingerprint.base_url.len()))
+                })
+                .unwrap_or(0),
+        );
+        let metadata_bytes = entry_metadata_bytes
+            .saturating_add(file_metadata_bytes)
+            .saturating_add(index_metadata_bytes);
+        let entry_count = crate::memory::usize_to_u64(self.entries.len());
+        crate::memory::MemoryEstimate::estimated(
+            vector_bytes
+                .saturating_add(text_bytes)
+                .saturating_add(metadata_bytes),
+        )
+        .count("entries", self.entries.len())
+        .count("dimensions", self.dimension)
+        .count("indexed_files", self.file_mtimes.len())
+        .count_u64("vector_bytes", vector_bytes)
+        .count_u64("text_bytes", text_bytes)
+        .count_u64("metadata_bytes", metadata_bytes)
+        .count_u64(
+            "average_text_bytes",
+            text_bytes.checked_div(entry_count).unwrap_or(0),
+        )
+        .count_u64(
+            "average_metadata_bytes",
+            metadata_bytes.checked_div(entry_count).unwrap_or(0),
+        )
+    }
+
     /// Number of files currently tracked by the semantic index.
     pub fn indexed_file_count(&self) -> usize {
         self.file_mtimes.len()
@@ -4078,6 +4176,34 @@ Connection: close
 
     fn test_project_root() -> PathBuf {
         std::env::current_dir().unwrap()
+    }
+
+    #[test]
+    fn semantic_memory_estimate_is_zero_when_empty_and_scales_with_entries() {
+        let root = test_project_root();
+        let mut index = SemanticIndex::new(root.clone(), 3);
+        assert_eq!(index.estimated_memory().estimated_bytes, Some(0));
+
+        let entry = |name: &str| EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: root.join(format!("{name}.rs")),
+                name: name.to_string(),
+                qualified_name: Some(format!("module::{name}")),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 1,
+                exported: true,
+                embed_text: format!("function {name} body"),
+                snippet: format!("fn {name}() {{}}"),
+            },
+            vector: vec![1.0, 2.0, 3.0],
+        };
+        index.entries.push(entry("one"));
+        let one_entry = index.estimated_memory().estimated_bytes.unwrap();
+        assert!(one_entry > 0);
+        index.entries.push(entry("two"));
+        let two_entries = index.estimated_memory().estimated_bytes.unwrap();
+        assert!(two_entries > one_entry);
     }
 
     fn set_file_metadata(index: &mut SemanticIndex, file: &Path, mtime: SystemTime, size: u64) {

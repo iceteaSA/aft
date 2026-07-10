@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use lsp_types::FileChangeType;
@@ -694,6 +694,9 @@ pub struct App {
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
     provider_factory: LanguageProviderFactory,
+    /// Weak actor references let status attribute process RSS across roots
+    /// without making the process-global App own per-root caches.
+    memory_contexts: parking_lot::Mutex<BTreeMap<PathBuf, Weak<AppContext>>>,
 }
 
 impl App {
@@ -704,6 +707,7 @@ impl App {
             lsp_child_registry: crate::lsp::child_registry::LspChildRegistry::new(),
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
             provider_factory,
+            memory_contexts: parking_lot::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -726,6 +730,37 @@ impl App {
 
     pub fn stdout_writer(&self) -> SharedStdoutWriter {
         Arc::clone(&self.stdout_writer)
+    }
+
+    pub(crate) fn register_memory_context(&self, root: PathBuf, ctx: &Arc<AppContext>) {
+        let mut contexts = self.memory_contexts.lock();
+        contexts.retain(|_, context| context.strong_count() > 0);
+        contexts.insert(root, Arc::downgrade(ctx));
+    }
+
+    pub(crate) fn unregister_memory_context(&self, root: &Path, ctx: &Arc<AppContext>) {
+        let mut contexts = self.memory_contexts.lock();
+        let removes_current = contexts
+            .get(root)
+            .and_then(Weak::upgrade)
+            .is_some_and(|registered| Arc::ptr_eq(&registered, ctx));
+        if removes_current {
+            contexts.remove(root);
+        }
+    }
+
+    /// Snapshot process roots without waiting behind actor registration. A busy
+    /// registry is surfaced as a named status gap by the memory snapshot.
+    pub(crate) fn try_memory_contexts(&self) -> Option<Vec<(PathBuf, Arc<AppContext>)>> {
+        let contexts = self.memory_contexts.try_lock()?;
+        Some(
+            contexts
+                .iter()
+                .filter_map(|(root, context)| {
+                    context.upgrade().map(|context| (root.clone(), context))
+                })
+                .collect(),
+        )
     }
 
     /// Return the process-shared database handle, opening it only when the
@@ -3971,6 +4006,100 @@ impl AppContext {
             "local_entries": entries,
             "warm_entries": 0,
         })
+    }
+
+    /// Build one root's memory estimate using only non-blocking lock attempts.
+    /// A contended subsystem is represented as `busy` rather than delaying the
+    /// status control path.
+    pub fn memory_root_snapshot(&self) -> crate::memory::RootMemorySnapshot {
+        let semantic = match self.semantic_index.try_read() {
+            Ok(index) => index
+                .as_ref()
+                .map(SemanticIndex::estimated_memory)
+                .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("entries", 0)),
+            Err(TryLockError::Poisoned(error)) => error
+                .into_inner()
+                .as_ref()
+                .map(SemanticIndex::estimated_memory)
+                .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("entries", 0)),
+            Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
+        };
+        let trigram = match self.search_index.try_read() {
+            Ok(index) => index
+                .as_ref()
+                .map(SearchIndex::estimated_memory)
+                .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("files", 0)),
+            Err(TryLockError::Poisoned(error)) => error
+                .into_inner()
+                .as_ref()
+                .map(SearchIndex::estimated_memory)
+                .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("files", 0)),
+            Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
+        };
+        let symbols = match self.symbol_cache.try_read() {
+            Ok(cache) => cache.estimated_memory(),
+            Err(TryLockError::Poisoned(error)) => error.into_inner().estimated_memory(),
+            Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
+        };
+        let callgraph = match self.callgraph_store.try_read() {
+            Ok(store) => store
+                .as_ref()
+                .map(|store| store.estimated_memory())
+                .unwrap_or_else(|| {
+                    crate::memory::MemoryEstimate::estimated(0).count("open_generation_handles", 0)
+                }),
+            Err(TryLockError::Poisoned(error)) => error
+                .into_inner()
+                .as_ref()
+                .map(|store| store.estimated_memory())
+                .unwrap_or_else(|| {
+                    crate::memory::MemoryEstimate::estimated(0).count("open_generation_handles", 0)
+                }),
+            Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
+        };
+        let inspect = self.inspect_manager.estimated_memory();
+        let bash = self.bash_background.estimated_memory();
+        let lsp = self
+            .lsp_manager
+            .try_lock()
+            .map(|lsp| lsp.estimated_memory())
+            .unwrap_or_else(crate::memory::MemoryEstimate::busy);
+        // AFT currently creates tree-sitter parsers per operation rather than
+        // retaining a parser pool. Keep that fact explicit instead of assigning
+        // a guessed byte size to tree-sitter internals.
+        let parser_pool = crate::memory::MemoryEstimate::not_estimated()
+            .count("pooled_parsers", 0)
+            .gap("tree_sitter_parser_bytes");
+        crate::memory::RootMemorySnapshot::new(
+            semantic,
+            trigram,
+            symbols,
+            callgraph,
+            inspect,
+            bash,
+            lsp,
+            parser_pool,
+        )
+    }
+
+    /// Attribute all actor roots registered in this process. Standalone mode
+    /// has no actor registry, so the current context is inserted directly.
+    pub fn memory_snapshot(&self, current_root: Option<&Path>) -> crate::memory::MemorySnapshot {
+        let mut roots = BTreeMap::new();
+        let (roots_status, contexts) = match self.app.try_memory_contexts() {
+            Some(contexts) => ("ready", contexts),
+            None => ("busy", Vec::new()),
+        };
+        for (root, context) in contexts {
+            roots.insert(root.display().to_string(), context.memory_root_snapshot());
+        }
+        let current_label = current_root
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "<unconfigured>".to_string());
+        roots
+            .entry(current_label)
+            .or_insert_with(|| self.memory_root_snapshot());
+        crate::memory::MemorySnapshot::new(roots_status, roots)
     }
 }
 

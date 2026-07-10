@@ -143,6 +143,75 @@ impl DiagnosticsStore {
         self.generation
     }
 
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let mut diagnostic_count = 0usize;
+        let entry_bytes = self
+            .entries
+            .iter()
+            .fold(0u64, |bytes, ((server, path), entry)| {
+                diagnostic_count = diagnostic_count.saturating_add(entry.diagnostics.len());
+                let diagnostics_bytes = entry.diagnostics.iter().fold(0u64, |bytes, diagnostic| {
+                    bytes
+                        .saturating_add(std::mem::size_of::<StoredDiagnostic>() as u64)
+                        .saturating_add(crate::memory::path_bytes(&diagnostic.file))
+                        .saturating_add(crate::memory::usize_to_u64(diagnostic.message.len()))
+                        .saturating_add(
+                            diagnostic
+                                .code
+                                .as_ref()
+                                .map(|code| crate::memory::usize_to_u64(code.len()))
+                                .unwrap_or(0),
+                        )
+                        .saturating_add(
+                            diagnostic
+                                .source
+                                .as_ref()
+                                .map(|source| crate::memory::usize_to_u64(source.len()))
+                                .unwrap_or(0),
+                        )
+                });
+                bytes
+                    .saturating_add(std::mem::size_of_val(server) as u64)
+                    .saturating_add(crate::memory::path_bytes(&server.root))
+                    .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+                    .saturating_add(crate::memory::path_bytes(path))
+                    .saturating_add(std::mem::size_of::<DiagnosticEntry>() as u64)
+                    .saturating_add(
+                        entry
+                            .result_id
+                            .as_ref()
+                            .map(|result_id| crate::memory::usize_to_u64(result_id.len()))
+                            .unwrap_or(0),
+                    )
+                    .saturating_add(diagnostics_bytes)
+            });
+        let order_bytes = self.order.iter().fold(0u64, |bytes, (server, path)| {
+            bytes
+                .saturating_add(std::mem::size_of_val(server) as u64)
+                .saturating_add(crate::memory::path_bytes(&server.root))
+                .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+                .saturating_add(crate::memory::path_bytes(path))
+        });
+        let publish_bytes =
+            self.last_publish_at_for_file
+                .iter()
+                .fold(0u64, |bytes, ((server, path), _)| {
+                    bytes
+                        .saturating_add(std::mem::size_of_val(server) as u64)
+                        .saturating_add(crate::memory::path_bytes(&server.root))
+                        .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+                        .saturating_add(crate::memory::path_bytes(path))
+                        .saturating_add(std::mem::size_of::<Instant>() as u64)
+                });
+        crate::memory::MemoryEstimate::estimated(
+            entry_bytes
+                .saturating_add(order_bytes)
+                .saturating_add(publish_bytes),
+        )
+        .count("diagnostic_entries", self.entries.len())
+        .count("diagnostics", diagnostic_count)
+    }
+
     /// The current LRU cap (0 = unbounded). Test-only accessor used to verify
     /// the `lsp.diagnostic_cache_size` config wiring.
     #[cfg(test)]
@@ -608,6 +677,27 @@ mod tests {
             code: None,
             source: None,
         }
+    }
+
+    #[test]
+    fn diagnostics_memory_estimate_is_zero_when_empty_and_nonzero_when_populated() {
+        let mut store = DiagnosticsStore::new();
+        assert_eq!(store.estimated_memory().estimated_bytes, Some(0));
+        let file = PathBuf::from("/tmp/memory.rs");
+        store.publish(
+            server_key(ServerKind::Rust),
+            file.clone(),
+            vec![diag(
+                file.to_str().unwrap(),
+                1,
+                "resident diagnostic message",
+                DiagnosticSeverity::Warning,
+            )],
+        );
+        let estimate = store.estimated_memory();
+        assert!(estimate.estimated_bytes.unwrap() > 0);
+        assert_eq!(estimate.counts["diagnostic_entries"], 1);
+        assert_eq!(estimate.counts["diagnostics"], 1);
     }
 
     #[test]

@@ -53,6 +53,16 @@ impl DocumentStore {
         }
     }
 
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let bytes = self.entries.keys().fold(0u64, |bytes, path| {
+            bytes
+                .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+                .saturating_add(std::mem::size_of::<DocumentEntry>() as u64)
+                .saturating_add(crate::memory::path_bytes(path))
+        });
+        crate::memory::MemoryEstimate::estimated(bytes).count("documents", self.entries.len())
+    }
+
     /// Check if a document is already opened (tracked).
     pub fn is_open(&self, path: &Path) -> bool {
         self.entries.contains_key(path)
@@ -200,6 +210,16 @@ mod tests {
         let advanced = modified.checked_add(duration).expect("advanced mtime");
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(advanced))
             .expect("set advanced mtime");
+    }
+
+    #[test]
+    fn document_memory_estimate_is_zero_when_empty_and_nonzero_when_populated() {
+        let mut store = DocumentStore::new();
+        assert_eq!(store.estimated_memory().estimated_bytes, Some(0));
+        store.open(PathBuf::from("/tmp/aft-document-memory"));
+        let estimate = store.estimated_memory();
+        assert!(estimate.estimated_bytes.unwrap() > 0);
+        assert_eq!(estimate.counts["documents"], 1);
     }
 
     #[test]

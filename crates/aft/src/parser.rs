@@ -953,6 +953,34 @@ pub struct SymbolCache {
 
 pub type SharedSymbolCache = Arc<RwLock<SymbolCache>>;
 
+fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
+    symbols.iter().fold(0u64, |bytes, symbol| {
+        let scope_bytes = symbol.scope_chain.iter().fold(0u64, |scope_bytes, scope| {
+            scope_bytes
+                .saturating_add(std::mem::size_of::<String>() as u64)
+                .saturating_add(crate::memory::usize_to_u64(scope.len()))
+        });
+        bytes
+            .saturating_add(std::mem::size_of::<Symbol>() as u64)
+            .saturating_add(crate::memory::usize_to_u64(symbol.name.len()))
+            .saturating_add(
+                symbol
+                    .signature
+                    .as_ref()
+                    .map(|signature| crate::memory::usize_to_u64(signature.len()))
+                    .unwrap_or(0),
+            )
+            .saturating_add(scope_bytes)
+            .saturating_add(
+                symbol
+                    .parent
+                    .as_ref()
+                    .map(|parent| crate::memory::usize_to_u64(parent.len()))
+                    .unwrap_or(0),
+            )
+    })
+}
+
 impl SymbolCache {
     pub fn new() -> Self {
         Self {
@@ -1139,6 +1167,37 @@ impl SymbolCache {
     /// Number of cached entries.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Estimate the resident hot symbol map from cached paths and the strings
+    /// owned by each symbol. Tree-sitter parse trees are request-local and are
+    /// therefore not part of this long-lived cache estimate.
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        if self.entries.is_empty() {
+            return crate::memory::MemoryEstimate::estimated(0)
+                .count("entries", 0)
+                .count("symbols", 0);
+        }
+        let entry_bytes = self.entries.iter().fold(0u64, |bytes, (path, cached)| {
+            bytes
+                .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+                .saturating_add(crate::memory::path_bytes(path))
+                .saturating_add(std::mem::size_of::<CachedSymbols>() as u64)
+                .saturating_add(symbols_estimated_bytes(&cached.symbols))
+        });
+        let project_root_bytes = self
+            .project_root
+            .as_deref()
+            .map(crate::memory::path_bytes)
+            .unwrap_or(0);
+        let symbol_count = self
+            .entries
+            .values()
+            .map(|cached| cached.symbols.len())
+            .fold(0usize, usize::saturating_add);
+        crate::memory::MemoryEstimate::estimated(entry_bytes.saturating_add(project_root_bytes))
+            .count("entries", self.entries.len())
+            .count("symbols", symbol_count)
     }
 
     pub(crate) fn project_root(&self) -> Option<PathBuf> {
@@ -7757,6 +7816,23 @@ mod tests {
             exported: true,
             parent: None,
         }
+    }
+
+    #[test]
+    fn symbol_memory_estimate_is_zero_when_empty_and_nonzero_when_populated() {
+        let mut cache = SymbolCache::new();
+        assert_eq!(cache.estimated_memory().estimated_bytes, Some(0));
+        cache.insert(
+            PathBuf::from("src/lib.rs"),
+            SystemTime::UNIX_EPOCH,
+            10,
+            cache_freshness::zero_hash(),
+            vec![test_symbol("memory_estimate")],
+        );
+        let estimate = cache.estimated_memory();
+        assert!(estimate.estimated_bytes.unwrap() > 0);
+        assert_eq!(estimate.counts["entries"], 1);
+        assert_eq!(estimate.counts["symbols"], 1);
     }
 
     #[test]

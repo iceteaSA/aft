@@ -277,16 +277,22 @@ impl Executor {
     /// rather than replacing the per-root [`AppContext`]. Returns `true` when a
     /// new actor was inserted.
     pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<AppContext>) -> bool {
+        let memory_root = root_id.as_path().to_path_buf();
         let inserted = {
             let mut state = self.inner.state.lock();
             if state.actors.contains_key(&root_id) {
                 false
             } else {
                 state.actor_order.push(root_id.clone());
-                state.actors.insert(root_id, ActorState::new(ctx));
+                state
+                    .actors
+                    .insert(root_id, ActorState::new(Arc::clone(&ctx)));
                 true
             }
         };
+        if inserted {
+            ctx.app().register_memory_context(memory_root, &ctx);
+        }
         self.wake_scheduler();
         inserted
     }
@@ -304,6 +310,12 @@ impl Executor {
             state.actor_order.retain(|actor_root| actor_root != root_id);
             state.actors.remove(root_id)
         };
+        if let Some(actor) = removed.as_ref() {
+            actor
+                .ctx
+                .app()
+                .unregister_memory_context(root_id.as_path(), &actor.ctx);
+        }
         drop(removed);
         self.wake_scheduler();
     }

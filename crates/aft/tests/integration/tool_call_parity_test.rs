@@ -446,6 +446,12 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
             }
         }
         Value::Object(map) => {
+            // Memory attribution is sampled independently in the direct and
+            // tool_call processes. Preserve its schema/status fields while
+            // masking every volatile byte/count number.
+            if let Some(memory) = map.get_mut("memory") {
+                mask_memory_snapshot(memory);
+            }
             // These fields are intentionally volatile: grep reports wall-clock timing,
             // backup ids are per-operation identifiers, cache keys derive from the
             // temporary root path, and `tier2_last_run` is a wall-clock unix-seconds
@@ -475,6 +481,28 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn mask_memory_snapshot(memory: &mut Value) {
+    if let Some(roots) = memory.get_mut("roots").and_then(Value::as_object_mut) {
+        let values = std::mem::take(roots)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        for (index, value) in values.into_iter().enumerate() {
+            roots.insert(format!("<memory_root_{index}>"), value);
+        }
+    }
+    mask_memory_numbers(memory);
+}
+
+fn mask_memory_numbers(value: &mut Value) {
+    match value {
+        Value::Number(_) => *value = Value::String("<memory_number>".to_string()),
+        Value::Array(values) => values.iter_mut().for_each(mask_memory_numbers),
+        Value::Object(values) => values.values_mut().for_each(mask_memory_numbers),
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
     }
 }
 
@@ -521,6 +549,13 @@ fn normalize_text(text: &str, project_root: &Path, cache_dir: &Path) -> String {
     // differ per process — same class as the envelope-level masking above.
     for key in ["project_key", "manifest_path", "owner_project_scope_key"] {
         normalized = mask_json_string_value(&normalized, key);
+    }
+    // The status formatter appends a compact memory block after the stable
+    // pretty-printed status JSON. RSS, estimates, counts, and transient busy
+    // states can all differ between the two parity processes.
+    if let Some(memory_start) = normalized.find("\n\nMemory:") {
+        normalized.truncate(memory_start);
+        normalized.push_str("\n\n<MEMORY>");
     }
     normalized
 }

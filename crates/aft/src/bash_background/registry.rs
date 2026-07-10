@@ -150,6 +150,40 @@ struct RecoveryContext {
     include_stderr_path: bool,
 }
 
+fn optional_string_bytes(value: Option<&String>) -> u64 {
+    value
+        .map(|value| crate::memory::usize_to_u64(value.len()))
+        .unwrap_or(0)
+}
+
+fn terminal_output_cache_estimated_bytes(cache: &TerminalOutputCache) -> u64 {
+    let recovery_bytes = cache
+        .recovery
+        .as_ref()
+        .map(|recovery| {
+            crate::memory::usize_to_u64(recovery.dropped_by_class.len())
+                .saturating_mul(
+                    (std::mem::size_of::<DropClass>() + std::mem::size_of::<usize>()) as u64,
+                )
+                .saturating_add(optional_string_bytes(recovery.output_path.as_ref()))
+                .saturating_add(optional_string_bytes(recovery.stderr_path.as_ref()))
+        })
+        .unwrap_or(0);
+    (std::mem::size_of::<TerminalOutputCache>() as u64)
+        .saturating_add(crate::memory::usize_to_u64(cache.output_preview.len()))
+        .saturating_add(optional_string_bytes(cache.output_path.as_ref()))
+        .saturating_add(optional_string_bytes(cache.stderr_path.as_ref()))
+        .saturating_add(recovery_bytes)
+}
+
+fn completion_estimated_bytes(completion: &BgCompletion) -> u64 {
+    (std::mem::size_of::<BgCompletion>() as u64)
+        .saturating_add(crate::memory::usize_to_u64(completion.task_id.len()))
+        .saturating_add(crate::memory::usize_to_u64(completion.session_id.len()))
+        .saturating_add(crate::memory::usize_to_u64(completion.command.len()))
+        .saturating_add(crate::memory::usize_to_u64(completion.output_preview.len()))
+}
+
 impl RecoveryContext {
     fn has_visible_drop(&self) -> bool {
         self.byte_truncated
@@ -2740,6 +2774,47 @@ impl BgTaskRegistry {
         })
     }
 
+    /// Estimate resident bash output caches without reading disk-backed task
+    /// streams. Spill files are deliberately excluded because they do not
+    /// occupy the daemon heap.
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let tasks = match self.inner.tasks.try_lock() {
+            Ok(tasks) => tasks.values().cloned().collect::<Vec<_>>(),
+            Err(_) => return crate::memory::MemoryEstimate::busy(),
+        };
+        let mut bytes = 0u64;
+        let mut terminal_output_caches = 0usize;
+        let mut sessions = HashSet::new();
+        for task in &tasks {
+            sessions.insert(task.session_id.clone());
+            let state = match task.state.try_lock() {
+                Ok(state) => state,
+                Err(_) => return crate::memory::MemoryEstimate::busy(),
+            };
+            if let Some(cache) = state.terminal_output_cache.as_ref() {
+                terminal_output_caches = terminal_output_caches.saturating_add(1);
+                bytes = bytes.saturating_add(terminal_output_cache_estimated_bytes(cache));
+            }
+        }
+        let completion_count = match self.inner.completions.try_lock() {
+            Ok(completions) => {
+                for completion in completions.iter() {
+                    sessions.insert(completion.session_id.clone());
+                    bytes = bytes.saturating_add(completion_estimated_bytes(completion));
+                }
+                completions.len()
+            }
+            Err(_) => return crate::memory::MemoryEstimate::busy(),
+        };
+
+        crate::memory::MemoryEstimate::estimated(bytes)
+            .count("tasks", tasks.len())
+            .count("sessions", sessions.len())
+            .count("terminal_output_caches", terminal_output_caches)
+            .count("completion_caches", completion_count)
+            .count_u64("output_ring_bytes", 0)
+    }
+
     fn running_count(&self) -> usize {
         self.inner
             .tasks
@@ -4058,6 +4133,33 @@ mod tests {
     const LONG_RUNNING_COMMAND: &str = "sleep 5";
     #[cfg(windows)]
     const LONG_RUNNING_COMMAND: &str = "cmd /c timeout /t 5 /nobreak > nul";
+
+    #[test]
+    fn bash_memory_estimate_is_zero_when_empty_and_nonzero_for_completion_cache() {
+        let registry = BgTaskRegistry::default();
+        assert_eq!(registry.estimated_memory().estimated_bytes, Some(0));
+        registry
+            .inner
+            .completions
+            .lock()
+            .unwrap()
+            .push_back(BgCompletion {
+                task_id: "bash-memory".to_string(),
+                session_id: "session-memory".to_string(),
+                status: BgTaskStatus::Completed,
+                exit_code: Some(0),
+                command: "printf memory".to_string(),
+                output_preview: "resident completion output".to_string(),
+                output_truncated: false,
+                original_tokens: None,
+                compressed_tokens: None,
+                tokens_skipped: false,
+            });
+        let estimate = registry.estimated_memory();
+        assert!(estimate.estimated_bytes.unwrap() > 0);
+        assert_eq!(estimate.counts["completion_caches"], 1);
+        assert_eq!(estimate.counts["sessions"], 1);
+    }
 
     #[test]
     fn gh_structured_detection_rejects_piped_commands() {

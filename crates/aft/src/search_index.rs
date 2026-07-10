@@ -184,7 +184,139 @@ impl SearchIndex {
 
     /// Number of unique trigrams in the combined base index and delta postings.
     pub fn trigram_count(&self) -> usize {
-        self.snapshot().trigram_count()
+        let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
+        let Some(base) = &self.base else {
+            return self.delta_postings.len();
+        };
+        base_count
+            + self
+                .delta_postings
+                .keys()
+                .filter(|trigram| base.lookup_entry(**trigram).is_none())
+                .count()
+    }
+
+    /// Estimate resident trigram-index bytes. Base posting lists stay on disk
+    /// and are read with `pread`; only the resident base lookup table, delta
+    /// postings, superseded mask, and file tables are included here.
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let Ok(compaction) = self.compaction_state.try_lock() else {
+            return crate::memory::MemoryEstimate::busy();
+        };
+        if self.base.is_none()
+            && self.delta_postings.is_empty()
+            && self.delta_file_trigrams.is_empty()
+            && self.files.is_empty()
+            && self.path_to_id.is_empty()
+            && self.file_trigram_count.is_empty()
+            && self.unindexed_files.is_empty()
+            && self.superseded.is_empty()
+            && compaction.buffered_paths.is_empty()
+        {
+            return crate::memory::MemoryEstimate::estimated(0)
+                .count("files", 0)
+                .count("delta_trigrams", 0)
+                .count("delta_postings", 0)
+                .count("superseded_files", 0)
+                .count("unindexed_files", 0)
+                .count("base_lookup_entries", 0)
+                .count_u64("delta_packed_bytes", 0)
+                .count_u64("base_postings_resident_bytes", 0);
+        }
+        let delta_posting_count = self
+            .delta_postings
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let delta_postings_bytes = crate::memory::usize_to_u64(delta_posting_count)
+            .saturating_mul(std::mem::size_of::<Posting>() as u64)
+            .saturating_add(
+                crate::memory::usize_to_u64(self.delta_postings.len())
+                    .saturating_mul(std::mem::size_of::<u32>() as u64),
+            );
+        let delta_file_trigram_count = self
+            .delta_file_trigrams
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let delta_file_table_bytes = crate::memory::usize_to_u64(delta_file_trigram_count)
+            .saturating_mul(std::mem::size_of::<u32>() as u64)
+            .saturating_add(
+                crate::memory::usize_to_u64(self.delta_file_trigrams.len())
+                    .saturating_mul(std::mem::size_of::<u32>() as u64),
+            );
+        let files_bytes = crate::memory::usize_to_u64(self.files.len())
+            .saturating_mul(std::mem::size_of::<FileEntry>() as u64)
+            .saturating_add(
+                self.files
+                    .iter()
+                    .map(|entry| crate::memory::path_bytes(&entry.path))
+                    .fold(0u64, u64::saturating_add),
+            );
+        let path_table_bytes = self.path_to_id.iter().fold(0u64, |bytes, (path, _)| {
+            bytes
+                .saturating_add(std::mem::size_of::<u32>() as u64)
+                .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+                .saturating_add(crate::memory::path_bytes(path))
+        });
+        let file_count_table_bytes = crate::memory::usize_to_u64(self.file_trigram_count.len())
+            .saturating_mul(std::mem::size_of::<u32>() as u64);
+        let masks_bytes = crate::memory::usize_to_u64(
+            self.superseded
+                .len()
+                .saturating_add(self.unindexed_files.len()),
+        )
+        .saturating_mul(std::mem::size_of::<u32>() as u64);
+        let base_lookup_bytes = self
+            .base
+            .as_ref()
+            .map(|base| {
+                crate::memory::usize_to_u64(base.lookup.len())
+                    .saturating_mul(std::mem::size_of::<LookupEntry>() as u64)
+            })
+            .unwrap_or(0);
+        let compaction_bytes = compaction
+            .buffered_paths
+            .iter()
+            .map(|path| {
+                (std::mem::size_of::<PathBuf>() as u64)
+                    .saturating_add(crate::memory::path_bytes(path))
+            })
+            .fold(0u64, u64::saturating_add);
+        let metadata_bytes = crate::memory::path_bytes(&self.project_root)
+            .saturating_add(
+                self.git_head
+                    .as_ref()
+                    .map(|head| crate::memory::usize_to_u64(head.len()))
+                    .unwrap_or(0),
+            )
+            .saturating_add(crate::memory::usize_to_u64(
+                self.ignore_rules_fingerprint.len(),
+            ));
+        let estimated_bytes = delta_postings_bytes
+            .saturating_add(delta_file_table_bytes)
+            .saturating_add(files_bytes)
+            .saturating_add(path_table_bytes)
+            .saturating_add(file_count_table_bytes)
+            .saturating_add(masks_bytes)
+            .saturating_add(base_lookup_bytes)
+            .saturating_add(compaction_bytes)
+            .saturating_add(metadata_bytes);
+        crate::memory::MemoryEstimate::estimated(estimated_bytes)
+            .count("files", self.files.len())
+            .count("delta_trigrams", self.delta_postings.len())
+            .count("delta_postings", delta_posting_count)
+            .count("superseded_files", self.superseded.len())
+            .count("unindexed_files", self.unindexed_files.len())
+            .count(
+                "base_lookup_entries",
+                self.base
+                    .as_ref()
+                    .map(|base| base.lookup.len())
+                    .unwrap_or(0),
+            )
+            .count_u64("delta_packed_bytes", self.delta_packed_bytes as u64)
+            .count_u64("base_postings_resident_bytes", 0)
     }
 
     /// True when `write_to_disk` would persist changes beyond the current base.
@@ -4401,6 +4533,17 @@ mod tests {
         let root = fs::canonicalize(&project).expect("canonicalize project");
 
         assert!(cached_path_under_root(&root, Path::new("link/secret.txt")).is_none());
+    }
+
+    #[test]
+    fn trigram_memory_estimate_is_zero_when_empty_and_nonzero_when_populated() {
+        let mut index = SearchIndex::new();
+        assert_eq!(index.estimated_memory().estimated_bytes, Some(0));
+        index.index_file(Path::new("memory-estimate.rs"), b"fn memory_estimate() {}");
+        let estimate = index.estimated_memory();
+        assert!(estimate.estimated_bytes.unwrap() > 0);
+        assert!(estimate.counts["delta_postings"] > 0);
+        assert_eq!(estimate.counts["base_postings_resident_bytes"], 0);
     }
 
     #[test]

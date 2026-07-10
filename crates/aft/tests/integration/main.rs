@@ -98,6 +98,7 @@ mod staging_cleanup_test;
 mod state_commands_test;
 mod status_compression_test;
 mod status_disk_scope_test;
+mod status_memory_test;
 mod subc_bridge_test;
 mod subc_plumbing_drift_test;
 #[cfg(unix)]

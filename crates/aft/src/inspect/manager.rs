@@ -476,6 +476,43 @@ impl InspectManager {
         }
     }
 
+    /// Estimate inspect's resident aggregate maps without waiting on active
+    /// scans. SQLite internals and OXC fact payload bytes are not observable
+    /// cheaply, so their open-handle/entry counts remain explicit gaps.
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let caches = match self.caches.try_lock() {
+            Ok(caches) => caches.values().cloned().collect::<Vec<_>>(),
+            Err(_) => return crate::memory::MemoryEstimate::busy(),
+        };
+        let facts_entries = match self.oxc_facts_cache.try_lock() {
+            Ok(facts) => facts.len(),
+            Err(_) => return crate::memory::MemoryEstimate::busy(),
+        };
+        let mut bytes = 0u64;
+        let mut memory_aggregates = 0u64;
+        for cache in &caches {
+            let estimate = cache.estimated_memory();
+            let Some(cache_bytes) = estimate.estimated_bytes else {
+                return crate::memory::MemoryEstimate::busy();
+            };
+            bytes = bytes.saturating_add(cache_bytes);
+            memory_aggregates = memory_aggregates.saturating_add(
+                estimate
+                    .counts
+                    .get("memory_aggregates")
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }
+        crate::memory::MemoryEstimate::partial(bytes)
+            .count("open_generation_handles", caches.len())
+            .count("oxc_fact_entries", facts_entries)
+            .count_u64("memory_aggregates", memory_aggregates)
+            .gap("sqlite_internal_bytes")
+            .gap("prepared_statement_cache_entries")
+            .gap("oxc_fact_bytes")
+    }
+
     pub fn drain_completions(&self) -> usize {
         let mut drained = 0usize;
         while let Ok(result) = self.result_rx.try_recv() {

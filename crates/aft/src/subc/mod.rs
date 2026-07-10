@@ -484,6 +484,44 @@ fn due_maintenance_jobs(
     (jobs, deferred)
 }
 
+fn eviction_estimate_label(estimate: &crate::memory::MemoryEstimate) -> String {
+    match estimate.estimated_bytes {
+        Some(bytes) => format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+        None if estimate.status == "busy" => "busy".to_string(),
+        None => "not estimated".to_string(),
+    }
+}
+
+fn idle_root_eviction_message(
+    root_id: &ProjectRootId,
+    memory: &crate::memory::RootMemorySnapshot,
+) -> String {
+    // Semantic, bash, LSP, and parser state remain resident. The freed total is
+    // deliberately only the known-byte portion of handles eviction actually drops.
+    let freed_bytes = [
+        &memory.trigram,
+        &memory.symbols,
+        &memory.callgraph,
+        &memory.inspect,
+    ]
+    .iter()
+    .filter_map(|estimate| estimate.estimated_bytes)
+    .fold(0u64, u64::saturating_add);
+    format!(
+        "evicted idle root {}: freed ~{:.1} MB (semantic {} retained, trigram {}, symbols {}, callgraph {}, inspect {}, bash {} retained, lsp {} retained, parser_pool {} retained)",
+        root_id.as_path().display(),
+        freed_bytes as f64 / (1024.0 * 1024.0),
+        eviction_estimate_label(&memory.semantic),
+        eviction_estimate_label(&memory.trigram),
+        eviction_estimate_label(&memory.symbols),
+        eviction_estimate_label(&memory.callgraph),
+        eviction_estimate_label(&memory.inspect),
+        eviction_estimate_label(&memory.bash),
+        eviction_estimate_label(&memory.lsp),
+        eviction_estimate_label(&memory.parser_pool),
+    )
+}
+
 /// Reap root-scoped resources from the existing subc maintenance loop. The
 /// actor remains registered so a bound route can continue to receive requests;
 /// only disposable handles are cleared and the next request reopens them.
@@ -518,6 +556,10 @@ fn reap_idle_roots(
         let Some(ctx) = executor.actor_context(&root_id) else {
             continue;
         };
+        if ctx.artifact_eviction_blocked() {
+            continue;
+        }
+        let memory_before = ctx.memory_root_snapshot();
         if !ctx.evict_idle_artifacts() {
             continue;
         }
@@ -529,10 +571,7 @@ fn reap_idle_roots(
             meta.idle_artifacts_evicted = true;
         }
         reaped += 1;
-        log::info!(
-            "subc attach: evicted idle root artifacts for {}",
-            root_id.as_path().display()
-        );
+        log::info!("{}", idle_root_eviction_message(&root_id, &memory_before));
     }
     reaped
 }
@@ -3583,6 +3622,14 @@ mod tests {
         let mut meta = RootMeta::new(Instant::now());
         meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
         live_roots.insert(root.clone(), meta);
+
+        let message = idle_root_eviction_message(&root, &ctx.memory_root_snapshot());
+        assert!(message.contains("evicted idle root"));
+        assert!(message.contains("freed ~"));
+        assert!(message.contains("semantic"));
+        assert!(message.contains("trigram"));
+        assert!(message.contains("bash"));
+        assert!(message.contains("parser_pool"));
 
         assert_eq!(
             reap_idle_roots(Instant::now(), &mut live_roots, &HashMap::new(), &executor),

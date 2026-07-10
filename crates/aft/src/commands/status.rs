@@ -45,13 +45,10 @@ impl AppContext {
     pub fn build_status_snapshot_for_session(&self, session_id: &str) -> StatusPayload {
         let config = self.config();
 
-        // Search index status
-        let search_index_info = {
-            let index = self
-                .search_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match index.as_ref() {
+        // Search index status. Status is a control-path snapshot, so lock
+        // pressure is represented directly instead of delaying the caller.
+        let search_index_info = match self.search_index().try_read() {
+            Ok(index) => match index.as_ref() {
                 Some(idx) if idx.ready => {
                     let file_count = idx.file_count();
                     let trigram_count = idx.trigram_count();
@@ -70,78 +67,80 @@ impl AppContext {
                     };
                     serde_json::json!({ "status": status })
                 }
-            }
+            },
+            Err(_) => serde_json::json!({ "status": "busy" }),
         };
 
-        // Semantic index status
-        let semantic_index_info = {
-            let status = self
-                .semantic_index_status()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let refreshing_count = status.refreshing_count();
-            let index = self
-                .semantic_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match index.as_ref() {
-                Some(idx) => {
-                    let status_label = match status {
-                        SemanticIndexStatus::Ready { .. } => "ready",
-                        _ => idx.status_label(),
-                    };
-                    serde_json::json!({
-                        "status": status_label,
-                        "state": status_label,
-                        "refreshing_count": refreshing_count,
-                        "entries": idx.entry_count(),
-                        "dimension": idx.dimension(),
-                        "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
-                        "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
-                    })
+        let semantic_status = self
+            .semantic_index_status()
+            .try_read()
+            .ok()
+            .map(|status| status.clone());
+        let semantic_index_info = match semantic_status {
+            None => serde_json::json!({ "status": "busy", "state": "busy" }),
+            Some(status) => match self.semantic_index().try_read() {
+                Err(_) => serde_json::json!({ "status": "busy", "state": "busy" }),
+                Ok(index) => {
+                    let refreshing_count = status.refreshing_count();
+                    match index.as_ref() {
+                        Some(idx) => {
+                            let status_label = match status {
+                                SemanticIndexStatus::Ready { .. } => "ready",
+                                _ => idx.status_label(),
+                            };
+                            serde_json::json!({
+                                "status": status_label,
+                                "state": status_label,
+                                "refreshing_count": refreshing_count,
+                                "entries": idx.entry_count(),
+                                "dimension": idx.dimension(),
+                                "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
+                                "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
+                            })
+                        }
+                        None => match status {
+                            SemanticIndexStatus::Disabled => serde_json::json!({
+                                "status": "disabled",
+                                "state": "disabled",
+                                "refreshing_count": 0,
+                                "backend": config.semantic_backend_label(),
+                                "model": config.semantic.model.as_str(),
+                            }),
+                            SemanticIndexStatus::Building {
+                                stage,
+                                files,
+                                entries_done,
+                                entries_total,
+                            } => serde_json::json!({
+                                "status": "loading",
+                                "state": "loading",
+                                "refreshing_count": 0,
+                                "stage": stage,
+                                "files": files,
+                                "entries_done": entries_done,
+                                "entries_total": entries_total,
+                                "backend": config.semantic_backend_label(),
+                                "model": config.semantic.model.as_str(),
+                            }),
+                            SemanticIndexStatus::Ready { refreshing, .. } => serde_json::json!({
+                                "status": "ready",
+                                "state": "ready",
+                                "refreshing_count": refreshing.len(),
+                                "backend": config.semantic_backend_label(),
+                                "model": config.semantic.model.as_str(),
+                            }),
+                            SemanticIndexStatus::Failed(error) => serde_json::json!({
+                                "status": "failed",
+                                "state": "failed",
+                                "refreshing_count": 0,
+                                "error": error,
+                                "backend": config.semantic_backend_label(),
+                                "model": config.semantic.model.as_str(),
+                            }),
+                        },
+                    }
                 }
-                None => match status {
-                    SemanticIndexStatus::Disabled => serde_json::json!({
-                        "status": "disabled",
-                        "state": "disabled",
-                        "refreshing_count": 0,
-                        "backend": config.semantic_backend_label(),
-                        "model": config.semantic.model.as_str(),
-                    }),
-                    SemanticIndexStatus::Building {
-                        stage,
-                        files,
-                        entries_done,
-                        entries_total,
-                    } => serde_json::json!({
-                        "status": "loading",
-                        "state": "loading",
-                        "refreshing_count": 0,
-                        "stage": stage,
-                        "files": files,
-                        "entries_done": entries_done,
-                        "entries_total": entries_total,
-                        "backend": config.semantic_backend_label(),
-                        "model": config.semantic.model.as_str(),
-                    }),
-                    SemanticIndexStatus::Ready { refreshing, .. } => serde_json::json!({
-                        "status": "ready",
-                        "state": "ready",
-                        "refreshing_count": refreshing.len(),
-                        "backend": config.semantic_backend_label(),
-                        "model": config.semantic.model.as_str(),
-                    }),
-                    SemanticIndexStatus::Failed(error) => serde_json::json!({
-                        "status": "failed",
-                        "state": "failed",
-                        "refreshing_count": 0,
-                        "error": error,
-                        "backend": config.semantic_backend_label(),
-                        "model": config.semantic.model.as_str(),
-                    }),
-                },
-            }
+            },
         };
 
         // Disk cache sizes — scoped to the **current project** only.
@@ -258,6 +257,11 @@ impl AppContext {
             }),
             None => serde_json::Value::Null,
         };
+        let memory_root = self
+            .canonical_cache_root_opt()
+            .or_else(|| config.project_root.clone());
+        let memory = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
+            .unwrap_or(serde_json::Value::Null);
 
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -282,6 +286,7 @@ impl AppContext {
             "disk": disk_info,
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
+            "memory": memory,
             "compression": compression,
             "storage_dir": storage_dir,
             // Project-wide (all sessions): total in-memory checkpoint count.
@@ -394,6 +399,18 @@ mod tests {
         ctx.set_cache_role(true, None);
         let response = handle_status(&request(), &ctx);
         assert_eq!(response.data["cache_role"], "worktree");
+    }
+
+    #[test]
+    fn memory_snapshot_reports_contended_subsystem_as_busy() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let _semantic_writer = ctx.semantic_index().write().unwrap();
+        let status = ctx.build_status_snapshot();
+        assert_eq!(status["semantic_index"]["status"], "busy");
+        assert_eq!(
+            status["memory"]["roots"]["<unconfigured>"]["semantic"]["status"],
+            "busy"
+        );
     }
 
     #[test]

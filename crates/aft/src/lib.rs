@@ -86,6 +86,7 @@ pub mod log_ctx;
 pub mod logging;
 pub mod lsp;
 pub mod lsp_hints;
+pub mod memory;
 pub mod migrate_storage;
 pub mod parser;
 pub mod patch;

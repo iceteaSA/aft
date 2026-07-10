@@ -372,6 +372,52 @@ pub struct ReadonlyInspectCache {
     inner: InspectCache,
 }
 
+impl InspectCache {
+    /// Estimate only the in-process aggregate map. SQLite connection and
+    /// prepared-statement internals remain named gaps rather than fabricated
+    /// byte values.
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let memory = match self.memory.try_read() {
+            Ok(memory) => memory,
+            Err(_) => return crate::memory::MemoryEstimate::busy(),
+        };
+        if memory.is_empty() {
+            return crate::memory::MemoryEstimate::partial(0)
+                .count("memory_aggregates", 0)
+                .count("open_generation_handles", 1)
+                .gap("sqlite_internal_bytes")
+                .gap("prepared_statement_cache_entries");
+        }
+        let aggregate_bytes = memory.iter().fold(0u64, |bytes, (key, aggregate)| {
+            bytes
+                .saturating_add(std::mem::size_of::<JobKey>() as u64)
+                .saturating_add(
+                    key.scope_hash
+                        .as_ref()
+                        .map(|hash| crate::memory::usize_to_u64(hash.len()))
+                        .unwrap_or(0),
+                )
+                .saturating_add(std::mem::size_of::<MemoryAggregate>() as u64)
+                .saturating_add(crate::memory::estimated_json_bytes(&aggregate.payload))
+                .saturating_add(
+                    aggregate
+                        .contribution_set_hash
+                        .as_ref()
+                        .map(|hash| crate::memory::usize_to_u64(hash.len()))
+                        .unwrap_or(0),
+                )
+        });
+        let metadata_bytes = crate::memory::path_bytes(&self.project_root)
+            .saturating_add(crate::memory::usize_to_u64(self.project_key.len()))
+            .saturating_add(crate::memory::path_bytes(&self.sqlite_path));
+        crate::memory::MemoryEstimate::partial(aggregate_bytes.saturating_add(metadata_bytes))
+            .count("memory_aggregates", memory.len())
+            .count("open_generation_handles", 1)
+            .gap("sqlite_internal_bytes")
+            .gap("prepared_statement_cache_entries")
+    }
+}
+
 pub trait InspectCacheRead {
     fn get_aggregated_for_config(
         &self,
@@ -2358,5 +2404,31 @@ mod tests {
             .unwrap();
 
         assert_ne!(without_mirrors, with_mirrors);
+    }
+}
+
+#[cfg(test)]
+mod memory_estimate_tests {
+    use super::*;
+
+    #[test]
+    fn inspect_memory_estimate_is_zero_when_empty_and_nonzero_when_populated() {
+        let root = tempfile::tempdir().expect("project root");
+        let project_root = std::fs::canonicalize(root.path()).expect("canonical project root");
+        let storage = tempfile::tempdir().expect("inspect storage");
+        let cache = InspectCache::open(storage.path().to_path_buf(), project_root)
+            .expect("open inspect cache");
+        assert_eq!(cache.estimated_memory().estimated_bytes, Some(0));
+
+        cache
+            .store_aggregated(
+                JobKey::for_project_category(InspectCategory::Todos),
+                serde_json::json!({"count": 1, "items": [{"text": "resident todo"}]}),
+            )
+            .expect("store memory aggregate");
+        let estimate = cache.estimated_memory();
+        assert!(estimate.estimated_bytes.unwrap() > 0);
+        assert_eq!(estimate.counts["memory_aggregates"], 1);
+        assert_eq!(estimate.counts["open_generation_handles"], 1);
     }
 }

@@ -296,6 +296,38 @@ impl LspManager {
         self.clients.len()
     }
 
+    /// Estimate the per-server document metadata and diagnostics retained by
+    /// the manager. LSP child-process memory is outside this process RSS and is
+    /// not included.
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let mut bytes = 0u64;
+        let mut document_count = 0u64;
+        for documents in self.documents.values() {
+            let estimate = documents.estimated_memory();
+            bytes = bytes.saturating_add(estimate.estimated_bytes.unwrap_or(0));
+            document_count = document_count
+                .saturating_add(estimate.counts.get("documents").copied().unwrap_or(0));
+        }
+        let diagnostics = self.diagnostics.estimated_memory();
+        bytes = bytes.saturating_add(diagnostics.estimated_bytes.unwrap_or(0));
+        crate::memory::MemoryEstimate::estimated(bytes)
+            .count("servers", self.clients.len())
+            .count("document_stores", self.documents.len())
+            .count_u64("documents", document_count)
+            .count_u64(
+                "diagnostic_entries",
+                diagnostics
+                    .counts
+                    .get("diagnostic_entries")
+                    .copied()
+                    .unwrap_or(0),
+            )
+            .count_u64(
+                "diagnostics",
+                diagnostics.counts.get("diagnostics").copied().unwrap_or(0),
+            )
+    }
+
     /// Apply the configured diagnostic LRU cap (the `lsp.diagnostic_cache_size`
     /// knob). 0 disables the cap. Called at construction so the documented
     /// config field actually takes effect instead of always using the default.

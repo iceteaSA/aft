@@ -2657,7 +2657,8 @@ fn value_to_plain_string(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-// Status has no TypeScript wrapper; this mirrors the subc bare status fallback.
+// Status has no TypeScript wrapper; preserve the pretty JSON summary and add
+// one deliberately thin human-readable view of the raw memory section.
 fn format_status(data: &Value) -> String {
     if let Some(text) = data
         .get("text")
@@ -2666,5 +2667,112 @@ fn format_status(data: &Value) -> String {
     {
         return text.to_string();
     }
-    serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string())
+    let mut summary = data.clone();
+    let memory = summary
+        .as_object_mut()
+        .and_then(|summary| summary.remove("memory"));
+    let pretty = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string());
+    match memory.as_ref() {
+        Some(memory) => format!("{pretty}\n\n{}", format_memory_block(memory)),
+        None => pretty,
+    }
+}
+
+fn format_memory_block(memory: &Value) -> String {
+    let process = memory.get("process").unwrap_or(&Value::Null);
+    let rss = format_optional_memory_bytes(process.get("rss_bytes"));
+    let attributed = format_optional_memory_bytes(process.get("total_attributed_bytes"));
+    let unattributed = format_optional_memory_bytes(process.get("unattributed_bytes"));
+    let mut lines = vec![format!(
+        "Memory: RSS {rss} | attributed {attributed} | unattributed {unattributed}"
+    )];
+    if let Some(roots) = memory.get("roots").and_then(Value::as_object) {
+        for (root, estimate) in roots {
+            let total = format_optional_memory_bytes(estimate.get("attributed_bytes"));
+            let subsystems = [
+                ("semantic", "semantic"),
+                ("trigram", "trigram"),
+                ("symbols", "symbols"),
+                ("callgraph", "callgraph"),
+                ("inspect", "inspect"),
+                ("bash", "bash"),
+                ("lsp", "lsp"),
+                ("parser_pool", "parsers"),
+            ]
+            .iter()
+            .map(|(key, label)| {
+                let subsystem = estimate.get(*key).unwrap_or(&Value::Null);
+                let value = if subsystem.get("status").and_then(Value::as_str) == Some("busy") {
+                    "busy".to_string()
+                } else {
+                    format_optional_memory_bytes(subsystem.get("estimated_bytes"))
+                };
+                format!("{label} {value}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+            lines.push(format!("  {root}: {total} ({subsystems})"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_optional_memory_bytes(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "not estimated".to_string();
+    };
+    let (sign, magnitude) = if let Some(bytes) = value.as_i64() {
+        (if bytes < 0 { "-" } else { "" }, bytes.unsigned_abs())
+    } else if let Some(bytes) = value.as_u64() {
+        ("", bytes)
+    } else {
+        return "not estimated".to_string();
+    };
+    let magnitude = magnitude as f64;
+    if magnitude >= 1024.0 * 1024.0 {
+        format!("{sign}{:.1} MiB", magnitude / (1024.0 * 1024.0))
+    } else if magnitude >= 1024.0 {
+        format!("{sign}{:.1} KiB", magnitude / 1024.0)
+    } else {
+        format!("{sign}{} B", magnitude as u64)
+    }
+}
+
+#[cfg(test)]
+mod status_memory_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn status_text_renders_compact_memory_block() {
+        let data = json!({
+            "version": "test",
+            "memory": {
+                "process": {
+                    "rss_bytes": 8 * 1024 * 1024,
+                    "total_attributed_bytes": 3 * 1024 * 1024,
+                    "unattributed_bytes": 5 * 1024 * 1024
+                },
+                "roots": {
+                    "/repo": {
+                        "attributed_bytes": 3 * 1024 * 1024,
+                        "semantic": {"status": "ready", "estimated_bytes": 2 * 1024 * 1024},
+                        "trigram": {"status": "ready", "estimated_bytes": 1024 * 1024},
+                        "symbols": {"status": "ready", "estimated_bytes": 0},
+                        "callgraph": {"status": "ready", "estimated_bytes": null},
+                        "inspect": {"status": "ready", "estimated_bytes": 0},
+                        "bash": {"status": "ready", "estimated_bytes": 0},
+                        "lsp": {"status": "ready", "estimated_bytes": 0},
+                        "parser_pool": {"status": "ready", "estimated_bytes": null}
+                    }
+                }
+            }
+        });
+        let rendered = format_status(&data);
+        assert!(
+            rendered.contains("Memory: RSS 8.0 MiB | attributed 3.0 MiB | unattributed 5.0 MiB")
+        );
+        assert!(rendered.contains("/repo: 3.0 MiB (semantic 2.0 MiB, trigram 1.0 MiB"));
+        assert!(!rendered.contains("\"memory\""));
+    }
 }
