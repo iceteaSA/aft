@@ -136,6 +136,13 @@ use self::manifest::{
     is_subc_agent_core_tool, is_subc_native_plumbing_tool,
 };
 pub use self::wire::SubcError;
+
+/// Test-only view of the fail-closed tool-call gate: would `name` be admitted
+/// on a bound route (as an agent tool or native plumbing)? Used by the
+/// plugin-send drift guard in `subc_plumbing_drift_test.rs`.
+pub fn is_tool_call_admitted_for_test(name: &str) -> bool {
+    manifest::is_subc_agent_core_tool(name) || manifest::is_subc_native_plumbing_tool(name)
+}
 use self::wire::{
     build_error_frame, build_goodbye_frame, build_tool_response_frame, decrement_counted_channel,
     response_is_fatal_panic, response_message, send_counted_channel, send_frame,

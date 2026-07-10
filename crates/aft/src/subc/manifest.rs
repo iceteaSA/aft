@@ -60,6 +60,14 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   over the session's own backup/checkpoint state — the plugin safety tool
 ///   calls them BEFORE `aft_safety undo`/`restore` to know which paths to ask
 ///   permission for. Without them, safety undo/restore fails over subc.
+/// - `bash_kill` / `bash_write` / `bash_notify` / `bash_unnotify` /
+///   `bash_wait_detach`: the rest of the background-bash consumer surface the
+///   plugins invoke natively (kill a task, drive a PTY, register/remove a
+///   watch, detach a wait-mode command when a user message arrives). All are
+///   session-scoped task plumbing; the untrusted-bind bash denial still fires
+///   first for every `bash_*` name.
+/// - `inspect_tier2_run`: the plugins' background Tier-2 refresh trigger for
+///   the bound root; scan work runs on the maintenance class either way.
 pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
     matches!(
         name,
@@ -68,6 +76,12 @@ pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_ack_completions"
             | "undo_preview"
             | "checkpoint_paths"
+            | "bash_kill"
+            | "bash_write"
+            | "bash_notify"
+            | "bash_unnotify"
+            | "bash_wait_detach"
+            | "inspect_tier2_run"
     )
 }
 
