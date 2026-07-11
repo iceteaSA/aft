@@ -22,7 +22,100 @@ pub struct DrainBatchOutcome {
 
 pub const WATCHER_PATH_DRAIN_BATCH_CAP: usize = 2_048;
 pub const WATCHER_DRAIN_SLICE_BUDGET: Duration = Duration::from_millis(250);
+const WATCHER_DRAIN_UNIT_WARN_AFTER: Duration = Duration::from_secs(5);
+const WATCHER_DRAIN_UNIT_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
+
+struct WatcherDrainUnitGuard<'a> {
+    phase: &'static str,
+    path: &'a Path,
+    batch_len: usize,
+    started: Instant,
+}
+
+impl<'a> WatcherDrainUnitGuard<'a> {
+    fn start(phase: WatcherDrainApplyPhase, path: &'a Path) -> Self {
+        Self {
+            phase: watcher_drain_phase_name(phase),
+            path,
+            batch_len: 1,
+            started: Instant::now(),
+        }
+    }
+
+    fn start_batch(phase: WatcherDrainApplyPhase, path: &'a Path, batch_len: usize) -> Self {
+        Self {
+            phase: watcher_drain_phase_name(phase),
+            path,
+            batch_len,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for WatcherDrainUnitGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        let (warn_after, final_after) = watcher_drain_unit_thresholds();
+        if elapsed < warn_after {
+            return;
+        }
+        let path = if self.batch_len == 1 {
+            self.path.display().to_string()
+        } else {
+            format!("{} (+{} paths)", self.path.display(), self.batch_len - 1)
+        };
+        emit_watcher_drain_unit_log(format!(
+            "watcher drain unit exceeded 5s: phase={} path={} elapsed={}ms",
+            self.phase,
+            path,
+            elapsed.as_millis()
+        ));
+        if elapsed >= final_after {
+            emit_watcher_drain_unit_log(format!(
+                "watcher drain unit completed after 30s: phase={} path={} elapsed={}ms",
+                self.phase,
+                path,
+                elapsed.as_millis()
+            ));
+        }
+    }
+}
+
+fn watcher_drain_unit_thresholds() -> (Duration, Duration) {
+    #[cfg(test)]
+    if let Some(thresholds) = WATCHER_UNIT_TEST_THRESHOLDS.with(std::cell::Cell::get) {
+        return thresholds;
+    }
+    (
+        WATCHER_DRAIN_UNIT_WARN_AFTER,
+        WATCHER_DRAIN_UNIT_FINAL_AFTER,
+    )
+}
+
+fn emit_watcher_drain_unit_log(line: String) {
+    log::warn!("{line}");
+    #[cfg(test)]
+    WATCHER_UNIT_TEST_LOGS.with(|logs| logs.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+thread_local! {
+    static WATCHER_UNIT_TEST_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    static WATCHER_UNIT_TEST_THRESHOLDS: std::cell::Cell<Option<(Duration, Duration)>> = const { std::cell::Cell::new(None) };
+    static WATCHER_UNIT_TEST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn delay_watcher_unit_for_test() {
+    let delay = WATCHER_UNIT_TEST_DELAY.with(std::cell::Cell::get);
+    if !delay.is_zero() {
+        thread::sleep(delay);
+    }
+}
+
+#[cfg(not(test))]
+fn delay_watcher_unit_for_test() {}
 
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
@@ -1211,28 +1304,24 @@ pub fn refresh_callgraph_store_for_watcher(
     if !ctx.callgraph_writer() {
         return;
     }
-    let store =
-        match CallGraphStore::open_ready_repairing(ctx.callgraph_store_dir(), project_root.clone())
-        {
-            Ok(Some(store)) => store,
-            Ok(None) => {
-                // The callgraph store is not loaded into memory yet. If a build is
-                // already creating it, save the changed paths so they can be replayed
-                // after the new store is available; otherwise, there is no store to
-                // update.
-                if ctx.callgraph_store_rx().lock().is_some() {
-                    ctx.add_pending_callgraph_store_paths(source_paths);
-                }
-                return;
-            }
-            Err(error) => {
-                aft::slog_warn!(
-                    "callgraph store writer open failed during refresh: {}",
-                    error
-                );
-                return;
-            }
-        };
+    let store = match CallGraphStore::open_ready(ctx.callgraph_store_dir(), project_root.clone()) {
+        Ok(Some(store)) => store,
+        Ok(None) => {
+            // A missing ready store or one that needs repair is replayed after the
+            // maintenance build publishes a writable generation. The watcher drain
+            // never performs root repair or a cold rebuild inline.
+            ctx.add_pending_callgraph_store_paths(source_paths);
+            return;
+        }
+        Err(error) => {
+            ctx.add_pending_callgraph_store_paths(source_paths);
+            aft::slog_warn!(
+                "callgraph store writer open failed during refresh; deferred paths: {}",
+                error
+            );
+            return;
+        }
+    };
     if let Err(error) = store.refresh_files(&source_paths) {
         aft::slog_warn!("callgraph store refresh failed: {}", error);
         match store.mark_files_stale(&source_paths) {
@@ -1264,24 +1353,81 @@ pub fn drain_watcher_events(ctx: &AppContext) {
     }
 }
 
+fn watcher_drain_phase_name(stage: WatcherDrainApplyPhase) -> &'static str {
+    match stage {
+        WatcherDrainApplyPhase::PendingTier2 => "pending_tier2",
+        WatcherDrainApplyPhase::PendingIndexes => "pending_indexes",
+        WatcherDrainApplyPhase::SymbolCache => "symbol_cache",
+        WatcherDrainApplyPhase::Callgraph => "callgraph",
+        WatcherDrainApplyPhase::SearchIndex => "search_index",
+        WatcherDrainApplyPhase::SemanticIndex => "semantic_index",
+        WatcherDrainApplyPhase::LspDiagnostics => "lsp_diagnostics",
+        WatcherDrainApplyPhase::Complete => "complete",
+    }
+}
+
 fn apply_watcher_path_phase(
+    stage: WatcherDrainApplyPhase,
     paths: &mut VecDeque<PathBuf>,
     remaining: &mut usize,
     started: Instant,
+    budget: Duration,
     mut apply: impl FnMut(&Path),
 ) -> bool {
     while *remaining > 0 {
         let path = paths
             .pop_front()
             .expect("watcher apply phase tracks its remaining paths");
-        apply(&path);
+        {
+            let _watchdog = WatcherDrainUnitGuard::start(stage, &path);
+            delay_watcher_unit_for_test();
+            apply(&path);
+        }
         paths.push_back(path);
         *remaining -= 1;
-        if started.elapsed() >= WATCHER_DRAIN_SLICE_BUDGET {
+        if started.elapsed() >= budget {
             return false;
         }
     }
     true
+}
+
+fn apply_callgraph_watcher_phase(
+    ctx: &AppContext,
+    paths: &mut VecDeque<PathBuf>,
+    remaining: &mut usize,
+    started: Instant,
+    budget: Duration,
+    enabled: bool,
+    mut refresh: impl FnMut(&AppContext, &HashSet<PathBuf>),
+) -> bool {
+    let mut changed = HashSet::new();
+    let completed = apply_watcher_path_phase(
+        WatcherDrainApplyPhase::Callgraph,
+        paths,
+        remaining,
+        started,
+        budget,
+        |path| {
+            if enabled && watcher_path_is_callgraph_indexed(path) {
+                changed.insert(path.to_path_buf());
+            }
+        },
+    );
+    if !changed.is_empty() {
+        let first = changed
+            .iter()
+            .min()
+            .expect("non-empty callgraph watcher batch has a first path");
+        let _watchdog = WatcherDrainUnitGuard::start_batch(
+            WatcherDrainApplyPhase::Callgraph,
+            first,
+            changed.len(),
+        );
+        delay_watcher_unit_for_test();
+        refresh(ctx, &changed);
+    }
+    completed
 }
 
 fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyPhase {
@@ -1314,13 +1460,18 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
 
     loop {
         let completed = match stage {
-            WatcherDrainApplyPhase::PendingTier2 => {
-                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+            WatcherDrainApplyPhase::PendingTier2 => apply_watcher_path_phase(
+                WatcherDrainApplyPhase::PendingTier2,
+                &mut paths,
+                &mut remaining,
+                started,
+                WATCHER_DRAIN_SLICE_BUDGET,
+                |path| {
                     if heavy_root_work_allowed && ctx.inspect_writer() {
                         ctx.add_pending_tier2_paths([path.to_path_buf()]);
                     }
-                })
-            }
+                },
+            ),
             WatcherDrainApplyPhase::PendingIndexes => {
                 let search_build_in_progress = ctx
                     .search_index_rx()
@@ -1329,45 +1480,61 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     .is_some();
                 let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
                 let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
-                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
-                    if heavy_root_work_allowed
-                        && !shared_artifacts_read_only
-                        && !oversized_inline_batch
-                        && search_build_in_progress
-                    {
-                        ctx.add_pending_search_index_paths([path.to_path_buf()]);
-                    }
-                    if heavy_root_work_allowed
-                        && !shared_artifacts_read_only
-                        && !oversized_inline_batch
-                        && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
-                        && watcher_path_is_semantic_source(path)
-                    {
-                        ctx.add_pending_semantic_index_paths([path.to_path_buf()]);
-                    }
-                })
+                apply_watcher_path_phase(
+                    WatcherDrainApplyPhase::PendingIndexes,
+                    &mut paths,
+                    &mut remaining,
+                    started,
+                    WATCHER_DRAIN_SLICE_BUDGET,
+                    |path| {
+                        if heavy_root_work_allowed
+                            && !shared_artifacts_read_only
+                            && !oversized_inline_batch
+                            && search_build_in_progress
+                        {
+                            ctx.add_pending_search_index_paths([path.to_path_buf()]);
+                        }
+                        if heavy_root_work_allowed
+                            && !shared_artifacts_read_only
+                            && !oversized_inline_batch
+                            && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
+                            && watcher_path_is_semantic_source(path)
+                        {
+                            ctx.add_pending_semantic_index_paths([path.to_path_buf()]);
+                        }
+                    },
+                )
             }
-            WatcherDrainApplyPhase::SymbolCache => {
-                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+            WatcherDrainApplyPhase::SymbolCache => apply_watcher_path_phase(
+                WatcherDrainApplyPhase::SymbolCache,
+                &mut paths,
+                &mut remaining,
+                started,
+                WATCHER_DRAIN_SLICE_BUDGET,
+                |path| {
                     if !shared_artifacts_read_only {
                         if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
                             symbol_cache.invalidate(path);
                         }
                     }
-                })
-            }
-            WatcherDrainApplyPhase::Callgraph => {
-                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
-                    if heavy_root_work_allowed && !oversized_inline_batch {
-                        refresh_callgraph_store_for_watcher(
-                            ctx,
-                            &HashSet::from([path.to_path_buf()]),
-                        );
-                    }
-                })
-            }
-            WatcherDrainApplyPhase::SearchIndex => {
-                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                },
+            ),
+            WatcherDrainApplyPhase::Callgraph => apply_callgraph_watcher_phase(
+                ctx,
+                &mut paths,
+                &mut remaining,
+                started,
+                WATCHER_DRAIN_SLICE_BUDGET,
+                heavy_root_work_allowed && !oversized_inline_batch,
+                refresh_callgraph_store_for_watcher,
+            ),
+            WatcherDrainApplyPhase::SearchIndex => apply_watcher_path_phase(
+                WatcherDrainApplyPhase::SearchIndex,
+                &mut paths,
+                &mut remaining,
+                started,
+                WATCHER_DRAIN_SLICE_BUDGET,
+                |path| {
                     if heavy_root_work_allowed
                         && !shared_artifacts_read_only
                         && !oversized_inline_batch
@@ -1384,10 +1551,15 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                             }
                         }
                     }
-                })
-            }
-            WatcherDrainApplyPhase::SemanticIndex => {
-                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                },
+            ),
+            WatcherDrainApplyPhase::SemanticIndex => apply_watcher_path_phase(
+                WatcherDrainApplyPhase::SemanticIndex,
+                &mut paths,
+                &mut remaining,
+                started,
+                WATCHER_DRAIN_SLICE_BUDGET,
+                |path| {
                     if !heavy_root_work_allowed
                         || shared_artifacts_read_only
                         || oversized_inline_batch
@@ -1416,10 +1588,15 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                             status_changed = true;
                         }
                     }
-                })
-            }
-            WatcherDrainApplyPhase::LspDiagnostics => {
-                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                },
+            ),
+            WatcherDrainApplyPhase::LspDiagnostics => apply_watcher_path_phase(
+                WatcherDrainApplyPhase::LspDiagnostics,
+                &mut paths,
+                &mut remaining,
+                started,
+                WATCHER_DRAIN_SLICE_BUDGET,
+                |path| {
                     if !path.exists() {
                         status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
                         return;
@@ -1429,8 +1606,8 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     if stale.had_entries {
                         ctx.lsp_resync_changed_file_for_diagnostics(path);
                     }
-                })
-            }
+                },
+            ),
             WatcherDrainApplyPhase::Complete => true,
         };
 
@@ -1940,6 +2117,126 @@ mod watcher_slice_tests {
         (ctx, tx)
     }
 
+    fn set_watcher_unit_test_seam(delay: Duration, thresholds: Option<(Duration, Duration)>) {
+        WATCHER_UNIT_TEST_DELAY.with(|value| value.set(delay));
+        WATCHER_UNIT_TEST_THRESHOLDS.with(|value| value.set(thresholds));
+        WATCHER_UNIT_TEST_LOGS.with(|logs| logs.borrow_mut().clear());
+    }
+
+    fn clear_watcher_unit_test_seam() {
+        set_watcher_unit_test_seam(Duration::ZERO, None);
+    }
+
+    #[test]
+    fn callgraph_phase_batches_all_indexed_paths_into_one_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _) = context_with_watcher(temp.path());
+        let mut paths = VecDeque::from([
+            temp.path().join("a.rs"),
+            temp.path().join("b.ts"),
+            temp.path().join("ignored.txt"),
+        ]);
+        let mut remaining = paths.len();
+        let mut refreshed = Vec::new();
+
+        let completed = apply_callgraph_watcher_phase(
+            &ctx,
+            &mut paths,
+            &mut remaining,
+            Instant::now(),
+            WATCHER_DRAIN_SLICE_BUDGET,
+            true,
+            |_, changed| refreshed.push(changed.clone()),
+        );
+
+        assert!(completed);
+        assert_eq!(remaining, 0);
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].len(), 2);
+    }
+
+    #[test]
+    fn callgraph_phase_flushes_once_per_slice_before_requeue() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _) = context_with_watcher(temp.path());
+        let mut paths =
+            VecDeque::from([temp.path().join("first.rs"), temp.path().join("second.rs")]);
+        let mut remaining = paths.len();
+        let mut refreshed = Vec::new();
+        set_watcher_unit_test_seam(Duration::from_millis(2), None);
+
+        let first_completed = apply_callgraph_watcher_phase(
+            &ctx,
+            &mut paths,
+            &mut remaining,
+            Instant::now(),
+            Duration::from_millis(1),
+            true,
+            |_, changed| refreshed.push(changed.clone()),
+        );
+        assert!(!first_completed);
+        assert_eq!(remaining, 1);
+        assert_eq!(refreshed.len(), 1, "the yielded slice must flush its batch");
+
+        let second_completed = apply_callgraph_watcher_phase(
+            &ctx,
+            &mut paths,
+            &mut remaining,
+            Instant::now(),
+            Duration::from_millis(1),
+            true,
+            |_, changed| refreshed.push(changed.clone()),
+        );
+        clear_watcher_unit_test_seam();
+
+        assert!(!second_completed);
+        assert_eq!(remaining, 0);
+        assert_eq!(refreshed.len(), 2);
+        assert!(refreshed.iter().all(|batch| batch.len() == 1));
+    }
+
+    #[test]
+    fn watcher_unit_watchdog_names_slow_phase_and_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let slow_path = temp.path().join("slow.rs");
+        let mut paths = VecDeque::from([slow_path.clone()]);
+        let mut remaining = 1;
+        set_watcher_unit_test_seam(
+            Duration::from_millis(5),
+            Some((Duration::from_millis(1), Duration::from_secs(1))),
+        );
+
+        let completed = apply_watcher_path_phase(
+            WatcherDrainApplyPhase::SemanticIndex,
+            &mut paths,
+            &mut remaining,
+            Instant::now(),
+            WATCHER_DRAIN_SLICE_BUDGET,
+            |_| {},
+        );
+        let logs = WATCHER_UNIT_TEST_LOGS.with(|logs| logs.borrow().clone());
+        clear_watcher_unit_test_seam();
+
+        assert!(completed);
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("watcher drain unit exceeded 5s"));
+        assert!(logs[0].contains("phase=semantic_index"));
+        assert!(logs[0].contains(&format!("path={}", slow_path.display())));
+    }
+
+    #[test]
+    fn watcher_callgraph_refresh_defers_when_ready_store_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _) = context_with_watcher(temp.path());
+        ctx.update_config(|config| config.callgraph_store = true);
+        ctx.set_cache_role(false, None);
+        let source = temp.path().join("pending.rs");
+
+        refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone()]));
+
+        assert_eq!(ctx.take_pending_callgraph_store_paths(), vec![source]);
+    }
+
     #[test]
     fn watcher_single_dispatch_event_is_sliced_by_path_count() {
         let temp = tempfile::tempdir().unwrap();
@@ -1967,7 +2264,13 @@ mod watcher_slice_tests {
         }
 
         assert_eq!(processed, path_count);
-        assert_eq!(slices, 4);
+        // At least ceil(1024/256) slices from the path budget; the 250ms time
+        // budget may end a slice early under parallel test load, so an exact
+        // slice count would be load-sensitive.
+        assert!(
+            (4..8).contains(&slices),
+            "expected 4-7 path-budgeted slices, got {slices}"
+        );
         assert_eq!(ctx.pending_tier2_paths().len(), path_count);
     }
 

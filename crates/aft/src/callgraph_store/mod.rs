@@ -701,24 +701,36 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, true)
+        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, true, true, true)
+    }
+
+    /// Open a ready store for bounded maintenance work without repairing root
+    /// metadata or starting a cold rebuild. A store that needs either action is
+    /// reported as unavailable so a background build can own that work.
+    pub fn open_ready(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Option<Self>> {
+        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false, false, false)
     }
 
     pub fn open_ready_no_rebuild(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false)
+        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false, true, true)
     }
 
     fn open_ready_with_rebuild_policy(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
         allow_cold_build: bool,
+        allow_root_repair: bool,
+        allow_borrow_only: bool,
     ) -> Result<Option<Self>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
+            if !allow_borrow_only {
+                return Ok(None);
+            }
             return Self::open_readonly(callgraph_dir, project_root)
                 .map(|store| store.map(ReadonlyCallGraphStore::into_inner));
         };
@@ -726,7 +738,7 @@ impl CallGraphStore {
         else {
             return Ok(None);
         };
-        let OpenedStore { store, root_repair } = Self::open_at_path(
+        let OpenedStore { store, root_repair } = Self::open_at_path_with_root_repair(
             project_root.clone(),
             project_key,
             sqlite_path,
@@ -734,6 +746,7 @@ impl CallGraphStore {
             true,
             Some(Arc::clone(&writer_lease)),
             None,
+            allow_root_repair,
         )?;
         match root_repair {
             OpenRootRepair::NeedsRebuild { .. } if allow_cold_build => {
@@ -1053,6 +1066,28 @@ impl CallGraphStore {
         writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
         read_marker: Option<crate::root_cache::ReadMarker>,
     ) -> Result<OpenedStore> {
+        Self::open_at_path_with_root_repair(
+            project_root,
+            project_key,
+            sqlite_path,
+            generation,
+            use_wal,
+            writer_lease,
+            read_marker,
+            true,
+        )
+    }
+
+    fn open_at_path_with_root_repair(
+        project_root: PathBuf,
+        project_key: String,
+        sqlite_path: PathBuf,
+        generation: Option<String>,
+        use_wal: bool,
+        writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
+        read_marker: Option<crate::root_cache::ReadMarker>,
+        allow_root_repair: bool,
+    ) -> Result<OpenedStore> {
         if let Some(lease) = writer_lease.as_ref() {
             verify_writer_lease(lease)?;
         }
@@ -1072,7 +1107,7 @@ impl CallGraphStore {
         if let Some(lease) = writer_lease.as_ref() {
             verify_writer_lease(lease)?;
         }
-        let root_repair = reconcile_workspace_roots(&mut conn, &project_root)?;
+        let root_repair = reconcile_workspace_roots(&mut conn, &project_root, allow_root_repair)?;
         let read_marker = match (read_marker, generation.as_deref(), sqlite_path.parent()) {
             (Some(marker), _, _) => Some(marker),
             (None, Some(label), Some(cache_dir)) => {
@@ -4091,7 +4126,11 @@ const STORE_DATA_PATH_COLUMNS: &[(&str, &str)] = &[
 /// opener. That can make each clone rebuild on open when they alternate — bounded
 /// by open frequency — but each rebuild is correct for its opener, unlike silent
 /// cross-clone corruption.
-fn reconcile_workspace_roots(conn: &mut Connection, project_root: &Path) -> Result<OpenRootRepair> {
+fn reconcile_workspace_roots(
+    conn: &mut Connection,
+    project_root: &Path,
+    allow_repair: bool,
+) -> Result<OpenRootRepair> {
     let roots = stored_workspace_roots(conn)?;
     let current_root = project_root.display().to_string();
     if roots.is_empty() || (roots.len() == 1 && roots[0] == current_root) {
@@ -4120,6 +4159,14 @@ fn reconcile_workspace_roots(conn: &mut Connection, project_root: &Path) -> Resu
                 reason,
             });
         }
+    }
+
+    if !allow_repair {
+        return Ok(OpenRootRepair::NeedsRebuild {
+            previous_roots: roots,
+            current_root,
+            reason: "workspace root metadata requires deferred repair".to_string(),
+        });
     }
 
     let tx = conn.transaction()?;
@@ -8944,6 +8991,33 @@ mod cold_build_insert_tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[test]
+    fn nonrepairing_open_policy_leaves_moved_root_metadata_for_maintenance() {
+        let dir = tempdir().unwrap();
+        let previous_root = dir.path().join("previous-root");
+        let current_root = dir.path().join("current-root");
+        fs::create_dir_all(&previous_root).unwrap();
+        fs::create_dir_all(&current_root).unwrap();
+        fs::remove_dir(&previous_root).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO backend_file_state(
+                backend, workspace_root, file_path, content_hash, status, updated_at
+             ) VALUES ('rust', ?1, 'src/main.rs', 'hash', 'ready', 1)",
+            params![previous_root.display().to_string()],
+        )
+        .unwrap();
+
+        let repair = reconcile_workspace_roots(&mut conn, &current_root, false).unwrap();
+
+        assert!(matches!(repair, OpenRootRepair::NeedsRebuild { .. }));
+        assert_eq!(
+            stored_workspace_roots(&conn).unwrap(),
+            vec![previous_root.display().to_string()]
+        );
+    }
 
     #[test]
     fn sqlite_readonly_uri_percent_encodes_windows_paths() {
