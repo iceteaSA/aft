@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +14,10 @@ use aft::context::AppContext;
 use aft::executor::{ExecutorConfig, Lane};
 use aft::path_identity::ProjectRootId;
 use aft::protocol::{RawRequest, Response};
+use aft::watcher_filter::{
+    run_watcher_thread, watcher_dispatch_channel, WatcherDispatchEvent, WatcherFilterConfig,
+    WatcherThreadHandle,
+};
 use serde_json::{json, Value};
 use subc_protocol::session::{HealthReport, ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget};
@@ -42,6 +46,18 @@ const TOOL_BOUND: Duration = Duration::from_secs(5 * DEBUG_BOUND_MULTIPLIER as u
 const HEALTH_BOUND: Duration = Duration::from_millis(500 * DEBUG_BOUND_MULTIPLIER as u64);
 const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(700 * DEBUG_BOUND_MULTIPLIER as u64);
 const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
+const CONCURRENCY_SCENARIO_BOUND: Duration =
+    Duration::from_secs(10 * DEBUG_BOUND_MULTIPLIER as u64);
+const WATCHER_DISPATCH_PATH_CAP: usize = 1_024;
+const WATCHER_BACKLOG_EVENTS: usize = 768;
+
+static SYNTHETIC_WATCHER_SENDERS: OnceLock<
+    Mutex<Vec<crossbeam_channel::Sender<WatcherDispatchEvent>>>,
+> = OnceLock::new();
+
+struct SyntheticRawWatcher(
+    #[allow(dead_code)] std::sync::mpsc::Sender<notify::Result<notify::Event>>,
+);
 
 #[derive(Clone, Debug)]
 struct StormScale {
@@ -213,13 +229,119 @@ fn handle_embedding_request(mut stream: std::net::TcpStream, delay: Duration) {
 }
 
 fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
-    if req.command == "configure" {
-        if let Some(delay) = configure_sleep_delay(&req) {
-            thread::sleep(delay);
+    match req.command.as_str() {
+        "configure" => {
+            if let Some(delay) = configure_sleep_delay(&req) {
+                thread::sleep(delay);
+            }
+            aft::commands::configure::handle_configure(&req, ctx)
         }
-        return aft::commands::configure::handle_configure(&req, ctx);
+        "subc_storm_inject_dispatch" => inject_dispatch_events(&req, ctx),
+        "subc_storm_inject_raw_paths" => inject_raw_watcher_paths(&req, ctx),
+        "subc_storm_watcher_pending" => watcher_pending_response(&req, ctx),
+        _ => subc_bridge_test::bridge_dispatch(req, ctx),
     }
-    subc_bridge_test::bridge_dispatch(req, ctx)
+}
+
+fn inject_dispatch_events(req: &RawRequest, ctx: &AppContext) -> Response {
+    let Some(root) = ctx.config().project_root.clone() else {
+        return Response::error(
+            &req.id,
+            "missing_project_root",
+            "storm root is not configured",
+        );
+    };
+    let Some(events) = req.params.get("events").and_then(Value::as_array) else {
+        return Response::error(&req.id, "invalid_request", "events must be an array");
+    };
+    let (tx, rx) = watcher_dispatch_channel();
+    let mut path_count = 0usize;
+    for event in events {
+        let dispatch = if event.get("rescan").and_then(Value::as_bool) == Some(true) {
+            WatcherDispatchEvent::RescanRequired
+        } else {
+            let Some(paths) = event.get("paths").and_then(Value::as_array) else {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "each event needs paths or rescan",
+                );
+            };
+            let paths = paths
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|path| root.join(path))
+                .collect::<Vec<_>>();
+            path_count += paths.len();
+            WatcherDispatchEvent::Paths(paths)
+        };
+        tx.send(dispatch).expect("inject synthetic watcher event");
+    }
+    *ctx.watcher_rx().lock() = Some(rx);
+    SYNTHETIC_WATCHER_SENDERS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("synthetic watcher sender lock")
+        .push(tx);
+    Response::success(
+        &req.id,
+        json!({ "events": events.len(), "paths": path_count }),
+    )
+}
+
+fn inject_raw_watcher_paths(req: &RawRequest, ctx: &AppContext) -> Response {
+    let Some(root) = ctx.config().project_root.clone() else {
+        return Response::error(
+            &req.id,
+            "missing_project_root",
+            "storm root is not configured",
+        );
+    };
+    let Some(paths) = req.params.get("paths").and_then(Value::as_array) else {
+        return Response::error(&req.id, "invalid_request", "paths must be an array");
+    };
+    let paths = paths
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|path| root.join(path))
+        .collect::<Vec<_>>();
+    let path_count = paths.len();
+    let matcher = ctx.shared_gitignore();
+    let matcher_generation = ctx.gitignore_generation();
+    let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let thread_shutdown = Arc::clone(&shutdown);
+    let filter_root = std::fs::canonicalize(&root).unwrap_or(root);
+    let config = WatcherFilterConfig::new(filter_root, None);
+    let handle = thread::spawn(move || {
+        run_watcher_thread(
+            config,
+            Vec::new(),
+            matcher,
+            matcher_generation,
+            dispatch_tx,
+            thread_shutdown,
+            move |_, _, raw_tx| {
+                let mut event =
+                    notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any));
+                event.paths = paths;
+                raw_tx.send(Ok(event)).map_err(|error| error.to_string())?;
+                Ok::<SyntheticRawWatcher, String>(SyntheticRawWatcher(raw_tx))
+            },
+        );
+    });
+    ctx.stop_watcher_runtime();
+    ctx.install_watcher_runtime(dispatch_rx, WatcherThreadHandle::new(shutdown, handle));
+    Response::success(&req.id, json!({ "raw_paths": path_count }))
+}
+
+fn watcher_pending_response(req: &RawRequest, ctx: &AppContext) -> Response {
+    let pending = ctx
+        .watcher_rx()
+        .lock()
+        .as_ref()
+        .map_or(0, crossbeam_channel::Receiver::len);
+    Response::success(&req.id, json!({ "pending": pending }))
 }
 
 fn configure_sleep_delay(req: &RawRequest) -> Option<Duration> {
@@ -239,6 +361,419 @@ fn configure_sleep_delay(req: &RawRequest) -> Option<Duration> {
         }
     }
     None
+}
+
+#[test]
+fn max_paths_single_event() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "max_paths_single_event",
+        Duration::from_secs(30),
+        drive_max_paths_single_event,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn reads_during_maintenance() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "reads_during_maintenance",
+        Duration::from_secs(30),
+        drive_reads_during_maintenance,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn pool_size_two() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch_and_executor_config(
+        "pool_size_two",
+        Duration::from_secs(30),
+        drive_pool_size_two,
+        |_, _, _| {},
+        storm_dispatch,
+        ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        },
+    );
+}
+
+#[test]
+fn generation_supersession_mid_drain() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "generation_supersession_mid_drain",
+        Duration::from_secs(30),
+        drive_generation_supersession_mid_drain,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn ignore_edit_ordering() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "ignore_edit_ordering",
+        Duration::from_secs(30),
+        drive_ignore_edit_ordering,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn rename_pair() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "rename_pair",
+        Duration::from_secs(30),
+        drive_rename_pair,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+fn overflow_control() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "overflow_control",
+        Duration::from_secs(30),
+        drive_overflow_control,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+async fn drive_max_paths_single_event(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let root = session.root1.clone();
+    prepare_storm_root(&root);
+    let paths = (0..WATCHER_DISPATCH_PATH_CAP)
+        .map(|index| format!("src/max_path_{index:04}.rs"))
+        .collect::<Vec<_>>();
+    for (index, path) in paths.iter().enumerate() {
+        write_storm_file(&root.join(path), &format!("max_old_{index:04}"));
+    }
+    init_git(&root);
+
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 30_000_u64;
+    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "max-paths").await;
+    for (index, path) in paths.iter().enumerate() {
+        write_storm_file(&root.join(path), &format!("max_new_{index:04}"));
+    }
+
+    corr += 1;
+    let started = Instant::now();
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_storm_inject_dispatch",
+        json!({ "events": [{ "paths": paths }] }),
+    );
+    let injected = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    assert_eq!(injected.get("events").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        injected.get("paths").and_then(Value::as_u64),
+        Some(WATCHER_DISPATCH_PATH_CAP as u64)
+    );
+    wait_for_watcher_empty(&tx, &mut rx, &mut corr).await;
+    for marker in ["max_new_0000", "max_new_0512", "max_new_1023"] {
+        wait_for_grep_total(&tx, &mut rx, &mut corr, marker, 1).await;
+    }
+    let elapsed = started.elapsed();
+    // I-B: Once maintenance drains are sliced, replace this log with a latency assertion.
+    eprintln!("max_paths_single_event wall time: {elapsed:?}");
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_reads_during_maintenance(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let root = session.root1.clone();
+    prepare_storm_root(&root);
+    init_git(&root);
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 31_000_u64;
+    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "reads-maintenance").await;
+
+    let mut events = Vec::with_capacity(WATCHER_BACKLOG_EVENTS);
+    for index in 0..WATCHER_BACKLOG_EVENTS {
+        let path = format!("src/maintenance_{index:04}.rs");
+        write_storm_file(&root.join(&path), &format!("maintenance_marker_{index:04}"));
+        events.push(json!({ "paths": [path] }));
+    }
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_storm_inject_dispatch",
+        json!({ "events": events }),
+    );
+    expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+
+    let started = Instant::now();
+    let mut expected = HashSet::new();
+    for index in 0..6 {
+        corr += 1;
+        expected.insert(corr);
+        send_tool(
+            &tx,
+            1,
+            corr,
+            "read",
+            json!({ "filePath": "README.md", "limit": 20 }),
+        );
+        corr += 1;
+        expected.insert(corr);
+        send_tool(
+            &tx,
+            1,
+            corr,
+            "grep",
+            json!({ "pattern": format!("maintenance_marker_{:04}", index * 100) }),
+        );
+    }
+    collect_tool_responses(&mut rx, expected, CONCURRENCY_SCENARIO_BOUND).await;
+    let elapsed = started.elapsed();
+    // I-A target: Once interactive tool-lane isolation exists, enforce its tighter latency budget.
+    assert!(
+        elapsed <= CONCURRENCY_SCENARIO_BOUND,
+        "concurrent reads took {elapsed:?}"
+    );
+    wait_for_watcher_empty(&tx, &mut rx, &mut corr).await;
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_pool_size_two(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    assert_eq!(session.executor.pool_size(), 2, "storm executor pool seam");
+    let root = session.root1.clone();
+    prepare_storm_root(&root);
+    init_git(&root);
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 32_000_u64;
+    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "pool-two").await;
+
+    let path = "src/pool_two.rs";
+    write_storm_file(&root.join(path), "pool_two_maintenance_marker");
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_storm_inject_dispatch",
+        json!({
+            "events": (0..WATCHER_BACKLOG_EVENTS)
+                .map(|_| json!({ "paths": [path] }))
+                .collect::<Vec<_>>()
+        }),
+    );
+    expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+
+    corr += 1;
+    let read_corr = corr;
+    send_tool(
+        &tx,
+        1,
+        read_corr,
+        "read",
+        json!({ "filePath": "README.md", "limit": 20 }),
+    );
+    corr += 1;
+    let grep_corr = corr;
+    send_tool(
+        &tx,
+        1,
+        grep_corr,
+        "grep",
+        json!({ "pattern": "pool_two_maintenance_marker" }),
+    );
+    collect_tool_responses(
+        &mut rx,
+        HashSet::from([read_corr, grep_corr]),
+        CONCURRENCY_SCENARIO_BOUND,
+    )
+    .await;
+    wait_for_watcher_empty(&tx, &mut rx, &mut corr).await;
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_generation_supersession_mid_drain(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let root = session.root1.clone();
+    prepare_storm_root(&root);
+    init_git(&root);
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 33_000_u64;
+    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "generation-old").await;
+
+    let mut events = Vec::with_capacity(WATCHER_BACKLOG_EVENTS);
+    for index in 0..WATCHER_BACKLOG_EVENTS {
+        let path = format!("src/superseded_{index:04}.rs");
+        events.push(json!({ "paths": [path] }));
+    }
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_storm_inject_dispatch",
+        json!({ "events": events }),
+    );
+    let injected = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    assert_eq!(
+        injected.get("events").and_then(Value::as_u64),
+        Some(WATCHER_BACKLOG_EVENTS as u64)
+    );
+
+    corr += 1;
+    send_bind(
+        &tx,
+        1,
+        corr,
+        &root,
+        "generation-new",
+        storm_project_config(true, false, true, 0),
+    );
+    expect_ack_within(&mut rx, corr, SETUP_BIND_BOUND).await;
+    wait_for_ready_health(
+        &tx,
+        &mut rx,
+        &mut corr,
+        std::slice::from_ref(&root),
+        &HashSet::new(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(watcher_pending(&tx, &mut rx, &mut corr).await, 0);
+
+    let stale_tail_path = "src/superseded_0767.rs";
+    write_storm_file(&root.join(stale_tail_path), "stale_tail_marker");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_for_grep_total(&tx, &mut rx, &mut corr, "stale_tail_marker", 0).await;
+
+    let current_path = "src/current_generation.rs";
+    write_storm_file(&root.join(current_path), "current_generation_marker");
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_storm_inject_dispatch",
+        json!({ "events": [{ "paths": [current_path] }] }),
+    );
+    expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    wait_for_watcher_empty(&tx, &mut rx, &mut corr).await;
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "read",
+        json!({ "filePath": current_path, "limit": 20 }),
+    );
+    let current = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    assert!(
+        current.to_string().contains("current_generation_marker"),
+        "new generation read returned inconsistent state: {current:?}"
+    );
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_ignore_edit_ordering(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let root = session.root1.clone();
+    prepare_storm_root(&root);
+    write_storm_file(&root.join("flip_unignored.rs"), "newly_unignored_marker");
+    write_storm_file(&root.join("flip_ignored.rs"), "newly_ignored_marker");
+    std::fs::write(root.join(".gitignore"), "flip_unignored.rs\n").expect("initial ignore");
+    init_git(&root);
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 34_000_u64;
+    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "ignore-ordering").await;
+    wait_for_grep_total(&tx, &mut rx, &mut corr, "newly_unignored_marker", 0).await;
+    wait_for_grep_total(&tx, &mut rx, &mut corr, "newly_ignored_marker", 1).await;
+
+    std::fs::write(root.join(".gitignore"), "flip_ignored.rs\n").expect("flipped ignore");
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_storm_inject_raw_paths",
+        json!({ "paths": [".gitignore", "flip_unignored.rs", "flip_ignored.rs"] }),
+    );
+    expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    wait_for_grep_total(&tx, &mut rx, &mut corr, "newly_unignored_marker", 1).await;
+    wait_for_grep_total(&tx, &mut rx, &mut corr, "newly_ignored_marker", 0).await;
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_rename_pair(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let root = session.root1.clone();
+    prepare_storm_root(&root);
+    write_storm_file(&root.join("tracked_rename.rs"), "rename_source_marker");
+    std::fs::write(root.join(".gitignore"), "target/\n").expect("target ignore");
+    init_git(&root);
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 35_000_u64;
+    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "rename-pair").await;
+    wait_for_grep_total(&tx, &mut rx, &mut corr, "rename_source_marker", 1).await;
+
+    std::fs::create_dir_all(root.join("target")).expect("ignored target dir");
+    std::fs::rename(
+        root.join("tracked_rename.rs"),
+        root.join("target/renamed.rs"),
+    )
+    .expect("rename into ignored directory");
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_storm_inject_raw_paths",
+        json!({ "paths": ["tracked_rename.rs", "target/renamed.rs"] }),
+    );
+    expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    wait_for_grep_total(&tx, &mut rx, &mut corr, "rename_source_marker", 0).await;
+    send_goodbye_and_wait(&tx).await;
+}
+
+async fn drive_overflow_control(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let root = session.root1.clone();
+    prepare_storm_root(&root);
+    init_git(&root);
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 36_000_u64;
+    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "overflow-control").await;
+
+    write_storm_file(&root.join("granular_before.rs"), "granular_before_marker");
+    write_storm_file(&root.join("overflow_only.rs"), "overflow_rescan_marker");
+    write_storm_file(&root.join("granular_after.rs"), "granular_after_marker");
+    corr += 1;
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "subc_storm_inject_dispatch",
+        json!({
+            "events": [
+                { "paths": ["granular_before.rs"] },
+                { "rescan": true },
+                { "paths": ["granular_after.rs"] }
+            ]
+        }),
+    );
+    expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    wait_for_grep_total(&tx, &mut rx, &mut corr, "overflow_rescan_marker", 1).await;
+    send_goodbye_and_wait(&tx).await;
 }
 
 #[test]
@@ -1024,6 +1559,126 @@ fn create_storm_roots(count: usize) -> (Vec<tempfile::TempDir>, Vec<PathBuf>) {
         dirs.push(dir);
     }
     (dirs, paths)
+}
+
+fn prepare_storm_root(root: &Path) {
+    std::fs::write(root.join("README.md"), "storm regression fixture\n")
+        .expect("storm fixture README");
+}
+
+fn write_storm_file(path: &Path, marker: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("storm fixture parent");
+    }
+    std::fs::write(path, format!("pub fn marker() {{ /* {marker} */ }}\n"))
+        .expect("storm fixture file");
+}
+
+async fn bind_ready_search_root(
+    tx: &mpsc::UnboundedSender<Frame>,
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: &mut u64,
+    root: &Path,
+    session: &str,
+) {
+    *corr += 1;
+    send_bind(
+        tx,
+        1,
+        *corr,
+        root,
+        session,
+        storm_project_config(true, false, false, 0),
+    );
+    expect_ack_within(rx, *corr, SETUP_BIND_BOUND).await;
+    wait_for_ready_health(tx, rx, corr, &[root.to_path_buf()], &HashSet::new()).await;
+}
+
+async fn collect_tool_responses(
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    mut expected: HashSet<u64>,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while !expected.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for tool responses: {expected:?}"
+        );
+        let frame = read_frame_from_rx(rx, remaining, "concurrent tool responses").await;
+        if !expected.contains(&frame.header.corr) {
+            continue;
+        }
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "tool corr {} returned {:?}",
+            frame.header.corr,
+            frame.header.ty
+        );
+        let body: Value = serde_json::from_slice(&frame.body).expect("concurrent tool body");
+        assert_ne!(
+            body.get("isError").and_then(Value::as_bool),
+            Some(true),
+            "concurrent tool failed: {body:?}"
+        );
+        expected.remove(&frame.header.corr);
+    }
+}
+
+async fn watcher_pending(
+    tx: &mpsc::UnboundedSender<Frame>,
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: &mut u64,
+) -> usize {
+    *corr += 1;
+    send_tool(tx, 1, *corr, "subc_storm_watcher_pending", json!({}));
+    expect_tool_response(rx, *corr, TOOL_BOUND)
+        .await
+        .get("pending")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+async fn wait_for_watcher_empty(
+    tx: &mpsc::UnboundedSender<Frame>,
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: &mut u64,
+) {
+    let deadline = Instant::now() + CONCURRENCY_SCENARIO_BOUND;
+    loop {
+        if watcher_pending(tx, rx, corr).await == 0 {
+            return;
+        }
+        assert!(Instant::now() < deadline, "watcher backlog did not drain");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_grep_total(
+    tx: &mpsc::UnboundedSender<Frame>,
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: &mut u64,
+    pattern: &str,
+    expected: u64,
+) {
+    let deadline = Instant::now() + CONCURRENCY_SCENARIO_BOUND;
+    loop {
+        *corr += 1;
+        send_tool(tx, 1, *corr, "grep", json!({ "pattern": pattern }));
+        let response = expect_tool_response(rx, *corr, TOOL_BOUND).await;
+        if response.get("total_matches").and_then(Value::as_u64) == Some(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grep {pattern:?} did not reach {expected} matches: {response:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn init_git(root: &Path) {
