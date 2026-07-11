@@ -52,6 +52,13 @@ export interface AftProjectTransport {
 export interface AftTransportPool {
   getBridge(projectRoot: string): AftProjectTransport;
   getActiveBridgeForRoot(projectRoot: string): AftProjectTransport | null;
+  /**
+   * All currently-live project transports, for session-scoped signals (e.g.
+   * bash wait-detach) that must reach their target even when the caller's
+   * root-key resolution disagrees with the key the tool call used. Callers
+   * must only send session-scoped, read-only commands through these.
+   */
+  activeBridges(): AftProjectTransport[];
   toolCall(
     projectRoot: string,
     runtime: BridgeToolCallRuntime,

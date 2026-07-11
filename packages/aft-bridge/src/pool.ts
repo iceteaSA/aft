@@ -195,6 +195,17 @@ export class BridgePool implements AftTransportPool {
     return entry.bridge;
   }
 
+  /** All live bridges, for session-scoped signals that must not depend on
+   * exact root-key resolution (the command itself carries the session ID). */
+  activeBridges(): BinaryBridge[] {
+    if (this.shutdownCalled) return [];
+    const alive: BinaryBridge[] = [];
+    for (const entry of this.bridges.values()) {
+      if (entry.bridge.isAlive()) alive.push(entry.bridge);
+    }
+    return alive;
+  }
+
   /**
    * Get or create the bridge for `projectRoot`.
    *

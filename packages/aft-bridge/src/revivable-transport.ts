@@ -45,6 +45,12 @@ export class RevivableTransportPool implements AftTransportPool {
     return transport;
   }
 
+  /** Delegate to the active pool: session-scoped signal fan-out reaches the
+   * same live transports the underlying pool would report. */
+  activeBridges(): AftProjectTransport[] {
+    return this.activePool.activeBridges();
+  }
+
   getActiveBridgeForRoot(projectRoot: string): RevivableProjectTransport | null {
     const key = canonicalizeProjectRoot(projectRoot);
     const bridge = this.currentBridge(key);

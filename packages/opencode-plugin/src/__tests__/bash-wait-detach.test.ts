@@ -37,10 +37,11 @@ describe("bash wait detach helper", () => {
     });
   });
 
-  test("user-message detach is skipped without a session or active bridge", async () => {
+  test("user-message detach is skipped without a session or any live bridge", async () => {
     const send = mock(async () => ({ success: true }));
     const pool = {
       getActiveBridgeForRoot: () => null,
+      activeBridges: () => [],
     };
 
     await signalBashWaitDetachForProject(
@@ -55,5 +56,33 @@ describe("bash wait detach helper", () => {
     );
 
     expect(send).not.toHaveBeenCalled();
+  });
+
+  test("root-key miss fans out to every live bridge instead of dropping", async () => {
+    const sends: string[] = [];
+    const bridgeFor = (label: string) => ({
+      send: mock(async (command: string, params: Record<string, unknown>) => {
+        sends.push(`${label}:${command}:${String(params.session_id)}`);
+        return { success: true };
+      }),
+    });
+    const bridgeA = bridgeFor("a");
+    const bridgeB = bridgeFor("b");
+    const pool = {
+      // Exact root resolution misses (the silent-drop bug this guards):
+      getActiveBridgeForRoot: () => null,
+      activeBridges: () => [bridgeA, bridgeB],
+    };
+
+    await signalBashWaitDetachForProject(
+      pool as unknown as Parameters<typeof signalBashWaitDetachForProject>[0],
+      "/repo-that-does-not-match",
+      "session-3",
+    );
+
+    expect(sends.sort()).toEqual([
+      "a:bash_wait_detach:session-3",
+      "b:bash_wait_detach:session-3",
+    ]);
   });
 });

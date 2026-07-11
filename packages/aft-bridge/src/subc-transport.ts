@@ -535,6 +535,14 @@ export class SubcTransportPool implements AftTransportPool {
     return this.transports.get(key) ?? null;
   }
 
+  /** All live per-root facades, for session-scoped signals that must not
+   * depend on exact root-key resolution (the command carries the session ID
+   * and the module scopes by session, so fan-out is safe). */
+  activeBridges(): SubcTransport[] {
+    if (!this.client || this.shuttingDown) return [];
+    return [...this.transports.values()];
+  }
+
   async toolCall(
     projectRoot: string,
     runtime: { sessionID?: string },
