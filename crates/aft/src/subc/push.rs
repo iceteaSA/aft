@@ -949,14 +949,14 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert(
             1,
-            RouteIdentity {
+            RouteIdentity(Arc::new(RouteIdentityData {
                 root: root.clone(),
                 project_root: root.as_path().to_path_buf(),
                 harness: "opencode".to_string(),
                 session: session.clone(),
                 trust: BindTrust::FirstParty,
                 consumer_elicitation_capable: false,
-            },
+            })),
         );
         let mut root_channels = HashMap::new();
         root_channels.insert(root.clone(), HashSet::from([1]));

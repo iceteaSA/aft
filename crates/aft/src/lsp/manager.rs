@@ -805,6 +805,10 @@ impl LspManager {
         self.diagnostics.error_warning_counts()
     }
 
+    pub fn diagnostics_generation(&self) -> u64 {
+        self.diagnostics.generation()
+    }
+
     /// Status-bar error/warning counts with a per-file `keep` predicate and
     /// cross-server dedup applied (see
     /// [`DiagnosticsStore::filtered_error_warning_counts`]). The caller supplies

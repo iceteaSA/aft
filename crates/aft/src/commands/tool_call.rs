@@ -3,7 +3,9 @@ use std::sync::OnceLock;
 
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
-use crate::run_tool_call::{run_tool_call, DispatchFn, ToolCallContext, ToolCallOutcome};
+use crate::run_tool_call::{
+    run_tool_call, strip_agent_preview_arg, DispatchFn, ToolCallContext, ToolCallOutcome,
+};
 
 type StandaloneDispatch = fn(RawRequest, &AppContext) -> Response;
 
@@ -69,7 +71,21 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         preview,
     };
 
-    match run_tool_call(name, &arguments, &tool_ctx, ctx, dispatch) {
+    let sanitized_arguments = strip_agent_preview_arg(&arguments);
+    let format_context = crate::subc_format::FormatContext::from_tool_call(
+        name,
+        &sanitized_arguments,
+        tool_ctx.project_root.as_path(),
+    );
+
+    match run_tool_call(
+        name,
+        &sanitized_arguments,
+        &format_context,
+        &tool_ctx,
+        ctx,
+        dispatch,
+    ) {
         ToolCallOutcome::Unary(result) => response_with_text(result.response, result.text),
     }
 }

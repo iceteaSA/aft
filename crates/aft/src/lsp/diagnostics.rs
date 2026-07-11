@@ -95,6 +95,9 @@ pub struct DiagnosticsStore {
     capacity: usize,
     /// Monotonic epoch counter. Incremented on every publish.
     next_epoch: u64,
+    /// Monotonic identity for any diagnostics-store mutation. Status-bar
+    /// aggregation uses it to skip unchanged project filtering work.
+    generation: u64,
     /// Last time a server published/replaced diagnostics for a specific file.
     /// Used as a per-file freshness proof for push-only servers.
     last_publish_at_for_file: HashMap<(ServerKey, PathBuf), Instant>,
@@ -111,6 +114,7 @@ impl DiagnosticsStore {
             order: Vec::new(),
             capacity,
             next_epoch: 0,
+            generation: 0,
             last_publish_at_for_file: HashMap::new(),
         }
     }
@@ -119,6 +123,9 @@ impl DiagnosticsStore {
     /// current entry count, the oldest entries are evicted immediately
     /// to fit.
     pub fn set_capacity(&mut self, capacity: usize) {
+        if self.capacity != capacity {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.capacity = capacity;
         if capacity > 0 {
             while self.entries.len() > capacity {
@@ -130,6 +137,10 @@ impl DiagnosticsStore {
     /// Number of currently-tracked entries.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The current LRU cap (0 = unbounded). Test-only accessor used to verify
@@ -191,6 +202,7 @@ impl DiagnosticsStore {
     ) {
         let key = (server, file);
         self.next_epoch = self.next_epoch.saturating_add(1);
+        self.generation = self.generation.wrapping_add(1);
         let entry = DiagnosticEntry {
             diagnostics,
             epoch: self.next_epoch,
@@ -409,18 +421,24 @@ impl DiagnosticsStore {
     /// Prefer `clear_for_server` for real manager cleanup so peer roots of the
     /// same kind are not wiped.
     pub fn clear_server(&mut self, server: ServerKind) {
+        let before = self.entries.len();
         self.entries
             .retain(|(stored_key, _), _| stored_key.kind != server);
         self.order
             .retain(|(stored_key, _)| stored_key.kind != server);
         self.last_publish_at_for_file
             .retain(|(stored_key, _), _| stored_key.kind != server);
+        if self.entries.len() != before {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     /// Drop one cached report for a specific server/file pair.
     pub fn clear_for_server_file(&mut self, key: &ServerKey, file: &Path) {
         let cache_key = (key.clone(), file.to_path_buf());
-        self.entries.remove(&cache_key);
+        if self.entries.remove(&cache_key).is_some() {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.order.retain(|entry_key| entry_key != &cache_key);
         self.last_publish_at_for_file.remove(&cache_key);
     }
@@ -436,6 +454,7 @@ impl DiagnosticsStore {
             .retain(|(_, stored_file), _| stored_file != file);
         let removed = self.entries.len() != before;
         if removed {
+            self.generation = self.generation.wrapping_add(1);
             self.order.retain(|(_, stored_file)| stored_file != file);
             self.last_publish_at_for_file
                 .retain(|(_, stored_file), _| stored_file != file);
@@ -463,6 +482,9 @@ impl DiagnosticsStore {
                 changed = true;
             }
         }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
         (had_entries, changed)
     }
 
@@ -475,15 +497,22 @@ impl DiagnosticsStore {
         };
         let changed = entry.stale;
         entry.stale = false;
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.touch_existing(&cache_key);
         changed
     }
 
     /// Drop all entries for a specific server instance.
     pub fn clear_for_server(&mut self, key: &ServerKey) {
+        let before = self.entries.len();
         self.entries.retain(|(k, _), _| k != key);
         self.order.retain(|(k, _)| k != key);
         self.last_publish_at_for_file.retain(|(k, _), _| k != key);
+        if self.entries.len() != before {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     /// Backward-compatible alias for tests/callers that already used the

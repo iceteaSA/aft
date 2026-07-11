@@ -1355,6 +1355,17 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
 }
 
 #[test]
+#[ignore = "manual subc idle round-trip microbenchmark"]
+fn subc_bridge_idle_echo_round_trip_benchmark() {
+    run_subc_bridge_test(
+        "subc_bridge_idle_echo_round_trip_benchmark",
+        Duration::from_secs(60),
+        drive_idle_echo_benchmark_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_core_routing_reuses_same_root_actor_and_allows_different_roots() {
     run_subc_bridge_test(
         "subc_bridge_core_routing_reuses_same_root_actor_and_allows_different_roots",
@@ -3199,6 +3210,60 @@ async fn drive_watcher_stale_daemon(input: FakeDaemonInput) {
         expect_watcher_stale_status_pushes_for_tool(&mut stream, 65, HashSet::from([1]), &root1)
             .await;
     assert_eq!(watcher_pushes.len(), 1);
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_idle_echo_benchmark_daemon(input: FakeDaemonInput) {
+    const WARMUP_CALLS: u64 = 20;
+    const MEASURED_CALLS: u64 = 200;
+
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    stream.set_nodelay(true).expect("set benchmark TCP_NODELAY");
+    bind_route1(&mut stream, &root1).await;
+
+    for corr in 1..=WARMUP_CALLS {
+        send_tool_call(
+            &mut stream,
+            1,
+            1_000 + corr,
+            "echo",
+            json!({ "case": "fast" }),
+        )
+        .await;
+        let _ = read_frame_timeout(&mut stream, "warmup echo response").await;
+    }
+
+    let started = Instant::now();
+    let mut round_trips = Vec::with_capacity(MEASURED_CALLS as usize);
+    for corr in 1..=MEASURED_CALLS {
+        let call_started = Instant::now();
+        send_tool_call(
+            &mut stream,
+            1,
+            2_000 + corr,
+            "echo",
+            json!({ "case": "fast" }),
+        )
+        .await;
+        let response = read_frame_timeout(&mut stream, "measured echo response").await;
+        assert_eq!(response.header.corr, 2_000 + corr);
+        round_trips.push(call_started.elapsed());
+    }
+    let elapsed = started.elapsed();
+    round_trips.sort_unstable();
+    let percentile = |percent: usize| {
+        let index = (round_trips.len() - 1) * percent / 100;
+        round_trips[index].as_micros()
+    };
+    eprintln!(
+        "subc idle echo: calls={MEASURED_CALLS} total_us={} p50_us={} p95_us={}",
+        elapsed.as_micros(),
+        percentile(50),
+        percentile(95),
+    );
 
     send_connection_goodbye(&mut stream).await;
 }

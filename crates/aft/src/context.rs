@@ -72,6 +72,16 @@ struct StatusBarTier2 {
     duplicates: Option<usize>,
     todos: Option<usize>,
     stale: bool,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StatusBarCache {
+    valid: bool,
+    diagnostics_generation: u64,
+    tier2_generation: u64,
+    tsconfig_generation: u64,
+    counts: Option<StatusBarCounts>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -946,6 +956,7 @@ pub struct AppContext {
     /// Deduping here (not in a process-global static) lets daemon roots emit the
     /// same counts independently.
     status_bar_last_emitted: RwLock<Option<StatusBarCounts>>,
+    status_bar_cached: RwLock<StatusBarCache>,
     bash_background: BgTaskRegistry,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
@@ -1090,7 +1101,7 @@ impl AppContext {
         // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
         // so the documented `lsp.diagnostic_cache_size` knob takes effect.
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
-        AppContext {
+        let context = AppContext {
             app: Arc::clone(&app),
             provider,
             backup: parking_lot::Mutex::new(BackupStore::new()),
@@ -1159,6 +1170,7 @@ impl AppContext {
             progress_sender: Arc::clone(&progress_sender),
             status_emitter,
             status_bar_last_emitted: RwLock::new(None),
+            status_bar_cached: RwLock::new(StatusBarCache::default()),
             bash_background: BgTaskRegistry::new(Arc::clone(&progress_sender)),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
@@ -1172,48 +1184,73 @@ impl AppContext {
             tsconfig_membership: parking_lot::Mutex::new(
                 crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
             ),
-        }
+        };
+        crate::logging::sync_storage_root(context.storage_dir());
+        context
     }
 
-    /// Current agent status-bar counts. `errors`/`warnings` are read LIVE from
-    /// the LSP diagnostics store (continuously drained, no round-trip); the
-    /// Tier-2 + todos counts are the last-known cached values. Returns `None`
-    /// until the Tier-2 cache has been populated at least once, so we never
-    /// surface a bar that misleadingly claims "0 dead code" before any scan.
+    /// Current agent status-bar counts. Generation identities are checked before
+    /// project scoping or tsconfig membership work, so unchanged responses reuse
+    /// the last honest aggregate from the continuously drained stores.
     pub fn status_bar_counts(&self) -> Option<StatusBarCounts> {
-        // All three Tier-2 categories must hold a real value before the bar is
-        // surfaced — otherwise a partially-scanned cold run would render a
-        // fabricated `0` for the not-yet-completed categories (#1). Extract the
-        // values under a short read guard, drop it, then compute E/W (which
-        // touches other state) with no status-bar guard held.
-        let (dead_code, unused_exports, duplicates, todos, tier2_stale) = {
-            let tier2 = self
-                .status_bar_tier2
+        let tier2 = self
+            .status_bar_tier2
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let tsconfig_generation = self.tsconfig_membership.lock().generation();
+        let lsp = self.lsp_manager.lock();
+        let diagnostics_generation = lsp.diagnostics_generation();
+
+        {
+            let cached = self
+                .status_bar_cached
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (Some(dead_code), Some(unused_exports), Some(duplicates)) =
-                (tier2.dead_code, tier2.unused_exports, tier2.duplicates)
-            else {
-                return None;
-            };
-            (
-                dead_code,
-                unused_exports,
-                duplicates,
-                tier2.todos.unwrap_or(0),
-                tier2.stale,
-            )
+            if cached.valid
+                && cached.diagnostics_generation == diagnostics_generation
+                && cached.tier2_generation == tier2.generation
+                && cached.tsconfig_generation == tsconfig_generation
+            {
+                return cached.counts.clone();
+            }
+        }
+
+        let counts = match (tier2.dead_code, tier2.unused_exports, tier2.duplicates) {
+            (Some(dead_code), Some(unused_exports), Some(duplicates)) => {
+                let (errors, warnings) = match self.canonical_cache_root_opt() {
+                    Some(root) => {
+                        let mut membership = self.tsconfig_membership.lock();
+                        lsp.filtered_error_warning_counts(|file| {
+                            file.starts_with(&root) && !membership.should_skip_diagnostics(file)
+                        })
+                    }
+                    None => lsp.warm_error_warning_counts(),
+                };
+                Some(StatusBarCounts {
+                    errors,
+                    warnings,
+                    dead_code,
+                    unused_exports,
+                    duplicates,
+                    todos: tier2.todos.unwrap_or(0),
+                    tier2_stale: tier2.stale,
+                })
+            }
+            _ => None,
         };
-        let (errors, warnings) = self.status_bar_error_warning_counts();
-        Some(StatusBarCounts {
-            errors,
-            warnings,
-            dead_code,
-            unused_exports,
-            duplicates,
-            todos,
-            tier2_stale,
-        })
+
+        *self
+            .status_bar_cached
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = StatusBarCache {
+            valid: true,
+            diagnostics_generation,
+            tier2_generation: tier2.generation,
+            tsconfig_generation,
+            counts: counts.clone(),
+        };
+        counts
     }
 
     pub fn try_health_snapshot(&self, project_root: &Path) -> RootHealthSnapshot {
@@ -1323,24 +1360,6 @@ impl AppContext {
         true
     }
 
-    /// Error/warning counts for the agent status bar, filtered to match
-    /// `aft_inspect`/`tsc` (v0.35 council): only diagnostics under the canonical
-    /// project root, with build-excluded TS/JS files skipped via the persistent
-    /// tsconfig-membership cache, and cross-server duplicates collapsed. Falls
-    /// back to the raw warm count before configure has set a canonical root.
-    fn status_bar_error_warning_counts(&self) -> (usize, usize) {
-        let Some(root) = self.canonical_cache_root_opt() else {
-            // Pre-configure: no project root to scope against. Raw count is the
-            // best available signal (and the bar is gated on Tier-2 anyway).
-            return self.lsp_manager.lock().warm_error_warning_counts();
-        };
-        let lsp = self.lsp_manager.lock();
-        let mut membership = self.tsconfig_membership.lock();
-        lsp.filtered_error_warning_counts(|file| {
-            file.starts_with(&root) && !membership.should_skip_diagnostics(file)
-        })
-    }
-
     /// Invalidate the status-bar tsconfig-membership cache. Called from the
     /// watcher seam when a tsconfig-like file changes and from `configure`
     /// when the project root changes, so the next bar count re-reads from disk.
@@ -1350,7 +1369,7 @@ impl AppContext {
 
     #[cfg(test)]
     pub fn tsconfig_membership_clear_generation_for_test(&self) -> u64 {
-        self.tsconfig_membership.lock().clear_generation()
+        self.tsconfig_membership.lock().generation()
     }
 
     /// Mark the status-bar Tier-2 counts stale (rendered with `~`) without
@@ -1368,6 +1387,9 @@ impl AppContext {
         {
             let changed = !tier2.stale;
             tier2.stale = true;
+            if changed {
+                tier2.generation = tier2.generation.wrapping_add(1);
+            }
             return changed;
         }
         false
@@ -1390,6 +1412,13 @@ impl AppContext {
             .status_bar_tier2
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = (
+            tier2.dead_code,
+            tier2.unused_exports,
+            tier2.duplicates,
+            tier2.todos,
+            tier2.stale,
+        );
         if let Some(dead_code) = dead_code {
             tier2.dead_code = Some(dead_code);
         }
@@ -1403,6 +1432,16 @@ impl AppContext {
             tier2.todos = Some(todos);
         }
         tier2.stale = stale;
+        let current = (
+            tier2.dead_code,
+            tier2.unused_exports,
+            tier2.duplicates,
+            tier2.todos,
+            tier2.stale,
+        );
+        if current != previous {
+            tier2.generation = tier2.generation.wrapping_add(1);
+        }
     }
 
     /// Borrow the cached project gitignore matcher. Returns `None` when no
@@ -2079,10 +2118,15 @@ impl AppContext {
             changed
         };
         if root_changed {
-            *self
+            let mut tier2 = self
                 .status_bar_tier2
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = StatusBarTier2::default();
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let generation = tier2.generation.wrapping_add(1);
+            *tier2 = StatusBarTier2 {
+                generation,
+                ..StatusBarTier2::default()
+            };
             *self
                 .status_bar_last_emitted
                 .write()

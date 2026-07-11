@@ -1910,6 +1910,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.semantic_fingerprint_generation()
         };
     ctx.set_config(next_config.clone());
+    crate::logging::sync_storage_root(ctx.storage_dir());
     ctx.set_harness(harness.clone());
     {
         let mut backup = ctx.backup().lock();

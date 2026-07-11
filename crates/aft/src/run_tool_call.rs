@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
@@ -38,16 +39,12 @@ pub struct ToolCallContext {
 pub fn run_tool_call(
     bare_name: &str,
     args: &Value,
+    format_context: &crate::subc_format::FormatContext,
     ctx: &ToolCallContext,
     app_ctx: &AppContext,
     dispatch: &DispatchFn<'_>,
 ) -> ToolCallOutcome {
     let sanitized_args = strip_agent_preview_arg(args);
-    let format_context = crate::subc_format::FormatContext::from_tool_call(
-        bare_name,
-        &sanitized_args,
-        ctx.project_root.as_path(),
-    );
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,
         preview: ctx.preview,
@@ -108,17 +105,24 @@ pub fn run_tool_call(
     ))
 }
 
-fn strip_agent_preview_arg(args: &Value) -> Value {
+pub(crate) fn strip_agent_preview_arg(args: &Value) -> Cow<'_, Value> {
     let Some(map) = args.as_object() else {
-        return args.clone();
+        return Cow::Borrowed(args);
     };
     if !map.contains_key("preview") {
-        return args.clone();
+        return Cow::Borrowed(args);
     }
 
     let mut sanitized = map.clone();
     sanitized.remove("preview");
-    Value::Object(sanitized)
+    Cow::Owned(Value::Object(sanitized))
+}
+
+pub(crate) fn strip_agent_preview_arg_owned(mut args: Value) -> Value {
+    if let Some(map) = args.as_object_mut() {
+        map.remove("preview");
+    }
+    args
 }
 
 fn tool_call_result_from_response(

@@ -6,7 +6,7 @@ mod tests;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     thread::{self, JoinHandle},
@@ -212,12 +212,16 @@ impl Executor {
         let state = Arc::new(Mutex::new(SchedulerState::new(effective.clone())));
         let heavy = Arc::new(HeavySemaphore::new(effective.heavy_permits));
         let nonrunnable_dispatches = Arc::new(AtomicUsize::new(0));
+        let completed_interactive = Arc::new(AtomicU64::new(0));
+        let completed_maintenance = Arc::new(AtomicU64::new(0));
         let (run_tx, run_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
         let scheduler_state = Arc::clone(&state);
         let scheduler_heavy = Arc::clone(&heavy);
         let scheduler_violations = Arc::clone(&nonrunnable_dispatches);
+        let scheduler_completed_interactive = Arc::clone(&completed_interactive);
+        let scheduler_completed_maintenance = Arc::clone(&completed_maintenance);
         let scheduler_handle = thread::Builder::new()
             .name("aft-executor-scheduler".to_string())
             .spawn(move || {
@@ -227,6 +231,8 @@ impl Executor {
                     run_tx,
                     event_rx,
                     scheduler_violations,
+                    scheduler_completed_interactive,
+                    scheduler_completed_maintenance,
                 );
             })
             .expect("spawn AFT executor scheduler");
@@ -250,6 +256,8 @@ impl Executor {
                 worker_handles: Mutex::new(worker_handles),
                 config: effective,
                 nonrunnable_dispatches,
+                completed_interactive,
+                completed_maintenance,
             }),
         }
     }
@@ -520,6 +528,13 @@ impl Executor {
         self.inner.nonrunnable_dispatches.load(Ordering::Acquire)
     }
 
+    pub fn completion_counts(&self) -> (u64, u64) {
+        (
+            self.inner.completed_interactive.load(Ordering::Relaxed),
+            self.inner.completed_maintenance.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn actor_is_fatal(&self, root_id: &ProjectRootId) -> bool {
         self.inner
             .state
@@ -548,6 +563,8 @@ struct ExecutorInner {
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
     config: EffectiveConfig,
     nonrunnable_dispatches: Arc<AtomicUsize>,
+    completed_interactive: Arc<AtomicU64>,
+    completed_maintenance: Arc<AtomicU64>,
 }
 
 impl Drop for ExecutorInner {
@@ -1035,15 +1052,25 @@ fn scheduler_loop(
     run_tx: Sender<RunJob>,
     event_rx: Receiver<SchedulerEvent>,
     nonrunnable_dispatches: Arc<AtomicUsize>,
+    completed_interactive: Arc<AtomicU64>,
+    completed_maintenance: Arc<AtomicU64>,
 ) {
     while let Ok(event) = event_rx.recv() {
         let mut shutdown = false;
         {
             let mut state = state.lock();
+            note_completion_event(&event, &completed_interactive, &completed_maintenance);
             shutdown |= process_scheduler_event(event, &mut state);
             while !shutdown {
                 match event_rx.try_recv() {
-                    Ok(event) => shutdown |= process_scheduler_event(event, &mut state),
+                    Ok(event) => {
+                        note_completion_event(
+                            &event,
+                            &completed_interactive,
+                            &completed_maintenance,
+                        );
+                        shutdown |= process_scheduler_event(event, &mut state)
+                    }
                     Err(_) => break,
                 }
             }
@@ -1055,6 +1082,24 @@ fn scheduler_loop(
 
         if shutdown {
             break;
+        }
+    }
+}
+
+fn note_completion_event(
+    event: &SchedulerEvent,
+    completed_interactive: &AtomicU64,
+    completed_maintenance: &AtomicU64,
+) {
+    let SchedulerEvent::Completed(event) = event else {
+        return;
+    };
+    match event.job_class {
+        JobClass::Interactive => {
+            completed_interactive.fetch_add(1, Ordering::Relaxed);
+        }
+        JobClass::Maintenance => {
+            completed_maintenance.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

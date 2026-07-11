@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -30,7 +31,9 @@ use crate::jsonc::strip_jsonc;
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
 use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
-use crate::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome, ToolCallResult};
+use crate::run_tool_call::{
+    run_tool_call, strip_agent_preview_arg_owned, ToolCallContext, ToolCallOutcome, ToolCallResult,
+};
 use crate::runtime_drain;
 
 use subc_protocol::manifest::{
@@ -45,7 +48,7 @@ use subc_protocol::{
     ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
@@ -307,13 +310,24 @@ struct RouteBindCompletion {
 }
 
 #[derive(Debug, Clone)]
-struct RouteIdentity {
+struct RouteIdentity(Arc<RouteIdentityData>);
+
+#[derive(Debug)]
+struct RouteIdentityData {
     root: ProjectRootId,
     project_root: PathBuf,
     harness: String,
     session: String,
     trust: BindTrust,
     consumer_elicitation_capable: bool,
+}
+
+impl Deref for RouteIdentity {
+    type Target = RouteIdentityData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1244,6 +1258,12 @@ async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStre
             endpoint: endpoint_label.clone(),
             source,
         })?;
+    stream
+        .set_nodelay(true)
+        .map_err(|source| SubcError::Connect {
+            endpoint: endpoint_label.clone(),
+            source,
+        })?;
 
     authenticate_client(&mut stream, &conn, AUTH_DEADLINE)
         .await
@@ -1968,9 +1988,10 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
+        let mut write_buffer = Vec::new();
         while let Some(frame) = rx.recv().await {
             decrement_counted_channel(&metrics.writer_queued);
-            write_frame(&mut write, &frame).await?;
+            write_frame_contiguous(&mut write, &frame, &mut write_buffer).await?;
         }
         Ok(())
     })
@@ -1982,6 +2003,32 @@ where
 /// error / EOF) is forwarded over `tx`; the loop consumes them via cancel-safe
 /// `recv()`. Exits on EOF (Ok(None)), a read error, or when `tx` is dropped
 /// (the loop ended and aborted us).
+async fn write_frame_contiguous<W>(
+    writer: &mut W,
+    frame: &Frame,
+    buffer: &mut Vec<u8>,
+) -> Result<(), subc_transport::FrameIoError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if frame.header.len as usize != frame.body.len() {
+        return Err(subc_transport::FrameIoError::BodyLengthMismatch {
+            header_len: frame.header.len,
+            body_len: frame.body.len(),
+        });
+    }
+
+    let header = frame.header.encode();
+    buffer.clear();
+    buffer.reserve(header.len() + frame.body.len());
+    buffer.extend_from_slice(&header);
+    buffer.extend_from_slice(&frame.body);
+    writer
+        .write_all(buffer)
+        .await
+        .map_err(subc_transport::FrameIoError::Io)
+}
+
 fn spawn_reader_task<R>(mut read: R, tx: mpsc::Sender<Result<Frame, SubcError>>) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -2493,14 +2540,14 @@ async fn handle_control_request(
                 }
             };
 
-            let route_identity = RouteIdentity {
+            let route_identity = RouteIdentity(Arc::new(RouteIdentityData {
                 root: bind_root_id.clone(),
                 project_root: PathBuf::from(&bind_project_root),
                 harness: bind_harness.clone(),
                 session: bind_session.clone(),
                 trust: bind_trust,
                 consumer_elicitation_capable,
-            };
+            }));
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
             let inserted_new_actor = register_actor_for_bind(
@@ -2744,12 +2791,14 @@ async fn handle_tool_call(
         }
     }
 
-    let is_bg_events_subscribe = serde_json::from_slice::<BgEventsProbe>(&frame.body)
-        .ok()
-        .and_then(|probe| probe.op)
-        .as_deref()
-        == Some("bg_events");
-    if is_bg_events_subscribe {
+    let route_request =
+        serde_json::from_slice::<RouteRequest>(&frame.body).map_err(SubcError::Json)?;
+    if matches!(
+        route_request,
+        RouteRequest::BgEvents(BgEventsRequest {
+            op: BgEventsOp::BgEvents
+        })
+    ) {
         if let Some(old_sub) = bg_subs.get(&route_id).copied() {
             let _ = push::try_send_bg_stream_end(tx, metrics, route_id, &old_sub);
         }
@@ -2769,8 +2818,8 @@ async fn handle_tool_call(
         );
         bg_sub_by_session.insert((identity.root.clone(), identity.session.clone()), route_id);
         push::arm_bg_wake(
-            identity.root,
-            identity.session,
+            identity.root.clone(),
+            identity.session.clone(),
             route_id,
             bg_wake_pending,
             bg_wake_epoch,
@@ -2778,11 +2827,14 @@ async fn handle_tool_call(
         return Ok(());
     }
 
-    let call = serde_json::from_slice::<ToolCallRequest>(&frame.body).map_err(SubcError::Json)?;
-    let bare_name = call.name.clone();
+    let RouteRequest::ToolCall(call) = route_request else {
+        unreachable!("background event subscription returned above")
+    };
+    let bare_name = call.name;
+    let arguments = strip_agent_preview_arg_owned(call.arguments);
     let format_context = crate::subc_format::FormatContext::from_tool_call(
         &bare_name,
-        &call.arguments,
+        &arguments,
         identity.project_root.as_path(),
     );
 
@@ -2821,19 +2873,19 @@ async fn handle_tool_call(
     // the RouteBind config-trust cap) from ever reaching dispatch. Only
     // the integration-test harness (run_subc_mode_for_test) opens this to
     // drive synthetic native commands through the executor.
-    if !is_subc_agent_core_tool(&call.name)
-        && !is_subc_native_plumbing_tool(&call.name)
+    if !is_subc_agent_core_tool(&bare_name)
+        && !is_subc_native_plumbing_tool(&bare_name)
         && !allow_native_passthrough
     {
         log::warn!(
             "subc tool call: rejecting non-manifest tool name {:?} on route {} (fail-closed)",
-            call.name,
+            bare_name,
             frame.header.channel
         );
         let response = Response::error(
             request_id.clone(),
             "unknown_tool",
-            format!("tool {:?} is not in the AFT tool manifest", call.name),
+            format!("tool {:?} is not in the AFT tool manifest", bare_name),
         );
         let text = crate::subc_format::format_response_with_context(
             &bare_name,
@@ -2854,7 +2906,7 @@ async fn handle_tool_call(
     if bare_name == "bash" {
         if matches!(bind_trust, BindTrust::Untrusted) {
             let plan = match bash::prepare_bash_elicitation_plan(
-                &call.arguments,
+                &arguments,
                 identity.project_root.as_path(),
             ) {
                 Ok(plan) => plan,
@@ -2922,11 +2974,11 @@ async fn handle_tool_call(
                     tool_corr: frame.header.corr,
                     tool_flags: frame.header.flags,
                     tool_ver: frame.header.ver,
-                    root: identity.root,
-                    project_root: identity.project_root,
-                    session_id: identity.session,
+                    root: identity.root.clone(),
+                    project_root: identity.project_root.clone(),
+                    session_id: identity.session.clone(),
                     request_id,
-                    arguments: call.arguments,
+                    arguments,
                     format_context,
                     cancel,
                     grants: plan.grants,
@@ -2962,15 +3014,15 @@ async fn handle_tool_call(
             bash_poll_touch_tx,
             metrics,
             dispatch,
-            identity.root,
-            identity.project_root,
-            identity.session,
+            identity.root.clone(),
+            identity.project_root.clone(),
+            identity.session.clone(),
             request_id,
             frame.header.channel,
             frame.header.corr,
             frame.header.flags,
             frame.header.ver,
-            call.arguments,
+            arguments,
             format_context,
             cancel,
             bind_trust,
@@ -2987,36 +3039,33 @@ async fn handle_tool_call(
         diagnostics_on_edit,
         preview: call.preview,
     };
-    let arguments_for_run = call.arguments.clone();
-    let bare_name_for_run = bare_name.clone();
     let bare_name_for_frame = bare_name.clone();
-    let bare_name_for_finalize = bare_name.clone();
-    let session_for_log = identity.session.clone();
-    let session_for_finalize = identity.session.clone();
+    let identity_for_run = identity.clone();
     let request_id_for_force = request_id.clone();
-    let format_context_for_frame = format_context;
+    let format_context_for_frame = format_context.clone();
     let (text_tx, text_rx) = oneshot::channel::<String>();
     let rx = executor.submit_async(
-        identity.root,
+        identity.root.clone(),
         lane,
         request_id.clone(),
         Box::new(move |ctx| {
-            log_ctx::with_session(Some(session_for_log.clone()), || {
+            log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 let run = || {
                     let dispatch_with_finalize = |raw_req: RawRequest, app_ctx: &AppContext| {
                         let mut response = dispatch(raw_req, app_ctx);
                         crate::response_finalize::finalize_response_with_bg_completions(
                             &mut response,
                             app_ctx,
-                            &session_for_finalize,
-                            &bare_name_for_finalize,
+                            &identity_for_run.session,
+                            &bare_name,
                             bind_trust.allows_bash_observation(),
                         );
                         response
                     };
                     match run_tool_call(
-                        &bare_name_for_run,
-                        &arguments_for_run,
+                        &bare_name,
+                        &arguments,
+                        &format_context,
                         &tool_call_context,
                         ctx,
                         &dispatch_with_finalize,
@@ -3208,9 +3257,22 @@ async fn signal_fatal_teardown(
     }
     shutdown.notify_one();
 }
-#[derive(Deserialize)]
-struct BgEventsProbe {
-    op: Option<String>,
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RouteRequest {
+    BgEvents(BgEventsRequest),
+    ToolCall(ToolCallRequest),
+}
+
+#[derive(Debug, Deserialize)]
+struct BgEventsRequest {
+    op: BgEventsOp,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BgEventsOp {
+    BgEvents,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3334,14 +3396,14 @@ pub(crate) mod test_support {
         session_id: &str,
         trust: BindTrust,
     ) -> RouteIdentity {
-        RouteIdentity {
+        RouteIdentity(Arc::new(RouteIdentityData {
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
             harness: "opencode".to_string(),
             session: session_id.to_string(),
             trust,
             consumer_elicitation_capable: false,
-        }
+        }))
     }
 
     pub(super) fn progress_frame(request_id: &str, kind: ProgressKind, chunk: &str) -> PushFrame {

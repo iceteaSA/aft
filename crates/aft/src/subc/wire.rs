@@ -1,8 +1,11 @@
 //! Frame encoding and writer-queue helpers used by the subc transport edge.
 
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Serialize, Serializer};
+
 use super::{
-    control_flags, fmt, json, mpsc, AtomicUsize, DispatchPathMetrics, ErrorBody, Flags, Frame,
-    FrameType, Ordering, PathBuf, Response, ToolCallResult, Value, CONTROL_SEND_TIMEOUT,
+    control_flags, fmt, mpsc, AtomicUsize, DispatchPathMetrics, ErrorBody, Flags, Frame, FrameType,
+    Ordering, PathBuf, Response, ToolCallResult, Value, CONTROL_SEND_TIMEOUT,
     RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
 };
 
@@ -125,26 +128,85 @@ pub(super) async fn send_frame(
     }
 }
 
-/// Flatten a tool-call `Response` + server-rendered `text` into the SAME flat
-/// object the standalone NDJSON `tool_call` command puts on the wire:
-/// `{id, success, ...data, text}` (Response flattens `data` to the top level —
-/// protocol.rs — and `response_with_text` merges `text` in). Mirrors
-/// `commands::tool_call::response_with_text` exactly, including its non-object
-/// `data` fallback (data replaced by `{text}`), so the subc `structuredContent`
-/// is byte-identical to the standalone response body. Built field-by-field
-/// rather than via `serde_json::to_value(response)` because `#[serde(flatten)]`
-/// of a non-object `data` would error.
-fn flat_tool_response(response: &crate::protocol::Response, text: &str) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("id".to_string(), Value::String(response.id.clone()));
-    obj.insert("success".to_string(), Value::Bool(response.success));
-    if let Some(data) = response.data.as_object() {
-        for (key, value) in data {
-            obj.insert(key.clone(), value.clone());
+/// Borrowed flat response matching the standalone NDJSON shape without cloning
+/// the response id or any structured data values.
+struct FlatToolResponse<'a> {
+    response: &'a crate::protocol::Response,
+    text: &'a str,
+}
+
+impl Serialize for FlatToolResponse<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let data = self.response.data.as_object();
+        let has_text = data.is_some_and(|data| data.contains_key("text"));
+        let field_count =
+            2 + data.map_or(0, |data| {
+                data.len()
+                    - usize::from(data.contains_key("id"))
+                    - usize::from(data.contains_key("success"))
+            }) + usize::from(!has_text);
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        match data.and_then(|data| data.get("id")) {
+            Some(value) => map.serialize_entry("id", value)?,
+            None => map.serialize_entry("id", &self.response.id)?,
         }
+        match data.and_then(|data| data.get("success")) {
+            Some(value) => map.serialize_entry("success", value)?,
+            None => map.serialize_entry("success", &self.response.success)?,
+        }
+        if let Some(data) = data {
+            for (key, value) in data {
+                match key.as_str() {
+                    "id" | "success" => {}
+                    "text" => map.serialize_entry(key, self.text)?,
+                    _ => map.serialize_entry(key, value)?,
+                }
+            }
+        }
+        if !has_text {
+            map.serialize_entry("text", self.text)?;
+        }
+        map.end()
     }
-    obj.insert("text".to_string(), Value::String(text.to_string()));
-    Value::Object(obj)
+}
+
+struct ToolResponseEnvelope<'a> {
+    result: &'a ToolCallResult,
+}
+
+impl Serialize for ToolResponseEnvelope<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut envelope = serializer.serialize_struct("ToolResponseEnvelope", 3)?;
+        envelope.serialize_field(
+            "content",
+            &[TextContent {
+                kind: "text",
+                text: &self.result.text,
+            }],
+        )?;
+        envelope.serialize_field("isError", &!self.result.response.success)?;
+        envelope.serialize_field(
+            "structuredContent",
+            &FlatToolResponse {
+                response: &self.result.response,
+                text: &self.result.text,
+            },
+        )?;
+        envelope.end()
+    }
+}
+
+#[derive(Serialize)]
+struct TextContent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
 }
 
 pub(super) fn build_tool_response_frame(
@@ -154,7 +216,6 @@ pub(super) fn build_tool_response_frame(
     flags: Flags,
     result: &ToolCallResult,
 ) -> Result<Frame, SubcError> {
-    let is_error = !result.response.success;
     // `content`/`isError` is the MCP-native surface a GENERIC host reads (and a
     // generic host ignores `structuredContent`, per the MCP spec). The
     // FIRST-PARTY AFT plugin instead reads `structuredContent`, which carries
@@ -165,12 +226,7 @@ pub(super) fn build_tool_response_frame(
     // unchanged. SubcTransport.toolCall re-lifts `structuredContent` straight to
     // the flat ToolCallResult, so nothing downstream of the transport differs
     // from the NDJSON path.
-    let payload = json!({
-        "content": [{ "type": "text", "text": result.text.as_str() }],
-        "isError": is_error,
-        "structuredContent": flat_tool_response(&result.response, &result.text),
-    });
-    let body = serde_json::to_vec(&payload).map_err(SubcError::Json)?;
+    let body = serde_json::to_vec(&ToolResponseEnvelope { result }).map_err(SubcError::Json)?;
 
     Frame::build_with_version(ver, FrameType::Response, flags, route_channel, corr, body)
         .map_err(SubcError::FrameBuild)
@@ -436,7 +492,11 @@ mod tests {
             "text": "rendered text",
         });
         assert_eq!(
-            flat_tool_response(&result.response, &result.text),
+            serde_json::to_value(FlatToolResponse {
+                response: &result.response,
+                text: &result.text,
+            })
+            .unwrap(),
             expected_flat,
             "structuredContent must be byte-identical to the standalone flat response"
         );
@@ -445,6 +505,16 @@ mod tests {
         // sidecar shape under structuredContent for the first-party plugin.
         let frame =
             build_tool_response_frame(PROTOCOL_VERSION, 1, 42, control_flags(), &result).unwrap();
+        let expected_body = serde_json::to_vec(&json!({
+            "content": [{ "type": "text", "text": "rendered text" }],
+            "isError": false,
+            "structuredContent": expected_flat.clone(),
+        }))
+        .unwrap();
+        assert_eq!(
+            frame.body, expected_body,
+            "tool response wire bytes drifted"
+        );
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["isError"], json!(false));
         assert_eq!(body["content"][0]["type"], json!("text"));

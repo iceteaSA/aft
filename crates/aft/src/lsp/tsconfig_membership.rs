@@ -25,6 +25,8 @@ const TS_JS_EXTENSIONS: &[&str] = &[
 #[derive(Default)]
 pub(crate) struct TsconfigMembershipCache {
     projects: HashMap<PathBuf, Option<ResolvedTsConfig>>,
+    canonical_files: HashMap<PathBuf, PathBuf>,
+    file_projects: HashMap<PathBuf, Option<PathBuf>>,
     clear_generation: u64,
 }
 
@@ -41,11 +43,12 @@ impl TsconfigMembershipCache {
     /// files keyed under a different directory).
     pub(crate) fn clear(&mut self) {
         self.projects.clear();
+        self.canonical_files.clear();
+        self.file_projects.clear();
         self.clear_generation = self.clear_generation.wrapping_add(1);
     }
 
-    #[cfg(test)]
-    pub(crate) fn clear_generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         self.clear_generation
     }
 
@@ -54,7 +57,17 @@ impl TsconfigMembershipCache {
             return false;
         }
 
-        let Some(tsconfig_dir) = find_workspace_root(file, &[TSCONFIG_JSON]) else {
+        let canonical_file = self
+            .canonical_files
+            .entry(file.to_path_buf())
+            .or_insert_with(|| canonical_or_normalized(file))
+            .clone();
+        let tsconfig_dir = self
+            .file_projects
+            .entry(canonical_file.clone())
+            .or_insert_with(|| find_workspace_root(&canonical_file, &[TSCONFIG_JSON]))
+            .clone();
+        let Some(tsconfig_dir) = tsconfig_dir else {
             return false;
         };
 
@@ -64,7 +77,7 @@ impl TsconfigMembershipCache {
             .or_insert_with(|| load_project(&tsconfig_dir));
 
         match project {
-            Some(project) => !project.contains(file),
+            Some(project) => !project.contains_canonical(&canonical_file),
             None => false,
         }
     }
@@ -78,13 +91,12 @@ struct ResolvedTsConfig {
 }
 
 impl ResolvedTsConfig {
-    fn contains(&self, file: &Path) -> bool {
-        let file = canonical_or_normalized(file);
-        if self.files.iter().any(|member| *member == file) {
+    fn contains_canonical(&self, file: &Path) -> bool {
+        if self.files.iter().any(|member| member == file) {
             return true;
         }
 
-        self.include.is_match(&file) && !self.exclude.is_match(&file)
+        self.include.is_match(file) && !self.exclude.is_match(file)
     }
 }
 

@@ -10,7 +10,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -20,6 +20,7 @@ const ROTATION_CHECK_EVERY: u64 = 64;
 const LOG_CHANNEL_CAPACITY: usize = 4096;
 const DEAD_PROCESS_LOG_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DEFAULT_PERF_TICK_INTERVAL: Duration = Duration::from_secs(60);
+const PERF_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Initialize the `RUST_LOG`-filtered stderr logger and its additive file sink.
 pub fn init() {
@@ -371,23 +372,22 @@ struct PerfMetrics {
     callgraph_invalidations: AtomicU64,
     file_lines_dropped: AtomicU64,
     tier2: Mutex<BTreeMap<String, (u64, u64)>>,
+    next_sample_ns: AtomicU64,
     reporter: Mutex<PerfReporter>,
 }
 
 struct PerfReporter {
     last_report: Instant,
-    previous_executor: Option<ExecutorSample>,
-    executor_completed_interactive: u64,
-    executor_completed_maintenance: u64,
+    last_completed_interactive: u64,
+    last_completed_maintenance: u64,
 }
 
 impl Default for PerfReporter {
     fn default() -> Self {
         Self {
             last_report: Instant::now(),
-            previous_executor: None,
-            executor_completed_interactive: 0,
-            executor_completed_maintenance: 0,
+            last_completed_interactive: 0,
+            last_completed_maintenance: 0,
         }
     }
 }
@@ -407,7 +407,8 @@ static PERF: LazyLock<PerfMetrics> = LazyLock::new(PerfMetrics::default);
 /// Move subsequent file log writes to a newly configured storage root.
 ///
 /// Reconfiguration is queued behind existing writes and is a no-op when the
-/// root has not changed, so callers may invoke this from periodic drain loops.
+/// root has not changed. Initialization and explicit configure changes call
+/// this directly, avoiding storage-root polling on transport drain turns.
 pub fn sync_storage_root(storage_root: PathBuf) {
     let Ok(mut control) = FILE_CONTROL.lock() else {
         return;
@@ -475,15 +476,13 @@ pub fn note_callgraph_invalidations(files: usize) {
 
 /// Sample executor liveness and emit one busy-only aggregate at the configured cadence.
 ///
-/// Calling this every transport/drain turn is cheap: executor state is sampled
-/// with its existing try-lock API, and all counters are atomics between ticks.
+/// The transport may call this every loop turn; an atomic deadline keeps all
+/// executor sampling and reporter locking off that path between drain ticks.
 pub fn perf_tick(executor: Option<&Executor>) {
-    if let Some(context) = executor
-        .and_then(Executor::try_actor_entries)
-        .and_then(|entries| entries.into_iter().next().map(|(_, context)| context))
-    {
-        sync_storage_root(context.storage_dir());
+    if !perf_sample_due() {
+        return;
     }
+
     let sample = executor.and_then(|executor| {
         executor
             .try_dispatch_liveness_snapshot()
@@ -497,42 +496,27 @@ pub fn perf_tick(executor: Option<&Executor>) {
             })
     });
 
-    let interval = perf_tick_interval();
-    let (completed_interactive, completed_maintenance, due) = {
+    let completion_counts = executor.map_or((0, 0), Executor::completion_counts);
+    let (completed_interactive, completed_maintenance) = {
         let Ok(mut reporter) = PERF.reporter.lock() else {
             return;
         };
-        if let (Some(previous), Some(current)) = (reporter.previous_executor, sample) {
-            reporter.executor_completed_interactive =
-                reporter.executor_completed_interactive.saturating_add(
-                    previous
-                        .interactive_running
-                        .saturating_sub(current.interactive_running) as u64,
-                );
-            reporter.executor_completed_maintenance =
-                reporter.executor_completed_maintenance.saturating_add(
-                    previous
-                        .maintenance_running
-                        .saturating_sub(current.maintenance_running) as u64,
-                );
-        }
-        reporter.previous_executor = sample;
-        if reporter.last_report.elapsed() < interval {
+        if reporter.last_report.elapsed() < perf_tick_interval() {
             return;
         }
         reporter.last_report = Instant::now();
         let completed = (
-            reporter.executor_completed_interactive,
-            reporter.executor_completed_maintenance,
-            true,
+            completion_counts
+                .0
+                .saturating_sub(reporter.last_completed_interactive),
+            completion_counts
+                .1
+                .saturating_sub(reporter.last_completed_maintenance),
         );
-        reporter.executor_completed_interactive = 0;
-        reporter.executor_completed_maintenance = 0;
+        reporter.last_completed_interactive = completion_counts.0;
+        reporter.last_completed_maintenance = completion_counts.1;
         completed
     };
-    if !due {
-        return;
-    }
 
     let watcher_ingested = PERF.watcher_ingested.swap(0, Ordering::Relaxed);
     let watcher_paths = PERF.watcher_paths.swap(0, Ordering::Relaxed);
@@ -607,13 +591,37 @@ fn format_optional_ms(value: Option<u64>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+fn perf_sample_due() -> bool {
+    static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+    let now_ns = ORIGIN.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let mut deadline = PERF.next_sample_ns.load(Ordering::Relaxed);
+    loop {
+        if now_ns < deadline {
+            return false;
+        }
+        let next = now_ns.saturating_add(PERF_SAMPLE_INTERVAL.as_nanos() as u64);
+        match PERF.next_sample_ns.compare_exchange_weak(
+            deadline,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => deadline = observed,
+        }
+    }
+}
+
 fn perf_tick_interval() -> Duration {
-    std::env::var("AFT_PERF_TICK_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_PERF_TICK_INTERVAL)
+    static INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("AFT_PERF_TICK_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_PERF_TICK_INTERVAL)
+    })
 }
 
 #[cfg(test)]
