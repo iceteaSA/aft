@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INSPECT_SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
 
@@ -23,6 +23,12 @@ pub(crate) struct Tier2ContributionUpdates {
     pub upserts: Vec<FileContribution>,
     pub deletes: Vec<PathBuf>,
     pub metadata_updates: Vec<(PathBuf, FileFreshness)>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct InspectDbTimings {
+    pub lock_wait: Duration,
+    pub transaction: Duration,
 }
 
 #[derive(Debug)]
@@ -789,7 +795,7 @@ impl InspectCache {
         category: InspectCategory,
         updates: Tier2ContributionUpdates,
         config: &Config,
-    ) -> Result<String, InspectCacheError> {
+    ) -> Result<(String, InspectDbTimings), InspectCacheError> {
         self.apply_contribution_updates_with_config(category, updates, Some(config))
     }
 
@@ -798,13 +804,19 @@ impl InspectCache {
         category: InspectCategory,
         updates: Tier2ContributionUpdates,
         config: Option<&Config>,
-    ) -> Result<String, InspectCacheError> {
+    ) -> Result<(String, InspectDbTimings), InspectCacheError> {
         self.verify_writer_lease()?;
         let now = unix_seconds_now();
+        let lock_started = Instant::now();
         let mut conn = self
             .conn
             .lock()
             .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let mut timings = InspectDbTimings {
+            lock_wait: lock_started.elapsed(),
+            ..InspectDbTimings::default()
+        };
+        let transaction_started = Instant::now();
         let tx = conn.transaction()?;
 
         for relative_file in updates.deletes {
@@ -871,13 +883,14 @@ impl InspectCache {
             config,
         )?;
         tx.commit()?;
+        timings.transaction = transaction_started.elapsed();
 
         self.memory
             .write()
             .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
             .remove(&JobKey::for_project_category(category));
 
-        Ok(contribution_set_hash)
+        Ok((contribution_set_hash, timings))
     }
 
     pub(crate) fn load_aggregate_if_hash_matches(
@@ -1555,6 +1568,9 @@ fn percent_encode_sqlite_uri_path(path: &str) -> String {
 
 fn configure_connection(conn: &Connection) -> Result<(), InspectCacheError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // Inspect facts are fully recomputable, so NORMAL avoids a full fsync per
+    // commit while WAL transactions and writer-lease publication stay atomic.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
 }
@@ -2037,6 +2053,19 @@ mod tests {
             sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
             "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
         );
+    }
+
+    #[test]
+    fn inspect_cache_writer_uses_normal_synchronous_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("checkout");
+        fs::create_dir_all(&project_root).unwrap();
+        let cache = InspectCache::open(temp.path().join("inspect"), project_root).unwrap();
+        let conn = cache.conn.lock().unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "SQLite NORMAL mode is numeric value 1");
     }
 
     #[test]

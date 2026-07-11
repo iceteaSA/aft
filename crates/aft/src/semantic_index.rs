@@ -17,8 +17,7 @@ use std::fs;
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use tree_sitter::Parser;
 use url::Url;
 
@@ -1341,6 +1340,8 @@ pub struct SemanticIndex {
     file_mtimes: HashMap<PathBuf, SystemTime>,
     /// Track indexed file sizes alongside mtimes for staleness detection
     file_sizes: HashMap<PathBuf, u64>,
+    /// Avoid walking every indexed path on warm refreshes once size metadata is complete.
+    any_missing_sizes: bool,
     file_hashes: HashMap<PathBuf, blake3::Hash>,
     /// Embedding dimension (384 for MiniLM-L6-v2)
     dimension: usize,
@@ -1355,6 +1356,31 @@ struct IndexedFileMetadata {
     size: u64,
     content_hash: blake3::Hash,
 }
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SemanticCollectPhaseTimings {
+    sched: Duration,
+    read_hash: Duration,
+    parse: Duration,
+    extract: Duration,
+    build: Duration,
+}
+
+impl SemanticCollectPhaseTimings {
+    fn add_assign(&mut self, other: Self) {
+        self.sched += other.sched;
+        self.read_hash += other.read_hash;
+        self.parse += other.parse;
+        self.extract += other.extract;
+        self.build += other.build;
+    }
+}
+
+type CollectedSemanticFile = (
+    PathBuf,
+    Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
+    SemanticCollectPhaseTimings,
+);
 
 /// Result of an incremental refresh of the semantic index. Counts are file
 /// counts; `total_processed` is the number of current/deleted files considered.
@@ -1416,6 +1442,7 @@ impl SemanticIndex {
             entries: Vec::new(),
             file_mtimes: HashMap::new(),
             file_sizes: HashMap::new(),
+            any_missing_sizes: false,
             file_hashes: HashMap::new(),
             dimension,
             fingerprint: None,
@@ -1447,22 +1474,37 @@ impl SemanticIndex {
         project_root: &Path,
         files: &[PathBuf],
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
-        let collect_started = std::time::Instant::now();
-        let per_file: Vec<(
-            PathBuf,
-            Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
-        )> = files
-            .par_iter()
-            .map_init(HashMap::new, |parsers, file| {
-                let result = collect_semantic_file(project_root, file, parsers);
-                (file.clone(), result)
-            })
-            .collect();
+        let collect_started = Instant::now();
+        let collect_one =
+            |file: &Path, parsers: &mut HashMap<crate::parser::LangId, Parser>, sched: Duration| {
+                let mut phases = SemanticCollectPhaseTimings {
+                    sched,
+                    ..SemanticCollectPhaseTimings::default()
+                };
+                let result = collect_semantic_file(project_root, file, parsers, &mut phases);
+                (file.to_path_buf(), result, phases)
+            };
+        let per_file: Vec<CollectedSemanticFile> = if files.len() <= 2 {
+            let mut parsers = HashMap::new();
+            files
+                .iter()
+                .map(|file| collect_one(file, &mut parsers, Duration::ZERO))
+                .collect()
+        } else {
+            files
+                .par_iter()
+                .map_init(HashMap::new, |parsers, file| {
+                    collect_one(file, parsers, collect_started.elapsed())
+                })
+                .collect()
+        };
 
         let mut chunks: Vec<SemanticChunk> = Vec::new();
         let mut file_metadata: HashMap<PathBuf, IndexedFileMetadata> = HashMap::new();
+        let mut phases = SemanticCollectPhaseTimings::default();
 
-        for (file, result) in per_file {
+        for (file, result, file_phases) in per_file {
+            phases.add_assign(file_phases);
             match result {
                 Ok((metadata, file_chunks)) => {
                     file_metadata.insert(file, metadata);
@@ -1497,6 +1539,16 @@ impl SemanticIndex {
             file_metadata.len(),
             collect_ms
         );
+        if collect_ms > 50 {
+            slog_info!(
+                "semantic collect phases: sched={}ms read_hash={}ms parse={}ms extract={}ms build={}ms",
+                phases.sched.as_millis(),
+                phases.read_hash.as_millis(),
+                phases.parse.as_millis(),
+                phases.extract.as_millis(),
+                phases.build.as_millis(),
+            );
+        }
 
         (chunks, file_metadata)
     }
@@ -1643,6 +1695,7 @@ impl SemanticIndex {
                     .iter()
                     .map(|(path, metadata)| (path.clone(), metadata.size))
                     .collect(),
+                any_missing_sizes: false,
                 file_hashes: file_metadata
                     .into_iter()
                     .map(|(path, metadata)| (path, metadata.content_hash))
@@ -1723,6 +1776,7 @@ impl SemanticIndex {
                 .iter()
                 .map(|(path, metadata)| (path.clone(), metadata.size))
                 .collect(),
+            any_missing_sizes: false,
             file_hashes: file_metadata
                 .into_iter()
                 .map(|(path, metadata)| (path, metadata.content_hash))
@@ -2353,6 +2407,10 @@ impl SemanticIndex {
     }
 
     fn backfill_missing_file_sizes(&mut self) {
+        if !self.any_missing_sizes {
+            return;
+        }
+
         for path in self.file_mtimes.keys() {
             if self.file_sizes.contains_key(path) {
                 continue;
@@ -2364,6 +2422,10 @@ impl SemanticIndex {
                 }
             }
         }
+        self.any_missing_sizes = self
+            .file_mtimes
+            .keys()
+            .any(|path| !self.file_sizes.contains_key(path));
     }
 
     /// Remove entries for a specific file
@@ -3011,10 +3073,14 @@ impl SemanticIndex {
             }
         }
 
+        let any_missing_sizes = file_mtimes
+            .keys()
+            .any(|path| !file_sizes.contains_key(path));
         Ok(Self {
             entries,
             file_mtimes,
             file_sizes,
+            any_missing_sizes,
             file_hashes,
             dimension,
             fingerprint,
@@ -3443,39 +3509,50 @@ fn collect_semantic_file(
     project_root: &Path,
     file: &Path,
     parsers: &mut HashMap<crate::parser::LangId, Parser>,
+    phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
-    let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
-    if !metadata.is_file() {
-        return Err("not a regular file".to_string());
-    }
-    let mtime = metadata.modified().map_err(|error| error.to_string())?;
-    let size = metadata.len();
+    let read_hash_started = Instant::now();
+    let read_result = (|| {
+        let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("not a regular file".to_string());
+        }
+        let mtime = metadata.modified().map_err(|error| error.to_string())?;
+        let size = metadata.len();
 
-    if !is_semantic_indexed_extension(file) {
-        return Err("unsupported file extension".to_string());
-    }
-    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+        if !is_semantic_indexed_extension(file) {
+            return Err("unsupported file extension".to_string());
+        }
+        let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
 
-    let mut indexed_metadata = IndexedFileMetadata {
-        mtime,
-        size,
-        content_hash: cache_freshness::zero_hash(),
-    };
+        let mut indexed_metadata = IndexedFileMetadata {
+            mtime,
+            size,
+            content_hash: cache_freshness::zero_hash(),
+        };
 
-    // OOM backstop: skip oversized files before the read + parse (tracked with
-    // zero chunks by the caller, so freshness won't re-read them every refresh).
-    if size > MAX_SEMANTIC_FILE_BYTES {
+        // OOM backstop: skip oversized files before the read + parse (tracked with
+        // zero chunks by the caller, so freshness won't re-read them every refresh).
+        if size > MAX_SEMANTIC_FILE_BYTES {
+            return Ok((indexed_metadata, lang, None));
+        }
+
+        let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
+        indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
+            cache_freshness::hash_bytes(source.as_bytes())
+        } else {
+            cache_freshness::zero_hash()
+        };
+        Ok((indexed_metadata, lang, Some(source)))
+    })();
+    phases.read_hash += read_hash_started.elapsed();
+    let (indexed_metadata, lang, source) = read_result?;
+    let Some(source) = source else {
         return Ok((indexed_metadata, Vec::new()));
-    }
-
-    let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
-    indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
-        cache_freshness::hash_bytes(source.as_bytes())
-    } else {
-        cache_freshness::zero_hash()
     };
 
-    let chunks = collect_file_chunks_from_source(project_root, file, lang, parsers, &source)?;
+    let chunks =
+        collect_file_chunks_from_source_timed(project_root, file, lang, parsers, &source, phases)?;
     Ok((indexed_metadata, chunks))
 }
 
@@ -3498,6 +3575,7 @@ fn collect_file_chunks(
     collect_file_chunks_from_source(project_root, file, lang, parsers, &source)
 }
 
+#[cfg(test)]
 fn collect_file_chunks_from_source(
     project_root: &Path,
     file: &Path,
@@ -3505,13 +3583,43 @@ fn collect_file_chunks_from_source(
     parsers: &mut HashMap<crate::parser::LangId, Parser>,
     source: &str,
 ) -> Result<Vec<SemanticChunk>, String> {
-    let tree = parser_for(parsers, lang)?
-        .parse(source, None)
-        .ok_or_else(|| format!("tree-sitter parse returned None for {}", file.display()))?;
-    let symbols =
-        extract_symbols_from_tree(source, &tree, lang).map_err(|error| error.to_string())?;
+    collect_file_chunks_from_source_timed(
+        project_root,
+        file,
+        lang,
+        parsers,
+        source,
+        &mut SemanticCollectPhaseTimings::default(),
+    )
+}
 
-    Ok(symbols_to_chunks(file, &symbols, source, project_root))
+fn collect_file_chunks_from_source_timed(
+    project_root: &Path,
+    file: &Path,
+    lang: crate::parser::LangId,
+    parsers: &mut HashMap<crate::parser::LangId, Parser>,
+    source: &str,
+    phases: &mut SemanticCollectPhaseTimings,
+) -> Result<Vec<SemanticChunk>, String> {
+    let parse_started = Instant::now();
+    let tree_result = parser_for(parsers, lang).and_then(|parser| {
+        parser
+            .parse(source, None)
+            .ok_or_else(|| format!("tree-sitter parse returned None for {}", file.display()))
+    });
+    phases.parse += parse_started.elapsed();
+    let tree = tree_result?;
+
+    let extract_started = Instant::now();
+    let symbols_result =
+        extract_symbols_from_tree(source, &tree, lang).map_err(|error| error.to_string());
+    phases.extract += extract_started.elapsed();
+    let symbols = symbols_result?;
+
+    let build_started = Instant::now();
+    let chunks = symbols_to_chunks(file, &symbols, source, project_root);
+    phases.build += build_started.elapsed();
+    Ok(chunks)
 }
 
 /// Build a display snippet from a symbol's source

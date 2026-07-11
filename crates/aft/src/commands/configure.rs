@@ -43,7 +43,9 @@ pub fn semantic_stale_generation_discards_for_test() -> usize {
     SEMANTIC_STALE_GENERATION_DISCARDS.load(Ordering::SeqCst)
 }
 
-const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
+// The watcher already coalesces filesystem events for 250 ms. Keep a short
+// worker window for corpus-build replay bursts without adding a second full debounce.
+const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 50;
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 
 #[cfg(test)]

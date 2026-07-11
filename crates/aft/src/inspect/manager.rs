@@ -8,7 +8,7 @@ use crossbeam_channel::{after, bounded, select, Receiver, Sender};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::cache::{InspectCache, InspectCacheRead, Tier2ContributionUpdates};
+use super::cache::{InspectCache, InspectCacheRead, InspectDbTimings, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 #[cfg(test)]
@@ -23,7 +23,7 @@ use super::oxc_engine::{
     DynamicImportFact, ExportFact, FileFacts, FileId, ImportFact, OxcEngineResult, OxcFactsCache,
     ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
-use crate::cache_freshness::{self, FileFreshness};
+use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore, CallGraphStoreError};
 use crate::cold_build_limiter;
 
@@ -1003,7 +1003,7 @@ impl InspectManager {
     fn tier2_run_with_reuse_job_result_with_options(
         &self,
         mut job: InspectJob,
-        options: Tier2ReuseOptions,
+        mut options: Tier2ReuseOptions,
     ) -> InspectResult {
         let started = Instant::now();
         panic_tier2_reuse_for_debug(&job);
@@ -1051,6 +1051,22 @@ impl InspectManager {
             }
         };
         delay_tier2_reuse_for_debug(&job.project_root);
+        if options.has_force_paths() {
+            if let Ok(cached) = load_contribution_freshness(cache.as_ref(), job.category) {
+                let (remaining, downgraded) = downgrade_unchanged_forced_paths_with_freshness(
+                    &job.project_root,
+                    &cached,
+                    options.force_rescan_paths.iter().cloned().collect(),
+                );
+                options.force_rescan_paths = remaining.into_iter().collect();
+                if downgraded > 0 {
+                    crate::slog_info!(
+                        "inspect: {} forced paths downgraded to cached (content unchanged)",
+                        downgraded
+                    );
+                }
+            }
+        }
         if !options.has_force_paths() {
             if let Ok(Some(success)) =
                 self.tier2_quick_reuse_success(&job, cache.as_ref(), &options)
@@ -1303,9 +1319,11 @@ impl InspectManager {
 
         let db_started = Instant::now();
         let mut contribution_set_hash = if has_updates {
-            cache
+            let (hash, db_timings) = cache
                 .apply_contribution_updates_for_config(job.category, updates, job.config.as_ref())
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            phases.add_db_timings(db_timings);
+            hash
         } else {
             cache
                 .contribution_set_hash_for_config(job.category, job.config.as_ref())
@@ -1389,13 +1407,15 @@ impl InspectManager {
                     ..Tier2ContributionUpdates::default()
                 };
                 let db_started = Instant::now();
-                contribution_set_hash = cache
+                let (hash, db_timings) = cache
                     .apply_contribution_updates_for_config(
                         job.category,
                         rescan_updates,
                         job.config.as_ref(),
                     )
                     .map_err(|error| error.to_string())?;
+                contribution_set_hash = hash;
+                phases.add_db_timings(db_timings);
                 phases.db += db_started.elapsed();
                 aggregate_job.callgraph_snapshot = rescan_job.callgraph_snapshot.clone();
                 scan_files = full_scan_files;
@@ -1724,14 +1744,23 @@ struct Tier2PhaseTimings {
     snapshot: Duration,
     /// Scanner compute over files needing (re)scan.
     scan: Duration,
-    /// SQLite contribution upserts/deletes (busy-wait contention shows here).
+    /// SQLite contribution upserts/deletes, including connection lock wait.
     db: Duration,
+    /// Time waiting for the shared SQLite connection mutex.
+    db_lock: Duration,
+    /// Time spent in contribution update transactions after acquiring the mutex.
+    db_txn: Duration,
     /// Aggregate roll-up + store.
     rollup: Duration,
     scanned_files: usize,
 }
 
 impl Tier2PhaseTimings {
+    fn add_db_timings(&mut self, timings: InspectDbTimings) {
+        self.db_lock += timings.lock_wait;
+        self.db_txn += timings.transaction;
+    }
+
     fn log(&self, category: InspectCategory) {
         let worked = self.freshness + self.scan + self.snapshot + self.rollup + self.db;
         if !worked.is_zero() {
@@ -1744,13 +1773,15 @@ impl Tier2PhaseTimings {
             return;
         }
         crate::slog_info!(
-            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms rollup={}ms",
+            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup={}ms",
             category,
             self.freshness.as_millis(),
             self.snapshot.as_millis(),
             self.scan.as_millis(),
             self.scanned_files,
             self.db.as_millis(),
+            self.db_lock.as_millis(),
+            self.db_txn.as_millis(),
             self.rollup.as_millis()
         );
     }
@@ -1778,6 +1809,47 @@ fn forced_relative_paths(job: &InspectJob, paths: &BTreeSet<PathBuf>) -> BTreeSe
         }
     }
     keys
+}
+
+fn downgrade_unchanged_forced_paths_with_freshness(
+    project_root: &Path,
+    cached: &[CachedContributionFreshness],
+    paths: Vec<PathBuf>,
+) -> (Vec<PathBuf>, usize) {
+    let cached = cached
+        .iter()
+        .map(|record| (freshness_record_relative_key(record), record.freshness))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining = Vec::with_capacity(paths.len());
+    let mut downgraded = 0;
+
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            project_root.join(&path)
+        };
+        let direct_key = relative_cache_key(project_root, &absolute);
+        let canonical_key = std::fs::canonicalize(&absolute)
+            .ok()
+            .map(|canonical| relative_cache_key(project_root, &canonical));
+        let freshness = cached
+            .get(&direct_key)
+            .or_else(|| canonical_key.as_ref().and_then(|key| cached.get(key)));
+        let content_unchanged = freshness.is_some_and(|freshness| {
+            matches!(
+                cache_freshness::verify_file_strict(&absolute, freshness),
+                FreshnessVerdict::HotFresh | FreshnessVerdict::ContentFresh { .. }
+            )
+        });
+        if content_unchanged {
+            downgraded += 1;
+        } else {
+            remaining.push(path);
+        }
+    }
+
+    (remaining, downgraded)
 }
 
 fn panic_tier2_reuse_for_debug(job: &InspectJob) {
@@ -4895,5 +4967,56 @@ export function main() { foo(); }
 "#,
         );
         vec![path]
+    }
+
+    #[test]
+    fn forced_paths_downgrade_only_when_strict_hash_matches_cached_fact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let unchanged = root.join("unchanged.ts");
+        let changed = root.join("changed.ts");
+        let oversized = root.join("oversized.ts");
+        std::fs::write(&unchanged, "export const value = 1;\n").expect("write unchanged");
+        std::fs::write(&changed, "export const before = 1;\n").expect("write changed baseline");
+        let unchanged_freshness =
+            cache_freshness::collect(&unchanged).expect("unchanged freshness");
+        let changed_freshness = cache_freshness::collect(&changed).expect("changed freshness");
+        std::fs::write(&changed, "export const after_ = 2;\n").expect("change same-size content");
+        let oversized_file = std::fs::File::create(&oversized).expect("create oversized");
+        oversized_file
+            .set_len(cache_freshness::CONTENT_HASH_SIZE_CAP + 1)
+            .expect("size oversized");
+        let oversized_freshness =
+            cache_freshness::collect(&oversized).expect("oversized freshness");
+        let cached = vec![
+            CachedContributionFreshness {
+                file_path: PathBuf::from("unchanged.ts"),
+                freshness: unchanged_freshness,
+            },
+            CachedContributionFreshness {
+                file_path: PathBuf::from("changed.ts"),
+                freshness: changed_freshness,
+            },
+            CachedContributionFreshness {
+                file_path: PathBuf::from("oversized.ts"),
+                freshness: oversized_freshness,
+            },
+        ];
+
+        let (remaining, downgraded) = downgrade_unchanged_forced_paths_with_freshness(
+            &root,
+            &cached,
+            vec![
+                PathBuf::from("unchanged.ts"),
+                PathBuf::from("changed.ts"),
+                PathBuf::from("oversized.ts"),
+            ],
+        );
+
+        assert_eq!(downgraded, 1);
+        assert_eq!(
+            remaining,
+            vec![PathBuf::from("changed.ts"), PathBuf::from("oversized.ts")]
+        );
     }
 }
