@@ -51,6 +51,14 @@ pub enum JobClass {
 
 pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>;
 
+/// Age at which a queued interactive mutating job (route binds, edits) jumps
+/// ahead of pure reads in interactive admission. Reads-first admission would
+/// otherwise let a sustained read stream starve queued writers; this bounds
+/// that wait. For binds it matches the half-deadline breadcrumb point: the
+/// daemon rejects binds at 12s, so promotion at 6s leaves half the budget for
+/// draining readers and running the configure itself.
+const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
+
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub pool_size: usize,
@@ -826,8 +834,11 @@ impl ActorState {
     }
 
     fn higher_priority_writer_barrier_blocks(&self, job_class: JobClass) -> bool {
+        // Maintenance must not start while interactive mutating work (tool
+        // mutations, route binds) waits: a maintenance job that takes the
+        // actor's writer slot would push the interactive writer behind it.
         matches!(job_class, JobClass::Maintenance)
-            && self.front_lane(JobClass::Interactive) == Some(Lane::Mutating)
+            && !self.interactive.queue(Lane::Mutating).is_empty()
     }
 
     fn class_queues(&self, job_class: JobClass) -> &ClassQueues {
@@ -896,9 +907,35 @@ impl ClassQueues {
         self.order.front().copied()
     }
 
+    /// Interactive admission order: a hard-starved configure (queued RouteBind
+    /// older than the promotion age) preempts everything so its daemon deadline
+    /// survives; otherwise pure reads go first (they overlap each other and
+    /// never barrier the actor), then remaining lanes in arrival order.
+    /// Maintenance keeps strict arrival order via `front_lane`.
+    fn next_interactive_lane(&self, now: Instant) -> Option<Lane> {
+        let starved_writer = self.mutating.iter().any(|job| {
+            now.saturating_duration_since(job.queued_at) >= INTERACTIVE_WRITER_PROMOTION_AGE
+        });
+        if starved_writer {
+            // Also stops NEW readers from being admitted on this actor while
+            // the promoted writer waits for in-flight readers to drain.
+            return Some(Lane::Mutating);
+        }
+        if !self.pure_reads.is_empty() {
+            return Some(Lane::PureRead);
+        }
+        self.order
+            .iter()
+            .copied()
+            .find(|lane| *lane != Lane::PureRead)
+    }
+
     fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob> {
-        let order_lane = self.order.pop_front()?;
-        debug_assert_eq!(order_lane, lane);
+        // Keep `order` consistent with per-lane queues when admission picks a
+        // lane other than the arrival-order head: remove the FIRST occurrence
+        // of the chosen lane from `order`, not necessarily the front.
+        let position = self.order.iter().position(|queued| *queued == lane)?;
+        self.order.remove(position);
         self.queue_mut(lane).pop_front()
     }
 
@@ -1307,7 +1344,12 @@ fn try_admit_actor(
     config: &EffectiveConfig,
     heavy: &Arc<HeavySemaphore>,
 ) -> Option<RunJob> {
-    let lane = actor.front_lane(job_class)?;
+    let lane = match job_class {
+        JobClass::Interactive => actor
+            .class_queues(JobClass::Interactive)
+            .next_interactive_lane(Instant::now())?,
+        JobClass::Maintenance => actor.front_lane(job_class)?,
+    };
     let mut heavy_permit = None;
 
     if actor.writer_inflight || actor.higher_priority_writer_barrier_blocks(job_class) {

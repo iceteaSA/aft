@@ -856,6 +856,8 @@ fn mutator_drains_then_exclusive() {
         }),
     );
 
+    // Both blocked for now: the mutator behind the in-flight readers' epoch,
+    // the late read behind read_cap (2 readers already running).
     assert!(mutator_started_rx
         .recv_timeout(Duration::from_millis(75))
         .is_err());
@@ -872,24 +874,25 @@ fn mutator_drains_then_exclusive() {
             .expect("initial read completion response");
     }
 
+    // Reads-first interactive admission: once read_cap frees, the late read is
+    // admitted ahead of the earlier-queued mutator (the writer's wait is
+    // bounded by the promotion age, not by arrival order).
+    late_read_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("late read starts ahead of the queued mutator");
+    late_read_handle
+        .recv_timeout(Duration::from_secs(1))
+        .expect("late read completion response");
+
     let observed_reads = mutator_started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("mutator starts after reads drain");
     assert_eq!(observed_reads, 0);
-    assert!(late_read_started_rx
-        .recv_timeout(Duration::from_millis(75))
-        .is_err());
 
     release_mutator_tx.send(()).expect("release mutator");
     mutator_handle
         .recv_timeout(Duration::from_secs(1))
         .expect("mutator completion response");
-    late_read_started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("late read starts after mutator completes");
-    late_read_handle
-        .recv_timeout(Duration::from_secs(1))
-        .expect("late read completion response");
 }
 
 #[test]
@@ -1315,4 +1318,182 @@ fn mutating_jobs_are_not_dispatched_to_park_on_epoch_write() {
             .expect("mutator completion response");
     }
     assert_eq!(executor.nonrunnable_dispatch_count(), 0);
+}
+
+#[test]
+fn pure_reads_admit_ahead_of_queued_interactive_mutating() {
+    // One actor, one worker: a long-running mutating job holds the actor while
+    // a second mutating job and a pure read queue behind it. Pre-I-C, strict
+    // arrival order admitted the queued mutator first; reads-first admission
+    // must run the read as soon as the first mutator completes.
+    let executor = test_executor(1, 2, 2, 1);
+    let (_dir, root) = test_root("reads-first");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+    let first_mutator = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "mutator-1".to_string(),
+        Box::new(move |_ctx| {
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release first mutator");
+            ok("mutator-1")
+        }),
+    );
+    // Give the scheduler time to start the first mutator before queueing more.
+    std::thread::sleep(Duration::from_millis(50));
+    let (order_tx, order_rx) = crossbeam_channel::unbounded::<&'static str>();
+    let mutator_order = order_tx.clone();
+    let second_mutator = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "mutator-2".to_string(),
+        Box::new(move |_ctx| {
+            mutator_order.send("mutator-2").expect("record mutator");
+            ok("mutator-2")
+        }),
+    );
+    let read_order = order_tx;
+    let read = executor.submit_async(
+        root.clone(),
+        Lane::PureRead,
+        "read-1".to_string(),
+        Box::new(move |_ctx| {
+            read_order.send("read-1").expect("record read");
+            ok("read-1")
+        }),
+    );
+
+    release_tx.send(()).expect("release first mutator");
+    let first_admitted = order_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first queued job runs");
+    assert_eq!(
+        first_admitted, "read-1",
+        "pure read must be admitted ahead of the queued mutating job"
+    );
+    assert_eq!(
+        order_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second queued job runs"),
+        "mutator-2"
+    );
+    for handle in [first_mutator, second_mutator, read] {
+        recv_async(handle);
+    }
+}
+
+#[test]
+fn starved_bind_promotes_over_pure_reads() {
+    // A queued configure (subc-bind-*) older than the promotion age must win
+    // the interactive lane pick even when pure reads are queued, and new reads
+    // must stop being admitted while it waits.
+    let (_dir, root) = test_root("bind-promotion");
+    let mut actor = ActorState::new(test_ctx());
+    let now = Instant::now();
+
+    let (tx, _rx) = crossbeam_channel::bounded::<Response>(1);
+    let bind_job = QueuedJob {
+        request_id: "subc-bind-42".to_string(),
+        command: "executor::Interactive::Mutating".to_string(),
+        job: Box::new(|_ctx| ok("subc-bind-42")),
+        completion: CompletionSender::Sync(tx.clone()),
+        queued_at: now - INTERACTIVE_WRITER_PROMOTION_AGE - Duration::from_secs(1),
+    };
+    let read_job = QueuedJob {
+        request_id: "read-1".to_string(),
+        command: "executor::Interactive::PureRead".to_string(),
+        job: Box::new(|_ctx| ok("read-1")),
+        completion: CompletionSender::Sync(tx),
+        queued_at: now,
+    };
+    // Read arrived FIRST in arrival order; the starved bind must still win.
+    actor.push_job(JobClass::Interactive, Lane::PureRead, read_job);
+    actor.push_job(JobClass::Interactive, Lane::Mutating, bind_job);
+
+    assert_eq!(
+        actor
+            .class_queues(JobClass::Interactive)
+            .next_interactive_lane(Instant::now()),
+        Some(Lane::Mutating),
+        "starved bind must preempt queued pure reads"
+    );
+    let _ = root;
+}
+
+#[test]
+fn fresh_bind_does_not_preempt_pure_reads() {
+    // A configure queued just now stays behind pure reads (reads-first), only
+    // age promotes it.
+    let mut actor = ActorState::new(test_ctx());
+    let now = Instant::now();
+    let (tx, _rx) = crossbeam_channel::bounded::<Response>(1);
+    actor.push_job(
+        JobClass::Interactive,
+        Lane::Mutating,
+        QueuedJob {
+            request_id: "subc-bind-7".to_string(),
+            command: "executor::Interactive::Mutating".to_string(),
+            job: Box::new(|_ctx| ok("subc-bind-7")),
+            completion: CompletionSender::Sync(tx.clone()),
+            queued_at: now,
+        },
+    );
+    actor.push_job(
+        JobClass::Interactive,
+        Lane::PureRead,
+        QueuedJob {
+            request_id: "read-2".to_string(),
+            command: "executor::Interactive::PureRead".to_string(),
+            job: Box::new(|_ctx| ok("read-2")),
+            completion: CompletionSender::Sync(tx),
+            queued_at: now,
+        },
+    );
+
+    assert_eq!(
+        actor
+            .class_queues(JobClass::Interactive)
+            .next_interactive_lane(Instant::now()),
+        Some(Lane::PureRead),
+        "fresh binds queue behind pure reads until the promotion age"
+    );
+}
+
+#[test]
+fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
+    // The maintenance barrier check must consider ANY queued interactive
+    // mutating job, not only the arrival-order head (pre-I-C it checked
+    // front_lane, which reads-first admission can reorder past).
+    let mut actor = ActorState::new(test_ctx());
+    let (tx, _rx) = crossbeam_channel::bounded::<Response>(1);
+    actor.push_job(
+        JobClass::Interactive,
+        Lane::PureRead,
+        QueuedJob {
+            request_id: "read-3".to_string(),
+            command: "executor::Interactive::PureRead".to_string(),
+            job: Box::new(|_ctx| ok("read-3")),
+            completion: CompletionSender::Sync(tx.clone()),
+            queued_at: Instant::now(),
+        },
+    );
+    actor.push_job(
+        JobClass::Interactive,
+        Lane::Mutating,
+        QueuedJob {
+            request_id: "edit-1".to_string(),
+            command: "executor::Interactive::Mutating".to_string(),
+            job: Box::new(|_ctx| ok("edit-1")),
+            completion: CompletionSender::Sync(tx),
+            queued_at: Instant::now(),
+        },
+    );
+
+    assert!(
+        actor.higher_priority_writer_barrier_blocks(JobClass::Maintenance),
+        "maintenance must defer while interactive mutating work is queued, even behind reads"
+    );
 }
