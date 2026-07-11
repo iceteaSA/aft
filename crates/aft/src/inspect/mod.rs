@@ -5,6 +5,7 @@ mod entry_points;
 mod frameworks;
 pub mod freshness;
 mod generated;
+pub(crate) use generated::is_generated_file;
 pub mod job;
 mod manager;
 pub mod oxc_engine;

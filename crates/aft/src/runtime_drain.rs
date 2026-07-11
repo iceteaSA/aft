@@ -341,7 +341,11 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     if let Some(store) = latest {
         // Replay source files that changed while the cold build was running so
         // the freshly-installed store reflects mid-build edits.
-        let pending = ctx.take_pending_callgraph_store_paths();
+        let pending = ctx
+            .take_pending_callgraph_store_paths()
+            .into_iter()
+            .filter(|path| !watcher_path_is_generated_for_callgraph(ctx, path))
+            .collect::<Vec<_>>();
         if !pending.is_empty() {
             if let Err(error) = store.refresh_files(&pending) {
                 crate::slog_warn!(
@@ -1278,6 +1282,11 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
     status_changed
 }
 
+fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> bool {
+    ctx.callgraph_project_root()
+        .is_some_and(|project_root| crate::inspect::is_generated_file(&project_root, path))
+}
+
 pub fn refresh_callgraph_store_for_watcher(
     ctx: &AppContext,
     changed: &HashSet<std::path::PathBuf>,
@@ -1287,7 +1296,10 @@ pub fn refresh_callgraph_store_for_watcher(
     }
     let source_paths = changed
         .iter()
-        .filter(|path| watcher_path_is_callgraph_indexed(path))
+        .filter(|path| {
+            watcher_path_is_callgraph_indexed(path)
+                && !watcher_path_is_generated_for_callgraph(ctx, path)
+        })
         .cloned()
         .collect::<Vec<_>>();
     if source_paths.is_empty() {
@@ -1402,6 +1414,7 @@ fn apply_callgraph_watcher_phase(
     mut refresh: impl FnMut(&AppContext, &HashSet<PathBuf>),
 ) -> bool {
     let mut changed = HashSet::new();
+    let mut generated_skipped = 0usize;
     let completed = apply_watcher_path_phase(
         WatcherDrainApplyPhase::Callgraph,
         paths,
@@ -1410,10 +1423,20 @@ fn apply_callgraph_watcher_phase(
         budget,
         |path| {
             if enabled && watcher_path_is_callgraph_indexed(path) {
-                changed.insert(path.to_path_buf());
+                if watcher_path_is_generated_for_callgraph(ctx, path) {
+                    generated_skipped += 1;
+                } else {
+                    changed.insert(path.to_path_buf());
+                }
             }
         },
     );
+    if generated_skipped > 0 {
+        log::debug!(
+            "callgraph refresh skipped {} generated file(s)",
+            generated_skipped
+        );
+    }
     if !changed.is_empty() {
         let first = changed
             .iter()
@@ -2131,9 +2154,12 @@ mod watcher_slice_tests {
     fn callgraph_phase_batches_all_indexed_paths_into_one_refresh() {
         let temp = tempfile::tempdir().unwrap();
         let (ctx, _) = context_with_watcher(temp.path());
+        let generated = temp.path().join("compiled.ts");
+        std::fs::write(&generated, "// @generated\nexport const compiled = true;\n").unwrap();
         let mut paths = VecDeque::from([
             temp.path().join("a.rs"),
             temp.path().join("b.ts"),
+            generated,
             temp.path().join("ignored.txt"),
         ]);
         let mut remaining = paths.len();
@@ -2231,8 +2257,10 @@ mod watcher_slice_tests {
         ctx.update_config(|config| config.callgraph_store = true);
         ctx.set_cache_role(false, None);
         let source = temp.path().join("pending.rs");
+        let generated = temp.path().join("compiled.ts");
+        std::fs::write(&generated, "// @generated\nexport const compiled = true;\n").unwrap();
 
-        refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone()]));
+        refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone(), generated]));
 
         assert_eq!(ctx.take_pending_callgraph_store_paths(), vec![source]);
     }

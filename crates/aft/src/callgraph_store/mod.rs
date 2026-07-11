@@ -305,6 +305,40 @@ pub struct IncrementalStats {
     pub refreshed_own_files: usize,
 }
 
+/// Phase timings for the copy-based incremental refresh benchmark.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshFilesProfile {
+    pub parse: Duration,
+    pub dependency_selection: Duration,
+    pub row_deletes: Duration,
+    pub row_inserts: Duration,
+    pub dependent_parse: Duration,
+    pub index_load: Duration,
+    pub ref_resolution: Duration,
+    pub method_dispatch: Duration,
+    pub commit: Duration,
+    pub total: Duration,
+}
+
+impl RefreshFilesProfile {
+    pub fn report(&self) -> String {
+        format!(
+            "parse={}ms dependency_selection={}ms row_deletes={}ms row_inserts={}ms dependent_parse={}ms index_load={}ms ref_resolution={}ms method_dispatch={}ms commit={}ms total={}ms",
+            self.parse.as_millis(),
+            self.dependency_selection.as_millis(),
+            self.row_deletes.as_millis(),
+            self.row_inserts.as_millis(),
+            self.dependent_parse.as_millis(),
+            self.index_load.as_millis(),
+            self.ref_resolution.as_millis(),
+            self.method_dispatch.as_millis(),
+            self.commit.as_millis(),
+            self.total.as_millis(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StoredEdge {
     pub source_file: String,
@@ -433,7 +467,6 @@ impl StoreForwardCall {
 
 #[derive(Debug, Clone)]
 struct FileExtract {
-    abs_path: PathBuf,
     rel_path: String,
     freshness: FileFreshness,
     lang: LangId,
@@ -1485,6 +1518,21 @@ impl CallGraphStore {
     }
 
     pub fn refresh_files(&self, changed_files: &[PathBuf]) -> Result<IncrementalStats> {
+        let (stats, profile) = self.refresh_files_profiled(changed_files)?;
+        if std::env::var_os("AFT_BENCH_REFRESH_FILES").is_some() {
+            eprintln!("refresh_files phases: {}", profile.report());
+        }
+        Ok(stats)
+    }
+
+    /// Run an incremental refresh and return phase timings for an offline store copy.
+    #[doc(hidden)]
+    pub fn refresh_files_profiled(
+        &self,
+        changed_files: &[PathBuf],
+    ) -> Result<(IncrementalStats, RefreshFilesProfile)> {
+        let total_started = Instant::now();
+        let mut profile = RefreshFilesProfile::default();
         self.verify_writer_lease()?;
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let tx = conn.transaction()?;
@@ -1506,13 +1554,18 @@ impl CallGraphStore {
                 if old_row.is_some() {
                     surface_changed.insert(rel_path.clone());
                     deleted.insert(rel_path.clone());
+                    let started = Instant::now();
+                    let dependent_refs = ref_ids_depending_on(&tx, &self.project_root, &rel_path)?;
+                    profile.dependency_selection += started.elapsed();
                     record_dependent_refs(
                         &mut selected_ref_ids,
                         &mut selected_refs_by_caller,
-                        ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                        dependent_refs,
                     );
+                    let started = Instant::now();
                     delete_file_rows(&tx, &rel_path)?;
                     clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
+                    profile.row_deletes += started.elapsed();
                 }
                 continue;
             }
@@ -1536,35 +1589,50 @@ impl CallGraphStore {
                     FreshnessVerdict::Deleted => {
                         surface_changed.insert(rel_path.clone());
                         deleted.insert(rel_path.clone());
+                        let started = Instant::now();
+                        let dependent_refs =
+                            ref_ids_depending_on(&tx, &self.project_root, &rel_path)?;
+                        profile.dependency_selection += started.elapsed();
                         record_dependent_refs(
                             &mut selected_ref_ids,
                             &mut selected_refs_by_caller,
-                            ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                            dependent_refs,
                         );
+                        let started = Instant::now();
                         delete_file_rows(&tx, &rel_path)?;
                         clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
+                        profile.row_deletes += started.elapsed();
                         continue;
                     }
                     FreshnessVerdict::Stale => {}
                 }
             }
 
+            let started = Instant::now();
             let extract = build_file_extract(&self.project_root, &abs_path)?;
+            profile.parse += started.elapsed();
             let surface_is_changed = old_row
                 .as_ref()
                 .map(|row| row.surface_fingerprint != extract.surface_fingerprint)
                 .unwrap_or(true);
             if surface_is_changed {
                 surface_changed.insert(rel_path.clone());
+                let started = Instant::now();
+                let dependent_refs = ref_ids_depending_on(&tx, &self.project_root, &rel_path)?;
+                profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
                     &mut selected_ref_ids,
                     &mut selected_refs_by_caller,
-                    ref_ids_depending_on(&tx, &self.project_root, &rel_path)?,
+                    dependent_refs,
                 );
             }
             own_refresh.insert(rel_path.clone());
+            let started = Instant::now();
             delete_file_rows(&tx, &rel_path)?;
+            profile.row_deletes += started.elapsed();
+            let started = Instant::now();
             insert_file_extract(&tx, &self.project_root, &extract)?;
+            profile.row_inserts += started.elapsed();
             changed_extracts.insert(rel_path, extract);
         }
 
@@ -1584,7 +1652,9 @@ impl CallGraphStore {
             }
             let abs_path = self.project_root.join(rel_path);
             if abs_path.exists() {
+                let started = Instant::now();
                 let extract = build_file_extract(&self.project_root, &abs_path)?;
+                profile.dependent_parse += started.elapsed();
                 caller_extracts.insert(rel_path.clone(), extract);
             }
         }
@@ -1603,11 +1673,18 @@ impl CallGraphStore {
             }
 
             own_refresh.insert(rel_path.clone());
+            let started = Instant::now();
             delete_file_rows(&tx, &rel_path)?;
+            profile.row_deletes += started.elapsed();
+            let started = Instant::now();
             insert_file_extract(&tx, &self.project_root, extract)?;
+            profile.row_inserts += started.elapsed();
         }
 
+        let started = Instant::now();
         let index = ProjectIndex::from_db_and_callers(&tx, &self.project_root, &caller_extracts)?;
+        profile.index_load += started.elapsed();
+        let started = Instant::now();
         for rel_path in &touched_callers {
             if deleted.contains(rel_path) {
                 continue;
@@ -1636,18 +1713,27 @@ impl CallGraphStore {
                 }
             }
         }
+        profile.ref_resolution += started.elapsed();
 
+        let started = Instant::now();
         delete_method_dispatch_edges_for_callers(&tx, &own_refresh)?;
         insert_method_dispatch_edges(&tx, &self.project_root, Some(&own_refresh))?;
+        profile.method_dispatch += started.elapsed();
 
+        let started = Instant::now();
         tx.commit()?;
-        Ok(IncrementalStats {
-            changed_files: changed,
-            surface_changed: surface_changed.into_iter().collect(),
-            deleted_files: deleted.into_iter().collect(),
-            dependency_selected_refs,
-            refreshed_own_files: own_refresh.len(),
-        })
+        profile.commit += started.elapsed();
+        profile.total = total_started.elapsed();
+        Ok((
+            IncrementalStats {
+                changed_files: changed,
+                surface_changed: surface_changed.into_iter().collect(),
+                deleted_files: deleted.into_iter().collect(),
+                dependency_selected_refs,
+                refreshed_own_files: own_refresh.len(),
+            },
+            profile,
+        ))
     }
 
     pub fn refresh_corpus(&self, current_files: &[PathBuf]) -> Result<ColdBuildStats> {
@@ -3923,6 +4009,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             provenance      TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_refs_short_name ON refs(short_name);
+        CREATE INDEX IF NOT EXISTS idx_refs_kind_caller_file ON refs(kind, caller_file);
         CREATE INDEX IF NOT EXISTS idx_refs_caller_file ON refs(caller_file);
         CREATE INDEX IF NOT EXISTS idx_refs_caller_node_kind ON refs(caller_node, kind, status);
         CREATE INDEX IF NOT EXISTS idx_refs_target_file ON refs(target_file);
@@ -4068,6 +4155,7 @@ fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
          DROP INDEX IF EXISTS idx_nodes_name;
          DROP INDEX IF EXISTS idx_nodes_scoped;
          DROP INDEX IF EXISTS idx_refs_short_name;
+         DROP INDEX IF EXISTS idx_refs_kind_caller_file;
          DROP INDEX IF EXISTS idx_refs_caller_file;
          DROP INDEX IF EXISTS idx_refs_caller_node_kind;
          DROP INDEX IF EXISTS idx_refs_target_file;
@@ -4088,6 +4176,7 @@ fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
          CREATE INDEX IF NOT EXISTS idx_nodes_scoped ON nodes(scoped_name);
          CREATE INDEX IF NOT EXISTS idx_refs_short_name ON refs(short_name);
+         CREATE INDEX IF NOT EXISTS idx_refs_kind_caller_file ON refs(kind, caller_file);
          CREATE INDEX IF NOT EXISTS idx_refs_caller_file ON refs(caller_file);
          CREATE INDEX IF NOT EXISTS idx_refs_caller_node_kind ON refs(caller_node, kind, status);
          CREATE INDEX IF NOT EXISTS idx_refs_target_file ON refs(target_file);
@@ -4610,7 +4699,6 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
     let surface_fingerprint = surface_fingerprint(&mut nodes, &data, &surface_parts);
 
     Ok(FileExtract {
-        abs_path,
         rel_path,
         freshness,
         lang,
@@ -6041,24 +6129,20 @@ impl DbFileIndex {
             }
         }
         let mut module_targets = HashMap::new();
-        for import in &extract.data.import_block.imports {
-            module_targets.insert(
-                import.module_path.clone(),
-                module_target_from_dependencies(
-                    project_root,
-                    &module_dependencies(project_root, &extract.abs_path, &import.module_path),
-                ),
-            );
-        }
         let mut reexports = Vec::new();
         for raw_ref in &extract.raw_refs {
+            if !matches!(raw_ref.kind.as_str(), "import" | "reexport") {
+                continue;
+            }
+            let Some(module_path) = &raw_ref.module_path else {
+                continue;
+            };
+            let target_file = module_target_from_dependencies(project_root, &raw_ref.dependencies);
+            module_targets
+                .entry(module_path.clone())
+                .or_insert_with(|| target_file.clone());
             if raw_ref.kind == "reexport" {
-                if let Some(module_path) = &raw_ref.module_path {
-                    let target_file =
-                        module_target_from_dependencies(project_root, &raw_ref.dependencies);
-                    module_targets.insert(module_path.clone(), target_file.clone());
-                    reexports.push(reexport_index_from_raw(raw_ref, target_file));
-                }
+                reexports.push(reexport_index_from_raw(raw_ref, target_file));
             }
         }
         Self {
@@ -6138,9 +6222,13 @@ fn load_db_file_indexes(
         file.node_by_bare.entry(name).or_insert(id);
     }
     let file_keys: HashSet<String> = files.keys().cloned().collect();
+    // Persisted caller extracts supply import targets. Only reexports from other
+    // files need dependency reconstruction, and their caller dependencies are
+    // loaded once instead of issuing repeated SQLite queries per reference.
+    let dependencies_by_file = load_file_dependencies_index(tx)?;
     let mut ref_stmt = tx.prepare(
         "SELECT ref_id, caller_file, kind, module_path, full_ref, wildcard, local_name, requested_name
-         FROM refs WHERE kind IN ('import', 'reexport', 'export_alias')",
+         FROM refs WHERE kind IN ('reexport', 'export_alias')",
     )?;
     let ref_rows = ref_stmt.query_map([], |row| {
         Ok((
@@ -6176,7 +6264,17 @@ fn load_db_file_indexes(
         let Some(module_path) = module_path else {
             continue;
         };
-        let deps = dependencies_for_ref(tx, project_root, &ref_id)?;
+        let file_deps = dependencies_by_file
+            .get(&caller_file)
+            .cloned()
+            .unwrap_or_default();
+        let deps = stored_dependencies_for_module(
+            project_root,
+            &caller_file,
+            &module_path,
+            &file_deps,
+            &file_keys,
+        );
         let target_file = deps
             .iter()
             .find(|dep| file_keys.contains(*dep))
@@ -6212,6 +6310,74 @@ fn load_db_file_indexes(
     }
 
     Ok(files)
+}
+
+fn stored_dependencies_for_module(
+    project_root: &Path,
+    caller_file: &str,
+    module_path: &str,
+    caller_dependencies: &BTreeSet<String>,
+    indexed_files: &HashSet<String>,
+) -> BTreeSet<String> {
+    let caller_path = project_root.join(caller_file);
+    let mut candidates = rust_module_dependencies(project_root, &caller_path, module_path);
+    if module_path.starts_with('.') {
+        let caller_dir = caller_path.parent().unwrap_or(project_root);
+        for candidate in relative_module_candidates(&caller_dir.join(module_path)) {
+            let normalized = if candidate.is_file() {
+                canonicalize_path(&candidate)
+            } else {
+                candidate
+            };
+            candidates.insert(relative_path(project_root, &normalized));
+        }
+    }
+    let exact = candidates
+        .intersection(caller_dependencies)
+        .filter(|dependency| indexed_files.contains(*dependency))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !exact.is_empty() || module_path.starts_with('.') {
+        return exact;
+    }
+
+    let module_path = rust_module_path_without_alias_or_use_list(module_path)
+        .trim_matches(|character| matches!(character, '\'' | '"'));
+    let package_name = module_path
+        .split('/')
+        .next_back()
+        .unwrap_or(module_path)
+        .replace('_', "-");
+    let matched = caller_dependencies
+        .iter()
+        .filter(|dependency| indexed_files.contains(*dependency))
+        .filter(|dependency| {
+            dependency.as_str() == module_path
+                || dependency.ends_with(&format!("/{module_path}"))
+                || Path::new(dependency).components().any(|component| {
+                    component.as_os_str().to_string_lossy().replace('_', "-") == package_name
+                })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if matched.len() == 1 {
+        matched
+    } else {
+        BTreeSet::new()
+    }
+}
+
+fn load_file_dependencies_index(tx: &Transaction<'_>) -> Result<HashMap<String, BTreeSet<String>>> {
+    let mut by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut stmt = tx.prepare("SELECT file_path, dep_file FROM file_dependencies")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (file_path, dependency) = row?;
+        by_file.entry(file_path).or_default().insert(dependency);
+    }
+    Ok(by_file)
 }
 
 struct ColdBuildInsertStatements<'stmt> {
@@ -8492,47 +8658,6 @@ fn parse_reexport_names(statement: &str) -> HashMap<String, String> {
     names
 }
 
-fn dependencies_for_ref(
-    tx: &Transaction<'_>,
-    project_root: &Path,
-    ref_id: &str,
-) -> Result<BTreeSet<String>> {
-    let row = tx.query_row(
-        "SELECT kind, caller_file, module_path, target_file FROM refs WHERE ref_id = ?1",
-        params![ref_id],
-        |row| {
-            Ok(RefDependencyRow {
-                ref_id: ref_id.to_string(),
-                kind: row.get(0)?,
-                caller_file: row.get(1)?,
-                module_path: row.get(2)?,
-                target_file: row.get(3)?,
-            })
-        },
-    )?;
-
-    match row.kind.as_str() {
-        "import" | "reexport" => {
-            let Some(module_path) = row.module_path.as_deref() else {
-                return Ok(BTreeSet::new());
-            };
-            let file_deps = file_dependencies_for_file(tx, &row.caller_file)?;
-            let module_deps =
-                module_dependencies_for_ref(project_root, &row.caller_file, module_path);
-            Ok(file_deps.intersection(&module_deps).cloned().collect())
-        }
-        "export_alias" => Ok(BTreeSet::new()),
-        "call" => {
-            let mut deps = file_dependencies_for_file(tx, &row.caller_file)?;
-            if let Some(target_file) = row.target_file {
-                deps.insert(target_file);
-            }
-            Ok(deps)
-        }
-        _ => file_dependencies_for_file(tx, &row.caller_file),
-    }
-}
-
 #[derive(Debug)]
 struct RefDependencyRow {
     ref_id: String,
@@ -8564,17 +8689,6 @@ fn ref_dependency_row_depends_on(
         "export_alias" => false,
         _ => false,
     }
-}
-
-fn file_dependencies_for_file(tx: &Transaction<'_>, file_path: &str) -> Result<BTreeSet<String>> {
-    let mut stmt = tx
-        .prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1 ORDER BY dep_file")?;
-    let rows = stmt.query_map(params![file_path], |row| row.get::<_, String>(0))?;
-    let mut deps = BTreeSet::new();
-    for row in rows {
-        deps.insert(row?);
-    }
-    Ok(deps)
 }
 
 fn module_dependencies_for_ref(
@@ -9454,6 +9568,27 @@ export function leaf() {}
     }
 
     #[test]
+    fn persisted_workspace_reexport_selects_its_package_dependency() {
+        let root = tempdir().expect("temp dir");
+        let dependencies = BTreeSet::from([
+            "packages/aft-bridge/src/index.ts".to_string(),
+            "packages/opencode-plugin/src/types.ts".to_string(),
+        ]);
+        let indexed_files = dependencies.iter().cloned().collect::<HashSet<_>>();
+
+        assert_eq!(
+            stored_dependencies_for_module(
+                root.path(),
+                "packages/opencode-plugin/src/shared/bash-hints.ts",
+                "@cortexkit/aft-bridge",
+                &dependencies,
+                &indexed_files,
+            ),
+            BTreeSet::from(["packages/aft-bridge/src/index.ts".to_string()])
+        );
+    }
+
+    #[test]
     fn incremental_barrel_refresh_matches_per_ref_lookup_and_cold_rebuild() {
         let dir = tempdir().expect("temp dir");
         let project_root = dir.path();
@@ -9537,6 +9672,32 @@ export function leaf() {}
                 "incremental refresh {table} rows must match cold rebuild"
             );
         }
+
+        let consumer_path = project_root.join("src/consumer_a.ts");
+        fs::write(
+            &consumer_path,
+            "import { target } from \"./index\";\nexport function consumerA() { return target(); }\nexport const refreshed = true;\n",
+        )
+        .expect("edit barrel consumer");
+        store
+            .refresh_files(std::slice::from_ref(&consumer_path))
+            .expect("refresh consumer through unchanged barrel");
+        cold_store
+            .cold_build(&files)
+            .expect("comparison cold rebuild after consumer refresh");
+        for table in [
+            "nodes",
+            "refs",
+            "file_dependencies",
+            "edges",
+            "dispatch_hints",
+        ] {
+            assert_eq!(
+                graph_table_rows(&store, table),
+                graph_table_rows(&cold_store, table),
+                "refresh through a persisted barrel must preserve cold-build {table} rows"
+            );
+        }
     }
 
     fn build_reference_connection(
@@ -9591,7 +9752,7 @@ export function leaf() {}
         conn
     }
 
-    fn fixture_extract(project_root: &Path) -> FileExtract {
+    fn fixture_extract(_project_root: &Path) -> FileExtract {
         let rel_path = "src/main.ts".to_string();
         let target_path = "src/helper.ts".to_string();
         let node = NodeRecord {
@@ -9635,7 +9796,6 @@ export function leaf() {}
             dependencies,
         };
         FileExtract {
-            abs_path: project_root.join(&rel_path),
             rel_path,
             freshness: FileFreshness {
                 mtime: UNIX_EPOCH + Duration::from_secs(123),
