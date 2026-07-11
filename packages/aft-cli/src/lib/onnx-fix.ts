@@ -12,9 +12,9 @@
  *   2. Install ONNX 1.24 system-wide — manual, slow, distro-specific.
  *   3. Run doctor — diagnostics only.
  *
- * None of those is automatable safely. But there's a fourth option AFT
- * actually owns end-to-end: clear `<storage_dir>/onnxruntime/` and let
- * the bridge re-download v1.24 on next start. That's what `--fix` does.
+ * AFT owns a safe fourth option end-to-end: clear only
+ * `<storage_dir>/onnxruntime/` and immediately download a managed v1.24.
+ * That's what `--fix` does.
  *
  * Pair this with the resolver fix in `packages/aft-bridge/src/onnx-runtime.ts`
  * (which now skips system installs below v1.20) and the user gets a working
@@ -24,6 +24,7 @@
 
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { ensureOnnxRuntime } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import type { DiagnosticReport, HarnessDiagnostic } from "./diagnostics.js";
@@ -38,24 +39,21 @@ export interface OnnxFixCandidate {
 }
 
 /**
- * Identify harnesses where AFT's ONNX resolution is broken and could be
- * auto-fixed by clearing `<storage_dir>/onnxruntime/`. Each entry carries
- * a human-readable reason so the prompt explains exactly what's wrong.
+ * Identify harnesses where AFT can repair ONNX resolution by replacing its
+ * managed cache and downloading a compatible runtime. Each entry carries a
+ * human-readable reason so the prompt explains exactly what's wrong.
  */
 export function findOnnxFixCandidates(report: DiagnosticReport): OnnxFixCandidate[] {
   const candidates: OnnxFixCandidate[] = [];
 
   for (const harness of report.harnesses) {
     if (!harness.onnxRuntime.required) continue;
-    if (!harness.storageDir.exists) continue;
 
     const storageOnnxDir = join(harness.storageDir.path, "onnxruntime");
 
-    // Case 1: system install is too old AND no compatible cached install
-    // exists. The resolver picks the system path, Rust rejects it. Clearing
-    // storage/onnxruntime is a no-op here (nothing to clear), but the user
-    // still benefits from being told the resolver fix in v0.19.5 takes care
-    // of this on the next bridge start.
+    // A stale managed runtime must be removed before ensureOnnxRuntime can
+    // install the current version. An incompatible system runtime is never
+    // deleted; the bridge resolver skips it while installing managed storage.
     const systemTooOld =
       harness.onnxRuntime.systemPath !== null && harness.onnxRuntime.systemCompatible === false;
     const cachedTooOld =
@@ -65,7 +63,7 @@ export function findOnnxFixCandidates(report: DiagnosticReport): OnnxFixCandidat
     if (cachedTooOld) {
       candidates.push({
         harness,
-        reason: `cached ONNX Runtime at ${harness.onnxRuntime.cachedPath} is v${harness.onnxRuntime.cachedVersion}, but AFT requires ${harness.onnxRuntime.requirement}. Clearing forces a fresh download on next start.`,
+        reason: `cached ONNX Runtime at ${harness.onnxRuntime.cachedPath} is v${harness.onnxRuntime.cachedVersion}, but AFT requires ${harness.onnxRuntime.requirement}. Clearing it allows an immediate managed download.`,
         storageOnnxDir,
         storageOnnxBytes: existsSync(storageOnnxDir) ? dirSize(storageOnnxDir) : 0,
       });
@@ -75,7 +73,20 @@ export function findOnnxFixCandidates(report: DiagnosticReport): OnnxFixCandidat
     if (systemTooOld && !hasCompatibleCached) {
       candidates.push({
         harness,
-        reason: `system ONNX Runtime at ${harness.onnxRuntime.systemPath} is v${harness.onnxRuntime.systemVersion}, but AFT requires ${harness.onnxRuntime.requirement}, and no AFT-managed install is present. AFT v0.19.5+ skips incompatible system installs and auto-downloads v1.24 on next start; clearing any stale state here ensures a clean slate.`,
+        reason: `system ONNX Runtime at ${harness.onnxRuntime.systemPath} is v${harness.onnxRuntime.systemVersion}, but AFT requires ${harness.onnxRuntime.requirement}, and no AFT-managed install is present. AFT will leave the system copy untouched and download v1.24 into managed storage.`,
+        storageOnnxDir,
+        storageOnnxBytes: existsSync(storageOnnxDir) ? dirSize(storageOnnxDir) : 0,
+      });
+      continue;
+    }
+
+    if (!harness.onnxRuntime.systemPath && !harness.onnxRuntime.cachedPath) {
+      const ignoredCopy = harness.onnxRuntime.ignoredSystemPath
+        ? ` The Windows system copy at ${harness.onnxRuntime.ignoredSystemPath} was ignored because its version is unreadable.`
+        : "";
+      candidates.push({
+        harness,
+        reason: `no compatible ONNX Runtime is installed.${ignoredCopy} AFT will download v1.24 into managed storage.`,
         storageOnnxDir,
         storageOnnxBytes: existsSync(storageOnnxDir) ? dirSize(storageOnnxDir) : 0,
       });
@@ -87,6 +98,7 @@ export function findOnnxFixCandidates(report: DiagnosticReport): OnnxFixCandidat
 
 export interface OnnxFixResult {
   cleared: number;
+  installed: number;
   bytesReclaimed: number;
   errors: { path: string; error: string }[];
 }
@@ -98,19 +110,10 @@ export interface OnnxFixOptions {
   confirmFn?: (message: string, defaultYes?: boolean) => Promise<boolean>;
   /** Inject a custom rmSync impl for testing. */
   rmFn?: (path: string, options: { recursive: boolean; force: boolean }) => void;
+  /** Inject the managed-runtime installer for testing. */
+  ensureFn?: (storageDir: string) => Promise<string | null>;
 }
 
-/**
- * Interactive ONNX fix flow. Returns the apply result (or null if no
- * fixable issues were found, or the user declined).
- *
- * Safety contract:
- *   - Only deletes paths inside `<storage_dir>/onnxruntime/` (AFT-owned).
- *   - NEVER touches `/usr/lib/...`, `/opt/homebrew/lib/...`, or any other
- *     system path.
- *   - Asks consent before any deletion (unless `options.yes` is set).
- *   - Reports byte counts so the user knows what's being reclaimed.
- */
 export async function runOnnxFix(
   adapters: HarnessAdapter[],
   report: DiagnosticReport,
@@ -118,26 +121,24 @@ export async function runOnnxFix(
 ): Promise<OnnxFixResult | null> {
   const candidates = findOnnxFixCandidates(report);
 
-  if (candidates.length === 0) {
-    return null;
-  }
+  if (candidates.length === 0) return null;
 
   log.warn(
-    `Found ${candidates.length} ONNX Runtime issue(s) that --fix can address by clearing AFT-managed cache:`,
+    `Found ${candidates.length} ONNX Runtime issue(s) that --fix can repair with an AFT-managed runtime:`,
   );
-  for (const c of candidates) {
-    log.info(`  • ${c.harness.displayName}: ${c.reason}`);
-    if (c.storageOnnxBytes > 0) {
-      log.info(`    will delete: ${c.storageOnnxDir} (${formatBytes(c.storageOnnxBytes)})`);
+  for (const candidate of candidates) {
+    log.info(`  • ${candidate.harness.displayName}: ${candidate.reason}`);
+    if (candidate.storageOnnxBytes > 0) {
+      log.info(
+        `    will delete: ${candidate.storageOnnxDir} (${formatBytes(candidate.storageOnnxBytes)})`,
+      );
     } else {
-      log.info(`    no AFT-managed ONNX cache to delete; nothing to reclaim`);
+      log.info("    no AFT-managed ONNX cache to delete");
     }
   }
 
   note(
-    "This NEVER touches system paths like /usr/lib. It only deletes AFT's own ONNX download cache. " +
-      "On next bridge start, AFT will re-download ONNX Runtime v1.24 and use that instead of the " +
-      "incompatible system library.",
+    "This NEVER touches system paths like /usr/lib or C:\\Windows\\System32. It only replaces AFT's own ONNX cache, then downloads the compatible managed runtime.",
     "Safe operation",
   );
 
@@ -151,42 +152,54 @@ export async function runOnnxFix(
     return null;
   }
 
-  const result: OnnxFixResult = { cleared: 0, bytesReclaimed: 0, errors: [] };
+  const result: OnnxFixResult = { cleared: 0, installed: 0, bytesReclaimed: 0, errors: [] };
   const rmFn = options.rmFn ?? rmSync;
+  const ensureFn = options.ensureFn ?? ensureOnnxRuntime;
 
-  for (const c of candidates) {
-    if (!existsSync(c.storageOnnxDir)) {
-      // Nothing to delete — but the resolver fix in v0.19.5+ will still
-      // produce a working install on next start. Report success so the
-      // user sees consistent feedback.
-      log.success(
-        `${c.harness.displayName}: no cached state to clear; restart your harness to trigger a fresh ONNX download`,
-      );
-      continue;
+  for (const candidate of candidates) {
+    if (existsSync(candidate.storageOnnxDir)) {
+      try {
+        rmFn(candidate.storageOnnxDir, { recursive: true, force: true });
+        result.cleared += 1;
+        result.bytesReclaimed += candidate.storageOnnxBytes;
+        log.success(
+          `${candidate.harness.displayName}: cleared ${candidate.storageOnnxDir} (reclaimed ${formatBytes(candidate.storageOnnxBytes)})`,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.error(
+          `${candidate.harness.displayName}: failed to clear ${candidate.storageOnnxDir}: ${message}`,
+        );
+        result.errors.push({ path: candidate.storageOnnxDir, error: message });
+        continue;
+      }
     }
+
     try {
-      rmFn(c.storageOnnxDir, { recursive: true, force: true });
-      result.cleared += 1;
-      result.bytesReclaimed += c.storageOnnxBytes;
-      log.success(
-        `${c.harness.displayName}: cleared ${c.storageOnnxDir} (reclaimed ${formatBytes(c.storageOnnxBytes)})`,
-      );
+      log.info(`${candidate.harness.displayName}: downloading managed ONNX Runtime…`);
+      const installedPath = await ensureFn(candidate.harness.storageDir.path);
+      if (!installedPath) {
+        const message = "managed ONNX Runtime download was unavailable";
+        log.error(`${candidate.harness.displayName}: ${message}`);
+        result.errors.push({ path: candidate.storageOnnxDir, error: message });
+        continue;
+      }
+      result.installed += 1;
+      log.success(`${candidate.harness.displayName}: ONNX Runtime installed at ${installedPath}`);
     } catch (err) {
-      const message = (err as Error).message ?? "unknown error";
-      log.error(`${c.harness.displayName}: failed to clear ${c.storageOnnxDir}: ${message}`);
-      result.errors.push({ path: c.storageOnnxDir, error: message });
+      const message = err instanceof Error ? err.message : String(err);
+      log.error(`${candidate.harness.displayName}: ONNX Runtime download failed: ${message}`);
+      result.errors.push({ path: candidate.storageOnnxDir, error: message });
     }
   }
 
-  // Acknowledge the suppressed `adapters` argument — kept in the public
-  // signature so future fixes (e.g. plugin re-registration, lsp cache
-  // wipe) can use it without a breaking call-site change.
+  // Keep the adapter argument in the public signature for compatibility with
+  // other doctor fixes that operate on harness adapters.
   void adapters;
 
-  if (result.cleared > 0 || candidates.some((c) => c.storageOnnxBytes === 0)) {
+  if (result.installed > 0) {
     note(
-      "Restart your AFT-using harness (OpenCode / Pi) to trigger a fresh ONNX Runtime download. " +
-        "Watch the TUI sidebar — the Semantic Index status should move from 'failed' → 'building' → 'ready'.",
+      "Restart your AFT-using harness (OpenCode / Pi) so semantic indexing uses the newly installed managed runtime.",
       "Next step",
     );
   }

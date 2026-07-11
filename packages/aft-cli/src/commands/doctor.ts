@@ -194,6 +194,10 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
         parts.push(
           `system: ${h.onnxRuntime.systemVersion ?? "unknown"}${h.onnxRuntime.systemCompatible === false ? " (incompatible)" : ""}`,
         );
+      } else if (h.onnxRuntime.ignoredSystemPath) {
+        parts.push(
+          `system: ${h.onnxRuntime.ignoredSystemReason} at ${h.onnxRuntime.ignoredSystemPath}`,
+        );
       }
       if (!h.onnxRuntime.cachedPath && !h.onnxRuntime.systemPath) {
         parts.push(`not installed — ${h.onnxRuntime.installHint}`);
@@ -606,12 +610,12 @@ export function buildDoctorFixPlan(
     if (candidate.storageOnnxBytes > 0) {
       items.push({
         kind: "onnx",
-        message: `Will delete AFT-managed ONNX cache at ${candidate.storageOnnxDir} (${formatBytes(candidate.storageOnnxBytes)})`,
+        message: `Will replace AFT-managed ONNX cache at ${candidate.storageOnnxDir} (${formatBytes(candidate.storageOnnxBytes)}) and download a compatible runtime`,
       });
     } else {
       items.push({
         kind: "onnx",
-        message: `Will leave system ONNX untouched and refresh AFT-managed ONNX state for ${candidate.harness.displayName} on next start`,
+        message: `Will leave system ONNX untouched and download a compatible AFT-managed runtime for ${candidate.harness.displayName}`,
       });
     }
   }

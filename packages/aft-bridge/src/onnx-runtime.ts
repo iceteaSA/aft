@@ -470,6 +470,26 @@ function pathEntriesForPlatform(): string[] {
     });
 }
 
+function isWindowsSystem32Directory(dir: string): boolean {
+  if (process.platform !== "win32") return false;
+
+  const normalizedDir = win32
+    .resolve(dir)
+    .replace(/[\\/]+$/, "")
+    .toLowerCase();
+  const windowsRoots = [process.env.SystemRoot, process.env.windir, "C:\\Windows"];
+  return windowsRoots.some((root) => {
+    if (!root) return false;
+    return (
+      normalizedDir ===
+      win32
+        .resolve(root, "System32")
+        .replace(/[\\/]+$/, "")
+        .toLowerCase()
+    );
+  });
+}
+
 function directoryContainsLibrary(dir: string, libName: string): boolean {
   try {
     const entries = readdirSync(dir);
@@ -583,6 +603,15 @@ function findSystemOnnxRuntime(libName?: string): string | null {
     // it shadow a later candidate with a known compatible version.
     const version = detectOnnxVersion(dir, libName);
     if (!version) {
+      // Windows ships an unversioned ONNX Runtime in System32 on some releases.
+      // Rust can discover that DLL is too old only after startup, so never let
+      // an unverifiable OS copy prevent AFT from downloading its managed runtime.
+      if (isWindowsSystem32Directory(dir)) {
+        warn(
+          `Skipping unversioned Windows system ONNX Runtime at ${dir}; falling through to AFT-managed download.`,
+        );
+        continue;
+      }
       unknownVersionPaths.push(dir);
       continue;
     }

@@ -157,7 +157,26 @@ describe("findOnnxFixCandidates", () => {
     expect(candidates).toHaveLength(1);
     expect(candidates[0].reason).toContain("system ONNX Runtime");
     expect(candidates[0].reason).toContain("1.9.0");
-    expect(candidates[0].reason).toContain("v0.19.5+ skips incompatible system installs");
+    expect(candidates[0].reason).toContain("download v1.24");
+  });
+
+  test("flags a missing runtime after an unreadable Windows system copy is ignored", () => {
+    const report = makeReport([
+      makeHarness({
+        onnxRuntime: {
+          ...makeHarness().onnxRuntime,
+          ignoredSystemPath: "C:\\Windows\\System32",
+          ignoredSystemReason: "version unreadable (Windows system copy) — ignored",
+          platform: "win32-x64",
+        },
+      }),
+    ]);
+
+    const candidates = findOnnxFixCandidates(report);
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].reason).toContain("version is unreadable");
+    expect(candidates[0].reason).toContain("download v1.24");
   });
 
   test("does NOT flag system install when a compatible cached install exists", () => {
@@ -247,10 +266,12 @@ describe("runOnnxFix", () => {
       rmFn: (path) => {
         removed.push(path);
       },
+      ensureFn: async () => join(storagePath, "onnxruntime", "1.24.4"),
     });
 
     expect(result).not.toBe(null);
     expect(result?.cleared).toBe(1);
+    expect(result?.installed).toBe(1);
     expect(result?.errors).toEqual([]);
     // Critical safety: the path deleted must be inside our test workDir,
     // never `/usr/lib/...`.
@@ -279,6 +300,7 @@ describe("runOnnxFix", () => {
     await runOnnxFix([], report, {
       confirmFn: async () => true,
       rmFn: (path) => removed.push(path),
+      ensureFn: async () => join(storagePath, "onnxruntime", "1.24.4"),
     });
 
     // The candidate's storage dir doesn't exist (we never downloaded
@@ -289,5 +311,33 @@ describe("runOnnxFix", () => {
       expect(path).not.toContain("/opt/homebrew");
       expect(path).toContain(workDir);
     }
+  });
+
+  test("downloads a managed runtime immediately when none is installed", async () => {
+    const storagePath = join(workDir, "storage");
+    const report = makeReport([
+      makeHarness({
+        storageDir: { path: storagePath, exists: false, accessible: false, sizesByKey: {} },
+        onnxRuntime: {
+          ...makeHarness().onnxRuntime,
+          ignoredSystemPath: "C:\\Windows\\System32",
+          ignoredSystemReason: "version unreadable (Windows system copy) — ignored",
+          platform: "win32-x64",
+        },
+      }),
+    ]);
+    const ensured: string[] = [];
+
+    const result = await runOnnxFix([], report, {
+      yes: true,
+      ensureFn: async (storageDir) => {
+        ensured.push(storageDir);
+        return join(storageDir, "onnxruntime", "1.24.4");
+      },
+    });
+
+    expect(ensured).toEqual([storagePath]);
+    expect(result?.installed).toBe(1);
+    expect(result?.errors).toEqual([]);
   });
 });

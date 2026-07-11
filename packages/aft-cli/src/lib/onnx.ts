@@ -44,6 +44,26 @@ function pathEntriesForPlatform(): string[] {
     });
 }
 
+function isWindowsSystem32Directory(dir: string): boolean {
+  if (process.platform !== "win32") return false;
+
+  const normalizedDir = win32
+    .resolve(dir)
+    .replace(/[\\/]+$/, "")
+    .toLowerCase();
+  const windowsRoots = [process.env.SystemRoot, process.env.windir, "C:\\Windows"];
+  return windowsRoots.some((root) => {
+    if (!root) return false;
+    return (
+      normalizedDir ===
+      win32
+        .resolve(root, "System32")
+        .replace(/[\\/]+$/, "")
+        .toLowerCase()
+    );
+  });
+}
+
 function directoryContainsLibrary(dir: string, libName: string): boolean {
   try {
     const entries = readdirSync(dir);
@@ -55,6 +75,22 @@ function directoryContainsLibrary(dir: string, libName: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function findIgnoredWindowsSystemOnnxRuntime(): string | null {
+  if (process.platform !== "win32") return null;
+
+  const windowsRoots = [process.env.SystemRoot, process.env.windir, "C:\\Windows"];
+  const seen = new Set<string>();
+  for (const root of windowsRoots) {
+    if (!root) continue;
+    const systemDir = join(root, "System32");
+    const key = win32.resolve(systemDir).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (directoryContainsLibrary(systemDir, getOnnxLibraryName())) return systemDir;
+  }
+  return null;
 }
 
 export function findSystemOnnxRuntime(): string | null {
@@ -118,6 +154,10 @@ export function findSystemOnnxRuntime(): string | null {
 
     const version = detectOrtVersion(dir);
     if (!version) {
+      // Windows ships an unversioned ONNX Runtime in System32 on some releases.
+      // The CLI cannot prove that OS copy meets AFT's minimum version, so report
+      // it as unavailable and allow the bridge to install a managed runtime.
+      if (isWindowsSystem32Directory(dir)) continue;
       unknownVersionPaths.push(dir);
       continue;
     }

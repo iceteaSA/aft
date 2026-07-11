@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { __test__ as bridgeOnnxTest } from "../../../aft-bridge/src/onnx-runtime.js";
 import {
   findCachedOnnxRuntime,
+  findIgnoredWindowsSystemOnnxRuntime,
   findSystemOnnxRuntime,
   getOnnxLibraryName,
   ONNX_RUNTIME_VERSION,
@@ -26,6 +27,8 @@ beforeEach(() => {
     ["USERPROFILE", process.env.USERPROFILE],
     ["ProgramFiles", process.env.ProgramFiles],
     ["ProgramFiles(x86)", process.env["ProgramFiles(x86)"]],
+    ["SystemRoot", process.env.SystemRoot],
+    ["windir", process.env.windir],
   ]);
 });
 
@@ -62,6 +65,29 @@ describe("CLI ONNX system detection", () => {
     const found = withPlatform("win32", () => findSystemOnnxRuntime());
 
     expect(found).toBe(runtimeDir);
+  });
+
+  test("doctor rejects an unversioned ONNX Runtime from Windows System32", () => {
+    const windowsDir = join(workDir, "Windows");
+    const systemDir = join(windowsDir, "System32");
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "onnxruntime.dll"), "Windows component");
+    process.env.PATH = systemDir;
+    process.env.SystemRoot = windowsDir;
+    process.env.ProgramFiles = join(workDir, "program-files");
+    process.env["ProgramFiles(x86)"] = join(workDir, "program-files-x86");
+    process.env.USERPROFILE = join(workDir, "profile-without-nuget");
+    delete process.env.Path;
+    delete process.env.path;
+    delete process.env.windir;
+
+    const result = withPlatform("win32", () => ({
+      found: findSystemOnnxRuntime(),
+      ignored: findIgnoredWindowsSystemOnnxRuntime(),
+    }));
+
+    expect(result.found).toBeNull();
+    expect(result.ignored).toBe(systemDir);
   });
 
   test("doctor skips incompatible Windows PATH DLLs and selects a compatible candidate", () => {

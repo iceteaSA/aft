@@ -18,6 +18,7 @@ import { getLspCacheReport, type LspCacheReport } from "./lsp-cache.js";
 import {
   detectOrtVersion,
   findCachedOnnxRuntime,
+  findIgnoredWindowsSystemOnnxRuntime,
   findSystemOnnxRuntime,
   getManualInstallHint,
   isOrtVersionCompatible,
@@ -86,6 +87,8 @@ export interface HarnessDiagnostic {
     systemPath: string | null;
     systemVersion: string | null;
     systemCompatible: boolean | null;
+    ignoredSystemPath?: string | null;
+    ignoredSystemReason?: string | null;
     cachedPath: string | null;
     cachedVersion: string | null;
     cachedCompatible: boolean | null;
@@ -174,6 +177,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
         true);
 
   const systemOrtDir = findSystemOnnxRuntime();
+  const ignoredSystemOrtDir = systemOrtDir ? null : findIgnoredWindowsSystemOnnxRuntime();
   const cachedOrtDir = findCachedOnnxRuntime(storage);
   const systemVersion = systemOrtDir ? detectOrtVersion(systemOrtDir) : null;
   const cachedVersion = cachedOrtDir ? detectOrtVersion(cachedOrtDir) : null;
@@ -205,6 +209,10 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       systemPath: systemOrtDir,
       systemVersion,
       systemCompatible: systemVersion ? isOrtVersionCompatible(systemVersion) : null,
+      ignoredSystemPath: ignoredSystemOrtDir,
+      ignoredSystemReason: ignoredSystemOrtDir
+        ? "version unreadable (Windows system copy) — ignored"
+        : null,
       cachedPath: cachedOrtDir,
       cachedVersion,
       cachedCompatible: cachedVersion ? isOrtVersionCompatible(cachedVersion) : null,
@@ -410,7 +418,9 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
           code: "onnx_missing",
           severity: "medium",
           scope: h.displayName,
-          message: "ONNX Runtime is required for semantic search but was not detected.",
+          message: h.onnxRuntime.ignoredSystemPath
+            ? `ONNX Runtime at ${h.onnxRuntime.ignoredSystemPath} has a ${h.onnxRuntime.ignoredSystemReason}; no compatible runtime was detected.`
+            : "ONNX Runtime is required for semantic search but was not detected.",
           remediation: `Run \`aft doctor --fix\` or install ONNX Runtime manually (${h.onnxRuntime.installHint}).`,
         });
       }

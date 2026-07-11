@@ -224,6 +224,31 @@ describe("findSystemOnnxRuntime (Windows PATH)", () => {
     );
   });
 
+  test("rejects an unversioned ONNX Runtime from Windows System32", async () => {
+    const windowsDir = join(workDir, "Windows");
+    const systemDir = join(windowsDir, "System32");
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "onnxruntime.dll"), "Windows component");
+
+    await withEnv(
+      {
+        PATH: systemDir,
+        Path: undefined,
+        path: undefined,
+        SystemRoot: windowsDir,
+        windir: undefined,
+        ProgramFiles: join(workDir, "program-files"),
+        "ProgramFiles(x86)": join(workDir, "program-files-x86"),
+        USERPROFILE: join(workDir, "profile-without-nuget"),
+      },
+      async () => {
+        const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+        expect(found).toBeNull();
+      },
+    );
+  });
+
   test("ignores non-existent PATH directories without throwing", async () => {
     await withEnv(
       {
