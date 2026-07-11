@@ -234,7 +234,10 @@ pub(super) fn trust_for_principal(principal: &Option<Principal>) -> BindTrust {
     match principal {
         Some(Principal::Direct) => BindTrust::FirstParty,
         Some(Principal::Reserved { module_id })
-            if module_id == "llm-runner" || module_id == "aft" =>
+            if module_id == "llm-runner"
+                || module_id == "aft"
+                || module_id == "broca"
+                || module_id == "alfonso-core" =>
         {
             BindTrust::FirstParty
         }
