@@ -23,8 +23,11 @@ pub struct DrainBatchOutcome {
 pub const WATCHER_EVENT_DRAIN_BATCH_CAP: usize = 256;
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
 
-pub fn drain_configure_warning_events(ctx: &AppContext) {
+pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
+}
+
+pub fn drain_configure_warning_events(ctx: &AppContext) {
     for (generation, frame) in ctx.drain_configure_warnings() {
         if ctx.configure_generation() != generation {
             aft::slog_info!(
@@ -1626,6 +1629,56 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
 }
 
 #[cfg(test)]
+pub(crate) fn configure_search_order_context_for_test(
+    root: &Path,
+    storage: &Path,
+) -> (AppContext, std::path::PathBuf) {
+    std::fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+    std::fs::write(root.join("ignored.rs"), "fn ignored_marker() {}\n").unwrap();
+
+    let ctx = AppContext::new(
+        crate::context::default_language_provider_factory(),
+        crate::config::Config {
+            project_root: Some(root.to_path_buf()),
+            storage_dir: Some(storage.to_path_buf()),
+            ..crate::config::Config::default()
+        },
+    );
+    let canonical_root = std::fs::canonicalize(root).unwrap();
+    let ignored_path = canonical_root.join("ignored.rs");
+    ctx.set_canonical_cache_root(canonical_root.clone());
+    ctx.set_harness(crate::harness::Harness::Opencode);
+    ctx.enqueue_configure_maintenance(crate::context::ConfigureMaintenanceJob {
+        generation: ctx.configure_generation(),
+        root_path: root.to_path_buf(),
+        canonical_cache_root: canonical_root,
+        harness: crate::harness::Harness::Opencode,
+        storage_root: storage.to_path_buf(),
+        harness_dir: storage.join("opencode"),
+        session_id: "order-test".to_string(),
+        home_match: false,
+        format_tool_cache_clear_needed: false,
+        run_bash_replay: false,
+        refresh_project_runtime: true,
+        sync_bash_compress_flag: false,
+        reset_filter_registry: false,
+        clear_failed_spawns: false,
+        warm_callgraph_store: false,
+    });
+
+    let (search_tx, search_rx) = crossbeam_channel::unbounded();
+    search_tx
+        .send(crate::search_index::SearchIndex::new())
+        .unwrap();
+    drop(search_tx);
+    *ctx.search_index_rx()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(search_rx);
+    ctx.add_pending_search_index_paths([ignored_path.clone()]);
+    (ctx, ignored_path)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
@@ -1642,6 +1695,38 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         (ctx, tx)
+    }
+
+    #[test]
+    fn standalone_configure_tail_precedes_completed_search_install() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (ctx, ignored_path) =
+            configure_search_order_context_for_test(root.path(), storage.path());
+        assert!(!watcher_path_is_ignored_by_current_matcher(
+            &ctx,
+            &ignored_path
+        ));
+
+        drain_deferred_configure_maintenance(&ctx);
+        drain_configure_warning_events(&ctx);
+        drain_search_index_events(&ctx);
+
+        assert!(watcher_path_is_ignored_by_current_matcher(
+            &ctx,
+            &ignored_path
+        ));
+        assert_eq!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("completed search index installed")
+                .file_count(),
+            0,
+            "configure must install the ignore matcher before pending paths replay"
+        );
+        ctx.stop_watcher_runtime();
     }
 
     #[test]

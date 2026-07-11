@@ -87,14 +87,15 @@ const RELIABLE_PUSH_DRAIN_BUDGET: usize = 32;
 /// control-plane work such as completed RouteBind acknowledgements.
 ///
 /// The decomposed maintenance pass charges this budget by Mutating job, not by
-/// root. Set the default burst to 24 so one maintenance pass over eight live
-/// roots fits in a single tick, while follow-up batches still re-enter the
-/// capped queue instead of bypassing the budget.
+/// root. Size the default burst for one maintenance pass over eight live roots,
+/// while follow-up batches still re-enter the capped queue instead of bypassing
+/// the budget.
 const MAINTENANCE_SUBMIT_BUDGET: usize = INITIAL_MAINTENANCE_DRAIN_KINDS.len() * 8;
-const INITIAL_MAINTENANCE_DRAIN_KINDS: [MaintenanceDrainKind; 3] = [
+const INITIAL_MAINTENANCE_DRAIN_KINDS: [MaintenanceDrainKind; 4] = [
     MaintenanceDrainKind::Watcher,
     MaintenanceDrainKind::Lsp,
-    MaintenanceDrainKind::Short,
+    MaintenanceDrainKind::ConfigureTail,
+    MaintenanceDrainKind::CompletionDrains,
 ];
 #[cfg(test)]
 const INITIAL_MAINTENANCE_JOB_COUNT: usize = INITIAL_MAINTENANCE_DRAIN_KINDS.len();
@@ -339,7 +340,8 @@ struct MaintenanceCompletion {
 enum MaintenanceDrainKind {
     Watcher,
     Lsp,
-    Short,
+    ConfigureTail,
+    CompletionDrains,
 }
 
 impl MaintenanceDrainKind {
@@ -347,7 +349,8 @@ impl MaintenanceDrainKind {
         match self {
             Self::Watcher => "watcher",
             Self::Lsp => "lsp",
-            Self::Short => "short",
+            Self::ConfigureTail => "configure-tail",
+            Self::CompletionDrains => "completion-drains",
         }
     }
 }
@@ -539,7 +542,7 @@ fn submit_due_maintenance_jobs(
             .fetch_add(1, Ordering::Relaxed);
     }
     for (root_id, kind) in due_jobs {
-        let bg_sessions_to_check = if kind == MaintenanceDrainKind::Short {
+        let bg_sessions_to_check = if kind == MaintenanceDrainKind::CompletionDrains {
             bg_sub_by_session
                 .iter()
                 .filter_map(|((root, session), _)| {
@@ -2137,7 +2140,7 @@ fn route_bind_error_code_for_configure_response(response: &Response) -> &'static
     }
 }
 
-fn queue_initial_short_maintenance_after_bind(
+fn queue_post_bind_configure_and_completion_maintenance(
     root_id: &ProjectRootId,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
 ) {
@@ -2150,7 +2153,9 @@ fn queue_initial_short_maintenance_after_bind(
 
     meta.maintenance_pending = true;
     meta.maintenance_queued_kinds
-        .push_back(MaintenanceDrainKind::Short);
+        .push_back(MaintenanceDrainKind::ConfigureTail);
+    meta.maintenance_queued_kinds
+        .push_back(MaintenanceDrainKind::CompletionDrains);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2290,7 +2295,7 @@ async fn handle_route_bind_completion(
     )
     .map_err(SubcError::FrameBuild)?;
     send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await?;
-    queue_initial_short_maintenance_after_bind(&completion.bind_root_id, live_roots);
+    queue_post_bind_configure_and_completion_maintenance(&completion.bind_root_id, live_roots);
     let replayed = push::replay_buffered_push_frames(
         tx,
         metrics,
@@ -3123,8 +3128,12 @@ fn submit_maintenance_job(
                         requeue_kind: drained.has_more.then_some(kind),
                     }
                 }
-                MaintenanceDrainKind::Short => {
+                MaintenanceDrainKind::ConfigureTail => {
+                    runtime_drain::drain_deferred_configure_maintenance(ctx);
                     runtime_drain::drain_configure_warning_events(ctx);
+                    MaintenanceJobOutcome::default()
+                }
+                MaintenanceDrainKind::CompletionDrains => {
                     runtime_drain::drain_search_index_events(ctx);
                     runtime_drain::drain_callgraph_store_events(ctx);
                     runtime_drain::drain_semantic_index_events(ctx);
@@ -3550,13 +3559,75 @@ mod tests {
         assert!(!live_roots[&poisoned_root].maintenance_pending);
     }
 
+    #[tokio::test]
+    async fn subc_configure_tail_precedes_completed_search_install() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = ProjectRootId::from_path(root_dir.path()).unwrap();
+        let (ctx, ignored_path) =
+            runtime_drain::configure_search_order_context_for_test(root_dir.path(), storage.path());
+        let ctx = Arc::new(ctx);
+        assert!(!runtime_drain::watcher_path_is_ignored_by_current_matcher(
+            &ctx,
+            &ignored_path
+        ));
+
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(4);
+        submit_maintenance_job(
+            &executor,
+            root.clone(),
+            MaintenanceDrainKind::ConfigureTail,
+            Vec::new(),
+            &completion_tx,
+            &metrics,
+        );
+        submit_maintenance_job(
+            &executor,
+            root,
+            MaintenanceDrainKind::CompletionDrains,
+            Vec::new(),
+            &completion_tx,
+            &metrics,
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+            .await
+            .expect("configure-tail completion timed out")
+            .expect("configure-tail completion channel closed");
+        let second = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+            .await
+            .expect("completion-drains completion timed out")
+            .expect("completion-drains completion channel closed");
+        assert!(first.response.id.contains("configure-tail"));
+        assert!(second.response.id.contains("completion-drains"));
+        assert!(runtime_drain::watcher_path_is_ignored_by_current_matcher(
+            &ctx,
+            &ignored_path
+        ));
+        assert_eq!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("completed search index installed")
+                .file_count(),
+            0,
+            "configure must install the ignore matcher before pending paths replay"
+        );
+        ctx.stop_watcher_runtime();
+    }
+
     #[test]
-    fn initial_short_maintenance_is_queued_without_starting_actor_work() {
-        let (_dir, root) = test_root("maintenance-initial-short");
+    fn post_bind_configure_and_completion_jobs_are_queued_in_order() {
+        let (_dir, root) = test_root("maintenance-post-bind");
         let mut live_roots = HashMap::new();
         live_roots.insert(root.clone(), RootMeta::new(Instant::now()));
 
-        queue_initial_short_maintenance_after_bind(&root, &mut live_roots);
+        queue_post_bind_configure_and_completion_maintenance(&root, &mut live_roots);
+        queue_post_bind_configure_and_completion_maintenance(&root, &mut live_roots);
 
         let meta = live_roots.get(&root).expect("root metadata");
         assert!(meta.maintenance_pending);
@@ -3566,15 +3637,24 @@ mod tests {
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            vec![MaintenanceDrainKind::Short]
+            vec![
+                MaintenanceDrainKind::ConfigureTail,
+                MaintenanceDrainKind::CompletionDrains,
+            ]
         );
 
         let (due, deferred) =
             due_maintenance_jobs(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET, &HashSet::new());
 
-        assert_eq!(due, vec![(root.clone(), MaintenanceDrainKind::Short)]);
+        assert_eq!(
+            due,
+            vec![
+                (root.clone(), MaintenanceDrainKind::ConfigureTail),
+                (root.clone(), MaintenanceDrainKind::CompletionDrains),
+            ]
+        );
         assert!(!deferred);
-        assert_eq!(live_roots[&root].maintenance_jobs_in_flight, 1);
+        assert_eq!(live_roots[&root].maintenance_jobs_in_flight, 2);
         assert!(live_roots[&root].maintenance_queued_kinds.is_empty());
     }
 

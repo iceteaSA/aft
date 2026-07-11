@@ -304,6 +304,7 @@ fn main() {
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
         aft::logging::sync_storage_root(runtime.storage_dir());
+        aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::runtime_drain::drain_search_index_events(runtime);
         aft::runtime_drain::drain_callgraph_store_events(runtime);
@@ -376,6 +377,7 @@ fn finalize_ready_pending(
 
 fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
+        aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
     }
 }
