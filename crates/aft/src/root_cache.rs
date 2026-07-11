@@ -200,33 +200,6 @@ fn canonical_root(project_root: &Path) -> PathBuf {
     std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf())
 }
 
-fn detect_linked_worktree(project_root: &Path) -> bool {
-    if std::env::var_os("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD").is_some() {
-        return false;
-    }
-    let Ok(output) = crate::effective_path::new_command("git")
-        .arg("-C")
-        .arg(project_root)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ])
-        .output()
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut lines = text.lines();
-    let (Some(git_dir), Some(common_dir)) = (lines.next(), lines.next()) else {
-        return false;
-    };
-    canonical_root(Path::new(git_dir)) != canonical_root(Path::new(common_dir))
-}
 
 fn process_leases() -> &'static Mutex<HashMap<ProcessLeaseKey, Weak<WriterLease>>> {
     PROCESS_LEASES.get_or_init(|| Mutex::new(HashMap::new()))
