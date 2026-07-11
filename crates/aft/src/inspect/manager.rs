@@ -513,6 +513,12 @@ impl InspectManager {
             .gap("oxc_fact_bytes")
     }
 
+    /// Whether completed scan results are waiting in the channel. Used by the
+    /// maintenance scheduler to skip enqueueing a completion drain with no work.
+    pub fn has_pending_completions(&self) -> bool {
+        !self.result_rx.is_empty()
+    }
+
     pub fn drain_completions(&self) -> usize {
         let mut drained = 0usize;
         while let Ok(result) = self.result_rx.try_recv() {

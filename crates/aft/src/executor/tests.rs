@@ -1497,3 +1497,63 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
         "maintenance must defer while interactive mutating work is queued, even behind reads"
     );
 }
+
+#[test]
+fn maintenance_commit_overlaps_pure_reads_and_defers_to_writers() {
+    // A long MaintenanceCommit job must not block PureReads (the I-A invariant:
+    // background maintenance can never exclude interactive reads), and a
+    // second MaintenanceCommit must serialize behind the first.
+    let executor = test_executor(4, 2, 4, 1);
+    let (_dir, root) = test_root("maintenance-commit-overlap");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    let (mc_started_tx, mc_started_rx) = crossbeam_channel::bounded(1);
+    let (release_mc_tx, release_mc_rx) = crossbeam_channel::bounded::<()>(1);
+    let mc = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "mc-1".to_string(),
+        Box::new(move |_ctx| {
+            mc_started_tx.send(()).expect("signal mc start");
+            release_mc_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release maintenance commit");
+            ok("mc-1")
+        }),
+    );
+    mc_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("maintenance commit starts");
+
+    // Read overlaps the running MaintenanceCommit.
+    let read = executor.submit_async(
+        root.clone(),
+        Lane::PureRead,
+        "read-overlap".to_string(),
+        Box::new(|_ctx| ok("read-overlap")),
+    );
+    let read_response = recv_async(read);
+    assert!(read_response.success, "read must complete while maintenance holds the read gate");
+
+    // Second MaintenanceCommit queues behind the first (serialized per actor).
+    let (mc2_started_tx, mc2_started_rx) = crossbeam_channel::bounded(1);
+    let _mc2 = executor.submit_maintenance_async(
+        root,
+        Lane::MaintenanceCommit,
+        "mc-2".to_string(),
+        Box::new(move |_ctx| {
+            mc2_started_tx.send(()).expect("signal mc2 start");
+            ok("mc-2")
+        }),
+    );
+    assert!(
+        mc2_started_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "second maintenance commit must wait for the first"
+    );
+
+    release_mc_tx.send(()).expect("release maintenance commit");
+    recv_async(mc);
+    mc2_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second maintenance commit runs after the first");
+}

@@ -423,6 +423,8 @@ impl RootMeta {
 
 fn due_maintenance_jobs(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: Option<&Executor>,
+    bg_sub_roots: &HashSet<ProjectRootId>,
     budget: usize,
     pending_bind_roots: &HashSet<ProjectRootId>,
 ) -> (Vec<(ProjectRootId, MaintenanceDrainKind)>, bool) {
@@ -461,9 +463,34 @@ fn due_maintenance_jobs(
                 deferred = true;
                 continue;
             }
+            // Only enqueue kinds with pending work. Probes are cheap and
+            // fail-open (contended sources count as pending), so an idle root
+            // costs four probes per tick instead of four dispatched jobs.
+            let executor_actor_context = executor.and_then(|executor| executor.actor_context(&root_id));
+            let kinds_with_work: Vec<MaintenanceDrainKind> = match executor_actor_context {
+                Some(ctx) => INITIAL_MAINTENANCE_DRAIN_KINDS
+                    .into_iter()
+                    .filter(|kind| match kind {
+                        MaintenanceDrainKind::Watcher => ctx.watcher_drain_has_work(),
+                        MaintenanceDrainKind::Lsp => ctx.lsp_drain_has_work(),
+                        MaintenanceDrainKind::ConfigureTail => ctx.configure_tail_has_work(),
+                        // The bg-session wake CLEAR rides CompletionDrains and
+                        // its pending state is loop-owned (wake epochs), not
+                        // visible from AppContext: a root with any bg
+                        // subscription never skips this kind.
+                        MaintenanceDrainKind::CompletionDrains => {
+                            bg_sub_roots.contains(&root_id) || ctx.completion_drains_have_work()
+                        }
+                    })
+                    .collect(),
+                // No context handle (actor gone mid-tick): enqueue everything.
+                None => INITIAL_MAINTENANCE_DRAIN_KINDS.to_vec(),
+            };
+            if kinds_with_work.is_empty() {
+                continue;
+            }
             meta.maintenance_pending = true;
-            meta.maintenance_queued_kinds
-                .extend(INITIAL_MAINTENANCE_DRAIN_KINDS);
+            meta.maintenance_queued_kinds.extend(kinds_with_work);
         }
 
         while let Some(kind) = meta.maintenance_queued_kinds.pop_front() {
@@ -591,7 +618,19 @@ fn submit_due_maintenance_jobs(
         .map(|pending| pending.bind_root_id.clone())
         .collect::<HashSet<_>>();
     let (due_jobs, deferred_jobs) =
-        due_maintenance_jobs(live_roots, MAINTENANCE_SUBMIT_BUDGET, &pending_bind_roots);
+        {
+        let bg_sub_roots: HashSet<ProjectRootId> = bg_sub_by_session
+            .keys()
+            .map(|(root, _)| root.clone())
+            .collect();
+        due_maintenance_jobs(
+            live_roots,
+            Some(executor),
+            &bg_sub_roots,
+            MAINTENANCE_SUBMIT_BUDGET,
+            &pending_bind_roots,
+        )
+    };
     if deferred_jobs {
         metrics
             .maintenance_budget_deferrals
@@ -3193,9 +3232,19 @@ fn submit_maintenance_job(
     let response_id = request_id.clone();
     let completion_root_id = root_id.clone();
     let (outcome_tx, outcome_rx) = oneshot::channel::<MaintenanceJobOutcome>();
+    // ConfigureTail runs deferred configure mutations and needs the actor
+    // epoch write gate. The other drain kinds only mutate subsystem state
+    // behind that subsystem's own lock, so they run on MaintenanceCommit and
+    // overlap interactive reads instead of excluding them.
+    let lane = match kind {
+        MaintenanceDrainKind::ConfigureTail => Lane::Mutating,
+        MaintenanceDrainKind::Watcher
+        | MaintenanceDrainKind::Lsp
+        | MaintenanceDrainKind::CompletionDrains => Lane::MaintenanceCommit,
+    };
     let rx = executor.submit_maintenance_async(
         root_id,
-        Lane::Mutating,
+        lane,
         request_id.clone(),
         Box::new(move |ctx| {
             let outcome = match kind {
@@ -3658,7 +3707,7 @@ mod tests {
         live_roots.insert(poisoned_root.clone(), poisoned_meta);
 
         let (due, deferred) =
-            due_maintenance_jobs(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET, &HashSet::new());
+            due_maintenance_jobs(&mut live_roots, None, &HashSet::new(), MAINTENANCE_SUBMIT_BUDGET, &HashSet::new());
 
         assert_eq!(due.len(), INITIAL_MAINTENANCE_JOB_COUNT);
         assert!(due.iter().all(|(root, _)| root == &healthy_root));
@@ -3756,7 +3805,7 @@ mod tests {
         );
 
         let (due, deferred) =
-            due_maintenance_jobs(&mut live_roots, MAINTENANCE_SUBMIT_BUDGET, &HashSet::new());
+            due_maintenance_jobs(&mut live_roots, None, &HashSet::new(), MAINTENANCE_SUBMIT_BUDGET, &HashSet::new());
 
         assert_eq!(
             due,
@@ -3784,7 +3833,7 @@ mod tests {
 
         let small_budget = INITIAL_MAINTENANCE_JOB_COUNT + 1;
         let (first_due, first_deferred) =
-            due_maintenance_jobs(&mut live_roots, small_budget, &HashSet::new());
+            due_maintenance_jobs(&mut live_roots, None, &HashSet::new(), small_budget, &HashSet::new());
 
         assert_eq!(first_due.len(), small_budget);
         assert!(first_deferred);
@@ -3813,7 +3862,7 @@ mod tests {
         let pending_bind_roots = HashSet::from([bind_root.clone()]);
 
         let (due, deferred) =
-            due_maintenance_jobs(&mut live_roots, usize::MAX, &pending_bind_roots);
+            due_maintenance_jobs(&mut live_roots, None, &HashSet::new(), usize::MAX, &pending_bind_roots);
 
         assert_eq!(due.len(), INITIAL_MAINTENANCE_JOB_COUNT);
         assert!(due.iter().all(|(root, _)| root == &healthy_root));
@@ -3827,7 +3876,7 @@ mod tests {
         let (_dir, root) = test_root("maintenance-requeue");
         let mut live_roots = HashMap::new();
         live_roots.insert(root.clone(), RootMeta::new(Instant::now()));
-        let (due, deferred) = due_maintenance_jobs(&mut live_roots, usize::MAX, &HashSet::new());
+        let (due, deferred) = due_maintenance_jobs(&mut live_roots, None, &HashSet::new(), usize::MAX, &HashSet::new());
         assert_eq!(due.len(), INITIAL_MAINTENANCE_JOB_COUNT);
         assert!(due.iter().all(|(due_root, _)| due_root == &root));
         assert!(!deferred);
@@ -3841,7 +3890,7 @@ mod tests {
         );
         assert_eq!(meta.maintenance_queued_kinds.len(), 1);
 
-        let (requeued, deferred) = due_maintenance_jobs(&mut live_roots, 1, &HashSet::new());
+        let (requeued, deferred) = due_maintenance_jobs(&mut live_roots, None, &HashSet::new(), 1, &HashSet::new());
         assert_eq!(
             requeued,
             vec![(root.clone(), MaintenanceDrainKind::Watcher)]
@@ -3866,7 +3915,7 @@ mod tests {
         let (_dir, root) = test_root("maintenance-bind-requeue");
         let mut live_roots = HashMap::new();
         live_roots.insert(root.clone(), RootMeta::new(Instant::now()));
-        let (due, _) = due_maintenance_jobs(&mut live_roots, usize::MAX, &HashSet::new());
+        let (due, _) = due_maintenance_jobs(&mut live_roots, None, &HashSet::new(), usize::MAX, &HashSet::new());
         assert_eq!(due.len(), INITIAL_MAINTENANCE_JOB_COUNT);
 
         let meta = live_roots.get_mut(&root).unwrap();
@@ -3885,7 +3934,7 @@ mod tests {
         let (_dir, root) = test_root("maintenance-fatal");
         let mut live_roots = HashMap::new();
         live_roots.insert(root.clone(), RootMeta::new(Instant::now()));
-        let (due, _) = due_maintenance_jobs(&mut live_roots, usize::MAX, &HashSet::new());
+        let (due, _) = due_maintenance_jobs(&mut live_roots, None, &HashSet::new(), usize::MAX, &HashSet::new());
         assert_eq!(due.len(), INITIAL_MAINTENANCE_JOB_COUNT);
 
         let meta = live_roots.get_mut(&root).unwrap();

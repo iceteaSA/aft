@@ -777,6 +777,12 @@ impl LspManager {
         self.drain_events_bounded(usize::MAX)
     }
 
+    /// Whether LSP events are waiting to be drained. Cheap channel peek for
+    /// the maintenance scheduler's skip probe.
+    pub fn has_pending_events(&self) -> bool {
+        !self.event_rx.is_empty()
+    }
+
     pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
         let mut events = Vec::new();
         let mut diagnostics_changed = false;

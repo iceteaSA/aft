@@ -1845,6 +1845,73 @@ impl AppContext {
             .remove(&(root.to_path_buf(), session_id.to_string()));
     }
 
+    /// Cheap emptiness probes for the maintenance scheduler: a drain kind with
+    /// no pending work is not enqueued at all, so idle roots stop paying a
+    /// dispatch cycle per kind per tick. Every probe is lock-free or try-lock
+    /// (a contended source reports "maybe work" and the kind is enqueued —
+    /// fail-open keeps the skip an optimization, never a correctness gate).
+    pub fn watcher_drain_has_work(&self) -> bool {
+        let receiver_pending = self
+            .watcher_rx
+            .lock()
+            .as_ref()
+            .is_some_and(|rx| !rx.is_empty());
+        receiver_pending
+            || self
+                .watcher_drain_slice
+                .lock()
+                .as_ref()
+                .is_some_and(WatcherDrainSliceState::has_pending_work)
+    }
+
+    pub fn lsp_drain_has_work(&self) -> bool {
+        match self.lsp_manager.try_lock() {
+            Some(lsp) => lsp.has_pending_events(),
+            // Contended: the manager is busy, so events may be queuing.
+            None => true,
+        }
+    }
+
+    pub fn completion_drains_have_work(&self) -> bool {
+        let search_pending = self
+            .search_index_rx
+            .try_read()
+            .map(|rx| rx.as_ref().is_some_and(|rx| !rx.is_empty()))
+            .unwrap_or(true);
+        if search_pending {
+            return true;
+        }
+        if self
+            .callgraph_store_rx
+            .lock()
+            .as_ref()
+            .is_some_and(|rx| !rx.is_empty())
+        {
+            return true;
+        }
+        if self
+            .semantic_index_rx
+            .lock()
+            .as_ref()
+            .is_some_and(|rx| !rx.is_empty())
+        {
+            return true;
+        }
+        if self
+            .semantic_refresh_event_rx
+            .lock()
+            .as_ref()
+            .is_some_and(|rx| !rx.is_empty())
+        {
+            return true;
+        }
+        self.inspect_manager().has_pending_completions() || self.has_new_reuse_completions()
+    }
+
+    pub fn configure_tail_has_work(&self) -> bool {
+        !self.configure_maintenance_jobs.lock().is_empty() || !self.configure_warnings_rx.is_empty()
+    }
+
     pub(crate) fn enqueue_configure_maintenance(&self, job: ConfigureMaintenanceJob) {
         self.configure_maintenance_jobs.lock().push_back(job);
     }
@@ -2967,6 +3034,14 @@ impl AppContext {
     /// have completed since the last call, advancing the last-seen marker. The
     /// per-request inspect drain uses this to refresh the status bar after a
     /// background scan — those completions bypass `drain_completions`.
+    /// Peek variant of `take_new_reuse_completions`: reports whether new reuse
+    /// completions exist WITHOUT consuming the observation, so the maintenance
+    /// scheduler's skip probe cannot swallow a status-bar refresh.
+    pub fn has_new_reuse_completions(&self) -> bool {
+        self.inspect_manager.reuse_completion_count()
+            != self.last_seen_reuse_completions.load(Ordering::SeqCst)
+    }
+
     pub fn take_new_reuse_completions(&self) -> bool {
         let current = self.inspect_manager.reuse_completion_count();
         let previous = self

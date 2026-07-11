@@ -29,7 +29,14 @@ const MAX_INLINE_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2; // 4.5 MiB encoded p
 const MAX_INLINE_IMAGE_DIMENSION: u32 = 1024;
 const MAX_DECODE_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_IMAGE_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
-const IMAGE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Debug builds get a wider budget: unoptimized image codecs on large test
+/// fixtures routinely exceed 10s under parallel test load, and the timeout
+/// exists to bound production hangs, not to assert codec speed.
+const IMAGE_PROCESS_TIMEOUT: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(40)
+} else {
+    Duration::from_secs(10)
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageKind {

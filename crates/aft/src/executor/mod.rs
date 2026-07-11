@@ -37,8 +37,16 @@ pub enum Lane {
     /// then takes a short write gate for the install point.
     HeavyInit,
     /// Mutating work. Becomes a writer barrier at the actor queue head, drains
-    /// in-flight reads, and runs under the actor epoch write gate.
+    /// in-flight reads, and runs under the actor epoch write gate. Reserved for
+    /// configure and user-initiated tool mutations: background maintenance must
+    /// use `MaintenanceCommit` so it can never exclude interactive reads.
     Mutating,
+    /// Maintenance work that mutates only subsystem state behind that
+    /// subsystem's own lock (watcher/LSP drains, completed-build installs,
+    /// callgraph store writes). Runs under the actor epoch READ gate and
+    /// overlaps PureReads; serialized to one in-flight per actor so
+    /// maintenance cannot self-stack.
+    MaintenanceCommit,
 }
 
 /// Scheduler class used to keep deferrable maintenance from occupying the
@@ -801,6 +809,7 @@ struct ActorState {
     lsp_inflight: bool,
     actor_total_inflight: usize,
     writer_inflight: bool,
+    maintenance_commit_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
     deficit: isize,
     interactive: ClassQueues,
@@ -817,6 +826,7 @@ impl ActorState {
             lsp_inflight: false,
             actor_total_inflight: 0,
             writer_inflight: false,
+            maintenance_commit_inflight: false,
             mutating_inflight: None,
             deficit: 0,
             interactive: ClassQueues::new(),
@@ -893,6 +903,7 @@ struct ClassQueues {
     lsp_status: VecDeque<QueuedJob>,
     heavy_init: VecDeque<QueuedJob>,
     mutating: VecDeque<QueuedJob>,
+    maintenance_commit: VecDeque<QueuedJob>,
 }
 
 impl ClassQueues {
@@ -903,6 +914,7 @@ impl ClassQueues {
             lsp_status: VecDeque::new(),
             heavy_init: VecDeque::new(),
             mutating: VecDeque::new(),
+            maintenance_commit: VecDeque::new(),
         }
     }
 
@@ -966,6 +978,7 @@ impl ClassQueues {
         fail_queued_job_queue(&mut self.lsp_status);
         fail_queued_job_queue(&mut self.heavy_init);
         fail_queued_job_queue(&mut self.mutating);
+        fail_queued_job_queue(&mut self.maintenance_commit);
     }
 
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
@@ -985,6 +998,7 @@ impl ClassQueues {
             Lane::SerialLspStatus => &self.lsp_status,
             Lane::HeavyInit => &self.heavy_init,
             Lane::Mutating => &self.mutating,
+            Lane::MaintenanceCommit => &self.maintenance_commit,
         }
     }
 
@@ -994,6 +1008,7 @@ impl ClassQueues {
             Lane::SerialLspStatus => &mut self.lsp_status,
             Lane::HeavyInit => &mut self.heavy_init,
             Lane::Mutating => &mut self.mutating,
+            Lane::MaintenanceCommit => &mut self.maintenance_commit,
         }
     }
 }
@@ -1198,6 +1213,9 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
                 actor.writer_inflight = false;
                 actor.mutating_inflight = None;
             }
+            Lane::MaintenanceCommit => {
+                actor.maintenance_commit_inflight = false;
+            }
         }
 
         if panicked && lane == Lane::Mutating {
@@ -1368,7 +1386,8 @@ fn try_admit_actor(
         return None;
     }
 
-    let has_epoch_reader = actor.read_inflight > 0 || actor.lsp_inflight;
+    let has_epoch_reader =
+        actor.read_inflight > 0 || actor.lsp_inflight || actor.maintenance_commit_inflight;
     let actor_has_capacity = actor.actor_total_inflight < config.actor_cap;
     let runnable = match lane {
         Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_capacity,
@@ -1384,6 +1403,9 @@ fn try_admit_actor(
             }
         }
         Lane::Mutating => !has_epoch_reader && actor_has_capacity,
+        // Overlaps reads (epoch read gate); one in flight per actor so
+        // maintenance cannot stack; a running writer blocks it like reads.
+        Lane::MaintenanceCommit => !actor.maintenance_commit_inflight && actor_has_capacity,
     };
 
     if !runnable {
@@ -1413,6 +1435,10 @@ fn try_admit_actor(
         }
         Lane::Mutating => {
             actor.writer_inflight = true;
+            actor.actor_total_inflight += 1;
+        }
+        Lane::MaintenanceCommit => {
+            actor.maintenance_commit_inflight = true;
             actor.actor_total_inflight += 1;
         }
     }
@@ -1487,6 +1513,13 @@ fn run_lane_job(run_job: &mut RunJob) -> Response {
         }
         Lane::Mutating => {
             let _epoch = run_job.epoch.write();
+            job(&run_job.ctx)
+        }
+        Lane::MaintenanceCommit => {
+            // Same gate as reads: the job's mutations are protected by the
+            // touched subsystems' own locks, and holding only the read gate
+            // lets interactive PureReads overlap freely.
+            let _epoch = run_job.epoch.read();
             job(&run_job.ctx)
         }
     }
