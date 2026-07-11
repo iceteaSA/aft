@@ -2,17 +2,17 @@ use crate as aft;
 use crate::callgraph_store::CallGraphStore;
 use crate::context::{
     AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-    SemanticRefreshRequest,
+    SemanticRefreshRequest, WatcherDrainApplyPhase, WatcherDrainPhase, WatcherDrainSliceState,
 };
 use crate::log_ctx;
 use crate::lsp::client::LspEvent;
 use crate::protocol::PushFrame;
 use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DrainBatchOutcome {
@@ -20,7 +20,8 @@ pub struct DrainBatchOutcome {
     pub has_more: bool,
 }
 
-pub const WATCHER_EVENT_DRAIN_BATCH_CAP: usize = 256;
+pub const WATCHER_PATH_DRAIN_BATCH_CAP: usize = 2_048;
+pub const WATCHER_DRAIN_SLICE_BUDGET: Duration = Duration::from_millis(250);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
 
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
@@ -1255,287 +1256,212 @@ pub fn refresh_callgraph_store_for_watcher(
 /// coalescing; this drain only reacts to compact control events and surviving
 /// paths because the cache/index state below is not Send.
 pub fn drain_watcher_events(ctx: &AppContext) {
-    let _ = drain_watcher_events_bounded(ctx, usize::MAX);
+    loop {
+        let outcome = drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        if !outcome.has_more {
+            break;
+        }
+    }
 }
 
-pub fn drain_watcher_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
-    let mut changed: HashSet<std::path::PathBuf> = HashSet::new();
-    let mut ignore_file_changed = false;
-    let mut rescan_required = false;
-    let mut watcher_failed = None;
-    let mut root_deleted = false;
-    let mut outcome = DrainBatchOutcome::default();
+fn apply_watcher_path_phase(
+    paths: &mut VecDeque<PathBuf>,
+    remaining: &mut usize,
+    started: Instant,
+    mut apply: impl FnMut(&Path),
+) -> bool {
+    while *remaining > 0 {
+        let path = paths
+            .pop_front()
+            .expect("watcher apply phase tracks its remaining paths");
+        apply(&path);
+        paths.push_back(path);
+        *remaining -= 1;
+        if started.elapsed() >= WATCHER_DRAIN_SLICE_BUDGET {
+            return false;
+        }
+    }
+    true
+}
 
-    {
-        let rx_ref = ctx.watcher_rx().lock();
-        let rx = match rx_ref.as_ref() {
-            Some(rx) => rx,
-            None => {
-                ctx.tick_tier2_refresh_scheduler(0);
-                return outcome; // No watcher configured
-            }
-        };
+fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyPhase {
+    match stage {
+        WatcherDrainApplyPhase::PendingTier2 => WatcherDrainApplyPhase::PendingIndexes,
+        WatcherDrainApplyPhase::PendingIndexes => WatcherDrainApplyPhase::SymbolCache,
+        WatcherDrainApplyPhase::SymbolCache => WatcherDrainApplyPhase::Callgraph,
+        WatcherDrainApplyPhase::Callgraph => WatcherDrainApplyPhase::SearchIndex,
+        WatcherDrainApplyPhase::SearchIndex => WatcherDrainApplyPhase::SemanticIndex,
+        WatcherDrainApplyPhase::SemanticIndex => WatcherDrainApplyPhase::LspDiagnostics,
+        WatcherDrainApplyPhase::LspDiagnostics => WatcherDrainApplyPhase::Complete,
+        WatcherDrainApplyPhase::Complete => WatcherDrainApplyPhase::Complete,
+    }
+}
 
-        loop {
-            if outcome.processed >= max_events {
-                outcome.has_more = !rx.is_empty();
-                break;
-            }
-            match rx.try_recv() {
-                Ok(WatcherDispatchEvent::Paths(paths)) => {
-                    outcome.processed += 1;
-                    if !rescan_required {
-                        changed.extend(paths);
+fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, started: Instant) {
+    let WatcherDrainPhase::Apply {
+        mut stage,
+        mut paths,
+        mut remaining,
+        oversized_inline_batch,
+    } = std::mem::take(&mut state.phase)
+    else {
+        return;
+    };
+    let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
+    let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
+    let mut semantic_refresh_paths = std::mem::take(&mut state.semantic_refresh_paths);
+    let mut status_changed = state.status_changed;
+
+    loop {
+        let completed = match stage {
+            WatcherDrainApplyPhase::PendingTier2 => {
+                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                    if heavy_root_work_allowed && ctx.inspect_writer() {
+                        ctx.add_pending_tier2_paths([path.to_path_buf()]);
                     }
-                }
-                Ok(WatcherDispatchEvent::RescanRequired) => {
-                    outcome.processed += 1;
-                    rescan_required = true;
-                    changed.clear();
-                }
-                Ok(WatcherDispatchEvent::IgnoreRulesChanged { path }) => {
-                    outcome.processed += 1;
-                    ignore_file_changed = true;
-                    log::debug!(
-                        "watcher: ignore rules changed at {}, rebuilding matcher",
-                        path.display()
-                    );
-                    if !rescan_required {
-                        if ctx.heavy_root_work_allowed() {
-                            ctx.rebuild_gitignore();
-                        } else {
-                            ctx.clear_gitignore();
+                })
+            }
+            WatcherDrainApplyPhase::PendingIndexes => {
+                let search_build_in_progress = ctx
+                    .search_index_rx()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some();
+                let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
+                let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
+                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                    if heavy_root_work_allowed
+                        && !shared_artifacts_read_only
+                        && !oversized_inline_batch
+                        && search_build_in_progress
+                    {
+                        ctx.add_pending_search_index_paths([path.to_path_buf()]);
+                    }
+                    if heavy_root_work_allowed
+                        && !shared_artifacts_read_only
+                        && !oversized_inline_batch
+                        && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
+                        && watcher_path_is_semantic_source(path)
+                    {
+                        ctx.add_pending_semantic_index_paths([path.to_path_buf()]);
+                    }
+                })
+            }
+            WatcherDrainApplyPhase::SymbolCache => {
+                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                    if !shared_artifacts_read_only {
+                        if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
+                            symbol_cache.invalidate(path);
                         }
                     }
-                }
-                Ok(WatcherDispatchEvent::RootDeleted) => {
-                    outcome.processed += 1;
-                    root_deleted = true;
-                    break;
-                }
-                Ok(WatcherDispatchEvent::Error(error)) => {
-                    outcome.processed += 1;
-                    watcher_failed = Some(error);
-                    break;
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    watcher_failed = Some("watcher channel disconnected".to_string());
-                    break;
-                }
+                })
             }
-        }
-    }
-
-    crate::logging::note_watcher_events(outcome.processed);
-    let mut watcher_status_changed = false;
-    if root_deleted {
-        ctx.stop_watcher_runtime_in_background();
-        let _ = ctx.add_degraded_reason("project_root_deleted".to_string());
-        aft::slog_warn!(
-            "project root deleted; dropping watcher to avoid delete-storm: {:?}",
-            ctx.canonical_cache_root_opt()
-        );
-        watcher_status_changed = true;
-        changed.clear();
-        rescan_required = false;
-    } else if let Some(error) = watcher_failed {
-        ctx.stop_watcher_runtime_in_background();
-        let _ = ctx.add_degraded_reason("watcher_unavailable".to_string());
-        aft::slog_warn!(
-            "file watcher unavailable; continuing without live external-change invalidation: {}",
-            error
-        );
-        watcher_status_changed = true;
-        rescan_required = false;
-    }
-
-    let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
-    let mut status_changed = watcher_status_changed;
-    let mut project_corpus_refresh_requested = false;
-    if rescan_required {
-        crate::logging::note_watcher_overflow();
-        aft::slog_warn!("watcher overflow: forcing project rescan");
-        if heavy_root_work_allowed {
-            ctx.rebuild_gitignore();
-        } else {
-            ctx.clear_gitignore();
-        }
-        status_changed |= refresh_project_after_watcher_rescan(ctx);
-        project_corpus_refresh_requested = true;
-        changed.clear();
-    } else if ignore_file_changed {
-        status_changed |= refresh_corpus_after_ignore_change(ctx);
-        project_corpus_refresh_requested = true;
-    }
-
-    let scheduler_changed_path_count = if rescan_required {
-        aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1
-    } else if ignore_file_changed {
-        changed.len().max(1)
-    } else {
-        changed.len()
-    };
-    if changed.is_empty() {
-        if status_changed {
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
-        }
-        ctx.tick_tier2_refresh_scheduler(scheduler_changed_path_count);
-        return outcome;
-    }
-
-    if heavy_root_work_allowed && ctx.inspect_writer() {
-        ctx.add_pending_tier2_paths(changed.iter().cloned());
-    }
-
-    // A real source change makes the last-known Tier-2 counts stale until the
-    // next background scan reconciles them — surface that in the status bar
-    // immediately (the `~` marker) so the agent never reads them as live.
-    if ctx.mark_status_bar_tier2_stale() {
-        status_changed = true;
-    }
-
-    // A tsconfig change can shift which files `tsc` checks, which is the policy
-    // the status-bar E/W count filters on. Clear the membership cache wholesale
-    // so the next bar count re-resolves from disk (handles new nested configs,
-    // edited `extends` parents, and deletions without per-key bookkeeping).
-    if changed.iter().any(|path| watcher_path_is_tsconfig(path)) {
-        ctx.clear_tsconfig_membership_cache();
-        status_changed = true;
-    }
-
-    let oversized_inline_batch = changed.len() > WATCHER_BATCH_INLINE_CAP;
-    if oversized_inline_batch {
-        aft::slog_warn!(
-            "watcher batch of {} paths exceeds inline cap {}; scheduling corpus refresh",
-            changed.len(),
-            WATCHER_BATCH_INLINE_CAP
-        );
-        if !project_corpus_refresh_requested {
-            status_changed |= refresh_project_corpus(ctx, "oversized watcher batch", false);
-        }
-    }
-
-    let search_build_in_progress = {
-        let search_index_rx = ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        search_index_rx.is_some()
-    };
-    if heavy_root_work_allowed
-        && !ctx.shared_artifacts_read_only()
-        && !oversized_inline_batch
-        && search_build_in_progress
-    {
-        ctx.add_pending_search_index_paths(changed.iter().cloned());
-    }
-    let semantic_source_paths = changed
-        .iter()
-        .filter(|path| aft::runtime_drain::watcher_path_is_semantic_source(path))
-        .cloned()
-        .collect::<Vec<_>>();
-    let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
-    let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
-    if heavy_root_work_allowed
-        && !ctx.shared_artifacts_read_only()
-        && !oversized_inline_batch
-        && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
-        && !semantic_source_paths.is_empty()
-    {
-        ctx.add_pending_semantic_index_paths(semantic_source_paths.clone());
-    }
-
-    if !ctx.shared_artifacts_read_only() {
-        if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
-            for path in &changed {
-                symbol_cache.invalidate(path);
-            }
-        }
-    }
-
-    let mut semantic_refresh_paths = Vec::new();
-    if heavy_root_work_allowed && !oversized_inline_batch {
-        refresh_callgraph_store_for_watcher(ctx, &changed);
-
-        if !ctx.shared_artifacts_read_only() {
-            let mut index_ref = ctx
-                .search_index()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(index) = index_ref.as_mut() {
-                for path in &changed {
-                    if path.exists() {
-                        index.update_file(path);
-                    } else {
-                        index.remove_file(path);
+            WatcherDrainApplyPhase::Callgraph => {
+                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                    if heavy_root_work_allowed && !oversized_inline_batch {
+                        refresh_callgraph_store_for_watcher(
+                            ctx,
+                            &HashSet::from([path.to_path_buf()]),
+                        );
                     }
-                }
+                })
             }
-        }
-
-        let stale_paths = if ctx.shared_artifacts_read_only() {
-            Vec::new()
-        } else {
-            let mut semantic_index_ref = ctx
-                .semantic_index()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut stale_paths = Vec::new();
-            if let Some(index) = semantic_index_ref.as_mut() {
-                for path in &semantic_source_paths {
-                    index.invalidate_file(path);
-                    stale_paths.push(path.clone());
-                }
+            WatcherDrainApplyPhase::SearchIndex => {
+                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                    if heavy_root_work_allowed
+                        && !shared_artifacts_read_only
+                        && !oversized_inline_batch
+                    {
+                        let mut index_ref = ctx
+                            .search_index()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(index) = index_ref.as_mut() {
+                            if path.exists() {
+                                index.update_file(path);
+                            } else {
+                                index.remove_file(path);
+                            }
+                        }
+                    }
+                })
             }
-            stale_paths
+            WatcherDrainApplyPhase::SemanticIndex => {
+                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                    if !heavy_root_work_allowed
+                        || shared_artifacts_read_only
+                        || oversized_inline_batch
+                        || !watcher_path_is_semantic_source(path)
+                    {
+                        return;
+                    }
+                    let invalidated = {
+                        let mut semantic_index_ref = ctx
+                            .semantic_index()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        semantic_index_ref.as_mut().is_some_and(|index| {
+                            index.invalidate_file(path);
+                            true
+                        })
+                    };
+                    if invalidated {
+                        let mut status = ctx
+                            .semantic_index_status()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                            status.add_refreshing_file(path.to_path_buf());
+                            semantic_refresh_paths.push(path.to_path_buf());
+                            status_changed = true;
+                        }
+                    }
+                })
+            }
+            WatcherDrainApplyPhase::LspDiagnostics => {
+                apply_watcher_path_phase(&mut paths, &mut remaining, started, |path| {
+                    if !path.exists() {
+                        status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
+                        return;
+                    }
+                    let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
+                    status_changed |= stale.changed;
+                    if stale.had_entries {
+                        ctx.lsp_resync_changed_file_for_diagnostics(path);
+                    }
+                })
+            }
+            WatcherDrainApplyPhase::Complete => true,
         };
-        if !stale_paths.is_empty() {
-            let mut status = ctx
-                .semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                for path in &stale_paths {
-                    status.add_refreshing_file(path.clone());
-                }
-                semantic_refresh_paths = stale_paths;
-                status_changed = true;
-            }
-        }
-    }
 
-    // Keep LSP diagnostics honest for filesystem changes that bypass AFT's
-    // write/edit tools. Deleted files cannot be republished by a server, so we
-    // still evict them. Existing files with warm diagnostics are marked stale:
-    // stale entries stay in the store for pull resultIds/server coverage, but
-    // status-bar and inspect warm reads hide them until a publish or pull proves
-    // they match the current file contents.
-    //
-    // Not gated on the trigram `SOURCE_EXTENSIONS` set: any registered LSP
-    // server (Bash, YAML, Solidity, Vue, C/C++, custom servers, …) can publish
-    // diagnostics for files outside that set. The store checks are cheap no-ops
-    // for paths with no diagnostics.
-    let mut lsp_resync_paths = Vec::new();
-    for path in &changed {
-        if !path.exists() {
-            if ctx.lsp_clear_diagnostics_for_file(path) {
-                status_changed = true;
-            }
-            continue;
+        if !completed {
+            state.status_changed = status_changed;
+            state.semantic_refresh_paths = semantic_refresh_paths;
+            state.phase = WatcherDrainPhase::Apply {
+                stage,
+                paths,
+                remaining,
+                oversized_inline_batch,
+            };
+            return;
         }
 
-        let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
-        if stale.changed {
-            status_changed = true;
+        if stage == WatcherDrainApplyPhase::Complete {
+            break;
         }
-        if stale.had_entries {
-            lsp_resync_paths.push(path.clone());
+        stage = next_watcher_apply_phase(stage);
+        remaining = paths.len();
+        if started.elapsed() >= WATCHER_DRAIN_SLICE_BUDGET {
+            state.status_changed = status_changed;
+            state.semantic_refresh_paths = semantic_refresh_paths;
+            state.phase = WatcherDrainPhase::Apply {
+                stage,
+                paths,
+                remaining,
+                oversized_inline_batch,
+            };
+            return;
         }
-    }
-
-    for path in &lsp_resync_paths {
-        ctx.lsp_resync_changed_file_for_diagnostics(path);
     }
 
     if !semantic_refresh_paths.is_empty() {
@@ -1562,11 +1488,232 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_events: usize) -> Drai
         }
     }
 
-    aft::slog_info!("invalidated {} files", changed.len());
+    aft::slog_info!("invalidated {} files", paths.len());
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
-    ctx.tick_tier2_refresh_scheduler(scheduler_changed_path_count);
+    ctx.tick_tier2_refresh_scheduler(state.scheduler_changed_path_count);
+    state.phase = WatcherDrainPhase::Collect;
+    state.status_changed = false;
+    state.scheduler_changed_path_count = 0;
+    state.semantic_refresh_paths.clear();
+}
+
+pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
+    let started = Instant::now();
+    let configure_generation = ctx.configure_generation();
+    let mut state = ctx
+        .watcher_drain_slice()
+        .lock()
+        .take()
+        .filter(|state| state.configure_generation == configure_generation)
+        .unwrap_or_else(|| WatcherDrainSliceState::new(configure_generation));
+    let mut outcome = DrainBatchOutcome::default();
+    let mut dispatch_events_received = 0usize;
+    let mut watcher_failed = None;
+    let mut root_deleted = false;
+
+    {
+        let rx_ref = ctx.watcher_rx().lock();
+        let Some(rx) = rx_ref.as_ref() else {
+            ctx.tick_tier2_refresh_scheduler(0);
+            return outcome;
+        };
+
+        loop {
+            match rx.try_recv() {
+                Ok(WatcherDispatchEvent::Paths(paths)) => {
+                    dispatch_events_received += 1;
+                    if !state.rescan_required {
+                        state.pending_paths.extend(paths);
+                    }
+                }
+                Ok(WatcherDispatchEvent::RescanRequired) => {
+                    dispatch_events_received += 1;
+                    state.rescan_required = true;
+                    state.pending_paths.clear();
+                    state.phase = WatcherDrainPhase::Collect;
+                    state.semantic_refresh_paths.clear();
+                    state.scheduler_changed_path_count = 0;
+                }
+                Ok(WatcherDispatchEvent::IgnoreRulesChanged { path }) => {
+                    dispatch_events_received += 1;
+                    state.ignore_changed = true;
+                    log::debug!(
+                        "watcher: ignore rules changed at {}, rebuilding matcher",
+                        path.display()
+                    );
+                    if !state.rescan_required {
+                        if ctx.heavy_root_work_allowed() {
+                            ctx.rebuild_gitignore();
+                        } else {
+                            ctx.clear_gitignore();
+                        }
+                    }
+                }
+                Ok(WatcherDispatchEvent::RootDeleted) => {
+                    dispatch_events_received += 1;
+                    root_deleted = true;
+                    break;
+                }
+                Ok(WatcherDispatchEvent::Error(error)) => {
+                    dispatch_events_received += 1;
+                    watcher_failed = Some(error);
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    watcher_failed = Some("watcher channel disconnected".to_string());
+                    break;
+                }
+            }
+            if started.elapsed() >= WATCHER_DRAIN_SLICE_BUDGET {
+                break;
+            }
+        }
+    }
+
+    crate::logging::note_watcher_events(dispatch_events_received);
+    let receiver_has_more_after_receive = ctx
+        .watcher_rx()
+        .lock()
+        .as_ref()
+        .is_some_and(|rx| !rx.is_empty());
+
+    if root_deleted {
+        ctx.stop_watcher_runtime_in_background();
+        let _ = ctx.add_degraded_reason("project_root_deleted".to_string());
+        aft::slog_warn!(
+            "project root deleted; dropping watcher to avoid delete-storm: {:?}",
+            ctx.canonical_cache_root_opt()
+        );
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        return outcome;
+    }
+    if let Some(error) = watcher_failed {
+        ctx.stop_watcher_runtime_in_background();
+        let _ = ctx.add_degraded_reason("watcher_unavailable".to_string());
+        aft::slog_warn!(
+            "file watcher unavailable; continuing without live external-change invalidation: {}",
+            error
+        );
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        return outcome;
+    }
+
+    if state.rescan_required && receiver_has_more_after_receive {
+        outcome.has_more = true;
+        *ctx.watcher_drain_slice().lock() = Some(state);
+        return outcome;
+    }
+
+    if state.rescan_required {
+        crate::logging::note_watcher_overflow();
+        aft::slog_warn!("watcher overflow: forcing project rescan");
+        if ctx.heavy_root_work_allowed() {
+            ctx.rebuild_gitignore();
+        } else {
+            ctx.clear_gitignore();
+        }
+        state.status_changed |= refresh_project_after_watcher_rescan(ctx);
+        state.scheduler_changed_path_count =
+            aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1;
+        if state.status_changed {
+            ctx.status_emitter().signal(ctx.build_status_snapshot());
+        }
+        ctx.tick_tier2_refresh_scheduler(state.scheduler_changed_path_count);
+        state.rescan_required = false;
+        state.ignore_changed = false;
+        state.status_changed = false;
+        state.scheduler_changed_path_count = 0;
+    } else if matches!(state.phase, WatcherDrainPhase::Collect) {
+        let ignore_changed = state.ignore_changed;
+        let mut project_corpus_refresh_requested = false;
+        if ignore_changed {
+            state.status_changed |= refresh_corpus_after_ignore_change(ctx);
+            project_corpus_refresh_requested = true;
+            state.ignore_changed = false;
+        }
+
+        if max_paths > 0 && !state.pending_paths.is_empty() {
+            let mut unique = HashSet::new();
+            let mut paths = VecDeque::new();
+            while outcome.processed < max_paths {
+                let Some(path) = state.pending_paths.pop_front() else {
+                    break;
+                };
+                outcome.processed += 1;
+                if unique.insert(path.clone()) {
+                    paths.push_back(path);
+                }
+            }
+            crate::logging::note_drain_paths(outcome.processed);
+
+            if paths.is_empty() {
+                if state.status_changed {
+                    ctx.status_emitter().signal(ctx.build_status_snapshot());
+                }
+                ctx.tick_tier2_refresh_scheduler(usize::from(ignore_changed));
+                state.status_changed = false;
+            } else {
+                state.path_slice_count += 1;
+                state.scheduler_changed_path_count = if ignore_changed {
+                    paths.len().max(1)
+                } else {
+                    paths.len()
+                };
+                if ctx.mark_status_bar_tier2_stale() {
+                    state.status_changed = true;
+                }
+                if paths.iter().any(|path| watcher_path_is_tsconfig(path)) {
+                    ctx.clear_tsconfig_membership_cache();
+                    state.status_changed = true;
+                }
+
+                let oversized_inline_batch = paths.len() > WATCHER_BATCH_INLINE_CAP;
+                if oversized_inline_batch {
+                    aft::slog_warn!(
+                        "watcher batch of {} paths exceeds inline cap {}; scheduling corpus refresh",
+                        paths.len(),
+                        WATCHER_BATCH_INLINE_CAP
+                    );
+                    if !project_corpus_refresh_requested {
+                        state.status_changed |=
+                            refresh_project_corpus(ctx, "oversized watcher batch", false);
+                    }
+                }
+                let remaining = paths.len();
+                state.phase = WatcherDrainPhase::Apply {
+                    stage: WatcherDrainApplyPhase::PendingTier2,
+                    paths,
+                    remaining,
+                    oversized_inline_batch,
+                };
+            }
+        } else if ignore_changed {
+            if state.status_changed {
+                ctx.status_emitter().signal(ctx.build_status_snapshot());
+            }
+            ctx.tick_tier2_refresh_scheduler(1);
+            state.status_changed = false;
+        }
+    }
+
+    if matches!(state.phase, WatcherDrainPhase::Apply { .. })
+        && started.elapsed() < WATCHER_DRAIN_SLICE_BUDGET
+    {
+        apply_watcher_slice(ctx, &mut state, started);
+    }
+
+    let receiver_has_more = ctx
+        .watcher_rx()
+        .lock()
+        .as_ref()
+        .is_some_and(|rx| !rx.is_empty());
+    outcome.has_more = state.has_pending_work() || receiver_has_more;
+    if state.configure_generation == ctx.configure_generation() {
+        *ctx.watcher_drain_slice().lock() = Some(state);
+    }
     outcome
 }
 
@@ -1773,5 +1920,100 @@ mod tests {
 
         assert_eq!(processed, total);
         assert_eq!(ctx.pending_tier2_paths().len(), total);
+    }
+}
+
+#[cfg(test)]
+mod watcher_slice_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::context::{default_language_provider_factory, AppContext};
+
+    fn context_with_watcher(
+        root: &Path,
+    ) -> (AppContext, crossbeam_channel::Sender<WatcherDispatchEvent>) {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        ctx.update_config(|config| config.project_root = Some(root.to_path_buf()));
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        (ctx, tx)
+    }
+
+    #[test]
+    fn watcher_single_dispatch_event_is_sliced_by_path_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(temp.path());
+        let path_count = 1_024;
+        let path_cap = 256;
+        tx.send(WatcherDispatchEvent::Paths(
+            (0..path_count)
+                .map(|index| temp.path().join(format!("single-event-{index}.txt")))
+                .collect(),
+        ))
+        .unwrap();
+
+        let mut slices = 0;
+        let mut processed = 0;
+        loop {
+            let outcome = drain_watcher_events_bounded(&ctx, path_cap);
+            slices += 1;
+            processed += outcome.processed;
+            assert!(outcome.processed <= path_cap);
+            if !outcome.has_more {
+                break;
+            }
+            assert!(slices < 8, "single dispatch event did not converge");
+        }
+
+        assert_eq!(processed, path_count);
+        assert_eq!(slices, 4);
+        assert_eq!(ctx.pending_tier2_paths().len(), path_count);
+    }
+
+    #[test]
+    fn watcher_rescan_supersedes_pending_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(temp.path());
+        tx.send(WatcherDispatchEvent::Paths(
+            (0..5)
+                .map(|index| temp.path().join(format!("before-rescan-{index}.txt")))
+                .collect(),
+        ))
+        .unwrap();
+        let first = drain_watcher_events_bounded(&ctx, 2);
+        assert_eq!(first.processed, 2);
+        assert!(first.has_more);
+        assert_eq!(ctx.watcher_drain_pending_path_count(), 3);
+
+        tx.send(WatcherDispatchEvent::RescanRequired).unwrap();
+        let second = drain_watcher_events_bounded(&ctx, 2);
+
+        assert_eq!(second.processed, 0);
+        assert!(!second.has_more);
+        assert_eq!(ctx.watcher_drain_pending_path_count(), 0);
+    }
+
+    #[test]
+    fn watcher_generation_change_discards_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(temp.path());
+        tx.send(WatcherDispatchEvent::Paths(
+            (0..5)
+                .map(|index| temp.path().join(format!("old-generation-{index}.txt")))
+                .collect(),
+        ))
+        .unwrap();
+        let first = drain_watcher_events_bounded(&ctx, 2);
+        assert_eq!(first.processed, 2);
+        assert!(first.has_more);
+
+        ctx.advance_configure_generation();
+        let second = drain_watcher_events_bounded(&ctx, 2);
+
+        assert_eq!(second.processed, 0);
+        assert!(!second.has_more);
+        assert_eq!(ctx.watcher_drain_pending_path_count(), 0);
+        assert_eq!(ctx.pending_tier2_paths().len(), 2);
     }
 }

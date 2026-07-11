@@ -48,6 +48,9 @@ const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(700 * DEBUG_BOUND_
 const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
 const CONCURRENCY_SCENARIO_BOUND: Duration =
     Duration::from_secs(10 * DEBUG_BOUND_MULTIPLIER as u64);
+const WATCHER_SINGLE_EVENT_BOUND: Duration =
+    Duration::from_secs(10 * DEBUG_BOUND_MULTIPLIER as u64);
+const WATCHER_SLICE_READ_BOUND: Duration = Duration::from_secs(2 * DEBUG_BOUND_MULTIPLIER as u64);
 const WATCHER_DISPATCH_PATH_CAP: usize = 1_024;
 const WATCHER_BACKLOG_EVENTS: usize = 768;
 
@@ -277,6 +280,7 @@ fn inject_dispatch_events(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         tx.send(dispatch).expect("inject synthetic watcher event");
     }
+    ctx.stop_watcher_runtime();
     *ctx.watcher_rx().lock() = Some(rx);
     SYNTHETIC_WATCHER_SENDERS
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -340,8 +344,15 @@ fn watcher_pending_response(req: &RawRequest, ctx: &AppContext) -> Response {
         .watcher_rx()
         .lock()
         .as_ref()
-        .map_or(0, crossbeam_channel::Receiver::len);
-    Response::success(&req.id, json!({ "pending": pending }))
+        .map_or(0, crossbeam_channel::Receiver::len)
+        + ctx.watcher_drain_pending_path_count();
+    Response::success(
+        &req.id,
+        json!({
+            "pending": pending,
+            "slices": ctx.watcher_drain_path_slice_count(),
+        }),
+    )
 }
 
 fn configure_sleep_delay(req: &RawRequest) -> Option<Duration> {
@@ -369,6 +380,18 @@ fn max_paths_single_event() {
         "max_paths_single_event",
         Duration::from_secs(30),
         drive_max_paths_single_event,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+#[test]
+#[ignore = "quiet-box latency harness; run explicitly with --ignored --nocapture"]
+fn max_paths_single_event_benchmark() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "max_paths_single_event_benchmark",
+        Duration::from_secs(30),
+        drive_max_paths_single_event_with_report,
         |_, _, _| {},
         storm_dispatch,
     );
@@ -448,6 +471,14 @@ fn overflow_control() {
 }
 
 async fn drive_max_paths_single_event(input: FakeDaemonInput) {
+    drive_max_paths_single_event_inner(input, false).await;
+}
+
+async fn drive_max_paths_single_event_with_report(input: FakeDaemonInput) {
+    drive_max_paths_single_event_inner(input, true).await;
+}
+
+async fn drive_max_paths_single_event_inner(input: FakeDaemonInput, report: bool) {
     let session = subc_bridge_test::open_fake_daemon_session(input).await;
     let root = session.root1.clone();
     prepare_storm_root(&root);
@@ -481,13 +512,47 @@ async fn drive_max_paths_single_event(input: FakeDaemonInput) {
         injected.get("paths").and_then(Value::as_u64),
         Some(WATCHER_DISPATCH_PATH_CAP as u64)
     );
+
+    corr += 1;
+    let read_started = Instant::now();
+    send_tool(
+        &tx,
+        1,
+        corr,
+        "read",
+        json!({ "filePath": "README.md", "limit": 20 }),
+    );
+    expect_tool_response(&mut rx, corr, WATCHER_SLICE_READ_BOUND).await;
+    let read_elapsed = read_started.elapsed();
+    assert!(
+        read_elapsed <= WATCHER_SLICE_READ_BOUND,
+        "read queued during watcher drain took {read_elapsed:?}"
+    );
+
     wait_for_watcher_empty(&tx, &mut rx, &mut corr).await;
+    let slices_after = watcher_progress(&tx, &mut rx, &mut corr)
+        .await
+        .get("slices")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let slice_count = slices_after;
+    assert_eq!(
+        slice_count, 1,
+        "1,024 paths must fit one 2,048-path watcher slice"
+    );
     for marker in ["max_new_0000", "max_new_0512", "max_new_1023"] {
         wait_for_grep_total(&tx, &mut rx, &mut corr, marker, 1).await;
     }
     let elapsed = started.elapsed();
-    // I-B: Once maintenance drains are sliced, replace this log with a latency assertion.
-    eprintln!("max_paths_single_event wall time: {elapsed:?}");
+    assert!(
+        elapsed <= WATCHER_SINGLE_EVENT_BOUND,
+        "1,024-path watcher event took {elapsed:?}; mid-drain read took {read_elapsed:?}"
+    );
+    if report {
+        eprintln!(
+            "max_paths_single_event: slices={slice_count} total={elapsed:?} mid_drain_read={read_elapsed:?}"
+        );
+    }
     send_goodbye_and_wait(&tx).await;
 }
 
@@ -1629,14 +1694,22 @@ async fn collect_tool_responses(
     }
 }
 
+async fn watcher_progress(
+    tx: &mpsc::UnboundedSender<Frame>,
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: &mut u64,
+) -> Value {
+    *corr += 1;
+    send_tool(tx, 1, *corr, "subc_storm_watcher_pending", json!({}));
+    expect_tool_response(rx, *corr, TOOL_BOUND).await
+}
+
 async fn watcher_pending(
     tx: &mpsc::UnboundedSender<Frame>,
     rx: &mut mpsc::UnboundedReceiver<Frame>,
     corr: &mut u64,
 ) -> usize {
-    *corr += 1;
-    send_tool(tx, 1, *corr, "subc_storm_watcher_pending", json!({}));
-    expect_tool_response(rx, *corr, TOOL_BOUND)
+    watcher_progress(tx, rx, corr)
         .await
         .get("pending")
         .and_then(Value::as_u64)

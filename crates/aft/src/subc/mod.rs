@@ -3111,7 +3111,7 @@ fn submit_maintenance_job(
                 MaintenanceDrainKind::Watcher => {
                     let drained = runtime_drain::drain_watcher_events_bounded(
                         ctx,
-                        runtime_drain::WATCHER_EVENT_DRAIN_BATCH_CAP,
+                        runtime_drain::WATCHER_PATH_DRAIN_BATCH_CAP,
                     );
                     MaintenanceJobOutcome {
                         empty_bg_sessions: Vec::new(),

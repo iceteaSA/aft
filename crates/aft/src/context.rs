@@ -156,6 +156,67 @@ struct ConfigureWarmState {
     key: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WatcherDrainApplyPhase {
+    #[default]
+    PendingTier2,
+    PendingIndexes,
+    SymbolCache,
+    Callgraph,
+    SearchIndex,
+    SemanticIndex,
+    LspDiagnostics,
+    Complete,
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum WatcherDrainPhase {
+    #[default]
+    Collect,
+    Apply {
+        stage: WatcherDrainApplyPhase,
+        paths: VecDeque<PathBuf>,
+        remaining: usize,
+        oversized_inline_batch: bool,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct WatcherDrainSliceState {
+    pub(crate) configure_generation: u64,
+    pub(crate) phase: WatcherDrainPhase,
+    pub(crate) pending_paths: VecDeque<PathBuf>,
+    pub(crate) ignore_changed: bool,
+    pub(crate) rescan_required: bool,
+    pub(crate) status_changed: bool,
+    pub(crate) scheduler_changed_path_count: usize,
+    pub(crate) semantic_refresh_paths: Vec<PathBuf>,
+    pub(crate) path_slice_count: usize,
+}
+
+impl WatcherDrainSliceState {
+    pub(crate) fn new(configure_generation: u64) -> Self {
+        Self {
+            configure_generation,
+            phase: WatcherDrainPhase::Collect,
+            pending_paths: VecDeque::new(),
+            ignore_changed: false,
+            rescan_required: false,
+            status_changed: false,
+            scheduler_changed_path_count: 0,
+            semantic_refresh_paths: Vec::new(),
+            path_slice_count: 0,
+        }
+    }
+
+    pub(crate) fn has_pending_work(&self) -> bool {
+        !matches!(self.phase, WatcherDrainPhase::Collect)
+            || !self.pending_paths.is_empty()
+            || self.ignore_changed
+            || self.rescan_required
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) generation: u64,
@@ -855,6 +916,7 @@ pub struct AppContext {
     semantic_embedding_model: parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>,
     watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
+    watcher_drain_slice: parking_lot::Mutex<Option<WatcherDrainSliceState>>,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
     lsp_manager: parking_lot::Mutex<LspManager>,
     configure_generation: Arc<AtomicU64>,
@@ -1077,6 +1139,7 @@ impl AppContext {
             semantic_embedding_model: parking_lot::Mutex::new(None),
             watcher: parking_lot::Mutex::new(None),
             watcher_rx: parking_lot::Mutex::new(None),
+            watcher_drain_slice: parking_lot::Mutex::new(None),
             watcher_thread: parking_lot::Mutex::new(None),
             lsp_manager: parking_lot::Mutex::new(lsp_manager),
             configure_generation: Arc::new(AtomicU64::new(0)),
@@ -3281,6 +3344,32 @@ impl AppContext {
         &self.watcher_rx
     }
 
+    /// Access continuation state for the bounded watcher drain.
+    pub(crate) fn watcher_drain_slice(
+        &self,
+    ) -> &parking_lot::Mutex<Option<WatcherDrainSliceState>> {
+        &self.watcher_drain_slice
+    }
+
+    /// Include partially consumed dispatch events when reporting drain backlog.
+    pub fn watcher_drain_pending_path_count(&self) -> usize {
+        self.watcher_drain_slice.lock().as_ref().map_or(0, |state| {
+            let active_paths = match &state.phase {
+                WatcherDrainPhase::Collect => 0,
+                WatcherDrainPhase::Apply { paths, .. } => paths.len(),
+            };
+            active_paths + state.pending_paths.len()
+        })
+    }
+
+    /// Number of path-budgeted watcher batches since this runtime was installed.
+    pub fn watcher_drain_path_slice_count(&self) -> usize {
+        self.watcher_drain_slice
+            .lock()
+            .as_ref()
+            .map_or(0, |state| state.path_slice_count)
+    }
+
     /// Install a watcher filter thread and its dispatch receiver. The caller
     /// must have stopped any previous watcher runtime first.
     pub fn install_watcher_runtime(
@@ -3296,6 +3385,7 @@ impl AppContext {
             self.app.watcher_started();
         }
         *self.watcher_rx.lock() = Some(rx);
+        *self.watcher_drain_slice.lock() = None;
     }
 
     /// Stop the watcher filter thread (if any) and clear the dispatch receiver.
@@ -3306,6 +3396,7 @@ impl AppContext {
             runtime.shutdown_and_join();
         }
         *self.watcher_rx.lock() = None;
+        *self.watcher_drain_slice.lock() = None;
         *self.watcher.lock() = None;
     }
 
@@ -3319,6 +3410,7 @@ impl AppContext {
             std::thread::spawn(move || runtime.shutdown_and_join());
         }
         *self.watcher_rx.lock() = None;
+        *self.watcher_drain_slice.lock() = None;
         *self.watcher.lock() = None;
     }
 

@@ -361,6 +361,7 @@ fn process_is_alive(pid: u32) -> bool {
 #[derive(Default)]
 struct PerfMetrics {
     watcher_ingested: AtomicU64,
+    watcher_paths: AtomicU64,
     watcher_dropped: AtomicU64,
     drain_slices: AtomicU64,
     semantic_collects: AtomicU64,
@@ -428,6 +429,12 @@ pub fn sync_storage_root(storage_root: PathBuf) {
 /// Called by `drain_watcher_events_bounded` for dispatch events actually received.
 pub fn note_watcher_events(count: usize) {
     PERF.watcher_ingested
+        .fetch_add(count as u64, Ordering::Relaxed);
+}
+
+/// Called when a watcher drain slice takes paths from dispatch continuation state.
+pub fn note_drain_paths(count: usize) {
+    PERF.watcher_paths
         .fetch_add(count as u64, Ordering::Relaxed);
 }
 
@@ -528,6 +535,7 @@ pub fn perf_tick(executor: Option<&Executor>) {
     }
 
     let watcher_ingested = PERF.watcher_ingested.swap(0, Ordering::Relaxed);
+    let watcher_paths = PERF.watcher_paths.swap(0, Ordering::Relaxed);
     let watcher_dropped = PERF.watcher_dropped.swap(0, Ordering::Relaxed);
     let drain_slices = PERF.drain_slices.swap(0, Ordering::Relaxed);
     let semantic_collects = PERF.semantic_collects.swap(0, Ordering::Relaxed);
@@ -549,6 +557,7 @@ pub fn perf_tick(executor: Option<&Executor>) {
             || sample.maintenance_queued > 0
     });
     let active = watcher_ingested > 0
+        || watcher_paths > 0
         || watcher_dropped > 0
         || drain_slices > 0
         || semantic_collects > 0
@@ -573,8 +582,9 @@ pub fn perf_tick(executor: Option<&Executor>) {
     };
     let sample = sample.unwrap_or_default();
     crate::slog_info!(
-        "perf tick: watcher={{ingested:{},dropped:{}}} drains={} tier2=[{}] semantic={{collects:{},files:{},chunks:{},ms:{}}} callgraph_invalidations={} executor_completed={{interactive:{},maintenance:{}}} oldest_queued_ms={{interactive:{},maintenance:{}}} file_log_dropped={}",
+        "perf tick: watcher={{ingested:{},paths:{},dropped:{}}} drains={} tier2=[{}] semantic={{collects:{},files:{},chunks:{},ms:{}}} callgraph_invalidations={} executor_completed={{interactive:{},maintenance:{}}} oldest_queued_ms={{interactive:{},maintenance:{}}} file_log_dropped={}",
         watcher_ingested,
+        watcher_paths,
         watcher_dropped,
         drain_slices,
         tier2_summary,
