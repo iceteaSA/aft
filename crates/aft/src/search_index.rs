@@ -1249,24 +1249,51 @@ impl SearchIndex {
         self.ready = ready;
     }
 
-    pub(crate) fn verify_against_disk(&mut self, current_head: Option<String>) {
+    pub(crate) fn verify_against_disk_with_strategy(
+        &mut self,
+        current_head: Option<String>,
+        verify_strategy: cache_freshness::VerifyStrategy,
+    ) -> bool {
         self.git_head = current_head;
-        verify_file_mtimes(self);
+        let changed = verify_file_mtimes(self, verify_strategy);
         self.ready = true;
+        changed
     }
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn verify_against_disk_for_debug(&mut self, current_head: Option<String>) {
-        self.verify_against_disk(current_head);
+        let _ = self.verify_against_disk_with_strategy(
+            current_head,
+            cache_freshness::VerifyStrategy::Strict,
+        );
     }
 
+    #[cfg(test)]
     pub(crate) fn rebuild_or_refresh(
         root: &Path,
         max_file_size: u64,
         current_head: Option<String>,
         baseline: Option<SearchIndex>,
         cache_dir: Option<&Path>,
+    ) -> Self {
+        Self::rebuild_or_refresh_with_strategy(
+            root,
+            max_file_size,
+            current_head,
+            baseline,
+            cache_dir,
+            cache_freshness::VerifyStrategy::Strict,
+        )
+    }
+
+    pub(crate) fn rebuild_or_refresh_with_strategy(
+        root: &Path,
+        max_file_size: u64,
+        current_head: Option<String>,
+        baseline: Option<SearchIndex>,
+        cache_dir: Option<&Path>,
+        verify_strategy: cache_freshness::VerifyStrategy,
     ) -> Self {
         if let Some(mut baseline) = baseline {
             baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -1290,7 +1317,7 @@ impl SearchIndex {
                 // fingerprint so unchanged trees reuse the disk cache instead of
                 // rebuilding every configure.
                 baseline.git_head = current_head;
-                verify_file_mtimes(&mut baseline);
+                let _ = verify_file_mtimes(&mut baseline, verify_strategy);
                 baseline.ready = true;
                 return baseline;
             }
@@ -1301,7 +1328,7 @@ impl SearchIndex {
                 let project_root = baseline.project_root.clone();
                 if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
                     baseline.git_head = Some(current);
-                    verify_file_mtimes(&mut baseline);
+                    let _ = verify_file_mtimes(&mut baseline, verify_strategy);
                     baseline.ready = true;
                     return baseline;
                 }
@@ -4168,12 +4195,16 @@ fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
 
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
 /// since the index was last written. Also detect new files and deleted files.
-fn verify_file_mtimes(index: &mut SearchIndex) {
+fn verify_file_mtimes(
+    index: &mut SearchIndex,
+    verify_strategy: cache_freshness::VerifyStrategy,
+) -> bool {
     let filters = PathFilters::default();
     let current_files = walk_project_files(&index.project_root, &filters);
     let current_file_set: HashSet<PathBuf> = current_files.iter().cloned().collect();
     let mut stale_paths = Vec::new();
     let mut removed_paths = Vec::new();
+    let mut changed = false;
 
     for entry in Arc::make_mut(&mut index.files).iter_mut() {
         if entry.path.as_os_str().is_empty() {
@@ -4188,7 +4219,15 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
             size: entry.size,
             content_hash: entry.content_hash,
         };
-        match cache_freshness::verify_file_strict(&entry.path, &cached) {
+        let verdict = match verify_strategy {
+            cache_freshness::VerifyStrategy::StatFirst => {
+                cache_freshness::verify_file(&entry.path, &cached)
+            }
+            cache_freshness::VerifyStrategy::Strict => {
+                cache_freshness::verify_file_strict(&entry.path, &cached)
+            }
+        };
+        match verdict {
             FreshnessVerdict::HotFresh => {}
             FreshnessVerdict::ContentFresh {
                 new_mtime,
@@ -4196,6 +4235,7 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
             } => {
                 entry.modified = new_mtime;
                 entry.size = new_size;
+                changed = true;
             }
             FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
                 stale_paths.push(entry.path.clone())
@@ -4205,6 +4245,7 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
 
     for path in &removed_paths {
         index.remove_file(path);
+        changed = true;
     }
 
     // Re-index stale files that are still in the current walk set. If an ignore
@@ -4216,12 +4257,14 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
         } else {
             index.remove_file(path);
         }
+        changed = true;
     }
 
     // Detect new files not in the index
     for path in current_files {
         if !index.path_to_id.contains_key(&path) {
             index.update_file(&path);
+            changed = true;
         }
     }
 
@@ -4231,6 +4274,7 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
             stale_paths.len()
         );
     }
+    changed
 }
 
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
@@ -5862,5 +5906,30 @@ mod tests {
             sort_grep_matches_by_mtime_desc(&mut copy, dir.path());
             assert_eq!(copy.len(), matches.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod warm_reload_verification_tests {
+    use super::*;
+
+    #[test]
+    fn warm_disk_verification_uses_stat_first_and_hashes_changed_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let path = root.join("warm.rs");
+        fs::write(&path, "fn warm_reload() {}\n").unwrap();
+        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(&path, original_mtime).unwrap();
+        let mut index = SearchIndex::build(&root);
+
+        cache_freshness::watch_hash_file_for_debug(&path);
+        index.verify_against_disk_with_strategy(None, cache_freshness::VerifyStrategy::StatFirst);
+        assert_eq!(cache_freshness::watched_hash_file_count_for_debug(), 0);
+
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        cache_freshness::watch_hash_file_for_debug(&path);
+        index.verify_against_disk_with_strategy(None, cache_freshness::VerifyStrategy::StatFirst);
+        assert_eq!(cache_freshness::watched_hash_file_count_for_debug(), 1);
     }
 }

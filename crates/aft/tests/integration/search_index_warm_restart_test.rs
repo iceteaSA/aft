@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,22 @@ fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
         fs::write(path, content).expect("write fixture file");
     }
     temp_dir
+}
+
+fn find_cache_bin(root: &Path) -> PathBuf {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("read cache directory") {
+            let entry = entry.expect("read cache entry");
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name() == Some(OsStr::new("cache.bin")) {
+                return path;
+            }
+        }
+    }
+    panic!("search cache.bin should exist under {}", root.display());
 }
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {
@@ -114,6 +130,10 @@ fn unchanged_head_warm_configure_reuses_verified_cache_without_rebuild_thread() 
     assert_eq!(ready["search_index"]["status"], "ready");
     let status = aft.shutdown();
     assert!(status.success());
+    let cache_bin = find_cache_bin(shared_cache.path());
+    let cache_before_restart = fs::metadata(&cache_bin).expect("stat warm search cache");
+    let cache_len_before_restart = cache_before_restart.len();
+    let cache_mtime_before_restart = cache_before_restart.modified().expect("cache mtime");
 
     // A REAL warm restart (fresh process, unchanged HEAD) loads the disk cache
     // and verifies it on a background thread instead of inline on the dispatch
@@ -125,13 +145,23 @@ fn unchanged_head_warm_configure_reuses_verified_cache_without_rebuild_thread() 
     ]);
     let warm = configure_search_index(&mut restarted, project.path(), "cfg-warm-restart");
     assert_eq!(warm["success"], true, "configure failed: {warm:?}");
-    assert_eq!(warm["search_index_cache_reused"], true);
     assert!(
         marker.exists(),
         "warm restart should verify the cached index on a background thread"
     );
     let ready = wait_for_search_index_ready(&mut restarted, Duration::from_secs(5));
     assert_eq!(ready["search_index"]["status"], "ready");
+    let cache_after_restart = fs::metadata(&cache_bin).expect("stat reused search cache");
+    assert_eq!(
+        cache_after_restart.len(),
+        cache_len_before_restart,
+        "warm restart must reuse the persisted index, not rebuild it"
+    );
+    assert_eq!(
+        cache_after_restart.modified().expect("cache mtime"),
+        cache_mtime_before_restart,
+        "warm restart must reuse the persisted index, not rewrite it"
+    );
     let status = restarted.shutdown();
     assert!(status.success());
 }

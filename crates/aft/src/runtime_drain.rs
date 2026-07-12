@@ -1428,6 +1428,9 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
     else {
         return;
     };
+    if !paths.is_empty() || remaining > 0 {
+        ctx.invalidate_warm_verify_memo();
+    }
     let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
     let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
     let mut semantic_refresh_paths = std::mem::take(&mut state.semantic_refresh_paths);

@@ -2963,7 +2963,11 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
-        self.pending_search_index_paths.lock().extend(paths);
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        if !paths.is_empty() {
+            self.invalidate_warm_verify_memo();
+            self.pending_search_index_paths.lock().extend(paths);
+        }
     }
 
     pub fn take_pending_search_index_paths(&self) -> Vec<PathBuf> {
@@ -2976,7 +2980,17 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
-        self.pending_semantic_index_paths.lock().extend(paths);
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        if !paths.is_empty() {
+            self.invalidate_warm_verify_memo();
+            self.pending_semantic_index_paths.lock().extend(paths);
+        }
+    }
+
+    pub(crate) fn invalidate_warm_verify_memo(&self) {
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::cache_freshness::invalidate_verify_memo(&root);
+        }
     }
 
     pub fn take_pending_semantic_index_paths(&self) -> Vec<PathBuf> {
@@ -5614,6 +5628,51 @@ mod gitignore_tests {
         assert!(
             is_ignored(&ctx, &generated_file),
             "nested gitignore in packages/foo/.gitignore should ignore generated/"
+        );
+    }
+}
+
+#[cfg(test)]
+mod verify_memo_watcher_tests {
+    use super::*;
+
+    #[test]
+    fn pending_watcher_path_invalidates_root_verify_memo() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let artifact = root.join("cache.bin");
+        std::fs::write(&artifact, b"generation").unwrap();
+        let generation = crate::cache_freshness::artifact_generation(&artifact).unwrap();
+        crate::cache_freshness::record_verify_completed(
+            &root,
+            crate::cache_freshness::VerifyArtifact::Search,
+            Some(generation),
+        );
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                Some(generation),
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Skip
+        );
+
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.add_pending_search_index_paths([root.join("changed.rs")]);
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                Some(generation),
+            ),
+            crate::cache_freshness::WarmVerifyPlan::StatFirst
         );
     }
 }

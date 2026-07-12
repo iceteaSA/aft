@@ -1,11 +1,13 @@
 use rayon::prelude::*;
 #[cfg(debug_assertions)]
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const CONTENT_HASH_SIZE_CAP: u64 = 4 * 1024 * 1024;
 
@@ -14,6 +16,44 @@ static STRICT_VERIFY_FILE_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(debug_assertions)]
 thread_local! {
     static HASH_FILE_IF_SMALL_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+#[cfg(any(debug_assertions, test))]
+static WATCHED_HASH_FILE: OnceLock<Mutex<Option<(PathBuf, usize)>>> = OnceLock::new();
+
+const VERIFY_MEMO_TTL: Duration = Duration::from_secs(10 * 60);
+static VERIFY_MEMO: OnceLock<Mutex<BTreeMap<(PathBuf, VerifyArtifact), VerifyMemoEntry>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum VerifyArtifact {
+    Search,
+    Semantic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WarmVerifyPlan {
+    Skip,
+    StatFirst,
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyStrategy {
+    StatFirst,
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArtifactGeneration {
+    size: u64,
+    modified_nanos: Option<u128>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifyMemoEntry {
+    verify_completed_at: Instant,
+    generation: ArtifactGeneration,
+    invalidated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +84,18 @@ pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blak
     }
     #[cfg(debug_assertions)]
     HASH_FILE_IF_SMALL_CALLS.with(|calls| calls.set(calls.get() + 1));
+    #[cfg(any(debug_assertions, test))]
+    {
+        let mut watched = WATCHED_HASH_FILE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((watched_path, count)) = watched.as_mut() {
+            if watched_path == path {
+                *count += 1;
+            }
+        }
+    }
     fs::read(path).map(|bytes| Some(hash_bytes(&bytes)))
 }
 
@@ -56,6 +108,79 @@ pub fn metadata_matches(path: &Path, cached: &FileFreshness) -> std::io::Result<
 
 pub fn zero_hash() -> blake3::Hash {
     blake3::Hash::from_bytes([0u8; 32])
+}
+
+pub(crate) fn artifact_generation(path: &Path) -> Option<ArtifactGeneration> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    Some(ArtifactGeneration {
+        size: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn verify_memo() -> &'static Mutex<BTreeMap<(PathBuf, VerifyArtifact), VerifyMemoEntry>> {
+    VERIFY_MEMO.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub(crate) fn warm_verify_plan(
+    root: &Path,
+    artifact: VerifyArtifact,
+    generation: Option<ArtifactGeneration>,
+) -> WarmVerifyPlan {
+    let Some(generation) = generation else {
+        return WarmVerifyPlan::Strict;
+    };
+    let memo = verify_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = memo.get(&(root.to_path_buf(), artifact)) else {
+        return WarmVerifyPlan::Strict;
+    };
+    if entry.generation != generation {
+        return WarmVerifyPlan::Strict;
+    }
+    if entry.invalidated || entry.verify_completed_at.elapsed() >= VERIFY_MEMO_TTL {
+        WarmVerifyPlan::StatFirst
+    } else {
+        WarmVerifyPlan::Skip
+    }
+}
+
+pub(crate) fn record_verify_completed(
+    root: &Path,
+    artifact: VerifyArtifact,
+    generation: Option<ArtifactGeneration>,
+) {
+    let Some(generation) = generation else {
+        return;
+    };
+    verify_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            (root.to_path_buf(), artifact),
+            VerifyMemoEntry {
+                verify_completed_at: Instant::now(),
+                generation,
+                invalidated: false,
+            },
+        );
+}
+
+pub(crate) fn invalidate_verify_memo(root: &Path) {
+    let mut memo = verify_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for ((memo_root, _), entry) in memo.iter_mut() {
+        if memo_root == root {
+            entry.invalidated = true;
+        }
+    }
 }
 
 pub fn collect(path: &Path) -> std::io::Result<FileFreshness> {
@@ -89,15 +214,29 @@ pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdi
 pub(crate) fn verify_files_strict_bounded<K: Send>(
     files: Vec<(K, PathBuf, FileFreshness)>,
 ) -> Vec<(K, PathBuf, FreshnessVerdict)> {
+    verify_files_bounded(files, VerifyStrategy::Strict)
+}
+
+pub(crate) fn verify_files_bounded<K: Send>(
+    files: Vec<(K, PathBuf, FileFreshness)>,
+    strategy: VerifyStrategy,
+) -> Vec<(K, PathBuf, FreshnessVerdict)> {
     fn verify_one<K>(
         (key, path, cached): (K, PathBuf, FileFreshness),
+        strategy: VerifyStrategy,
     ) -> (K, PathBuf, FreshnessVerdict) {
-        let verdict = verify_file_strict(&path, &cached);
+        let verdict = match strategy {
+            VerifyStrategy::StatFirst => verify_file(&path, &cached),
+            VerifyStrategy::Strict => verify_file_strict(&path, &cached),
+        };
         (key, path, verdict)
     }
 
     if files.len() <= 1 {
-        return files.into_iter().map(verify_one::<K>).collect();
+        return files
+            .into_iter()
+            .map(|file| verify_one(file, strategy))
+            .collect();
     }
 
     match rayon::ThreadPoolBuilder::new()
@@ -105,8 +244,16 @@ pub(crate) fn verify_files_strict_bounded<K: Send>(
         .thread_name(|index| format!("aft-semantic-verify-{index}"))
         .build()
     {
-        Ok(pool) => pool.install(|| files.into_par_iter().map(verify_one::<K>).collect()),
-        Err(_) => files.into_iter().map(verify_one::<K>).collect(),
+        Ok(pool) => pool.install(|| {
+            files
+                .into_par_iter()
+                .map(|file| verify_one(file, strategy))
+                .collect()
+        }),
+        Err(_) => files
+            .into_iter()
+            .map(|file| verify_one(file, strategy))
+            .collect(),
     }
 }
 
@@ -140,6 +287,26 @@ pub fn reset_hash_file_if_small_count_for_debug() {
 #[doc(hidden)]
 pub fn hash_file_if_small_count_for_debug() -> usize {
     HASH_FILE_IF_SMALL_CALLS.with(Cell::get)
+}
+
+#[cfg(any(debug_assertions, test))]
+#[doc(hidden)]
+pub fn watch_hash_file_for_debug(path: &Path) {
+    *WATCHED_HASH_FILE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path.to_path_buf(), 0));
+}
+
+#[cfg(any(debug_assertions, test))]
+#[doc(hidden)]
+pub fn watched_hash_file_count_for_debug() -> usize {
+    WATCHED_HASH_FILE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map_or(0, |(_, count)| *count)
 }
 
 fn verify_file_inner(
@@ -354,5 +521,141 @@ mod tests {
         assert!(hash_file_if_small(&path, CONTENT_HASH_SIZE_CAP + 1)
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod warm_reload_tests {
+    use super::*;
+
+    #[test]
+    fn stat_first_hashes_only_files_with_changed_metadata_while_cold_verify_is_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warm.rs");
+        fs::write(&path, b"fn warm() {}\n").unwrap();
+        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(&path, original_mtime).unwrap();
+        let freshness = collect(&path).unwrap();
+
+        watch_hash_file_for_debug(&path);
+        let unchanged = verify_files_bounded(
+            vec![((), path.clone(), freshness)],
+            VerifyStrategy::StatFirst,
+        );
+        assert_eq!(unchanged[0].2, FreshnessVerdict::HotFresh);
+        assert_eq!(watched_hash_file_count_for_debug(), 0);
+
+        watch_hash_file_for_debug(&path);
+        let cold = verify_files_strict_bounded(vec![((), path.clone(), freshness)]);
+        assert_eq!(cold[0].2, FreshnessVerdict::HotFresh);
+        assert_eq!(watched_hash_file_count_for_debug(), 1);
+
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        watch_hash_file_for_debug(&path);
+        let changed_stat = verify_files_bounded(
+            vec![((), path.clone(), freshness)],
+            VerifyStrategy::StatFirst,
+        );
+        assert!(matches!(
+            changed_stat[0].2,
+            FreshnessVerdict::ContentFresh { .. }
+        ));
+        assert_eq!(watched_hash_file_count_for_debug(), 1);
+    }
+
+    #[test]
+    fn verify_memo_skips_hits_and_invalidates_on_watcher_or_generation_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let artifact = dir.path().join("cache.bin");
+        fs::create_dir(&root).unwrap();
+        fs::write(&artifact, b"generation-one").unwrap();
+        let generation_one = artifact_generation(&artifact).unwrap();
+
+        assert_eq!(
+            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_one)),
+            WarmVerifyPlan::Strict
+        );
+        record_verify_completed(&root, VerifyArtifact::Search, Some(generation_one));
+        assert_eq!(
+            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_one)),
+            WarmVerifyPlan::Skip
+        );
+
+        invalidate_verify_memo(&root);
+        assert_eq!(
+            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_one)),
+            WarmVerifyPlan::StatFirst
+        );
+
+        fs::write(&artifact, b"generation-two-is-different").unwrap();
+        let generation_two = artifact_generation(&artifact).unwrap();
+        assert_ne!(generation_one, generation_two);
+        assert_eq!(
+            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_two)),
+            WarmVerifyPlan::Strict
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_cpu_time() -> Duration {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(result, 0, "getrusage should report process CPU time");
+        let usage = unsafe { usage.assume_init() };
+        let seconds = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64;
+        let micros = (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as u64;
+        Duration::from_secs(seconds) + Duration::from_micros(micros)
+    }
+
+    /// Measures the configure -> eviction -> rebind freshness component against
+    /// a real repository. The first pass models a cold strict verification; the
+    /// second models the unchanged-generation memo hit after in-process eviction.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual CPU measurement; needs AFT_BENCH_REPO"]
+    fn configure_eviction_rebind_cpu_measurement() {
+        let root = PathBuf::from(
+            std::env::var("AFT_BENCH_REPO").expect("AFT_BENCH_REPO must name a repository"),
+        );
+        let records = crate::callgraph::walk_project_files(&root)
+            .filter_map(|path| collect(&path).ok().map(|freshness| (path, freshness)))
+            .collect::<Vec<_>>();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact = artifact_dir.path().join("cache.bin");
+        fs::write(&artifact, b"stable-generation").unwrap();
+        let generation = artifact_generation(&artifact).unwrap();
+
+        let strict_inputs = records
+            .iter()
+            .enumerate()
+            .map(|(index, (path, freshness))| (index, path.clone(), *freshness))
+            .collect();
+        let before = process_cpu_time();
+        let _ = verify_files_strict_bounded(strict_inputs);
+        let strict_cpu = process_cpu_time().saturating_sub(before);
+        record_verify_completed(&root, VerifyArtifact::Search, Some(generation));
+
+        let before = process_cpu_time();
+        if warm_verify_plan(&root, VerifyArtifact::Search, Some(generation)) != WarmVerifyPlan::Skip
+        {
+            panic!("unchanged artifact generation should skip rebind verification");
+        }
+        let memo_hit_cpu = process_cpu_time().saturating_sub(before);
+
+        invalidate_verify_memo(&root);
+        let stat_inputs = records
+            .iter()
+            .enumerate()
+            .map(|(index, (path, freshness))| (index, path.clone(), *freshness))
+            .collect();
+        let before = process_cpu_time();
+        let _ = verify_files_bounded(stat_inputs, VerifyStrategy::StatFirst);
+        let stat_first_cpu = process_cpu_time().saturating_sub(before);
+
+        eprintln!(
+            "configure-eviction-rebind CPU: files={} cold_strict={:?} memo_rebind={:?} invalidated_stat_first={:?}",
+            records.len(), strict_cpu, memo_hit_cpu, stat_first_cpu
+        );
     }
 }

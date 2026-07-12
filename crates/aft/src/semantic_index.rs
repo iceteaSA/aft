@@ -2218,6 +2218,29 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
+        self.refresh_stale_files_with_strategy(
+            project_root,
+            current_files,
+            embed_fn,
+            max_batch_size,
+            progress,
+            cache_freshness::VerifyStrategy::Strict,
+        )
+    }
+
+    pub(crate) fn refresh_stale_files_with_strategy<F, P>(
+        &mut self,
+        project_root: &Path,
+        current_files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        progress: &mut P,
+        verify_strategy: cache_freshness::VerifyStrategy,
+    ) -> Result<RefreshSummary, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+    {
         self.materialize_shared_base();
         self.backfill_missing_file_sizes();
 
@@ -2272,14 +2295,21 @@ impl SemanticIndex {
             }
         }
 
-        for (check_index, path, verdict) in
-            cache_freshness::verify_files_strict_bounded(strict_verify_inputs)
-        {
+        let verified = match verify_strategy {
+            cache_freshness::VerifyStrategy::StatFirst => cache_freshness::verify_files_bounded(
+                strict_verify_inputs,
+                cache_freshness::VerifyStrategy::StatFirst,
+            ),
+            cache_freshness::VerifyStrategy::Strict => {
+                cache_freshness::verify_files_strict_bounded(strict_verify_inputs)
+            }
+        };
+        for (check_index, path, verdict) in verified {
             checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
         }
 
         for check in checks {
-            match check.expect("strict freshness check should be populated") {
+            match check.expect("freshness check should be populated") {
                 IndexedFileCheck::Deleted(path) => deleted.push(path),
                 IndexedFileCheck::MissingMetadata(path) => changed.push(path),
                 IndexedFileCheck::Verified(_path, FreshnessVerdict::HotFresh) => {}

@@ -564,9 +564,10 @@ fn idle_root_eviction_message(
     memory: &crate::memory::RootMemorySnapshot,
     pressure_relief: Option<&crate::memory::AllocatorPressureRelief>,
 ) -> String {
-    // Semantic, bash, LSP, and parser state remain resident. The freed total is
-    // deliberately only the known-byte portion of handles eviction actually drops.
+    // Bash, LSP, and parser state remain resident. The freed total is deliberately
+    // only the known-byte portion of handles eviction actually drops.
     let freed_bytes = [
+        &memory.semantic,
         &memory.trigram,
         &memory.symbols,
         &memory.callgraph,
@@ -576,7 +577,7 @@ fn idle_root_eviction_message(
     .filter_map(|estimate| estimate.estimated_bytes)
     .fold(0u64, u64::saturating_add);
     let mut message = format!(
-        "evicted idle root {}: freed ~{:.1} MB (semantic {} retained, trigram {}, symbols {}, callgraph {}, inspect {}, bash {} retained, lsp {} retained, parser_pool {} retained)",
+        "evicted idle root {}: freed ~{:.1} MB (semantic {}, trigram {}, symbols {}, callgraph {}, inspect {}; retained: bash {}, lsp {}, parser_pool {})",
         root_id.as_path().display(),
         freed_bytes as f64 / (1024.0 * 1024.0),
         eviction_estimate_label(&memory.semantic),
@@ -636,6 +637,7 @@ fn reap_idle_roots(
     now: Instant,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     executor: &Arc<Executor>,
 ) -> usize {
     let pending_bind_roots = pending_binds
@@ -645,8 +647,12 @@ fn reap_idle_roots(
     let candidates = live_roots
         .iter()
         .filter_map(|(root_id, meta)| {
+            let has_bound_session = root_channels
+                .get(root_id)
+                .is_some_and(|channels| !channels.is_empty());
             if meta.idle_artifacts_evicted
-                || now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL
+                || (has_bound_session
+                    && now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL)
                 || meta.active_bash_waits > 0
                 || meta.maintenance_pending
                 || !meta.maintenance_queued_kinds.is_empty()
@@ -2102,6 +2108,7 @@ where
                     Instant::now(),
                     &mut live_roots,
                     &pending_binds,
+                    &root_channels,
                     &executor,
                 );
                 if reaped > 0 {
@@ -3817,12 +3824,19 @@ mod tests {
         assert!(message.contains("evicted idle root"));
         assert!(message.contains("freed ~"));
         assert!(message.contains("semantic"));
+        assert!(!message.contains("semantic not estimated retained"));
         assert!(message.contains("trigram"));
-        assert!(message.contains("bash"));
+        assert!(message.contains("retained: bash"));
         assert!(message.contains("parser_pool"));
 
         assert_eq!(
-            reap_idle_roots(Instant::now(), &mut live_roots, &HashMap::new(), &executor),
+            reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+            ),
             1
         );
         assert!(ctx.search_index().read().unwrap().is_none());
@@ -3834,6 +3848,41 @@ mod tests {
             .ensure_callgraph_store()
             .expect("reopen callgraph store")
             .is_some());
+        assert!(live_roots[&root].idle_artifacts_evicted);
+    }
+
+    #[test]
+    fn idle_root_reaper_keeps_recent_bound_roots_and_evicts_unbound_roots() {
+        let (_root_dir, root) = test_root("idle-root-live-session-gate");
+        let ctx = test_ctx();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx));
+        let now = Instant::now();
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(now))]);
+        let root_channels = HashMap::from([(root.clone(), HashSet::from([7]))]);
+
+        assert_eq!(
+            reap_idle_roots(
+                now,
+                &mut live_roots,
+                &HashMap::new(),
+                &root_channels,
+                &executor,
+            ),
+            0
+        );
+        assert!(!live_roots[&root].idle_artifacts_evicted);
+
+        assert_eq!(
+            reap_idle_roots(
+                now,
+                &mut live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+            ),
+            1
+        );
         assert!(live_roots[&root].idle_artifacts_evicted);
     }
 

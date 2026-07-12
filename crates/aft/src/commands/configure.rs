@@ -13,6 +13,7 @@ use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+use crate::cache_freshness::{self, VerifyArtifact, VerifyStrategy, WarmVerifyPlan};
 use crate::config::{Config, SemanticBackendConfig};
 use crate::context::{
     AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticIndexEvent,
@@ -2188,14 +2189,44 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     // HEAD freshness is deliberately probed after the bind ack. The
                     // helper bounds git so a wedged repository cannot pin maintenance.
                     let current_head = current_git_head(&root_for_search);
+                    let cache_path = cache_dir.join("cache.bin");
+                    let artifact_generation = cache_freshness::artifact_generation(&cache_path);
+                    let verify_plan = cache_freshness::warm_verify_plan(
+                        &root_for_search,
+                        VerifyArtifact::Search,
+                        artifact_generation,
+                    );
                     let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
+                    let mut persist_to_disk = true;
+                    let mut record_completed_verify = true;
                     let mut index = match baseline {
                         Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
-                            let _cache_lock = (!is_worktree_bridge_for_search)
-                                .then(|| CacheLock::acquire(&cache_dir, &root_for_search).ok())
-                                .flatten();
                             index.set_ready(false);
-                            index.verify_against_disk(current_head.clone());
+                            match verify_plan {
+                                WarmVerifyPlan::Skip => {
+                                    index.set_ready(true);
+                                    persist_to_disk = false;
+                                    record_completed_verify = false;
+                                }
+                                WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => {
+                                    let _cache_lock = (!is_worktree_bridge_for_search)
+                                        .then(|| {
+                                            CacheLock::acquire(&cache_dir, &root_for_search).ok()
+                                        })
+                                        .flatten();
+                                    let strategy = match verify_plan {
+                                        WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
+                                        WarmVerifyPlan::Strict => VerifyStrategy::Strict,
+                                        WarmVerifyPlan::Skip => unreachable!(),
+                                    };
+                                    let disk_changed = index.verify_against_disk_with_strategy(
+                                        current_head.clone(),
+                                        strategy,
+                                    );
+                                    persist_to_disk =
+                                        disk_changed || index.has_pending_disk_changes();
+                                }
+                            }
                             index
                         }
                         mut baseline => {
@@ -2207,20 +2238,34 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             } else {
                                 CacheLock::acquire(&cache_dir, &root_for_search).ok()
                             };
-                            let index = SearchIndex::rebuild_or_refresh(
+                            let strategy = match verify_plan {
+                                WarmVerifyPlan::Strict => VerifyStrategy::Strict,
+                                WarmVerifyPlan::Skip | WarmVerifyPlan::StatFirst => {
+                                    VerifyStrategy::StatFirst
+                                }
+                            };
+                            let index = SearchIndex::rebuild_or_refresh_with_strategy(
                                 &root_for_search,
                                 search_index_max_file_size,
                                 current_head,
                                 baseline,
                                 Some(&cache_dir),
+                                strategy,
                             );
                             delay_search_rebuild_publish_for_debug();
                             index
                         }
                     };
-                    if !is_worktree_bridge_for_search {
+                    if !is_worktree_bridge_for_search && persist_to_disk {
                         let head = index.stored_git_head().map(str::to_owned);
                         index.write_to_disk(&cache_dir, head.as_deref());
+                    }
+                    if record_completed_verify {
+                        cache_freshness::record_verify_completed(
+                            &root_for_search,
+                            VerifyArtifact::Search,
+                            cache_freshness::artifact_generation(&cache_path),
+                        );
                     }
                     let symbol_files = search_index_symbol_files(&index);
                     if search_generation_flag.load(Ordering::SeqCst) == search_generation {
@@ -2373,6 +2418,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         index: SemanticIndex,
                         model: crate::semantic_index::EmbeddingModel,
                         persist_to_disk: bool,
+                        record_verify_completion: bool,
                     }
 
                     let build_once = || -> Result<SemanticBuildReady, String> {
@@ -2407,6 +2453,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             });
 
                         if let Some(ref dir) = semantic_storage {
+                            let data_path = dir
+                                .join("semantic")
+                                .join(&semantic_project_key)
+                                .join("semantic.bin");
+                            let verify_plan = cache_freshness::warm_verify_plan(
+                                &root_clone,
+                                VerifyArtifact::Semantic,
+                                cache_freshness::artifact_generation(&data_path),
+                            );
                             if let Some(cached) = SemanticIndex::read_from_disk(
                                 dir,
                                 &semantic_project_key,
@@ -2415,6 +2470,18 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 Some(&fingerprint_key),
                             ) {
                                 clear_cold_seed_gate_and_notify();
+                                if verify_plan == WarmVerifyPlan::Skip {
+                                    slog_info!(
+                                        "semantic index: recently verified cache generation reused ({} entries)",
+                                        cached.entry_count(),
+                                    );
+                                    return Ok(SemanticBuildReady {
+                                        index: cached,
+                                        model,
+                                        persist_to_disk: false,
+                                        record_verify_completion: false,
+                                    });
+                                }
                                 // Try incremental refresh: re-embed only changed/new files,
                                 // drop entries for deleted files, keep everything else.
                                 // This is the hot path for restart on a project with a
@@ -2456,12 +2523,18 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     });
                                 };
 
-                                match cached.refresh_stale_files(
+                                let verify_strategy = match verify_plan {
+                                    WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
+                                    WarmVerifyPlan::Strict => VerifyStrategy::Strict,
+                                    WarmVerifyPlan::Skip => unreachable!(),
+                                };
+                                match cached.refresh_stale_files_with_strategy(
                                     &root_clone,
                                     &current_files,
                                     &mut embed,
                                     semantic_config.max_batch_size.max(1),
                                     &mut progress,
+                                    verify_strategy,
                                 ) {
                                     Ok(summary) => {
                                         if summary.is_noop() {
@@ -2491,6 +2564,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                             index: cached,
                                             model,
                                             persist_to_disk,
+                                            record_verify_completion: true,
                                         });
                                     }
                                     Err(error) => {
@@ -2521,6 +2595,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                                 index: cached,
                                                 model,
                                                 persist_to_disk: false,
+                                                record_verify_completion: false,
                                             });
                                         }
                                         // Permanent failure (dimension mismatch, etc.): the
@@ -2610,6 +2685,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             index,
                             model,
                             persist_to_disk: true,
+                            record_verify_completion: true,
                         })
                     };
 
@@ -2738,9 +2814,24 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 index,
                                 model,
                                 persist_to_disk,
+                                record_verify_completion,
                             } = ready;
                             if persist_to_disk {
                                 persist_completed_index(&index, "current generation publish");
+                            }
+                            if record_verify_completion {
+                                let generation = semantic_storage.as_ref().and_then(|dir| {
+                                    cache_freshness::artifact_generation(
+                                        &dir.join("semantic")
+                                            .join(&semantic_project_key)
+                                            .join("semantic.bin"),
+                                    )
+                                });
+                                cache_freshness::record_verify_completed(
+                                    &root_clone,
+                                    VerifyArtifact::Semantic,
+                                    generation,
+                                );
                             }
                             let worker_index = index.clone();
                             let worker_handle = spawn_semantic_refresh_worker(
