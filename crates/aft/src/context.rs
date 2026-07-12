@@ -166,6 +166,23 @@ struct ConfigureWarmState {
     key: Option<String>,
 }
 
+#[derive(Debug)]
+struct ConfigurePhaseTiming {
+    phase: &'static str,
+    started_at: Instant,
+    completed: Vec<(&'static str, Duration)>,
+}
+
+impl Default for ConfigurePhaseTiming {
+    fn default() -> Self {
+        Self {
+            phase: "idle",
+            started_at: Instant::now(),
+            completed: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WatcherDrainApplyPhase {
     #[default]
@@ -244,6 +261,9 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) reset_filter_registry: bool,
     pub(crate) clear_failed_spawns: bool,
     pub(crate) warm_callgraph_store: bool,
+    /// One-shot gates for artifact workers created during configure. The
+    /// configure tail opens them only after the bind response has been produced.
+    pub(crate) artifact_load_starts: Vec<crossbeam_channel::Sender<()>>,
 }
 
 impl StatusEmitter {
@@ -908,7 +928,7 @@ pub struct AppContext {
     canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
     is_worktree_bridge: parking_lot::Mutex<bool>,
     git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
-    shared_artifacts_read_only: parking_lot::Mutex<bool>,
+    shared_artifacts_read_only: AtomicBool,
     callgraph_writer: AtomicBool,
     inspect_writer: AtomicBool,
     artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
@@ -966,6 +986,7 @@ pub struct AppContext {
     lsp_manager: parking_lot::Mutex<LspManager>,
     configure_generation: Arc<AtomicU64>,
     configure_warm_state: parking_lot::Mutex<ConfigureWarmState>,
+    configure_phase_timing: parking_lot::Mutex<ConfigurePhaseTiming>,
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
@@ -1147,7 +1168,7 @@ impl AppContext {
             canonical_cache_root: parking_lot::Mutex::new(None),
             is_worktree_bridge: parking_lot::Mutex::new(false),
             git_common_dir: parking_lot::Mutex::new(None),
-            shared_artifacts_read_only: parking_lot::Mutex::new(false),
+            shared_artifacts_read_only: AtomicBool::new(false),
             callgraph_writer: AtomicBool::new(true),
             inspect_writer: AtomicBool::new(true),
             artifact_owner_status: parking_lot::Mutex::new(None),
@@ -1190,6 +1211,7 @@ impl AppContext {
             lsp_manager: parking_lot::Mutex::new(lsp_manager),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
+            configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
@@ -1327,7 +1349,7 @@ impl AppContext {
         // read-only disk openers against the shared artifact. Reporting them
         // as "building" is a permanent lie that keeps module health degraded
         // whenever any worktree is bound.
-        let borrows_shared_artifacts = *self.shared_artifacts_read_only.lock();
+        let borrows_shared_artifacts = self.shared_artifacts_read_only.load(Ordering::SeqCst);
         let search_index_status = if search_index.as_ref().is_some_and(|index| index.ready) {
             "ready"
         } else if borrows_shared_artifacts && config.search_index {
@@ -2051,6 +2073,35 @@ impl AppContext {
         Arc::clone(&self.configure_generation)
     }
 
+    pub(crate) fn begin_configure_ack_phase(&self, phase: &'static str) {
+        let now = Instant::now();
+        let mut timing = self.configure_phase_timing.lock();
+        if phase == "canonicalize" {
+            timing.completed.clear();
+        } else if timing.phase != "idle" && timing.phase != "ack_ready" {
+            let previous = timing.phase;
+            let elapsed = now.saturating_duration_since(timing.started_at);
+            timing.completed.push((previous, elapsed));
+        }
+        timing.phase = phase;
+        timing.started_at = now;
+    }
+
+    pub(crate) fn configure_ack_phase_snapshot(&self) -> String {
+        let timing = self.configure_phase_timing.lock();
+        let mut parts = timing
+            .completed
+            .iter()
+            .map(|(phase, elapsed)| format!("{phase}={}ms", elapsed.as_millis()))
+            .collect::<Vec<_>>();
+        parts.push(format!(
+            "{}={}ms",
+            timing.phase,
+            timing.started_at.elapsed().as_millis()
+        ));
+        parts.join(",")
+    }
+
     pub fn advance_semantic_fingerprint_generation(&self) -> u64 {
         self.semantic_fingerprint_generation
             .fetch_add(1, Ordering::SeqCst)
@@ -2269,7 +2320,7 @@ impl AppContext {
         // callgraph cold-build gating while explicit inspect demand stays enabled.
         self.inspect_manager
             .set_automatic_tier2_refresh_allowed(!is_worktree_bridge);
-        let artifact_read_only = *self.shared_artifacts_read_only.lock();
+        let artifact_read_only = self.shared_artifacts_read_only.load(Ordering::SeqCst);
         self.callgraph_writer
             .store(!is_worktree_bridge && !artifact_read_only, Ordering::SeqCst);
     }
@@ -2282,7 +2333,8 @@ impl AppContext {
         let read_only = status
             .as_ref()
             .is_some_and(|status| status.mode == ArtifactOwnerMode::ReadOnly);
-        *self.shared_artifacts_read_only.lock() = read_only;
+        self.shared_artifacts_read_only
+            .store(read_only, Ordering::SeqCst);
         self.callgraph_writer
             .store(!self.is_worktree_bridge() && !read_only, Ordering::SeqCst);
         self.inspect_writer.store(true, Ordering::SeqCst);
@@ -2363,7 +2415,7 @@ impl AppContext {
             "not_initialized"
         } else if self.is_worktree_bridge() {
             "worktree"
-        } else if *self.shared_artifacts_read_only.lock() {
+        } else if self.shared_artifacts_read_only.load(Ordering::SeqCst) {
             "read_only"
         } else {
             "main"

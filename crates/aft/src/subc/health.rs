@@ -1,11 +1,11 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
-use crate::context::{RootHealthState};
 use super::{
     json, Arc, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport, HealthStatus,
     Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
     DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
+use crate::context::RootHealthState;
 use crate::executor::BindBlockerSnapshot;
 
 pub(super) struct DispatchPathMetrics {
@@ -133,6 +133,7 @@ pub(super) fn warn_slow_pending_binds(
             .try_bind_blocker_snapshot(&pending.bind_root_id, &pending.configure_request_id)
             .unwrap_or_else(|| BindBlockerSnapshot {
                 configure_state: "scheduler_busy",
+                configure_phase_timings: None,
                 blockers: vec!["scheduler_busy".to_string()],
             });
         crate::slog_warn!(
@@ -160,12 +161,17 @@ fn pending_bind_breadcrumb(
     } else {
         snapshot.blockers.join(", ")
     };
+    let phase_timings = snapshot
+        .configure_phase_timings
+        .as_deref()
+        .unwrap_or("unavailable");
     format!(
-        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, blockers=[{}])",
+        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], blockers=[{}])",
         root_id.as_path().display(),
         duration_millis_u64(age),
         configure_request_id,
         snapshot.configure_state,
+        phase_timings,
         blockers,
     )
 }
@@ -240,9 +246,7 @@ pub(super) fn build_health_report(
         .count();
     let warming_roots = roots
         .iter()
-        .filter(|root| {
-            !matches!(root.state, RootHealthState::Busy) && !root.is_fully_ready()
-        })
+        .filter(|root| !matches!(root.state, RootHealthState::Busy) && !root.is_fully_ready())
         .count();
     let detail = if busy_roots > 0 {
         Some(format!(
@@ -298,12 +302,17 @@ mod tests {
                 "subc-bind-7",
                 &BindBlockerSnapshot {
                     configure_state: "queued",
+                    configure_phase_timings: Some("artifact_owner_claim=12ms".to_string()),
                     blockers: vec![blocker.to_string()],
                 },
             );
             assert!(
                 breadcrumb.contains(blocker),
                 "breadcrumb omitted blocker class: {breadcrumb}"
+            );
+            assert!(
+                breadcrumb.contains("configure_phase_timings=[artifact_owner_claim=12ms]"),
+                "breadcrumb omitted configure phase timings: {breadcrumb}"
             );
         }
     }
@@ -380,5 +389,50 @@ mod tests {
         queued
             .recv_timeout(Duration::from_secs(1))
             .expect("queued completion response");
+    }
+
+    #[test]
+    fn health_snapshot_fast_fails_while_mutating_job_holds_component_lock() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let (_dir, root) = test_root("health-mutating-lock");
+        let ctx = test_ctx();
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let blocker = executor.submit(
+            root,
+            Lane::Mutating,
+            "health-lock-blocker".to_string(),
+            Box::new(move |ctx| {
+                let _index = ctx
+                    .search_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                started_tx.send(()).expect("signal held health lock");
+                std::thread::sleep(Duration::from_secs(2));
+                Response::success("health-lock-blocker", json!({ "ok": true }))
+            }),
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mutating lock holder starts");
+
+        let started = Instant::now();
+        let report = build_health_report(&executor, &HashMap::new(), &DispatchPathMetrics::new());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "health snapshot waited behind a mutating lock for {elapsed:?}"
+        );
+        assert_eq!(report.status, HealthStatus::Degraded);
+
+        blocker
+            .recv_timeout(Duration::from_secs(3))
+            .expect("mutating lock holder completes");
     }
 }

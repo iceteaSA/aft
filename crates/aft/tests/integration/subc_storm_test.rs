@@ -1077,6 +1077,7 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
     let semantic_roots: HashSet<usize> = (0..roots.len()).filter(|index| index % 2 == 0).collect();
 
     aft::commands::configure::reset_semantic_stale_generation_discards_for_test();
+    aft::commands::configure::reset_configure_artifact_load_attempts_for_test();
     let mut routes = build_route_specs(&scale, &roots);
     let mut corr = 10_000_u64;
     let mut pending_binds = HashMap::new();
@@ -1217,6 +1218,10 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
         aft::commands::configure::semantic_stale_generation_discards_for_test(),
         0,
         "equivalent rebinds must not discard completed semantic builds as stale"
+    );
+    assert!(
+        aft::commands::configure::configure_artifact_load_attempts_for_test() >= roots.len(),
+        "fleet storm did not exercise one post-ack artifact load per cold-ish root"
     );
     assert_bind_stats(&stats.bind_latencies);
     assert!(

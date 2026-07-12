@@ -32,6 +32,21 @@ use crate::{slog_debug, slog_info, slog_warn};
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
+static CONFIGURE_ARTIFACT_LOAD_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+fn note_configure_artifact_load_attempt() {
+    CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+}
+
+#[doc(hidden)]
+pub fn reset_configure_artifact_load_attempts_for_test() {
+    CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.store(0, Ordering::SeqCst);
+}
+
+#[doc(hidden)]
+pub fn configure_artifact_load_attempts_for_test() -> usize {
+    CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.load(Ordering::SeqCst)
+}
 
 #[doc(hidden)]
 pub fn reset_semantic_stale_generation_discards_for_test() {
@@ -1539,9 +1554,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             format!("configure: project_root is not a directory: {}", root),
         );
     }
+    ctx.begin_configure_ack_phase("canonicalize");
     let canonical_cache_root =
         std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
     debug_assert!(canonical_cache_root.is_absolute());
+    ctx.begin_configure_ack_phase("worktree_probe");
     let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(ctx, &canonical_cache_root);
 
     let previous_config = ctx.config();
@@ -1566,6 +1583,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // no tiers would keep the PREVIOUS bind's resolved core config (the
     // cross-bind escalation: a later low-trust bind inheriting an earlier
     // high-trust bind's capability by simply omitting tiers).
+    ctx.begin_configure_ack_phase("config_resolve");
     let tiers = match resolve_config_tiers_for_configure(params, &root_path) {
         Ok(tiers) => tiers,
         Err(error) => return Response::error(&req.id, "invalid_request", error),
@@ -1745,6 +1763,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 reset_filter_registry: false,
                 clear_failed_spawns: false,
                 warm_callgraph_store: false,
+                artifact_load_starts: Vec::new(),
             });
             slog_debug!(
                 "equivalent configure registered session {} for generation {}",
@@ -1759,6 +1778,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
 
+        ctx.begin_configure_ack_phase("ack_ready");
         let artifact_owner_status = ctx.artifact_owner_status();
         let search_index_cache_reused = next_config.search_index
             && ctx
@@ -1804,6 +1824,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
     let artifact_key_needed = !home_match
         && (next_config.search_index || next_config.semantic_search || next_config.callgraph_store);
+    ctx.begin_configure_ack_phase("cache_key_resolve");
     let project_key = if artifact_key_needed {
         Some(
             match ctx.memoized_artifact_cache_key_for_configure(
@@ -1831,6 +1852,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         None
     };
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
+    ctx.begin_configure_ack_phase("artifact_owner_claim");
     let artifact_owner_claim = if let Some(project_key) = project_key.as_ref() {
         if is_worktree_bridge {
             Some(crate::artifact_owner::open_read_only_borrow(
@@ -1876,6 +1898,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             slog_warn!("{}", note);
         }
     }
+    ctx.begin_configure_ack_phase("storage_capability_probe");
     let root_cache_storage_ok = match crate::root_cache::storage_allows_root_keyed(&storage_root) {
         Ok(true) => true,
         Ok(false) => {
@@ -1902,6 +1925,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let heavy_root_work_allowed =
         !home_match && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
+    ctx.begin_configure_ack_phase("state_commit");
     // Commit phase: no validation returns after this point.
     let semantic_fingerprint_generation =
         if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
@@ -1970,6 +1994,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .set_db_project_key(crate::path_identity::project_scope_key(
             &canonical_cache_root,
         ));
+    ctx.begin_configure_ack_phase("index_loading_state");
     let search_index = ctx.config().search_index;
     let semantic_search = ctx.config().semantic_search;
     let search_index_max_file_size = ctx.config().search_index_max_file_size;
@@ -1986,6 +2011,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
+    let mut artifact_load_starts = Vec::new();
     if equivalent_warm_config {
         // The zero-work rebind path keeps the live index serving; report that
         // honestly instead of implying the cache was dropped.
@@ -2069,11 +2095,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
         if search_index {
             let cache_dir = resolve_cache_dir_with_key(&project_key, storage_dir.as_deref());
-            // Unlike worktree topology, HEAD is a cache-freshness input and may
-            // change between equivalent rebinds, so this probe remains live.
-            let current_head = current_git_head(&canonical_cache_root);
-
-            let root_for_prewarm = canonical_cache_root.clone();
+            let root_for_search = canonical_cache_root.clone();
             let symbol_cache = ctx.symbol_cache();
             let symbol_storage = storage_dir.clone();
             let symbol_project_key = project_key.clone();
@@ -2082,257 +2104,171 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             let session_id_for_bg = log_ctx::current_session();
             let search_generation = configure_generation;
             let search_generation_flag = ctx.configure_generation_flag();
+            let (tx, rx) = unbounded::<SearchIndex>();
+            *ctx.search_index_rx()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+            let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+            artifact_load_starts.push(start_tx);
 
-            if shared_artifacts_read_only_for_search {
-                match crate::readonly_artifacts::open_search_index_read_only(
-                    &canonical_cache_root,
-                    storage_dir.as_deref(),
-                ) {
-                    crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
-                        search_index_cache_reused = true;
-                        let symbol_files = search_index_symbol_files(&index);
-                        *ctx.search_index()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+            #[cfg(debug_assertions)]
+            mark_search_rebuild_spawn_for_debug();
+            thread::spawn(move || {
+                if start_rx.recv().is_err() {
+                    return;
+                }
+                log_ctx::with_session(session_id_for_bg.clone(), || {
+                    note_configure_artifact_load_attempt();
+                    if shared_artifacts_read_only_for_search {
+                        match crate::readonly_artifacts::open_search_index_read_only(
+                            &root_for_search,
+                            symbol_storage.as_deref(),
+                        ) {
+                            crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
+                                let symbol_files = search_index_symbol_files(&index);
+                                let _ = tx.send(index);
+                                spawn_symbol_cache_prewarm(
+                                    root_for_search,
+                                    symbol_cache,
+                                    symbol_storage,
+                                    symbol_project_key,
+                                    symbol_cache_generation,
+                                    symbol_files,
+                                    true,
+                                    log_ctx::current_session(),
+                                );
+                            }
+                            crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                                slog_warn!(
+                                    "search index is read-only and stale for {} file(s); not repairing shared artifacts",
+                                    stale.drift_count
+                                );
+                            }
+                            crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
+                                slog_warn!(
+                                    "search index is read-only but no shared artifact snapshot exists"
+                                );
+                            }
+                        }
+                        return;
+                    }
+
+                    let _permit = crate::cold_build_limiter::acquire_blocking(
+                        "search index post-configure load",
+                    );
+                    // HEAD freshness is deliberately probed after the bind ack. The
+                    // helper bounds git so a wedged repository cannot pin maintenance.
+                    let current_head = current_git_head(&root_for_search);
+                    let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
+                    let mut index = match baseline {
+                        Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
+                            let _cache_lock = (!is_worktree_bridge_for_search)
+                                .then(|| CacheLock::acquire(&cache_dir, &root_for_search).ok())
+                                .flatten();
+                            index.set_ready(false);
+                            index.verify_against_disk(current_head.clone());
+                            index
+                        }
+                        mut baseline => {
+                            if let Some(index) = baseline.as_mut() {
+                                index.set_ready(false);
+                            }
+                            let _cache_lock = if is_worktree_bridge_for_search {
+                                None
+                            } else {
+                                CacheLock::acquire(&cache_dir, &root_for_search).ok()
+                            };
+                            let index = SearchIndex::rebuild_or_refresh(
+                                &root_for_search,
+                                search_index_max_file_size,
+                                current_head,
+                                baseline,
+                                Some(&cache_dir),
+                            );
+                            delay_search_rebuild_publish_for_debug();
+                            index
+                        }
+                    };
+                    if !is_worktree_bridge_for_search {
+                        let head = index.stored_git_head().map(str::to_owned);
+                        index.write_to_disk(&cache_dir, head.as_deref());
+                    }
+                    let symbol_files = search_index_symbol_files(&index);
+                    if search_generation_flag.load(Ordering::SeqCst) == search_generation {
+                        let _ = tx.send(index);
                         spawn_symbol_cache_prewarm(
-                            root_for_prewarm,
+                            root_for_search,
                             symbol_cache,
                             symbol_storage,
                             symbol_project_key,
                             symbol_cache_generation,
                             symbol_files,
-                            true,
-                            session_id_for_bg,
+                            false,
+                            log_ctx::current_session(),
+                        );
+                    } else {
+                        slog_info!(
+                            "search index build result discarded for stale generation {}",
+                            search_generation
                         );
                     }
-                    crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                        slog_warn!(
-                        "search index is read-only and stale for {} file(s); not repairing shared artifacts",
-                        stale.drift_count
-                    );
-                    }
-                    crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
-                        slog_warn!(
-                            "search index is read-only but no shared artifact snapshot exists"
-                        );
-                    }
-                }
-            } else {
-                let baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
-                search_index_cache_reused = baseline.is_some();
-                match baseline {
-                    Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
-                        // Install the cached index immediately as NOT-ready, then VERIFY
-                        // it against disk on a BACKGROUND thread. `verify_against_disk`
-                        // walks the project and content-hashes every cached file
-                        // (verify_file_strict → blake3), which is O(repo) and MUST NOT
-                        // run on the dispatch thread: configure is dispatched on the
-                        // single request loop, so an inline verify blocks configure and
-                        // every queued request (bash/read/edit) past the 30s transport
-                        // timeout on a large repo. This regressed in v0.39.1 — v0.39.0
-                        // verify was stat-only (mtime+size); content_hash was added to
-                        // FileFreshness so verify now hashes all files. While ready=false
-                        // grep/glob fall back to a walk, exactly like the cache-miss
-                        // branch below. The drain installs the verified, ready index.
-                        index.set_ready(false);
-                        *ctx.search_index()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(index.clone());
-
-                        let (tx, rx): (
-                            crossbeam_channel::Sender<SearchIndex>,
-                            crossbeam_channel::Receiver<SearchIndex>,
-                        ) = unbounded();
-                        *ctx.search_index_rx()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
-
-                        #[cfg(debug_assertions)]
-                        mark_search_rebuild_spawn_for_debug();
-
-                        let head_for_verify = current_head.clone();
-                        thread::spawn(move || {
-                            let session_id_for_prewarm = session_id_for_bg.clone();
-                            log_ctx::with_session(session_id_for_bg, || {
-                                let _permit = crate::cold_build_limiter::acquire_blocking(
-                                    "search index warm verify",
-                                );
-                                let mut verified = index;
-                                let _cache_lock = if is_worktree_bridge_for_search {
-                                    None
-                                } else {
-                                    CacheLock::acquire(&cache_dir, &root_for_prewarm).ok()
-                                };
-                                verified.verify_against_disk(head_for_verify);
-                                let symbol_files = search_index_symbol_files(&verified);
-                                if search_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                                    == search_generation
-                                {
-                                    let _ = tx.send(verified);
-                                } else {
-                                    slog_info!(
-                                    "search index build result discarded for stale generation {}",
-                                    search_generation
-                                );
-                                    return;
-                                }
-                                spawn_symbol_cache_prewarm(
-                                    root_for_prewarm,
-                                    symbol_cache,
-                                    symbol_storage,
-                                    symbol_project_key,
-                                    symbol_cache_generation,
-                                    symbol_files,
-                                    is_worktree_bridge_for_search,
-                                    session_id_for_prewarm,
-                                );
-                            });
-                        });
-                    }
-                    mut baseline => {
-                        if let Some(index) = baseline.as_mut() {
-                            index.set_ready(false);
-                            *ctx.search_index()
-                                .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(index.clone());
-                        }
-
-                        let (tx, rx): (
-                            crossbeam_channel::Sender<SearchIndex>,
-                            crossbeam_channel::Receiver<SearchIndex>,
-                        ) = unbounded();
-                        *ctx.search_index_rx()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
-
-                        #[cfg(debug_assertions)]
-                        mark_search_rebuild_spawn_for_debug();
-
-                        let root_clone = canonical_cache_root.clone();
-                        let search_generation_flag = Arc::clone(&search_generation_flag);
-                        thread::spawn(move || {
-                            let session_id_for_prewarm = session_id_for_bg.clone();
-                            log_ctx::with_session(session_id_for_bg, || {
-                                let _permit = crate::cold_build_limiter::acquire_blocking(
-                                    "search index build",
-                                );
-                                let index = {
-                                    let _cache_lock = if is_worktree_bridge_for_search {
-                                        None
-                                    } else {
-                                        match CacheLock::acquire(&cache_dir, &root_clone) {
-                                            Ok(lock) => Some(lock),
-                                            Err(error) => {
-                                                slog_warn!(
-                                                    "failed to acquire search cache lock: {}",
-                                                    error
-                                                );
-                                                None
-                                            }
-                                        }
-                                    };
-                                    let mut index = SearchIndex::rebuild_or_refresh(
-                                        &root_clone,
-                                        search_index_max_file_size,
-                                        current_head,
-                                        baseline,
-                                        Some(&cache_dir),
-                                    );
-                                    delay_search_rebuild_publish_for_debug();
-                                    if !is_worktree_bridge_for_search {
-                                        let head = index.stored_git_head().map(str::to_owned);
-                                        index.write_to_disk(&cache_dir, head.as_deref());
-                                    }
-                                    index
-                                };
-
-                                let symbol_files = search_index_symbol_files(&index);
-                                if search_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                                    == search_generation
-                                {
-                                    let _ = tx.send(index);
-                                } else {
-                                    slog_info!(
-                                    "search index build result discarded for stale generation {}",
-                                    search_generation
-                                );
-                                    return;
-                                }
-                                spawn_symbol_cache_prewarm(
-                                    root_clone,
-                                    symbol_cache,
-                                    symbol_storage,
-                                    symbol_project_key,
-                                    symbol_cache_generation,
-                                    symbol_files,
-                                    is_worktree_bridge_for_search,
-                                    session_id_for_prewarm,
-                                );
-                            });
-                        });
-                    }
-                }
-            }
+                });
+            });
         }
 
         if semantic_search && ctx.shared_artifacts_read_only() {
-            match crate::readonly_artifacts::open_semantic_index_read_only(
-                &canonical_cache_root,
-                storage_dir.as_deref(),
-            ) {
-                crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
-                    *ctx.semantic_index()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-                    *ctx.semantic_index_status()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        SemanticIndexStatus::ready();
-                }
-                crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                    // Serve the stale snapshot instead of refusing: read-only
-                    // sessions (mason worktrees) cannot rebuild, and drifted
-                    // embeddings still rank far better than no semantic lane.
-                    // Same serve-with-disclosure posture as the trigram lane
-                    // above and the cross-root borrow path.
-                    crate::slog_warn!(
-                        "semantic index is read-only and stale for {} file(s); serving stale snapshot without repairing shared artifacts",
-                        stale.drift_count
-                    );
-                    *ctx.semantic_index()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stale.index);
-                    *ctx.semantic_index_status()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        SemanticIndexStatus::ready();
-                }
-                crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
-                    *ctx.semantic_index_status()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        SemanticIndexStatus::Failed(
-                            "semantic index is read-only but no shared artifact snapshot exists"
-                                .to_string(),
-                        );
-                }
-            }
-        } else if semantic_search {
-            let semantic_initial_stage = if previous_config.semantic_search
-                && previous_project_root.as_deref() == Some(root_path.as_path())
-                && semantic_fingerprint_config_changed(&previous_config.semantic, &semantic_config)
-            {
-                "fingerprint_change"
-            } else {
-                "initial"
-            };
             *ctx.semantic_index_status()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 SemanticIndexStatus::Building {
-                    stage: semantic_initial_stage.to_string(),
+                    stage: "loading_artifacts".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                };
+            let (tx, rx) = unbounded::<SemanticIndexEvent>();
+            *ctx.semantic_index_rx().lock() = Some(rx);
+            let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+            artifact_load_starts.push(start_tx);
+            let semantic_root = canonical_cache_root.clone();
+            let semantic_storage = storage_dir.clone();
+            let session_id = log_ctx::current_session();
+            thread::spawn(move || {
+                if start_rx.recv().is_err() {
+                    return;
+                }
+                log_ctx::with_session(session_id, || {
+                    note_configure_artifact_load_attempt();
+                    let event = match crate::readonly_artifacts::open_semantic_index_read_only(
+                        &semantic_root,
+                        semantic_storage.as_deref(),
+                    ) {
+                        crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
+                            SemanticIndexEvent::Ready(index)
+                        }
+                        crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                            slog_warn!(
+                                "semantic index is read-only and stale for {} file(s); serving stale snapshot without repairing shared artifacts",
+                                stale.drift_count
+                            );
+                            SemanticIndexEvent::Ready(stale.index)
+                        }
+                        crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
+                            SemanticIndexEvent::Failed(
+                                "semantic index is read-only but no shared artifact snapshot exists"
+                                    .to_string(),
+                            )
+                        }
+                    };
+                    let _ = tx.send(event);
+                });
+            });
+        } else if semantic_search {
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SemanticIndexStatus::Building {
+                    stage: "loading_artifacts".to_string(),
                     files: None,
                     entries_done: None,
                     entries_total: None,
@@ -2365,7 +2301,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             let semantic_generation_flag = ctx.configure_generation_flag();
             let semantic_fingerprint_generation_flag = ctx.semantic_fingerprint_generation_flag();
             let session_id_for_bg2 = log_ctx::current_session();
+            let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+            artifact_load_starts.push(start_tx);
             thread::spawn(move || {
+                if start_rx.recv().is_err() {
+                    return;
+                }
+                note_configure_artifact_load_attempt();
                 log_ctx::with_session(session_id_for_bg2, || {
                     // Cap file count to bound memory on huge project roots (e.g.,
                     // /home/user). The local fastembed model (~200MB) + embeddings +
@@ -2808,6 +2750,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         || previous_config.experimental_bash_compress != next_config.experimental_bash_compress;
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
+    ctx.begin_configure_ack_phase("maintenance_enqueue");
     ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
         root_path: root_path.clone(),
@@ -2824,6 +2767,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         reset_filter_registry: !equivalent_warm_config,
         clear_failed_spawns,
         warm_callgraph_store: next_config.callgraph_store && !home_match && !equivalent_warm_config,
+        artifact_load_starts,
     });
 
     slog_info!("project root set: {}", root_path.display());
@@ -2879,6 +2823,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Return the success response immediately so the plugin can mark the project as
     // configured. Missing-binary warnings are sent later in a `configure_warnings`
     // push frame.
+    ctx.begin_configure_ack_phase("ack_ready");
     let response = Response::success(
         &req.id,
         json!({
@@ -2935,13 +2880,21 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             && !job.sync_bash_compress_flag
             && !job.reset_filter_registry
             && !job.clear_failed_spawns
-            && !job.warm_callgraph_store;
+            && !job.warm_callgraph_store
+            && job.artifact_load_starts.is_empty();
         if session_only {
             replay_configure_session(ctx, &job);
             continue;
         }
 
         delay_configure_deferred_maintenance_for_test();
+
+        // Artifact workers are created in a blocked state during configure so
+        // no deserialization can race ahead of the bind acknowledgement. The
+        // configure tail is scheduled only after the response is delivered.
+        for start in &job.artifact_load_starts {
+            let _ = start.send(());
+        }
 
         if job.format_tool_cache_clear_needed {
             crate::format::clear_tool_cache();
@@ -3105,8 +3058,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        external_ignore_watch_paths, install_project_watcher_with, parse_lsp_paths_extra,
-        semantic_build_retry_backoff, should_clear_failed_spawns, validate_storage_dir,
+        configure_artifact_load_attempts_for_test, external_ignore_watch_paths,
+        install_project_watcher_with, parse_lsp_paths_extra,
+        reset_configure_artifact_load_attempts_for_test, semantic_build_retry_backoff,
+        should_clear_failed_spawns, validate_storage_dir,
     };
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -3478,6 +3433,7 @@ mod tests {
     }
 
     fn wait_for_semantic_build_ready(ctx: &AppContext, timeout: Duration) {
+        super::drain_deferred_configure_maintenance(ctx);
         let deadline = Instant::now() + timeout;
         loop {
             crate::runtime_drain::drain_build_completions(ctx);
@@ -3856,7 +3812,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("shared artifacts opened read-only"));
-        assert!(sibling_ctx.search_index_rx().read().unwrap().is_none());
+        assert!(
+            sibling_ctx.search_index_rx().read().unwrap().is_some(),
+            "read-only sibling search artifact must remain gated until configure maintenance"
+        );
     }
 
     #[test]
@@ -4084,6 +4043,9 @@ mod tests {
             "configure failed: {:?}",
             first_response.data
         );
+        // The runtime opens post-ack loader gates before a later reconfigure can
+        // supersede the generation; mirror that ordering in this direct-handler test.
+        super::drain_deferred_configure_maintenance(&first_ctx);
         let disabled_response = handle_configure_for_test(
             &configure_semantic_with_storage(&project, &storage, &server.base_url, false),
             &first_ctx,
@@ -4144,7 +4106,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_worktree_configure_schedules_no_cold_warm_builds() {
+    fn linked_worktree_configure_defers_read_only_artifact_loads_without_cold_builds() {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
@@ -4178,9 +4140,18 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(ctx.cache_role(), "worktree");
-        assert!(ctx.search_index_rx().read().unwrap().is_none());
-        assert!(ctx.semantic_index_rx().lock().is_none());
-        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert!(
+            ctx.search_index_rx().read().unwrap().is_some(),
+            "read-only search artifact load should wait for configure maintenance"
+        );
+        assert!(
+            ctx.semantic_index_rx().lock().is_some(),
+            "read-only semantic artifact load should wait for configure maintenance"
+        );
+        assert!(
+            ctx.callgraph_store_rx().lock().is_none(),
+            "linked worktrees must not schedule a callgraph cold build"
+        );
     }
 
     #[test]
@@ -4246,6 +4217,57 @@ mod tests {
         let frame =
             wait_for_configure_warnings(&ctx, ctx.configure_generation(), Duration::from_secs(5));
         assert_eq!(frame.frame_type, "configure_warnings");
+    }
+
+    #[test]
+    fn configure_artifact_loads_start_only_from_post_ack_maintenance() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+        reset_configure_artifact_load_attempts_for_test();
+
+        let response = handle_configure_for_test(&req, &ctx);
+        assert!(response.success);
+        assert_eq!(
+            configure_artifact_load_attempts_for_test(),
+            0,
+            "artifact deserialization started before configure returned its acknowledgement"
+        );
+        assert!(ctx.search_index_rx().read().unwrap().is_some());
+
+        super::drain_deferred_configure_maintenance(&ctx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while configure_artifact_load_attempts_for_test() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "post-ack maintenance did not release the artifact loader"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let completion_deadline = Instant::now() + Duration::from_secs(5);
+        while ctx.search_index_rx().read().unwrap().is_some() {
+            crate::runtime_drain::drain_search_index_events(&ctx);
+            assert!(
+                Instant::now() < completion_deadline,
+                "post-ack artifact loader did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

@@ -1963,6 +1963,7 @@ pub(crate) fn configure_search_order_context_for_test(
         reset_filter_registry: false,
         clear_failed_spawns: false,
         warm_callgraph_store: false,
+        artifact_load_starts: Vec::new(),
     });
 
     let (search_tx, search_rx) = crossbeam_channel::unbounded();
@@ -2026,6 +2027,52 @@ mod tests {
             "configure must install the ignore matcher before pending paths replay"
         );
         ctx.stop_watcher_runtime();
+    }
+
+    #[test]
+    fn post_ack_semantic_ready_transition_pushes_status_changed() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.project_root = Some(root.path().to_path_buf());
+        config.semantic_search = true;
+        let ctx = AppContext::new(default_language_provider_factory(), config);
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        *ctx.semantic_index_rx().lock() = Some(event_rx);
+        let (push_tx, push_rx) = std::sync::mpsc::channel();
+        ctx.set_progress_sender(Some(std::sync::Arc::new(Box::new(move |frame| {
+            let _ = push_tx.send(frame);
+        }))));
+
+        event_tx
+            .send(SemanticIndexEvent::Ready(
+                crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3),
+            ))
+            .unwrap();
+        drain_semantic_index_events(&ctx);
+
+        assert!(matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { .. }
+        ));
+        let pushed = push_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready transition should push status_changed");
+        assert!(matches!(
+            pushed,
+            crate::protocol::PushFrame::StatusChanged(_)
+        ));
     }
 
     #[test]

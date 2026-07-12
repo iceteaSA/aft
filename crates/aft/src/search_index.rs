@@ -4440,22 +4440,42 @@ fn remaining_bytes<R: Seek>(reader: &mut R, total_len: usize) -> Option<usize> {
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
-    let output = crate::effective_path::new_command("git")
+    const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let mut child = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(root)
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let deadline = Instant::now() + GIT_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let value = String::from_utf8(output.stdout).ok()?;
+    let mut stdout = Vec::new();
+    child.stdout.take()?.read_to_end(&mut stdout).ok()?;
+    let value = String::from_utf8(stdout).ok()?;
     let value = value.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    (!value.is_empty()).then_some(value)
 }
 
 fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: &str) -> bool {

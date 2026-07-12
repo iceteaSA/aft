@@ -193,6 +193,7 @@ pub struct MutatingLaneSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindBlockerSnapshot {
     pub configure_state: &'static str,
+    pub configure_phase_timings: Option<String>,
     pub blockers: Vec<String>,
 }
 
@@ -743,6 +744,10 @@ impl SchedulerState {
 
         BindBlockerSnapshot {
             configure_state,
+            configure_phase_timings: self
+                .actors
+                .get(root_id)
+                .map(|actor| actor.ctx.configure_ack_phase_snapshot()),
             blockers,
         }
     }
