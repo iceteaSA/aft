@@ -1267,9 +1267,9 @@ fn run_subc_mode_inner(
 
     let actor_contexts = executor.actor_contexts();
     if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
-        // EOF/Goodbye teardown flushes each root's in-memory trigram delta.
-        // Fatal/panic-driven connection teardown skips this best-effort disk work.
-        flush_actor_search_indexes_on_graceful_shutdown(&actor_contexts);
+        // EOF/Goodbye teardown flushes each root's index deltas and queued
+        // callgraph refreshes. Fatal/panic teardown skips this best-effort work.
+        flush_actor_indexes_on_graceful_shutdown(&actor_contexts);
     }
     for actor_ctx in &actor_contexts {
         actor_ctx.lsp().shutdown_all();
@@ -1279,10 +1279,11 @@ fn run_subc_mode_inner(
     loop_result.map(|_| ())
 }
 
-fn flush_actor_search_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) {
+fn flush_actor_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) {
     for actor_ctx in actor_contexts {
         let _ = actor_ctx.flush_search_index_on_graceful_shutdown();
     }
+    let _ = crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
 }
 
 /// Test-only entry that enables the non-manifest native-command passthrough on
@@ -3585,7 +3586,7 @@ mod tests {
         assert!(executor.register_actor(root1.clone(), Arc::clone(&ctx1)));
         assert!(executor.register_actor(root2.clone(), Arc::clone(&ctx2)));
 
-        flush_actor_search_indexes_on_graceful_shutdown(&executor.actor_contexts());
+        flush_actor_indexes_on_graceful_shutdown(&executor.actor_contexts());
 
         let mut restored1 =
             crate::search_index::SearchIndex::read_from_disk(&cache_dir1, &canonical_root1)

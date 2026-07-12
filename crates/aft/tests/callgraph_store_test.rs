@@ -989,7 +989,17 @@ fn writer_access_serves_legacy_fallback_while_background_migration_and_refresh_c
     assert!(migrated
         .sqlite_path()
         .starts_with(ctx.callgraph_store_dir()));
-    assert_eq!(entry_leaf_from_store(migrated.as_ref()), "migratedLeaf");
+    let refresh_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if entry_leaf_from_store(migrated.as_ref()) == "migratedLeaf" {
+            break;
+        }
+        assert!(
+            Instant::now() < refresh_deadline,
+            "background watcher refresh did not converge the migrated generation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
         without_wal_sidecars(directory_file_snapshot(&legacy_dir)),
         legacy_before,

@@ -929,7 +929,7 @@ pub struct AppContext {
     callgraph_store_force_rebuild: parking_lot::Mutex<bool>,
     callgraph_store_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
     callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
-    pending_callgraph_store_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
+    pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
     search_index: RwLock<Option<SearchIndex>>,
     search_index_rx: RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
@@ -1158,7 +1158,7 @@ impl AppContext {
             callgraph_store_force_rebuild: parking_lot::Mutex::new(false),
             callgraph_store_rx: parking_lot::Mutex::new(None),
             callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
-            pending_callgraph_store_paths: parking_lot::Mutex::new(BTreeSet::new()),
+            pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
             search_index: RwLock::new(None),
             search_index_rx: RwLock::new(None),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
@@ -2630,16 +2630,13 @@ impl AppContext {
                     // the installed store reflects mid-build edits (mirrors the
                     // drain install path). Empty in the common case.
                     let pending = self.take_pending_callgraph_store_paths();
-                    if !pending.is_empty() {
-                        if let Err(error) = store.refresh_files(&pending) {
-                            crate::slog_warn!(
-                                "callgraph store inline post-build refresh failed: {}",
-                                error
-                            );
-                            let _ = store.mark_files_stale(&pending);
-                        }
-                    }
+                    // The completed build owns the writer lease until dropped;
+                    // release it before the refresh worker lazily opens the newly
+                    // published generation.
                     drop(store);
+                    if !pending.is_empty() {
+                        self.enqueue_callgraph_store_refresh(pending);
+                    }
                     let ready = match CallGraphStore::open_readonly(
                         callgraph_dir.clone(),
                         project_root.clone(),
@@ -2841,8 +2838,8 @@ impl AppContext {
         &self.callgraph_store_rx
     }
 
-    /// Record source-file paths that changed while a cold build was in flight,
-    /// so they can be refreshed once the freshly-built store is installed.
+    /// Record source-file paths that could not be applied to the writable store
+    /// so the next ready-store replay can refresh them.
     pub fn add_pending_callgraph_store_paths<I>(&self, paths: I)
     where
         I: IntoIterator<Item = PathBuf>,
@@ -2850,7 +2847,36 @@ impl AppContext {
         self.pending_callgraph_store_paths.lock().extend(paths);
     }
 
-    /// Take and clear the paths that changed during a background cold build.
+    /// Queue a refresh on the process-wide store worker. Writer-ineligible roots
+    /// retain the invalidation for replay instead of touching shared store state.
+    pub fn enqueue_callgraph_store_refresh<I>(&self, paths: I) -> bool
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        if paths.is_empty() {
+            return true;
+        }
+        if !self.heavy_root_work_allowed() {
+            return false;
+        }
+        if !self.callgraph_writer() {
+            self.add_pending_callgraph_store_paths(paths);
+            return false;
+        }
+        let Some(project_root) = self.callgraph_project_root() else {
+            self.add_pending_callgraph_store_paths(paths);
+            return false;
+        };
+        crate::callgraph_store::enqueue_callgraph_store_refresh(
+            self.callgraph_store_dir(),
+            project_root,
+            paths,
+            Arc::clone(&self.pending_callgraph_store_paths),
+        )
+    }
+
+    /// Take and clear paths waiting for a ready writable store.
     pub fn take_pending_callgraph_store_paths(&self) -> Vec<PathBuf> {
         std::mem::take(&mut *self.pending_callgraph_store_paths.lock())
             .into_iter()

@@ -11,7 +11,15 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
-    config::Config, parser::TreeSitterProvider, path_identity::ProjectRootId, protocol::Response,
+    callgraph_store::{
+        callgraph_refresh_worker_test_counts, clear_callgraph_refresh_worker_test_seam,
+        flush_callgraph_store_refreshes_with_budget, set_callgraph_refresh_worker_test_seam,
+        CallGraphStore,
+    },
+    config::Config,
+    parser::TreeSitterProvider,
+    path_identity::ProjectRootId,
+    protocol::Response,
 };
 
 fn ok(id: impl Into<String>) -> Response {
@@ -1260,6 +1268,84 @@ fn newer_interactive_mutator_beats_older_same_actor_maintenance_mutator() {
         .recv_timeout(Duration::from_secs(1))
         .expect("maintenance starts after cap frees");
     assert!(recv_async(maintenance).success);
+}
+
+#[test]
+fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
+    let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+    let root_dir = tempfile::Builder::new()
+        .prefix("aft-executor-callgraph-offload-")
+        .tempdir()
+        .expect("create callgraph worker root");
+    let storage = root_dir.path().join("storage");
+    let source = root_dir.path().join("main.rs");
+    std::fs::write(&source, "fn entry() { leaf(); }\nfn leaf() {}\n")
+        .expect("write callgraph fixture");
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root_dir.path().to_path_buf()),
+            storage_dir: Some(storage),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    ));
+    ctx.set_canonical_cache_root(root_dir.path().to_path_buf());
+    ctx.set_cache_role(false, None);
+    let (store, _) = CallGraphStore::cold_build_with_lease(
+        ctx.callgraph_store_dir(),
+        root_dir.path().to_path_buf(),
+        std::slice::from_ref(&source),
+    )
+    .expect("build callgraph fixture");
+    drop(store);
+    set_callgraph_refresh_worker_test_seam(
+        root_dir.path().to_path_buf(),
+        Duration::from_millis(350),
+        false,
+    );
+
+    let executor = test_executor(2, 1, 2, 1);
+    let root = ProjectRootId::from_path(root_dir.path()).expect("canonical actor root");
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+    let ctx_for_drain = Arc::clone(&ctx);
+    let source_for_drain = source.clone();
+    let maintenance = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "watcher-drain".to_string(),
+        Box::new(move |_| {
+            ctx_for_drain.enqueue_callgraph_store_refresh([source_for_drain]);
+            ok("watcher-drain")
+        }),
+    );
+    assert!(recv_async(maintenance).success);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while callgraph_refresh_worker_test_counts(root_dir.path()).0 == 0 {
+        assert!(Instant::now() < deadline, "refresh worker did not start");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let (mutating_started_tx, mutating_started_rx) = crossbeam_channel::bounded(1);
+    let mutating = executor.submit_async(
+        root,
+        Lane::Mutating,
+        "interactive-edit".to_string(),
+        Box::new(move |_| {
+            mutating_started_tx
+                .send(())
+                .expect("signal writer admission");
+            ok("interactive-edit")
+        }),
+    );
+    mutating_started_rx
+        .recv_timeout(Duration::from_millis(150))
+        .expect("interactive writer should admit while store worker is mid-write");
+    assert!(recv_async(mutating).success);
+    assert!(flush_callgraph_store_refreshes_with_budget(
+        Duration::from_secs(1)
+    ));
+    clear_callgraph_refresh_worker_test_seam(root_dir.path());
 }
 
 #[test]

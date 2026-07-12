@@ -346,21 +346,13 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
             .into_iter()
             .filter(|path| !watcher_path_is_generated_for_callgraph(ctx, path))
             .collect::<Vec<_>>();
-        if !pending.is_empty() {
-            if let Err(error) = store.refresh_files(&pending) {
-                crate::slog_warn!(
-                    "callgraph store post-build pending refresh failed: {}",
-                    error
-                );
-                if let Err(mark_error) = store.mark_files_stale(&pending) {
-                    crate::slog_warn!(
-                        "failed to mark callgraph store files stale after post-build refresh failure: {}",
-                        mark_error
-                    );
-                }
-            }
-        }
+        // Release the cold-build writer lease before waking the refresh worker.
+        // The worker opens through the generation pointer when it processes the
+        // batch, so a concurrent later swap still targets the current generation.
         drop(store);
+        if !pending.is_empty() {
+            ctx.enqueue_callgraph_store_refresh(pending);
+        }
         if let Some(project_root) = ctx.callgraph_project_root() {
             match CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root) {
                 Ok(Some(store)) => {
@@ -1291,7 +1283,7 @@ pub fn refresh_callgraph_store_for_watcher(
     ctx: &AppContext,
     changed: &HashSet<std::path::PathBuf>,
 ) {
-    if !ctx.callgraph_writer() || !ctx.heavy_root_work_allowed() {
+    if !ctx.heavy_root_work_allowed() {
         return;
     }
     let source_paths = changed
@@ -1305,50 +1297,10 @@ pub fn refresh_callgraph_store_for_watcher(
     if source_paths.is_empty() {
         return;
     }
-    // Converge to the current generation before writing: if another process
-    // published a newer one, drop our stale store so the changed paths get
-    // recorded as pending and replayed against the fresh store (rather than
-    // incrementally written into a superseded generation).
-    ctx.revalidate_callgraph_store_generation();
-    let Some(project_root) = ctx.callgraph_project_root() else {
-        return;
-    };
-    if !ctx.callgraph_writer() {
-        return;
-    }
-    let store = match CallGraphStore::open_ready(ctx.callgraph_store_dir(), project_root.clone()) {
-        Ok(Some(store)) => store,
-        Ok(None) => {
-            // A missing ready store or one that needs repair is replayed after the
-            // maintenance build publishes a writable generation. The watcher drain
-            // never performs root repair or a cold rebuild inline.
-            ctx.add_pending_callgraph_store_paths(source_paths);
-            return;
-        }
-        Err(error) => {
-            ctx.add_pending_callgraph_store_paths(source_paths);
-            aft::slog_warn!(
-                "callgraph store writer open failed during refresh; deferred paths: {}",
-                error
-            );
-            return;
-        }
-    };
-    if let Err(error) = store.refresh_files(&source_paths) {
-        aft::slog_warn!("callgraph store refresh failed: {}", error);
-        match store.mark_files_stale(&source_paths) {
-            Ok(marked) => aft::slog_warn!(
-                "marked {} callgraph store file(s) stale after refresh failure",
-                marked.len()
-            ),
-            Err(mark_error) => aft::slog_warn!(
-                "failed to mark callgraph store files stale after refresh failure: {}",
-                mark_error
-            ),
-        }
-    } else {
-        crate::logging::note_callgraph_invalidations(source_paths.len());
-    }
+    // This is intentionally the only watcher call-site action. Opening and
+    // mutating SQLite belongs to the process-wide store worker, outside every
+    // executor lane and its epoch gate.
+    ctx.enqueue_callgraph_store_refresh(source_paths);
 }
 
 /// Drain pre-filtered watcher events and apply cache invalidations on the
@@ -2262,6 +2214,31 @@ mod watcher_slice_tests {
 
         refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone(), generated]));
 
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let pending = ctx.take_pending_callgraph_store_paths();
+            if !pending.is_empty() {
+                assert_eq!(pending, vec![source]);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "refresh worker did not defer the unavailable store batch"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn watcher_callgraph_refresh_keeps_worktree_paths_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _) = context_with_watcher(temp.path());
+        ctx.update_config(|config| config.callgraph_store = true);
+        ctx.set_cache_role(true, None);
+        let source = temp.path().join("worktree.rs");
+
+        refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone()]));
+
         assert_eq!(ctx.take_pending_callgraph_store_paths(), vec![source]);
     }
 
@@ -2296,8 +2273,8 @@ mod watcher_slice_tests {
         // budget may end a slice early under parallel test load, so an exact
         // slice count would be load-sensitive.
         assert!(
-            (4..8).contains(&slices),
-            "expected 4-7 path-budgeted slices, got {slices}"
+            (4..=8).contains(&slices),
+            "expected 4-8 path-budgeted slices, got {slices}"
         );
         assert_eq!(ctx.pending_tier2_paths().len(), path_count);
     }

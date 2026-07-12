@@ -17,7 +17,8 @@ use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, Ve
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tree_sitter::{Node, Parser};
 
@@ -40,6 +41,9 @@ const SQLITE_FILE_SET_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
 /// always retained, bounding the root-keyed callgraph store to roughly two or
 /// three large generations without adding user-visible configuration.
 const MARKED_GENERATION_RETENTION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const REFRESH_WORKER_WARN_AFTER: Duration = Duration::from_secs(5);
+const REFRESH_WORKER_FINAL_AFTER: Duration = Duration::from_secs(30);
+pub const REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 // THREAD-LOCAL, not a process-global: the observer fires synchronously on the
@@ -167,6 +171,436 @@ pub const CALLGRAPH_STORE_FLAG: &str = "callgraph_store";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CallGraphStoreOptions {
     pub enabled: bool,
+}
+
+pub type PendingCallGraphStorePaths = Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RefreshRoot {
+    callgraph_dir: PathBuf,
+    project_root: PathBuf,
+}
+
+#[derive(Clone)]
+struct RefreshBatch {
+    root: RefreshRoot,
+    paths: BTreeSet<PathBuf>,
+    pending_sinks: Vec<PendingCallGraphStorePaths>,
+}
+
+impl RefreshBatch {
+    fn defer(&self) {
+        for sink in &self.pending_sinks {
+            sink.lock().extend(self.paths.iter().cloned());
+        }
+    }
+
+    fn merge(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        sink: PendingCallGraphStorePaths,
+    ) {
+        self.paths.extend(paths);
+        if !self
+            .pending_sinks
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &sink))
+        {
+            self.pending_sinks.push(sink);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RefreshQueue {
+    order: VecDeque<RefreshRoot>,
+    queued: HashMap<RefreshRoot, RefreshBatch>,
+    active: Option<RefreshBatch>,
+    shutdown_requested: bool,
+}
+
+struct RefreshWorkerShared {
+    queue: Mutex<RefreshQueue>,
+    wake: Condvar,
+}
+
+struct RefreshWorker {
+    shared: Arc<RefreshWorkerShared>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct RefreshWorkerWatchdog {
+    first_path: PathBuf,
+    batch_len: usize,
+    started: Instant,
+}
+
+impl RefreshWorkerWatchdog {
+    fn start(paths: &[PathBuf]) -> Self {
+        Self {
+            first_path: paths
+                .first()
+                .expect("non-empty callgraph refresh batch has a first path")
+                .clone(),
+            batch_len: paths.len(),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RefreshWorkerWatchdog {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if elapsed < REFRESH_WORKER_WARN_AFTER {
+            return;
+        }
+        let path = if self.batch_len == 1 {
+            self.first_path.display().to_string()
+        } else {
+            format!(
+                "{} (+{} paths)",
+                self.first_path.display(),
+                self.batch_len - 1
+            )
+        };
+        log::warn!(
+            "watcher drain unit exceeded 5s: phase=callgraph path={} elapsed={}ms",
+            path,
+            elapsed.as_millis()
+        );
+        if elapsed >= REFRESH_WORKER_FINAL_AFTER {
+            log::warn!(
+                "watcher drain unit completed after 30s: phase=callgraph path={} elapsed={}ms",
+                path,
+                elapsed.as_millis()
+            );
+        }
+    }
+}
+
+impl RefreshWorker {
+    fn spawn() -> Arc<Self> {
+        let shared = Arc::new(RefreshWorkerShared {
+            queue: Mutex::new(RefreshQueue::default()),
+            wake: Condvar::new(),
+        });
+        let thread_shared = Arc::clone(&shared);
+        let thread = std::thread::Builder::new()
+            .name("aft-callgraph-refresh".to_string())
+            .spawn(move || callgraph_refresh_worker_loop(&thread_shared))
+            .expect("failed to spawn callgraph refresh worker");
+        Arc::new(Self {
+            shared,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    fn enqueue(
+        &self,
+        root: RefreshRoot,
+        paths: Vec<PathBuf>,
+        pending_sink: PendingCallGraphStorePaths,
+    ) -> bool {
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .expect("callgraph refresh queue mutex poisoned");
+        if queue.shutdown_requested {
+            pending_sink.lock().extend(paths);
+            return false;
+        }
+        if let Some(batch) = queue.queued.get_mut(&root) {
+            batch.merge(paths, pending_sink);
+        } else {
+            queue.order.push_back(root.clone());
+            queue.queued.insert(
+                root.clone(),
+                RefreshBatch {
+                    root,
+                    paths: paths.into_iter().collect(),
+                    pending_sinks: vec![pending_sink],
+                },
+            );
+        }
+        self.shared.wake.notify_one();
+        true
+    }
+
+    fn shutdown_with_budget(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .expect("callgraph refresh queue mutex poisoned");
+        queue.shutdown_requested = true;
+        self.shared.wake.notify_one();
+        while (queue.active.is_some() || !queue.order.is_empty()) && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = self
+                .shared
+                .wake
+                .wait_timeout(queue, remaining)
+                .expect("callgraph refresh queue mutex poisoned while waiting for shutdown");
+            queue = next;
+        }
+        let drained = queue.active.is_none() && queue.order.is_empty();
+        if !drained {
+            if let Some(active) = queue.active.as_ref() {
+                active.defer();
+            }
+            for batch in queue.queued.values() {
+                batch.defer();
+            }
+            queue.order.clear();
+            queue.queued.clear();
+        }
+        drop(queue);
+
+        if drained {
+            if let Some(thread) = self
+                .thread
+                .lock()
+                .expect("callgraph refresh worker thread mutex poisoned")
+                .take()
+            {
+                let _ = thread.join();
+            }
+        }
+        drained
+    }
+}
+
+static CALLGRAPH_REFRESH_WORKER: OnceLock<Mutex<Option<Arc<RefreshWorker>>>> = OnceLock::new();
+
+pub fn enqueue_callgraph_store_refresh(
+    callgraph_dir: PathBuf,
+    project_root: PathBuf,
+    paths: Vec<PathBuf>,
+    pending_sink: PendingCallGraphStorePaths,
+) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    let slot = CALLGRAPH_REFRESH_WORKER.get_or_init(|| Mutex::new(None));
+    let worker = {
+        let mut worker = slot
+            .lock()
+            .expect("callgraph refresh worker mutex poisoned");
+        Arc::clone(worker.get_or_insert_with(RefreshWorker::spawn))
+    };
+    worker.enqueue(
+        RefreshRoot {
+            callgraph_dir,
+            project_root,
+        },
+        paths,
+        pending_sink,
+    )
+}
+
+pub fn flush_callgraph_store_refreshes_on_graceful_shutdown() -> bool {
+    flush_callgraph_store_refreshes_with_budget(REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET)
+}
+
+#[doc(hidden)]
+pub fn flush_callgraph_store_refreshes_with_budget(budget: Duration) -> bool {
+    let slot = CALLGRAPH_REFRESH_WORKER.get_or_init(|| Mutex::new(None));
+    let worker = slot
+        .lock()
+        .expect("callgraph refresh worker mutex poisoned")
+        .clone();
+    let Some(worker) = worker else {
+        return true;
+    };
+    let drained = worker.shutdown_with_budget(budget);
+    if drained {
+        let mut current = slot
+            .lock()
+            .expect("callgraph refresh worker mutex poisoned");
+        if current
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &worker))
+        {
+            *current = None;
+        }
+    }
+    drained
+}
+
+fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
+    loop {
+        let batch = {
+            let mut queue = shared
+                .queue
+                .lock()
+                .expect("callgraph refresh queue mutex poisoned");
+            loop {
+                if let Some(root) = queue.order.pop_front() {
+                    let batch = queue
+                        .queued
+                        .remove(&root)
+                        .expect("queued callgraph refresh root has a batch");
+                    queue.active = Some(batch.clone());
+                    break batch;
+                }
+                if queue.shutdown_requested {
+                    return;
+                }
+                queue = shared
+                    .wake
+                    .wait(queue)
+                    .expect("callgraph refresh queue mutex poisoned while waiting");
+            }
+        };
+
+        process_callgraph_refresh_batch(&batch);
+
+        let mut queue = shared
+            .queue
+            .lock()
+            .expect("callgraph refresh queue mutex poisoned");
+        queue.active = None;
+        shared.wake.notify_all();
+    }
+}
+
+fn process_callgraph_refresh_batch(batch: &RefreshBatch) {
+    let paths = batch.paths.iter().cloned().collect::<Vec<_>>();
+    let _watchdog = RefreshWorkerWatchdog::start(&paths);
+    let store = match CallGraphStore::open_ready(
+        batch.root.callgraph_dir.clone(),
+        batch.root.project_root.clone(),
+    ) {
+        Ok(Some(store)) => store,
+        Ok(None) => {
+            batch.defer();
+            return;
+        }
+        Err(error) => {
+            batch.defer();
+            crate::slog_warn!(
+                "callgraph store writer open failed during refresh; deferred paths: {}",
+                error
+            );
+            return;
+        }
+    };
+
+    let test_seam = refresh_worker_test_seam(&batch.root.project_root);
+    note_refresh_worker_call_for_test(&batch.root.project_root);
+    if !test_seam.delay.is_zero() {
+        std::thread::sleep(test_seam.delay);
+    }
+    let refresh_result = if test_seam.fail_refresh {
+        Err(CallGraphStoreError::Unavailable(
+            "injected refresh worker failure".to_string(),
+        ))
+    } else {
+        store.refresh_files(&paths).map(|_| ())
+    };
+    if let Err(error) = refresh_result {
+        crate::slog_warn!("callgraph store refresh failed: {}", error);
+        match store.mark_files_stale(&paths) {
+            Ok(marked) => {
+                note_refresh_worker_stale_mark_for_test(&batch.root.project_root);
+                crate::slog_warn!(
+                    "marked {} callgraph store file(s) stale after refresh failure",
+                    marked.len()
+                );
+            }
+            Err(mark_error) => crate::slog_warn!(
+                "failed to mark callgraph store files stale after refresh failure: {}",
+                mark_error
+            ),
+        }
+    } else {
+        crate::logging::note_callgraph_invalidations(paths.len());
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct RefreshWorkerTestSeam {
+    delay: Duration,
+    fail_refresh: bool,
+    refresh_calls: usize,
+    stale_marks: usize,
+}
+
+static REFRESH_WORKER_TEST_SEAMS: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestSeam>>> =
+    OnceLock::new();
+
+fn refresh_worker_test_seam(project_root: &Path) -> RefreshWorkerTestSeam {
+    let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() else {
+        return RefreshWorkerTestSeam::default();
+    };
+    seams
+        .lock()
+        .expect("callgraph refresh test seam mutex poisoned")
+        .get(project_root)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn note_refresh_worker_call_for_test(project_root: &Path) {
+    if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
+        if let Some(seam) = seams
+            .lock()
+            .expect("callgraph refresh test seam mutex poisoned")
+            .get_mut(project_root)
+        {
+            seam.refresh_calls += 1;
+        }
+    }
+}
+
+fn note_refresh_worker_stale_mark_for_test(project_root: &Path) {
+    if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
+        if let Some(seam) = seams
+            .lock()
+            .expect("callgraph refresh test seam mutex poisoned")
+            .get_mut(project_root)
+        {
+            seam.stale_marks += 1;
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn set_callgraph_refresh_worker_test_seam(
+    project_root: PathBuf,
+    delay: Duration,
+    fail_refresh: bool,
+) {
+    REFRESH_WORKER_TEST_SEAMS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("callgraph refresh test seam mutex poisoned")
+        .insert(
+            project_root,
+            RefreshWorkerTestSeam {
+                delay,
+                fail_refresh,
+                ..RefreshWorkerTestSeam::default()
+            },
+        );
+}
+
+#[doc(hidden)]
+pub fn callgraph_refresh_worker_test_counts(project_root: &Path) -> (usize, usize) {
+    let seam = refresh_worker_test_seam(project_root);
+    (seam.refresh_calls, seam.stale_marks)
+}
+
+#[doc(hidden)]
+pub fn clear_callgraph_refresh_worker_test_seam(project_root: &Path) {
+    if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
+        seams
+            .lock()
+            .expect("callgraph refresh test seam mutex poisoned")
+            .remove(project_root);
+    }
 }
 
 #[derive(Debug)]
@@ -9096,6 +9530,207 @@ fn unix_seconds_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod refresh_worker_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Mutex as TestMutex;
+    use tempfile::tempdir;
+
+    static REFRESH_WORKER_TEST_LOCK: TestMutex<()> = TestMutex::new(());
+
+    fn ready_store_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        let callgraph_dir = temp
+            .path()
+            .join("storage")
+            .join("callgraph")
+            .join(crate::search_index::artifact_cache_key(&root));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.rs");
+        fs::write(&source, "fn entry() { old_leaf(); }\nfn old_leaf() {}\n").unwrap();
+        let (store, _) = CallGraphStore::cold_build_with_lease(
+            callgraph_dir.clone(),
+            root.clone(),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        drop(store);
+        (temp, root, callgraph_dir, source)
+    }
+
+    fn pending_paths() -> PendingCallGraphStorePaths {
+        Arc::new(parking_lot::Mutex::new(BTreeSet::new()))
+    }
+
+    fn wait_for_refresh_calls(root: &Path, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while callgraph_refresh_worker_test_counts(root).0 < expected {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected} callgraph refresh worker call(s)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn queued_batches_for_one_root_coalesce_while_worker_is_busy() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::from_millis(150), false);
+
+        enqueue_callgraph_store_refresh(
+            callgraph_dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+        );
+        wait_for_refresh_calls(&root, 1);
+        for _ in 0..3 {
+            enqueue_callgraph_store_refresh(
+                callgraph_dir.clone(),
+                root.clone(),
+                vec![source.clone()],
+                Arc::clone(&pending),
+            );
+        }
+
+        assert!(flush_callgraph_store_refreshes_with_budget(
+            Duration::from_secs(2)
+        ));
+        assert_eq!(callgraph_refresh_worker_test_counts(&root).0, 2);
+        assert!(pending.lock().is_empty());
+        clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    #[test]
+    fn queued_refresh_opens_generation_published_after_enqueue() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+        let (_active_temp, active_root, active_dir, active_source) = ready_store_fixture();
+        let (_target_temp, target_root, target_dir, target_source) = ready_store_fixture();
+        set_callgraph_refresh_worker_test_seam(
+            active_root.clone(),
+            Duration::from_millis(800),
+            false,
+        );
+        set_callgraph_refresh_worker_test_seam(target_root.clone(), Duration::ZERO, false);
+        enqueue_callgraph_store_refresh(
+            active_dir,
+            active_root.clone(),
+            vec![active_source],
+            pending_paths(),
+        );
+        wait_for_refresh_calls(&active_root, 1);
+
+        fs::write(
+            &target_source,
+            "fn entry() { build_leaf(); }\nfn build_leaf() {}\nfn worker_leaf() {}\n",
+        )
+        .unwrap();
+        enqueue_callgraph_store_refresh(
+            target_dir.clone(),
+            target_root.clone(),
+            vec![target_source.clone()],
+            pending_paths(),
+        );
+        let (new_generation, _) = CallGraphStore::cold_build_with_lease(
+            target_dir.clone(),
+            target_root.clone(),
+            std::slice::from_ref(&target_source),
+        )
+        .unwrap();
+        fs::write(
+            &target_source,
+            "fn entry() { worker_leaf(); }\nfn build_leaf() {}\nfn worker_leaf() {}\n",
+        )
+        .unwrap();
+        drop(new_generation);
+
+        assert!(flush_callgraph_store_refreshes_with_budget(
+            Duration::from_secs(3)
+        ));
+        let current = CallGraphStore::open_readonly(target_dir, target_root.clone())
+            .unwrap()
+            .expect("current callgraph generation");
+        let tree = current.call_tree(Path::new("main.rs"), "entry", 1).unwrap();
+        assert_eq!(tree.children[0].name, "worker_leaf");
+        assert_eq!(callgraph_refresh_worker_test_counts(&target_root).0, 1);
+        clear_callgraph_refresh_worker_test_seam(&active_root);
+        clear_callgraph_refresh_worker_test_seam(&target_root);
+    }
+
+    #[test]
+    fn refresh_failure_marks_files_stale() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, true);
+
+        enqueue_callgraph_store_refresh(callgraph_dir.clone(), root.clone(), vec![source], pending);
+        assert!(flush_callgraph_store_refreshes_with_budget(
+            Duration::from_secs(2)
+        ));
+
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 1));
+        let store = CallGraphStore::open_ready(callgraph_dir, root.clone())
+            .unwrap()
+            .expect("ready callgraph store");
+        assert_eq!(store.stale_files().unwrap(), vec!["main.rs"]);
+        clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    #[test]
+    fn bounded_shutdown_defers_unprocessed_batches() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+        let (_active_temp, active_root, active_dir, active_source) = ready_store_fixture();
+        let (_queued_temp, queued_root, queued_dir, queued_source) = ready_store_fixture();
+        let active_pending = pending_paths();
+        let queued_pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(
+            active_root.clone(),
+            Duration::from_millis(300),
+            false,
+        );
+
+        enqueue_callgraph_store_refresh(
+            active_dir,
+            active_root.clone(),
+            vec![active_source.clone()],
+            Arc::clone(&active_pending),
+        );
+        wait_for_refresh_calls(&active_root, 1);
+        enqueue_callgraph_store_refresh(
+            queued_dir,
+            queued_root.clone(),
+            vec![queued_source.clone()],
+            Arc::clone(&queued_pending),
+        );
+
+        assert!(!flush_callgraph_store_refreshes_with_budget(
+            Duration::from_millis(20)
+        ));
+        assert!(active_pending.lock().contains(&active_source));
+        assert!(queued_pending.lock().contains(&queued_source));
+        assert_eq!(callgraph_refresh_worker_test_counts(&queued_root).0, 0);
+        clear_callgraph_refresh_worker_test_seam(&active_root);
+    }
 }
 
 #[cfg(test)]

@@ -288,10 +288,10 @@ fn main() {
 
     pending.drain_on_shutdown();
     if graceful_stdin_shutdown {
-        // Only the natural stdin-EOF path flushes the trigram delta. Signal,
-        // stdout-error, and panic teardown skip disk work so abrupt exits stay
-        // fast and never wait on lock contention or cold-build recovery.
-        flush_search_indexes_on_graceful_shutdown(&registry);
+        // Only the natural stdin-EOF path flushes owner-side index deltas and
+        // queued callgraph refreshes. Signal, stdout-error, and panic teardown
+        // skip disk work so abrupt exits stay fast and avoid lock contention.
+        flush_indexes_on_graceful_shutdown(&registry);
     }
     for runtime in registry.iter() {
         runtime.lsp().shutdown_all();
@@ -316,10 +316,11 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
     aft::logging::perf_tick(None);
 }
 
-fn flush_search_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
+fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
         let _ = runtime.flush_search_index_on_graceful_shutdown();
     }
+    let _ = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
 }
 
 fn drain_runtime_events_and_write_pending(
@@ -1386,7 +1387,7 @@ mod signal_handler_tests {
 #[cfg(test)]
 mod graceful_shutdown_search_index_tests {
     use super::{
-        flush_search_indexes_on_graceful_shutdown, global_gitignore_env_test_lock, App, AppContext,
+        flush_indexes_on_graceful_shutdown, global_gitignore_env_test_lock, App, AppContext,
         Config, RuntimeRegistry,
     };
     use std::path::{Path, PathBuf};
@@ -1528,7 +1529,7 @@ mod graceful_shutdown_search_index_tests {
                 .update_file(&file);
         }
 
-        flush_search_indexes_on_graceful_shutdown(&registry);
+        flush_indexes_on_graceful_shutdown(&registry);
 
         let mut restored =
             aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
@@ -1579,7 +1580,7 @@ mod graceful_shutdown_search_index_tests {
                 "test should exercise graceful shutdown while a search rebuild is still in flight"
             );
 
-            flush_search_indexes_on_graceful_shutdown(&registry);
+            flush_indexes_on_graceful_shutdown(&registry);
 
             let mut restored =
                 aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
@@ -1652,7 +1653,7 @@ mod graceful_shutdown_search_index_tests {
 
         ctx.set_cache_role(true, None);
         wait_for_next_directory_write_mtime(&cache_dir, before);
-        flush_search_indexes_on_graceful_shutdown(&registry);
+        flush_indexes_on_graceful_shutdown(&registry);
 
         let after = std::fs::metadata(&cache_path)
             .expect("cache metadata after shutdown")
@@ -1681,7 +1682,7 @@ mod graceful_shutdown_search_index_tests {
             .expect("cache mtime before shutdown");
 
         wait_for_next_directory_write_mtime(&cache_dir, before);
-        flush_search_indexes_on_graceful_shutdown(&registry);
+        flush_indexes_on_graceful_shutdown(&registry);
 
         let after = std::fs::metadata(&cache_path)
             .expect("cache metadata after shutdown")
@@ -1725,6 +1726,7 @@ mod watcher_filter_tests {
         RenameMode,
     };
     use notify::EventKind;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     /// Wait budget for an async dispatch (semantic-refresh request / status
@@ -1988,10 +1990,18 @@ mod watcher_filter_tests {
             "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
         )
         .unwrap();
-        let mut paths = vec![source];
-        paths.extend((1..WATCHER_BATCH_INLINE_CAP).map(|i| root.join(format!("note-{i}.txt"))));
-        tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
+        aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            root.to_path_buf(),
+            Duration::from_millis(350),
+            false,
+        );
+        tx.send(WatcherDispatchEvent::Paths(vec![source])).unwrap();
+        let drain_started = Instant::now();
         drain_watcher_events(&ctx);
+        assert!(
+            drain_started.elapsed() < Duration::from_millis(250),
+            "watcher drain waited for the callgraph store write"
+        );
 
         let store = {
             let guard = ctx
@@ -2003,10 +2013,26 @@ mod watcher_filter_tests {
                 .map(std::sync::Arc::clone)
                 .expect("store remains open")
         };
-        let tree = store
-            .call_tree(std::path::Path::new("main.ts"), "entry", 1)
-            .unwrap();
-        assert_eq!(tree.children[0].name, "newLeaf");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let tree = store
+                .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+                .unwrap();
+            if tree.children[0].name == "newLeaf" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "async callgraph refresh did not publish the changed edge"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                1
+            ))
+        );
+        aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(root);
     }
 
     #[test]

@@ -576,8 +576,8 @@ fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
 
 // These warmup drain copies are intentionally separate from `runtime_drain`: the
 // warmup CLI is a one-shot with no live status consumer or mid-build edit
-// stream, so it keeps leaner drains without status-emitter signals or
-// pending-path replay. Do not deduplicate them unless that behavior changes.
+// stream, so it keeps leaner drains without status-emitter signals. Do not
+// deduplicate them unless that behavior changes.
 /// Install the finished callgraph store once the background cold build sends it
 /// over `callgraph_store_rx`. Mirrors `main::drain_callgraph_store_events` but
 /// without the status-emitter signal (warmup has no sidebar consumer).
@@ -605,13 +605,10 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
     let mut installed = false;
     if let Some(store) = latest {
         let pending = ctx.take_pending_callgraph_store_paths();
-        if !pending.is_empty() {
-            if let Err(error) = store.refresh_files(&pending) {
-                eprintln!("aft warmup: callgraph store post-build refresh failed: {error}");
-                let _ = store.mark_files_stale(&pending);
-            }
-        }
         drop(store);
+        if !pending.is_empty() {
+            ctx.enqueue_callgraph_store_refresh(pending);
+        }
         if let Some(project_root) = ctx.callgraph_project_root() {
             if let Ok(Some(store)) =
                 CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root)
