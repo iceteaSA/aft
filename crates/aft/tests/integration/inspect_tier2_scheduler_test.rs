@@ -310,6 +310,34 @@ fn watcher_tick_after_quiet_gap_triggers_tier2_refresh() {
 }
 
 #[test]
+fn direct_inspect_mid_watcher_quiet_window_computes_immediately() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }\n",
+    );
+    let ctx = configured_context(&root);
+    let base = Instant::now();
+    let change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+    ctx.reset_tier2_refresh_scheduler_at(base);
+    assert_eq!(ctx.tick_tier2_refresh_scheduler_at(change, 1), None);
+
+    let response = inspect(&ctx);
+
+    assert!(
+        !scanner_state_contains(&response, "pending_categories", "dead_code"),
+        "direct inspect should compute Tier-2 during the watcher quiet window: {response:#}"
+    );
+    assert_eq!(
+        ctx.inspect_manager()
+            .automatic_tier2_schedule_count_for_test(),
+        0,
+        "the direct inspect path must not wait for or enqueue an automatic refresh"
+    );
+}
+
+#[test]
 fn direct_inspect_cold_tier2_computes_without_scheduler_pull() {
     let (_temp_dir, root) = fixture_project();
     write_file(

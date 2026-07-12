@@ -31,6 +31,16 @@ impl Tier2TriggerReason {
 }
 
 #[derive(Debug, Clone)]
+struct Tier2DispatchRollback {
+    last_change_at: Option<Instant>,
+    activity_started_at: Option<Instant>,
+    debounce_delay: Duration,
+    last_scan_started_at: Option<Instant>,
+    pull_demand_pending: bool,
+    configure_warm_pending: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct Tier2RefreshScheduler {
     configured_at: Option<Instant>,
     last_change_at: Option<Instant>,
@@ -40,6 +50,7 @@ pub struct Tier2RefreshScheduler {
     pull_demand_pending: bool,
     configure_warm_pending: bool,
     last_trigger_reason: Option<Tier2TriggerReason>,
+    dispatch_rollback: Option<Tier2DispatchRollback>,
 }
 
 impl Tier2RefreshScheduler {
@@ -53,6 +64,7 @@ impl Tier2RefreshScheduler {
             pull_demand_pending: false,
             configure_warm_pending: false,
             last_trigger_reason: None,
+            dispatch_rollback: None,
         }
     }
 
@@ -65,6 +77,7 @@ impl Tier2RefreshScheduler {
         self.pull_demand_pending = false;
         self.configure_warm_pending = true;
         self.last_trigger_reason = None;
+        self.dispatch_rollback = None;
     }
 
     pub fn request_pull(&mut self, can_write: bool) -> bool {
@@ -129,12 +142,23 @@ impl Tier2RefreshScheduler {
         self.last_scan_started_at = Some(now);
         self.pull_demand_pending = false;
         self.configure_warm_pending = false;
+        self.dispatch_rollback = None;
         self.clear_activity_window();
     }
 
+    /// Restore the trigger state when the cold-build permit rejects a dispatch.
+    /// An automatic debounce must not become pull demand, because pull demand
+    /// intentionally bypasses the watcher quiet window.
     pub fn note_dispatch_deferred(&mut self) {
-        self.last_scan_started_at = None;
-        self.pull_demand_pending = true;
+        let Some(rollback) = self.dispatch_rollback.take() else {
+            return;
+        };
+        self.last_change_at = rollback.last_change_at;
+        self.activity_started_at = rollback.activity_started_at;
+        self.debounce_delay = rollback.debounce_delay;
+        self.last_scan_started_at = rollback.last_scan_started_at;
+        self.pull_demand_pending = rollback.pull_demand_pending;
+        self.configure_warm_pending = rollback.configure_warm_pending;
     }
 
     pub fn last_trigger_reason(&self) -> Option<Tier2TriggerReason> {
@@ -187,6 +211,14 @@ impl Tier2RefreshScheduler {
         now: Instant,
         reason: Tier2TriggerReason,
     ) -> Tier2TriggerReason {
+        self.dispatch_rollback = Some(Tier2DispatchRollback {
+            last_change_at: self.last_change_at,
+            activity_started_at: self.activity_started_at,
+            debounce_delay: self.debounce_delay,
+            last_scan_started_at: self.last_scan_started_at,
+            pull_demand_pending: self.pull_demand_pending,
+            configure_warm_pending: self.configure_warm_pending,
+        });
         self.last_scan_started_at = Some(now);
         self.pull_demand_pending = false;
         self.configure_warm_pending = false;
@@ -364,6 +396,56 @@ mod tests {
                 false,
                 false,
             ),
+            Some(Tier2TriggerReason::Pull)
+        );
+    }
+
+    #[test]
+    fn deferred_debounce_keeps_trickle_in_the_quiet_window() {
+        let (mut scheduler, base) = configured_scheduler();
+        let first_change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        assert_eq!(scheduler.tick(first_change, 1, true, false), None);
+
+        let first_deadline = first_change + TIER2_REFRESH_DEBOUNCE;
+        assert_eq!(
+            scheduler.tick(first_deadline, 0, true, false),
+            Some(Tier2TriggerReason::Debounce)
+        );
+        scheduler.note_dispatch_deferred();
+
+        let mut last_change = first_deadline;
+        for edit in 1..=6 {
+            last_change = first_deadline + Duration::from_secs(edit * 10);
+            assert_eq!(
+                scheduler.tick(last_change, 1, true, false),
+                None,
+                "edit {edit} must extend the quiet window instead of retrying dispatch"
+            );
+        }
+        assert_eq!(
+            scheduler.tick(
+                last_change + TIER2_REFRESH_DEBOUNCE - Duration::from_secs(1),
+                0,
+                true,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            scheduler.tick(last_change + TIER2_REFRESH_DEBOUNCE, 0, true, false),
+            Some(Tier2TriggerReason::Debounce),
+            "six edits over one minute should produce one dispatch after quiet"
+        );
+    }
+
+    #[test]
+    fn explicit_pull_mid_debounce_still_dispatches_immediately() {
+        let (mut scheduler, base) = configured_scheduler();
+        let change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        assert_eq!(scheduler.tick(change, 1, true, false), None);
+        assert!(scheduler.request_pull(true));
+        assert_eq!(
+            scheduler.tick(change + Duration::from_secs(10), 0, true, false),
             Some(Tier2TriggerReason::Pull)
         );
     }
