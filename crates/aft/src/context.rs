@@ -1322,7 +1322,15 @@ impl AppContext {
             None => return RootHealthSnapshot::busy(project_root),
         };
 
+        // Borrow-only roots (mason worktrees, read-only siblings) never
+        // materialize an in-RAM index or spawn a build: queries go through the
+        // read-only disk openers against the shared artifact. Reporting them
+        // as "building" is a permanent lie that keeps module health degraded
+        // whenever any worktree is bound.
+        let borrows_shared_artifacts = *self.shared_artifacts_read_only.lock();
         let search_index_status = if search_index.as_ref().is_some_and(|index| index.ready) {
+            "ready"
+        } else if borrows_shared_artifacts && config.search_index {
             "ready"
         } else if config.search_index
             || search_index.as_ref().is_some()
@@ -1338,9 +1346,15 @@ impl AppContext {
             SemanticIndexStatus::Disabled => "disabled",
             SemanticIndexStatus::Failed(_) => "degraded",
         };
+        let callgraph_writer = self.callgraph_writer.load(Ordering::SeqCst);
         let callgraph_store_status = if !self.heavy_root_work_allowed() {
             "disabled"
         } else if callgraph_store.as_ref().is_some() {
+            "ready"
+        } else if !callgraph_writer && config.callgraph_store {
+            // Read-only roots never cold-build; they query the shared store
+            // via ReadonlyCallGraphStore on demand. "building" would never
+            // resolve.
             "ready"
         } else if callgraph_store_rx.is_some() || config.callgraph_store {
             "building"

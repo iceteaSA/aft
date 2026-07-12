@@ -1,5 +1,6 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
+use crate::context::{RootHealthState};
 use super::{
     json, Arc, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport, HealthStatus,
     Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
@@ -227,18 +228,39 @@ pub(super) fn build_health_report(
         .collect();
     roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
 
-    let all_roots_ready = roots.iter().all(RootHealthSnapshot::is_fully_ready);
-    let detail = if roots.is_empty() || all_roots_ready {
-        None
+    // Health-verdict rule: DEGRADED means dispatch is impaired (an actor we
+    // could not even snapshot without contention), never "a background index
+    // is still warming". A serving root with search/callgraph mid-build is
+    // healthy — component build states are informational detail, otherwise a
+    // module with any active mason worktree reads permanently degraded and
+    // the daemon's on-failing policies treat routine warmup as wreckage.
+    let busy_roots = roots
+        .iter()
+        .filter(|root| matches!(root.state, RootHealthState::Busy))
+        .count();
+    let warming_roots = roots
+        .iter()
+        .filter(|root| {
+            !matches!(root.state, RootHealthState::Busy) && !root.is_fully_ready()
+        })
+        .count();
+    let detail = if busy_roots > 0 {
+        Some(format!(
+            "{busy_roots} root actor(s) could not be snapshotted without contention"
+        ))
+    } else if warming_roots > 0 {
+        Some(format!(
+            "{warming_roots} root(s) warming background indexes (serving normally)"
+        ))
     } else {
-        Some("one or more root actors are still warming, degraded, or busy".to_string())
+        None
     };
 
     HealthReport {
-        status: if all_roots_ready {
-            HealthStatus::Ok
-        } else {
+        status: if busy_roots > 0 {
             HealthStatus::Degraded
+        } else {
+            HealthStatus::Ok
         },
         detail,
         metrics: Some(json!({
