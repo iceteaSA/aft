@@ -86,17 +86,34 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
     let project_root = grep_executor::project_root(ctx);
-    let scope_has_files = grep_executor::scope_has_files(&project_root, &scope);
-
+    let total_started = std::time::Instant::now();
     let search_start = std::time::Instant::now();
     let params = GrepParams {
         include,
         exclude,
         max_results,
     };
-    let result = grep_executor::execute(ctx, &compiled, &scope, &params);
+    let (result, phases) = grep_executor::execute_profiled(ctx, &compiled, &scope, &params);
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
+    let scope_probe_started = std::time::Instant::now();
+    let scope_has_files = phases
+        .indexed_scope_has_files
+        .unwrap_or_else(|| grep_executor::scope_has_files(&project_root, &scope));
+    let scope_probe = scope_probe_started.elapsed();
+    let format_started = std::time::Instant::now();
     let text = format_grep_text(&result, &project_root);
+    let post_filter_format = phases.query.post_filter + format_started.elapsed();
+    crate::slog_debug!(
+        "perf grep phases: snapshot_acquire={:.3}ms trigram_lookup={:.3}ms pread_verify={:.3}ms candidates={} bytes={} post_filter/format={:.3}ms scope_probe={:.3}ms total={:.3}ms",
+        phases.snapshot_acquire.as_secs_f64() * 1000.0,
+        phases.query.trigram_lookup.as_secs_f64() * 1000.0,
+        phases.query.pread_verify.as_secs_f64() * 1000.0,
+        phases.query.candidate_count,
+        phases.query.bytes_verified,
+        post_filter_format.as_secs_f64() * 1000.0,
+        scope_probe.as_secs_f64() * 1000.0,
+        total_started.elapsed().as_secs_f64() * 1000.0,
+    );
 
     let mut body = serde_json::json!({
         "text": text,

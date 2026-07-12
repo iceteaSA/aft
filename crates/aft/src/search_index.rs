@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, OnceLock,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -391,6 +391,13 @@ impl SearchIndexSnapshot {
                 .count()
     }
 
+    pub(crate) fn has_file_in_scope(&self, search_root: &Path) -> bool {
+        let search_root = canonicalize_or_normalize(search_root);
+        self.files.iter().any(|file| {
+            !file.path.as_os_str().is_empty() && is_within_search_root(&search_root, &file.path)
+        })
+    }
+
     /// Score-rank file candidates and report whether the pre-filter step that
     /// collects candidates reached its internal size limit before ranking.
     pub fn lexical_rank_with_stats(
@@ -495,6 +502,15 @@ pub struct GrepResult {
     pub engine_capped: bool,
     /// True when a fallback directory walk stopped early due to file-count or time budget.
     pub walk_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GrepQueryPhaseTimings {
+    pub trigram_lookup: Duration,
+    pub pread_verify: Duration,
+    pub post_filter: Duration,
+    pub candidate_count: usize,
+    pub bytes_verified: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1467,6 +1483,18 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
     ) -> GrepResult {
+        self.search_grep_profiled(pattern, include, exclude, search_root, max_results)
+            .0
+    }
+
+    pub(crate) fn search_grep_profiled(
+        &self,
+        pattern: &CompiledPattern,
+        include: &[String],
+        exclude: &[String],
+        search_root: &Path,
+        max_results: usize,
+    ) -> (GrepResult, GrepQueryPhaseTimings) {
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
             CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
@@ -1478,6 +1506,7 @@ impl SearchIndexSnapshot {
         };
         let search_root = canonicalize_or_normalize(search_root);
 
+        let trigram_started = Instant::now();
         let raw_pattern = pattern.raw_pattern_for_trigrams();
         let query = if pattern.case_insensitive() && !raw_pattern.is_ascii() {
             RegexQuery::default()
@@ -1486,7 +1515,9 @@ impl SearchIndexSnapshot {
         };
         let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
         let candidate_ids = self.candidates(&query);
+        let trigram_lookup = trigram_started.elapsed();
 
+        let candidate_filter_started = Instant::now();
         let candidate_files: Vec<&FileEntry> = candidate_ids
             .into_iter()
             .filter_map(|file_id| self.files.get(file_id as usize))
@@ -1494,15 +1525,19 @@ impl SearchIndexSnapshot {
             .filter(|file| is_within_search_root(&search_root, &file.path))
             .filter(|file| filters.matches(&self.project_root, &file.path))
             .collect();
+        let candidate_count = candidate_files.len();
+        let candidate_filter = candidate_filter_started.elapsed();
 
         let total_matches = AtomicUsize::new(0);
         let files_searched = AtomicUsize::new(0);
         let files_with_matches = AtomicUsize::new(0);
+        let bytes_verified = AtomicUsize::new(0);
         let truncated = AtomicBool::new(false);
         let engine_capped = AtomicBool::new(false);
         let stop_after = max_results.saturating_mul(2);
         let stop_scan = Arc::new(AtomicBool::new(false));
 
+        let pread_started = Instant::now();
         let mut matches = if candidate_files.len() > 10 {
             candidate_files
                 .par_iter()
@@ -1524,6 +1559,7 @@ impl SearchIndexSnapshot {
                         &total_matches,
                         &files_searched,
                         &files_with_matches,
+                        &bytes_verified,
                         &truncated,
                         &engine_capped,
                         Some(&stop_scan),
@@ -1547,6 +1583,7 @@ impl SearchIndexSnapshot {
                     &total_matches,
                     &files_searched,
                     &files_with_matches,
+                    &bytes_verified,
                     &truncated,
                     &engine_capped,
                     None,
@@ -1559,7 +1596,9 @@ impl SearchIndexSnapshot {
             }
             matches
         };
+        let pread_verify = pread_started.elapsed();
 
+        let post_filter_started = Instant::now();
         sort_shared_grep_matches_by_cached_mtime_desc(&mut matches, &self.project_root, |path| {
             self.path_to_id
                 .get(path)
@@ -1578,7 +1617,7 @@ impl SearchIndexSnapshot {
             })
             .collect();
 
-        GrepResult {
+        let result = GrepResult {
             total_matches: total_matches.load(Ordering::Relaxed),
             matches,
             files_searched: files_searched.load(Ordering::Relaxed),
@@ -1592,7 +1631,16 @@ impl SearchIndexSnapshot {
             fully_degraded,
             engine_capped: engine_capped.load(Ordering::Relaxed),
             walk_truncated: false,
-        }
+        };
+        let post_filter = candidate_filter + post_filter_started.elapsed();
+        let phases = GrepQueryPhaseTimings {
+            trigram_lookup,
+            pread_verify,
+            post_filter,
+            candidate_count,
+            bytes_verified: bytes_verified.load(Ordering::Relaxed),
+        };
+        (result, phases)
     }
 
     fn empty_grep_result(&self) -> GrepResult {
@@ -1614,27 +1662,48 @@ impl SearchIndexSnapshot {
     }
 
     pub fn glob(&self, pattern: &str, search_root: &Path) -> Vec<PathBuf> {
+        self.glob_profiled(pattern, search_root, true).0
+    }
+
+    pub(crate) fn glob_profiled(
+        &self,
+        pattern: &str,
+        search_root: &Path,
+        sort_by_mtime: bool,
+    ) -> (Vec<PathBuf>, bool, usize) {
         let filters = match build_path_filters(&[pattern.to_string()], &[]) {
             Ok(filters) => filters,
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), false, 0),
         };
         let search_root = canonicalize_or_normalize(search_root);
+        let entries_visited = self.files.len();
+        let mut scope_has_files = false;
         let mut entries = self
             .files
             .iter()
             .filter(|file| !file.path.as_os_str().is_empty())
-            .filter(|file| is_within_search_root(&search_root, &file.path))
+            .filter(|file| {
+                let in_scope = is_within_search_root(&search_root, &file.path);
+                scope_has_files |= in_scope;
+                in_scope
+            })
             .filter(|file| filters.matches(&self.project_root, &file.path))
             .map(|file| (file.path.clone(), file.modified))
             .collect::<Vec<_>>();
 
-        entries.sort_by(|(left_path, left_mtime), (right_path, right_mtime)| {
-            right_mtime
-                .cmp(left_mtime)
-                .then_with(|| left_path.cmp(right_path))
-        });
+        if sort_by_mtime {
+            entries.sort_by(|(left_path, left_mtime), (right_path, right_mtime)| {
+                right_mtime
+                    .cmp(left_mtime)
+                    .then_with(|| left_path.cmp(right_path))
+            });
+        }
 
-        entries.into_iter().map(|(path, _)| path).collect()
+        (
+            entries.into_iter().map(|(path, _)| path).collect(),
+            scope_has_files,
+            entries_visited,
+        )
     }
 
     pub fn candidates(&self, query: &RegexQuery) -> Vec<u32> {
@@ -1790,6 +1859,7 @@ fn search_candidate_file(
     total_matches: &AtomicUsize,
     files_searched: &AtomicUsize,
     files_with_matches: &AtomicUsize,
+    bytes_verified: &AtomicUsize,
     truncated: &AtomicBool,
     engine_capped: &AtomicBool,
     stop_scan: Option<&Arc<AtomicBool>>,
@@ -1803,6 +1873,7 @@ fn search_candidate_file(
         Some(content) => content,
         None => return Vec::new(),
     };
+    bytes_verified.fetch_add(content.len(), Ordering::Relaxed);
     // Defense in depth: even though indexing tries to filter binaries via
     // `is_binary_path` + full-content `is_binary_bytes`, we double-check at
     // query time. content_inspector is fast (~bytes-per-cycle on a small
@@ -5493,6 +5564,24 @@ mod tests {
             files,
             vec![fs::canonicalize(src.join("main.rs")).expect("canonicalize src file")]
         );
+    }
+
+    #[test]
+    fn snapshot_reports_file_presence_without_a_filesystem_walk() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let src = project.join("src");
+        let empty = project.join("empty");
+        fs::create_dir_all(&src).expect("create src dir");
+        fs::create_dir_all(&empty).expect("create empty dir");
+        fs::write(src.join("main.rs"), "pub fn main() {}\n").expect("write src file");
+
+        let index = SearchIndex::build(&project);
+        let snapshot = index.snapshot();
+
+        assert!(snapshot.has_file_in_scope(&project));
+        assert!(snapshot.has_file_in_scope(&src));
+        assert!(!snapshot.has_file_in_scope(&empty));
     }
 
     #[test]

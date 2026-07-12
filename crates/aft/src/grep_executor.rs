@@ -16,8 +16,8 @@ use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
     build_path_filters, has_any_project_file_from, read_searchable_text, resolve_search_scope,
-    sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc, GrepMatch, GrepResult, IndexStatus,
-    PathFilters,
+    sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc, GrepMatch, GrepQueryPhaseTimings,
+    GrepResult, IndexStatus, PathFilters,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -29,6 +29,7 @@ pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
 pub struct FallbackWalkOutcome {
     pub files: Vec<PathBuf>,
     pub walk_truncated: bool,
+    pub entries_visited: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +37,29 @@ pub struct GrepParams {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub max_results: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GrepExecutionPhaseTimings {
+    pub snapshot_acquire: Duration,
+    pub query: GrepQueryPhaseTimings,
+    pub indexed_scope_has_files: Option<bool>,
+}
+
+impl GrepExecutionPhaseTimings {
+    fn add(&mut self, other: Self) {
+        self.snapshot_acquire += other.snapshot_acquire;
+        self.query.trigram_lookup += other.query.trigram_lookup;
+        self.query.pread_verify += other.query.pread_verify;
+        self.query.post_filter += other.query.post_filter;
+        self.query.candidate_count += other.query.candidate_count;
+        self.query.bytes_verified += other.query.bytes_verified;
+        self.indexed_scope_has_files =
+            match (self.indexed_scope_has_files, other.indexed_scope_has_files) {
+                (Some(left), Some(right)) => Some(left || right),
+                _ => None,
+            };
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -146,9 +170,18 @@ pub fn execute(
     scope: &GrepScope,
     params: &GrepParams,
 ) -> GrepResult {
+    execute_profiled(ctx, pattern, scope, params).0
+}
+
+pub(crate) fn execute_profiled(
+    ctx: &AppContext,
+    pattern: &CompiledPattern,
+    scope: &GrepScope,
+    params: &GrepParams,
+) -> (GrepResult, GrepExecutionPhaseTimings) {
     let project_root = project_root(ctx);
     if scope.roots.len() == 1 {
-        return execute_root(
+        return execute_root_profiled(
             ctx,
             pattern,
             &scope.roots[0],
@@ -159,17 +192,27 @@ pub fn execute(
     }
 
     let mut results = Vec::new();
+    let mut phases: Option<GrepExecutionPhaseTimings> = None;
     for root in &scope.roots {
-        results.push(execute_root(
+        let (result, root_phases) = execute_root_profiled(
             ctx,
             pattern,
             root,
             params,
             scope.per_root_max,
             &project_root,
-        ));
+        );
+        results.push(result);
+        if let Some(phases) = phases.as_mut() {
+            phases.add(root_phases);
+        } else {
+            phases = Some(root_phases);
+        }
     }
-    merge_grep_results(results, &project_root, params.max_results)
+    (
+        merge_grep_results(results, &project_root, params.max_results),
+        phases.unwrap_or_default(),
+    )
 }
 
 fn resolve_roots(
@@ -224,14 +267,14 @@ fn resolve_roots(
     }
 }
 
-fn execute_root(
+fn execute_root_profiled(
     ctx: &AppContext,
     pattern: &CompiledPattern,
     root: &ResolvedRoot,
     params: &GrepParams,
     max_results: usize,
     project_root: &Path,
-) -> GrepResult {
+) -> (GrepResult, GrepExecutionPhaseTimings) {
     // Explicit single-file scope: search the named file directly, bypassing the
     // trigram index and the gitignore/.aftignore-aware walk. Matches ripgrep,
     // where naming a file explicitly searches it even when it is gitignored,
@@ -242,9 +285,13 @@ fn execute_root(
         } else {
             IndexStatus::Fallback
         };
-        return grep_explicit_file(&root.search_root, pattern, max_results, index_status);
+        return (
+            grep_explicit_file(&root.search_root, pattern, max_results, index_status),
+            GrepExecutionPhaseTimings::default(),
+        );
     }
 
+    let snapshot_started = Instant::now();
     let indexed_snapshot = {
         let search_index = ctx
             .search_index()
@@ -255,36 +302,50 @@ fn execute_root(
             _ => None,
         }
     };
-    let indexed = indexed_snapshot.map(|snapshot| {
-        snapshot.search_grep(
+    let snapshot_acquire = snapshot_started.elapsed();
+    if let Some(snapshot) = indexed_snapshot {
+        let scope_started = Instant::now();
+        let indexed_scope_has_files = snapshot.has_file_in_scope(&root.search_root);
+        let scope_elapsed = scope_started.elapsed();
+        let (result, mut query) = snapshot.search_grep_profiled(
             pattern,
             &params.include,
             &params.exclude,
             &root.search_root,
             max_results,
-        )
-    });
-
-    match indexed {
-        Some(result) => result,
-        None => {
-            let index_status = if root.use_index {
-                current_index_status(ctx)
-            } else {
-                IndexStatus::Fallback
-            };
-            fallback_grep(
-                project_root,
-                &root.search_root,
-                &root.filter_root,
-                pattern,
-                &params.include,
-                &params.exclude,
-                max_results,
-                index_status,
-            )
-        }
+        );
+        query.post_filter += scope_elapsed;
+        return (
+            result,
+            GrepExecutionPhaseTimings {
+                snapshot_acquire,
+                query,
+                indexed_scope_has_files: Some(indexed_scope_has_files),
+            },
+        );
     }
+
+    let index_status = if root.use_index {
+        current_index_status(ctx)
+    } else {
+        IndexStatus::Fallback
+    };
+    (
+        fallback_grep(
+            project_root,
+            &root.search_root,
+            &root.filter_root,
+            pattern,
+            &params.include,
+            &params.exclude,
+            max_results,
+            index_status,
+        ),
+        GrepExecutionPhaseTimings {
+            snapshot_acquire,
+            ..GrepExecutionPhaseTimings::default()
+        },
+    )
 }
 
 /// Grep a single explicitly-named file directly, bypassing the trigram index
@@ -438,9 +499,11 @@ fn bounded_fallback_walk_files_with_limits(
     let started = Instant::now();
     let mut files = Vec::new();
     let mut walk_truncated = false;
+    let mut entries_visited = 0usize;
     let builder = fallback_project_walk_builder(search_root);
 
     for entry in builder.build().filter_map(|entry| entry.ok()) {
+        entries_visited += 1;
         if started.elapsed() >= budget {
             walk_truncated = true;
             break;
@@ -466,6 +529,7 @@ fn bounded_fallback_walk_files_with_limits(
     FallbackWalkOutcome {
         files,
         walk_truncated,
+        entries_visited,
     }
 }
 

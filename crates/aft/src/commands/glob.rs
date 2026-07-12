@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::context::AppContext;
 use crate::grep_executor::bounded_fallback_walk_files;
@@ -15,6 +16,11 @@ use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResoluti
 struct GlobDiscovery {
     files: Vec<PathBuf>,
     walk_truncated: bool,
+    source: &'static str,
+    entries_visited: usize,
+    walk_time: Duration,
+    scope_has_files: bool,
+    scope_probe: Duration,
 }
 
 const MAX_GLOB_RESULTS: usize = 100;
@@ -77,11 +83,16 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             ),
         );
     }
-    let scope_has_files = search_roots
-        .iter()
-        .any(|root| scope_has_files(&project_root, root));
-
-    let (mut files, walk_truncated) = if search_roots.len() == 1 {
+    let total_started = Instant::now();
+    let (
+        mut files,
+        walk_truncated,
+        source,
+        entries_visited,
+        walk_time,
+        scope_has_files,
+        scope_probe,
+    ) = if search_roots.len() == 1 {
         let discovery = glob_root(
             ctx,
             &project_root,
@@ -89,29 +100,59 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             pattern,
             MAX_GLOB_RESULTS + 1,
         );
-        (discovery.files, discovery.walk_truncated)
+        (
+            discovery.files,
+            discovery.walk_truncated,
+            discovery.source,
+            discovery.entries_visited,
+            discovery.walk_time,
+            discovery.scope_has_files,
+            discovery.scope_probe,
+        )
     } else {
         let discoveries: Vec<GlobDiscovery> = search_roots
             .iter()
             .map(|root| glob_root(ctx, &project_root, root, pattern, MAX_GLOB_RESULTS + 1))
             .collect();
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
+        let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
+        let walk_time = discoveries.iter().map(|d| d.walk_time).sum();
+        let scope_has_files = discoveries.iter().any(|d| d.scope_has_files);
+        let scope_probe = discoveries.iter().map(|d| d.scope_probe).sum();
+        let source = if discoveries.iter().all(|d| d.source == "index") {
+            "index"
+        } else {
+            "mixed/fallback"
+        };
         let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
-        (files, walk_truncated)
+        (
+            files,
+            walk_truncated,
+            source,
+            entries_visited,
+            walk_time,
+            scope_has_files,
+            scope_probe,
+        )
     };
-    // Sort before truncation so glob output is deterministic across runs and
-    // machines. The underlying walk yields files in filesystem (inode) order,
-    // which differs between directories and platforms — leaving both the
-    // agent-facing text and the `files` array, and crucially WHICH files
-    // survive the MAX_GLOB_RESULTS cap, non-deterministic. A lexical sort gives
-    // a stable contract for agents and keeps the tool_call/direct parity test
-    // (two independently-walked temp projects) byte-stable.
-    files.sort();
+    crate::slog_debug!(
+        "perf glob phases: source={} walk={:.3}ms entries_visited={} scope_probe={:.3}ms discovery_total={:.3}ms",
+        source,
+        walk_time.as_secs_f64() * 1000.0,
+        entries_visited,
+        scope_probe.as_secs_f64() * 1000.0,
+        total_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    // Keep the lexically first results so output is deterministic across filesystems.
+    // Partitioning yields the same subset as sorting the entire list first while
+    // avoiding a full O(n log n) sort when a broad glob returns thousands of paths.
     let total = files.len();
     let result_truncated = total > MAX_GLOB_RESULTS;
     if result_truncated {
+        files.select_nth_unstable(MAX_GLOB_RESULTS);
         files.truncate(MAX_GLOB_RESULTS);
     }
+    files.sort();
 
     let mut body = serde_json::json!({
         "text": format_glob_text(&files, pattern, &project_root, result_truncated),
@@ -158,21 +199,39 @@ fn glob_root(
             _ => None,
         }
     };
-    let indexed = indexed_snapshot.map(|snapshot| GlobDiscovery {
-        files: snapshot.glob(pattern, &search_scope.root),
-        walk_truncated: false,
+    let indexed = indexed_snapshot.map(|snapshot| {
+        let (files, scope_has_files, entries_visited) =
+            snapshot.glob_profiled(pattern, &search_scope.root, false);
+        GlobDiscovery {
+            entries_visited,
+            files,
+            walk_truncated: false,
+            source: "index",
+            walk_time: Duration::ZERO,
+            scope_has_files,
+            scope_probe: Duration::ZERO,
+        }
     });
 
     match indexed {
         Some(discovery) => discovery,
         None => {
             if !search_scope.use_index {
+                let walk_started = Instant::now();
                 if let Some(outcome) =
                     super::grep::ripgrep_glob(&search_scope.root, pattern, max_results)
                 {
+                    let walk_time = walk_started.elapsed();
+                    let scope_started = Instant::now();
+                    let scope_has_files = scope_has_files(project_root, &search_scope.root);
                     return GlobDiscovery {
                         files: outcome.files,
                         walk_truncated: outcome.walk_truncated,
+                        source: "fallback",
+                        entries_visited: outcome.entries_visited,
+                        walk_time,
+                        scope_has_files,
+                        scope_probe: scope_started.elapsed(),
                     };
                 }
             }
@@ -204,10 +263,19 @@ fn fallback_glob(
     } else {
         search_root
     };
+    let walk_started = Instant::now();
     let outcome = bounded_fallback_walk_files(filter_root, search_root, &filters);
+    let walk_time = walk_started.elapsed();
+    let scope_started = Instant::now();
+    let scope_has_files = scope_has_files(project_root, search_root);
     GlobDiscovery {
         files: outcome.files,
         walk_truncated: outcome.walk_truncated,
+        source: "fallback",
+        entries_visited: outcome.entries_visited,
+        walk_time,
+        scope_has_files,
+        scope_probe: scope_started.elapsed(),
     }
 }
 
