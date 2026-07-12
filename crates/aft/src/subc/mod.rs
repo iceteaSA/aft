@@ -32,7 +32,8 @@ use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
 use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
 use crate::run_tool_call::{
-    run_tool_call, strip_agent_preview_arg_owned, ToolCallContext, ToolCallOutcome, ToolCallResult,
+    run_tool_call, strip_agent_preview_arg_owned, PhaseTrace, ToolCallContext, ToolCallOutcome,
+    ToolCallResult,
 };
 use crate::runtime_drain;
 
@@ -152,6 +153,16 @@ use self::wire::{
     response_is_fatal_panic, response_message, send_counted_channel, send_frame,
     send_reliable_writer_frame,
 };
+
+struct DecodedFrame {
+    frame: Frame,
+    phase_trace: PhaseTrace,
+}
+
+struct ToolCallCompletion {
+    text: String,
+    phase_trace: PhaseTrace,
+}
 
 #[derive(Clone)]
 struct PushSenders {
@@ -1557,7 +1568,7 @@ where
     // stream (the next read would parse a body byte as a frame header). A
     // dedicated reader task owns the socket, reads whole frames sequentially, and
     // forwards them over a channel; the loop selects on the cancel-safe `recv()`.
-    let (reader_tx, mut reader_rx) = mpsc::channel::<Result<Frame, SubcError>>(256);
+    let (reader_tx, mut reader_rx) = mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
     let reader_task = spawn_reader_task(read, reader_tx);
     let shutdown = Arc::new(Notify::new());
     // Drain-tick deadline is tracked manually and checked at the TOP of every
@@ -1753,6 +1764,8 @@ where
                     Some(Err(error)) => break Err(error),
                     Some(Ok(frame)) => frame,
                 };
+                let phase_trace = frame.phase_trace;
+                let frame = frame.frame;
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
@@ -1895,6 +1908,7 @@ where
                         if let Err(error) = handle_tool_call(
                             &writer_tx,
                             &frame,
+                            phase_trace,
                             &routes,
                             &pending_binds,
                             &mut live_roots,
@@ -2185,7 +2199,10 @@ where
         .map_err(subc_transport::FrameIoError::Io)
 }
 
-fn spawn_reader_task<R>(mut read: R, tx: mpsc::Sender<Result<Frame, SubcError>>) -> JoinHandle<()>
+fn spawn_reader_task<R>(
+    mut read: R,
+    tx: mpsc::Sender<Result<DecodedFrame, SubcError>>,
+) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -2193,7 +2210,11 @@ where
         loop {
             match read_frame(&mut read).await {
                 Ok(Some(frame)) => {
-                    if tx.send(Ok(frame)).await.is_err() {
+                    let decoded = DecodedFrame {
+                        frame,
+                        phase_trace: PhaseTrace::new(Instant::now()),
+                    };
+                    if tx.send(Ok(decoded)).await.is_err() {
                         return;
                     }
                 }
@@ -2892,6 +2913,7 @@ async fn send_route_bind_error_parts(
 async fn handle_tool_call(
     tx: &mpsc::Sender<Frame>,
     frame: &Frame,
+    mut phase_trace: PhaseTrace,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -3197,26 +3219,28 @@ async fn handle_tool_call(
     };
     let bare_name_for_frame = bare_name.clone();
     let identity_for_run = identity.clone();
+    let completion_session = identity.session.clone();
+    let completion_root = identity.project_root.clone();
     let request_id_for_force = request_id.clone();
     let format_context_for_frame = format_context.clone();
-    let (text_tx, text_rx) = oneshot::channel::<String>();
+    let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
+    phase_trace.mark_executor_submitted();
     let rx = executor.submit_async(
         identity.root.clone(),
         lane,
         request_id.clone(),
         Box::new(move |ctx| {
+            phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 let run = || {
-                    let dispatch_with_finalize = |raw_req: RawRequest, app_ctx: &AppContext| {
-                        let mut response = dispatch(raw_req, app_ctx);
+                    let finalizer = |response: &mut Response| {
                         crate::response_finalize::finalize_response_with_bg_completions(
-                            &mut response,
-                            app_ctx,
+                            response,
+                            ctx,
                             &identity_for_run.session,
                             &bare_name,
                             bind_trust.allows_bash_observation(),
                         );
-                        response
                     };
                     match run_tool_call(
                         &bare_name,
@@ -3224,11 +3248,17 @@ async fn handle_tool_call(
                         &format_context,
                         &tool_call_context,
                         ctx,
-                        &dispatch_with_finalize,
+                        &dispatch,
+                        Some(&finalizer),
+                        Some(&mut phase_trace),
                     ) {
                         ToolCallOutcome::Unary(result) => {
-                            let _ = text_tx.send(result.text);
-                            result.response
+                            let response = result.response;
+                            let _ = tool_call_tx.send(ToolCallCompletion {
+                                text: result.text,
+                                phase_trace,
+                            });
+                            response
                         }
                     }
                 };
@@ -3250,18 +3280,22 @@ async fn handle_tool_call(
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&completion_metrics);
         let response = await_executor_response(rx, request_id.clone()).await;
-        let text = text_rx.await.unwrap_or_else(|_| {
-            crate::subc_format::format_response_with_context(
-                &bare_name_for_frame,
-                &response,
-                &format_context_for_frame,
-            )
-        });
+        let (text, phase_trace) = match tool_call_rx.await {
+            Ok(completion) => (completion.text, Some(completion.phase_trace)),
+            Err(_) => (
+                crate::subc_format::format_response_with_context(
+                    &bare_name_for_frame,
+                    &response,
+                    &format_context_for_frame,
+                ),
+                None,
+            ),
+        };
         let result = ToolCallResult { text, response };
         let fatal = response_is_fatal_panic(&result.response);
-        match build_tool_response_frame(ver, route_channel, corr, flags, &result) {
+        let enqueued = match build_tool_response_frame(ver, route_channel, corr, flags, &result) {
             Ok(response_frame) => {
-                if let Err(error) = send_reliable_writer_frame(
+                match send_reliable_writer_frame(
                     &completion_tx,
                     &completion_metrics,
                     response_frame,
@@ -3269,11 +3303,27 @@ async fn handle_tool_call(
                 )
                 .await
                 {
-                    log::warn!("subc attach: failed to queue tool response frame: {error}");
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::warn!("subc attach: failed to queue tool response frame: {error}");
+                        false
+                    }
                 }
             }
             Err(error) => {
                 log::error!("subc attach: failed to build tool response frame: {error}");
+                false
+            }
+        };
+        if enqueued {
+            if let Some(phases) = phase_trace.and_then(PhaseTrace::finish) {
+                log_ctx::with_session(Some(completion_session), || {
+                    crate::logging::note_tool_call_trace(
+                        &bare_name_for_frame,
+                        &completion_root,
+                        phases,
+                    );
+                });
             }
         }
         if fatal {

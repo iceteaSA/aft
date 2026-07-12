@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -7,6 +8,91 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
+pub type FinalizeFn<'a> = dyn Fn(&mut Response) + 'a;
+
+/// Monotonic timestamps for one subc tool call. The recorder stays on the
+/// request path and only takes an `Instant::now()` at each phase boundary.
+#[derive(Debug)]
+pub struct PhaseTrace {
+    frame_decoded: Instant,
+    executor_submitted: Option<Instant>,
+    job_admitted: Option<Instant>,
+    translate_done: Option<Instant>,
+    execute_done: Option<Instant>,
+    format_done: Option<Instant>,
+    finalize_done: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCallPhaseDurations {
+    pub queue: Duration,
+    pub translate: Duration,
+    pub execute: Duration,
+    pub format: Duration,
+    pub finalize: Duration,
+    pub egress_enqueue: Duration,
+    pub total: Duration,
+}
+
+impl PhaseTrace {
+    pub fn new(frame_decoded: Instant) -> Self {
+        Self {
+            frame_decoded,
+            executor_submitted: None,
+            job_admitted: None,
+            translate_done: None,
+            execute_done: None,
+            format_done: None,
+            finalize_done: None,
+        }
+    }
+
+    pub fn mark_executor_submitted(&mut self) {
+        self.executor_submitted = Some(Instant::now());
+    }
+
+    pub fn mark_job_admitted(&mut self) {
+        self.job_admitted = Some(Instant::now());
+    }
+
+    fn mark_translate_done(&mut self) {
+        self.translate_done = Some(Instant::now());
+    }
+
+    fn mark_execute_done(&mut self) {
+        self.execute_done = Some(Instant::now());
+    }
+
+    fn mark_format_done(&mut self) {
+        self.format_done = Some(Instant::now());
+    }
+
+    fn mark_finalize_done(&mut self) {
+        self.finalize_done = Some(Instant::now());
+    }
+
+    pub fn finish(self) -> Option<ToolCallPhaseDurations> {
+        self.finish_at(Instant::now())
+    }
+
+    fn finish_at(self, response_enqueued: Instant) -> Option<ToolCallPhaseDurations> {
+        let executor_submitted = self.executor_submitted?;
+        let job_admitted = self.job_admitted?;
+        let translate_done = self.translate_done?;
+        let execute_done = self.execute_done?;
+        let format_done = self.format_done?;
+        let finalize_done = self.finalize_done?;
+        Some(ToolCallPhaseDurations {
+            queue: job_admitted.duration_since(executor_submitted),
+            translate: translate_done.duration_since(job_admitted),
+            execute: execute_done.duration_since(translate_done),
+            format: format_done.duration_since(execute_done),
+            finalize: finalize_done.duration_since(format_done),
+            egress_enqueue: response_enqueued.duration_since(finalize_done),
+            total: response_enqueued.duration_since(self.frame_decoded),
+        })
+    }
+}
 
 /// The full result of a tool call: the COMPLETE dispatch Response carried VERBATIM,
 /// plus the server-rendered agent-facing text (what the deleted TS formatters used to produce).
@@ -43,6 +129,8 @@ pub fn run_tool_call(
     ctx: &ToolCallContext,
     app_ctx: &AppContext,
     dispatch: &DispatchFn<'_>,
+    finalizer: Option<&FinalizeFn<'_>>,
+    mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
     let sanitized_args = strip_agent_preview_arg(args);
     let translate_context = crate::subc_translate::TranslateContext {
@@ -60,12 +148,17 @@ pub fn run_tool_call(
         // the special unsupported_tool error can fall through, allowing native
         // NDJSON commands such as configure/undo to reach dispatch unchanged.
         Err(err) if err.code != "unsupported_tool" => {
+            if let Some(trace) = phase_trace.as_mut() {
+                trace.mark_translate_done();
+                trace.mark_execute_done();
+            }
             let response = Response::error(ctx.request_id.clone(), err.code, err.message);
-            return ToolCallOutcome::Unary(tool_call_result_from_response(
-                bare_name,
-                &format_context,
-                response,
-            ));
+            let result = tool_call_result_from_response(bare_name, format_context, response);
+            if let Some(trace) = phase_trace.as_mut() {
+                trace.mark_format_done();
+                trace.mark_finalize_done();
+            }
+            return ToolCallOutcome::Unary(result);
         }
         Err(_) => {
             let map = sanitized_args.as_object().cloned().unwrap_or_default();
@@ -84,25 +177,44 @@ pub fn run_tool_call(
     let raw_req = match serde_json::from_value::<RawRequest>(Value::Object(map)) {
         Ok(req) => req,
         Err(error) => {
+            if let Some(trace) = phase_trace.as_mut() {
+                trace.mark_translate_done();
+                trace.mark_execute_done();
+            }
             let response = Response::error(
                 ctx.request_id.clone(),
                 "invalid_request",
                 format!("failed to build request from tool call: {error}"),
             );
-            return ToolCallOutcome::Unary(tool_call_result_from_response(
-                bare_name,
-                &format_context,
-                response,
-            ));
+            let result = tool_call_result_from_response(bare_name, format_context, response);
+            if let Some(trace) = phase_trace.as_mut() {
+                trace.mark_format_done();
+                trace.mark_finalize_done();
+            }
+            return ToolCallOutcome::Unary(result);
         }
     };
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_translate_done();
+    }
 
-    let response = dispatch(raw_req, app_ctx);
-    ToolCallOutcome::Unary(tool_call_result_from_response(
-        bare_name,
-        &format_context,
-        response,
-    ))
+    let mut response = dispatch(raw_req, app_ctx);
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_execute_done();
+    }
+    let text =
+        crate::subc_format::format_response_with_context(bare_name, &response, format_context);
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_format_done();
+    }
+    if let Some(finalizer) = finalizer {
+        finalizer(&mut response);
+    }
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_finalize_done();
+    }
+
+    ToolCallOutcome::Unary(ToolCallResult { text, response })
 }
 
 pub(crate) fn strip_agent_preview_arg(args: &Value) -> Cow<'_, Value> {
@@ -133,4 +245,33 @@ fn tool_call_result_from_response(
     let text =
         crate::subc_format::format_response_with_context(bare_name, &response, format_context);
     ToolCallResult { text, response }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_trace_reports_each_adjacent_delta_and_decode_to_egress_total() {
+        let t0 = Instant::now();
+        let trace = PhaseTrace {
+            frame_decoded: t0,
+            executor_submitted: Some(t0 + Duration::from_millis(1)),
+            job_admitted: Some(t0 + Duration::from_millis(3)),
+            translate_done: Some(t0 + Duration::from_millis(6)),
+            execute_done: Some(t0 + Duration::from_millis(10)),
+            format_done: Some(t0 + Duration::from_millis(15)),
+            finalize_done: Some(t0 + Duration::from_millis(21)),
+        };
+
+        let phases = trace.finish_at(t0 + Duration::from_millis(28)).unwrap();
+
+        assert_eq!(phases.queue, Duration::from_millis(2));
+        assert_eq!(phases.translate, Duration::from_millis(3));
+        assert_eq!(phases.execute, Duration::from_millis(4));
+        assert_eq!(phases.format, Duration::from_millis(5));
+        assert_eq!(phases.finalize, Duration::from_millis(6));
+        assert_eq!(phases.egress_enqueue, Duration::from_millis(7));
+        assert_eq!(phases.total, Duration::from_millis(28));
+    }
 }

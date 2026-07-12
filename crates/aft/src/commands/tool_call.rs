@@ -85,6 +85,8 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         &tool_ctx,
         ctx,
         dispatch,
+        None,
+        None,
     ) {
         ToolCallOutcome::Unary(result) => response_with_text(result.response, result.text),
     }

@@ -4,7 +4,8 @@
 //! races while preserving a single greppable directory for all AFT activity.
 
 use crate::executor::Executor;
-use std::collections::BTreeMap;
+use crate::run_tool_call::ToolCallPhaseDurations;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ const LOG_CHANNEL_CAPACITY: usize = 4096;
 const DEAD_PROCESS_LOG_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DEFAULT_PERF_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const PERF_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const SLOW_TOOL_CALL_THRESHOLD: Duration = Duration::from_millis(50);
+const TOOL_CALL_SAMPLE_CAPACITY: usize = 256;
 
 /// Initialize the `RUST_LOG`-filtered stderr logger and its additive file sink.
 pub fn init() {
@@ -371,6 +374,8 @@ struct PerfMetrics {
     semantic_ms: AtomicU64,
     callgraph_invalidations: AtomicU64,
     file_lines_dropped: AtomicU64,
+    tool_call_count: AtomicU64,
+    tool_calls: Mutex<VecDeque<ToolCallPerfSample>>,
     tier2: Mutex<BTreeMap<String, (u64, u64)>>,
     next_sample_ns: AtomicU64,
     reporter: Mutex<PerfReporter>,
@@ -380,6 +385,7 @@ struct PerfReporter {
     last_report: Instant,
     last_completed_interactive: u64,
     last_completed_maintenance: u64,
+    last_tool_call_count: u64,
 }
 
 impl Default for PerfReporter {
@@ -388,8 +394,24 @@ impl Default for PerfReporter {
             last_report: Instant::now(),
             last_completed_interactive: 0,
             last_completed_maintenance: 0,
+            last_tool_call_count: 0,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct ToolCallPerfSample {
+    total_ms: u64,
+    queue_ms: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ToolCallPerfSummary {
+    count: usize,
+    p50_total_ms: u64,
+    max_total_ms: u64,
+    p50_queue_ms: u64,
+    max_queue_ms: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -474,6 +496,50 @@ pub fn note_callgraph_invalidations(files: usize) {
         .fetch_add(files as u64, Ordering::Relaxed);
 }
 
+/// Record a completed subc tool call for slow-call diagnostics and the standing
+/// perf-tick window. The bounded queue is only locked once after response egress.
+pub fn note_tool_call_trace(name: &str, root: &Path, phases: ToolCallPhaseDurations) {
+    let sample = ToolCallPerfSample {
+        total_ms: duration_millis_u64(phases.total),
+        queue_ms: duration_millis_u64(phases.queue),
+    };
+    if let Ok(mut samples) = PERF.tool_calls.lock() {
+        if samples.len() == TOOL_CALL_SAMPLE_CAPACITY {
+            samples.pop_front();
+        }
+        samples.push_back(sample);
+        PERF.tool_call_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    crate::slog_debug!(
+        "tool_call phase name={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} root={}",
+        name,
+        duration_millis_f64(phases.total),
+        duration_millis_f64(phases.queue),
+        duration_millis_f64(phases.translate),
+        duration_millis_f64(phases.execute),
+        duration_millis_f64(phases.format),
+        duration_millis_f64(phases.finalize),
+        duration_millis_f64(phases.egress_enqueue),
+        root.display(),
+    );
+
+    if phases.total > SLOW_TOOL_CALL_THRESHOLD {
+        crate::slog_warn!(
+            "slow tool_call name={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} root={}",
+            name,
+            duration_millis_u64(phases.total),
+            duration_millis_u64(phases.queue),
+            duration_millis_u64(phases.translate),
+            duration_millis_u64(phases.execute),
+            duration_millis_u64(phases.format),
+            duration_millis_u64(phases.finalize),
+            duration_millis_u64(phases.egress_enqueue),
+            root.display(),
+        );
+    }
+}
+
 /// Sample executor liveness and emit one busy-only aggregate at the configured cadence.
 ///
 /// The transport may call this every loop turn; an atomic deadline keeps all
@@ -497,7 +563,8 @@ pub fn perf_tick(executor: Option<&Executor>) {
     });
 
     let completion_counts = executor.map_or((0, 0), Executor::completion_counts);
-    let (completed_interactive, completed_maintenance) = {
+    let tool_call_count = PERF.tool_call_count.load(Ordering::Relaxed);
+    let (completed_interactive, completed_maintenance, new_tool_calls) = {
         let Ok(mut reporter) = PERF.reporter.lock() else {
             return;
         };
@@ -512,9 +579,11 @@ pub fn perf_tick(executor: Option<&Executor>) {
             completion_counts
                 .1
                 .saturating_sub(reporter.last_completed_maintenance),
+            tool_call_count.saturating_sub(reporter.last_tool_call_count),
         );
         reporter.last_completed_interactive = completion_counts.0;
         reporter.last_completed_maintenance = completion_counts.1;
+        reporter.last_tool_call_count = tool_call_count;
         completed
     };
 
@@ -533,6 +602,11 @@ pub fn perf_tick(executor: Option<&Executor>) {
         .lock()
         .map(|mut tier2| std::mem::take(&mut *tier2))
         .unwrap_or_default();
+    let tool_calls = PERF
+        .tool_calls
+        .lock()
+        .map(|samples| summarize_tool_calls(&samples))
+        .unwrap_or_default();
 
     let executor_busy = sample.is_some_and(|sample| {
         sample.interactive_running > 0
@@ -548,6 +622,7 @@ pub fn perf_tick(executor: Option<&Executor>) {
         || callgraph_invalidations > 0
         || completed_interactive > 0
         || completed_maintenance > 0
+        || new_tool_calls > 0
         || file_lines_dropped > 0
         || !tier2.is_empty()
         || executor_busy;
@@ -566,7 +641,7 @@ pub fn perf_tick(executor: Option<&Executor>) {
     };
     let sample = sample.unwrap_or_default();
     crate::slog_info!(
-        "perf tick: watcher={{ingested:{},paths:{},dropped:{}}} drains={} tier2=[{}] semantic={{collects:{},files:{},chunks:{},ms:{}}} callgraph_invalidations={} executor_completed={{interactive:{},maintenance:{}}} oldest_queued_ms={{interactive:{},maintenance:{}}} file_log_dropped={}",
+        "perf tick: watcher={{ingested:{},paths:{},dropped:{}}} drains={} tier2=[{}] semantic={{collects:{},files:{},chunks:{},ms:{}}} callgraph_invalidations={} executor_completed={{interactive:{},maintenance:{}}} oldest_queued_ms={{interactive:{},maintenance:{}}} toolcall={{count:{},p50_total_ms:{},max_total_ms:{},p50_queue_ms:{},max_queue_ms:{}}} file_log_dropped={}",
         watcher_ingested,
         watcher_paths,
         watcher_dropped,
@@ -581,8 +656,45 @@ pub fn perf_tick(executor: Option<&Executor>) {
         completed_maintenance,
         format_optional_ms(sample.interactive_oldest_ms),
         format_optional_ms(sample.maintenance_oldest_ms),
+        tool_calls.count,
+        tool_calls.p50_total_ms,
+        tool_calls.max_total_ms,
+        tool_calls.p50_queue_ms,
+        tool_calls.max_queue_ms,
         file_lines_dropped,
     );
+}
+
+fn duration_millis_f64(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn summarize_tool_calls(samples: &VecDeque<ToolCallPerfSample>) -> ToolCallPerfSummary {
+    if samples.is_empty() {
+        return ToolCallPerfSummary::default();
+    }
+    let mut totals = samples
+        .iter()
+        .map(|sample| sample.total_ms)
+        .collect::<Vec<_>>();
+    let mut queues = samples
+        .iter()
+        .map(|sample| sample.queue_ms)
+        .collect::<Vec<_>>();
+    totals.sort_unstable();
+    queues.sort_unstable();
+    let median_index = (samples.len() - 1) / 2;
+    ToolCallPerfSummary {
+        count: samples.len(),
+        p50_total_ms: totals[median_index],
+        max_total_ms: totals[totals.len() - 1],
+        p50_queue_ms: queues[median_index],
+        max_queue_ms: queues[queues.len() - 1],
+    }
 }
 
 fn format_optional_ms(value: Option<u64>) -> String {
@@ -680,5 +792,35 @@ mod tests {
         assert!(!dead_rotated.exists());
         assert!(live.exists());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn tool_call_summary_uses_bounded_window_median_and_maxima() {
+        let samples = VecDeque::from([
+            ToolCallPerfSample {
+                total_ms: 9,
+                queue_ms: 5,
+            },
+            ToolCallPerfSample {
+                total_ms: 3,
+                queue_ms: 1,
+            },
+            ToolCallPerfSample {
+                total_ms: 7,
+                queue_ms: 2,
+            },
+            ToolCallPerfSample {
+                total_ms: 5,
+                queue_ms: 4,
+            },
+        ]);
+
+        let summary = summarize_tool_calls(&samples);
+
+        assert_eq!(summary.count, 4);
+        assert_eq!(summary.p50_total_ms, 5);
+        assert_eq!(summary.max_total_ms, 9);
+        assert_eq!(summary.p50_queue_ms, 2);
+        assert_eq!(summary.max_queue_ms, 5);
     }
 }
