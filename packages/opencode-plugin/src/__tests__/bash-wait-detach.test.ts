@@ -82,9 +82,6 @@ describe("bash wait detach helper", () => {
       "session-3",
     );
 
-    expect(sends.sort()).toEqual([
-      "a:bash_wait_detach:session-3",
-      "b:bash_wait_detach:session-3",
-    ]);
+    expect(sends.sort()).toEqual(["a:bash_wait_detach:session-3", "b:bash_wait_detach:session-3"]);
   });
 });

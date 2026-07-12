@@ -2,6 +2,7 @@
  * Shared helpers used by every Pi tool wrapper.
  */
 
+import { existsSync } from "node:fs";
 import type {
   AftProjectTransport,
   BridgeRequestOptions,
@@ -10,7 +11,6 @@ import type {
 } from "@cortexkit/aft-bridge";
 import { formatBridgeErrorMessage, timeoutForCommand } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync } from 'node:fs';
 import { Type } from "typebox";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import type { PluginContext } from "../types.js";
