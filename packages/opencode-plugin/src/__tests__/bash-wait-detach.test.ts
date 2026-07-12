@@ -6,20 +6,22 @@ import { signalBashWaitDetachForProject } from "../bash-wait-detach.js";
 describe("bash wait detach helper", () => {
   test("user-message detach sends bash_wait_detach on the active bridge", async () => {
     const calls: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [];
+    const bridge = {
+      send: async (
+        command: string,
+        params: Record<string, unknown>,
+        options: Record<string, unknown>,
+      ) => {
+        calls.push([command, params, options]);
+        return { success: true, detached: true };
+      },
+    };
     const pool = {
       getActiveBridgeForRoot: (projectRoot: string) => {
         expect(projectRoot).toBe("/repo");
-        return {
-          send: async (
-            command: string,
-            params: Record<string, unknown>,
-            options: Record<string, unknown>,
-          ) => {
-            calls.push([command, params, options]);
-            return { success: true, detached: true };
-          },
-        };
+        return bridge;
       },
+      activeBridges: () => [bridge],
     };
 
     await signalBashWaitDetachForProject(

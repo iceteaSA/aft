@@ -6,6 +6,16 @@ members = ["crates/aft", "crates/aft-tokenizer"]
 lto = true
 codegen-units = 1
 strip = true
+
+# Local staging builds (dev binaries for the daemon/NDJSON caches). Thin LTO +
+# parallel codegen gets within a few percent of fat-LTO performance at a
+# fraction of the link time (the fat-LTO + codegen-units=1 final step is
+# single-threaded and routinely 15-50 min on a contended box). GitHub releases
+# keep [profile.release] — maximum optimization for shipped binaries.
+[profile.stage]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
 # "unwind" instead of "abort" so catch_unwind works — required because
 # the ort crate panics (instead of returning Err) when dlopen fails on
 # an incompatible libonnxruntime.so. With "abort", that panic kills the

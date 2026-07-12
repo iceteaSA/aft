@@ -4,7 +4,10 @@ import { BASH_TRANSPORT_TIMEOUT_MS } from "./tools/_shared.js";
 
 type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot" | "activeBridges">;
 
-async function sendBashWaitDetach(bridge: AftProjectTransport, sessionID: string): Promise<void> {
+async function sendBashWaitDetach(
+  bridge: AftProjectTransport,
+  sessionID: string,
+): Promise<boolean> {
   const response = await bridge.send(
     "bash_wait_detach",
     { session_id: sessionID },
@@ -13,6 +16,10 @@ async function sendBashWaitDetach(bridge: AftProjectTransport, sessionID: string
   if (response.success === false) {
     throw new Error(String(response.message ?? "bash_wait_detach failed"));
   }
+  // success:true with detached:false means no active wait was found under
+  // this session on that bridge — possibly the wrong bridge. Callers use
+  // this to keep fanning out instead of treating delivery as done.
+  return response.detached === true;
 }
 
 export async function signalBashWaitDetachForProject(
@@ -21,28 +28,38 @@ export async function signalBashWaitDetachForProject(
   sessionID: string | undefined,
 ): Promise<void> {
   if (!sessionID) return;
-  // Root-key resolution can disagree with the key the bash tool call used
-  // (canonicalization, worktrees, cwd fallbacks). The command is scoped by
-  // session_id on the Rust side, so when the exact root has no live bridge,
-  // fan out to every live bridge instead of silently dropping the signal.
+  // Try the exact root first, but keep fanning out while no bridge reports an
+  // actually-detached wait: success:true + detached:false from the exact-root
+  // bridge means the wait lives elsewhere (root-key mismatch), not "done".
   const exact = pool.getActiveBridgeForRoot(projectRoot);
-  const targets = exact ? [exact] : pool.activeBridges();
+  const all = pool.activeBridges();
+  const targets = exact ? [exact, ...all.filter((bridge) => bridge !== exact)] : all;
   if (targets.length === 0) {
     warn(`[bash_wait_detach] no live bridge for session ${sessionID} (root ${projectRoot})`);
     return;
   }
-  const results = await Promise.allSettled(
-    targets.map((bridge: AftProjectTransport) => sendBashWaitDetach(bridge, sessionID)),
-  );
-  const failed = results.filter((result: PromiseSettledResult<void>) => result.status === "rejected");
-  if (failed.length === results.length) {
-    const err = (failed[0] as PromiseRejectedResult).reason;
+  let signaled = 0;
+  let lastError: unknown = null;
+  for (const bridge of targets) {
+    try {
+      signaled += 1;
+      if (await sendBashWaitDetach(bridge, sessionID)) {
+        log(
+          `[bash_wait_detach] detached wait for session ${sessionID} (bridge ${signaled}/${targets.length})`,
+        );
+        return;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (lastError !== null) {
     warn(
-      `[bash_wait_detach] failed for session ${sessionID}: ${err instanceof Error ? err.message : String(err)}`,
+      `[bash_wait_detach] failed for session ${sessionID}: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
     );
   } else {
     log(
-      `[bash_wait_detach] signaled for session ${sessionID} via ${results.length - failed.length} bridge(s)${exact ? "" : " (root-key fallback)"}`,
+      `[bash_wait_detach] no active wait found for session ${sessionID} (signaled ${signaled} bridge(s))`,
     );
   }
 }

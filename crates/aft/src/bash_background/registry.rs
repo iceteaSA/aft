@@ -353,6 +353,16 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
+    /// Number of sessions currently blocked in a `wait: true` foreground bash.
+    /// Diagnostic only (the detach-signal trace log).
+    pub fn active_wait_session_count(&self) -> usize {
+        self.inner
+            .active_wait_sessions
+            .lock()
+            .map(|active| active.len())
+            .unwrap_or(0)
+    }
+
     pub fn take_wait_mode_detach(&self, session_id: &str) -> bool {
         self.inner
             .wait_detach_sessions
