@@ -16,6 +16,12 @@ strip = true
 inherits = "release"
 lto = "thin"
 codegen-units = 4
+# Line tables + symbol names so `sample`/Instruments on a staged dev module
+# resolves real function names (release inherits strip=true, which left a
+# 91%-CPU thread anonymous during live diagnosis). Costs a few MB of binary
+# size on local staging builds only; GitHub releases stay stripped.
+strip = false
+debug = 1
 # "unwind" instead of "abort" so catch_unwind works — required because
 # the ort crate panics (instead of returning Err) when dlopen fails on
 # an incompatible libonnxruntime.so. With "abort", that panic kills the
