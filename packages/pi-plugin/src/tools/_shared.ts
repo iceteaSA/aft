@@ -10,6 +10,7 @@ import type {
 } from "@cortexkit/aft-bridge";
 import { formatBridgeErrorMessage, timeoutForCommand } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { existsSync } from 'node:fs';
 import { Type } from "typebox";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import type { PluginContext } from "../types.js";
@@ -46,6 +47,12 @@ export {
 
 /** Get the session bridge for the current working directory. */
 export function bridgeFor(ctx: PluginContext, cwd: string): AftProjectTransport {
+  // A restored session can point at a reclaimed mason worktree (or any
+  // deleted directory). Binding it would make the module configure, lease,
+  // and warm indexes for a dead root — refuse before any transport work.
+  if (!existsSync(cwd)) {
+    throw new Error(`project directory no longer exists: ${cwd} (stale restored session?)`);
+  }
   return ctx.pool.getBridge(cwd);
 }
 

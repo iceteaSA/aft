@@ -16,6 +16,7 @@
  * and still pass `session_id` explicitly.
  */
 
+import { existsSync } from 'node:fs';
 import * as os from "node:os";
 import * as path from "node:path";
 import type {
@@ -198,6 +199,14 @@ export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): AftProjectT
   const projectRoot = projectRootFor(runtime);
   if (ctx.isProjectEnabled?.(projectRoot) === false) {
     throw new Error(`AFT disabled by config for ${projectRoot}`);
+  }
+  // A restored session can point at a reclaimed mason worktree (or any
+  // deleted directory). Binding it would make the module configure, lease,
+  // and warm indexes for a dead root — refuse before any transport work.
+  if (!existsSync(projectRoot)) {
+    throw new Error(
+      `project directory no longer exists: ${projectRoot} (stale restored session?)`,
+    );
   }
   return ctx.pool.getBridge(projectRoot);
 }
