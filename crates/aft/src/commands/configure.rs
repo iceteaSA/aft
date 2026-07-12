@@ -3,6 +3,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+#[cfg(test)]
+use std::sync::{Condvar, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -32,6 +34,8 @@ use crate::{slog_debug, slog_info, slog_warn};
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static SEMANTIC_STALE_GENERATION_SIGNAL: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static CONFIGURE_ARTIFACT_LOAD_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
 fn note_configure_artifact_load_attempt() {
@@ -56,6 +60,31 @@ pub fn reset_semantic_stale_generation_discards_for_test() {
 #[doc(hidden)]
 pub fn semantic_stale_generation_discards_for_test() -> usize {
     SEMANTIC_STALE_GENERATION_DISCARDS.load(Ordering::SeqCst)
+}
+
+fn note_semantic_stale_generation_discard() {
+    SEMANTIC_STALE_GENERATION_DISCARDS.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    if let Some((_, changed)) = SEMANTIC_STALE_GENERATION_SIGNAL.get() {
+        changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> bool {
+    if semantic_stale_generation_discards_for_test() > 0 {
+        return true;
+    }
+    let (lock, changed) = SEMANTIC_STALE_GENERATION_SIGNAL.get_or_init(Default::default);
+    let guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_guard, result) = changed
+        .wait_timeout_while(guard, timeout, |_| {
+            semantic_stale_generation_discards_for_test() == 0
+        })
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !result.timed_out() || semantic_stale_generation_discards_for_test() > 0
 }
 
 // The watcher already coalesces filesystem events for 250 ms. Keep a short
@@ -2694,7 +2723,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 persist_completed_index(&ready.index, "stale generation discard");
                             }
                         }
-                        SEMANTIC_STALE_GENERATION_DISCARDS.fetch_add(1, Ordering::SeqCst);
+                        note_semantic_stale_generation_discard();
                         slog_info!(
                             "semantic index build result discarded for stale generation {}",
                             semantic_generation
@@ -3054,7 +3083,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc, Barrier, Mutex};
+    use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{
@@ -3312,15 +3341,25 @@ mod tests {
             .join("semantic.bin")
     }
 
+    fn count_non_probe_inputs(requests: &[Vec<String>]) -> usize {
+        requests
+            .iter()
+            .flatten()
+            .filter(|text| text.as_str() != "semantic index fingerprint probe")
+            .count()
+    }
+
     struct CountingEmbeddingServer {
         base_url: String,
         stop: Arc<AtomicBool>,
         requests: Arc<Mutex<Vec<Vec<String>>>>,
+        request_changed: Arc<Condvar>,
+        response_release: Arc<(Mutex<bool>, Condvar)>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl CountingEmbeddingServer {
-        fn start(delay: Duration) -> Self {
+        fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
             let addr = listener.local_addr().expect("embedding mock addr");
             listener
@@ -3328,15 +3367,26 @@ mod tests {
                 .expect("embedding mock nonblocking");
             let stop = Arc::new(AtomicBool::new(false));
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let request_changed = Arc::new(Condvar::new());
+            let response_release = Arc::new((Mutex::new(false), Condvar::new()));
             let stop_for_thread = Arc::clone(&stop);
             let requests_for_thread = Arc::clone(&requests);
+            let request_changed_for_thread = Arc::clone(&request_changed);
+            let response_release_for_thread = Arc::clone(&response_release);
             let handle = std::thread::spawn(move || {
                 while !stop_for_thread.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let requests = Arc::clone(&requests_for_thread);
+                            let request_changed = Arc::clone(&request_changed_for_thread);
+                            let response_release = Arc::clone(&response_release_for_thread);
                             std::thread::spawn(move || {
-                                handle_counting_embedding_request(stream, delay, requests)
+                                handle_counting_embedding_request(
+                                    stream,
+                                    requests,
+                                    request_changed,
+                                    response_release,
+                                )
                             });
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3350,23 +3400,47 @@ mod tests {
                 base_url: format!("http://{addr}"),
                 stop,
                 requests,
+                request_changed,
+                response_release,
                 handle: Some(handle),
             }
         }
 
         fn non_probe_input_count(&self) -> usize {
-            self.requests
+            count_non_probe_inputs(
+                &self
+                    .requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        }
+
+        fn wait_for_non_probe_input(&self, timeout: Duration) -> bool {
+            let requests = self
+                .requests
                 .lock()
-                .unwrap()
-                .iter()
-                .flatten()
-                .filter(|text| text.as_str() != "semantic index fingerprint probe")
-                .count()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (requests, result) = self
+                .request_changed
+                .wait_timeout_while(requests, timeout, |requests| {
+                    count_non_probe_inputs(requests) == 0
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !result.timed_out() || count_non_probe_inputs(&requests) > 0
+        }
+
+        fn release_responses(&self) {
+            let (released, changed) = &*self.response_release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
         }
     }
 
     impl Drop for CountingEmbeddingServer {
         fn drop(&mut self) {
+            self.release_responses();
             self.stop.store(true, Ordering::Relaxed);
             let _ = std::net::TcpStream::connect(self.base_url.trim_start_matches("http://"));
             if let Some(handle) = self.handle.take() {
@@ -3377,8 +3451,9 @@ mod tests {
 
     fn handle_counting_embedding_request(
         mut stream: std::net::TcpStream,
-        delay: Duration,
         requests: Arc<Mutex<Vec<Vec<String>>>>,
+        request_changed: Arc<Condvar>,
+        response_release: Arc<(Mutex<bool>, Condvar)>,
     ) {
         stream
             .set_nonblocking(false)
@@ -3408,8 +3483,25 @@ mod tests {
             Some(serde_json::Value::String(value)) => vec![value.clone()],
             _ => vec![String::new()],
         };
-        requests.lock().unwrap().push(inputs.clone());
-        std::thread::sleep(delay);
+        requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(inputs.clone());
+        request_changed.notify_all();
+        if inputs
+            .iter()
+            .any(|text| text != "semantic index fingerprint probe")
+        {
+            let (released, changed) = &*response_release;
+            let guard = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(
+                changed
+                    .wait_while(guard, |released| !*released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
         let data = inputs
             .iter()
             .enumerate()
@@ -4019,7 +4111,7 @@ mod tests {
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         super::reset_semantic_stale_generation_discards_for_test();
-        let server = CountingEmbeddingServer::start(Duration::from_millis(50));
+        let server = CountingEmbeddingServer::start();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let storage = temp.path().join("storage");
@@ -4043,9 +4135,14 @@ mod tests {
             "configure failed: {:?}",
             first_response.data
         );
-        // The runtime opens post-ack loader gates before a later reconfigure can
-        // supersede the generation; mirror that ordering in this direct-handler test.
         super::drain_deferred_configure_maintenance(&first_ctx);
+        // Opening the maintenance gate only makes the worker runnable. Hold its
+        // first corpus response so the next configure deterministically fences
+        // an in-flight build rather than racing thread scheduling.
+        assert!(
+            server.wait_for_non_probe_input(Duration::from_secs(5)),
+            "post-ack semantic loader did not begin its corpus request"
+        );
         let disabled_response = handle_configure_for_test(
             &configure_semantic_with_storage(&project, &storage, &server.base_url, false),
             &first_ctx,
@@ -4055,18 +4152,16 @@ mod tests {
             "disable configure failed: {:?}",
             disabled_response.data
         );
+        server.release_responses();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if super::semantic_stale_generation_discards_for_test() > 0 && semantic_file.is_file() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for stale semantic build to persist"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            super::wait_for_semantic_stale_generation_discard_for_test(Duration::from_secs(5)),
+            "timed out waiting for stale semantic build to persist"
+        );
+        assert!(
+            semantic_file.is_file(),
+            "stale semantic build was not persisted"
+        );
         let initial_non_probe_inputs = server.non_probe_input_count();
         assert!(
             initial_non_probe_inputs >= 4,
