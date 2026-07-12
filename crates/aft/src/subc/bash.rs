@@ -59,6 +59,7 @@ enum BashSpawnControl {
         block_to_completion: bool,
         timeout: Option<u64>,
         wait_window_ms: u64,
+        detach_on_user_message: bool,
     },
 }
 
@@ -367,6 +368,15 @@ pub(super) fn submit_deferred_bash(
                 let storage_dir =
                     crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
                 let project_root = ctx.config().project_root.clone();
+                // Register the session as detachable exactly like the
+                // standalone path (bash_orchestrate) does: without this, a
+                // bash_wait_detach signal finds no active wait and wait:true
+                // blocks through user messages.
+                let detach_on_user_message = settings.wait;
+                if detach_on_user_message {
+                    ctx.bash_background()
+                        .begin_wait_mode_session(&session_for_spawn);
+                }
                 if let Some(tx) = spawn_control_tx.take() {
                     let _ = tx.send(BashSpawnControl::Foreground {
                         task_id,
@@ -377,6 +387,7 @@ pub(super) fn submit_deferred_bash(
                         block_to_completion: settings.block_to_completion || settings.wait,
                         timeout: settings.timeout,
                         wait_window_ms,
+                        detach_on_user_message,
                     });
                 }
                 response
@@ -430,6 +441,7 @@ pub(super) fn submit_deferred_bash(
                 block_to_completion,
                 timeout,
                 wait_window_ms,
+                detach_on_user_message,
             }) => {
                 run_deferred_bash_wait(
                     executor,
@@ -450,6 +462,7 @@ pub(super) fn submit_deferred_bash(
                     block_to_completion,
                     timeout,
                     wait_window_ms,
+                    detach_on_user_message,
                     format_context,
                     cancel,
                 )
@@ -496,6 +509,7 @@ async fn run_deferred_bash_wait(
     block_to_completion: bool,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    detach_on_user_message: bool,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
 ) {
@@ -544,6 +558,10 @@ async fn run_deferred_bash_wait(
                                 &storage_for_poll,
                                 crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES,
                             ) else {
+                                if detach_on_user_message {
+                                    ctx.bash_background()
+                                        .end_wait_mode_session(&session_for_poll);
+                                }
                                 return finish_bash_poll_done(
                                     crate::commands::bash_orchestrate::task_not_found_response(
                                         &request_id_for_poll,
@@ -557,6 +575,29 @@ async fn run_deferred_bash_wait(
                                 );
                             };
 
+                            if detach_on_user_message
+                                && !snapshot.info.status.is_terminal()
+                                && ctx
+                                    .bash_background()
+                                    .take_wait_mode_detach(&session_for_poll)
+                            {
+                                let response = crate::commands::bash_orchestrate::detach_wait_mode_bash(
+                                    ctx,
+                                    &task_id_for_poll,
+                                    &session_for_poll,
+                                    &request_id_for_poll,
+                                );
+                                ctx.bash_background()
+                                    .end_wait_mode_session(&session_for_poll);
+                                return finish_bash_poll_done(
+                                    response,
+                                    ctx,
+                                    &session_for_poll,
+                                    &format_context_for_poll,
+                                    &mut poll_text_tx,
+                                    &mut poll_control_tx,
+                                );
+                            }
                             match crate::commands::bash_orchestrate::decide_bash_step(
                                 snapshot,
                                 deadline,
@@ -565,6 +606,10 @@ async fn run_deferred_bash_wait(
                                 &request_id_for_poll,
                             ) {
                                 crate::commands::bash_orchestrate::BashStep::Done(response) => {
+                                    if detach_on_user_message {
+                                        ctx.bash_background()
+                                            .end_wait_mode_session(&session_for_poll);
+                                    }
                                     finish_bash_poll_done(
                                         response,
                                         ctx,
@@ -575,6 +620,10 @@ async fn run_deferred_bash_wait(
                                     )
                                 }
                                 crate::commands::bash_orchestrate::BashStep::Promote => {
+                                    if detach_on_user_message {
+                                        ctx.bash_background()
+                                            .end_wait_mode_session(&session_for_poll);
+                                    }
                                     if let Some(tx) = poll_control_tx.take() {
                                         let _ = tx.send(BashPollControl::Promote);
                                     }
