@@ -177,11 +177,15 @@ pub struct ProcessMemorySnapshot {
 }
 
 impl ProcessMemorySnapshot {
-    pub fn from_roots(roots: &BTreeMap<String, RootMemorySnapshot>) -> Self {
+    pub fn from_roots(
+        roots: &BTreeMap<String, RootMemorySnapshot>,
+        shared_semantic_bases: &MemoryEstimate,
+    ) -> Self {
         let total_attributed_bytes = roots
             .values()
             .map(|root| root.attributed_bytes)
-            .fold(0u64, u64::saturating_add);
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0));
         let busy_subsystems = roots
             .values()
             .map(RootMemorySnapshot::busy_subsystem_count)
@@ -216,15 +220,19 @@ impl ProcessMemorySnapshot {
 pub struct MemorySnapshot {
     pub roots_status: &'static str,
     pub roots: BTreeMap<String, RootMemorySnapshot>,
+    /// Immutable borrowed semantic snapshots, attributed once process-wide.
+    pub shared_semantic_bases: MemoryEstimate,
     pub process: ProcessMemorySnapshot,
 }
 
 impl MemorySnapshot {
     pub fn new(roots_status: &'static str, roots: BTreeMap<String, RootMemorySnapshot>) -> Self {
-        let process = ProcessMemorySnapshot::from_roots(&roots);
+        let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
+        let process = ProcessMemorySnapshot::from_roots(&roots, &shared_semantic_bases);
         Self {
             roots_status,
             roots,
+            shared_semantic_bases,
             process,
         }
     }

@@ -140,15 +140,13 @@ struct DegradedGrepFallbackResult {
 struct ExternalBorrowMetadata {
     drift_count: usize,
     ignore_rules_differ: bool,
-    built_at_git_head: Option<String>,
 }
 
 impl ExternalBorrowMetadata {
-    fn from_search_index(index: &SearchIndex) -> Self {
+    fn from_search_index(_index: &SearchIndex) -> Self {
         Self {
             drift_count: 0,
             ignore_rules_differ: false,
-            built_at_git_head: index.stored_git_head().map(str::to_owned),
         }
     }
 
@@ -311,6 +309,10 @@ fn handle_external_search(
         ReadOnlyArtifact::Stale(stale) => {
             let mut borrow_metadata = ExternalBorrowMetadata::from_search_index(&stale.index);
             borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
+            crate::slog_warn!(
+                "{}",
+                borrowed_drift_log_message("search", &external_root, stale.drift_count)
+            );
             (stale.index, borrow_metadata)
         }
     };
@@ -445,6 +447,9 @@ fn handle_external_grep_search(
         search_index
             .snapshot()
             .search_grep(&compiled, &[], &[], external_root, grep_limit);
+    result
+        .matches
+        .retain(|grep_match| grep_match.file.is_file());
     result = filter_grep_result_for_tests(result, include_tests, external_root, top_k);
 
     let result_source = if literal { "literal" } else { "regex" };
@@ -455,11 +460,7 @@ fn handle_external_grep_search(
         .collect::<Vec<_>>();
     let interpreted_as = interpreted_as_label(effective_mode);
     let display_root = absolute_display_root(external_root);
-    let text = prepend_external_borrow_note(
-        format_grep_search_text(&result, &display_root, interpreted_as),
-        external_root,
-        borrow_metadata,
-    );
+    let text = format_grep_search_text(&result, &display_root, interpreted_as);
     let extras = external_response_extras(external_root, borrow_metadata)
         .as_object()
         .cloned()
@@ -526,6 +527,10 @@ fn handle_external_semantic_or_hybrid_search(
         },
         ReadOnlyArtifact::Stale(stale) => {
             borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
+            crate::slog_warn!(
+                "{}",
+                borrowed_drift_log_message("semantic", &external_root, stale.drift_count)
+            );
             if semantic_fingerprint_matches_session(ctx, &stale.index) {
                 Some(stale.index)
             } else {
@@ -601,6 +606,7 @@ fn handle_external_semantic_or_hybrid_search(
     };
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
     let mut semantic_results = semantic_index.search(&query_vector, semantic_fetch_limit);
+    semantic_results.retain(|result| result.file.is_file());
     let semantic_more_available = semantic_results.len() > semantic_limit;
     if semantic_more_available {
         semantic_results.truncate(semantic_limit);
@@ -615,6 +621,7 @@ fn handle_external_semantic_or_hybrid_search(
         params.include_tests,
         &external_root,
     );
+    results.retain(|result| result.file.is_file());
     let fused_more_available = results.len() > top_k;
     if fused_more_available {
         results.truncate(top_k);
@@ -624,16 +631,12 @@ fn handle_external_semantic_or_hybrid_search(
         enrich_snippets_from_source_with_context(&mut results, &external_root, None);
     let display_root = absolute_display_root(&external_root);
 
-    let text = prepend_external_borrow_note(
-        format_semantic_text_with_display_root(
-            &results,
-            &display_root,
-            more_available,
-            snippets_incomplete,
-            None,
-        ),
-        &external_root,
-        &borrow_metadata,
+    let text = format_semantic_text_with_display_root(
+        &results,
+        &display_root,
+        more_available,
+        snippets_incomplete,
+        None,
     );
 
     search_response(
@@ -673,7 +676,7 @@ fn external_lexical_only_response(
 ) -> Response {
     let lexical_count = lexical.files.len();
     let lexical_engine_capped = lexical.engine_capped;
-    let results = fuse_hybrid_results(
+    let mut results = fuse_hybrid_results(
         Vec::new(),
         lexical.files,
         shape,
@@ -681,17 +684,14 @@ fn external_lexical_only_response(
         params.include_tests,
         external_root,
     );
+    results.retain(|result| result.file.is_file());
     let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
     warnings.push(
         "Semantic search unavailable for external root; returning lexical-only fallback results."
             .to_string(),
     );
     let display_root = absolute_display_root(external_root);
-    let text = prepend_external_borrow_note(
-        format_lexical_unavailable_text(&detail, &results, &display_root),
-        external_root,
-        borrow_metadata,
-    );
+    let text = format_lexical_unavailable_text(&detail, &results, &display_root);
     let mut extras = semantic_unavailable_extras(true);
     for (key, value) in external_response_extras(external_root, borrow_metadata)
         .as_object()
@@ -761,50 +761,11 @@ fn external_response_extras(
     })
 }
 
-fn prepend_external_borrow_note(
-    text: String,
-    external_root: &Path,
-    borrow_metadata: &ExternalBorrowMetadata,
-) -> String {
-    match external_borrow_note(external_root, borrow_metadata) {
-        Some(note) => format!("{note}\n\n{text}"),
-        None => text,
-    }
-}
-
-fn external_borrow_note(
-    external_root: &Path,
-    borrow_metadata: &ExternalBorrowMetadata,
-) -> Option<String> {
-    if borrow_metadata.drift_count == 0 && !borrow_metadata.ignore_rules_differ {
-        return None;
-    }
-
-    let mut details = Vec::new();
-    if borrow_metadata.drift_count > 0 {
-        details.push(format!(
-            "{} file(s) drifted since build",
-            borrow_metadata.drift_count
-        ));
-    }
-    if borrow_metadata.ignore_rules_differ {
-        details.push("ignore rules differ between checkouts".to_string());
-    }
-
-    let head_clause = borrow_metadata
-        .built_at_git_head
-        .as_deref()
-        .map(|head| format!(" (built at HEAD {})", short_git_head(head)))
-        .unwrap_or_default();
-    Some(format!(
-        "note: borrowed index for {}{head_clause}: {}; line numbers may be off — grep the target root for exact positions.",
-        external_root.display(),
-        details.join("; ")
-    ))
-}
-
-fn short_git_head(head: &str) -> &str {
-    head.get(..12).unwrap_or(head)
+fn borrowed_drift_log_message(index_kind: &str, root: &Path, drift_count: usize) -> String {
+    format!(
+        "borrowed {index_kind} index for {} has {drift_count} drifted file(s); serving current-disk snippets without agent-facing stale prose",
+        root.display()
+    )
 }
 
 fn absolute_display_root(root: &Path) -> PathBuf {
@@ -1458,6 +1419,9 @@ fn handle_semantic_or_hybrid_search(
             .map(|index| index.search(&query_vector, semantic_fetch_limit))
             .unwrap_or_default()
     };
+    if ctx.shared_artifacts_read_only() {
+        semantic_results.retain(|result| result.file.is_file());
+    }
     let semantic_more_available = semantic_results.len() > semantic_limit;
     if semantic_more_available {
         semantic_results.truncate(semantic_limit);
@@ -1472,6 +1436,9 @@ fn handle_semantic_or_hybrid_search(
         params.include_tests,
         project_root,
     );
+    if ctx.shared_artifacts_read_only() {
+        results.retain(|result| result.file.is_file());
+    }
     let fused_more_available = results.len() > top_k;
     if fused_more_available {
         results.truncate(top_k);
@@ -2722,7 +2689,7 @@ fn enrich_snippets_from_source_with_context(
     let mut incomplete = false;
 
     for (rank, result) in results.iter_mut().enumerate() {
-        if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
+        if result.source == "lexical" {
             continue;
         }
 
@@ -2741,6 +2708,19 @@ fn enrich_snippets_from_source_with_context(
                 .ok()
                 .map(|content| content.lines().map(str::to_string).collect())
         });
+
+        if matches!(result.kind, SymbolKind::FileSummary) {
+            if let Some(lines) = lines {
+                result.snippet = lines
+                    .iter()
+                    .filter(|line| !line.trim().is_empty())
+                    .take(budget)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            continue;
+        }
 
         let Some(lines) = lines else {
             // File unreadable or gone — no snippet beats a stale one.
@@ -4121,6 +4101,57 @@ mod tests {
 
         assert!((candidates[0].rank_score - 0.012).abs() < 0.0001);
         assert!(!candidates[0].cap_protected);
+    }
+
+    #[test]
+    fn borrowed_drift_remains_available_in_logs() {
+        let message = borrowed_drift_log_message("semantic", Path::new("/borrowed"), 3);
+        assert!(message.contains("borrowed semantic index"));
+        assert!(message.contains("3 drifted file(s)"));
+    }
+
+    #[test]
+    fn file_summary_snippet_is_regenerated_from_current_disk_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("summary.rs");
+        std::fs::write(&path, "pub fn current_disk_symbol() {}\n").expect("write current source");
+        let mut candidate = semantic_candidate(
+            path.to_str().expect("utf8 path"),
+            "summary.rs",
+            None,
+            SymbolKind::FileSummary,
+            0.9,
+        );
+        candidate.snippet = "pub fn stale_persisted_symbol() {}".to_string();
+        let shape = rerank_shape(QueryKind::NaturalLanguage);
+        let mut results =
+            fuse_hybrid_results(vec![candidate], Vec::new(), &shape, 5, true, dir.path());
+
+        enrich_snippets_from_source(&mut results, dir.path());
+
+        assert!(results[0].snippet.contains("current_disk_symbol"));
+        assert!(!results[0].snippet.contains("stale_persisted_symbol"));
+    }
+
+    #[test]
+    fn file_summary_keeps_persisted_snippet_when_source_is_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.rs");
+        let mut candidate = semantic_candidate(
+            missing.to_str().expect("utf8 path"),
+            "missing.rs",
+            None,
+            SymbolKind::FileSummary,
+            0.9,
+        );
+        candidate.snippet = "persisted fallback".to_string();
+        let shape = rerank_shape(QueryKind::NaturalLanguage);
+        let mut results =
+            fuse_hybrid_results(vec![candidate], Vec::new(), &shape, 5, true, dir.path());
+
+        enrich_snippets_from_source(&mut results, dir.path());
+
+        assert_eq!(results[0].snippet, "persisted fallback");
     }
 
     #[test]

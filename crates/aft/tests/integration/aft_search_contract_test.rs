@@ -684,7 +684,7 @@ fn same_root_path_param_is_byte_identical_to_default_search() {
 }
 
 #[test]
-fn external_ignore_rule_mismatch_serves_borrowed_results_with_warning() {
+fn external_ignore_rule_mismatch_keeps_drift_in_metadata_only() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (owner_project, _owner_source, _source) = git_project_with_needle();
     let storage = tempfile::tempdir().expect("storage");
@@ -710,10 +710,10 @@ fn external_ignore_rule_mismatch_serves_borrowed_results_with_warning() {
     assert_eq!(response["borrowed"], true);
     assert_eq!(response["ignore_rules_differ"], true);
     assert!(
-        response["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("ignore rules differ between checkouts")),
-        "expected borrow warning note in rendered text: {response:?}"
+        response["text"].as_str().is_some_and(|text| !text
+            .contains("ignore rules differ between checkouts")
+            && !text.contains("borrowed index")),
+        "borrow metadata must not become agent-facing stale prose: {response:?}"
     );
     let results = response["results"].as_array().expect("results array");
     assert!(
@@ -727,7 +727,7 @@ fn external_ignore_rule_mismatch_serves_borrowed_results_with_warning() {
 }
 
 #[test]
-fn external_semantic_search_serves_drifted_borrowed_indexes_with_note() {
+fn external_semantic_search_hides_drift_prose_and_refreshes_file_summary_snippet() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, external_source, _source) = git_project_with_needle();
     let storage = tempfile::tempdir().expect("storage");
@@ -741,11 +741,9 @@ fn external_semantic_search_serves_drifted_borrowed_indexes_with_note() {
     );
     std::fs::write(
         &external_source,
-        "// drifted after index build\npub fn needle_symbol() -> bool { true }\npub fn exported() {}\n",
+        "// updated after index build\npub fn needle_symbol() -> bool { false }\npub fn exported() {}\n",
     )
     .expect("mutate external source");
-    let expected_head = git_head(external_project.path());
-
     let session_project = tempfile::tempdir().expect("session project");
     let ctx = openai_context_with_storage(session_project.path(), storage.path(), base_url);
     let response = response_value(handle_semantic_search(
@@ -764,16 +762,16 @@ fn external_semantic_search_serves_drifted_borrowed_indexes_with_note() {
         .is_some_and(|count| count >= 1));
     let text = response["text"].as_str().expect("text");
     assert!(
-        text.contains("note: borrowed index for"),
-        "expected borrow note: {response:?}"
+        !text.contains("borrowed index"),
+        "unexpected borrow prose: {response:?}"
     );
     assert!(
-        text.contains("line numbers may be off"),
-        "expected drift warning: {response:?}"
+        !text.contains("drift"),
+        "unexpected drift prose: {response:?}"
     );
     assert!(
-        text.contains(&expected_head[..12]),
-        "expected borrowed note to mention the stored search-index HEAD: {response:?}"
+        text.contains("pub fn needle_symbol() -> bool { false }"),
+        "FileSummary snippet should be regenerated from current disk content: {response:?}"
     );
     handle.join().expect("embedding server thread");
 }

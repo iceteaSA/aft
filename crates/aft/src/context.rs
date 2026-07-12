@@ -3660,6 +3660,10 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        self.semantic_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         true
