@@ -411,6 +411,11 @@ mod tests {
             status["memory"]["roots"]["<unconfigured>"]["semantic"]["status"],
             "busy"
         );
+        assert_eq!(status["memory"]["process"]["sqlite"]["status"], "measured");
+        assert!(status["memory"]["process"]["allocator"]["status"].is_string());
+        assert!(status["memory"]["process"]["allocator"]
+            .get("retained_slack_bytes")
+            .is_some());
     }
 
     #[test]

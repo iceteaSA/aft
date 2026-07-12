@@ -2657,13 +2657,10 @@ impl ReadonlyCallGraphStore {
         self.inner.sqlite_path()
     }
 
-    /// Report the open generation handle without guessing at SQLite's internal
-    /// page or prepared-statement caches.
+    /// Report the open generation handle. SQLite-owned allocations are measured
+    /// once by the process-wide SQLite allocator counters.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
-        crate::memory::MemoryEstimate::not_estimated()
-            .count("open_generation_handles", 1)
-            .gap("sqlite_internal_bytes")
-            .gap("prepared_statement_cache_entries")
+        crate::memory::MemoryEstimate::partial(0).count("open_generation_handles", 1)
     }
 
     /// Whether this reader is temporarily serving a legacy harness partition.

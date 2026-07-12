@@ -373,9 +373,8 @@ pub struct ReadonlyInspectCache {
 }
 
 impl InspectCache {
-    /// Estimate only the in-process aggregate map. SQLite connection and
-    /// prepared-statement internals remain named gaps rather than fabricated
-    /// byte values.
+    /// Estimate only the in-process aggregate map. SQLite-owned allocations are
+    /// measured once by the process-wide SQLite allocator counters.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
         let memory = match self.memory.try_read() {
             Ok(memory) => memory,
@@ -384,9 +383,7 @@ impl InspectCache {
         if memory.is_empty() {
             return crate::memory::MemoryEstimate::partial(0)
                 .count("memory_aggregates", 0)
-                .count("open_generation_handles", 1)
-                .gap("sqlite_internal_bytes")
-                .gap("prepared_statement_cache_entries");
+                .count("open_generation_handles", 1);
         }
         let aggregate_bytes = memory.iter().fold(0u64, |bytes, (key, aggregate)| {
             bytes
@@ -413,8 +410,6 @@ impl InspectCache {
         crate::memory::MemoryEstimate::partial(aggregate_bytes.saturating_add(metadata_bytes))
             .count("memory_aggregates", memory.len())
             .count("open_generation_handles", 1)
-            .gap("sqlite_internal_bytes")
-            .gap("prepared_statement_cache_entries")
     }
 }
 

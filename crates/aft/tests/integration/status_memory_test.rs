@@ -71,10 +71,31 @@ fn status_memory_attributes_every_registered_root_and_exposes_residual() {
             assert!(estimate.get(subsystem).is_some(), "missing {subsystem}");
         }
     }
-    let attributed = memory["process"]["total_attributed_bytes"]
+    let process = &memory["process"];
+    let sqlite_used = process["sqlite"]["memory_used_bytes"]
+        .as_u64()
+        .expect("SQLite memory used");
+    assert_eq!(process["sqlite"]["status"], "measured");
+    assert!(
+        process["sqlite"]["memory_highwater_bytes"]
+            .as_u64()
+            .expect("SQLite memory highwater")
+            >= sqlite_used
+    );
+    assert!(process["allocator"].get("status").is_some());
+    assert!(process["allocator"].get("bytes_in_use").is_some());
+    assert!(process["allocator"].get("size_allocated").is_some());
+    assert!(process["allocator"].get("retained_slack_bytes").is_some());
+
+    let attributed = process["total_attributed_bytes"]
         .as_u64()
         .expect("attributed bytes");
+    assert!(attributed >= sqlite_used);
     assert!(attributed < 16 * 1024 * 1024 * 1024);
-    assert!(memory["process"].get("unattributed_bytes").is_some());
-    assert!(memory["process"].get("rss_status").is_some());
+    assert!(process.get("unattributed_bytes").is_some());
+    assert!(process.get("rss_status").is_some());
+    assert!(
+        !memory.to_string().contains("sqlite_internal_bytes"),
+        "process-wide SQLite counters replace per-root SQLite gaps"
+    );
 }

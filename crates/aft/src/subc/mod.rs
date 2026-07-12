@@ -526,9 +526,32 @@ fn eviction_estimate_label(estimate: &crate::memory::MemoryEstimate) -> String {
     }
 }
 
+fn optional_memory_label(bytes: Option<u64>) -> String {
+    bytes.map_or_else(
+        || "not estimated".to_string(),
+        |bytes| format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+    )
+}
+
+fn pressure_relief_label(relief: &crate::memory::AllocatorPressureRelief) -> String {
+    format!(
+        "; allocator pressure relief: RSS {} -> {}, in-use {} -> {}, allocated {} -> {}, slack {} -> {}, allocator reported {:.1} MB released",
+        optional_memory_label(relief.rss_before_bytes),
+        optional_memory_label(relief.rss_after_bytes),
+        optional_memory_label(relief.allocator_before.bytes_in_use),
+        optional_memory_label(relief.allocator_after.bytes_in_use),
+        optional_memory_label(relief.allocator_before.size_allocated),
+        optional_memory_label(relief.allocator_after.size_allocated),
+        optional_memory_label(relief.allocator_before.retained_slack_bytes),
+        optional_memory_label(relief.allocator_after.retained_slack_bytes),
+        relief.bytes_released as f64 / (1024.0 * 1024.0),
+    )
+}
+
 fn idle_root_eviction_message(
     root_id: &ProjectRootId,
     memory: &crate::memory::RootMemorySnapshot,
+    pressure_relief: Option<&crate::memory::AllocatorPressureRelief>,
 ) -> String {
     // Semantic, bash, LSP, and parser state remain resident. The freed total is
     // deliberately only the known-byte portion of handles eviction actually drops.
@@ -541,7 +564,7 @@ fn idle_root_eviction_message(
     .iter()
     .filter_map(|estimate| estimate.estimated_bytes)
     .fold(0u64, u64::saturating_add);
-    format!(
+    let mut message = format!(
         "evicted idle root {}: freed ~{:.1} MB (semantic {} retained, trigram {}, symbols {}, callgraph {}, inspect {}, bash {} retained, lsp {} retained, parser_pool {} retained)",
         root_id.as_path().display(),
         freed_bytes as f64 / (1024.0 * 1024.0),
@@ -553,7 +576,46 @@ fn idle_root_eviction_message(
         eviction_estimate_label(&memory.bash),
         eviction_estimate_label(&memory.lsp),
         eviction_estimate_label(&memory.parser_pool),
-    )
+    );
+    if let Some(pressure_relief) = pressure_relief {
+        message.push_str(&pressure_relief_label(pressure_relief));
+    }
+    message
+}
+
+fn process_has_been_idle(now: Instant, live_roots: &HashMap<ProjectRootId, RootMeta>) -> bool {
+    !live_roots.is_empty()
+        && live_roots.values().all(|meta| {
+            now.saturating_duration_since(meta.last_touched) >= IDLE_ROOT_TTL
+                && meta.active_bash_waits == 0
+                && !meta.maintenance_pending
+                && meta.maintenance_queued_kinds.is_empty()
+        })
+}
+
+fn allocator_pressure_relief_after_idle_sweep(
+    now: Instant,
+    live_roots: &HashMap<ProjectRootId, RootMeta>,
+    executor: &Executor,
+) -> Option<crate::memory::AllocatorPressureRelief> {
+    if !process_has_been_idle(now, live_roots)
+        || live_roots.keys().any(|root_id| {
+            executor
+                .actor_context(root_id)
+                .is_some_and(|ctx| ctx.artifact_eviction_blocked())
+        })
+    {
+        return None;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Some(crate::memory::relieve_allocator_pressure())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Reap root-scoped resources from the existing subc maintenance loop. The
@@ -585,7 +647,7 @@ fn reap_idle_roots(
         })
         .collect::<Vec<_>>();
 
-    let mut reaped = 0;
+    let mut reaped = Vec::new();
     for root_id in candidates {
         let Some(ctx) = executor.actor_context(&root_id) else {
             continue;
@@ -604,10 +666,19 @@ fn reap_idle_roots(
         if let Some(meta) = live_roots.get_mut(&root_id) {
             meta.idle_artifacts_evicted = true;
         }
-        reaped += 1;
-        log::info!("{}", idle_root_eviction_message(&root_id, &memory_before));
+        reaped.push((root_id, memory_before));
     }
-    reaped
+
+    let pressure_relief = (!reaped.is_empty())
+        .then(|| allocator_pressure_relief_after_idle_sweep(now, live_roots, executor))
+        .flatten();
+    for (root_id, memory_before) in &reaped {
+        log::info!(
+            "{}",
+            idle_root_eviction_message(root_id, memory_before, pressure_relief.as_ref())
+        );
+    }
+    reaped.len()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3635,6 +3706,7 @@ mod tests {
 
     #[test]
     fn idle_root_reaper_closes_artifacts_and_stops_watcher() {
+        let _ = env_logger::builder().is_test(true).try_init();
         let (root_dir, root) = test_root("idle-root-reaper");
         let storage = tempfile::tempdir().expect("storage tempdir");
         std::fs::write(
@@ -3691,7 +3763,7 @@ mod tests {
         meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
         live_roots.insert(root.clone(), meta);
 
-        let message = idle_root_eviction_message(&root, &ctx.memory_root_snapshot());
+        let message = idle_root_eviction_message(&root, &ctx.memory_root_snapshot(), None);
         assert!(message.contains("evicted idle root"));
         assert!(message.contains("freed ~"));
         assert!(message.contains("semantic"));
@@ -3713,6 +3785,55 @@ mod tests {
             .expect("reopen callgraph store")
             .is_some());
         assert!(live_roots[&root].idle_artifacts_evicted);
+    }
+
+    #[test]
+    fn allocator_pressure_relief_requires_every_root_to_be_idle() {
+        let (_idle_dir, idle_root) = test_root("allocator-relief-idle");
+        let (_active_dir, active_root) = test_root("allocator-relief-active");
+        let now = Instant::now();
+        let mut live_roots = HashMap::new();
+        let mut idle = RootMeta::new(now);
+        idle.last_touched = now - IDLE_ROOT_TTL - Duration::from_secs(1);
+        live_roots.insert(idle_root, idle);
+        assert!(process_has_been_idle(now, &live_roots));
+
+        live_roots.insert(active_root.clone(), RootMeta::new(now));
+        assert!(!process_has_been_idle(now, &live_roots));
+
+        let active = live_roots
+            .get_mut(&active_root)
+            .expect("active root metadata");
+        active.last_touched = now - IDLE_ROOT_TTL - Duration::from_secs(1);
+        active.active_bash_waits = 1;
+        assert!(!process_has_been_idle(now, &live_roots));
+    }
+
+    #[test]
+    fn pressure_relief_log_reports_before_and_after_measurements() {
+        let allocator = crate::memory::AllocatorMemorySnapshot {
+            status: "measured",
+            bytes_in_use: Some(8 * 1024 * 1024),
+            size_allocated: Some(12 * 1024 * 1024),
+            retained_slack_bytes: Some(4 * 1024 * 1024),
+            not_estimated: None,
+        };
+        let relief = crate::memory::AllocatorPressureRelief {
+            bytes_released: 3 * 1024 * 1024,
+            rss_before_bytes: Some(20 * 1024 * 1024),
+            rss_after_bytes: Some(17 * 1024 * 1024),
+            allocator_before: allocator.clone(),
+            allocator_after: crate::memory::AllocatorMemorySnapshot {
+                size_allocated: Some(9 * 1024 * 1024),
+                retained_slack_bytes: Some(1024 * 1024),
+                ..allocator
+            },
+        };
+        let message = pressure_relief_label(&relief);
+        assert!(message.contains("RSS 20.0 MB -> 17.0 MB"));
+        assert!(message.contains("allocated 12.0 MB -> 9.0 MB"));
+        assert!(message.contains("slack 4.0 MB -> 1.0 MB"));
+        assert!(message.contains("reported 3.0 MB released"));
     }
 
     #[test]

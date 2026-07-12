@@ -477,8 +477,8 @@ impl InspectManager {
     }
 
     /// Estimate inspect's resident aggregate maps without waiting on active
-    /// scans. SQLite internals and OXC fact payload bytes are not observable
-    /// cheaply, so their open-handle/entry counts remain explicit gaps.
+    /// scans. SQLite allocations are measured process-wide; OXC fact payload
+    /// bytes remain an explicit gap.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
         let caches = match self.caches.try_lock() {
             Ok(caches) => caches.values().cloned().collect::<Vec<_>>(),
@@ -508,8 +508,6 @@ impl InspectManager {
             .count("open_generation_handles", caches.len())
             .count("oxc_fact_entries", facts_entries)
             .count_u64("memory_aggregates", memory_aggregates)
-            .gap("sqlite_internal_bytes")
-            .gap("prepared_statement_cache_entries")
             .gap("oxc_fact_bytes")
     }
 
