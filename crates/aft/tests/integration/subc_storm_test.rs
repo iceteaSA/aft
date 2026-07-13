@@ -378,7 +378,10 @@ fn configure_sleep_delay(req: &RawRequest) -> Option<Duration> {
 fn max_paths_single_event() {
     subc_bridge_test::run_subc_bridge_test_with_dispatch(
         "max_paths_single_event",
-        Duration::from_secs(30),
+        // Windows CI runs the integration binary up to 5x slower under
+        // contention (memory 6987); the watchdog is a hang backstop, not a
+        // performance bound, so keep it generous.
+        Duration::from_secs(120),
         drive_max_paths_single_event,
         |_, _, _| {},
         storm_dispatch,
