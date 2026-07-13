@@ -1003,7 +1003,9 @@ fn inspect_direct_reuse_attaches_to_in_flight_background_category() {
         snapshot,
         InspectCategory::Duplicates,
         aft::inspect::JobScope::for_project(root.clone()),
-        Instant::now() + Duration::from_secs(5),
+        // Generous: the background reuse worker competes for CPU with the rest
+        // of the integration binary on contended runners (memory 6987).
+        Instant::now() + Duration::from_secs(20),
         Vec::new(),
     );
 
@@ -1084,7 +1086,9 @@ fn inspect_direct_claimed_reuse_panic_cleans_in_flight_key() {
         snapshot,
         InspectCategory::Duplicates,
         aft::inspect::JobScope::for_project(root.clone()),
-        Instant::now() + Duration::from_secs(5),
+        // Generous: the background reuse worker competes for CPU with the rest
+        // of the integration binary on contended runners (memory 6987).
+        Instant::now() + Duration::from_secs(20),
         Vec::new(),
     );
 
