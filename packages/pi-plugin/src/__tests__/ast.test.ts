@@ -4,9 +4,28 @@
 
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { registerAstTools } from "../tools/ast.js";
-import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
+import {
+  executeTool,
+  makeExtContext,
+  makeMockApi,
+  makeMockBridge,
+  makePluginContext,
+} from "./tool-test-utils.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 describe("AST tool adapters", () => {
   test("ast_grep_search forwards agent-facing contextLines and preserves globs", async () => {
@@ -14,13 +33,17 @@ describe("AST tool adapters", () => {
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "Found 0 matches" }));
     registerAstTools(api, makePluginContext(bridge), { astSearch: true, astReplace: true });
 
-    await executeTool(tools.get("ast_grep_search")!, {
-      pattern: "console.log($MSG)",
-      lang: "typescript",
-      paths: ["src"],
-      globs: ["**/*.ts", "!dist/**"],
-      contextLines: 3,
-    });
+    await executeTool(
+      tools.get("ast_grep_search")!,
+      {
+        pattern: "console.log($MSG)",
+        lang: "typescript",
+        paths: ["src"],
+        globs: ["**/*.ts", "!dist/**"],
+        contextLines: 3,
+      },
+      makeExtContext(projectRoot),
+    );
 
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toEqual({

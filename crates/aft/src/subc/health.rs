@@ -404,6 +404,7 @@ mod tests {
         let ctx = test_ctx();
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let blocker = executor.submit(
             root,
             Lane::Mutating,
@@ -414,7 +415,7 @@ mod tests {
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 started_tx.send(()).expect("signal held health lock");
-                std::thread::sleep(Duration::from_secs(2));
+                release_rx.recv().expect("release held health lock");
                 Response::success("health-lock-blocker", json!({ "ok": true }))
             }),
         );
@@ -422,15 +423,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("mutating lock holder starts");
 
-        let started = Instant::now();
         let report = build_health_report(&executor, &HashMap::new(), &DispatchPathMetrics::new());
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(10),
-            "health snapshot waited behind a mutating lock for {elapsed:?}"
-        );
         assert_eq!(report.status, HealthStatus::Degraded);
 
+        release_tx.send(()).expect("release held health lock");
         blocker
             .recv_timeout(Duration::from_secs(3))
             .expect("mutating lock holder completes");

@@ -36,7 +36,7 @@ pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
-const GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT: Duration = Duration::from_millis(250);
+const GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT: Duration = Duration::from_secs(5);
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_POLL: Duration = Duration::from_millis(10);
 
 /// Agent status-bar counts — the IDE-style "status bar" surfaced to the agent
@@ -3027,10 +3027,11 @@ impl AppContext {
             .is_some()
     }
 
-    /// Graceful EOF teardown can afford a short bounded wait for an already
-    /// running search rebuild to publish. Poll the observable receiver state
+    /// Graceful EOF teardown can afford a bounded wait for an already running
+    /// search rebuild to publish. Poll the observable receiver state
     /// directly instead of relying on fixed sleeps in callers or tests.
     fn wait_for_search_index_build_to_settle_on_graceful_shutdown(&self) {
+        crate::runtime_drain::note_search_rebuild_shutdown_wait_for_test();
         let deadline = Instant::now() + GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT;
         while self.search_index_build_in_progress() && Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());

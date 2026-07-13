@@ -110,7 +110,7 @@ export function makePluginContext(
   };
 }
 
-export function makeExtContext(cwd = "/repo", sessionId?: string): ExtensionContext {
+export function makeExtContext(cwd = process.cwd(), sessionId?: string): ExtensionContext {
   return {
     cwd,
     hasUI: false,

@@ -4,7 +4,10 @@
 
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { registerFsTools } from "../tools/fs.js";
 import {
   executeTool,
@@ -13,6 +16,16 @@ import {
   makeMockBridge,
   makePluginContext,
 } from "./tool-test-utils.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 describe("fs tool adapters", () => {
   test("aft_delete batches all files into one bridge call and reports partial success", async () => {
@@ -29,7 +42,7 @@ describe("fs tool adapters", () => {
     const result = (await executeTool(
       tools.get("aft_delete")!,
       { files: ["ok.ts", "locked.ts"] },
-      makeExtContext("/repo", "delete-session"),
+      makeExtContext(projectRoot, "delete-session"),
     )) as { content: Array<{ text: string }>; details: Record<string, unknown> };
 
     expect(calls).toHaveLength(1);

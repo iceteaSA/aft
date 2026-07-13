@@ -4,7 +4,10 @@
 
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { registerImportTools } from "../tools/imports.js";
 import {
   executeTool,
@@ -13,6 +16,16 @@ import {
   makeMockBridge,
   makePluginContext,
 } from "./tool-test-utils.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 describe("aft_import adapter", () => {
   test("add forwards Pi camelCase args through aft_import tool_call", async () => {
@@ -35,7 +48,7 @@ describe("aft_import adapter", () => {
         typeOnly: true,
         validate: "full",
       },
-      makeExtContext("/repo", "session-import"),
+      makeExtContext(projectRoot, "session-import"),
     );
 
     expect(calls[0].command).toBe("tool_call");

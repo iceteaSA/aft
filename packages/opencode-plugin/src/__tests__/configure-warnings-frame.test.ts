@@ -1,5 +1,5 @@
 /// <reference path="../bun-test.d.ts" />
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,15 @@ import {
 } from "../configure-warnings.js";
 
 const tempRoots = new Set<string>();
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 function createStorageDir(): string {
   const root = mkdtempSync(join(tmpdir(), "aft-opencode-configure-warnings-"));
@@ -62,7 +71,7 @@ describe("configure_warnings push-frame handler", () => {
     const { client, messages } = createClient();
 
     await handleConfigureWarningsForSession({
-      projectRoot: "/repo",
+      projectRoot: projectRoot,
       sessionId: "session-1",
       client,
       bridge,
@@ -84,7 +93,7 @@ describe("configure_warnings push-frame handler", () => {
 
     await expect(
       handleConfigureWarningsForSession({
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
         sessionId: null,
         client,
         bridge,
@@ -104,7 +113,7 @@ describe("configure_warnings push-frame handler", () => {
     const client = { tui: { showToast } };
 
     enqueueConfigureWarningsForSession({
-      projectRoot: "/repo",
+      projectRoot: projectRoot,
       sessionId: "session-1",
       client,
       bridge,

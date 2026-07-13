@@ -1,9 +1,22 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { showAftStatusDialog } from "../dialogs/status-dialog.js";
 import { makeMockBridge, makePluginContext } from "./tool-test-utils.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 describe("aft-status dialog cache", () => {
   test("fetches fresh status when cached snapshot belongs to another session", async () => {
@@ -20,7 +33,7 @@ describe("aft-status dialog cache", () => {
       await showAftStatusDialog(
         {} as ExtensionAPI,
         {
-          cwd: "/repo",
+          cwd: projectRoot,
           sessionManager: { getSessionId: () => "new-session" },
           ui: {
             custom: async (factory: (...args: unknown[]) => unknown) => {

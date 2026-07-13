@@ -490,6 +490,11 @@ fn process_callgraph_refresh_batch(batch: &RefreshBatch) {
 
     let test_seam = refresh_worker_test_seam(&batch.root.project_root);
     note_refresh_worker_call_for_test(&batch.root.project_root);
+    #[cfg(test)]
+    if let Some(gate) = take_refresh_worker_test_gate(&batch.root.project_root) {
+        let _ = gate.held_tx.send(());
+        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+    }
     if !test_seam.delay.is_zero() {
         std::thread::sleep(test_seam.delay);
     }
@@ -530,6 +535,48 @@ struct RefreshWorkerTestSeam {
 
 static REFRESH_WORKER_TEST_SEAMS: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestSeam>>> =
     OnceLock::new();
+
+#[cfg(test)]
+struct RefreshWorkerTestGate {
+    held_tx: crossbeam_channel::Sender<()>,
+    release_rx: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static REFRESH_WORKER_TEST_GATES: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestGate>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn install_refresh_worker_test_gate(
+    project_root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    REFRESH_WORKER_TEST_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("callgraph refresh test gate mutex poisoned")
+        .insert(
+            project_root,
+            RefreshWorkerTestGate {
+                held_tx,
+                release_rx,
+            },
+        );
+    (held_rx, release_tx)
+}
+
+#[cfg(test)]
+fn take_refresh_worker_test_gate(project_root: &Path) -> Option<RefreshWorkerTestGate> {
+    REFRESH_WORKER_TEST_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("callgraph refresh test gate mutex poisoned")
+        .remove(project_root)
+}
 
 fn refresh_worker_test_seam(project_root: &Path) -> RefreshWorkerTestSeam {
     let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() else {
@@ -9564,7 +9611,7 @@ mod refresh_worker_tests {
     }
 
     fn wait_for_refresh_calls(root: &Path, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(12);
         while callgraph_refresh_worker_test_counts(root).0 < expected {
             assert!(
                 Instant::now() < deadline,
@@ -9616,11 +9663,9 @@ mod refresh_worker_tests {
         let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
         let (_active_temp, active_root, active_dir, active_source) = ready_store_fixture();
         let (_target_temp, target_root, target_dir, target_source) = ready_store_fixture();
-        set_callgraph_refresh_worker_test_seam(
-            active_root.clone(),
-            Duration::from_millis(800),
-            false,
-        );
+        set_callgraph_refresh_worker_test_seam(active_root.clone(), Duration::ZERO, false);
+        let (active_held_rx, active_release_tx) =
+            install_refresh_worker_test_gate(active_root.clone());
         set_callgraph_refresh_worker_test_seam(target_root.clone(), Duration::ZERO, false);
         enqueue_callgraph_store_refresh(
             active_dir,
@@ -9628,7 +9673,9 @@ mod refresh_worker_tests {
             vec![active_source],
             pending_paths(),
         );
-        wait_for_refresh_calls(&active_root, 1);
+        active_held_rx
+            .recv_timeout(Duration::from_secs(12))
+            .expect("active refresh worker holds the queue");
 
         fs::write(
             &target_source,
@@ -9654,8 +9701,12 @@ mod refresh_worker_tests {
         .unwrap();
         drop(new_generation);
 
+        active_release_tx
+            .send(())
+            .expect("release active refresh worker");
+        wait_for_refresh_calls(&target_root, 1);
         assert!(flush_callgraph_store_refreshes_with_budget(
-            Duration::from_secs(3)
+            Duration::from_secs(12)
         ));
         let current = CallGraphStore::open_readonly(target_dir, target_root.clone())
             .unwrap()

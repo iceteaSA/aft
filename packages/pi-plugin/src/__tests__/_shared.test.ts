@@ -4,7 +4,10 @@
 
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -17,6 +20,16 @@ import {
   textResult,
 } from "../tools/_shared.js";
 import { makeExtContext, makeMockBridge } from "./tool-test-utils.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 describe("tool shared helpers", () => {
   test("bridgeFor resolves the bridge using the current cwd", () => {
@@ -31,13 +44,13 @@ describe("tool shared helpers", () => {
       },
     } as never;
 
-    expect(bridgeFor(ctx, "/workspace/project")).toBe(bridge);
-    expect(requested).toEqual(["/workspace/project"]);
+    expect(bridgeFor(ctx, projectRoot)).toBe(bridge);
+    expect(requested).toEqual([projectRoot]);
   });
 
   test("callBridge propagates session id, warning client, and long-command timeout", async () => {
     const { bridge, calls } = makeMockBridge((_command, params) => ({ success: true, params }));
-    const extCtx = makeExtContext("/repo", "pi-session-123");
+    const extCtx = makeExtContext(projectRoot, "pi-session-123");
 
     const response = await callBridge(bridge, "grep", { pattern: "needle" }, extCtx);
 
@@ -68,7 +81,7 @@ describe("tool shared helpers", () => {
       text: "ok",
       params,
     }));
-    const extCtx = makeExtContext("/repo", "pi-session-123");
+    const extCtx = makeExtContext(projectRoot, "pi-session-123");
 
     const response = await callToolCall(
       bridge,

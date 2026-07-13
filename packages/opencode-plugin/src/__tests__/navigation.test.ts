@@ -1,11 +1,25 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+
 import { navigationTools } from "../tools/navigation.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
@@ -46,8 +60,8 @@ function makeToolContext(): ToolContext {
   return {
     messageID: "message-id",
     agent: "test",
-    directory: "/repo",
-    worktree: "/repo",
+    directory: projectRoot,
+    worktree: projectRoot,
     abort: new AbortController().signal,
     metadata: () => {},
     ask: noopAsk,

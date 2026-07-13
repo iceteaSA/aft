@@ -9,9 +9,22 @@
 
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { registerStatusCommand } from "../commands/aft-status.js";
 import { makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 describe("aft-status command", () => {
   test("opens a custom overlay dialog when UI is available", async () => {
@@ -21,7 +34,7 @@ describe("aft-status command", () => {
     registerStatusCommand(api, makePluginContext(bridge));
 
     await commands.get("aft-status")!.handler("", {
-      cwd: "/repo",
+      cwd: projectRoot,
       hasUI: true,
       ui: {
         // Custom overlay — accept any factory + options shape, just record
@@ -54,7 +67,7 @@ describe("aft-status command", () => {
     registerStatusCommand(api, makePluginContext(bridge));
 
     await commands.get("aft-status")!.handler("", {
-      cwd: "/repo",
+      cwd: projectRoot,
       hasUI: false,
       ui: {
         notify: (message: string, level: string) => notifications.push({ message, level }),
@@ -76,7 +89,7 @@ describe("aft-status command", () => {
     // command handler. UI-path bridge errors surface inside the dialog
     // component instead (its own render() shows the error banner).
     await commands.get("aft-status")!.handler("", {
-      cwd: "/repo",
+      cwd: projectRoot,
       hasUI: false,
       ui: {
         notify: (message: string, level: string) => notifications.push({ message, level }),
@@ -98,7 +111,7 @@ describe("aft-status command", () => {
     registerStatusCommand(api, makePluginContext(bridge));
 
     await commands.get("aft-status")!.handler("", {
-      cwd: "/repo",
+      cwd: projectRoot,
       hasUI: false,
       sessionManager: { getSessionId: () => "session-new" },
       ui: {
@@ -119,7 +132,7 @@ describe("aft-status command", () => {
     registerStatusCommand(api, makePluginContext(bridge));
 
     await commands.get("aft-status")!.handler("", {
-      cwd: "/repo",
+      cwd: projectRoot,
       hasUI: false,
       sessionManager: { getSessionId: () => "session-1" },
       ui: {

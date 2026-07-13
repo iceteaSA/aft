@@ -14,9 +14,10 @@
 
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { registerAstTools } from "../tools/ast.js";
 import { registerFsTools } from "../tools/fs.js";
@@ -35,6 +36,16 @@ import {
   makeMockBridge,
   makePluginContext,
 } from "./tool-test-utils.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 function restrictedContext(bridge: BinaryBridge): PluginContext {
   return makePluginContext(bridge, { config: { restrict_to_project_root: true } });
@@ -152,7 +163,7 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
       }
 
       await expect(
-        executeTool(tools.get(entry.toolName)!, entry.params, makeExtContext("/repo")),
+        executeTool(tools.get(entry.toolName)!, entry.params, makeExtContext(projectRoot)),
         `${entry.label} must hard-block external path under restrict=true`,
       ).rejects.toThrow(BLOCK_MESSAGE);
       // The mutating bridge command must never run for a blocked external path.
@@ -203,7 +214,7 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
         });
 
         await expect(
-          executeTool(tools.get(entry.toolName)!, entry.params(form), makeExtContext("/repo")),
+          executeTool(tools.get(entry.toolName)!, entry.params(form), makeExtContext(projectRoot)),
         ).rejects.toThrow(BLOCK_MESSAGE);
         expect(calls).toHaveLength(0);
       }
@@ -221,7 +232,7 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
     await executeTool(
       tools.get("aft_import")!,
       { op: "organize", filePath: "/outside/open.ts" },
-      makeExtContext("/repo"),
+      makeExtContext(projectRoot),
     );
 
     expect(calls).toHaveLength(1);
@@ -235,8 +246,8 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
 
     await executeTool(
       tools.get("aft_import")!,
-      { op: "organize", filePath: "/repo/src/in-root.ts" },
-      makeExtContext("/repo"),
+      { op: "organize", filePath: join(projectRoot, "src", "in-root.ts") },
+      makeExtContext(projectRoot),
     );
 
     expect(
@@ -254,11 +265,11 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
       executeTool(
         tools.get("aft_import")!,
         { op: "organize", filePath: tildeOutside },
-        makeExtContext("/repo"),
+        makeExtContext(projectRoot),
       ),
     ).rejects.toThrow(BLOCK_MESSAGE);
-    // Sanity: the resolved home path really is outside /repo.
-    expect(resolve(homedir(), "aft-pi-tilde/imports.ts").startsWith("/repo")).toBe(false);
+    // Sanity: the resolved home path really is outside the temporary project.
+    expect(resolve(homedir(), "aft-pi-tilde/imports.ts").startsWith(projectRoot)).toBe(false);
     expect(
       calls.some((call) => call.command === "tool_call" && call.params.name === "import"),
     ).toBe(false);

@@ -1,7 +1,20 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { signalBashWaitDetachForProject } from "../bash-wait-detach.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 describe("bash wait detach helper", () => {
   test("user-message detach sends bash_wait_detach on the active bridge", async () => {
@@ -17,8 +30,8 @@ describe("bash wait detach helper", () => {
       },
     };
     const pool = {
-      getActiveBridgeForRoot: (projectRoot: string) => {
-        expect(projectRoot).toBe("/repo");
+      getActiveBridgeForRoot: (root: string) => {
+        expect(root).toBe(projectRoot);
         return bridge;
       },
       activeBridges: () => [bridge],
@@ -26,7 +39,7 @@ describe("bash wait detach helper", () => {
 
     await signalBashWaitDetachForProject(
       pool as Parameters<typeof signalBashWaitDetachForProject>[0],
-      "/repo",
+      projectRoot,
       "session-1",
     );
 
@@ -48,12 +61,12 @@ describe("bash wait detach helper", () => {
 
     await signalBashWaitDetachForProject(
       pool as Parameters<typeof signalBashWaitDetachForProject>[0],
-      "/repo",
+      projectRoot,
       undefined,
     );
     await signalBashWaitDetachForProject(
       pool as Parameters<typeof signalBashWaitDetachForProject>[0],
-      "/repo",
+      projectRoot,
       "session-2",
     );
 

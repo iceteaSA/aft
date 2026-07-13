@@ -1424,33 +1424,6 @@ mod graceful_shutdown_search_index_tests {
         (canonical_root, cache_dir)
     }
 
-    fn search_rebuild_delay_test_lock() -> &'static std::sync::Mutex<()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn with_search_rebuild_publish_delay_ms<R>(ms: u64, f: impl FnOnce() -> R) -> R {
-        let _guard = search_rebuild_delay_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS");
-        unsafe {
-            std::env::set_var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS", ms.to_string());
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS", value),
-                None => std::env::remove_var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS"),
-            }
-        }
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-
     fn wait_for_next_directory_write_mtime(dir: &Path, baseline: SystemTime) {
         let probe = dir.join("mtime-probe");
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1566,51 +1539,58 @@ mod graceful_shutdown_search_index_tests {
             install_resident_search_index(ctx, root.path(), storage.path());
 
         std::fs::write(&file, "new delayed shutdown token\n").expect("edit source");
-        let (new_matches, old_matches) = with_search_rebuild_publish_delay_ms(100, || {
-            aft::runtime_drain::spawn_search_corpus_refresh(
-                ctx,
-                canonical_root.clone(),
-                ctx.config(),
-            );
-            assert!(
-                ctx.search_index_rx()
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some(),
-                "test should exercise graceful shutdown while a search rebuild is still in flight"
-            );
+        let (publish_reached_rx, shutdown_waiting_rx, publish_release_tx) =
+            aft::runtime_drain::install_search_rebuild_publish_gate_for_test();
+        aft::runtime_drain::spawn_search_corpus_refresh(ctx, canonical_root.clone(), ctx.config());
+        publish_reached_rx
+            .recv_timeout(Duration::from_secs(12))
+            .expect("search rebuild reaches its publish gate");
+        assert!(
+            ctx.search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "test should exercise graceful shutdown while a search rebuild is still in flight"
+        );
 
-            flush_indexes_on_graceful_shutdown(&registry);
-
-            let mut restored =
-                aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
-                    .expect("load search index after delayed rebuild flush");
-            restored.ready = true;
-            let new_matches = restored
-                .grep(
-                    "new delayed shutdown token",
-                    true,
-                    &[],
-                    &[],
-                    &canonical_root,
-                    10,
-                )
-                .matches
-                .len();
-            let old_matches = restored
-                .grep(
-                    "old delayed shutdown token",
-                    true,
-                    &[],
-                    &[],
-                    &canonical_root,
-                    10,
-                )
-                .matches
-                .len();
-            wait_for_search_index_build_to_finish(ctx);
-            (new_matches, old_matches)
+        let release = std::thread::spawn(move || {
+            shutdown_waiting_rx
+                .recv_timeout(Duration::from_secs(12))
+                .expect("graceful shutdown waits for the in-flight rebuild");
+            publish_release_tx
+                .send(())
+                .expect("release search rebuild publish gate");
         });
+        flush_indexes_on_graceful_shutdown(&registry);
+        release.join().expect("publish gate release thread");
+
+        let mut restored =
+            aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
+                .expect("load search index after delayed rebuild flush");
+        restored.ready = true;
+        let new_matches = restored
+            .grep(
+                "new delayed shutdown token",
+                true,
+                &[],
+                &[],
+                &canonical_root,
+                10,
+            )
+            .matches
+            .len();
+        let old_matches = restored
+            .grep(
+                "old delayed shutdown token",
+                true,
+                &[],
+                &[],
+                &canonical_root,
+                10,
+            )
+            .matches
+            .len();
+        wait_for_search_index_build_to_finish(ctx);
 
         assert_eq!(
             new_matches, 1,

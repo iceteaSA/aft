@@ -1,6 +1,9 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { __test__ } from "../index.js";
 import { buildInspectSections, registerInspectTool } from "../tools/inspect.js";
 import {
@@ -10,6 +13,16 @@ import {
   makeMockBridge,
   makePluginContext,
 } from "./tool-test-utils.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 function toolArgs(call: { params: Record<string, unknown> }): Record<string, unknown> {
   return call.params.arguments as Record<string, unknown>;
@@ -120,7 +133,7 @@ describe("Pi aft_inspect adapter", () => {
     await executeTool(
       tools.get("aft_inspect")!,
       { sections: "todos", scope: ["src", "tests"], topK: 9 },
-      makeExtContext("/repo", "pi-session"),
+      makeExtContext(projectRoot, "pi-session"),
     );
 
     expect(calls[0].command).toBe("tool_call");
@@ -144,7 +157,7 @@ describe("Pi aft_inspect adapter", () => {
     await executeTool(
       tools.get("aft_inspect")!,
       { sections: [], scope: "" },
-      makeExtContext("/repo", "pi-session"),
+      makeExtContext(projectRoot, "pi-session"),
     );
 
     expect(toolArgs(calls[0]).sections).toBeUndefined();
@@ -172,7 +185,7 @@ describe("Pi aft_inspect adapter", () => {
     const result = (await executeTool(
       tools.get("aft_inspect")!,
       {},
-      makeExtContext("/repo", "pi-session"),
+      makeExtContext(projectRoot, "pi-session"),
     )) as { details: { scanner_state: { pending_categories: string[] } } };
 
     expect(result.details.scanner_state.pending_categories).toEqual([
@@ -209,7 +222,7 @@ describe("Pi aft_inspect adapter", () => {
     const result = (await executeTool(
       tools.get("aft_inspect")!,
       {},
-      makeExtContext("/repo", "pi-session"),
+      makeExtContext(projectRoot, "pi-session"),
     )) as { details: { scanner_state: { stale_categories: string[] } } };
 
     expect(result.details.scanner_state.stale_categories).toEqual(["unused_exports"]);
@@ -234,7 +247,7 @@ describe("Pi aft_inspect adapter", () => {
     const result = (await executeTool(
       tools.get("aft_inspect")!,
       {},
-      makeExtContext("/repo", "pi-session"),
+      makeExtContext(projectRoot, "pi-session"),
     )) as { content: Array<{ type: string; text: string }> };
     const text = result.content[0]?.text ?? "";
 
@@ -280,11 +293,11 @@ describe("Pi aft_inspect adapter", () => {
     });
     registerInspectTool(api, makePluginContext(bridge));
 
-    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
     const result = (await executeTool(
       tools.get("aft_inspect")!,
       {},
-      makeExtContext("/repo", "pi-session"),
+      makeExtContext(projectRoot, "pi-session"),
     )) as {
       details: {
         summary: { dead_code: { count: number }; unused_exports: { count: number } };
@@ -319,8 +332,8 @@ describe("Pi aft_inspect adapter", () => {
     });
     registerInspectTool(api, makePluginContext(bridge));
 
-    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
-    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
 
     expect(calls.map((call) => call.command)).toEqual([
       "tool_call",
@@ -347,8 +360,8 @@ describe("Pi aft_inspect adapter", () => {
     });
     registerInspectTool(api, makePluginContext(bridge));
 
-    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
-    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
 
     expect(calls.map((call) => call.command)).toEqual([
       "tool_call",
@@ -375,9 +388,9 @@ describe("Pi aft_inspect adapter", () => {
     });
     registerInspectTool(api, makePluginContext(bridge));
 
-    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
     await Promise.resolve();
-    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
 
     expect(calls.map((call) => call.command)).toEqual([
       "tool_call",
@@ -408,10 +421,10 @@ describe("Pi aft_inspect adapter", () => {
       });
       registerInspectTool(api, makePluginContext(bridge));
 
-      await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+      await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
       await Promise.resolve();
       now += 4 * 60 * 1000 + 1;
-      await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+      await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
 
       expect(calls.map((call) => call.command)).toEqual([
         "tool_call",
@@ -435,14 +448,14 @@ describe("Pi aft_inspect adapter", () => {
       executeTool(
         tools.get("aft_inspect")!,
         { sections: "todos", topK: "9" },
-        makeExtContext("/repo", "pi-session"),
+        makeExtContext(projectRoot, "pi-session"),
       ),
     ).rejects.toThrow("topK must be an integer between 1 and 100");
     await expect(
       executeTool(
         tools.get("aft_inspect")!,
         { sections: "todos", topK: 101 },
-        makeExtContext("/repo", "pi-session"),
+        makeExtContext(projectRoot, "pi-session"),
       ),
     ).rejects.toThrow("topK must be between 1 and 100");
     expect(calls).toHaveLength(0);

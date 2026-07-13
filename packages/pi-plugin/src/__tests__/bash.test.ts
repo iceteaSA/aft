@@ -8,7 +8,8 @@
  * - background task metadata tracking
  */
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,16 @@ import {
   registerBashTool,
 } from "../tools/bash.js";
 import type { PluginContext } from "../types.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 // Minimal mock types
 interface MockToolDef {
@@ -210,7 +221,7 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const extCtx: MockExtensionContext = { cwd: "/test", hasUI: false };
+    const extCtx: MockExtensionContext = { cwd: projectRoot, hasUI: false };
 
     const result = (await bashTool.execute(
       "test-call",
@@ -256,7 +267,7 @@ describe("bash tool adapter", () => {
 
     for (const command of commands) {
       const result = (await bashTool.execute("test-call", { command }, undefined, undefined, {
-        cwd: "/test",
+        cwd: projectRoot,
       })) as { content: Array<{ type: string; text: string }> };
 
       const callArgs = calls.at(-1) as [string, Record<string, unknown>];
@@ -280,7 +291,7 @@ describe("bash tool adapter", () => {
       { command: "bun test | grep fail", compressed: false },
       undefined,
       undefined,
-      { cwd: "/test" },
+      { cwd: projectRoot },
     )) as { content: Array<{ type: string; text: string }> };
 
     const callArgs = calls[0] as [string, Record<string, unknown>];
@@ -299,7 +310,7 @@ describe("bash tool adapter", () => {
     await tools
       .get("bash")!
       .execute("test-call", { command: "printf raw", compressed: "false" }, undefined, undefined, {
-        cwd: "/test",
+        cwd: projectRoot,
       });
 
     const callArgs = calls[0] as [string, Record<string, unknown>];
@@ -330,7 +341,7 @@ describe("bash tool adapter", () => {
       { command: "bun test", timeout: 40_000, background: true, compressed: false },
       undefined,
       undefined,
-      { cwd: "/test" },
+      { cwd: projectRoot },
     )) as { content: Array<{ text: string }>; details: Record<string, unknown> };
 
     const callArgs = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
@@ -382,7 +393,7 @@ describe("bash tool adapter", () => {
       { command: "printf done" },
       undefined,
       undefined,
-      { cwd: "/test" },
+      { cwd: projectRoot },
     )) as { content: Array<{ text: string }> };
 
     expect(result.content[0].text).toBe("done");
@@ -430,7 +441,7 @@ describe("bash tool adapter", () => {
         { command: "sleep 2", wait: "true", timeout: 250 },
         undefined,
         undefined,
-        { cwd: "/test" },
+        { cwd: projectRoot },
       )) as { content: Array<{ text: string }> };
 
     expect(result.content[0].text).toBe("waited");
@@ -458,7 +469,7 @@ describe("bash tool adapter", () => {
         { command: "sleep 2", wait: true, background: true },
         undefined,
         undefined,
-        { cwd: "/test" },
+        { cwd: projectRoot },
       ),
     ).rejects.toThrow("wait:true cannot be used with background:true");
     await expect(
@@ -467,7 +478,7 @@ describe("bash tool adapter", () => {
         { command: "python", wait: true, pty: true },
         undefined,
         undefined,
-        { cwd: "/test" },
+        { cwd: projectRoot },
       ),
     ).rejects.toThrow("wait:true cannot be used with pty:true");
   });
@@ -493,7 +504,7 @@ describe("bash tool adapter", () => {
     const result = (await tools
       .get("bash")!
       .execute("test-call", { command: 'grep -nE "x" src/' }, undefined, undefined, {
-        cwd: "/test",
+        cwd: projectRoot,
       })) as { content: Array<{ text: string }> };
 
     expect(result.content[0].text).toContain("src/file.ts:1:x");
@@ -522,7 +533,7 @@ describe("bash tool adapter", () => {
     const result = (await tools
       .get("bash")!
       .execute("test-call", { command: "bun test | grep fail" }, undefined, undefined, {
-        cwd: "/test",
+        cwd: projectRoot,
       })) as { content: Array<{ text: string }> };
 
     expect(result.content[0].text).toContain("failure details");
@@ -557,7 +568,7 @@ describe("bash tool adapter", () => {
     let result: { content: Array<{ text: string }> };
     try {
       result = (await bashTool.execute("test-call", { command: "sleep 2" }, undefined, undefined, {
-        cwd: "/test",
+        cwd: projectRoot,
       })) as { content: Array<{ text: string }> };
     } finally {
       delete process.env.AFT_TEST_FOREGROUND_WAIT_MS;
@@ -605,7 +616,7 @@ describe("bash tool adapter", () => {
         { command: "sleep 2", background: true, pty: true, timeout: 25 },
         undefined,
         undefined,
-        { cwd: "/test" },
+        { cwd: projectRoot },
       )) as { content: Array<{ text: string }> };
 
     expect(result.content[0].text).toBe("finished without background");
@@ -640,7 +651,7 @@ describe("bash tool adapter", () => {
         { task_id: "bash-finished", pattern: "READY", background: true },
         undefined,
         undefined,
-        { cwd: "/test", sessionManager: { getSessionId: () => "s-watch" } },
+        { cwd: projectRoot, sessionManager: { getSessionId: () => "s-watch" } },
       );
 
     expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
@@ -659,7 +670,7 @@ describe("bash tool adapter", () => {
         { task_id: "bash-sticky", pattern: "READY", background: true, once: "false" },
         undefined,
         undefined,
-        { cwd: "/test" },
+        { cwd: projectRoot },
       );
 
     const notifyCall = calls.find((call) => (call as [string])[0] === "bash_notify") as [
@@ -699,7 +710,7 @@ describe("bash tool adapter", () => {
     registerBashTool(apiWithHook, ctx);
 
     const bashTool = tools.get("bash")!;
-    const extCtx: MockExtensionContext = { cwd: "/test", hasUI: false };
+    const extCtx: MockExtensionContext = { cwd: projectRoot, hasUI: false };
 
     await bashTool.execute(
       "test-call",
@@ -741,7 +752,7 @@ describe("bash tool adapter", () => {
     registerBashTool(apiWithFailingHook, ctx);
 
     const bashTool = tools.get("bash")!;
-    const extCtx: MockExtensionContext = { cwd: "/test", hasUI: false };
+    const extCtx: MockExtensionContext = { cwd: projectRoot, hasUI: false };
 
     await expect(
       bashTool.execute("test-call", { command: "echo test" }, undefined, undefined, extCtx),
@@ -761,7 +772,7 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const extCtx: MockExtensionContext = { cwd: "/test", hasUI: false };
+    const extCtx: MockExtensionContext = { cwd: projectRoot, hasUI: false };
 
     await expect(
       bashTool.execute("test-call", { command: "boom" }, undefined, undefined, extCtx),
@@ -797,7 +808,7 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const extCtx: MockExtensionContext = { cwd: "/test", hasUI: false };
+    const extCtx: MockExtensionContext = { cwd: projectRoot, hasUI: false };
 
     const updates: unknown[] = [];
     const result = await bashTool.execute(
@@ -832,7 +843,7 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const extCtx: MockExtensionContext = { cwd: "/test", hasUI: false };
+    const extCtx: MockExtensionContext = { cwd: projectRoot, hasUI: false };
 
     const result = (await bashTool.execute(
       "test-call",
@@ -863,7 +874,7 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const extCtx: MockExtensionContext = { cwd: "/test", hasUI: false };
+    const extCtx: MockExtensionContext = { cwd: projectRoot, hasUI: false };
 
     await expect(
       bashTool.execute("test-call", { command: "rm -rf /" }, undefined, undefined, extCtx),
@@ -885,7 +896,7 @@ describe("bash tool adapter", () => {
       },
     } as unknown as BinaryBridge;
     registerBashTool(api, makeMockContext(bridge));
-    const extCtx = { cwd: "/test" };
+    const extCtx = { cwd: projectRoot };
 
     await tools
       .get("bash_status")!
@@ -933,7 +944,7 @@ describe("bash tool adapter", () => {
       const result = (await tools
         .get("bash_watch")!
         .execute("call", { task_id: "bash-pi-wait", pattern: "ready" }, undefined, undefined, {
-          cwd: "/test",
+          cwd: projectRoot,
         })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
       expect(toolText(result)).toContain('matched "ready" at offset 6');
       expect(result.details.waited).toMatchObject({
@@ -986,7 +997,7 @@ describe("bash tool adapter", () => {
           { task_id: "bash-pi-regex", pattern: { regex: "ready: \\d+" } },
           undefined,
           undefined,
-          { cwd: "/test" },
+          { cwd: projectRoot },
         )) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
 
       expect(toolText(result)).toContain('matched "ready: 4242" at offset 4');
@@ -1038,7 +1049,7 @@ describe("bash tool adapter", () => {
             { task_id: "bash-pi-regex-invalid", pattern: { regex: "(" } },
             undefined,
             undefined,
-            { cwd: "/test" },
+            { cwd: projectRoot },
           ),
       ).rejects.toThrow("invalid_request: invalid_regex");
     } finally {
@@ -1062,7 +1073,7 @@ describe("bash tool adapter", () => {
       const result = (await tools
         .get("bash_watch")!
         .execute("call", { task_id: "bash-pi-stderr", pattern: "READY" }, undefined, undefined, {
-          cwd: "/test",
+          cwd: projectRoot,
         })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
       expect(toolText(result)).toContain('matched "READY" at offset 16');
       expect(result.details.waited).toMatchObject({
@@ -1091,7 +1102,7 @@ describe("bash tool adapter", () => {
       const result = (await tools
         .get("bash_watch")!
         .execute("call", { task_id: "bash-pi-race", pattern: "pattern" }, undefined, undefined, {
-          cwd: "/test",
+          cwd: projectRoot,
         })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
       expect(toolText(result)).toContain('matched "pattern" at offset 0');
       expect(toolText(result)).not.toContain("task exited");
@@ -1115,7 +1126,7 @@ describe("bash tool adapter", () => {
     const result = (await tools
       .get("bash_watch")!
       .execute("call", { task_id: "bash-pi-exit" }, undefined, undefined, {
-        cwd: "/test",
+        cwd: projectRoot,
       })) as { details: { waited?: { reason: string } } };
     expect(toolText(result)).toContain("task exited (completed, exit 0)");
     expect(result.details.waited?.reason).toBe("exited");
@@ -1206,7 +1217,7 @@ describe("bash tool adapter", () => {
     registerBashTool(api, ctx);
 
     const bashTool = tools.get("bash")!;
-    const extCtx: MockExtensionContext = { cwd: "/test", hasUI: false };
+    const extCtx: MockExtensionContext = { cwd: projectRoot, hasUI: false };
 
     const result = (await bashTool.execute(
       "test-call",
@@ -1312,12 +1323,12 @@ describe("registerBashTool gates background control tools", () => {
     await tools
       .get("bash_status")!
       .execute("status-call", { task_id: "bash-123" }, undefined, undefined, {
-        cwd: "/test",
+        cwd: projectRoot,
       });
     await tools
       .get("bash_kill")!
       .execute("kill-call", { task_id: "bash-123" }, undefined, undefined, {
-        cwd: "/test",
+        cwd: projectRoot,
       });
 
     expect((calls[0] as [string, Record<string, unknown>])[0]).toBe("bash_status");

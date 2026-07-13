@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,6 +11,15 @@ const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 
 /** Short timeout for tests — we don't want to wait 30s on failure. */
 const TEST_TIMEOUT_MS = 5_000;
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 describe("BinaryBridge lifecycle", () => {
   let bridge: BinaryBridge | null = null;
@@ -124,7 +133,7 @@ describe("BinaryBridge lifecycle", () => {
       `${JSON.stringify({
         type: "configure_warnings",
         session_id: "session-1",
-        project_root: "/repo",
+        project_root: projectRoot,
         warnings: [
           {
             kind: "formatter_not_installed",
@@ -138,7 +147,7 @@ describe("BinaryBridge lifecycle", () => {
 
     expect(deliveries).toHaveLength(1);
     expect(deliveries[0]).toEqual({
-      projectRoot: "/repo",
+      projectRoot: projectRoot,
       sessionId: "session-1",
       client: undefined,
       warnings: [
@@ -170,7 +179,7 @@ describe("BinaryBridge lifecycle", () => {
       (bridge as any).onStdoutData(
         `${JSON.stringify({
           type: "configure_warnings",
-          project_root: "/repo",
+          project_root: projectRoot,
           warnings: [
             {
               kind: "formatter_not_installed",
@@ -185,7 +194,7 @@ describe("BinaryBridge lifecycle", () => {
 
     expect(deliveries).toHaveLength(1);
     expect(deliveries[0]).toEqual({
-      projectRoot: "/repo",
+      projectRoot: projectRoot,
       sessionId: null,
       client: undefined,
       warnings: [
@@ -221,7 +230,7 @@ describe("BinaryBridge lifecycle", () => {
       `${JSON.stringify({
         type: "configure_warnings",
         session_id: "session-a",
-        project_root: "/repo",
+        project_root: projectRoot,
         warnings: [
           {
             kind: "formatter_not_installed",

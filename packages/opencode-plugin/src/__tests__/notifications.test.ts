@@ -1,5 +1,5 @@
 /// <reference path="../bun-test.d.ts" />
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,15 @@ import {
 } from "../notifications.js";
 
 const tempRoots = new Set<string>();
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 function createStorageDir(): string {
   const root = mkdtempSync(join(tmpdir(), "aft-opencode-notifications-"));
@@ -92,10 +101,13 @@ describe("Desktop notification session routing", () => {
   test("session-less warnings wait for an explicit session instead of using Desktop last-session state", async () => {
     const { client, messages } = createClient();
 
-    await sendWarning({ client, directory: "/repo" }, "queued warning");
+    await sendWarning({ client, directory: projectRoot }, "queued warning");
     expect(messages).toHaveLength(0);
 
-    await sendWarning({ client, directory: "/repo", sessionId: "session-1" }, "current warning");
+    await sendWarning(
+      { client, directory: projectRoot, sessionId: "session-1" },
+      "current warning",
+    );
 
     expect(messages).toHaveLength(2);
     expect(messages[0]).toContain("queued warning");
@@ -115,7 +127,7 @@ describe("Desktop notification session routing", () => {
     const { client, messages } = createClient();
 
     await sendFeatureAnnouncement(
-      { client, directory: "/repo" },
+      { client, directory: projectRoot },
       "9.9.9",
       ["Audit fix"],
       "",
@@ -127,7 +139,7 @@ describe("Desktop notification session routing", () => {
     expect(readFileSync(versionFile, "utf-8")).toBe("0.0.1");
 
     await sendFeatureAnnouncement(
-      { client, directory: "/repo", sessionId: "session-1" },
+      { client, directory: projectRoot, sessionId: "session-1" },
       "9.9.9",
       ["Audit fix"],
       "",
@@ -151,7 +163,7 @@ describe("Desktop notification session routing", () => {
     const { client, messages } = createClient();
 
     await sendFeatureAnnouncement(
-      { client, directory: "/repo" },
+      { client, directory: projectRoot },
       "9.9.9",
       ["Audit fix"],
       "",
@@ -164,7 +176,7 @@ describe("Desktop notification session routing", () => {
     // Even when a session binds later, no announcement is delivered for
     // this fresh-install version.
     await sendFeatureAnnouncement(
-      { client, directory: "/repo", sessionId: "session-1" },
+      { client, directory: projectRoot, sessionId: "session-1" },
       "9.9.9",
       ["Audit fix"],
       "",
@@ -196,7 +208,7 @@ function createConfigureDeliveryOpts(
       bridge,
       storageDir,
       pluginVersion: "1.0.0",
-      projectRoot: "/repo",
+      projectRoot: projectRoot,
       delivery,
     },
     showToast: toast.showToast,
@@ -270,7 +282,7 @@ describe("deliverConfigureWarnings", () => {
         bridge,
         storageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
       },
       [baseWarning()],
     );
@@ -281,7 +293,7 @@ describe("deliverConfigureWarnings", () => {
         bridge,
         storageDir: missingStorageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
       },
       [baseWarning({ tool: "prettier", hint: "Install prettier." })],
     );
@@ -393,7 +405,7 @@ describe("deliverConfigureWarnings", () => {
         bridge,
         storageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
       },
       [baseWarning()],
     );
@@ -422,7 +434,7 @@ describe("deliverConfigureWarnings", () => {
         bridge,
         storageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
       },
       [baseWarning()],
     );
@@ -444,7 +456,7 @@ describe("deliverConfigureWarnings", () => {
         bridge: first.bridge,
         storageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
       },
       [baseWarning()],
     );
@@ -458,7 +470,7 @@ describe("deliverConfigureWarnings", () => {
         bridge,
         storageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
       },
       [baseWarning()],
     );
@@ -497,7 +509,7 @@ describe("deliverConfigureWarnings", () => {
         bridge,
         storageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
         delivery: "chat",
       },
       [baseWarning()],
@@ -530,7 +542,7 @@ describe("deliverConfigureWarnings", () => {
         bridge,
         storageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
         delivery: "chat",
       },
       [
@@ -555,7 +567,7 @@ describe("deliverConfigureWarnings", () => {
         bridge,
         storageDir,
         pluginVersion: "1.0.0",
-        projectRoot: "/repo",
+        projectRoot: projectRoot,
         delivery: "toast",
       },
       [baseWarning()],
@@ -583,7 +595,7 @@ describe("deliverConfigureWarnings", () => {
           bridge,
           storageDir,
           pluginVersion: "1.0.0",
-          projectRoot: "/repo",
+          projectRoot: projectRoot,
         },
         [baseWarning()],
       ),
@@ -599,7 +611,7 @@ describe("sendFeatureAnnouncement storage", () => {
     const showToast = mock(async () => undefined);
 
     await sendFeatureAnnouncement(
-      { client: { tui: { showToast } }, directory: "/repo" },
+      { client: { tui: { showToast } }, directory: projectRoot },
       "0.30.0",
       ["Feature"],
       "",
@@ -623,7 +635,7 @@ describe("sendFeatureAnnouncement storage", () => {
     const showToast = mock(async () => undefined);
 
     await sendFeatureAnnouncement(
-      { client: { tui: { showToast } }, directory: "/repo" },
+      { client: { tui: { showToast } }, directory: projectRoot },
       "0.30.1",
       ["Feature"],
       "",

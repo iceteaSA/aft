@@ -10,7 +10,7 @@ use crate::protocol::PushFrame;
 use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1085,19 +1085,61 @@ pub fn semantic_corpus_refresh_in_progress(ctx: &AppContext) -> bool {
     )
 }
 
-#[cfg(debug_assertions)]
-pub fn delay_search_rebuild_publish_for_debug() {
-    let Some(delay_ms) = std::env::var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-    else {
-        return;
-    };
-    thread::sleep(Duration::from_millis(delay_ms));
+struct SearchRebuildPublishGate {
+    reached_tx: crossbeam_channel::Sender<()>,
+    release_rx: crossbeam_channel::Receiver<()>,
 }
 
-#[cfg(not(debug_assertions))]
-pub fn delay_search_rebuild_publish_for_debug() {}
+static SEARCH_REBUILD_PUBLISH_GATE: OnceLock<Mutex<Option<SearchRebuildPublishGate>>> =
+    OnceLock::new();
+static SEARCH_REBUILD_SHUTDOWN_WAIT_SIGNAL: OnceLock<Mutex<Option<crossbeam_channel::Sender<()>>>> =
+    OnceLock::new();
+
+#[doc(hidden)]
+pub fn install_search_rebuild_publish_gate_for_test() -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (shutdown_waiting_tx, shutdown_waiting_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *SEARCH_REBUILD_PUBLISH_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("search rebuild publish gate mutex poisoned") = Some(SearchRebuildPublishGate {
+        reached_tx,
+        release_rx,
+    });
+    *SEARCH_REBUILD_SHUTDOWN_WAIT_SIGNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("search rebuild shutdown wait signal mutex poisoned") = Some(shutdown_waiting_tx);
+    (reached_rx, shutdown_waiting_rx, release_tx)
+}
+
+pub(crate) fn note_search_rebuild_shutdown_wait_for_test() {
+    let signal = SEARCH_REBUILD_SHUTDOWN_WAIT_SIGNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("search rebuild shutdown wait signal mutex poisoned")
+        .take();
+    if let Some(signal) = signal {
+        let _ = signal.send(());
+    }
+}
+
+fn wait_on_search_rebuild_publish_gate_for_test() {
+    let gate = SEARCH_REBUILD_PUBLISH_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("search rebuild publish gate mutex poisoned")
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.reached_tx.send(());
+        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+    }
+}
 
 pub fn spawn_search_corpus_refresh(
     ctx: &AppContext,
@@ -1151,7 +1193,7 @@ pub fn spawn_search_corpus_refresh(
                 config.search_index_max_file_size,
                 &cache_dir,
             );
-            delay_search_rebuild_publish_for_debug();
+            wait_on_search_rebuild_publish_gate_for_test();
             if !shared_artifacts_read_only {
                 let head = index.stored_git_head().map(str::to_owned);
                 index.write_to_disk(&cache_dir, head.as_deref());
@@ -2264,7 +2306,7 @@ mod watcher_slice_tests {
 
         refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone(), generated]));
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(12);
         loop {
             let pending = ctx.take_pending_callgraph_store_paths();
             if !pending.is_empty() {

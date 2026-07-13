@@ -1,6 +1,9 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import {
@@ -10,6 +13,16 @@ import {
 } from "../tools/inspect.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = realpathSync(mkdtempSync(join(tmpdir(), "aft-test-repo-")));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = {
@@ -124,7 +137,7 @@ describe("aft_inspect tool", () => {
 
     await tools.aft_inspect.execute(
       { sections: ["todos", "dead_code"], scope: "src", topK: 7 },
-      createMockSdkContext("/repo"),
+      createMockSdkContext(projectRoot),
     );
 
     expect(sendCalls).toEqual([]);
@@ -134,7 +147,7 @@ describe("aft_inspect tool", () => {
         name: "inspect",
         rawArgs: {
           sections: ["todos", "dead_code"],
-          scope: "/repo/src",
+          scope: join(projectRoot, "src"),
           topK: 7,
         },
         options: expect.objectContaining({
@@ -150,7 +163,7 @@ describe("aft_inspect tool", () => {
 
     await tools.aft_inspect.execute(
       { sections: [], scope: "", topK: undefined },
-      createMockSdkContext("/repo"),
+      createMockSdkContext(projectRoot),
     );
 
     expect(toolCallCalls[0]?.rawArgs.sections).toBeUndefined();
@@ -167,7 +180,7 @@ describe("aft_inspect tool", () => {
       summary: { diagnostics: { errors: 1, warnings: 0, info: 0, hints: 2 } },
     }));
 
-    const result = await tools.aft_inspect.execute({}, createMockSdkContext("/repo"));
+    const result = await tools.aft_inspect.execute({}, createMockSdkContext(projectRoot));
     const text = typeof result === "string" ? result : (result.output as string);
 
     expect(text).toBe(rendered);
