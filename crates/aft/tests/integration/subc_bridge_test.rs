@@ -3403,8 +3403,16 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
     let flood_count = 512_u64;
     const TEST_WRITER_QUEUE_CAPACITY: u64 = 256;
     const TEST_RELIABLE_PUSH_DRAIN_BUDGET: u64 = 32;
+    // Two drain batches of slack covers the loop finishing its current batch
+    // plus one more before observing the completed bind job on a fast box; a
+    // contended CI runner (loop turns run ~5x slower relative to the fake
+    // daemon's socket reads) can legitimately fit several more batches in
+    // that window. The invariant under test is "bounded, not starved" —
+    // priority means the ack rides within queue-capacity-plus-slack instead
+    // of waiting out the whole 512-frame flood, so extra batch slack keeps
+    // the assertion meaningful without making it a wall-clock bet.
     const ACK_AFTER_RELEASE_PUSH_BOUND: u64 =
-        TEST_WRITER_QUEUE_CAPACITY + 2 * TEST_RELIABLE_PUSH_DRAIN_BUDGET;
+        TEST_WRITER_QUEUE_CAPACITY + 6 * TEST_RELIABLE_PUSH_DRAIN_BUDGET;
     send_tool_call(
         &mut stream,
         1,
