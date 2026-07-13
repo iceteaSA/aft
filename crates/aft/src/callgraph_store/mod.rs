@@ -9626,7 +9626,11 @@ mod refresh_worker_tests {
         let _guard = REFRESH_WORKER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+        // Generous pre-drain: the refresh worker is process-wide, so a prior
+        // test's still-running batch (slow Windows CI) must fully settle
+        // before this test enqueues, or its wait deadline absorbs the
+        // leftover work. Idle workers return immediately.
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
         let (_temp, root, callgraph_dir, source) = ready_store_fixture();
         let pending = pending_paths();
         set_callgraph_refresh_worker_test_seam(root.clone(), Duration::from_millis(150), false);
@@ -9660,7 +9664,11 @@ mod refresh_worker_tests {
         let _guard = REFRESH_WORKER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+        // Generous pre-drain: the refresh worker is process-wide, so a prior
+        // test's still-running batch (slow Windows CI) must fully settle
+        // before this test enqueues, or its wait deadline absorbs the
+        // leftover work. Idle workers return immediately.
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
         let (_active_temp, active_root, active_dir, active_source) = ready_store_fixture();
         let (_target_temp, target_root, target_dir, target_source) = ready_store_fixture();
         set_callgraph_refresh_worker_test_seam(active_root.clone(), Duration::ZERO, false);
@@ -9723,7 +9731,11 @@ mod refresh_worker_tests {
         let _guard = REFRESH_WORKER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+        // Generous pre-drain: the refresh worker is process-wide, so a prior
+        // test's still-running batch (slow Windows CI) must fully settle
+        // before this test enqueues, or its wait deadline absorbs the
+        // leftover work. Idle workers return immediately.
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
         let (_temp, root, callgraph_dir, source) = ready_store_fixture();
         let pending = pending_paths();
         set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, true);
@@ -9746,7 +9758,11 @@ mod refresh_worker_tests {
         let _guard = REFRESH_WORKER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+        // Generous pre-drain: the refresh worker is process-wide, so a prior
+        // test's still-running batch (slow Windows CI) must fully settle
+        // before this test enqueues, or its wait deadline absorbs the
+        // leftover work. Idle workers return immediately.
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
         let (_active_temp, active_root, active_dir, active_source) = ready_store_fixture();
         let (_queued_temp, queued_root, queued_dir, queued_source) = ready_store_fixture();
         let active_pending = pending_paths();
