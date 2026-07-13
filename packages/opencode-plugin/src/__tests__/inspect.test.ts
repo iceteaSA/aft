@@ -59,7 +59,7 @@ function createPluginContext(pool: BridgePool, config: Record<string, unknown>):
   };
 }
 
-function createMockSdkContext(directory = "/tmp/inspect-tests"): ToolContext {
+function createMockSdkContext(directory = projectRoot): ToolContext {
   return {
     sessionID: "inspect-session",
     messageID: "message-id",

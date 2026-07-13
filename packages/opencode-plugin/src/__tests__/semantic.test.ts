@@ -1,10 +1,23 @@
 /// <reference path="../bun-test.d.ts" />
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { semanticTools } from "../tools/semantic.js";
 import type { PluginContext } from "../types.js";
 import { mockAsk, mockAskDeny, noopAsk } from "./test-helpers";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
@@ -36,7 +49,7 @@ function createPluginContext(pool: BridgePool, config: Record<string, unknown>):
   };
 }
 
-function createMockSdkContext(directory = "/tmp/semantic-tests", ask = noopAsk): ToolContext {
+function createMockSdkContext(directory = projectRoot, ask = noopAsk): ToolContext {
   return {
     sessionID: "semantic-session",
     messageID: "message-id",
@@ -98,7 +111,7 @@ describe("semanticTools", () => {
   });
 
   test("returns ONLY the clean text (no structured JSON dump) and sends params", async () => {
-    const sdkCtx = createMockSdkContext("/tmp/project");
+    const sdkCtx = createMockSdkContext(projectRoot);
     const bridgeResponse = {
       success: true,
       text: "src/auth.ts\nvalidateToken [function] lines 10-32\n\nFound 1 result(s).",
@@ -153,7 +166,7 @@ describe("semanticTools", () => {
   });
 
   test("passes includeTests through as a raw tool_call argument", async () => {
-    const sdkCtx = createMockSdkContext("/tmp/project");
+    const sdkCtx = createMockSdkContext(projectRoot);
     const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({
       success: true,
       text: "ok",
@@ -166,7 +179,7 @@ describe("semanticTools", () => {
 
   test("rejects blank queries before permission or bridge calls", async () => {
     const ask = mockAsk();
-    const sdkCtx = createMockSdkContext("/tmp/project", ask);
+    const sdkCtx = createMockSdkContext(projectRoot, ask);
     const sendImpl = mock(() => ({ success: true, text: "should not call" }));
     const { sendCalls, toolCallCalls, tools } = createMockSemanticHarness({}, sendImpl);
 
@@ -181,7 +194,7 @@ describe("semanticTools", () => {
   });
 
   test("returns server-rendered honesty text without appending plugin-side notes", async () => {
-    const sdkCtx = createMockSdkContext("/tmp/project");
+    const sdkCtx = createMockSdkContext(projectRoot);
     const { tools } = createMockSemanticHarness({}, () => ({
       success: true,
       text: "partial results\n\nFound 2 result(s). More results available; raise topK to see more.\nSearch status: fully degraded; partial/incomplete.",
@@ -203,7 +216,7 @@ describe("semanticTools", () => {
   });
 
   test("throws semantic runtime errors with code and message", async () => {
-    const sdkCtx = createMockSdkContext("/tmp/project");
+    const sdkCtx = createMockSdkContext(projectRoot);
     const { tools } = createMockSemanticHarness({}, () => ({
       success: false,
       code: "semantic_search_unavailable",
@@ -219,7 +232,7 @@ describe("semanticTools", () => {
   });
 
   test("throws bridge failure envelopes with their message", async () => {
-    const sdkCtx = createMockSdkContext("/tmp/project");
+    const sdkCtx = createMockSdkContext(projectRoot);
     const { tools } = createMockSemanticHarness({}, () => ({
       success: false,
       code: "permission_required",
@@ -235,7 +248,7 @@ describe("semanticTools", () => {
   test("asks aft_search permission for regex literal and auto hints but not semantic", async () => {
     for (const hint of ["regex", "literal", "auto"] as const) {
       const ask = mockAsk();
-      const sdkCtx = createMockSdkContext("/tmp/project", ask);
+      const sdkCtx = createMockSdkContext(projectRoot, ask);
       const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({
         success: true,
         text: "ok",
@@ -248,7 +261,7 @@ describe("semanticTools", () => {
     }
 
     const semanticAsk = mockAsk();
-    const semanticCtx = createMockSdkContext("/tmp/project", semanticAsk);
+    const semanticCtx = createMockSdkContext(projectRoot, semanticAsk);
     const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({
       success: true,
       text: "ok",
@@ -261,7 +274,7 @@ describe("semanticTools", () => {
   });
 
   test("permission denied returns an error envelope without bridge call", async () => {
-    const sdkCtx = createMockSdkContext("/tmp/project", mockAskDeny("Denied by policy"));
+    const sdkCtx = createMockSdkContext(projectRoot, mockAskDeny("Denied by policy"));
     const sendImpl = mock(() => ({ success: true, text: "should not call" }));
     const { sendCalls, toolCallCalls, tools } = createMockSemanticHarness({}, sendImpl);
 

@@ -4,11 +4,24 @@
 
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { astTools } from "../tools/ast.js";
 import type { PluginContext } from "../types.js";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+});
+
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 function createSdkContext(directory: string): ToolContext {
   return {
@@ -46,8 +59,7 @@ describe("AST tool adapters", () => {
       storageDir: "/tmp/aft-test",
     };
     const tools = astTools(ctx);
-    const dir = "/tmp/aft-ast-test";
-    const sdkCtx = createSdkContext(dir);
+    const sdkCtx = createSdkContext(projectRoot);
 
     await tools.ast_grep_replace.execute(
       {

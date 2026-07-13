@@ -1,12 +1,23 @@
 /// <reference path="../bun-test.d.ts" />
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { searchTools, splitIncludeArg } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
+
+let projectRoot: string;
+
+beforeAll(() => {
+  projectRoot = fs.realpathSync(fs.mkdtempSync(path.join(tmpdir(), "aft-test-repo-")));
+});
+
+afterAll(() => {
+  fs.rmSync(projectRoot, { recursive: true, force: true });
+});
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
@@ -48,7 +59,7 @@ function createPluginContext(pool: BridgePool, config: Record<string, unknown>):
 }
 
 function createMockSdkContext(
-  directory = "/tmp/search-tests",
+  directory = projectRoot,
   ask: ToolContext["ask"] = noopAsk,
 ): ToolContext {
   return {
@@ -134,7 +145,7 @@ describe("searchTools", () => {
   });
 
   test("returns grep response.text when provided and uses session-scoped bridges", async () => {
-    const sdkCtx = createMockSdkContext("/tmp/project");
+    const sdkCtx = createMockSdkContext(projectRoot);
     const { bridgeCalls, sendCalls, toolCallCalls, tools } = createMockSearchHarness(
       { hoist_builtin_tools: true },
       () => ({
@@ -547,7 +558,7 @@ describe("searchTools", () => {
   });
 
   test("glob splits exact absolute file patterns into path and basename", async () => {
-    const project = "/tmp/search-tests";
+    const project = projectRoot;
     const absoluteFile = path.join(project, "src", "exact.ts");
     const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
       success: true,
