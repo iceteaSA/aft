@@ -1,5 +1,8 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
-use crate::config::{SemanticBackend, SemanticBackendConfig};
+use crate::config::{
+    SemanticBackend, SemanticBackendConfig, DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
+    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+};
 use crate::fs_lock;
 use crate::parser::{detect_language, extract_symbols_from_tree, parse_source_with_cached_parser};
 use crate::search_index::{cache_relative_path, cached_path_under_root};
@@ -56,15 +59,59 @@ const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 // Build/refresh embedding requests keep a larger budget because they run on
 // background workers and often batch many texts through a cold local backend.
 const DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS: u64 = 25_000;
-// Interactive query embedding runs inside semantic_search dispatch; keep it
-// short so slow/unreachable remote backends degrade to lexical quickly.
-const DEFAULT_QUERY_EMBEDDING_TIMEOUT_MS: u64 = 8_000;
 const DEFAULT_MAX_BATCH_SIZE: usize = 64;
 const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
 const FALLBACK_BACKEND: &str = "none";
 const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
 static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Per-query request policy kept separate from the background build timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudget {
+    timeout_ms: u64,
+}
+
+impl QueryBudget {
+    pub fn from_config(config: &SemanticBackendConfig) -> Self {
+        let configured = if config.query_timeout_ms == 0 {
+            DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
+        } else {
+            config.query_timeout_ms
+        };
+        Self {
+            timeout_ms: configured
+                .clamp(MIN_SEMANTIC_QUERY_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS),
+        }
+    }
+
+    #[cfg(test)]
+    fn timeout_ms(self) -> u64 {
+        self.timeout_ms
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EmbeddingRequestPolicy {
+    Build,
+    Query(QueryBudget),
+}
+
+impl EmbeddingRequestPolicy {
+    fn max_attempts(self) -> usize {
+        match self {
+            Self::Build => EMBEDDING_REQUEST_MAX_ATTEMPTS,
+            Self::Query(_) => 1,
+        }
+    }
+
+    fn request_timeout(self) -> Option<Duration> {
+        match self {
+            Self::Build => None,
+            Self::Query(budget) => Some(Duration::from_millis(budget.timeout_ms)),
+        }
+    }
+}
 
 pub struct SemanticIndexLock {
     _guard: Option<fs_lock::LockGuard>,
@@ -485,14 +532,13 @@ fn embedding_response_body_is_transient(status: reqwest::StatusCode, raw: &str) 
 }
 
 fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
-    error.is_connect()
+    error.is_connect() || error.is_timeout()
 }
 
 /// Whether a send-time error means the backend is *unreachable or temporarily
-/// failing* (vs. a real misconfiguration). Broader than the in-request retry
-/// predicate: a per-request timeout is transient for the build/refresh layer
-/// (the model may still be cold-loading) but we don't burn the 3 fast
-/// in-request attempts on it — the build-level retry rides it out instead.
+/// failing* (vs. a real misconfiguration). Build requests retry both connection
+/// failures and timeouts; query requests use the same classification but have a
+/// one-attempt policy.
 fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_timeout()
 }
@@ -526,14 +572,23 @@ fn sleep_before_embedding_retry(attempt_index: usize) {
     }
 }
 
-fn send_embedding_request<F>(mut make_request: F, backend_label: &str) -> Result<String, String>
+fn send_embedding_request<F>(
+    mut make_request: F,
+    backend_label: &str,
+    policy: EmbeddingRequestPolicy,
+) -> Result<String, String>
 where
     F: FnMut() -> reqwest::blocking::RequestBuilder,
 {
-    for attempt_index in 0..EMBEDDING_REQUEST_MAX_ATTEMPTS {
-        let last_attempt = attempt_index + 1 == EMBEDDING_REQUEST_MAX_ATTEMPTS;
+    let max_attempts = policy.max_attempts();
+    for attempt_index in 0..max_attempts {
+        let last_attempt = attempt_index + 1 == max_attempts;
+        let mut request = make_request();
+        if let Some(timeout) = policy.request_timeout() {
+            request = request.timeout(timeout);
+        }
 
-        let response = match make_request().send() {
+        let response = match request.send() {
             Ok(response) => response,
             Err(error) => {
                 if !last_attempt && is_retryable_embedding_error(&error) {
@@ -617,9 +672,9 @@ impl SemanticEmbeddingModel {
     }
 
     pub fn from_config_for_query(config: &SemanticBackendConfig) -> Result<Self, String> {
-        let timeout_ms =
-            configured_embedding_timeout_ms(config).min(DEFAULT_QUERY_EMBEDDING_TIMEOUT_MS);
-        Self::from_config_with_timeout_ms(config, timeout_ms)
+        // The model may later be reused by a background build, so retain the build
+        // client's timeout. QueryBudget overrides each interactive HTTP request.
+        Self::from_config(config)
     }
 
     fn from_config_with_timeout_ms(
@@ -737,16 +792,20 @@ impl SemanticEmbeddingModel {
                     .ok_or_else(|| "embedding backend returned no vectors".to_string())?
             }
             SemanticEmbeddingEngine::OpenAiCompatible { .. } => {
-                let vectors =
-                    self.embed_texts(vec!["semantic index fingerprint probe".to_string()])?;
+                let vectors = self.embed_texts(
+                    vec!["semantic index fingerprint probe".to_string()],
+                    EmbeddingRequestPolicy::Build,
+                )?;
                 vectors
                     .first()
                     .map(|v| v.len())
                     .ok_or_else(|| "embedding backend returned no vectors".to_string())?
             }
             SemanticEmbeddingEngine::Ollama { .. } => {
-                let vectors =
-                    self.embed_texts(vec!["semantic index fingerprint probe".to_string()])?;
+                let vectors = self.embed_texts(
+                    vec!["semantic index fingerprint probe".to_string()],
+                    EmbeddingRequestPolicy::Build,
+                )?;
                 vectors
                     .first()
                     .map(|v| v.len())
@@ -759,17 +818,24 @@ impl SemanticEmbeddingModel {
     }
 
     pub fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        self.embed_texts(texts)
+        self.embed_texts(texts, EmbeddingRequestPolicy::Build)
     }
 
-    pub fn embed_query_cached(&mut self, query: &str) -> Result<Vec<f32>, String> {
+    pub fn embed_query_cached(
+        &mut self,
+        query: &str,
+        budget: QueryBudget,
+    ) -> Result<Vec<f32>, String> {
         if let Some(vector) = self.query_embedding_cache.get(query) {
             self.query_embedding_cache_hits += 1;
             return Ok(vector.clone());
         }
 
         self.query_embedding_cache_misses += 1;
-        let embeddings = self.embed_texts(vec![query.to_string()])?;
+        let embeddings = self.embed_texts(
+            vec![query.to_string()],
+            EmbeddingRequestPolicy::Query(budget),
+        )?;
         let vector = embeddings
             .first()
             .cloned()
@@ -796,7 +862,11 @@ impl SemanticEmbeddingModel {
         )
     }
 
-    fn embed_texts(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+    fn embed_texts(
+        &mut self,
+        texts: Vec<String>,
+        policy: EmbeddingRequestPolicy,
+    ) -> Result<Vec<Vec<f32>>, String> {
         match &mut self.engine {
             SemanticEmbeddingEngine::Local(model) => model
                 .embed(&texts)
@@ -834,6 +904,7 @@ impl SemanticEmbeddingModel {
                         request
                     },
                     "openai compatible",
+                    policy,
                 )?;
 
                 #[derive(Deserialize)]
@@ -907,6 +978,7 @@ impl SemanticEmbeddingModel {
                         client.post(&endpoint).json(&payload)
                     },
                     "ollama",
+                    policy,
                 )?;
 
                 #[derive(Deserialize)]
@@ -4410,37 +4482,41 @@ mod tests {
     #[test]
     #[ignore = "manual single-file semantic collect phase benchmark"]
     fn profile_rust_single_file_semantic_collect() {
-        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let file = project_root.join("src/profile_single_file.rs");
-        let source = "pub fn tiny() {}\n";
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = crate_root
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let files = [
+            workspace_root.join("crates/aft/src/bash_background/registry.rs"),
+            workspace_root.join("crates/aft-tokenizer/src/claude_data.rs"),
+        ];
 
-        for run in 1..=3 {
-            let mut phases = SemanticCollectPhaseTimings::default();
-            let started = Instant::now();
-            let chunks = collect_file_chunks_from_source_timed(
-                &project_root,
-                &file,
-                crate::parser::LangId::Rust,
-                source,
-                &mut phases,
-            )
-            .unwrap();
-            eprintln!(
-            "semantic single-file run {run}: total={:?} parse={:?} extract={:?} build={:?} chunks={}",
-            started.elapsed(),
-            phases.parse,
-            phases.extract,
-            phases.build,
-            chunks.len()
-        );
+        for file in files {
+            let source = fs::read_to_string(&file).expect("read benchmark source");
+            for run in 1..=5 {
+                let mut phases = SemanticCollectPhaseTimings::default();
+                let started = Instant::now();
+                let chunks = collect_file_chunks_from_source_timed(
+                    workspace_root,
+                    &file,
+                    crate::parser::LangId::Rust,
+                    &source,
+                    &mut phases,
+                )
+                .unwrap();
+                eprintln!(
+                    "semantic single-file file={} bytes={} run={run}: total={:?} parse={:?} extract={:?} build={:?} chunks={}",
+                    file.strip_prefix(workspace_root).unwrap().display(),
+                    source.len(),
+                    started.elapsed(),
+                    phases.parse,
+                    phases.extract,
+                    phases.build,
+                    chunks.len()
+                );
+            }
         }
-
-        let (chunks, output_bytes, output_hash) =
-            rust_fixture_semantic_output_fingerprint(&project_root);
-        eprintln!(
-        "rust fixture semantic output: chunks={chunks} bytes={output_bytes} blake3={output_hash}"
-    );
-        assert_eq!(output_hash, RUST_QUERY_BASELINE_OUTPUT_HASH);
     }
 
     #[test]
@@ -4553,6 +4629,54 @@ mod tests {
             ),
             "permanent auth failures must not become transient because of body text"
         );
+    }
+
+    fn start_slow_embedding_server(
+        expected_requests: usize,
+        response_delay: Duration,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding server");
+        listener
+            .set_nonblocking(true)
+            .expect("set slow server nonblocking");
+        let addr = listener.local_addr().expect("slow embedding server addr");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_thread = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut handlers = Vec::new();
+            while requests_for_thread.load(Ordering::SeqCst) < expected_requests
+                && Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        requests_for_thread.fetch_add(1, Ordering::SeqCst);
+                        handlers.push(thread::spawn(move || {
+                            let mut request = [0u8; 4096];
+                            let _ = stream.read(&mut request);
+                            thread::sleep(response_delay);
+                            let body =
+                                r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept slow embedding request: {error}"),
+                }
+            }
+            for handler in handlers {
+                handler.join().expect("slow embedding handler");
+            }
+        });
+
+        (format!("http://{addr}"), requests, handle)
     }
 
     fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
@@ -4676,8 +4800,12 @@ Connection: close
             .build()
             .expect("client");
 
-        let error = send_embedding_request(|| client.post(&url).body("{}"), "test backend")
-            .expect_err("truncated body should fail");
+        let error = send_embedding_request(
+            || client.post(&url).body("{}"),
+            "test backend",
+            EmbeddingRequestPolicy::Build,
+        )
+        .expect_err("truncated body should fail");
 
         handle.join().unwrap();
         assert!(
@@ -6226,13 +6354,14 @@ public class Greeter {
     }
 
     #[test]
-    fn interactive_query_embedding_model_caps_remote_timeout() {
+    fn interactive_query_budget_is_independent_from_build_timeout() {
         let mut config = SemanticBackendConfig {
             backend: SemanticBackend::OpenAiCompatible,
             model: "test-embedding".to_string(),
             base_url: Some("http://127.0.0.1:9".to_string()),
             api_key_env: None,
             timeout_ms: 0,
+            query_timeout_ms: 0,
             max_batch_size: 64,
             max_files: 20_000,
         };
@@ -6246,24 +6375,51 @@ public class Greeter {
         );
         assert_eq!(
             query_model.timeout_ms(),
-            DEFAULT_QUERY_EMBEDDING_TIMEOUT_MS,
-            "interactive query embedding is capped below the dispatch transport timeout"
+            DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS,
+            "a query-created model remains safe for later background build reuse"
+        );
+        assert_eq!(
+            QueryBudget::from_config(&config).timeout_ms(),
+            DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
         );
 
         config.timeout_ms = 60_000;
-        let query_model = SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
         assert_eq!(
-            query_model.timeout_ms(),
-            DEFAULT_QUERY_EMBEDDING_TIMEOUT_MS,
-            "explicitly long backend timeouts are capped for interactive queries"
+            QueryBudget::from_config(&config).timeout_ms(),
+            DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
+            "the build timeout must not affect interactive requests"
         );
 
-        config.timeout_ms = 3_000;
-        let query_model = SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
+        config.query_timeout_ms = 700;
+        assert_eq!(QueryBudget::from_config(&config).timeout_ms(), 700);
+    }
+
+    #[test]
+    fn background_build_embedding_keeps_retry_ladder() {
+        let (base_url, requests, handle) =
+            start_slow_embedding_server(EMBEDDING_REQUEST_MAX_ATTEMPTS, Duration::from_millis(300));
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-embedding".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 100,
+            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
+            max_batch_size: 64,
+            max_files: 20_000,
+        };
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+
+        let error = model
+            .embed(vec!["slow build batch".to_string()])
+            .expect_err("all slow build attempts should time out");
+        handle.join().expect("slow embedding server");
+
+        assert!(embedding_failure_is_transient(&error), "error: {error}");
         assert_eq!(
-            query_model.timeout_ms(),
-            3_000,
-            "shorter explicit timeouts are respected for interactive queries"
+            requests.load(Ordering::SeqCst),
+            EMBEDDING_REQUEST_MAX_ATTEMPTS,
+            "background builds must retain the existing retry ladder"
         );
     }
 
@@ -6281,6 +6437,7 @@ public class Greeter {
             base_url: Some(base_url),
             api_key_env: None,
             timeout_ms: 5_000,
+            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
         };
@@ -6355,6 +6512,7 @@ public class Greeter {
             base_url: Some(format!("http://{}", addr)),
             api_key_env: None,
             timeout_ms: 5_000,
+            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
         };
@@ -6401,6 +6559,7 @@ public class Greeter {
             base_url: Some(base_url),
             api_key_env: None,
             timeout_ms: 5_000,
+            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
         };

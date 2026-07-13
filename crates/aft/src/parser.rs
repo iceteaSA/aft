@@ -7828,6 +7828,222 @@ mod tests {
         assert_eq!(symbols.len(), 1);
     }
 
+    fn extract_rs_symbols_with_query_oracle(source: &str, root: Node<'_>) -> Vec<Symbol> {
+        let grammar = grammar_for(LangId::Rust);
+        let query = Query::new(&grammar, RS_QUERY).expect("compile Rust parity query");
+        let capture_names = query.capture_names();
+        let is_pub = |node: &Node<'_>| {
+            let mut cursor = node.walk();
+            if cursor.goto_first_child() {
+                loop {
+                    if cursor.node().kind() == "visibility_modifier" {
+                        return true;
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+            false
+        };
+
+        let mut symbols = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, root, source.as_bytes());
+        while let Some(query_match) = {
+            matches.advance();
+            matches.get()
+        } {
+            let mut function_name = None;
+            let mut function_definition = None;
+            let mut item_name = None;
+            let mut item_definition = None;
+            let mut item_kind = None;
+            let mut impl_node = None;
+            for capture in query_match.captures {
+                let Some(name) = capture_names.get(capture.index as usize) else {
+                    continue;
+                };
+                match *name {
+                    "fn.name" => function_name = Some(capture.node),
+                    "fn.def" => function_definition = Some(capture.node),
+                    "struct.name" => {
+                        item_name = Some(capture.node);
+                        item_kind = Some(SymbolKind::Struct);
+                    }
+                    "struct.def" => item_definition = Some(capture.node),
+                    "enum.name" => {
+                        item_name = Some(capture.node);
+                        item_kind = Some(SymbolKind::Enum);
+                    }
+                    "enum.def" => item_definition = Some(capture.node),
+                    "trait.name" => {
+                        item_name = Some(capture.node);
+                        item_kind = Some(SymbolKind::Interface);
+                    }
+                    "trait.def" => item_definition = Some(capture.node),
+                    "impl.def" => impl_node = Some(capture.node),
+                    _ => {}
+                }
+            }
+
+            if let (Some(name_node), Some(definition)) = (function_name, function_definition) {
+                let owner = rust_function_declaration_list_owner(&definition);
+                if owner
+                    .as_ref()
+                    .is_none_or(|owner| owner.kind() == "mod_item")
+                {
+                    let scope_chain = rust_mod_scope_chain(&definition, source);
+                    symbols.push(Symbol {
+                        name: node_text(source, &name_node).to_string(),
+                        kind: SymbolKind::Function,
+                        range: node_range_with_decorators(&definition, source, LangId::Rust),
+                        signature: Some(extract_signature(source, &definition)),
+                        scope_chain: scope_chain.clone(),
+                        exported: is_pub(&definition),
+                        parent: scope_chain.last().cloned(),
+                    });
+                }
+            }
+
+            if let (Some(name_node), Some(definition), Some(kind)) =
+                (item_name, item_definition, item_kind)
+            {
+                symbols.push(Symbol {
+                    name: node_text(source, &name_node).to_string(),
+                    kind,
+                    range: node_range_with_decorators(&definition, source, LangId::Rust),
+                    signature: Some(extract_signature(source, &definition)),
+                    scope_chain: Vec::new(),
+                    exported: is_pub(&definition),
+                    parent: None,
+                });
+            }
+
+            if let Some(impl_node) = impl_node {
+                let scope_name = rust_impl_scope_name(&impl_node, source);
+                let parent_name = scope_name
+                    .rsplit(" for ")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let mut impl_cursor = impl_node.walk();
+                if impl_cursor.goto_first_child() {
+                    loop {
+                        let child = impl_cursor.node();
+                        if child.kind() == "declaration_list" {
+                            let mut method_cursor = child.walk();
+                            if method_cursor.goto_first_child() {
+                                loop {
+                                    let method = method_cursor.node();
+                                    if method.kind() == "function_item" {
+                                        if let Some(name_node) = method.child_by_field_name("name")
+                                        {
+                                            symbols.push(Symbol {
+                                                name: node_text(source, &name_node).to_string(),
+                                                kind: SymbolKind::Method,
+                                                range: node_range_with_decorators(
+                                                    &method,
+                                                    source,
+                                                    LangId::Rust,
+                                                ),
+                                                signature: Some(extract_signature(source, &method)),
+                                                scope_chain: (!scope_name.is_empty())
+                                                    .then(|| vec![scope_name.clone()])
+                                                    .unwrap_or_default(),
+                                                exported: is_pub(&method),
+                                                parent: (!parent_name.is_empty())
+                                                    .then(|| parent_name.clone()),
+                                            });
+                                        }
+                                    }
+                                    if !method_cursor.goto_next_sibling() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !impl_cursor.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        dedup_symbols(&mut symbols);
+        symbols
+    }
+
+    fn rust_symbol_fingerprint(symbols: &[Symbol]) -> Vec<String> {
+        symbols
+            .iter()
+            .map(|symbol| {
+                format!(
+                    "{}|{:?}|{:?}|{:?}|{:?}|{}|{:?}",
+                    symbol.name,
+                    symbol.kind,
+                    symbol.range,
+                    symbol.signature,
+                    symbol.scope_chain,
+                    symbol.exported,
+                    symbol.parent
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rust_walk_matches_query_oracle_for_adversarial_shapes() {
+        let source = r#"
+#[cfg(any())]
+pub(crate) mod outer {
+    pub mod inner {
+        #[doc = "keeps decorator range"]
+        pub(crate) fn nested<T>() {}
+
+        pub(crate) struct Generic<T>(T);
+        pub enum State { Ready }
+        pub trait Service<T> {
+            fn declaration(&self);
+        }
+
+        impl<T> Service<T> for Generic<T> {
+            #[inline]
+            pub(crate) fn attributed_method(&self) {}
+            fn private_method(&self) {}
+        }
+    }
+}
+"#;
+        let grammar = grammar_for(LangId::Rust);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let query_symbols = extract_rs_symbols_with_query_oracle(source, tree.root_node());
+        let walk_symbols = extract_rs_symbols(source, &tree.root_node()).unwrap();
+        assert_eq!(
+            rust_symbol_fingerprint(&walk_symbols),
+            rust_symbol_fingerprint(&query_symbols)
+        );
+        assert!(walk_symbols.iter().any(|symbol| {
+            symbol.name == "nested" && symbol.exported && symbol.scope_chain == ["outer", "inner"]
+        }));
+        assert!(walk_symbols.iter().any(|symbol| {
+            symbol.name == "attributed_method"
+                && symbol.kind == SymbolKind::Method
+                && symbol.scope_chain == ["Service<T> for Generic<T>"]
+                && symbol.exported
+        }));
+        assert!(
+            walk_symbols
+                .iter()
+                .all(|symbol| symbol.name != "declaration"),
+            "trait declarations are not implementation methods"
+        );
+    }
+
     #[test]
     fn source_parser_is_reused_on_the_current_worker_thread() {
         let first = "pub fn first() {}\n";

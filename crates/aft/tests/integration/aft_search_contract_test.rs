@@ -1,7 +1,10 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use aft::commands::grep::handle_grep;
 use aft::commands::semantic_search::handle_semantic_search;
@@ -242,6 +245,7 @@ fn openai_context(project_root: &Path, base_url: String) -> AppContext {
                 base_url: Some(base_url),
                 api_key_env: None,
                 timeout_ms: 5_000,
+                query_timeout_ms: 3_000,
                 max_batch_size: 64,
                 max_files: 20_000,
             },
@@ -266,6 +270,7 @@ fn openai_context_with_storage(
                 base_url: Some(base_url),
                 api_key_env: None,
                 timeout_ms: 5_000,
+                query_timeout_ms: 3_000,
                 max_batch_size: 64,
                 max_files: 20_000,
             },
@@ -333,6 +338,39 @@ fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {
 
 fn start_mock_embedding_error_server() -> (String, thread::JoinHandle<()>) {
     start_mock_embedding_server_with_response("400 Bad Request", r#"{"error":"embedding boom"}"#)
+}
+
+fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding server");
+    let addr = listener.local_addr().expect("slow embedding server addr");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_for_thread = Arc::clone(&requests);
+    let handle = thread::spawn(move || {
+        let mut handlers = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let ordinal = requests_for_thread.fetch_add(1, Ordering::SeqCst);
+            handlers.push(thread::spawn(move || {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                if ordinal == 0 {
+                    thread::sleep(Duration::from_millis(750));
+                }
+                let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }));
+        }
+        for handler in handlers {
+            handler.join().expect("embedding response handler");
+        }
+    });
+
+    (format!("http://{addr}"), requests, handle)
 }
 
 fn start_mock_embedding_server_with_response(
@@ -924,6 +962,48 @@ fn embed_query_failure_falls_back_to_grep_when_hint_not_explicit_semantic() {
 
     assert_degraded_grep_fallback(&response, "unavailable");
     handle.join().expect("embedding server thread");
+}
+
+#[test]
+fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
+    let (project, source_file, source) = project_with_needle();
+    let (base_url, requests, handle) = start_recovering_slow_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    ctx.update_config(|config| config.semantic.query_timeout_ms = 500);
+    install_lexical_index(&ctx, &source_file, source);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+
+    let started = Instant::now();
+    let semantic_request = request_with("needle_symbol", Some("semantic"));
+    let degraded = response_value(handle_semantic_search(&semantic_request, &ctx));
+    let elapsed = started.elapsed();
+
+    assert_lexical_fallback(&degraded, "unavailable");
+    assert!(
+        degraded["text"].as_str().is_some_and(|text| text
+            .contains("Semantic search unavailable; returning lexical-only fallback results.")),
+        "existing degraded disclosure must remain byte-identical: {degraded:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "500ms query budget took {elapsed:?}"
+    );
+
+    let recovered = response_value(handle_semantic_search(&semantic_request, &ctx));
+    assert_eq!(recovered["success"], true, "response: {recovered:?}");
+    assert_eq!(recovered["complete"], true, "response: {recovered:?}");
+    handle.join().expect("recovering embedding server");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "each search should issue one fresh embedding request"
+    );
 }
 
 #[test]

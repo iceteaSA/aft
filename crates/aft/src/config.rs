@@ -3,6 +3,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) const DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 3_000;
+pub(crate) const MIN_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 500;
+pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 15_000;
+
+const fn default_semantic_query_timeout_ms() -> u64 {
+    DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
+}
+
 use crate::harness::Harness;
 
 /// Runtime configuration for the aft process.
@@ -44,6 +52,10 @@ pub struct SemanticBackendConfig {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub timeout_ms: u64,
+    /// Deadline for one interactive query embedding request. Unlike `timeout_ms`,
+    /// this budget never controls background index builds.
+    #[serde(default = "default_semantic_query_timeout_ms")]
+    pub query_timeout_ms: u64,
     pub max_batch_size: usize,
     /// Maximum number of project files to semantically index. Guards local
     /// fastembed memory (model + embeddings + batch buffers) on huge project
@@ -73,6 +85,7 @@ impl Default for SemanticBackendConfig {
             // Keep the default below the plugin bridge timeout to avoid bridge-killed
             // semantic_search requests when callers do not set an explicit timeout.
             timeout_ms: 25_000,
+            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
         }
