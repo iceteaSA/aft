@@ -147,6 +147,10 @@ impl AftProcess {
             // this never hangs. Lifecycle tests override it to "0" to exercise
             // the real Building -> drain -> Ready path.
             .env("AFT_CALLGRAPH_BUILD_WAIT_MS", "30000")
+            // Keep the fast pre-15s semantic quiet window in tests: rigs that
+            // assert watcher-driven semantic refresh would otherwise wait out
+            // the production burst-coalescing window on every batch.
+            .env("AFT_SEMANTIC_QUIET_WINDOW_MS", "50")
             // Disable the OS file watcher by default. ~600 integration spawns
             // each installing a recursive FsEventWatcher swamp the single macOS
             // fseventsd daemon, throttling event delivery and flaking the few

@@ -90,7 +90,22 @@ fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> boo
 
 // The watcher already coalesces filesystem events for 250 ms. Keep a short
 // worker window for corpus-build replay bursts without adding a second full debounce.
-const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 50;
+// Quiet window before a semantic re-embed batch runs. Embedding costs ~1-2s
+// per collect under load, and nobody semantically searches a file within
+// seconds of editing it — a long window coalesces an agent's whole edit burst
+// into one collect instead of one per save. Freshness is preserved where it
+// matters: unembedded changed files are already excluded from results by the
+// stale-file mask, and grep/read see changes instantly.
+const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 15_000;
+
+/// Test seam: rigs that assert on semantic refresh timing override the quiet
+/// window instead of waiting out the production window.
+fn semantic_refresh_quiet_window() -> Duration {
+    let from_env = std::env::var("AFT_SEMANTIC_QUIET_WINDOW_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    Duration::from_millis(from_env.unwrap_or(SEMANTIC_REFRESH_QUIET_WINDOW_MS))
+}
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 
 #[cfg(test)]
@@ -357,7 +372,7 @@ fn spawn_semantic_refresh_worker(
                 }
 
                 let mut disconnected = false;
-                let quiet_window = Duration::from_millis(SEMANTIC_REFRESH_QUIET_WINDOW_MS);
+                let quiet_window = semantic_refresh_quiet_window();
                 let mut deadline = Instant::now() + quiet_window;
 
                 while !corpus_requested && paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
