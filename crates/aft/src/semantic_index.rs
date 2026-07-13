@@ -4595,8 +4595,11 @@ Connection: close
     #[test]
     fn response_body_read_failures_are_marked_transient() {
         let (url, handle) = start_truncated_body_server(EMBEDDING_REQUEST_MAX_ATTEMPTS);
+        // Generous client timeout: this test classifies BODY-TRUNCATION errors,
+        // and a tight budget flips the failure into a connect/send timeout on a
+        // loaded machine, changing which error string the assertions see.
         let client = Client::builder()
-            .timeout(Duration::from_millis(250))
+            .timeout(Duration::from_secs(5))
             .build()
             .expect("client");
 
