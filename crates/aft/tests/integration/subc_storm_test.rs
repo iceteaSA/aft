@@ -699,7 +699,7 @@ async fn drive_generation_supersession_mid_drain(input: FakeDaemonInput) {
     corr += 1;
     send_bind(
         &tx,
-        1,
+        2,
         corr,
         &root,
         "generation-new",
@@ -1417,7 +1417,7 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
         "bash",
         json!({ "command": "sleep 1; printf storm-task-done", "background": true, "timeout": 10_000 }),
     );
-    let launch = expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+    let launch = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
     let task_id = launch["task_id"].as_str().expect("task_id").to_string();
 
     corr += 1;
@@ -1429,7 +1429,7 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
         "subc_test_defer_bash_completed",
         json!({ "task_id": reliable_task, "session_id": "restart-session" }),
     );
-    expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+    expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
     send_route_goodbye(&tx, 1, corr + 10);
     state.release_deferred_pushes();
     corr += 20;
@@ -1441,11 +1441,11 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
         "restart-session",
         storm_project_config(false, false, false, 0),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + TOOL_BOUND;
     let mut saw_ack = false;
     let mut saw_replay = false;
     while Instant::now() < deadline && !(saw_ack && saw_replay) {
-        let frame = read_frame_from_rx(&mut rx, Duration::from_secs(5), "rebind replay").await;
+        let frame = read_frame_from_rx(&mut rx, TOOL_BOUND, "rebind replay").await;
         if is_ack(&frame, corr) {
             saw_ack = true;
         } else if frame.header.ty == FrameType::Push
@@ -1462,7 +1462,7 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
 
     corr += 1;
     send_tool(&tx, 2, corr, "bash_status", json!({ "task_id": task_id }));
-    let status = expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+    let status = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
     assert!(
         status["status"].as_str().is_some(),
         "detached background task status should be recoverable after rebind: {status:?}"
@@ -1476,7 +1476,7 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
     loop {
         corr += 1;
         send_tool(&tx, 2, corr, "bash_status", json!({ "task_id": task_id }));
-        final_status = expect_tool_response(&mut rx, corr, Duration::from_secs(5)).await;
+        final_status = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
         if matches!(
             final_status["status"].as_str(),
             Some("completed") | Some("exited")
@@ -1511,7 +1511,7 @@ async fn drive_route_bind_deadline_daemon(input: FakeDaemonInput) {
     let slow_corr = corr;
     send_bind(
         &tx,
-        1,
+        2,
         slow_corr,
         &roots[0],
         "deadline-session",
@@ -1541,9 +1541,10 @@ async fn drive_route_bind_deadline_daemon(input: FakeDaemonInput) {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     corr += 1;
-    send_bind(
+    send_bind_epoch(
         &tx,
-        1,
+        2,
+        2,
         corr,
         &roots[0],
         "deadline-session",
@@ -1945,12 +1946,25 @@ fn send_bind(
     session: &str,
     doc: Value,
 ) {
+    send_bind_epoch(tx, channel, 1, corr, root, session, doc);
+}
+
+fn send_bind_epoch(
+    tx: &mpsc::UnboundedSender<Frame>,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    root: &Path,
+    session: &str,
+    doc: Value,
+) {
     let project_cfg = root.join(".cortexkit").join("aft.jsonc");
     std::fs::create_dir_all(project_cfg.parent().expect("project cfg parent")).expect("cfg dir");
     std::fs::write(&project_cfg, serde_json::to_string(&doc).expect("cfg json"))
         .expect("write cfg");
     let request = ModuleControlRequest::RouteBind {
         route_channel: channel,
+        epoch,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
@@ -1970,6 +1984,7 @@ fn send_control(tx: &mpsc::UnboundedSender<Frame>, corr: u64, request: ModuleCon
         Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Passive, false),
+            0,
             0,
             corr,
             serde_json::to_vec(&request).expect("control body"),
@@ -1991,6 +2006,7 @@ fn send_tool(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            1,
             corr,
             serde_json::to_vec(&json!({ "name": name, "arguments": arguments }))
                 .expect("tool body"),
@@ -2006,6 +2022,7 @@ fn send_route_goodbye(tx: &mpsc::UnboundedSender<Frame>, channel: u16, corr: u64
             FrameType::Goodbye,
             Flags::new(false, Priority::Passive, false),
             channel,
+            1,
             corr,
             Vec::new(),
         )
@@ -2024,6 +2041,7 @@ fn send_goodbye(tx: &mpsc::UnboundedSender<Frame>) {
         Frame::build(
             FrameType::Goodbye,
             Flags::new(false, Priority::Passive, false),
+            0,
             0,
             999_999,
             Vec::new(),

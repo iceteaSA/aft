@@ -123,7 +123,18 @@ const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const BASH_ELICITATION_TIMEOUT: Duration = Duration::from_secs(60);
 const BASH_ELICITATION_CREATE_METHOD: &str = "elicitation/create";
 
-type RouteChannel = u32;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RouteChannel {
+    channel: u16,
+    epoch: u32,
+}
+
+impl fmt::Display for RouteChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.channel, self.epoch)
+    }
+}
+
 type PushEnvelope = (ProjectRootId, PushFrame);
 type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
@@ -312,7 +323,7 @@ struct PendingBind {
 }
 
 struct RouteBindCompletion {
-    route_channel: u16,
+    route: RouteChannel,
     identity: RouteIdentity,
     bind_root_id: ProjectRootId,
     inserted_new_actor: bool,
@@ -396,7 +407,7 @@ struct ReverseCorrKey {
 }
 
 struct PendingBashAsk {
-    route_channel: u16,
+    route: RouteChannel,
     tool_corr: u64,
     tool_flags: Flags,
     tool_ver: u8,
@@ -777,8 +788,19 @@ fn note_maintenance_completion(
         meta.maintenance_jobs_in_flight > 0 || !meta.maintenance_queued_kinds.is_empty();
 }
 
-fn route_key(channel: u16) -> RouteChannel {
-    RouteChannel::from(channel)
+fn route_key(channel: u16, epoch: u32) -> RouteChannel {
+    RouteChannel { channel, epoch }
+}
+
+fn remove_installed_route(installed_epochs: &mut HashMap<u16, u32>, route: RouteChannel) {
+    if installed_epochs.get(&route.channel).copied() == Some(route.epoch) {
+        installed_epochs.remove(&route.channel);
+    }
+}
+
+fn ingress_route_is_current(installed_epochs: &HashMap<u16, u32>, frame: &Frame) -> bool {
+    frame.header.channel == 0
+        || installed_epochs.get(&frame.header.channel).copied() == Some(frame.header.epoch)
 }
 
 fn bash_elicitation_timeout() -> Duration {
@@ -887,7 +909,7 @@ fn bash_elicitation_request_body(
 
 fn build_bash_elicitation_request_frame(
     ver: u8,
-    channel: u16,
+    route: RouteChannel,
     corr: u64,
     flags: Flags,
     command: &str,
@@ -898,7 +920,8 @@ fn build_bash_elicitation_request_frame(
         ver,
         FrameType::Request,
         flags,
-        channel,
+        route.channel,
+        route.epoch,
         corr,
         serde_json::to_vec(&body).map_err(SubcError::Json)?,
     )
@@ -943,7 +966,7 @@ async fn settle_pending_bash_ask_denied(
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     let completion = bash::bash_denied_untrusted_completion(
-        pending.route_channel,
+        pending.route,
         pending.tool_corr,
         pending.tool_flags,
         pending.tool_ver,
@@ -1052,7 +1075,7 @@ async fn expire_pending_bash_asks(
             log::debug!(
                 "subc attach: bash elicitation request {} on route {} expired fail-closed",
                 key.corr,
-                pending.route_channel
+                pending.route
             );
             settle_pending_bash_ask_denied(
                 tx,
@@ -1085,7 +1108,7 @@ async fn handle_bash_elicitation_reply(
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
     let key = ReverseCorrKey {
-        route: route_key(frame.header.channel),
+        route: route_key(frame.header.channel, frame.header.epoch),
         corr: frame.header.corr,
     };
     let Some(pending) = pending_bash_asks.remove(&key) else {
@@ -1104,7 +1127,7 @@ async fn handle_bash_elicitation_reply(
                 pending.project_root,
                 pending.session_id,
                 pending.request_id,
-                pending.route_channel,
+                pending.route,
                 pending.tool_corr,
                 pending.tool_flags,
                 pending.tool_ver,
@@ -1119,7 +1142,7 @@ async fn handle_bash_elicitation_reply(
         log::debug!(
             "subc attach: dropping allowed bash elicitation reply {} for unbound route {}",
             key.corr,
-            pending.route_channel
+            pending.route
         );
     }
 
@@ -1457,6 +1480,7 @@ async fn process_route_bind_completion(
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
@@ -1471,6 +1495,7 @@ async fn process_route_bind_completion(
         push_buffer,
         live_roots,
         pending_binds,
+        installed_route_epochs,
         executor,
         shutdown,
         metrics,
@@ -1488,6 +1513,7 @@ async fn drain_pending_route_bind_completions(
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
@@ -1503,6 +1529,7 @@ async fn drain_pending_route_bind_completions(
             push_buffer,
             live_roots,
             pending_binds,
+            installed_route_epochs,
             executor,
             shutdown,
             metrics,
@@ -1541,6 +1568,7 @@ where
     let hello_frame = Frame::build(
         FrameType::Hello,
         control_flags(),
+        0,
         0,
         HELLO_CORR,
         serde_json::to_vec(&hello).map_err(SubcError::Json)?,
@@ -1604,6 +1632,7 @@ where
         lossy_seq,
     };
     let connection_cancel = PersistentCancelSignal::new();
+    let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: HashMap<(ProjectRootId, String), RouteChannel> = HashMap::new();
@@ -1650,6 +1679,7 @@ where
             &mut push_buffer,
             &mut live_roots,
             &mut pending_binds,
+            &mut installed_route_epochs,
             &executor,
             &shutdown,
             &dispatch_path_metrics,
@@ -1672,9 +1702,13 @@ where
                 &mut bg_wake_pending,
             );
             warn_slow_pending_binds(&mut pending_binds, &executor);
-            if let Err(error) =
-                expire_overdue_route_binds(&writer_tx, &mut pending_binds, &dispatch_path_metrics)
-                    .await
+            if let Err(error) = expire_overdue_route_binds(
+                &writer_tx,
+                &mut pending_binds,
+                &mut installed_route_epochs,
+                &dispatch_path_metrics,
+            )
+            .await
             {
                 break Err(error);
             }
@@ -1747,6 +1781,7 @@ where
                     &mut push_buffer,
                     &mut live_roots,
                     &mut pending_binds,
+                    &mut installed_route_epochs,
                     &executor,
                     &shutdown,
                     &dispatch_path_metrics,
@@ -1773,12 +1808,23 @@ where
                 let phase_trace = frame.phase_trace;
                 let frame = frame.frame;
 
+                if !ingress_route_is_current(&installed_route_epochs, &frame) {
+                    log::debug!(
+                        "subc attach: silently dropping {:?} for uninstalled route {}@{}",
+                        frame.header.ty,
+                        frame.header.channel,
+                        frame.header.epoch
+                    );
+                    continue;
+                }
+
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
                         let pong = match Frame::build_with_version(
                             frame.header.ver,
                             FrameType::Pong,
                             frame.header.flags,
+                            0,
                             0,
                             frame.header.corr,
                             Vec::new(),
@@ -1795,7 +1841,8 @@ where
                         break Ok(ModuleLoopExit::Graceful);
                     }
                     FrameType::Goodbye => {
-                        let channel = route_key(frame.header.channel);
+                        let channel = route_key(frame.header.channel, frame.header.epoch);
+                        remove_installed_route(&mut installed_route_epochs, channel);
                         end_bg_subscription(
                             &writer_tx,
                             &dispatch_path_metrics,
@@ -1899,6 +1946,7 @@ where
                             &executor,
                             &mut live_roots,
                             &mut pending_binds,
+                            &mut installed_route_epochs,
                             &control_completion_tx,
                             &dispatch_path_metrics,
                             &push_senders,
@@ -1940,7 +1988,7 @@ where
                         }
                     }
                     FrameType::Cancel => {
-                        let channel = route_key(frame.header.channel);
+                        let channel = route_key(frame.header.channel, frame.header.epoch);
                         if bg_subs.contains_key(&channel) {
                             end_bg_subscription(
                                 &writer_tx,
@@ -2399,15 +2447,16 @@ async fn handle_route_bind_completion(
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
-    let route_id = route_key(completion.route_channel);
+    let route_id = completion.route;
     let Some(pending) = pending_binds.remove(&route_id) else {
         log::warn!(
             "subc attach: dropping RouteBind completion for non-pending route {}",
-            completion.route_channel
+            completion.route
         );
         rollback_pending_bind_actor(
             executor,
@@ -2416,13 +2465,14 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             completion.inserted_new_actor,
         );
+        remove_installed_route(installed_route_epochs, route_id);
         return Ok(());
     };
 
     if pending.bind_root_id != completion.bind_root_id {
         log::warn!(
             "subc attach: pending RouteBind root mismatch for route {} (pending {} completion {})",
-            completion.route_channel,
+            completion.route,
             pending.bind_root_id.as_path().display(),
             completion.bind_root_id.as_path().display()
         );
@@ -2439,9 +2489,10 @@ async fn handle_route_bind_completion(
         );
         log::debug!(
             "subc attach: discarded completed RouteBind for cancelled route {} root {}",
-            completion.route_channel,
+            completion.route,
             completion.bind_root_id.as_path().display()
         );
+        remove_installed_route(installed_route_epochs, route_id);
         return Ok(());
     }
 
@@ -2475,10 +2526,11 @@ async fn handle_route_bind_completion(
             metrics,
         )
         .await?;
+        remove_installed_route(installed_route_epochs, route_id);
         if fatal {
             signal_fatal_teardown(
                 tx,
-                Some(completion.route_channel),
+                Some(completion.route),
                 completion.ver,
                 completion.corr,
                 shutdown,
@@ -2521,6 +2573,7 @@ async fn handle_route_bind_completion(
         FrameType::Response,
         control_flags(),
         0,
+        0,
         completion.corr,
         ack,
     )
@@ -2539,7 +2592,7 @@ async fn handle_route_bind_completion(
         log::debug!(
             "subc attach: replayed {} buffered Push frame(s) to route {} root {} harness {} session {}",
             replayed,
-            completion.route_channel,
+            completion.route,
             replay_key.root.as_path().display(),
             replay_key.harness,
             replay_key.session
@@ -2547,7 +2600,7 @@ async fn handle_route_bind_completion(
     }
     log::info!(
         "subc attach: route {} bound to root {}",
-        completion.route_channel,
+        completion.route,
         completion.bind_root_id.as_path().display()
     );
     Ok(())
@@ -2556,6 +2609,7 @@ async fn handle_route_bind_completion(
 async fn expire_overdue_route_binds(
     tx: &mpsc::Sender<Frame>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    installed_route_epochs: &mut HashMap<u16, u32>,
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     let now = Instant::now();
@@ -2582,6 +2636,7 @@ async fn expire_overdue_route_binds(
             pending.cancelled = true;
             pending.deadline_reported = true;
         }
+        remove_installed_route(installed_route_epochs, route);
         let age_ms = age.as_millis().min(u128::from(u64::MAX)) as u64;
         let deadline_ms = ROUTE_BIND_DEADLINE.as_millis();
         send_route_bind_error_parts(
@@ -2617,6 +2672,7 @@ async fn handle_control_request(
     executor: &Arc<Executor>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    installed_route_epochs: &mut HashMap<u16, u32>,
     control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
     push_senders: &PushSenders,
@@ -2628,12 +2684,23 @@ async fn handle_control_request(
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
+            epoch,
             target: _,
             identity,
             principal,
             consumer_capabilities,
         } => {
-            let route_id = route_key(route_channel);
+            let route_id = route_key(route_channel, epoch);
+            if epoch == 0 || installed_route_epochs.contains_key(&route_channel) {
+                return send_route_bind_error(
+                    tx,
+                    frame,
+                    "config_divergence",
+                    "route bind uses an invalid or already-installed channel generation",
+                    metrics,
+                )
+                .await;
+            }
             if pending_binds.contains_key(&route_id) {
                 return send_route_bind_error(
                     tx,
@@ -2666,7 +2733,7 @@ async fn handle_control_request(
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
             let bind_trust = trust_for_bind(&bind_harness, &principal);
-            // Typed capability DECLARATION (protocol 0.8): the facade stamps it
+            // Typed capability declaration from the consumer: the facade stamps it
             // from the MCP host's initialize-advertised capabilities. Absent
             // means no reverse-request capability — flat deny, fail-closed. A
             // consumer over-declaring only earns asks that TTL-deny.
@@ -2744,6 +2811,7 @@ async fn handle_control_request(
             );
 
             let configure_request_id = configure_req.id.clone();
+            installed_route_epochs.insert(route_channel, epoch);
             pending_binds.insert(
                 route_id,
                 PendingBind {
@@ -2791,7 +2859,7 @@ async fn handle_control_request(
                 // read data, so a later maintenance pass can do it without delaying the
                 // daemon's confirmation that the route is usable.
                 let completion = RouteBindCompletion {
-                    route_channel: completion_route_channel,
+                    route: route_key(completion_route_channel, epoch),
                     identity: completion_identity,
                     bind_root_id: completion_root,
                     inserted_new_actor,
@@ -2826,6 +2894,7 @@ async fn handle_control_request(
                 frame.header.ver,
                 FrameType::Response,
                 frame.header.flags,
+                0,
                 0,
                 frame.header.corr,
                 body,
@@ -2907,7 +2976,7 @@ async fn send_route_bind_error_parts(
     message: &str,
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
-    let response = build_error_frame(ver, 0, corr, flags, code, message)?;
+    let response = build_error_frame(ver, 0, 0, corr, flags, code, message)?;
     send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
     log::warn!("subc attach: route bind rejected ({code}): {message}");
     Ok(())
@@ -2915,7 +2984,7 @@ async fn send_route_bind_error_parts(
 
 /// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
 /// the sync command core → wrap the structured Response in a CallToolResult
-/// `{content, isError}`. v1 mapping: the whole `{success, ...}` Response
+/// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
 /// serialized into ONE text block; `isError` carries `success == false`.
 async fn handle_tool_call(
     tx: &mpsc::Sender<Frame>,
@@ -2940,11 +3009,12 @@ async fn handle_tool_call(
     dispatch: DispatchFn,
     allow_native_passthrough: bool,
 ) -> Result<(), SubcError> {
-    let route_id = route_key(frame.header.channel);
+    let route_id = route_key(frame.header.channel, frame.header.epoch);
     if pending_binds.contains_key(&route_id) {
         let error = build_error_frame(
             frame.header.ver,
             frame.header.channel,
+            frame.header.epoch,
             frame.header.corr,
             frame.header.flags,
             "route_not_bound",
@@ -2957,6 +3027,7 @@ async fn handle_tool_call(
         let error = build_error_frame(
             frame.header.ver,
             frame.header.channel,
+            frame.header.epoch,
             frame.header.corr,
             frame.header.flags,
             "route_not_bound",
@@ -3043,7 +3114,7 @@ async fn handle_tool_call(
         let result = ToolCallResult { text, response };
         let response_frame = build_tool_response_frame(
             frame.header.ver,
-            frame.header.channel,
+            route_id,
             frame.header.corr,
             frame.header.flags,
             &result,
@@ -3080,7 +3151,7 @@ async fn handle_tool_call(
         let result = ToolCallResult { text, response };
         let response_frame = build_tool_response_frame(
             frame.header.ver,
-            frame.header.channel,
+            route_id,
             frame.header.corr,
             frame.header.flags,
             &result,
@@ -3105,7 +3176,7 @@ async fn handle_tool_call(
                     let result = ToolCallResult { text, response };
                     let response_frame = build_tool_response_frame(
                         frame.header.ver,
-                        frame.header.channel,
+                        route_id,
                         frame.header.corr,
                         frame.header.flags,
                         &result,
@@ -3143,7 +3214,7 @@ async fn handle_tool_call(
                 allocate_reverse_corr(pending_bash_asks, route_id, next_bash_ask_corr);
             let ask_frame = build_bash_elicitation_request_frame(
                 frame.header.ver,
-                frame.header.channel,
+                route_id,
                 reverse_corr,
                 frame.header.flags,
                 &plan.command,
@@ -3155,7 +3226,7 @@ async fn handle_tool_call(
                     corr: reverse_corr,
                 },
                 PendingBashAsk {
-                    route_channel: frame.header.channel,
+                    route: route_id,
                     tool_corr: frame.header.corr,
                     tool_flags: frame.header.flags,
                     tool_ver: frame.header.ver,
@@ -3203,7 +3274,7 @@ async fn handle_tool_call(
             identity.project_root.clone(),
             identity.session.clone(),
             request_id,
-            frame.header.channel,
+            route_id,
             frame.header.corr,
             frame.header.flags,
             frame.header.ver,
@@ -3279,7 +3350,7 @@ async fn handle_tool_call(
     );
     let completion_tx = tx.clone();
     let completion_shutdown = Arc::clone(shutdown);
-    let route_channel = frame.header.channel;
+    let route = route_id;
     let corr = frame.header.corr;
     let flags = frame.header.flags;
     let ver = frame.header.ver;
@@ -3300,7 +3371,7 @@ async fn handle_tool_call(
         };
         let result = ToolCallResult { text, response };
         let fatal = response_is_fatal_panic(&result.response);
-        let enqueued = match build_tool_response_frame(ver, route_channel, corr, flags, &result) {
+        let enqueued = match build_tool_response_frame(ver, route, corr, flags, &result) {
             Ok(response_frame) => {
                 match send_reliable_writer_frame(
                     &completion_tx,
@@ -3336,7 +3407,7 @@ async fn handle_tool_call(
         if fatal {
             signal_fatal_teardown(
                 &completion_tx,
-                Some(route_channel),
+                Some(route),
                 ver,
                 corr,
                 &completion_shutdown,
@@ -3458,22 +3529,22 @@ async fn await_executor_response(rx: oneshot::Receiver<Response>, request_id: St
 }
 async fn signal_fatal_teardown(
     tx: &mpsc::Sender<Frame>,
-    route_channel: Option<u16>,
+    route: Option<RouteChannel>,
     ver: u8,
     corr: u64,
     shutdown: &Arc<Notify>,
     metrics: &DispatchPathMetrics,
 ) {
-    if let Some(route_channel) = route_channel {
-        if let Ok(frame) = build_goodbye_frame(ver, route_channel, corr) {
+    if let Some(route) = route {
+        if let Ok(frame) = build_goodbye_frame(ver, route.channel, route.epoch, corr) {
             if let Err(error) = send_frame(tx, metrics, frame).await {
                 log::warn!(
-                    "subc attach: failed to queue fatal route Goodbye for route {route_channel}: {error}"
+                    "subc attach: failed to queue fatal route Goodbye for route {route}: {error}"
                 );
             }
         }
     }
-    if let Ok(frame) = build_goodbye_frame(ver, 0, 0) {
+    if let Ok(frame) = build_goodbye_frame(ver, 0, 0, 0) {
         if let Err(error) = send_frame(tx, metrics, frame).await {
             log::warn!("subc attach: failed to queue fatal channel-0 Goodbye: {error}");
         }
@@ -3657,7 +3728,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{test_ctx, test_root};
+    use super::test_support::{completion_frame, test_ctx, test_root};
     use super::*;
 
     fn due_maintenance_jobs_without_actor_context(
@@ -3859,7 +3930,7 @@ mod tests {
         assert!(executor.register_actor(root.clone(), ctx));
         let now = Instant::now();
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(now))]);
-        let root_channels = HashMap::from([(root.clone(), HashSet::from([7]))]);
+        let root_channels = HashMap::from([(root.clone(), HashSet::from([route_key(7, 1)]))]);
 
         assert_eq!(
             reap_idle_roots(
@@ -3972,7 +4043,7 @@ mod tests {
         assert!(executor.register_actor(root.clone(), ctx));
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
         let session = "idle-session".to_string();
-        let channel = 17;
+        let channel = route_key(17, 1);
         let bg_sub_by_session = HashMap::from([((root.clone(), session.clone()), channel)]);
         let mut bg_wake_pending = HashSet::new();
 
@@ -4338,5 +4409,124 @@ mod tests {
             .await
             .expect("cancelled() must resolve when cancel races the await")
             .expect("waiter task panicked");
+    }
+
+    #[test]
+    fn ingress_epoch_validation_silently_drops_every_stale_route_frame() {
+        let installed = HashMap::from([(7, 9)]);
+        for ty in [
+            FrameType::Request,
+            FrameType::Response,
+            FrameType::Error,
+            FrameType::Push,
+            FrameType::Cancel,
+            FrameType::Goodbye,
+        ] {
+            let body = if ty.is_pure_header() {
+                Vec::new()
+            } else {
+                br#"{}"#.to_vec()
+            };
+            let stale = Frame::build(ty, control_flags(), 7, 8, 41, body).unwrap();
+            assert!(!ingress_route_is_current(&installed, &stale), "{ty:?}");
+        }
+
+        let uninstalled = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            8,
+            1,
+            42,
+            br#"{}"#.to_vec(),
+        )
+        .unwrap();
+        assert!(!ingress_route_is_current(&installed, &uninstalled));
+
+        let current = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            7,
+            9,
+            43,
+            br#"{}"#.to_vec(),
+        )
+        .unwrap();
+        let control = Frame::build(FrameType::Ping, control_flags(), 0, 0, 44, Vec::new()).unwrap();
+        assert!(ingress_route_is_current(&installed, &current));
+        assert!(ingress_route_is_current(&installed, &control));
+        assert_eq!(installed, HashMap::from([(7, 9)]));
+    }
+
+    #[tokio::test]
+    async fn route_bind_ack_precedes_route_egress_in_writer_queue() {
+        let (_dir, root) = test_root("route-bind-b2-ordering");
+        let route = route_key(7, 3);
+        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            root: root.clone(),
+            project_root: root.as_path().to_path_buf(),
+            harness: "opencode".to_string(),
+            session: "b2-session".to_string(),
+            trust: BindTrust::FirstParty,
+            consumer_elicitation_capable: false,
+        }));
+        let replay_key = push::ReplayKey::from_identity(&identity);
+        let completion = RouteBindCompletion {
+            route,
+            identity,
+            bind_root_id: root.clone(),
+            inserted_new_actor: false,
+            configure_response: Response::success("subc-bind-7", json!({})),
+            diagnostics_on_edit: false,
+            ver: PROTOCOL_VERSION,
+            corr: 91,
+            flags: control_flags(),
+        };
+        let mut pending_binds = HashMap::from([(
+            route,
+            PendingBind {
+                bind_root_id: root,
+                inserted_new_actor: false,
+                cancelled: false,
+                configure_request_id: "subc-bind-7".to_string(),
+                started_at: Instant::now(),
+                warned_half_deadline: false,
+                deadline_reported: false,
+                corr: 91,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+            },
+        )]);
+        let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
+        let mut push_buffer =
+            HashMap::from([(replay_key, VecDeque::from([completion_frame("b2-replay")]))]);
+        let (writer_tx, mut writer_rx) = mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+
+        handle_route_bind_completion(
+            &writer_tx,
+            completion,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut push_buffer,
+            &mut HashMap::new(),
+            &mut pending_binds,
+            &mut installed_route_epochs,
+            &Arc::new(Executor::new()),
+            &Arc::new(Notify::new()),
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        let ack = writer_rx.try_recv().expect("RouteBindAck");
+        assert_eq!(ack.header.ty, FrameType::Response);
+        assert_eq!((ack.header.channel, ack.header.epoch), (0, 0));
+        let route_frame = writer_rx.try_recv().expect("post-ack route frame");
+        assert_eq!(route_frame.header.ty, FrameType::Push);
+        assert_eq!(
+            (route_frame.header.channel, route_frame.header.epoch),
+            (route.channel, route.epoch)
+        );
     }
 }

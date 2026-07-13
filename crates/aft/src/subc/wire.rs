@@ -5,7 +5,7 @@ use serde::{Serialize, Serializer};
 
 use super::{
     control_flags, fmt, mpsc, AtomicUsize, DispatchPathMetrics, ErrorBody, Flags, Frame, FrameType,
-    Ordering, PathBuf, Response, ToolCallResult, Value, CONTROL_SEND_TIMEOUT,
+    Ordering, PathBuf, Response, RouteChannel, ToolCallResult, Value, CONTROL_SEND_TIMEOUT,
     RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
 };
 
@@ -211,7 +211,7 @@ struct TextContent<'a> {
 
 pub(super) fn build_tool_response_frame(
     ver: u8,
-    route_channel: u16,
+    route: RouteChannel,
     corr: u64,
     flags: Flags,
     result: &ToolCallResult,
@@ -228,13 +228,22 @@ pub(super) fn build_tool_response_frame(
     // from the NDJSON path.
     let body = serde_json::to_vec(&ToolResponseEnvelope { result }).map_err(SubcError::Json)?;
 
-    Frame::build_with_version(ver, FrameType::Response, flags, route_channel, corr, body)
-        .map_err(SubcError::FrameBuild)
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        body,
+    )
+    .map_err(SubcError::FrameBuild)
 }
 
 pub(super) fn build_error_frame(
     ver: u8,
     channel: u16,
+    epoch: u32,
     corr: u64,
     flags: Flags,
     code: &str,
@@ -245,16 +254,22 @@ pub(super) fn build_error_frame(
         message: message.to_string(),
     })
     .map_err(SubcError::Json)?;
-    Frame::build_with_version(ver, FrameType::Error, flags, channel, corr, body)
+    Frame::build_with_version(ver, FrameType::Error, flags, channel, epoch, corr, body)
         .map_err(SubcError::FrameBuild)
 }
 
-pub(super) fn build_goodbye_frame(ver: u8, channel: u16, corr: u64) -> Result<Frame, SubcError> {
+pub(super) fn build_goodbye_frame(
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+) -> Result<Frame, SubcError> {
     Frame::build_with_version(
         ver,
         FrameType::Goodbye,
         control_flags(),
         channel,
+        epoch,
         corr,
         Vec::new(),
     )
@@ -364,6 +379,7 @@ impl std::error::Error for SubcError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subc::route_key;
     use serde_json::json;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -375,7 +391,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
 
         for corr in 1..=3 {
-            let frame = Frame::build(FrameType::Ping, control_flags(), 0, corr, Vec::new())
+            let frame = Frame::build(FrameType::Ping, control_flags(), 0, 0, corr, Vec::new())
                 .expect("test frame");
             assert!(try_enqueue_writer_frame(&writer_tx, &metrics, frame).is_ok());
         }
@@ -393,7 +409,7 @@ mod tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
 
         let metrics_for_task = Arc::clone(&metrics);
@@ -402,7 +418,7 @@ mod tests {
             send_reliable_writer_frame(
                 &tx_for_task,
                 &metrics_for_task,
-                Frame::build(FrameType::Pong, control_flags(), 0, 2, Vec::new()).unwrap(),
+                Frame::build(FrameType::Pong, control_flags(), 0, 0, 2, Vec::new()).unwrap(),
                 "test reliable frame",
             )
             .await
@@ -441,14 +457,14 @@ mod tests {
         let (writer_tx, _writer_rx) = mpsc::channel::<Frame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
         let started = Instant::now();
 
         let result = send_frame(
             &writer_tx,
             &metrics,
-            Frame::build(FrameType::Pong, control_flags(), 0, 2, Vec::new()).unwrap(),
+            Frame::build(FrameType::Pong, control_flags(), 0, 0, 2, Vec::new()).unwrap(),
         )
         .await;
 
@@ -503,8 +519,14 @@ mod tests {
 
         // The frame body carries the MCP surface for generic hosts AND the flat
         // sidecar shape under structuredContent for the first-party plugin.
-        let frame =
-            build_tool_response_frame(PROTOCOL_VERSION, 1, 42, control_flags(), &result).unwrap();
+        let frame = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            42,
+            control_flags(),
+            &result,
+        )
+        .unwrap();
         let expected_body = serde_json::to_vec(&json!({
             "content": [{ "type": "text", "text": "rendered text" }],
             "isError": false,
@@ -533,9 +555,14 @@ mod tests {
             text: "error text".to_string(),
             response: err,
         };
-        let err_frame =
-            build_tool_response_frame(PROTOCOL_VERSION, 1, 43, control_flags(), &err_result)
-                .unwrap();
+        let err_frame = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            43,
+            control_flags(),
+            &err_result,
+        )
+        .unwrap();
         let err_body: Value = serde_json::from_slice(&err_frame.body).unwrap();
         assert_eq!(err_body["isError"], json!(true));
         assert_eq!(err_body["structuredContent"]["success"], json!(false));

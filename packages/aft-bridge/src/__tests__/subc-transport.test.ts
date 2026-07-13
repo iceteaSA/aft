@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   type BindIdentity,
+  type RouteHandle,
   type RouteTarget,
   SocketClosedError,
   SubcCallError,
@@ -60,10 +61,19 @@ class FakeSubscription {
   }
 }
 
+function fakeRouteHandle(channel: number): RouteHandle {
+  return { channel, epoch: channel } as RouteHandle;
+}
+
 /** Records every routeOpen/request/subscribe so a test can assert caching + bodies. */
 class FakeClient implements SubcClientLike {
   routeOpens: BindIdentity[] = [];
-  requests: { channel: number; body: unknown; options?: { timeoutMs?: number } }[] = [];
+  requests: {
+    route: RouteHandle;
+    channel: number;
+    body: unknown;
+    options?: { timeoutMs?: number };
+  }[] = [];
   subscriptions: FakeSubscription[] = [];
   closedRoutes: number[] = [];
   closed = 0;
@@ -76,7 +86,7 @@ class FakeClient implements SubcClientLike {
 
   constructor(private readonly onRequest: (channel: number, body: unknown) => Promise<unknown>) {}
 
-  async routeOpen(_target: RouteTarget, identity: BindIdentity): Promise<number> {
+  async routeOpen(_target: RouteTarget, identity: BindIdentity): Promise<RouteHandle> {
     this.routeOpens.push(identity);
     if (this.routeOpenError) {
       const err = this.routeOpenError;
@@ -84,30 +94,30 @@ class FakeClient implements SubcClientLike {
       throw err;
     }
     if (this.routeOpenGate) await this.routeOpenGate;
-    return this.nextChannel++;
+    return fakeRouteHandle(this.nextChannel++);
   }
 
   async request(
-    channel: number,
+    route: RouteHandle,
     body: unknown,
     options?: { timeoutMs?: number },
   ): Promise<unknown> {
-    this.requests.push({ channel, body, options });
-    return this.onRequest(channel, body);
+    this.requests.push({ route, channel: route.channel, body, options });
+    return this.onRequest(route.channel, body);
   }
 
   subscribe(
-    channel: number,
+    route: RouteHandle,
     _body: unknown,
     onEvent: (event: Uint8Array) => void,
   ): FakeSubscription {
-    const sub = new FakeSubscription(channel, onEvent, this.subscriptionUnsubscribeGate);
+    const sub = new FakeSubscription(route.channel, onEvent, this.subscriptionUnsubscribeGate);
     this.subscriptions.push(sub);
     return sub;
   }
 
-  async closeRouteChannel(channel: number): Promise<void> {
-    this.closedRoutes.push(channel);
+  async closeRouteChannel(route: RouteHandle): Promise<void> {
+    this.closedRoutes.push(route.channel);
   }
 
   close(): void {
@@ -240,9 +250,10 @@ describe("SubcTransport.toolCall", () => {
     expect(client.routeOpens.length).toBe(2);
     expect(client.routeOpens[0]?.session).toBe("sess-A");
     expect(client.routeOpens[1]?.session).toBe("sess-B");
-    // First two calls rode the same channel.
-    expect(client.requests[0]?.channel).toBe(client.requests[1]?.channel);
-    expect(client.requests[2]?.channel).not.toBe(client.requests[0]?.channel);
+    // The exact opaque handle is reused for one session; another session gets
+    // a different identity even independently of its numeric fields.
+    expect(client.requests[0]?.route).toBe(client.requests[1]?.route);
+    expect(client.requests[2]?.route).not.toBe(client.requests[0]?.route);
   });
 
   test("session-less call falls back to the __default__ session", async () => {

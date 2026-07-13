@@ -255,6 +255,7 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
             FrameType::HelloAck,
             control_flags(),
             0,
+            0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
                 negotiated_ver: PROTOCOL_VERSION,
@@ -287,6 +288,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
 
     let request = ModuleControlRequest::RouteBind {
         route_channel: ROUTE_CHANNEL,
+        epoch: 1,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
@@ -303,6 +305,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
         Frame::build(
             FrameType::Request,
             control_flags(),
+            0,
             0,
             10,
             serde_json::to_vec(&request).expect("route bind body"),
@@ -333,6 +336,7 @@ async fn send_tool_call(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            1,
             corr,
             serde_json::to_vec(&body).expect("tool call body"),
         )
@@ -384,7 +388,7 @@ async fn wait_for_status(
 async fn send_connection_goodbye(stream: &mut TcpStream) {
     send_frame(
         stream,
-        Frame::build(FrameType::Goodbye, control_flags(), 0, 99, Vec::new())
+        Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new())
             .expect("goodbye frame"),
     )
     .await;

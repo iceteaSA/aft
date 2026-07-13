@@ -312,16 +312,28 @@ async function prepareSubcLaneOnce(): Promise<PreparedSubcLane> {
 async function resolveSubcCore(): Promise<{ path: string | null; skipReason?: string }> {
   const envPath = process.env.SUBC_CORE_BIN?.trim();
   if (envPath) {
-    if (await isExecutable(envPath)) return { path: envPath };
+    if (await isExecutable(envPath)) {
+      return requireWireV2Core(envPath, "SUBC_CORE_BIN", process.env.SUBC_CORE_WIRE_VERSION);
+    }
     return { path: null, skipReason: `SUBC_CORE_BIN is not executable: ${envPath}` };
   }
   for (const candidate of [DEFAULT_SUBC_RELEASE, DEFAULT_SUBC_DEBUG]) {
-    if (await isExecutable(candidate)) return { path: candidate };
+    if (await isExecutable(candidate)) {
+      return requireWireV2Core(
+        candidate,
+        "local subconscious build",
+        process.env.SUBC_CORE_WIRE_VERSION,
+      );
+    }
   }
 
   const fetchedCache = await resolveFetchedSubcCoreCachePath();
   if (fetchedCache.path && (await isExecutable(fetchedCache.path))) {
-    return { path: fetchedCache.path };
+    return requireWireV2Core(
+      fetchedCache.path,
+      `pinned ${await readPinnedSubcCoreTag()}`,
+      await readPinnedSubcCoreWireVersion(),
+    );
   }
 
   const siblingLocations = `${DEFAULT_SUBC_RELEASE} or ${DEFAULT_SUBC_DEBUG}`;
@@ -339,6 +351,21 @@ async function resolveSubcCore(): Promise<{ path: string | null; skipReason?: st
     skipReason:
       `subc-core binary not found at ${siblingLocations}; set SUBC_CORE_BIN or build the sibling ` +
       `subconscious checkout (${fetchedCache.unavailableReason ?? "no cached release is available"})`,
+  };
+}
+
+function requireWireV2Core(
+  path: string,
+  source: string,
+  wireVersion: string | undefined | null,
+): { path: string | null; skipReason?: string } {
+  if (wireVersion?.trim() === "2") return { path };
+  const reportedVersion = wireVersion?.trim() || "unknown";
+  return {
+    path: null,
+    skipReason:
+      `wire-v2 e2e requires a subc-core wire version 2 daemon; ${source} reports ` +
+      `wire version ${reportedVersion}. No wire-v2 release asset is pinned yet.`,
   };
 }
 
@@ -413,6 +440,7 @@ function fetchedSubcCoreTarget(): string | null {
 }
 
 let pinnedSubcCoreTagPromise: Promise<string | null> | null = null;
+let pinnedSubcCoreWireVersionPromise: Promise<string | null> | null = null;
 
 async function readPinnedSubcCoreTag(): Promise<string | null> {
   pinnedSubcCoreTagPromise ??= readPinnedSubcCoreTagOnce();
@@ -423,6 +451,21 @@ async function readPinnedSubcCoreTagOnce(): Promise<string | null> {
   try {
     const script = await readFile(FETCH_SUBC_CORE_SCRIPT, "utf8");
     const match = script.match(/^SUBC_CORE_TAG=["']?([^"'\n]+)["']?$/m);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function readPinnedSubcCoreWireVersion(): Promise<string | null> {
+  pinnedSubcCoreWireVersionPromise ??= readPinnedSubcCoreWireVersionOnce();
+  return pinnedSubcCoreWireVersionPromise;
+}
+
+async function readPinnedSubcCoreWireVersionOnce(): Promise<string | null> {
+  try {
+    const script = await readFile(FETCH_SUBC_CORE_SCRIPT, "utf8");
+    const match = script.match(/^SUBC_CORE_WIRE_VERSION=["']?([^"'\n]+)["']?$/m);
     return match?.[1] ?? null;
   } catch {
     return null;

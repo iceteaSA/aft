@@ -17,6 +17,7 @@
  * published plugin dist; it is never a published runtime dependency.
  */
 
+import type { RouteHandle } from "@cortexkit/subc-client";
 import {
   type BindIdentity,
   connectionFileExists,
@@ -27,6 +28,7 @@ import {
   SubcClient,
   SubcError,
 } from "@cortexkit/subc-client";
+
 import type { StatusSnapshot } from "./bridge.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
 import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
@@ -53,14 +55,14 @@ export interface SubcSubscriptionLike {
  * seam without standing up a daemon; the real `SubcClient` satisfies it.
  */
 export interface SubcClientLike {
-  routeOpen(target: RouteTarget, identity: BindIdentity): Promise<number>;
-  request(routeChannel: number, body: unknown, opts?: RequestOptions): Promise<unknown>;
+  routeOpen(target: RouteTarget, identity: BindIdentity): Promise<RouteHandle>;
+  request(route: RouteHandle, body: unknown, opts?: RequestOptions): Promise<unknown>;
   subscribe(
-    routeChannel: number,
+    route: RouteHandle,
     body: unknown,
     onEvent: (event: Uint8Array) => void,
   ): SubcSubscriptionLike;
-  closeRouteChannel(channel: number, opts?: { drain?: boolean }): Promise<void>;
+  closeRouteChannel(route: RouteHandle, opts?: { drain?: boolean }): Promise<void>;
   close(): void;
 }
 
@@ -196,12 +198,11 @@ class BgSubscription {
       }
       if (this.stopped) return;
 
-      let channel: number;
+      let route: RouteHandle;
       try {
-        // A SECOND, dedicated routeOpen (NOT the tool route cache): the daemon
-        // mints a fresh channel per route.open, so the bg_events subscribe rides
-        // its own channel, isolated from the tool route's credit window.
-        channel = await client.routeOpen(
+        // A second dedicated route isolates bg_events from the tool route's
+        // credit window while preserving the client's connection-bound handle.
+        route = await client.routeOpen(
           { kind: "tool_provider", module_id: AFT_MODULE_ID },
           this.identity,
         );
@@ -215,16 +216,16 @@ class BgSubscription {
         continue;
       }
       if (this.stopped) {
-        safeCloseRoute(client, channel);
+        safeCloseRoute(client, route);
         return;
       }
 
-      // Channel lifetime: the `finally` guarantees closeRouteChannel on EVERY exit
+      // Route lifetime: the `finally` guarantees closeRouteChannel on every exit
       // path from here (StreamEnd return, drop+resubscribe, stopped) so the
       // dedicated route never leaks (B-#2).
       const subscribedAt = Date.now();
       try {
-        const sub = client.subscribe(channel, { op: "bg_events" }, () => {
+        const sub = client.subscribe(route, { op: "bg_events" }, () => {
           if (!this.stopped) this.onNudge();
         });
         this.current = sub;
@@ -254,7 +255,7 @@ class BgSubscription {
         if (Date.now() - subscribedAt >= BG_STABLE_MS) attempt = 0;
       } finally {
         this.current = null;
-        safeCloseRoute(client, channel);
+        safeCloseRoute(client, route);
       }
       await this.backoff(attempt++);
     }
@@ -279,9 +280,9 @@ function isUnknownChannelError(err: unknown): boolean {
  * client that rejects/throws when closing a route on an already-dead socket) nor
  * via an unhandled rejection. Used on every best-effort teardown path.
  */
-function safeCloseRoute(client: SubcClientLike, channel: number): void {
+function safeCloseRoute(client: SubcClientLike, route: RouteHandle): void {
   try {
-    void client.closeRouteChannel(channel).catch(() => undefined);
+    void client.closeRouteChannel(route).catch(() => undefined);
   } catch {
     // synchronous throw (e.g. closing a route on an already-closed client) — ignore
   }
@@ -311,9 +312,9 @@ interface RouteEntry {
   /** Client that minted this route; closeSession must close channels on this owner. */
   client: SubcClientLike;
   /** In-flight routeOpen; non-null until it settles. Concurrent callers await it. */
-  opening: Promise<number> | null;
-  /** Resolved channel once open; null while still opening. */
-  channel: number | null;
+  opening: Promise<RouteHandle> | null;
+  /** Exact connection-bound handle once open; null while still opening. */
+  handle: RouteHandle | null;
   /** Tombstone: a teardown raced the open — the resolving open must self-close. */
   closed: boolean;
 }
@@ -599,7 +600,7 @@ export class SubcTransportPool implements AftTransportPool {
 
     try {
       const client = await this.ensureClient();
-      const openRoute = async (): Promise<{ channel: number; entry: RouteEntry }> => {
+      const openRoute = async (): Promise<{ route: RouteHandle; entry: RouteEntry }> => {
         // closeSession/shutdown marks and deletes the record synchronously. A request
         // that was waiting for connect must not open a route for a session that no
         // longer exists.
@@ -608,7 +609,7 @@ export class SubcTransportPool implements AftTransportPool {
         }
 
         try {
-          const opened = await this.routeChannel(client, identity, record);
+          const opened = await this.routeHandle(client, identity, record);
           // routeOpen may have awaited. Do not send a request after a close, even
           // if a stale route entry just resolved.
           if (!this.isCurrentSession(key, record)) {
@@ -674,11 +675,11 @@ export class SubcTransportPool implements AftTransportPool {
         }
       };
 
-      const requestOnRoute = async (channel: number): Promise<unknown> => {
+      const requestOnRoute = async (route: RouteHandle): Promise<unknown> => {
         // Forward the caller's progress callback to the subc client. Current
         // foreground calls return one final reply, so production does not rely on
         // live progress events here.
-        const reply = await client.request(channel, body, { timeoutMs, onProgress });
+        const reply = await client.request(route, body, { timeoutMs, onProgress });
         // The half-open failure budget belongs to the current live session on the
         // current client. A late success after close or client replacement must
         // not mutate the current client's counter.
@@ -693,9 +694,9 @@ export class SubcTransportPool implements AftTransportPool {
         return reply;
       };
 
-      let { channel, entry } = await openRoute();
+      let { route, entry } = await openRoute();
       try {
-        return await requestOnRoute(channel);
+        return await requestOnRoute(route);
       } catch (err) {
         if (
           isUnknownChannelError(err) &&
@@ -706,9 +707,9 @@ export class SubcTransportPool implements AftTransportPool {
           // delivered to the module. Reopen the route and resend once; all other
           // route/request failures keep the no-auto-retry mutation-safety rule.
           clearRouteEntry(entry);
-          ({ channel, entry } = await openRoute());
+          ({ route, entry } = await openRoute());
           try {
-            return await requestOnRoute(channel);
+            return await requestOnRoute(route);
           } catch (retryErr) {
             handleRequestFailure(retryErr, entry);
             throw retryErr;
@@ -764,22 +765,22 @@ export class SubcTransportPool implements AftTransportPool {
    * ownership guard: stale request failures can clear only the route they used,
    * never a successor route in the same still-open session.
    */
-  private async routeChannel(
+  private async routeHandle(
     client: SubcClientLike,
     identity: BindIdentity,
     record: SessionRecord,
-  ): Promise<{ channel: number; entry: RouteEntry }> {
+  ): Promise<{ route: RouteHandle; entry: RouteEntry }> {
     const key = identityKey(identity);
     const existing = record.routeEntry;
-    if (existing?.channel != null) return { channel: existing.channel, entry: existing };
-    if (existing?.opening) return { channel: await existing.opening, entry: existing };
+    if (existing?.handle != null) return { route: existing.handle, entry: existing };
+    if (existing?.opening) return { route: await existing.opening, entry: existing };
 
     // Singleflight: install the entry BEFORE awaiting so a concurrent caller for
     // the same identity awaits this same open instead of minting a second channel.
-    const entry: RouteEntry = { client, opening: null, channel: null, closed: false };
+    const entry: RouteEntry = { client, opening: null, handle: null, closed: false };
     const opening = client
       .routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity)
-      .then((channel) => {
+      .then((route) => {
         // A close/shutdown may have raced this open, or this entry may have been
         // replaced by a transient drop/reopen. In both cases, release the freshly
         // minted channel and clear only this entry if it still owns the cache slot.
@@ -789,13 +790,13 @@ export class SubcTransportPool implements AftTransportPool {
           entry.closed ||
           this.client !== client
         ) {
-          safeCloseRoute(client, channel);
+          safeCloseRoute(client, route);
           if (record.routeEntry === entry) record.routeEntry = null;
           throw new RouteTornDownError("subc route opened after teardown");
         }
-        entry.channel = channel;
+        entry.handle = route;
         entry.opening = null;
-        return channel;
+        return route;
       })
       .catch((err) => {
         const current = this.isCurrentSession(key, record);
@@ -812,7 +813,7 @@ export class SubcTransportPool implements AftTransportPool {
       });
     entry.opening = opening;
     record.routeEntry = entry;
-    return { channel: await opening, entry };
+    return { route: await opening, entry };
   }
 
   /**
@@ -903,9 +904,9 @@ export class SubcTransportPool implements AftTransportPool {
     await Promise.allSettled(subs.map((sub) => sub.stop()));
     await Promise.allSettled(
       entries.map(async (entry) => {
-        if (entry.channel == null) return;
+        if (entry.handle == null) return;
         try {
-          await entry.client.closeRouteChannel(entry.channel);
+          await entry.client.closeRouteChannel(entry.handle);
         } catch {
           // best-effort; a dropped connection releases the route on the other side
         }
@@ -947,9 +948,9 @@ export class SubcTransportPool implements AftTransportPool {
     if (entry) entry.closed = true;
 
     if (sub) await sub.stop();
-    if (entry?.channel != null) {
+    if (entry?.handle != null) {
       try {
-        await entry.client.closeRouteChannel(entry.channel);
+        await entry.client.closeRouteChannel(entry.handle);
       } catch {
         // best-effort; a dropped connection releases the route on the other side
       }

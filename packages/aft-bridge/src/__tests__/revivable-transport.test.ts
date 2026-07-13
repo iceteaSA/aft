@@ -1,7 +1,12 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { BindIdentity, RequestOptions, RouteTarget } from "@cortexkit/subc-client";
+import type {
+  BindIdentity,
+  RequestOptions,
+  RouteHandle,
+  RouteTarget,
+} from "@cortexkit/subc-client";
 import { getActiveLogger, setActiveLogger } from "../active-logger.js";
 import type { Logger } from "../logger.js";
 import { RevivableTransportPool } from "../revivable-transport.js";
@@ -16,12 +21,13 @@ class FakeClient implements SubcClientLike {
   closed = 0;
   private nextChannel = 1;
 
-  async routeOpen(_target: RouteTarget, identity: BindIdentity): Promise<number> {
+  async routeOpen(_target: RouteTarget, identity: BindIdentity): Promise<RouteHandle> {
     this.routeOpens.push(identity);
-    return this.nextChannel++;
+    const channel = this.nextChannel++;
+    return { channel, epoch: channel } as RouteHandle;
   }
 
-  async request(_channel: number, _body: unknown, _options?: RequestOptions): Promise<unknown> {
+  async request(_route: RouteHandle, _body: unknown, _options?: RequestOptions): Promise<unknown> {
     return {
       structuredContent: {
         success: true,
@@ -31,14 +37,14 @@ class FakeClient implements SubcClientLike {
   }
 
   subscribe(
-    _channel: number,
+    _route: RouteHandle,
     _body: unknown,
     _onEvent: (event: Uint8Array) => void,
   ): SubcSubscriptionLike {
     return { unsubscribe: () => undefined };
   }
 
-  async closeRouteChannel(_channel: number): Promise<void> {}
+  async closeRouteChannel(_route: RouteHandle): Promise<void> {}
 
   close(): void {
     this.closed += 1;

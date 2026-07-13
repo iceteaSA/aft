@@ -29,7 +29,7 @@ pub(super) struct BashElicitationPlan {
 }
 
 pub(super) struct BashDeferredCompletion {
-    channel: u16,
+    route: RouteChannel,
     corr: u64,
     flags: Flags,
     ver: u8,
@@ -218,7 +218,7 @@ pub(super) fn submit_deferred_bash(
     project_root: PathBuf,
     session_id: String,
     request_id: String,
-    route_channel: u16,
+    route: RouteChannel,
     corr: u64,
     flags: Flags,
     ver: u8,
@@ -421,7 +421,7 @@ pub(super) fn submit_deferred_bash(
                 send_bash_deferred_completion(
                     &completion_tx,
                     &task_metrics,
-                    route_channel,
+                    route,
                     corr,
                     flags,
                     ver,
@@ -448,7 +448,7 @@ pub(super) fn submit_deferred_bash(
                     completion_tx,
                     poll_touch_tx,
                     task_metrics,
-                    route_channel,
+                    route,
                     corr,
                     flags,
                     ver,
@@ -474,7 +474,7 @@ pub(super) fn submit_deferred_bash(
                 send_bash_deferred_completion(
                     &completion_tx,
                     &task_metrics,
-                    route_channel,
+                    route,
                     corr,
                     flags,
                     ver,
@@ -495,7 +495,7 @@ async fn run_deferred_bash_wait(
     completion_tx: mpsc::Sender<BashDeferredCompletion>,
     poll_touch_tx: mpsc::Sender<ProjectRootId>,
     metrics: Arc<DispatchPathMetrics>,
-    route_channel: u16,
+    route: RouteChannel,
     corr: u64,
     flags: Flags,
     ver: u8,
@@ -519,7 +519,7 @@ async fn run_deferred_bash_wait(
                 send_bash_deferred_completion(
                     &completion_tx,
                     &metrics,
-                    route_channel,
+                    route,
                     corr,
                     flags,
                     ver,
@@ -669,7 +669,7 @@ async fn run_deferred_bash_wait(
                         send_bash_deferred_completion(
                             &completion_tx,
                             &metrics,
-                            route_channel,
+                            route,
                             corr,
                             flags,
                             ver,
@@ -697,7 +697,7 @@ async fn run_deferred_bash_wait(
                         send_bash_deferred_completion(
                             &completion_tx,
                             &metrics,
-                            route_channel,
+                            route,
                             corr,
                             flags,
                             ver,
@@ -782,7 +782,7 @@ async fn submit_bash_promote(
 async fn send_bash_deferred_completion(
     completion_tx: &mpsc::Sender<BashDeferredCompletion>,
     metrics: &DispatchPathMetrics,
-    channel: u16,
+    route: RouteChannel,
     corr: u64,
     flags: Flags,
     ver: u8,
@@ -795,7 +795,7 @@ async fn send_bash_deferred_completion(
         completion_tx,
         &metrics.bash_deferred_queued,
         BashDeferredCompletion {
-            channel,
+            route,
             corr,
             flags,
             ver,
@@ -821,7 +821,7 @@ pub(super) async fn handle_bash_deferred_completion(
         meta.active_bash_waits = meta.active_bash_waits.saturating_sub(1);
         meta.touch();
     }
-    let route_id = route_key(done.channel);
+    let route_id = done.route;
     let remove_route_cancel = if let Some(cancel) = route_bash_cancels.get_mut(&route_id) {
         cancel.active_waits = cancel.active_waits.saturating_sub(1);
         cancel.active_waits == 0
@@ -835,40 +835,32 @@ pub(super) async fn handle_bash_deferred_completion(
     if let Some(result) = done.result {
         if routes.contains_key(&route_id) {
             let frame =
-                build_tool_response_frame(done.ver, done.channel, done.corr, done.flags, &result)?;
+                build_tool_response_frame(done.ver, done.route, done.corr, done.flags, &result)?;
             send_reliable_writer_frame(tx, metrics, frame, "deferred bash response").await?;
         } else {
             log::debug!(
                 "subc attach: dropping deferred bash response {} for unbound route {}",
                 done.request_id,
-                done.channel
+                done.route
             );
         }
     } else {
         log::debug!(
             "subc attach: deferred bash wait {} cancelled before delivery on route {}",
             done.request_id,
-            done.channel
+            done.route
         );
     }
 
     if done.fatal {
-        signal_fatal_teardown(
-            tx,
-            Some(done.channel),
-            done.ver,
-            done.corr,
-            shutdown,
-            metrics,
-        )
-        .await;
+        signal_fatal_teardown(tx, Some(done.route), done.ver, done.corr, shutdown, metrics).await;
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn bash_denied_untrusted_completion(
-    channel: u16,
+    route: RouteChannel,
     corr: u64,
     flags: Flags,
     ver: u8,
@@ -878,7 +870,7 @@ pub(super) fn bash_denied_untrusted_completion(
 ) -> BashDeferredCompletion {
     let response = bash_denied_untrusted_response(request_id.clone());
     BashDeferredCompletion {
-        channel,
+        route,
         corr,
         flags,
         ver,

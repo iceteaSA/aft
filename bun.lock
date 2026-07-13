@@ -21,7 +21,7 @@
       "name": "@cortexkit/aft-bridge",
       "version": "0.46.0",
       "dependencies": {
-        "@cortexkit/subc-client": "^0.3.4",
+        "@cortexkit/subc-client": "^0.4.0",
         "undici": "^7.25.0",
       },
       "devDependencies": {
@@ -268,7 +268,7 @@
 
     "@cortexkit/aft-pi-rpc-e2e": ["@cortexkit/aft-pi-rpc-e2e@workspace:tests/pi-rpc"],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.3.4", "", {}, "sha512-r6Gr/VqSWwUjClFG7+F4dfevtCItn3kMNMqrj51uZV9mrf5qjcvUD6KuYZZAE+HVC6bk/dp7muV5rtNSFV6Xow=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.4.0", "", {}, "sha512-MhZ2p4HDzVW2y83GM76Ep95H1X5+3duj4SSKIxI/ucK8sjDzvEDUEqL5XeHKNQOcZqAy/+cfwsbku9HbClftxg=="],
 
     "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@0.80.2", "", { "dependencies": { "@earendil-works/pi-ai": "^0.80.2", "ignore": "7.0.5", "typebox": "1.1.38", "yaml": "2.9.0" } }, "sha512-BF9WPhixIFjT6Kp3Iz3H6ugkU+4AWotM8py96XE5pIK0arJbQKMWbR+dXSWWDEmR5yc/aFQODnuyowOEzMGO7Q=="],
 

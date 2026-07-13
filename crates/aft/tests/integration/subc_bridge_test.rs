@@ -64,6 +64,103 @@ pub(super) struct FakeDaemonSession {
     pub(super) executor: Arc<Executor>,
 }
 
+#[derive(Default)]
+struct FakeDaemonDemux {
+    next_epoch_by_channel: HashMap<u16, u32>,
+    installed: HashMap<u16, u32>,
+}
+
+impl FakeDaemonDemux {
+    fn grant(&mut self, channel: u16) -> u32 {
+        let next = self
+            .next_epoch_by_channel
+            .entry(channel)
+            .and_modify(|epoch| *epoch = epoch.saturating_add(1).max(1))
+            .or_insert(1);
+        self.installed.insert(channel, *next);
+        *next
+    }
+
+    fn close(&mut self, channel: u16, epoch: u32) {
+        if self.installed.get(&channel).copied() == Some(epoch) {
+            self.installed.remove(&channel);
+        }
+    }
+
+    fn rewrite(
+        &self,
+        frame: &Frame,
+        destination_channel: u16,
+        destination_epoch: u32,
+    ) -> Option<Frame> {
+        if frame.header.channel != 0
+            && self.installed.get(&frame.header.channel).copied() != Some(frame.header.epoch)
+        {
+            return None;
+        }
+        Frame::build_with_version(
+            frame.header.ver,
+            frame.header.ty,
+            frame.header.flags,
+            destination_channel,
+            destination_epoch,
+            frame.header.corr,
+            frame.body.clone(),
+        )
+        .ok()
+    }
+}
+
+#[test]
+fn fake_daemon_mints_epochs_and_drops_stale_frames_in_both_directions() {
+    let mut consumer = FakeDaemonDemux::default();
+    let mut provider = FakeDaemonDemux::default();
+    let consumer_epoch_1 = consumer.grant(4);
+    let provider_epoch_1 = provider.grant(9);
+
+    let request = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        4,
+        consumer_epoch_1,
+        71,
+        br#"{}"#.to_vec(),
+    )
+    .unwrap();
+    let provider_request = consumer
+        .rewrite(&request, 9, provider_epoch_1)
+        .expect("current client request");
+    assert_eq!(
+        (
+            provider_request.header.channel,
+            provider_request.header.epoch
+        ),
+        (9, provider_epoch_1)
+    );
+
+    consumer.close(4, consumer_epoch_1);
+    provider.close(9, provider_epoch_1);
+    let consumer_epoch_2 = consumer.grant(4);
+    let provider_epoch_2 = provider.grant(9);
+    assert_eq!((consumer_epoch_2, provider_epoch_2), (2, 2));
+    assert!(consumer.rewrite(&request, 9, provider_epoch_2).is_none());
+
+    let stale_response = Frame::build(
+        FrameType::Response,
+        control_flags(),
+        9,
+        provider_epoch_1,
+        71,
+        br#"{}"#.to_vec(),
+    )
+    .unwrap();
+    assert!(provider
+        .rewrite(&stale_response, 4, consumer_epoch_2)
+        .is_none());
+    assert_eq!(consumer.installed.get(&4), Some(&consumer_epoch_2));
+    assert_eq!(provider.installed.get(&9), Some(&provider_epoch_2));
+}
+
 pub(super) struct SubcBridgeTestRoots {
     root1: tempfile::TempDir,
     root2: tempfile::TempDir,
@@ -1432,6 +1529,16 @@ fn subc_bridge_tool_calls_carry_route_bind_session() {
 }
 
 #[test]
+fn subc_bridge_stale_epoch_ingress_is_silent_and_preserves_route_state() {
+    run_subc_bridge_test(
+        "subc_bridge_stale_epoch_ingress_is_silent_and_preserves_route_state",
+        Duration::from_secs(30),
+        drive_stale_epoch_ingress_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_l3_fanout_seq_ordering() {
     run_subc_bridge_test(
         "subc_bridge_l3_fanout_seq_ordering",
@@ -2178,6 +2285,7 @@ async fn drive_s1_rejection_daemon(
             FrameType::HelloAck,
             control_flags(),
             0,
+            0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
                 negotiated_ver: PROTOCOL_VERSION,
@@ -2194,6 +2302,7 @@ async fn drive_s1_rejection_daemon(
     // An mcp:* front binds a route with a CLEAN config (no marker).
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 1,
+        epoch: 1,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
@@ -2210,6 +2319,7 @@ async fn drive_s1_rejection_daemon(
         Frame::build(
             FrameType::Request,
             control_flags(),
+            0,
             0,
             1,
             serde_json::to_vec(&bind).expect("route bind body"),
@@ -2302,6 +2412,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
             FrameType::HelloAck,
             control_flags(),
             0,
+            0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
                 negotiated_ver: PROTOCOL_VERSION,
@@ -2351,7 +2462,7 @@ async fn bind_routes_1_and_4(stream: &mut tokio::net::TcpStream, root1: &std::pa
 pub(super) async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
     send_frame(
         stream,
-        Frame::build(FrameType::Goodbye, control_flags(), 0, 99, Vec::new())
+        Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new())
             .expect("goodbye frame"),
     )
     .await;
@@ -2867,7 +2978,7 @@ async fn drive_bash_route_close_daemon(input: FakeDaemonInput) {
     tokio::time::sleep(Duration::from_millis(200)).await;
     send_frame(
         &mut stream,
-        Frame::build(FrameType::Goodbye, control_flags(), 1, 111, Vec::new())
+        Frame::build(FrameType::Goodbye, control_flags(), 1, 1, 111, Vec::new())
             .expect("route goodbye frame"),
     )
     .await;
@@ -3122,7 +3233,7 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
     // session id and not leak to sibling sessions.
     send_route_bind_with_session_and_doc(
         &mut stream,
-        1,
+        9,
         49,
         &root1,
         "session-1",
@@ -3139,13 +3250,13 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
     expect_route_bind_ack(&mut stream, 49).await;
     let session_configure_warning_pushes = expect_configure_warning_pushes(
         &mut stream,
-        HashSet::from([1]),
+        HashSet::from([1, 9]),
         &root1,
         "session-1-reconfigure-warning",
         "session-1",
     )
     .await;
-    assert_eq!(session_configure_warning_pushes.len(), 1);
+    assert_eq!(session_configure_warning_pushes.len(), 2);
     assert_eq!(
         session_configure_warning_pushes[0]
             .get("session_id")
@@ -3293,6 +3404,83 @@ async fn drive_route_bind_session_daemon(input: FakeDaemonInput) {
         Some("session-4"),
     );
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_stale_epoch_ingress_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    send_route_bind(&mut stream, 1, 101, &root1).await;
+    expect_route_bind_ack(&mut stream, 101).await;
+
+    let body = json!({ "name": "subc_test_echo_session", "arguments": {} });
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            1,
+            2,
+            102,
+            serde_json::to_vec(&body).expect("stale request body"),
+        )
+        .expect("stale request frame"),
+    )
+    .await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(150),
+        "stale-epoch request",
+    )
+    .await;
+
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Goodbye, control_flags(), 1, 2, 103, Vec::new())
+            .expect("stale Goodbye frame"),
+    )
+    .await;
+    let response = call_tool_response(
+        &mut stream,
+        1,
+        104,
+        "subc_test_echo_session",
+        json!({}),
+        "current route after stale ingress",
+    )
+    .await;
+    assert_eq!(response["transport_session"], "session-1");
+
+    send_route_goodbye(&mut stream, 1, 105).await;
+    send_route_bind_epoch(&mut stream, 1, 2, 106, &root1).await;
+    expect_route_bind_ack(&mut stream, 106).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Goodbye, control_flags(), 1, 1, 107, Vec::new())
+            .expect("stale previous-generation Goodbye"),
+    )
+    .await;
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            1,
+            2,
+            108,
+            serde_json::to_vec(&body).expect("current request body"),
+        )
+        .expect("current request frame"),
+    )
+    .await;
+    let current = read_frame_timeout(&mut stream, "current reused route response").await;
+    assert_eq!(current.header.corr, 108);
+    assert_eq!((current.header.channel, current.header.epoch), (1, 2));
+    assert_eq!(
+        tool_response_json(&current)["transport_session"],
+        "session-1"
+    );
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -3587,7 +3775,7 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
     });
     send_frame(
         &mut stream,
-        Frame::build(FrameType::Goodbye, control_flags(), 10, 1110, Vec::new())
+        Frame::build(FrameType::Goodbye, control_flags(), 10, 1, 1110, Vec::new())
             .expect("route 10 goodbye"),
     )
     .await;
@@ -3595,7 +3783,12 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
     state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
     tokio::time::sleep(Duration::from_millis(150)).await;
     send_tool_call(&mut stream, 10, 1111, "echo", json!({ "case": "fast" })).await;
-    expect_error_frame_skipping_optional_ack(&mut stream, 10, 1111, "route_not_bound", 110).await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(150),
+        "request on a closed route generation",
+    )
+    .await;
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -3756,20 +3949,21 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
         ..
     } = open_fake_daemon_session(input).await;
 
-    // Bind a single-channel root for the configure-emitted push scenario. The
-    // follow-up RouteBind exercises already-live reconfigure behavior while
-    // keeping project-scoped status fan-out unambiguous.
+    // Keep route 6 live while route 7 configures. Project-scoped status may
+    // reach the already-acknowledged sibling, but route 7 cannot receive traffic
+    // before its own RouteBindAck.
     send_route_bind(&mut stream, 6, 15, &push_burst_root).await;
     expect_route_bind_ack(&mut stream, 15).await;
 
-    // L3 coalescing integration: configure emits a burst for an already-bound
-    // route. The non-blocking RouteBind path may deliver the coalesced Push
-    // before or after the bind ack, but it must still collapse the burst.
-    send_route_bind_with_doc(
+    // L3 coalescing integration: route 7's configure emits a burst for the
+    // already-bound sibling route 6. The sibling Push may arrive around route
+    // 7's ack, but the burst must still collapse.
+    send_route_bind_with_session_and_doc(
         &mut stream,
-        6,
+        7,
         16,
         &push_burst_root,
+        "session-6",
         json!({
             "callgraph_store": false,
             "search_index": false,
@@ -3798,6 +3992,7 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
             .any(|push| push_seq(push) == Some(15)),
         "configure burst should include the final status snapshot"
     );
+    send_route_goodbye(&mut stream, 7, 161).await;
     send_tool_call(
         &mut stream,
         6,
@@ -3834,11 +4029,12 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
     // configure emits enough lossy status frames to fill lossy_tx, then emits a
     // reliable BashCompleted. The completion must still arrive.
     let pressure_task = "reliable-after-lossy-pressure";
-    send_route_bind_with_doc(
+    send_route_bind_with_session_and_doc(
         &mut stream,
-        6,
+        7,
         17,
         &push_burst_root,
+        "session-6",
         json!({
             "callgraph_store": false,
             "search_index": false,
@@ -3880,6 +4076,7 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
         .await;
         assert_eq!(final_pressure_pushes.len(), 1);
     }
+    send_route_goodbye(&mut stream, 7, 171).await;
     send_tool_call(
         &mut stream,
         6,
@@ -4374,6 +4571,7 @@ async fn send_route_bind_with_elicitation_capability(
 
     let body = ModuleControlRequest::RouteBind {
         route_channel,
+        epoch: 1,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
@@ -4390,6 +4588,7 @@ async fn send_route_bind_with_elicitation_capability(
         Frame::build(
             FrameType::Request,
             control_flags(),
+            0,
             0,
             corr,
             serde_json::to_vec(&body).expect("route bind body"),
@@ -4458,6 +4657,7 @@ async fn send_bash_elicitation_reply_bytes(
             FrameType::Response,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            1,
             corr,
             body,
         )
@@ -4488,6 +4688,7 @@ async fn send_route_goodbye(stream: &mut tokio::net::TcpStream, channel: u16, co
             FrameType::Goodbye,
             control_flags(),
             channel,
+            1,
             corr,
             Vec::new(),
         )
@@ -5081,6 +5282,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
             FrameType::HelloAck,
             control_flags(),
             0,
+            0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
                 negotiated_ver: PROTOCOL_VERSION,
@@ -5096,6 +5298,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
 
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 1,
+        epoch: 1,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
@@ -5112,6 +5315,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         Frame::build(
             FrameType::Request,
             control_flags(),
+            0,
             0,
             101,
             serde_json::to_vec(&bind).expect("route bind body"),
@@ -5307,12 +5511,17 @@ async fn drive_detached_session_replay_daemon(input: FakeDaemonInput) {
     });
     send_frame(
         &mut stream,
-        Frame::build(FrameType::Goodbye, control_flags(), 1, 4310, Vec::new())
+        Frame::build(FrameType::Goodbye, control_flags(), 1, 1, 4310, Vec::new())
             .expect("route 1 goodbye"),
     )
     .await;
     send_tool_call(&mut stream, 1, 4311, "echo", json!({ "case": "fast" })).await;
-    expect_error_frame(&mut stream, 1, 4311, "route_not_bound").await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(150),
+        "request on detached route 1",
+    )
+    .await;
     state.release_deferred_pushes();
     send_route_bind_with_session(&mut stream, 7, 47, &root1, "session-1").await;
     let replayed =
@@ -5338,12 +5547,17 @@ async fn drive_detached_session_replay_daemon(input: FakeDaemonInput) {
     });
     send_frame(
         &mut stream,
-        Frame::build(FrameType::Goodbye, control_flags(), 7, 4320, Vec::new())
+        Frame::build(FrameType::Goodbye, control_flags(), 7, 1, 4320, Vec::new())
             .expect("route 7 goodbye"),
     )
     .await;
     send_tool_call(&mut stream, 7, 4321, "echo", json!({ "case": "fast" })).await;
-    expect_error_frame(&mut stream, 7, 4321, "route_not_bound").await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(150),
+        "request on detached route 7",
+    )
+    .await;
     state.release_deferred_pushes();
     send_route_bind_with_session(&mut stream, 8, 48, &root1, "session-1").await;
     expect_route_bind_ack_without_task_push(&mut stream, 48, lossy_task).await;
@@ -5456,7 +5670,12 @@ async fn drive_failed_new_root_daemon(input: FakeDaemonInput) {
     assert_eq!(sentinel_pushes.len(), 1);
     assert_eq!(push_seq(&sentinel_pushes[0]), Some(1));
     send_tool_call(&mut stream, 5, 550, "echo", json!({ "case": "fast" })).await;
-    expect_error_frame(&mut stream, 5, 550, "route_not_bound").await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(150),
+        "request on rejected route generation",
+    )
+    .await;
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -6045,6 +6264,7 @@ async fn send_control_request(
             FrameType::Request,
             control_flags(),
             0,
+            0,
             corr,
             serde_json::to_vec(&request).expect("control request body"),
         )
@@ -6076,6 +6296,31 @@ async fn send_route_bind(
         route_channel,
         corr,
         root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+}
+
+async fn send_route_bind_epoch(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    epoch: u32,
+    corr: u64,
+    root: &std::path::Path,
+) {
+    send_route_bind_with_harness_session_principal_and_doc_epoch(
+        stream,
+        route_channel,
+        epoch,
+        corr,
+        root,
+        "opencode",
+        &format!("session-{route_channel}"),
+        Some(Principal::Direct),
         json!({
             "callgraph_store": false,
             "search_index": false,
@@ -6157,6 +6402,32 @@ async fn send_route_bind_with_harness_session_principal_and_doc(
     principal: Option<Principal>,
     doc: Value,
 ) {
+    send_route_bind_with_harness_session_principal_and_doc_epoch(
+        stream,
+        route_channel,
+        1,
+        corr,
+        root,
+        harness,
+        session,
+        principal,
+        doc,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    epoch: u32,
+    corr: u64,
+    root: &std::path::Path,
+    harness: &str,
+    session: &str,
+    principal: Option<Principal>,
+    doc: Value,
+) {
     let consumer_capabilities: Option<Vec<String>> = None;
     // Config is read by AFT from <root>/.cortexkit/aft.jsonc, NOT from the wire
     // (the wire `config` is ignored since the unification). Write the bind's doc
@@ -6175,6 +6446,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc(
 
     let request = ModuleControlRequest::RouteBind {
         route_channel,
+        epoch,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
@@ -6191,6 +6463,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc(
         Frame::build(
             FrameType::Request,
             control_flags(),
+            0,
             0,
             corr,
             serde_json::to_vec(&request).expect("route bind body"),
@@ -6214,6 +6487,7 @@ async fn send_tool_call(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            1,
             corr,
             serde_json::to_vec(&body).expect("tool call body"),
         )
@@ -6246,6 +6520,7 @@ async fn send_bg_events_subscribe(stream: &mut tokio::net::TcpStream, channel: u
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            1,
             corr,
             serde_json::to_vec(&json!({ "op": "bg_events" })).expect("bg_events body"),
         )
@@ -6261,6 +6536,7 @@ async fn send_bg_events_cancel(stream: &mut tokio::net::TcpStream, channel: u16,
             FrameType::Cancel,
             Flags::new(false, Priority::Interactive, false),
             channel,
+            1,
             corr,
             Vec::new(),
         )
@@ -6682,34 +6958,6 @@ async fn expect_route_bind_ack(stream: &mut tokio::net::TcpStream, corr: u64) {
 
 async fn expect_route_bind_error(stream: &mut tokio::net::TcpStream, corr: u64, code: &str) {
     expect_error_frame(stream, 0, corr, code).await;
-}
-
-/// Like `expect_error_frame`, but tolerates one benign late `RouteBindAck` for a
-/// bind whose `Goodbye` raced its configure completion. When a `Goodbye` arrives
-/// while a slow bind's configure is in flight, the transport `select!` may pick
-/// the completion before the `Goodbye`: it then emits an ack on channel 0 for the
-/// abandoned corr and immediately tears the route down. Either ordering leaves the
-/// route unbound, so the only durable assertion is the subsequent
-/// `route_not_bound` error — the optional ack is correlated to a corr the gateway
-/// already abandoned and ignored. At most one such ack may appear.
-async fn expect_error_frame_skipping_optional_ack(
-    stream: &mut tokio::net::TcpStream,
-    channel: u16,
-    corr: u64,
-    code: &str,
-    optional_ack_corr: u64,
-) {
-    let frame = read_frame_timeout(stream, "Error frame (maybe after late ack)").await;
-    let frame = if frame.header.ty == FrameType::Response
-        && frame.header.channel == 0
-        && frame.header.corr == optional_ack_corr
-    {
-        // Benign late ack for the cancelled bind — skip it and read the real error.
-        read_frame_timeout(stream, "Error frame after late ack").await
-    } else {
-        frame
-    };
-    assert_error_frame(&frame, channel, corr, code);
 }
 
 fn assert_error_frame(frame: &Frame, channel: u16, corr: u64, code: &str) {
@@ -7749,6 +7997,7 @@ async fn drive_preview_write_daemon(input: FakeDaemonInput) {
         Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
+            1,
             1,
             102,
             serde_json::to_vec(&body).expect("preview tool call body"),

@@ -273,15 +273,12 @@ fn try_send_push_body(
     channel: RouteChannel,
     body: &[u8],
 ) -> PushSendOutcome {
-    let Ok(route_channel) = u16::try_from(channel) else {
-        log::warn!("subc attach: invalid route channel {channel} for Push fan-out");
-        return PushSendOutcome::PermanentFailure;
-    };
     let push_frame = match Frame::build_with_version(
         PROTOCOL_VERSION,
         FrameType::Push,
         control_flags(),
-        route_channel,
+        channel.channel,
+        channel.epoch,
         0,
         body.to_vec(),
     ) {
@@ -325,18 +322,21 @@ fn try_send_bg_stream_frame(
     ty: FrameType,
     body: Vec<u8>,
 ) -> PushSendOutcome {
-    let Ok(route_channel) = u16::try_from(channel) else {
-        log::warn!("subc attach: invalid route channel {channel} for bg_events stream");
-        return PushSendOutcome::PermanentFailure;
+    let frame = match Frame::build_with_version(
+        sub.ver,
+        ty,
+        sub.flags,
+        channel.channel,
+        channel.epoch,
+        sub.corr,
+        body,
+    ) {
+        Ok(frame) => frame,
+        Err(error) => {
+            log::warn!("subc attach: failed to build bg_events stream frame: {error}");
+            return PushSendOutcome::PermanentFailure;
+        }
     };
-    let frame =
-        match Frame::build_with_version(sub.ver, ty, sub.flags, route_channel, sub.corr, body) {
-            Ok(frame) => frame,
-            Err(error) => {
-                log::warn!("subc attach: failed to build bg_events stream frame: {error}");
-                return PushSendOutcome::PermanentFailure;
-            }
-        };
     match try_enqueue_writer_frame(writer_tx, metrics, frame) {
         Ok(()) => PushSendOutcome::Sent,
         Err(WriterEnqueueError::Full(_)) => PushSendOutcome::Backpressure,
@@ -948,7 +948,7 @@ mod tests {
         let session = "session-budget".to_string();
         let mut routes = HashMap::new();
         routes.insert(
-            1,
+            route_key(1, 1),
             RouteIdentity(Arc::new(RouteIdentityData {
                 root: root.clone(),
                 project_root: root.as_path().to_path_buf(),
@@ -959,7 +959,7 @@ mod tests {
             })),
         );
         let mut root_channels = HashMap::new();
-        root_channels.insert(root.clone(), HashSet::from([1]));
+        root_channels.insert(root.clone(), HashSet::from([route_key(1, 1)]));
         let session_identity = HashMap::new();
         let mut retry_buffer = RetryBuffer::new();
         let mut push_buffer = HashMap::new();
@@ -1087,10 +1087,13 @@ mod tests {
         let identity1 = route_identity(&root, "session-1");
         let identity2 = route_identity(&root, "session-2");
         let mut routes = HashMap::new();
-        routes.insert(route_key(1), identity1.clone());
-        routes.insert(route_key(2), identity2.clone());
+        routes.insert(route_key(1, 1), identity1.clone());
+        routes.insert(route_key(2, 1), identity2.clone());
         let mut root_channels = HashMap::new();
-        root_channels.insert(root.clone(), HashSet::from([route_key(1), route_key(2)]));
+        root_channels.insert(
+            root.clone(),
+            HashSet::from([route_key(1, 1), route_key(2, 1)]),
+        );
         let mut session_identity = HashMap::new();
         remember_session_identity(&mut session_identity, &identity1);
         remember_session_identity(&mut session_identity, &identity2);
@@ -1208,7 +1211,7 @@ mod tests {
         let replayed = replay_buffered_push_frames(
             &writer_tx,
             &metrics,
-            route_key(3),
+            route_key(3, 1),
             &mut push_buffer,
             &key,
             BindTrust::FirstParty,
@@ -1242,7 +1245,7 @@ mod tests {
         let replayed = replay_buffered_push_frames(
             &writer_tx,
             &metrics,
-            route_key(3),
+            route_key(3, 1),
             &mut push_buffer,
             &key,
             BindTrust::Untrusted,
@@ -1446,11 +1449,11 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
 
         let mut root_channels = HashMap::new();
-        root_channels.insert(root.clone(), HashSet::from([route_key(7)]));
+        root_channels.insert(root.clone(), HashSet::from([route_key(7, 1)]));
 
         let routes = HashMap::new();
         let started = Instant::now();
@@ -1490,9 +1493,9 @@ mod tests {
         let identity = route_identity(&root, "session-1");
         let key = ReplayKey::from_identity(&identity);
         let mut routes = HashMap::new();
-        routes.insert(route_key(9), identity.clone());
+        routes.insert(route_key(9, 1), identity.clone());
         let mut root_channels = HashMap::new();
-        root_channels.insert(root.clone(), HashSet::from([route_key(9)]));
+        root_channels.insert(root.clone(), HashSet::from([route_key(9, 1)]));
         let mut session_identity = HashMap::new();
         remember_session_identity(&mut session_identity, &identity);
         let mut retry_buffer = HashMap::new();
@@ -1500,7 +1503,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
 
         let result = fan_out_reliable_push_frame(
@@ -1523,20 +1526,28 @@ mod tests {
             }
         );
         assert!(push_buffer.is_empty());
-        assert_eq!(retry_buffer.get(&route_key(9)).map(VecDeque::len), Some(1));
-        assert_eq!(&retry_buffer[&route_key(9)][0].0, &key);
+        assert_eq!(
+            retry_buffer.get(&route_key(9, 1)).map(VecDeque::len),
+            Some(1)
+        );
+        assert_eq!(&retry_buffer[&route_key(9, 1)][0].0, &key);
 
         let queued = writer_rx.try_recv().expect("prefilled frame");
         assert_eq!(queued.header.ty, FrameType::Ping);
         assert_eq!(
-            drain_retry_buffer_for_channel(&writer_tx, &metrics, route_key(9), &mut retry_buffer),
+            drain_retry_buffer_for_channel(
+                &writer_tx,
+                &metrics,
+                route_key(9, 1),
+                &mut retry_buffer
+            ),
             1
         );
         let retried = writer_rx.try_recv().expect("retried reliable push");
         assert_eq!(retried.header.ty, FrameType::Push);
         assert_eq!(retried.header.channel, 9);
         assert_eq!(push_frame_task_id(&retried).as_deref(), Some("retry-task"));
-        assert!(!retry_buffer.contains_key(&route_key(9)));
+        assert!(!retry_buffer.contains_key(&route_key(9, 1)));
     }
 
     #[test]
@@ -1544,9 +1555,9 @@ mod tests {
         let (_root_dir, root) = test_root("subc-retry-fifo-root");
         let identity = route_identity(&root, "session-1");
         let mut routes = HashMap::new();
-        routes.insert(route_key(9), identity.clone());
+        routes.insert(route_key(9, 1), identity.clone());
         let mut root_channels = HashMap::new();
-        root_channels.insert(root.clone(), HashSet::from([route_key(9)]));
+        root_channels.insert(root.clone(), HashSet::from([route_key(9, 1)]));
         let mut session_identity = HashMap::new();
         remember_session_identity(&mut session_identity, &identity);
         let mut retry_buffer = HashMap::new();
@@ -1554,7 +1565,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
 
         let first = completion_frame("fifo-1");
@@ -1588,25 +1599,35 @@ mod tests {
             writer_rx.try_recv().is_err(),
             "second reliable frame must not bypass pending retry frame"
         );
-        let queued_tasks: Vec<_> = retry_buffer[&route_key(9)]
+        let queued_tasks: Vec<_> = retry_buffer[&route_key(9, 1)]
             .iter()
             .filter_map(|(_, frame)| completion_task(frame))
             .collect();
         assert_eq!(queued_tasks, vec!["fifo-1", "fifo-2"]);
 
         assert_eq!(
-            drain_retry_buffer_for_channel(&writer_tx, &metrics, route_key(9), &mut retry_buffer),
+            drain_retry_buffer_for_channel(
+                &writer_tx,
+                &metrics,
+                route_key(9, 1),
+                &mut retry_buffer
+            ),
             1
         );
         let first_sent = writer_rx.try_recv().expect("first reliable push");
         assert_eq!(push_frame_task_id(&first_sent).as_deref(), Some("fifo-1"));
         assert_eq!(
-            drain_retry_buffer_for_channel(&writer_tx, &metrics, route_key(9), &mut retry_buffer),
+            drain_retry_buffer_for_channel(
+                &writer_tx,
+                &metrics,
+                route_key(9, 1),
+                &mut retry_buffer
+            ),
             1
         );
         let second_sent = writer_rx.try_recv().expect("second reliable push");
         assert_eq!(push_frame_task_id(&second_sent).as_deref(), Some("fifo-2"));
-        assert!(!retry_buffer.contains_key(&route_key(9)));
+        assert!(!retry_buffer.contains_key(&route_key(9, 1)));
     }
 
     #[test]
@@ -1620,7 +1641,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(2);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
             .expect("prefill writer queue");
         let mut push_buffer = HashMap::new();
         for task in ["replay-1", "replay-2", "replay-3"] {
@@ -1631,7 +1652,7 @@ mod tests {
             replay_buffered_push_frames(
                 &writer_tx,
                 &metrics,
-                route_key(4),
+                route_key(4, 1),
                 &mut push_buffer,
                 &key,
                 BindTrust::FirstParty
@@ -1654,7 +1675,7 @@ mod tests {
             replay_buffered_push_frames(
                 &writer_tx,
                 &metrics,
-                route_key(4),
+                route_key(4, 1),
                 &mut push_buffer,
                 &key,
                 BindTrust::FirstParty
@@ -1679,18 +1700,22 @@ mod tests {
         let mut retry_buffer = HashMap::new();
         buffer_retry_frame(
             &mut retry_buffer,
-            route_key(5),
+            route_key(5, 1),
             key.clone(),
             completion_frame("migrated-task"),
         );
         let mut push_buffer = HashMap::new();
 
         assert_eq!(
-            migrate_retry_buffer_to_push_buffer(&mut retry_buffer, route_key(5), &mut push_buffer),
+            migrate_retry_buffer_to_push_buffer(
+                &mut retry_buffer,
+                route_key(5, 1),
+                &mut push_buffer
+            ),
             1
         );
 
-        assert!(!retry_buffer.contains_key(&route_key(5)));
+        assert!(!retry_buffer.contains_key(&route_key(5, 1)));
         assert_eq!(push_buffer.get(&key).map(VecDeque::len), Some(1));
         assert_eq!(
             completion_task(&push_buffer[&key][0]),
@@ -1720,7 +1745,7 @@ mod tests {
             replay_buffered_push_frames(
                 &writer_tx,
                 &metrics,
-                route_key(4),
+                route_key(4, 1),
                 &mut push_buffer,
                 &key,
                 BindTrust::FirstParty
@@ -1732,15 +1757,20 @@ mod tests {
         let mut retry_buffer = HashMap::new();
         buffer_retry_frame(
             &mut retry_buffer,
-            route_key(4),
+            route_key(4, 1),
             key,
             completion_frame("closed-retry"),
         );
         assert_eq!(
-            drain_retry_buffer_for_channel(&writer_tx, &metrics, route_key(4), &mut retry_buffer),
+            drain_retry_buffer_for_channel(
+                &writer_tx,
+                &metrics,
+                route_key(4, 1),
+                &mut retry_buffer
+            ),
             0
         );
-        assert!(!retry_buffer.contains_key(&route_key(4)));
+        assert!(!retry_buffer.contains_key(&route_key(4, 1)));
     }
 
     #[test]
@@ -1768,7 +1798,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-bg-wake-epoch-root");
         let session = "session-1".to_string();
         let key = (root.clone(), session.clone());
-        let channel = route_key(7);
+        let channel = route_key(7, 1);
         let mut bg_wake_pending = HashSet::from([channel]);
         let mut bg_wake_epoch = HashMap::from([(key.clone(), 41_u64)]);
 
@@ -1789,7 +1819,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-bg-wake-stale-root");
         let session = "session-1".to_string();
         let key = (root.clone(), session.clone());
-        let channel = route_key(8);
+        let channel = route_key(8, 1);
         let mut bg_sub_by_session = HashMap::new();
         bg_sub_by_session.insert(key.clone(), channel);
         let mut bg_wake_pending = HashSet::new();
@@ -1828,7 +1858,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-bg-wake-clear-root");
         let session = "session-1".to_string();
         let key = (root.clone(), session.clone());
-        let channel = route_key(9);
+        let channel = route_key(9, 1);
         let mut bg_sub_by_session = HashMap::new();
         bg_sub_by_session.insert(key.clone(), channel);
         let mut bg_wake_pending = HashSet::new();

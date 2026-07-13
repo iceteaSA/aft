@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SUBC_CORE_TAG="subc-core-v0.1.1"
+SUBC_CORE_WIRE_VERSION="1"
 SUBC_REPO="cortexkit/subconscious"
 BIN_NAME="subc-core"
 CACHE_DIR="$HOME/.cache/aft-ci/subc-core/$SUBC_CORE_TAG"

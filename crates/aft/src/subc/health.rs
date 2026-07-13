@@ -296,7 +296,10 @@ mod tests {
 
         for blocker in cases {
             let breadcrumb = pending_bind_breadcrumb(
-                7,
+                RouteChannel {
+                    channel: 7,
+                    epoch: 1,
+                },
                 &root,
                 Duration::from_secs(6),
                 "subc-bind-7",
