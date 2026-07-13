@@ -4406,9 +4406,13 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    // Only the unix-gated baseline test consumes these (see its comment for
+    // why Windows cannot reproduce the hash); keep Windows -D warnings clean.
+    #[cfg(unix)]
     const RUST_QUERY_BASELINE_OUTPUT_HASH: &str =
         "36315439db74ed8e186076f79ed261079b2b13a4443ed4272861a2518c78d98b";
 
+    #[cfg(unix)]
     fn rust_fixture_semantic_output_fingerprint(project_root: &Path) -> (usize, usize, String) {
         let fixture_root = project_root.join("tests/fixtures");
         // Re-materialize the fixtures with LF bytes before collecting: Windows
