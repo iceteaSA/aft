@@ -263,7 +263,10 @@ fn background_bash_spawns_and_completes_cross_platform() {
 #[test]
 fn restricted_read_allows_only_current_session_bash_artifacts() {
     let mut aft = AftProcess::spawn();
-    let (dir, _storage) = configure_restricted_background(&mut aft);
+    // The tempdir handle is only dereferenced by the unix-gated symlink block
+    // below; keep the binding underscore-prefixed so Windows (-D warnings)
+    // compiles while Drop still cleans the directory up.
+    let (_dir, _storage) = configure_restricted_background(&mut aft);
     let owner_session = "artifact-owner-session";
     let spawn = aft.send(
         &json!({
@@ -356,7 +359,7 @@ fn restricted_read_allows_only_current_session_bash_artifacts() {
     #[cfg(unix)]
     {
         let artifact_dir = output_path.parent().unwrap();
-        let link = dir.path().join("artifact-link");
+        let link = _dir.path().join("artifact-link");
         std::os::unix::fs::symlink(artifact_dir, &link).unwrap();
         let unregistered = artifact_dir.join("unregistered-output");
         std::fs::write(&unregistered, "not registered\n").unwrap();
