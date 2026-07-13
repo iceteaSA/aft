@@ -53,7 +53,14 @@ fn status_memory_attributes_every_registered_root_and_exposes_residual() {
     let memory = &response.data["memory"];
     assert_eq!(memory["roots_status"], "ready");
     let roots = memory["roots"].as_object().expect("memory roots object");
-    assert_eq!(roots.len(), 2);
+    // Presence, not exact count: the actor registry backing the memory view is
+    // process-wide, so under plain `cargo test` (thread-per-test, as on the
+    // Windows CI job) a concurrently running test can legitimately register
+    // additional roots. Nextest's process-per-test isolation hides this.
+    assert!(
+        roots.len() >= 2,
+        "expected at least the two registered roots: {roots:?}"
+    );
     for root in [first_root, second_root] {
         let estimate = roots
             .get(&root.display().to_string())
