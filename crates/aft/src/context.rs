@@ -960,6 +960,9 @@ pub struct AppContext {
     semantic_index: RwLock<Option<SemanticIndex>>,
     semantic_index_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RwLock<SemanticIndexStatus>,
+    /// Serializes missing-artifact checks with receiver installation so
+    /// concurrent fallback queries cannot start duplicate reload workers.
+    artifact_reload_lock: parking_lot::Mutex<()>,
     /// True while this context has a cold semantic seed scheduled or actively
     /// collecting/embedding/persisting the full project corpus. The semantic
     /// worker clears it as soon as it proves the cached/incremental path is in use.
@@ -1192,6 +1195,7 @@ impl AppContext {
             semantic_index: RwLock::new(None),
             semantic_index_rx: parking_lot::Mutex::new(None),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
+            artifact_reload_lock: parking_lot::Mutex::new(()),
             semantic_cold_seed_active: Arc::new(AtomicBool::new(false)),
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
             semantic_fingerprint_generation: Arc::new(AtomicU64::new(0)),
@@ -3328,6 +3332,10 @@ impl AppContext {
         &self.semantic_index_status
     }
 
+    pub(crate) fn artifact_reload_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.artifact_reload_lock.lock()
+    }
+
     /// Reset this context's cold semantic seed gate for a newly accepted
     /// configure and return the generation token for the worker being spawned.
     pub fn reset_semantic_cold_seed_gate_for_configure(&self) -> u64 {
@@ -3346,6 +3354,10 @@ impl AppContext {
 
     pub fn semantic_cold_seed_generation_flag(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.semantic_cold_seed_generation)
+    }
+
+    pub fn semantic_cold_seed_generation(&self) -> u64 {
+        self.semantic_cold_seed_generation.load(Ordering::SeqCst)
     }
 
     pub fn semantic_cold_seed_active(&self) -> bool {
@@ -3710,8 +3722,8 @@ impl AppContext {
         search_has_pending_disk_changes
     }
 
-    /// Drop idle root-scoped artifact handles. Persistent data remains on disk
-    /// and each command's existing lazy-open path recreates the handle later.
+    /// Drop idle root-scoped artifact handles. Persistent data remains on disk;
+    /// artifact-backed query paths schedule a background reload on first use.
     /// Returns false when an active build, bash task, inspect scan, or pending
     /// disk update makes eviction unsafe.
     pub fn evict_idle_artifacts(&self) -> bool {

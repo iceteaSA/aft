@@ -1361,6 +1361,12 @@ fn handle_semantic_or_hybrid_search(
     }
 
     if !semantic_index_loaded(ctx) {
+        let reloading = super::configure::trigger_semantic_index_reload_if_evicted(ctx);
+        let detail = if reloading {
+            "Semantic index is reloading; retry shortly."
+        } else {
+            "Semantic index is not ready yet."
+        };
         return semantic_unavailable_or_fallback_response(
             req,
             ctx,
@@ -1369,7 +1375,7 @@ fn handle_semantic_or_hybrid_search(
             &shape,
             "unavailable",
             "not_ready",
-            "Semantic index is not ready yet.".to_string(),
+            detail.to_string(),
             lexical,
             warnings,
             project_root,

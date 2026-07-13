@@ -1768,6 +1768,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         && ctx.configure_warm_key_matches(&preflight_warm_key)
         && ctx.is_worktree_bridge() == is_worktree_bridge
         && ctx.git_common_dir() == git_common_dir
+        && {
+            let missing = missing_artifact_loads(ctx);
+            !missing.search && !missing.semantic
+        }
     {
         let first_session_bind = ctx.note_configure_session_binding(
             canonical_cache_root.clone(),
@@ -1957,12 +1961,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     ctx.begin_configure_ack_phase("state_commit");
     // Commit phase: no validation returns after this point.
-    let semantic_fingerprint_generation =
-        if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
-            ctx.advance_semantic_fingerprint_generation()
-        } else {
-            ctx.semantic_fingerprint_generation()
-        };
+    if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
+        ctx.advance_semantic_fingerprint_generation();
+    }
     ctx.set_config(next_config.clone());
     crate::logging::sync_storage_root(ctx.storage_dir());
     ctx.set_harness(harness.clone());
@@ -2003,16 +2004,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
     let first_session_bind =
         ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
-    let semantic_cold_seed_generation = if !equivalent_warm_config {
+    if !equivalent_warm_config {
         ctx.reset_tier2_refresh_scheduler();
-        let semantic_cold_seed_generation = ctx.reset_semantic_cold_seed_gate_for_configure();
+        ctx.reset_semantic_cold_seed_gate_for_configure();
         if next_config.semantic_search && !ctx.shared_artifacts_read_only() && !home_match {
             ctx.schedule_semantic_cold_seed_gate_for_configure();
         }
-        semantic_cold_seed_generation
-    } else {
-        configure_generation
-    };
+    }
     // Project root (and thus tsconfig resolution) may have changed; drop the
     // status-bar membership cache so the next bar count re-resolves from disk.
     // Equivalent rebinds keep this hot cache because no tsconfig input changed.
@@ -2027,8 +2025,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.begin_configure_ack_phase("index_loading_state");
     let search_index = ctx.config().search_index;
     let semantic_search = ctx.config().semantic_search;
-    let search_index_max_file_size = ctx.config().search_index_max_file_size;
-    let semantic_config = ctx.config().semantic.clone();
     let mut search_index_cache_reused = false;
 
     // Reconfigure is still the signal that workspace package metadata may have
@@ -2069,6 +2065,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 configure_generation
             );
         }
+        artifact_load_starts.extend(schedule_missing_artifact_loads(
+            ctx,
+            search_index,
+            semantic_search,
+        ));
     } else {
         // Note: We intentionally only WARN on rapid reconfigure (rather than tracking
         // JoinHandles to cancel old threads) because:
@@ -2103,7 +2104,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         *ctx.search_index_rx()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let symbol_cache_generation = ctx.reset_symbol_cache();
         *ctx.semantic_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -2121,743 +2121,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         *ctx.semantic_embedding_model().lock() = None;
         ctx.clear_pending_index_updates();
 
-        let storage_dir = ctx.config().storage_dir.clone();
-
-        if search_index {
-            let cache_dir = resolve_cache_dir_with_key(&project_key, storage_dir.as_deref());
-            let root_for_search = canonical_cache_root.clone();
-            let symbol_cache = ctx.symbol_cache();
-            let symbol_storage = storage_dir.clone();
-            let symbol_project_key = project_key.clone();
-            let is_worktree_bridge_for_search = is_worktree_bridge;
-            let shared_artifacts_read_only_for_search = ctx.shared_artifacts_read_only();
-            let session_id_for_bg = log_ctx::current_session();
-            let search_generation = configure_generation;
-            let search_generation_flag = ctx.configure_generation_flag();
-            let (tx, rx) = unbounded::<SearchIndex>();
-            *ctx.search_index_rx()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
-            let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
-            artifact_load_starts.push(start_tx);
-
-            #[cfg(debug_assertions)]
-            mark_search_rebuild_spawn_for_debug();
-            thread::spawn(move || {
-                if start_rx.recv().is_err() {
-                    return;
-                }
-                log_ctx::with_session(session_id_for_bg.clone(), || {
-                    note_configure_artifact_load_attempt();
-                    if shared_artifacts_read_only_for_search {
-                        match crate::readonly_artifacts::open_search_index_read_only(
-                            &root_for_search,
-                            symbol_storage.as_deref(),
-                        ) {
-                            crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
-                                let symbol_files = search_index_symbol_files(&index);
-                                let _ = tx.send(index);
-                                spawn_symbol_cache_prewarm(
-                                    root_for_search,
-                                    symbol_cache,
-                                    symbol_storage,
-                                    symbol_project_key,
-                                    symbol_cache_generation,
-                                    symbol_files,
-                                    true,
-                                    log_ctx::current_session(),
-                                );
-                            }
-                            crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                                slog_warn!(
-                                    "search index is read-only and stale for {} file(s); not repairing shared artifacts",
-                                    stale.drift_count
-                                );
-                            }
-                            crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
-                                slog_warn!(
-                                    "search index is read-only but no shared artifact snapshot exists"
-                                );
-                            }
-                        }
-                        return;
-                    }
-
-                    let _permit = crate::cold_build_limiter::acquire_blocking(
-                        "search index post-configure load",
-                    );
-                    // HEAD freshness is deliberately probed after the bind ack. The
-                    // helper bounds git so a wedged repository cannot pin maintenance.
-                    let current_head = current_git_head(&root_for_search);
-                    let cache_path = cache_dir.join("cache.bin");
-                    let artifact_generation = cache_freshness::artifact_generation(&cache_path);
-                    let verify_plan = cache_freshness::warm_verify_plan(
-                        &root_for_search,
-                        VerifyArtifact::Search,
-                        artifact_generation,
-                    );
-                    let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
-                    let mut persist_to_disk = true;
-                    let mut record_completed_verify = true;
-                    let mut index = match baseline {
-                        Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
-                            index.set_ready(false);
-                            match verify_plan {
-                                WarmVerifyPlan::Skip => {
-                                    index.set_ready(true);
-                                    persist_to_disk = false;
-                                    record_completed_verify = false;
-                                }
-                                WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => {
-                                    let _cache_lock = (!is_worktree_bridge_for_search)
-                                        .then(|| {
-                                            CacheLock::acquire(&cache_dir, &root_for_search).ok()
-                                        })
-                                        .flatten();
-                                    let strategy = match verify_plan {
-                                        WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
-                                        WarmVerifyPlan::Strict => VerifyStrategy::Strict,
-                                        WarmVerifyPlan::Skip => unreachable!(),
-                                    };
-                                    let disk_changed = index.verify_against_disk_with_strategy(
-                                        current_head.clone(),
-                                        strategy,
-                                    );
-                                    persist_to_disk =
-                                        disk_changed || index.has_pending_disk_changes();
-                                }
-                            }
-                            index
-                        }
-                        mut baseline => {
-                            if let Some(index) = baseline.as_mut() {
-                                index.set_ready(false);
-                            }
-                            let _cache_lock = if is_worktree_bridge_for_search {
-                                None
-                            } else {
-                                CacheLock::acquire(&cache_dir, &root_for_search).ok()
-                            };
-                            let strategy = match verify_plan {
-                                WarmVerifyPlan::Strict => VerifyStrategy::Strict,
-                                WarmVerifyPlan::Skip | WarmVerifyPlan::StatFirst => {
-                                    VerifyStrategy::StatFirst
-                                }
-                            };
-                            let index = SearchIndex::rebuild_or_refresh_with_strategy(
-                                &root_for_search,
-                                search_index_max_file_size,
-                                current_head,
-                                baseline,
-                                Some(&cache_dir),
-                                strategy,
-                            );
-                            delay_search_rebuild_publish_for_debug();
-                            index
-                        }
-                    };
-                    if !is_worktree_bridge_for_search && persist_to_disk {
-                        let head = index.stored_git_head().map(str::to_owned);
-                        index.write_to_disk(&cache_dir, head.as_deref());
-                    }
-                    if record_completed_verify {
-                        cache_freshness::record_verify_completed(
-                            &root_for_search,
-                            VerifyArtifact::Search,
-                            cache_freshness::artifact_generation(&cache_path),
-                        );
-                    }
-                    let symbol_files = search_index_symbol_files(&index);
-                    if search_generation_flag.load(Ordering::SeqCst) == search_generation {
-                        let _ = tx.send(index);
-                        spawn_symbol_cache_prewarm(
-                            root_for_search,
-                            symbol_cache,
-                            symbol_storage,
-                            symbol_project_key,
-                            symbol_cache_generation,
-                            symbol_files,
-                            false,
-                            log_ctx::current_session(),
-                        );
-                    } else {
-                        slog_info!(
-                            "search index build result discarded for stale generation {}",
-                            search_generation
-                        );
-                    }
-                });
-            });
-        }
-
-        if semantic_search && ctx.shared_artifacts_read_only() {
-            *ctx.semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                SemanticIndexStatus::Building {
-                    stage: "loading_artifacts".to_string(),
-                    files: None,
-                    entries_done: None,
-                    entries_total: None,
-                };
-            let (tx, rx) = unbounded::<SemanticIndexEvent>();
-            *ctx.semantic_index_rx().lock() = Some(rx);
-            let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
-            artifact_load_starts.push(start_tx);
-            let semantic_root = canonical_cache_root.clone();
-            let semantic_storage = storage_dir.clone();
-            let session_id = log_ctx::current_session();
-            thread::spawn(move || {
-                if start_rx.recv().is_err() {
-                    return;
-                }
-                log_ctx::with_session(session_id, || {
-                    note_configure_artifact_load_attempt();
-                    let event = match crate::readonly_artifacts::open_semantic_index_read_only(
-                        &semantic_root,
-                        semantic_storage.as_deref(),
-                    ) {
-                        crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
-                            SemanticIndexEvent::Ready(index)
-                        }
-                        crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                            slog_warn!(
-                                "semantic index is read-only and stale for {} file(s); serving stale snapshot without repairing shared artifacts",
-                                stale.drift_count
-                            );
-                            SemanticIndexEvent::Ready(stale.index)
-                        }
-                        crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
-                            SemanticIndexEvent::Failed(
-                                "semantic index is read-only but no shared artifact snapshot exists"
-                                    .to_string(),
-                            )
-                        }
-                    };
-                    let _ = tx.send(event);
-                });
-            });
-        } else if semantic_search {
-            *ctx.semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                SemanticIndexStatus::Building {
-                    stage: "loading_artifacts".to_string(),
-                    files: None,
-                    entries_done: None,
-                    entries_total: None,
-                };
-            let (tx, rx): (
-                crossbeam_channel::Sender<SemanticIndexEvent>,
-                crossbeam_channel::Receiver<SemanticIndexEvent>,
-            ) = unbounded();
-            *ctx.semantic_index_rx().lock() = Some(rx);
-
-            let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
-            let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
-            let refresh_worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
-            ctx.install_semantic_refresh_worker(
-                refresh_tx,
-                refresh_event_rx,
-                Arc::clone(&refresh_worker_slot),
-            );
-
-            let root_clone = canonical_cache_root.clone();
-            let semantic_storage = storage_dir.clone();
-            let semantic_project_key = project_key.clone();
-            let semantic_config = semantic_config.clone();
-            let tx_progress = tx.clone();
-            let is_worktree_bridge_for_semantic = is_worktree_bridge;
-            let semantic_cold_seed_active = ctx.semantic_cold_seed_active_flag();
-            let semantic_cold_seed_generation_flag = ctx.semantic_cold_seed_generation_flag();
-            let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
-            let semantic_generation = configure_generation;
-            let semantic_generation_flag = ctx.configure_generation_flag();
-            let semantic_fingerprint_generation_flag = ctx.semantic_fingerprint_generation_flag();
-            let session_id_for_bg2 = log_ctx::current_session();
-            let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
-            artifact_load_starts.push(start_tx);
-            thread::spawn(move || {
-                if start_rx.recv().is_err() {
-                    return;
-                }
-                note_configure_artifact_load_attempt();
-                log_ctx::with_session(session_id_for_bg2, || {
-                    // Cap file count to bound memory on huge project roots (e.g.,
-                    // /home/user). The local fastembed model (~200MB) + embeddings +
-                    // batch buffers can exceed memory on constrained systems when
-                    // indexing tens of thousands of files. Configurable via
-                    // `semantic.max_files` (default 20k); remote backends that embed
-                    // server-side can raise it freely.
-                    let max_semantic_files = semantic_config.max_files;
-                    let mut semantic_retry_attempt: usize = 0;
-                    let set_cold_seed_active = || {
-                        if semantic_cold_seed_generation_flag
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            == semantic_cold_seed_generation_for_worker
-                        {
-                            semantic_cold_seed_active
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    };
-                    let clear_cold_seed_active = || {
-                        if semantic_cold_seed_generation_flag
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            == semantic_cold_seed_generation_for_worker
-                        {
-                            semantic_cold_seed_active
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    };
-                    let clear_cold_seed_gate_and_notify = || {
-                        clear_cold_seed_active();
-                        let _ = tx_progress.send(SemanticIndexEvent::ColdSeedGateCleared);
-                    };
-
-                    struct SemanticBuildReady {
-                        index: SemanticIndex,
-                        model: crate::semantic_index::EmbeddingModel,
-                        persist_to_disk: bool,
-                        record_verify_completion: bool,
-                    }
-
-                    let build_once = || -> Result<SemanticBuildReady, String> {
-                        let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                            stage: "initializing_embedding_model".to_string(),
-                            files: None,
-                            entries_done: None,
-                            entries_total: None,
-                        });
-                        let mut model =
-                            crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
-                        let fingerprint = model.fingerprint(&semantic_config)?;
-                        let fingerprint_key = fingerprint.as_string();
-                        let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
-                            .then(|| ())
-                            .and_then(|_| semantic_storage.as_ref())
-                            .and_then(|dir| {
-                                match SemanticIndexLock::acquire(
-                                    dir,
-                                    &semantic_project_key,
-                                    &root_clone,
-                                ) {
-                                    Ok(lock) => Some(lock),
-                                    Err(error) => {
-                                        slog_warn!(
-                                            "failed to acquire semantic cache lock: {}",
-                                            error
-                                        );
-                                        None
-                                    }
-                                }
-                            });
-
-                        if let Some(ref dir) = semantic_storage {
-                            let data_path = dir
-                                .join("semantic")
-                                .join(&semantic_project_key)
-                                .join("semantic.bin");
-                            let verify_plan = cache_freshness::warm_verify_plan(
-                                &root_clone,
-                                VerifyArtifact::Semantic,
-                                cache_freshness::artifact_generation(&data_path),
-                            );
-                            if let Some(cached) = SemanticIndex::read_from_disk(
-                                dir,
-                                &semantic_project_key,
-                                &root_clone,
-                                is_worktree_bridge_for_semantic,
-                                Some(&fingerprint_key),
-                            ) {
-                                clear_cold_seed_gate_and_notify();
-                                if verify_plan == WarmVerifyPlan::Skip {
-                                    slog_info!(
-                                        "semantic index: recently verified cache generation reused ({} entries)",
-                                        cached.entry_count(),
-                                    );
-                                    return Ok(SemanticBuildReady {
-                                        index: cached,
-                                        model,
-                                        persist_to_disk: false,
-                                        record_verify_completion: false,
-                                    });
-                                }
-                                // Try incremental refresh: re-embed only changed/new files,
-                                // drop entries for deleted files, keep everything else.
-                                // This is the hot path for restart on a project with a
-                                // handful of edits — avoids re-embedding 4000+ unchanged
-                                // files just to pick up 10 changes.
-                                let current_files = match walk_semantic_project_files_bounded(
-                                    &root_clone,
-                                    max_semantic_files,
-                                ) {
-                                    Ok(files) => files,
-                                    Err(observed) => {
-                                        slog_warn!(
-                                            "skipping semantic index: more than {} files exceeds limit of {}. \
-                                             Raise semantic.max_files or open a specific project directory.",
-                                            observed.saturating_sub(1),
-                                            max_semantic_files
-                                        );
-                                        return Err(format!(
-                                            "too many files (>{}) for semantic indexing (max {})",
-                                            max_semantic_files, max_semantic_files
-                                        ));
-                                    }
-                                };
-
-                                let mut cached = cached;
-                                let mut embed = |texts: Vec<String>| model.embed(texts);
-                                let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                                    stage: "refreshing_stale_files".to_string(),
-                                    files: None,
-                                    entries_done: None,
-                                    entries_total: None,
-                                });
-                                let mut progress = |done: usize, total: usize| {
-                                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                                        stage: "embedding_stale_symbols".to_string(),
-                                        files: None,
-                                        entries_done: Some(done),
-                                        entries_total: Some(total),
-                                    });
-                                };
-
-                                let verify_strategy = match verify_plan {
-                                    WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
-                                    WarmVerifyPlan::Strict => VerifyStrategy::Strict,
-                                    WarmVerifyPlan::Skip => unreachable!(),
-                                };
-                                match cached.refresh_stale_files_with_strategy(
-                                    &root_clone,
-                                    &current_files,
-                                    &mut embed,
-                                    semantic_config.max_batch_size.max(1),
-                                    &mut progress,
-                                    verify_strategy,
-                                ) {
-                                    Ok(summary) => {
-                                        if summary.is_noop() {
-                                            slog_info!(
-                                                "semantic index: cached index is current ({} entries)",
-                                                cached.entry_count(),
-                                            );
-                                        } else {
-                                            slog_info!(
-                                                "semantic index: refreshed incrementally — {} changed, {} new, {} deleted, {} total processed (kept {} cached)",
-                                                summary.changed,
-                                                summary.added,
-                                                summary.deleted,
-                                                summary.total_processed,
-                                                cached.len(),
-                                            );
-                                            cached.set_fingerprint(fingerprint);
-                                        }
-                                        let persist_to_disk = !summary.is_noop();
-                                        let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                                            stage: "loaded_cached_index".to_string(),
-                                            files: None,
-                                            entries_done: Some(cached.entry_count()),
-                                            entries_total: Some(cached.entry_count()),
-                                        });
-                                        return Ok(SemanticBuildReady {
-                                            index: cached,
-                                            model,
-                                            persist_to_disk,
-                                            record_verify_completion: true,
-                                        });
-                                    }
-                                    Err(error) => {
-                                        if crate::semantic_index::embedding_failure_is_transient(
-                                            &error,
-                                        ) {
-                                            // TRANSIENT backend error (e.g. the embedding
-                                            // server is overloaded by concurrent bridges, or
-                                            // briefly unreachable). Do NOT drop the cache and
-                                            // full-rebuild: a full corpus re-embed against an
-                                            // already-overloaded backend amplifies the overload
-                                            // and cascades to other bridges AND the main
-                                            // session (every bridge's incremental refresh then
-                                            // fails transiently and full-rebuilds too). Keep
-                                            // serving the valid cached index; the handful of
-                                            // changed files re-embed on a later refresh once the
-                                            // backend recovers. Mirrors the watcher-refresh
-                                            // self-heal in main.rs.
-                                            let clean =
-                                                crate::semantic_index::strip_transient_embedding_marker(
-                                                    &error,
-                                                );
-                                            slog_warn!(
-                                                "incremental refresh hit a transient backend error ({}); keeping the cached index instead of full-rebuilding",
-                                                clean
-                                            );
-                                            return Ok(SemanticBuildReady {
-                                                index: cached,
-                                                model,
-                                                persist_to_disk: false,
-                                                record_verify_completion: false,
-                                            });
-                                        }
-                                        // Permanent failure (dimension mismatch, etc.): the
-                                        // cache is genuinely unusable, drop it and full-rebuild.
-                                        slog_warn!(
-                                            "incremental refresh failed ({}), falling back to full rebuild",
-                                            error
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        set_cold_seed_active();
-
-                        let files = match walk_semantic_project_files_bounded(
-                            &root_clone,
-                            max_semantic_files,
-                        ) {
-                            Ok(files) => {
-                                let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                                    stage: "scanned_project_files".to_string(),
-                                    files: Some(files.len()),
-                                    entries_done: None,
-                                    entries_total: None,
-                                });
-                                files
-                            }
-                            Err(observed) => {
-                                let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                                    stage: "scanned_project_files".to_string(),
-                                    files: Some(observed),
-                                    entries_done: None,
-                                    entries_total: None,
-                                });
-                                slog_warn!(
-                                    "skipping semantic index: more than {} files exceeds limit of {}. \
-                                     Raise semantic.max_files or open a specific project directory.",
-                                    observed.saturating_sub(1),
-                                    max_semantic_files
-                                );
-                                return Err(format!(
-                                    "too many files (>{}) for semantic indexing (max {})",
-                                    max_semantic_files, max_semantic_files
-                                ));
-                            }
-                        };
-
-                        let mut embed = |texts: Vec<String>| model.embed(texts);
-
-                        let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                            stage: "extracting_symbols".to_string(),
-                            files: Some(files.len()),
-                            entries_done: None,
-                            entries_total: None,
-                        });
-                        let mut progress = |done: usize, total: usize| {
-                            let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                                stage: "embedding_symbols".to_string(),
-                                files: Some(files.len()),
-                                entries_done: Some(done),
-                                entries_total: Some(total),
-                            });
-                        };
-                        let index = SemanticIndex::build_with_progress(
-                            &root_clone,
-                            &files,
-                            &mut embed,
-                            semantic_config.max_batch_size.max(1),
-                            &mut progress,
-                        )?;
-                        let mut index = index;
-                        index.set_fingerprint(fingerprint);
-                        slog_info!(
-                            "built semantic index: {} files, {} entries",
-                            files.len(),
-                            index.len()
-                        );
-                        let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                            stage: "persisting_index".to_string(),
-                            files: Some(files.len()),
-                            entries_done: Some(index.len()),
-                            entries_total: Some(index.len()),
-                        });
-
-                        Ok(SemanticBuildReady {
-                            index,
-                            model,
-                            persist_to_disk: true,
-                            record_verify_completion: true,
-                        })
-                    };
-
-                    // Build-level retry: if the embedding backend is unreachable or
-                    // briefly failing (connection refused, timeout, 5xx/429), riding
-                    // it out beats parking the index in `Failed` forever — a state
-                    // nothing re-triggers short of a bridge restart. We keep retrying
-                    // with capped backoff, surfacing an honest "waiting for backend"
-                    // building-state so the sidebar shows recovery-in-progress, not a
-                    // red failure. The moment the backend returns, the build
-                    // succeeds and the index goes Ready.
-                    //
-                    // Permanent errors (dimension mismatch, too-many-files, 4xx auth)
-                    // are NOT marked transient and fail fast with the real message.
-                    //
-                    // Supersession is automatic: a reconfigure replaces the bridge's
-                    // semantic receiver, so the next `tx`/`tx_progress.send` returns
-                    // Err (receiver dropped) and this thread exits without competing
-                    // with the fresh build.
-                    let build_result = loop {
-                        let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
-                        match attempt_result {
-                            Ok(Err(ref error))
-                                if crate::semantic_index::embedding_failure_is_transient(error) =>
-                            {
-                                let clean =
-                                    crate::semantic_index::strip_transient_embedding_marker(error);
-                                let backoff = semantic_build_retry_backoff(semantic_retry_attempt);
-                                semantic_retry_attempt += 1;
-                                slog_warn!(
-                                "semantic index build: embedding backend unavailable ({}); retrying in {}s",
-                                clean,
-                                backoff.as_secs(),
-                            );
-                                // Surface "waiting for backend" as a building stage so
-                                // the sidebar shows recovery-in-progress. If the
-                                // receiver is gone (reconfigure superseded us), bail.
-                                clear_cold_seed_active();
-                                if tx_progress
-                                    .send(SemanticIndexEvent::Progress {
-                                        stage: format!("waiting_for_embedding_backend: {clean}"),
-                                        files: None,
-                                        entries_done: None,
-                                        entries_total: None,
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                if tx_progress
-                                    .send(SemanticIndexEvent::ColdSeedGateCleared)
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                thread::sleep(backoff);
-                                continue;
-                            }
-                            other => break other,
-                        }
-                    };
-
-                    enum SemanticBuildOutcome {
-                        Ready(SemanticBuildReady),
-                        Failed(String),
-                    }
-
-                    let outcome = match build_result {
-                        Ok(Ok(ready)) => SemanticBuildOutcome::Ready(ready),
-                        Ok(Err(error)) => {
-                            slog_warn!("failed to build semantic index: {}", error);
-                            SemanticBuildOutcome::Failed(error)
-                        }
-                        Err(_) => {
-                            let error = "semantic index build panicked".to_string();
-                            slog_warn!("{}", error);
-                            SemanticBuildOutcome::Failed(error)
-                        }
-                    };
-
-                    let persist_completed_index = |index: &SemanticIndex, reason: &str| {
-                        if is_worktree_bridge_for_semantic {
-                            return;
-                        }
-                        let Some(dir) = semantic_storage.as_ref() else {
-                            // Should be unreachable now that configure defaults
-                            // storage_dir; keep it loud in case a path regresses.
-                            slog_warn!(
-                                "semantic index persistence skipped for {reason}: no storage_dir resolved"
-                            );
-                            return;
-                        };
-                        if semantic_fingerprint_generation_flag
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            != semantic_fingerprint_generation
-                        {
-                            slog_info!(
-                                "semantic index persistence skipped for {reason}: semantic fingerprint changed after generation {} started",
-                                semantic_generation
-                            );
-                            return;
-                        }
-                        index.write_to_disk(dir, &semantic_project_key);
-                    };
-
-                    if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        != semantic_generation
-                    {
-                        if let SemanticBuildOutcome::Ready(ready) = &outcome {
-                            if ready.persist_to_disk {
-                                persist_completed_index(&ready.index, "stale generation discard");
-                            }
-                        }
-                        note_semantic_stale_generation_discard();
-                        slog_info!(
-                            "semantic index build result discarded for stale generation {}",
-                            semantic_generation
-                        );
-                        clear_cold_seed_active();
-                        return;
-                    }
-
-                    let event = match outcome {
-                        SemanticBuildOutcome::Ready(ready) => {
-                            let SemanticBuildReady {
-                                index,
-                                model,
-                                persist_to_disk,
-                                record_verify_completion,
-                            } = ready;
-                            if persist_to_disk {
-                                persist_completed_index(&index, "current generation publish");
-                            }
-                            if record_verify_completion {
-                                let generation = semantic_storage.as_ref().and_then(|dir| {
-                                    cache_freshness::artifact_generation(
-                                        &dir.join("semantic")
-                                            .join(&semantic_project_key)
-                                            .join("semantic.bin"),
-                                    )
-                                });
-                                cache_freshness::record_verify_completed(
-                                    &root_clone,
-                                    VerifyArtifact::Semantic,
-                                    generation,
-                                );
-                            }
-                            let worker_index = index.clone();
-                            let worker_handle = spawn_semantic_refresh_worker(
-                                root_clone.clone(),
-                                worker_index,
-                                model,
-                                semantic_config.max_batch_size.max(1),
-                                semantic_config.max_files,
-                                refresh_rx,
-                                refresh_event_tx,
-                                log_ctx::current_session(),
-                            );
-                            if let Ok(mut slot) = refresh_worker_slot.lock() {
-                                *slot = Some(worker_handle);
-                            }
-                            SemanticIndexEvent::Ready(index)
-                        }
-                        SemanticBuildOutcome::Failed(error) => SemanticIndexEvent::Failed(error),
-                    };
-
-                    if tx.send(event).is_err() {
-                        clear_cold_seed_active();
-                    }
-                });
-            });
-        }
+        artifact_load_starts.extend(schedule_missing_artifact_loads(
+            ctx,
+            search_index,
+            semantic_search,
+        ));
 
         // Clear the workspace package caches here because reconfigure can point AFT at a
         // different root; reset them before warming the callgraph store for the new project.
@@ -2961,6 +2229,849 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }),
     );
     response
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ArtifactLoadNeeds {
+    search: bool,
+    semantic: bool,
+}
+
+fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
+    let config = ctx.config();
+    let search_enabled = config.search_index;
+    let semantic_enabled = config.semantic_search;
+    drop(config);
+
+    let search_missing = search_enabled
+        && ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        && ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none();
+    let semantic_not_building = !matches!(
+        &*ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        SemanticIndexStatus::Building { .. }
+    );
+    let semantic_missing = semantic_enabled
+        && semantic_not_building
+        && ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        && ctx.semantic_index_rx().lock().is_none();
+
+    ArtifactLoadNeeds {
+        search: search_missing,
+        semantic: semantic_missing,
+    }
+}
+
+fn schedule_missing_artifact_loads(
+    ctx: &AppContext,
+    request_search: bool,
+    request_semantic: bool,
+) -> Vec<crossbeam_channel::Sender<()>> {
+    let _reload_guard = ctx.artifact_reload_guard();
+    let missing = missing_artifact_loads(ctx);
+    let load_search = request_search && missing.search;
+    let load_semantic = request_semantic && missing.semantic;
+    if !load_search && !load_semantic {
+        return Vec::new();
+    }
+    schedule_artifact_loads(ctx, load_search, load_semantic)
+}
+
+fn start_artifact_loads(starts: Vec<crossbeam_channel::Sender<()>>) -> bool {
+    let started = !starts.is_empty();
+    for start in starts {
+        let _ = start.send(());
+    }
+    started
+}
+
+/// Start a writer-owned trigram reload after an idle eviction. The caller keeps
+/// serving the current request through the bounded fallback walk.
+pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
+    if ctx.shared_artifacts_read_only() || ctx.canonical_cache_root_opt().is_none() {
+        return false;
+    }
+    start_artifact_loads(schedule_missing_artifact_loads(ctx, true, false))
+}
+
+/// Start a writer-owned semantic reload after an idle eviction without blocking
+/// the current query. Failed and disabled indexes retain their existing behavior.
+pub(crate) fn trigger_semantic_index_reload_if_evicted(ctx: &AppContext) -> bool {
+    if ctx.shared_artifacts_read_only()
+        || ctx.canonical_cache_root_opt().is_none()
+        || !matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
+        )
+    {
+        return false;
+    }
+    start_artifact_loads(schedule_missing_artifact_loads(ctx, false, true))
+}
+
+fn schedule_artifact_loads(
+    ctx: &AppContext,
+    load_search: bool,
+    load_semantic: bool,
+) -> Vec<crossbeam_channel::Sender<()>> {
+    let canonical_cache_root = ctx.canonical_cache_root();
+    let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
+    let config = ctx.config();
+    let storage_dir = config.storage_dir.clone();
+    let search_index_max_file_size = config.search_index_max_file_size;
+    let semantic_config = config.semantic.clone();
+    drop(config);
+    let is_worktree_bridge = ctx.is_worktree_bridge();
+    let configure_generation = ctx.configure_generation();
+    let semantic_cold_seed_generation = ctx.semantic_cold_seed_generation();
+    let semantic_fingerprint_generation = ctx.semantic_fingerprint_generation();
+    let symbol_cache_generation = if load_search {
+        ctx.reset_symbol_cache()
+    } else {
+        0
+    };
+    let mut artifact_load_starts = Vec::new();
+
+    if load_search {
+        let cache_dir = resolve_cache_dir_with_key(&project_key, storage_dir.as_deref());
+        let root_for_search = canonical_cache_root.clone();
+        let symbol_cache = ctx.symbol_cache();
+        let symbol_storage = storage_dir.clone();
+        let symbol_project_key = project_key.clone();
+        let is_worktree_bridge_for_search = is_worktree_bridge;
+        let shared_artifacts_read_only_for_search = ctx.shared_artifacts_read_only();
+        let session_id_for_bg = log_ctx::current_session();
+        let search_generation = configure_generation;
+        let search_generation_flag = ctx.configure_generation_flag();
+        let (tx, rx) = unbounded::<SearchIndex>();
+        *ctx.search_index_rx()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+        let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+        artifact_load_starts.push(start_tx);
+
+        #[cfg(debug_assertions)]
+        mark_search_rebuild_spawn_for_debug();
+        thread::spawn(move || {
+            if start_rx.recv().is_err() {
+                return;
+            }
+            log_ctx::with_session(session_id_for_bg.clone(), || {
+                note_configure_artifact_load_attempt();
+                if shared_artifacts_read_only_for_search {
+                    match crate::readonly_artifacts::open_search_index_read_only(
+                        &root_for_search,
+                        symbol_storage.as_deref(),
+                    ) {
+                        crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
+                            let symbol_files = search_index_symbol_files(&index);
+                            let _ = tx.send(index);
+                            spawn_symbol_cache_prewarm(
+                                root_for_search,
+                                symbol_cache,
+                                symbol_storage,
+                                symbol_project_key,
+                                symbol_cache_generation,
+                                symbol_files,
+                                true,
+                                log_ctx::current_session(),
+                            );
+                        }
+                        crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                            slog_warn!(
+                                "search index is read-only and stale for {} file(s); not repairing shared artifacts",
+                                stale.drift_count
+                            );
+                        }
+                        crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
+                            slog_warn!(
+                                "search index is read-only but no shared artifact snapshot exists"
+                            );
+                        }
+                    }
+                    return;
+                }
+
+                let _permit =
+                    crate::cold_build_limiter::acquire_blocking("search index post-configure load");
+                // HEAD freshness is deliberately probed after the bind ack. The
+                // helper bounds git so a wedged repository cannot pin maintenance.
+                let current_head = current_git_head(&root_for_search);
+                let cache_path = cache_dir.join("cache.bin");
+                let artifact_generation = cache_freshness::artifact_generation(&cache_path);
+                let verify_plan = cache_freshness::warm_verify_plan(
+                    &root_for_search,
+                    VerifyArtifact::Search,
+                    artifact_generation,
+                );
+                let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
+                let mut persist_to_disk = true;
+                let mut record_completed_verify = true;
+                let mut index = match baseline {
+                    Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
+                        index.set_ready(false);
+                        match verify_plan {
+                            WarmVerifyPlan::Skip => {
+                                index.set_ready(true);
+                                persist_to_disk = false;
+                                record_completed_verify = false;
+                            }
+                            WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => {
+                                let _cache_lock = (!is_worktree_bridge_for_search)
+                                    .then(|| CacheLock::acquire(&cache_dir, &root_for_search).ok())
+                                    .flatten();
+                                let strategy = match verify_plan {
+                                    WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
+                                    WarmVerifyPlan::Strict => VerifyStrategy::Strict,
+                                    WarmVerifyPlan::Skip => unreachable!(),
+                                };
+                                let disk_changed = index.verify_against_disk_with_strategy(
+                                    current_head.clone(),
+                                    strategy,
+                                );
+                                persist_to_disk = disk_changed || index.has_pending_disk_changes();
+                            }
+                        }
+                        index
+                    }
+                    mut baseline => {
+                        if let Some(index) = baseline.as_mut() {
+                            index.set_ready(false);
+                        }
+                        let _cache_lock = if is_worktree_bridge_for_search {
+                            None
+                        } else {
+                            CacheLock::acquire(&cache_dir, &root_for_search).ok()
+                        };
+                        let strategy = match verify_plan {
+                            WarmVerifyPlan::Strict => VerifyStrategy::Strict,
+                            WarmVerifyPlan::Skip | WarmVerifyPlan::StatFirst => {
+                                VerifyStrategy::StatFirst
+                            }
+                        };
+                        let index = SearchIndex::rebuild_or_refresh_with_strategy(
+                            &root_for_search,
+                            search_index_max_file_size,
+                            current_head,
+                            baseline,
+                            Some(&cache_dir),
+                            strategy,
+                        );
+                        delay_search_rebuild_publish_for_debug();
+                        index
+                    }
+                };
+                if !is_worktree_bridge_for_search && persist_to_disk {
+                    let head = index.stored_git_head().map(str::to_owned);
+                    index.write_to_disk(&cache_dir, head.as_deref());
+                }
+                if record_completed_verify {
+                    cache_freshness::record_verify_completed(
+                        &root_for_search,
+                        VerifyArtifact::Search,
+                        cache_freshness::artifact_generation(&cache_path),
+                    );
+                }
+                let symbol_files = search_index_symbol_files(&index);
+                if search_generation_flag.load(Ordering::SeqCst) == search_generation {
+                    let _ = tx.send(index);
+                    spawn_symbol_cache_prewarm(
+                        root_for_search,
+                        symbol_cache,
+                        symbol_storage,
+                        symbol_project_key,
+                        symbol_cache_generation,
+                        symbol_files,
+                        false,
+                        log_ctx::current_session(),
+                    );
+                } else {
+                    slog_info!(
+                        "search index build result discarded for stale generation {}",
+                        search_generation
+                    );
+                }
+            });
+        });
+    }
+
+    if load_semantic && ctx.shared_artifacts_read_only() {
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let (tx, rx) = unbounded::<SemanticIndexEvent>();
+        *ctx.semantic_index_rx().lock() = Some(rx);
+        let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+        artifact_load_starts.push(start_tx);
+        let semantic_root = canonical_cache_root.clone();
+        let semantic_storage = storage_dir.clone();
+        let session_id = log_ctx::current_session();
+        thread::spawn(move || {
+            if start_rx.recv().is_err() {
+                return;
+            }
+            log_ctx::with_session(session_id, || {
+                note_configure_artifact_load_attempt();
+                let event = match crate::readonly_artifacts::open_semantic_index_read_only(
+                    &semantic_root,
+                    semantic_storage.as_deref(),
+                ) {
+                    crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
+                        SemanticIndexEvent::Ready(index)
+                    }
+                    crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
+                        slog_warn!(
+                            "semantic index is read-only and stale for {} file(s); serving stale snapshot without repairing shared artifacts",
+                            stale.drift_count
+                        );
+                        SemanticIndexEvent::Ready(stale.index)
+                    }
+                    crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
+                        SemanticIndexEvent::Failed(
+                            "semantic index is read-only but no shared artifact snapshot exists"
+                                .to_string(),
+                        )
+                    }
+                };
+                let _ = tx.send(event);
+            });
+        });
+    } else if load_semantic {
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let (tx, rx): (
+            crossbeam_channel::Sender<SemanticIndexEvent>,
+            crossbeam_channel::Receiver<SemanticIndexEvent>,
+        ) = unbounded();
+        *ctx.semantic_index_rx().lock() = Some(rx);
+
+        let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
+        let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
+        let refresh_worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
+        ctx.install_semantic_refresh_worker(
+            refresh_tx,
+            refresh_event_rx,
+            Arc::clone(&refresh_worker_slot),
+        );
+
+        let root_clone = canonical_cache_root.clone();
+        let semantic_storage = storage_dir.clone();
+        let semantic_project_key = project_key.clone();
+        let semantic_config = semantic_config.clone();
+        let tx_progress = tx.clone();
+        let is_worktree_bridge_for_semantic = is_worktree_bridge;
+        let semantic_cold_seed_active = ctx.semantic_cold_seed_active_flag();
+        let semantic_cold_seed_generation_flag = ctx.semantic_cold_seed_generation_flag();
+        let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
+        let semantic_generation = configure_generation;
+        let semantic_generation_flag = ctx.configure_generation_flag();
+        let semantic_fingerprint_generation_flag = ctx.semantic_fingerprint_generation_flag();
+        let session_id_for_bg2 = log_ctx::current_session();
+        let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+        artifact_load_starts.push(start_tx);
+        thread::spawn(move || {
+            if start_rx.recv().is_err() {
+                return;
+            }
+            note_configure_artifact_load_attempt();
+            log_ctx::with_session(session_id_for_bg2, || {
+                // Cap file count to bound memory on huge project roots (e.g.,
+                // /home/user). The local fastembed model (~200MB) + embeddings +
+                // batch buffers can exceed memory on constrained systems when
+                // indexing tens of thousands of files. Configurable via
+                // `semantic.max_files` (default 20k); remote backends that embed
+                // server-side can raise it freely.
+                let max_semantic_files = semantic_config.max_files;
+                let mut semantic_retry_attempt: usize = 0;
+                let set_cold_seed_active = || {
+                    if semantic_cold_seed_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        == semantic_cold_seed_generation_for_worker
+                    {
+                        semantic_cold_seed_active.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                };
+                let clear_cold_seed_active = || {
+                    if semantic_cold_seed_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        == semantic_cold_seed_generation_for_worker
+                    {
+                        semantic_cold_seed_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                };
+                let clear_cold_seed_gate_and_notify = || {
+                    clear_cold_seed_active();
+                    let _ = tx_progress.send(SemanticIndexEvent::ColdSeedGateCleared);
+                };
+
+                struct SemanticBuildReady {
+                    index: SemanticIndex,
+                    model: crate::semantic_index::EmbeddingModel,
+                    persist_to_disk: bool,
+                    record_verify_completion: bool,
+                }
+
+                let build_once = || -> Result<SemanticBuildReady, String> {
+                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                        stage: "initializing_embedding_model".to_string(),
+                        files: None,
+                        entries_done: None,
+                        entries_total: None,
+                    });
+                    let mut model =
+                        crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
+                    let fingerprint = model.fingerprint(&semantic_config)?;
+                    let fingerprint_key = fingerprint.as_string();
+                    let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
+                        .then(|| ())
+                        .and_then(|_| semantic_storage.as_ref())
+                        .and_then(|dir| {
+                            match SemanticIndexLock::acquire(
+                                dir,
+                                &semantic_project_key,
+                                &root_clone,
+                            ) {
+                                Ok(lock) => Some(lock),
+                                Err(error) => {
+                                    slog_warn!("failed to acquire semantic cache lock: {}", error);
+                                    None
+                                }
+                            }
+                        });
+
+                    if let Some(ref dir) = semantic_storage {
+                        let data_path = dir
+                            .join("semantic")
+                            .join(&semantic_project_key)
+                            .join("semantic.bin");
+                        let verify_plan = cache_freshness::warm_verify_plan(
+                            &root_clone,
+                            VerifyArtifact::Semantic,
+                            cache_freshness::artifact_generation(&data_path),
+                        );
+                        if let Some(cached) = SemanticIndex::read_from_disk(
+                            dir,
+                            &semantic_project_key,
+                            &root_clone,
+                            is_worktree_bridge_for_semantic,
+                            Some(&fingerprint_key),
+                        ) {
+                            clear_cold_seed_gate_and_notify();
+                            if verify_plan == WarmVerifyPlan::Skip {
+                                slog_info!(
+                                    "semantic index: recently verified cache generation reused ({} entries)",
+                                    cached.entry_count(),
+                                );
+                                return Ok(SemanticBuildReady {
+                                    index: cached,
+                                    model,
+                                    persist_to_disk: false,
+                                    record_verify_completion: false,
+                                });
+                            }
+                            // Try incremental refresh: re-embed only changed/new files,
+                            // drop entries for deleted files, keep everything else.
+                            // This is the hot path for restart on a project with a
+                            // handful of edits — avoids re-embedding 4000+ unchanged
+                            // files just to pick up 10 changes.
+                            let current_files = match walk_semantic_project_files_bounded(
+                                &root_clone,
+                                max_semantic_files,
+                            ) {
+                                Ok(files) => files,
+                                Err(observed) => {
+                                    slog_warn!(
+                                        "skipping semantic index: more than {} files exceeds limit of {}. \
+                                         Raise semantic.max_files or open a specific project directory.",
+                                        observed.saturating_sub(1),
+                                        max_semantic_files
+                                    );
+                                    return Err(format!(
+                                        "too many files (>{}) for semantic indexing (max {})",
+                                        max_semantic_files, max_semantic_files
+                                    ));
+                                }
+                            };
+
+                            let mut cached = cached;
+                            let mut embed = |texts: Vec<String>| model.embed(texts);
+                            let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                stage: "refreshing_stale_files".to_string(),
+                                files: None,
+                                entries_done: None,
+                                entries_total: None,
+                            });
+                            let mut progress = |done: usize, total: usize| {
+                                let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                    stage: "embedding_stale_symbols".to_string(),
+                                    files: None,
+                                    entries_done: Some(done),
+                                    entries_total: Some(total),
+                                });
+                            };
+
+                            let verify_strategy = match verify_plan {
+                                WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
+                                WarmVerifyPlan::Strict => VerifyStrategy::Strict,
+                                WarmVerifyPlan::Skip => unreachable!(),
+                            };
+                            match cached.refresh_stale_files_with_strategy(
+                                &root_clone,
+                                &current_files,
+                                &mut embed,
+                                semantic_config.max_batch_size.max(1),
+                                &mut progress,
+                                verify_strategy,
+                            ) {
+                                Ok(summary) => {
+                                    if summary.is_noop() {
+                                        slog_info!(
+                                            "semantic index: cached index is current ({} entries)",
+                                            cached.entry_count(),
+                                        );
+                                    } else {
+                                        slog_info!(
+                                            "semantic index: refreshed incrementally — {} changed, {} new, {} deleted, {} total processed (kept {} cached)",
+                                            summary.changed,
+                                            summary.added,
+                                            summary.deleted,
+                                            summary.total_processed,
+                                            cached.len(),
+                                        );
+                                        cached.set_fingerprint(fingerprint);
+                                    }
+                                    let persist_to_disk = !summary.is_noop();
+                                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                        stage: "loaded_cached_index".to_string(),
+                                        files: None,
+                                        entries_done: Some(cached.entry_count()),
+                                        entries_total: Some(cached.entry_count()),
+                                    });
+                                    return Ok(SemanticBuildReady {
+                                        index: cached,
+                                        model,
+                                        persist_to_disk,
+                                        record_verify_completion: true,
+                                    });
+                                }
+                                Err(error) => {
+                                    if crate::semantic_index::embedding_failure_is_transient(&error)
+                                    {
+                                        // TRANSIENT backend error (e.g. the embedding
+                                        // server is overloaded by concurrent bridges, or
+                                        // briefly unreachable). Do NOT drop the cache and
+                                        // full-rebuild: a full corpus re-embed against an
+                                        // already-overloaded backend amplifies the overload
+                                        // and cascades to other bridges AND the main
+                                        // session (every bridge's incremental refresh then
+                                        // fails transiently and full-rebuilds too). Keep
+                                        // serving the valid cached index; the handful of
+                                        // changed files re-embed on a later refresh once the
+                                        // backend recovers. Mirrors the watcher-refresh
+                                        // self-heal in main.rs.
+                                        let clean =
+                                            crate::semantic_index::strip_transient_embedding_marker(
+                                                &error,
+                                            );
+                                        slog_warn!(
+                                            "incremental refresh hit a transient backend error ({}); keeping the cached index instead of full-rebuilding",
+                                            clean
+                                        );
+                                        return Ok(SemanticBuildReady {
+                                            index: cached,
+                                            model,
+                                            persist_to_disk: false,
+                                            record_verify_completion: false,
+                                        });
+                                    }
+                                    // Permanent failure (dimension mismatch, etc.): the
+                                    // cache is genuinely unusable, drop it and full-rebuild.
+                                    slog_warn!(
+                                        "incremental refresh failed ({}), falling back to full rebuild",
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    set_cold_seed_active();
+
+                    let files = match walk_semantic_project_files_bounded(
+                        &root_clone,
+                        max_semantic_files,
+                    ) {
+                        Ok(files) => {
+                            let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                stage: "scanned_project_files".to_string(),
+                                files: Some(files.len()),
+                                entries_done: None,
+                                entries_total: None,
+                            });
+                            files
+                        }
+                        Err(observed) => {
+                            let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                stage: "scanned_project_files".to_string(),
+                                files: Some(observed),
+                                entries_done: None,
+                                entries_total: None,
+                            });
+                            slog_warn!(
+                                "skipping semantic index: more than {} files exceeds limit of {}. \
+                                 Raise semantic.max_files or open a specific project directory.",
+                                observed.saturating_sub(1),
+                                max_semantic_files
+                            );
+                            return Err(format!(
+                                "too many files (>{}) for semantic indexing (max {})",
+                                max_semantic_files, max_semantic_files
+                            ));
+                        }
+                    };
+
+                    let mut embed = |texts: Vec<String>| model.embed(texts);
+
+                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                        stage: "extracting_symbols".to_string(),
+                        files: Some(files.len()),
+                        entries_done: None,
+                        entries_total: None,
+                    });
+                    let mut progress = |done: usize, total: usize| {
+                        let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                            stage: "embedding_symbols".to_string(),
+                            files: Some(files.len()),
+                            entries_done: Some(done),
+                            entries_total: Some(total),
+                        });
+                    };
+                    let index = SemanticIndex::build_with_progress(
+                        &root_clone,
+                        &files,
+                        &mut embed,
+                        semantic_config.max_batch_size.max(1),
+                        &mut progress,
+                    )?;
+                    let mut index = index;
+                    index.set_fingerprint(fingerprint);
+                    slog_info!(
+                        "built semantic index: {} files, {} entries",
+                        files.len(),
+                        index.len()
+                    );
+                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                        stage: "persisting_index".to_string(),
+                        files: Some(files.len()),
+                        entries_done: Some(index.len()),
+                        entries_total: Some(index.len()),
+                    });
+
+                    Ok(SemanticBuildReady {
+                        index,
+                        model,
+                        persist_to_disk: true,
+                        record_verify_completion: true,
+                    })
+                };
+
+                // Build-level retry: if the embedding backend is unreachable or
+                // briefly failing (connection refused, timeout, 5xx/429), riding
+                // it out beats parking the index in `Failed` forever — a state
+                // nothing re-triggers short of a bridge restart. We keep retrying
+                // with capped backoff, surfacing an honest "waiting for backend"
+                // building-state so the sidebar shows recovery-in-progress, not a
+                // red failure. The moment the backend returns, the build
+                // succeeds and the index goes Ready.
+                //
+                // Permanent errors (dimension mismatch, too-many-files, 4xx auth)
+                // are NOT marked transient and fail fast with the real message.
+                //
+                // Supersession is automatic: a reconfigure replaces the bridge's
+                // semantic receiver, so the next `tx`/`tx_progress.send` returns
+                // Err (receiver dropped) and this thread exits without competing
+                // with the fresh build.
+                let build_result = loop {
+                    let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
+                    match attempt_result {
+                        Ok(Err(ref error))
+                            if crate::semantic_index::embedding_failure_is_transient(error) =>
+                        {
+                            let clean =
+                                crate::semantic_index::strip_transient_embedding_marker(error);
+                            let backoff = semantic_build_retry_backoff(semantic_retry_attempt);
+                            semantic_retry_attempt += 1;
+                            slog_warn!(
+                            "semantic index build: embedding backend unavailable ({}); retrying in {}s",
+                            clean,
+                            backoff.as_secs(),
+                        );
+                            // Surface "waiting for backend" as a building stage so
+                            // the sidebar shows recovery-in-progress. If the
+                            // receiver is gone (reconfigure superseded us), bail.
+                            clear_cold_seed_active();
+                            if tx_progress
+                                .send(SemanticIndexEvent::Progress {
+                                    stage: format!("waiting_for_embedding_backend: {clean}"),
+                                    files: None,
+                                    entries_done: None,
+                                    entries_total: None,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if tx_progress
+                                .send(SemanticIndexEvent::ColdSeedGateCleared)
+                                .is_err()
+                            {
+                                return;
+                            }
+                            thread::sleep(backoff);
+                            continue;
+                        }
+                        other => break other,
+                    }
+                };
+
+                enum SemanticBuildOutcome {
+                    Ready(SemanticBuildReady),
+                    Failed(String),
+                }
+
+                let outcome = match build_result {
+                    Ok(Ok(ready)) => SemanticBuildOutcome::Ready(ready),
+                    Ok(Err(error)) => {
+                        slog_warn!("failed to build semantic index: {}", error);
+                        SemanticBuildOutcome::Failed(error)
+                    }
+                    Err(_) => {
+                        let error = "semantic index build panicked".to_string();
+                        slog_warn!("{}", error);
+                        SemanticBuildOutcome::Failed(error)
+                    }
+                };
+
+                let persist_completed_index = |index: &SemanticIndex, reason: &str| {
+                    if is_worktree_bridge_for_semantic {
+                        return;
+                    }
+                    let Some(dir) = semantic_storage.as_ref() else {
+                        // Should be unreachable now that configure defaults
+                        // storage_dir; keep it loud in case a path regresses.
+                        slog_warn!(
+                            "semantic index persistence skipped for {reason}: no storage_dir resolved"
+                        );
+                        return;
+                    };
+                    if semantic_fingerprint_generation_flag
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        != semantic_fingerprint_generation
+                    {
+                        slog_info!(
+                            "semantic index persistence skipped for {reason}: semantic fingerprint changed after generation {} started",
+                            semantic_generation
+                        );
+                        return;
+                    }
+                    index.write_to_disk(dir, &semantic_project_key);
+                };
+
+                if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                    != semantic_generation
+                {
+                    if let SemanticBuildOutcome::Ready(ready) = &outcome {
+                        if ready.persist_to_disk {
+                            persist_completed_index(&ready.index, "stale generation discard");
+                        }
+                    }
+                    note_semantic_stale_generation_discard();
+                    slog_info!(
+                        "semantic index build result discarded for stale generation {}",
+                        semantic_generation
+                    );
+                    clear_cold_seed_active();
+                    return;
+                }
+
+                let event = match outcome {
+                    SemanticBuildOutcome::Ready(ready) => {
+                        let SemanticBuildReady {
+                            index,
+                            model,
+                            persist_to_disk,
+                            record_verify_completion,
+                        } = ready;
+                        if persist_to_disk {
+                            persist_completed_index(&index, "current generation publish");
+                        }
+                        if record_verify_completion {
+                            let generation = semantic_storage.as_ref().and_then(|dir| {
+                                cache_freshness::artifact_generation(
+                                    &dir.join("semantic")
+                                        .join(&semantic_project_key)
+                                        .join("semantic.bin"),
+                                )
+                            });
+                            cache_freshness::record_verify_completed(
+                                &root_clone,
+                                VerifyArtifact::Semantic,
+                                generation,
+                            );
+                        }
+                        let worker_index = index.clone();
+                        let worker_handle = spawn_semantic_refresh_worker(
+                            root_clone.clone(),
+                            worker_index,
+                            model,
+                            semantic_config.max_batch_size.max(1),
+                            semantic_config.max_files,
+                            refresh_rx,
+                            refresh_event_tx,
+                            log_ctx::current_session(),
+                        );
+                        if let Ok(mut slot) = refresh_worker_slot.lock() {
+                            *slot = Some(worker_handle);
+                        }
+                        SemanticIndexEvent::Ready(index)
+                    }
+                    SemanticBuildOutcome::Failed(error) => SemanticIndexEvent::Failed(error),
+                };
+
+                if tx.send(event).is_err() {
+                    clear_cold_seed_active();
+                }
+            });
+        });
+    }
+
+    artifact_load_starts
 }
 
 fn replay_configure_session(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
@@ -3636,6 +3747,54 @@ mod tests {
         }
     }
 
+    fn wait_for_search_index_ready(ctx: &AppContext, timeout: Duration) {
+        super::drain_deferred_configure_maintenance(ctx);
+        let deadline = Instant::now() + timeout;
+        loop {
+            crate::runtime_drain::drain_build_completions(ctx);
+            let ready = ctx
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|index| index.ready);
+            if ready
+                && ctx
+                    .search_index_rx()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for search index build"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn semantic_search_request(query: &str) -> RawRequest {
+        serde_json::from_value(json!({
+            "id": "semantic-reload-query",
+            "command": "semantic_search",
+            "query": query,
+            "top_k": 5
+        }))
+        .expect("semantic search request")
+    }
+
+    fn grep_request(pattern: &str) -> RawRequest {
+        serde_json::from_value(json!({
+            "id": "grep-reload-query",
+            "command": "grep",
+            "pattern": pattern,
+            "max_results": 10
+        }))
+        .expect("grep request")
+    }
+
     #[test]
     fn configure_user_file_wins_project_wire_falls_back_per_tier() {
         let temp = tempfile::tempdir().unwrap();
@@ -4292,9 +4451,230 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_reconfigure_reloads_evicted_semantic_index_from_disk() {
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn reloadable_semantic_symbol() -> bool { true }\n",
+        )
+        .unwrap();
+        init_git_fixture(&project);
+        let request = configure_semantic_with_storage(&project, &storage, &server.base_url, true);
+        let ctx = test_context();
+
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            server.wait_for_non_probe_input(Duration::from_secs(5)),
+            "initial semantic build did not reach the embedding server"
+        );
+        server.release_responses();
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert!(semantic_cache_file(&storage, &project).is_file());
+        let embedded_before_reload = server.non_probe_input_count();
+
+        assert!(ctx.evict_idle_artifacts(), "semantic index should be idle");
+        assert!(ctx.semantic_index().read().unwrap().is_none());
+        reset_configure_artifact_load_attempts_for_test();
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(
+            response.success,
+            "equivalent configure failed: {:?}",
+            response.data
+        );
+        assert_eq!(
+            response.data["search_index_cache_reused"],
+            json!(false),
+            "an evicted artifact must not be reported as resident reuse"
+        );
+        assert_eq!(
+            configure_artifact_load_attempts_for_test(),
+            0,
+            "equivalent rebind must keep disk loading behind the acknowledgement"
+        );
+        assert!(
+            ctx.semantic_index_rx().lock().is_some(),
+            "equivalent rebind did not schedule the missing semantic artifact"
+        );
+
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(
+            configure_artifact_load_attempts_for_test(),
+            1,
+            "equivalent rebind should start one semantic loader"
+        );
+        assert_eq!(
+            server.non_probe_input_count(),
+            embedded_before_reload,
+            "semantic reload re-embedded corpus content instead of reading semantic.bin"
+        );
+    }
+
+    #[test]
+    fn semantic_query_reloads_evicted_index_once_without_reconfigure() {
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn query_reload_symbol() -> bool { true }\n",
+        )
+        .unwrap();
+        init_git_fixture(&project);
+        let ctx = test_context();
+        let configure = handle_configure_for_test(
+            &configure_semantic_with_storage(&project, &storage, &server.base_url, true),
+            &ctx,
+        );
+        assert!(configure.success, "configure failed: {:?}", configure.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            server.wait_for_non_probe_input(Duration::from_secs(5)),
+            "initial semantic build did not reach the embedding server"
+        );
+        server.release_responses();
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        let embedded_before_reload = server.non_probe_input_count();
+
+        assert!(ctx.evict_idle_artifacts(), "semantic index should be idle");
+        reset_configure_artifact_load_attempts_for_test();
+        let first = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("how does the query reload semantic state"),
+            &ctx,
+        );
+        assert!(
+            first.success,
+            "degraded search should succeed: {:?}",
+            first.data
+        );
+        assert!(
+            first.data["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Semantic index is reloading; retry shortly.")),
+            "first query did not disclose the scheduled reload: {:?}",
+            first.data
+        );
+        assert!(
+            ctx.semantic_index_rx().lock().is_some(),
+            "first query did not reserve the semantic reload slot"
+        );
+
+        let second = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("how does the query reload semantic state"),
+            &ctx,
+        );
+        assert!(
+            second.success,
+            "building fallback should succeed: {:?}",
+            second.data
+        );
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(
+            configure_artifact_load_attempts_for_test(),
+            1,
+            "repeated queries started duplicate semantic reload workers"
+        );
+        assert_eq!(
+            server.non_probe_input_count(),
+            embedded_before_reload,
+            "query-path reload re-embedded corpus content instead of reading semantic.bin"
+        );
+    }
+
+    #[test]
+    fn grep_query_reloads_evicted_trigram_index_from_cache() {
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn TrigramReloadNeedle() -> bool { true }\n",
+        )
+        .unwrap();
+        init_git_fixture(&project);
+        let ctx = test_context();
+        let configure = handle_configure_for_test(
+            &configure_request_with_params(json!({
+                "project_root": project,
+                "harness": "opencode",
+                "storage_dir": storage,
+                "config": [user_tier(json!({
+                    "search_index": true,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            })),
+            &ctx,
+        );
+        assert!(configure.success, "configure failed: {:?}", configure.data);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        ctx.flush_search_index_on_graceful_shutdown();
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+        let cache_dir = crate::search_index::resolve_cache_dir_with_key(
+            &ctx.memoized_artifact_cache_key(&canonical_project),
+            Some(&storage),
+        );
+        let cache_file = cache_dir.join("cache.bin");
+        let cache_modified_before = std::fs::metadata(&cache_file)
+            .and_then(|metadata| metadata.modified())
+            .expect("search cache modification time");
+
+        assert!(ctx.evict_idle_artifacts(), "trigram index should be idle");
+        reset_configure_artifact_load_attempts_for_test();
+        let first = crate::commands::grep::handle_grep(&grep_request("TrigramReloadNeedle"), &ctx);
+        assert!(first.success, "fallback grep failed: {:?}", first.data);
+        assert_eq!(first.data["index_status"], json!("Building"));
+        assert_eq!(first.data["total_matches"], json!(1));
+        assert!(
+            ctx.search_index_rx().read().unwrap().is_some(),
+            "fallback grep did not reserve the trigram reload slot"
+        );
+
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(
+            configure_artifact_load_attempts_for_test(),
+            1,
+            "fallback queries started duplicate trigram reload workers"
+        );
+        assert_eq!(
+            std::fs::metadata(&cache_file)
+                .and_then(|metadata| metadata.modified())
+                .expect("reloaded search cache modification time"),
+            cache_modified_before,
+            "trigram reload rewrote cache.bin instead of loading the verified cache"
+        );
+        let indexed =
+            crate::commands::grep::handle_grep(&grep_request("TrigramReloadNeedle"), &ctx);
+        assert!(indexed.success, "indexed grep failed: {:?}", indexed.data);
+        assert_eq!(indexed.data["index_status"], json!("Ready"));
+        assert_eq!(indexed.data["total_matches"], json!(1));
+    }
+
+    #[test]
     fn linked_worktree_configure_defers_read_only_artifact_loads_without_cold_builds() {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
@@ -4337,6 +4717,41 @@ mod tests {
         assert!(
             ctx.callgraph_store_rx().lock().is_none(),
             "linked worktrees must not schedule a callgraph cold build"
+        );
+
+        super::drain_deferred_configure_maintenance(&ctx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ctx.search_index_rx().read().unwrap().is_some()
+            || ctx.semantic_index_rx().lock().is_some()
+        {
+            crate::runtime_drain::drain_build_completions(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "read-only artifact opens did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ctx.evict_idle_artifacts(),
+            "read-only artifacts should be idle"
+        );
+        reset_configure_artifact_load_attempts_for_test();
+        let owner_before = ctx.artifact_owner_status();
+        let grep = crate::commands::grep::handle_grep(&grep_request("tracked"), &ctx);
+        assert!(
+            grep.success,
+            "read-only fallback grep failed: {:?}",
+            grep.data
+        );
+        assert!(!super::trigger_semantic_index_reload_if_evicted(&ctx));
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(ctx.semantic_index_rx().lock().is_none());
+        assert_eq!(configure_artifact_load_attempts_for_test(), 0);
+        assert!(ctx.shared_artifacts_read_only());
+        assert_eq!(
+            ctx.artifact_owner_status().map(|status| status.mode),
+            owner_before.map(|status| status.mode),
+            "read-only fallback must not acquire an owner lease"
         );
     }
 

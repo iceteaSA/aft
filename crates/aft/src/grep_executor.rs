@@ -280,6 +280,9 @@ fn execute_root_profiled(
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary + UTF-8 guards still apply.
     if root.search_root.is_file() {
+        if root.use_index {
+            crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
+        }
         let index_status = if root.use_index {
             current_index_status(ctx)
         } else {
@@ -325,6 +328,9 @@ fn execute_root_profiled(
         );
     }
 
+    if root.use_index {
+        crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
+    }
     let index_status = if root.use_index {
         current_index_status(ctx)
     } else {
