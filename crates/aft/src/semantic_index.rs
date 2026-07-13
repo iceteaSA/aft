@@ -1,7 +1,7 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::config::{SemanticBackend, SemanticBackendConfig};
 use crate::fs_lock;
-use crate::parser::{detect_language, extract_symbols_from_tree, grammar_for};
+use crate::parser::{detect_language, extract_symbols_from_tree, parse_source_with_cached_parser};
 use crate::search_index::{cache_relative_path, cached_path_under_root};
 use crate::symbols::{Symbol, SymbolKind};
 use crate::{slog_info, slog_warn};
@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
-use tree_sitter::Parser;
 use url::Url;
 
 const DEFAULT_DIMENSION: usize = 384;
@@ -1834,27 +1833,23 @@ impl SemanticIndex {
         files: &[PathBuf],
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
         let collect_started = Instant::now();
-        let collect_one =
-            |file: &Path, parsers: &mut HashMap<crate::parser::LangId, Parser>, sched: Duration| {
-                let mut phases = SemanticCollectPhaseTimings {
-                    sched,
-                    ..SemanticCollectPhaseTimings::default()
-                };
-                let result = collect_semantic_file(project_root, file, parsers, &mut phases);
-                (file.to_path_buf(), result, phases)
+        let collect_one = |file: &Path, sched: Duration| {
+            let mut phases = SemanticCollectPhaseTimings {
+                sched,
+                ..SemanticCollectPhaseTimings::default()
             };
+            let result = collect_semantic_file(project_root, file, &mut phases);
+            (file.to_path_buf(), result, phases)
+        };
         let per_file: Vec<CollectedSemanticFile> = if files.len() <= 2 {
-            let mut parsers = HashMap::new();
             files
                 .iter()
-                .map(|file| collect_one(file, &mut parsers, Duration::ZERO))
+                .map(|file| collect_one(file, Duration::ZERO))
                 .collect()
         } else {
             files
                 .par_iter()
-                .map_init(HashMap::new, |parsers, file| {
-                    collect_one(file, parsers, collect_started.elapsed())
-                })
+                .map(|file| collect_one(file, collect_started.elapsed()))
                 .collect()
         };
 
@@ -3948,25 +3943,6 @@ fn build_file_summary_chunk_with_lines(
     }
 }
 
-fn parser_for(
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
-    lang: crate::parser::LangId,
-) -> Result<&mut Parser, String> {
-    use std::collections::hash_map::Entry;
-
-    match parsers.entry(lang) {
-        Entry::Occupied(entry) => Ok(entry.into_mut()),
-        Entry::Vacant(entry) => {
-            let grammar = grammar_for(lang);
-            let mut parser = Parser::new();
-            parser
-                .set_language(&grammar)
-                .map_err(|error| error.to_string())?;
-            Ok(entry.insert(parser))
-        }
-    }
-}
-
 pub fn is_semantic_indexed_extension(path: &Path) -> bool {
     if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
         return true;
@@ -4060,7 +4036,6 @@ const MAX_SEMANTIC_FILE_BYTES: u64 = 4 * 1024 * 1024;
 fn collect_semantic_file(
     project_root: &Path,
     file: &Path,
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
     phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
     let read_hash_started = Instant::now();
@@ -4103,17 +4078,12 @@ fn collect_semantic_file(
         return Ok((indexed_metadata, Vec::new()));
     };
 
-    let chunks =
-        collect_file_chunks_from_source_timed(project_root, file, lang, parsers, &source, phases)?;
+    let chunks = collect_file_chunks_from_source_timed(project_root, file, lang, &source, phases)?;
     Ok((indexed_metadata, chunks))
 }
 
 #[cfg(test)]
-fn collect_file_chunks(
-    project_root: &Path,
-    file: &Path,
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
-) -> Result<Vec<SemanticChunk>, String> {
+fn collect_file_chunks(project_root: &Path, file: &Path) -> Result<Vec<SemanticChunk>, String> {
     if !is_semantic_indexed_extension(file) {
         return Err("unsupported file extension".to_string());
     }
@@ -4124,7 +4094,7 @@ fn collect_file_chunks(
         return Ok(Vec::new());
     }
     let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
-    collect_file_chunks_from_source(project_root, file, lang, parsers, &source)
+    collect_file_chunks_from_source(project_root, file, lang, &source)
 }
 
 #[cfg(test)]
@@ -4132,14 +4102,12 @@ fn collect_file_chunks_from_source(
     project_root: &Path,
     file: &Path,
     lang: crate::parser::LangId,
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
     source: &str,
 ) -> Result<Vec<SemanticChunk>, String> {
     collect_file_chunks_from_source_timed(
         project_root,
         file,
         lang,
-        parsers,
         source,
         &mut SemanticCollectPhaseTimings::default(),
     )
@@ -4149,16 +4117,12 @@ fn collect_file_chunks_from_source_timed(
     project_root: &Path,
     file: &Path,
     lang: crate::parser::LangId,
-    parsers: &mut HashMap<crate::parser::LangId, Parser>,
     source: &str,
     phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<Vec<SemanticChunk>, String> {
     let parse_started = Instant::now();
-    let tree_result = parser_for(parsers, lang).and_then(|parser| {
-        parser
-            .parse(source, None)
-            .ok_or_else(|| format!("tree-sitter parse returned None for {}", file.display()))
-    });
+    let tree_result =
+        parse_source_with_cached_parser(file, source, lang).map_err(|error| error.to_string());
     phases.parse += parse_started.elapsed();
     let tree = tree_result?;
 
@@ -4369,6 +4333,91 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    const RUST_QUERY_BASELINE_OUTPUT_HASH: &str =
+        "36315439db74ed8e186076f79ed261079b2b13a4443ed4272861a2518c78d98b";
+
+    fn rust_fixture_semantic_output_fingerprint(project_root: &Path) -> (usize, usize, String) {
+        let fixture_root = project_root.join("tests/fixtures");
+        let fixture_files = [
+            "imports_rs.rs",
+            "member_rs.rs",
+            "sample.rs",
+            "structure_rs.rs",
+        ]
+        .map(|name| fixture_root.join(name));
+        let (chunks, _) = SemanticIndex::collect_chunks(project_root, &fixture_files);
+        let normalized = chunks
+            .iter()
+            .map(|chunk| {
+                (
+                    chunk
+                        .file
+                        .strip_prefix(project_root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    &chunk.name,
+                    &chunk.qualified_name,
+                    &chunk.kind,
+                    chunk.start_line,
+                    chunk.end_line,
+                    chunk.exported,
+                    &chunk.embed_text,
+                    &chunk.snippet,
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = format!("{normalized:#?}");
+        (
+            chunks.len(),
+            output.len(),
+            blake3::hash(output.as_bytes()).to_hex().to_string(),
+        )
+    }
+
+    #[test]
+    fn rust_semantic_fixture_output_matches_query_baseline() {
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let (_, _, output_hash) = rust_fixture_semantic_output_fingerprint(&project_root);
+        assert_eq!(output_hash, RUST_QUERY_BASELINE_OUTPUT_HASH);
+    }
+
+    #[test]
+    #[ignore = "manual single-file semantic collect phase benchmark"]
+    fn profile_rust_single_file_semantic_collect() {
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let file = project_root.join("src/profile_single_file.rs");
+        let source = "pub fn tiny() {}\n";
+
+        for run in 1..=3 {
+            let mut phases = SemanticCollectPhaseTimings::default();
+            let started = Instant::now();
+            let chunks = collect_file_chunks_from_source_timed(
+                &project_root,
+                &file,
+                crate::parser::LangId::Rust,
+                source,
+                &mut phases,
+            )
+            .unwrap();
+            eprintln!(
+            "semantic single-file run {run}: total={:?} parse={:?} extract={:?} build={:?} chunks={}",
+            started.elapsed(),
+            phases.parse,
+            phases.extract,
+            phases.build,
+            chunks.len()
+        );
+        }
+
+        let (chunks, output_bytes, output_hash) =
+            rust_fixture_semantic_output_fingerprint(&project_root);
+        eprintln!(
+        "rust fixture semantic output: chunks={chunks} bytes={output_bytes} blake3={output_hash}"
+    );
+        assert_eq!(output_hash, RUST_QUERY_BASELINE_OUTPUT_HASH);
+    }
 
     #[test]
     fn semantic_index_includes_php_inc_and_scss_extensions() {
@@ -5766,8 +5815,7 @@ Connection: close
         let legacy_symbols = legacy_parser.extract_symbols(&file).unwrap();
         let legacy_chunks = symbols_to_chunks(&file, &legacy_symbols, &source, &project_root);
 
-        let mut parsers = HashMap::new();
-        let optimized_chunks = collect_file_chunks(&project_root, &file, &mut parsers).unwrap();
+        let optimized_chunks = collect_file_chunks(&project_root, &file).unwrap();
 
         assert_eq!(
             chunk_fingerprint(&optimized_chunks),
@@ -5792,8 +5840,7 @@ public class Greeter {
         )
         .unwrap();
 
-        let mut parsers = HashMap::new();
-        let chunks = collect_file_chunks(dir.path(), &file, &mut parsers).unwrap();
+        let chunks = collect_file_chunks(dir.path(), &file).unwrap();
 
         assert!(
             !chunks.is_empty(),
@@ -5842,16 +5889,15 @@ public class Greeter {
         std::fs::write(&big, &filler).unwrap();
         assert!(big.metadata().unwrap().len() > MAX_SEMANTIC_FILE_BYTES);
 
-        let mut parsers = HashMap::new();
         // Oversized → tracked with zero chunks, NOT an error (so the caller keeps
         // the file in metadata and freshness skips re-reading it).
-        let chunks = collect_file_chunks(dir.path(), &big, &mut parsers).unwrap();
+        let chunks = collect_file_chunks(dir.path(), &big).unwrap();
         assert!(chunks.is_empty(), "oversized file must yield no chunks");
 
         // A small file of the same language still produces chunks.
         let small = dir.path().join("small.ts");
         std::fs::write(&small, "export function foo() { return 1; }\n").unwrap();
-        let small_chunks = collect_file_chunks(dir.path(), &small, &mut parsers).unwrap();
+        let small_chunks = collect_file_chunks(dir.path(), &small).unwrap();
         assert!(!small_chunks.is_empty(), "small file should still chunk");
     }
 

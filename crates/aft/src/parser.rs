@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
@@ -136,6 +137,7 @@ const PY_QUERY: &str = r#"
   (decorator) @dec.decorator) @dec.def
 "#;
 
+#[cfg(test)]
 const RS_QUERY: &str = r#"
 ;; free functions (with optional visibility)
 (function_item
@@ -767,7 +769,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::TypeScript | LangId::Tsx => Some(TS_QUERY),
         LangId::JavaScript => Some(JS_QUERY),
         LangId::Python => Some(PY_QUERY),
-        LangId::Rust => Some(RS_QUERY),
+        LangId::Rust => None,
         LangId::Go => Some(GO_QUERY),
         LangId::C => Some(C_QUERY),
         LangId::Cpp => Some(CPP_QUERY),
@@ -804,8 +806,6 @@ static JS_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::JavaScript));
 static PY_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Python));
-static RS_QUERY_CACHE: LazyLock<Result<Query, String>> =
-    LazyLock::new(|| compile_query(LangId::Rust));
 static GO_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Go));
 static C_QUERY_CACHE: LazyLock<Result<Query, String>> = LazyLock::new(|| compile_query(LangId::C));
@@ -858,7 +858,6 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Tsx => Some(&*TSX_QUERY_CACHE),
         LangId::JavaScript => Some(&*JS_QUERY_CACHE),
         LangId::Python => Some(&*PY_QUERY_CACHE),
-        LangId::Rust => Some(&*RS_QUERY_CACHE),
         LangId::Go => Some(&*GO_QUERY_CACHE),
         LangId::C => Some(&*C_QUERY_CACHE),
         LangId::Cpp => Some(&*CPP_QUERY_CACHE),
@@ -879,7 +878,12 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::R => Some(&*R_QUERY_CACHE),
         LangId::Groovy => Some(&*GROOVY_QUERY_CACHE),
         LangId::ObjC => Some(&*OBJC_QUERY_CACHE),
-        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => None,
+        LangId::Rust
+        | LangId::Html
+        | LangId::Markdown
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Yaml => None,
     };
 
     query
@@ -889,6 +893,42 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
             })
         })
         .transpose()
+}
+
+thread_local! {
+    // A Parser is mutable and not Sync, so each semantic/rayon worker retains its
+    // own language parsers without a global lock or cross-thread sharing.
+    static REUSABLE_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
+}
+
+/// Parse source with a parser retained by the current worker thread.
+pub(crate) fn parse_source_with_cached_parser(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+) -> Result<Tree, AftError> {
+    REUSABLE_PARSERS.with(|parsers| {
+        let mut parsers = parsers.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(lang) {
+            let grammar = grammar_for(lang);
+            let mut parser = Parser::new();
+            parser.set_language(&grammar).map_err(|error| {
+                crate::slog_error!("grammar init failed for {:?}: {}", lang, error);
+                AftError::ParseError {
+                    message: format!("grammar init failed for {:?}: {}", lang, error),
+                }
+            })?;
+            entry.insert(parser);
+        }
+
+        parsers
+            .get_mut(&lang)
+            .expect("parser inserted for language")
+            .parse(source, None)
+            .ok_or_else(|| AftError::ParseError {
+                message: format!("tree-sitter parse returned None for {}", path.display()),
+            })
+    })
 }
 
 /// Cached parse result: mtime at parse time + the tree.
@@ -1512,6 +1552,9 @@ pub fn extract_symbols_from_tree(
 ) -> Result<Vec<Symbol>, AftError> {
     let root = tree.root_node();
 
+    if lang == LangId::Rust {
+        return extract_rs_symbols(source, &root);
+    }
     if lang == LangId::Html {
         return extract_html_symbols(source, &root);
     }
@@ -1536,7 +1579,6 @@ pub fn extract_symbols_from_tree(
         LangId::TypeScript | LangId::Tsx => extract_ts_symbols(source, &root, query),
         LangId::JavaScript => extract_js_symbols(source, &root, query),
         LangId::Python => extract_py_symbols(source, &root, query),
-        LangId::Rust => extract_rs_symbols(source, &root, query),
         LangId::Go => extract_go_symbols(source, &root, query),
         LangId::C => extract_c_symbols(source, &root, query),
         LangId::Cpp => extract_cpp_symbols(source, &root, query),
@@ -1557,9 +1599,12 @@ pub fn extract_symbols_from_tree(
         LangId::R => extract_r_symbols(source, &root, query),
         LangId::Groovy => extract_groovy_symbols(source, &root, query),
         LangId::ObjC => extract_objc_symbols(source, &root, query),
-        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => {
-            unreachable!("handled before query lookup")
-        }
+        LangId::Rust
+        | LangId::Html
+        | LangId::Markdown
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Yaml => unreachable!("handled before query lookup"),
     }
 }
 
@@ -2763,35 +2808,11 @@ fn split_rust_use_items(inner: &str) -> Vec<&str> {
     items
 }
 
-/// Extract symbols from Rust source.
+/// Extract symbols from Rust source without compiling a tree-sitter query.
 /// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
-fn extract_rs_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::Rust;
-    let capture_names = query.capture_names();
-
-    // Collect all visibility_modifier byte ranges first
-    let mut vis_ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    {
-        let vis_idx = capture_names.iter().position(|n| *n == "vis.mod");
-        if let Some(idx) = vis_idx {
-            let idx = idx as u32;
-            let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(query, *root, source.as_bytes());
-            while let Some(m) = {
-                matches.advance();
-                matches.get()
-            } {
-                for cap in m.captures {
-                    if cap.index == idx {
-                        vis_ranges.push(cap.node.byte_range());
-                    }
-                }
-            }
-        }
-    }
-
     let is_pub = |node: &Node| -> bool {
-        // Check if the node has a visibility_modifier as a direct child
         let mut child_cursor = node.walk();
         if child_cursor.goto_first_child() {
             loop {
@@ -2806,180 +2827,143 @@ fn extract_rs_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         false
     };
 
+    let item_symbol = |node: Node<'_>, kind: SymbolKind| -> Option<Symbol> {
+        let name_node = node.child_by_field_name("name")?;
+        Some(Symbol {
+            name: node_text(source, &name_node).to_string(),
+            kind,
+            range: node_range_with_decorators(&node, source, lang),
+            signature: Some(extract_signature(source, &node)),
+            scope_chain: Vec::new(),
+            exported: is_pub(&node),
+            parent: None,
+        })
+    };
+
     let mut symbols = Vec::new();
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, *root, source.as_bytes());
+    let mut pending = vec![*root];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "function_item" => {
+                let declaration_list_owner = node
+                    .parent()
+                    .filter(|parent| parent.kind() == "declaration_list")
+                    .and_then(|parent| parent.parent());
+                let in_non_module_declaration_list = declaration_list_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.kind() != "mod_item");
 
-    while let Some(m) = {
-        matches.advance();
-        matches.get()
-    } {
-        let mut fn_name_node = None;
-        let mut fn_def_node = None;
-        let mut struct_name_node = None;
-        let mut struct_def_node = None;
-        let mut enum_name_node = None;
-        let mut enum_def_node = None;
-        let mut trait_name_node = None;
-        let mut trait_def_node = None;
-        let mut impl_def_node = None;
-
-        for cap in m.captures {
-            let Some(&name) = capture_names.get(cap.index as usize) else {
-                continue;
-            };
-            match name {
-                "fn.name" => fn_name_node = Some(cap.node),
-                "fn.def" => fn_def_node = Some(cap.node),
-                "struct.name" => struct_name_node = Some(cap.node),
-                "struct.def" => struct_def_node = Some(cap.node),
-                "enum.name" => enum_name_node = Some(cap.node),
-                "enum.def" => enum_def_node = Some(cap.node),
-                "trait.name" => trait_name_node = Some(cap.node),
-                "trait.def" => trait_def_node = Some(cap.node),
-                "impl.def" => impl_def_node = Some(cap.node),
-                _ => {}
-            }
-        }
-
-        // Free function (skip impl/trait declaration lists; inline mod bodies are still free fns)
-        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
-            let declaration_list_owner = def_node
-                .parent()
-                .filter(|parent| parent.kind() == "declaration_list")
-                .and_then(|parent| parent.parent());
-            let in_non_module_declaration_list = declaration_list_owner
-                .as_ref()
-                .is_some_and(|owner| owner.kind() != "mod_item");
-
-            if !in_non_module_declaration_list {
-                let scope_chain = rust_mod_scope_chain(&def_node, source);
-                symbols.push(Symbol {
-                    name: node_text(source, &name_node).to_string(),
-                    kind: SymbolKind::Function,
-                    range: node_range_with_decorators(&def_node, source, lang),
-                    signature: Some(extract_signature(source, &def_node)),
-                    scope_chain: scope_chain.clone(),
-                    exported: is_pub(&def_node),
-                    parent: scope_chain.last().cloned(),
-                });
-            }
-        }
-
-        // Struct
-        if let (Some(name_node), Some(def_node)) = (struct_name_node, struct_def_node) {
-            symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
-                kind: SymbolKind::Struct,
-                range: node_range_with_decorators(&def_node, source, lang),
-                signature: Some(extract_signature(source, &def_node)),
-                scope_chain: vec![],
-                exported: is_pub(&def_node),
-                parent: None,
-            });
-        }
-
-        // Enum
-        if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
-            symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
-                kind: SymbolKind::Enum,
-                range: node_range_with_decorators(&def_node, source, lang),
-                signature: Some(extract_signature(source, &def_node)),
-                scope_chain: vec![],
-                exported: is_pub(&def_node),
-                parent: None,
-            });
-        }
-
-        // Trait (mapped to Interface kind)
-        if let (Some(name_node), Some(def_node)) = (trait_name_node, trait_def_node) {
-            symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
-                kind: SymbolKind::Interface,
-                range: node_range_with_decorators(&def_node, source, lang),
-                signature: Some(extract_signature(source, &def_node)),
-                scope_chain: vec![],
-                exported: is_pub(&def_node),
-                parent: None,
-            });
-        }
-
-        // Impl block — extract methods from inside
-        if let Some(impl_node) = impl_def_node {
-            // Find the type name(s) from the impl
-            // `impl TypeName { ... }` → scope = ["TypeName"]
-            // `impl Trait for TypeName { ... }` → scope = ["Trait for TypeName"]
-            let mut type_names: Vec<String> = Vec::new();
-            let mut child_cursor = impl_node.walk();
-            if child_cursor.goto_first_child() {
-                loop {
-                    let child = child_cursor.node();
-                    if child.kind() == "type_identifier" || child.kind() == "generic_type" {
-                        type_names.push(node_text(source, &child).to_string());
-                    }
-                    if !child_cursor.goto_next_sibling() {
-                        break;
+                if !in_non_module_declaration_list {
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        let scope_chain = rust_mod_scope_chain(&node, source);
+                        symbols.push(Symbol {
+                            name: node_text(source, &name_node).to_string(),
+                            kind: SymbolKind::Function,
+                            range: node_range_with_decorators(&node, source, lang),
+                            signature: Some(extract_signature(source, &node)),
+                            scope_chain: scope_chain.clone(),
+                            exported: is_pub(&node),
+                            parent: scope_chain.last().cloned(),
+                        });
                     }
                 }
             }
+            "struct_item" => {
+                if let Some(symbol) = item_symbol(node, SymbolKind::Struct) {
+                    symbols.push(symbol);
+                }
+            }
+            "enum_item" => {
+                if let Some(symbol) = item_symbol(node, SymbolKind::Enum) {
+                    symbols.push(symbol);
+                }
+            }
+            "trait_item" => {
+                if let Some(symbol) = item_symbol(node, SymbolKind::Interface) {
+                    symbols.push(symbol);
+                }
+            }
+            "impl_item" => {
+                let mut type_names = Vec::new();
+                let mut child_cursor = node.walk();
+                if child_cursor.goto_first_child() {
+                    loop {
+                        let child = child_cursor.node();
+                        if child.kind() == "type_identifier" || child.kind() == "generic_type" {
+                            type_names.push(node_text(source, &child).to_string());
+                        }
+                        if !child_cursor.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
 
-            let scope_name = if type_names.len() >= 2 {
-                // impl Trait for Type
-                format!("{} for {}", type_names[0], type_names[1])
-            } else if type_names.len() == 1 {
-                type_names[0].clone()
-            } else {
-                String::new()
-            };
+                let scope_name = if type_names.len() >= 2 {
+                    format!("{} for {}", type_names[0], type_names[1])
+                } else {
+                    type_names.first().cloned().unwrap_or_default()
+                };
+                let parent_name = type_names.last().cloned().unwrap_or_default();
 
-            let parent_name = type_names.last().cloned().unwrap_or_default();
-
-            // Find declaration_list and extract function_items
-            let mut child_cursor = impl_node.walk();
-            if child_cursor.goto_first_child() {
-                loop {
-                    let child = child_cursor.node();
-                    if child.kind() == "declaration_list" {
-                        let mut fn_cursor = child.walk();
-                        if fn_cursor.goto_first_child() {
-                            loop {
-                                let fn_node = fn_cursor.node();
-                                if fn_node.kind() == "function_item" {
-                                    if let Some(name_node) = fn_node.child_by_field_name("name") {
-                                        symbols.push(Symbol {
-                                            name: node_text(source, &name_node).to_string(),
-                                            kind: SymbolKind::Method,
-                                            range: node_range_with_decorators(
-                                                &fn_node, source, lang,
-                                            ),
-                                            signature: Some(extract_signature(source, &fn_node)),
-                                            scope_chain: if scope_name.is_empty() {
-                                                vec![]
-                                            } else {
-                                                vec![scope_name.clone()]
-                                            },
-                                            exported: is_pub(&fn_node),
-                                            parent: if parent_name.is_empty() {
-                                                None
-                                            } else {
-                                                Some(parent_name.clone())
-                                            },
-                                        });
+                let mut child_cursor = node.walk();
+                if child_cursor.goto_first_child() {
+                    loop {
+                        let child = child_cursor.node();
+                        if child.kind() == "declaration_list" {
+                            let mut method_cursor = child.walk();
+                            if method_cursor.goto_first_child() {
+                                loop {
+                                    let method = method_cursor.node();
+                                    if method.kind() == "function_item" {
+                                        if let Some(name_node) = method.child_by_field_name("name")
+                                        {
+                                            symbols.push(Symbol {
+                                                name: node_text(source, &name_node).to_string(),
+                                                kind: SymbolKind::Method,
+                                                range: node_range_with_decorators(
+                                                    &method, source, lang,
+                                                ),
+                                                signature: Some(extract_signature(source, &method)),
+                                                scope_chain: if scope_name.is_empty() {
+                                                    Vec::new()
+                                                } else {
+                                                    vec![scope_name.clone()]
+                                                },
+                                                exported: is_pub(&method),
+                                                parent: if parent_name.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(parent_name.clone())
+                                                },
+                                            });
+                                        }
                                     }
-                                }
-                                if !fn_cursor.goto_next_sibling() {
-                                    break;
+                                    if !method_cursor.goto_next_sibling() {
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
-                    if !child_cursor.goto_next_sibling() {
-                        break;
+                        if !child_cursor.goto_next_sibling() {
+                            break;
+                        }
                     }
                 }
             }
+            _ => {}
         }
+
+        let mut child_cursor = node.walk();
+        let mut children = Vec::new();
+        if child_cursor.goto_first_child() {
+            loop {
+                children.push(child_cursor.node());
+                if !child_cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        pending.extend(children.into_iter().rev());
     }
 
     dedup_symbols(&mut symbols);
@@ -7799,6 +7783,69 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(name)
+    }
+
+    #[test]
+    #[ignore = "manual single-file parser/query phase benchmark"]
+    fn profile_rust_parser_and_query_phases() {
+        let source = "pub fn tiny() -> bool {\n    true\n}\n";
+
+        let grammar_started = std::time::Instant::now();
+        let grammar = grammar_for(LangId::Rust);
+        let grammar_elapsed = grammar_started.elapsed();
+
+        let parser_init_started = std::time::Instant::now();
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let parser_init_elapsed = parser_init_started.elapsed();
+
+        let parse_started = std::time::Instant::now();
+        let tree = parser.parse(source, None).unwrap();
+        let parse_elapsed = parse_started.elapsed();
+
+        let query_compile_started = std::time::Instant::now();
+        let query = Query::new(&grammar, RS_QUERY).unwrap();
+        let query_compile_elapsed = query_compile_started.elapsed();
+
+        let query_execute_started = std::time::Instant::now();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut query_matches = 0;
+        while matches.next().is_some() {
+            query_matches += 1;
+        }
+        let query_execute_elapsed = query_execute_started.elapsed();
+
+        let direct_extract_started = std::time::Instant::now();
+        let symbols = extract_rs_symbols(source, &tree.root_node()).unwrap();
+        let direct_extract_elapsed = direct_extract_started.elapsed();
+
+        eprintln!(
+            "rust parser/query phases: grammar={grammar_elapsed:?} parser_init={parser_init_elapsed:?} parse_execute={parse_elapsed:?} query_compile={query_compile_elapsed:?} query_execute={query_execute_elapsed:?} direct_extract={direct_extract_elapsed:?} symbols={}",
+            symbols.len()
+        );
+        assert!(query_matches > 0);
+        assert_eq!(symbols.len(), 1);
+    }
+
+    #[test]
+    fn source_parser_is_reused_on_the_current_worker_thread() {
+        let first = "pub fn first() {}\n";
+        let second = "pub struct Second;\n";
+        let path = Path::new("worker.rs");
+
+        let before = REUSABLE_PARSERS.with(|parsers| parsers.borrow().len());
+        let first_tree =
+            parse_source_with_cached_parser(path, first, LangId::Rust).expect("parse first source");
+        let after_first = REUSABLE_PARSERS.with(|parsers| parsers.borrow().len());
+        let second_tree = parse_source_with_cached_parser(path, second, LangId::Rust)
+            .expect("parse second source");
+        let after_second = REUSABLE_PARSERS.with(|parsers| parsers.borrow().len());
+
+        assert!(!first_tree.root_node().has_error());
+        assert!(!second_tree.root_node().has_error());
+        assert!(after_first == before || after_first == before + 1);
+        assert_eq!(after_second, after_first);
     }
 
     fn test_symbol(name: &str) -> Symbol {
