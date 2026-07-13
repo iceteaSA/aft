@@ -195,7 +195,7 @@ function appendSkippedSearchPaths(text: string, missing: string[]): string {
 export async function assertExternalDirectoryPermission(
   extCtx: { cwd: string },
   target: string,
-  options: { restrictToProjectRoot?: boolean } = {},
+  options: { restrictToProjectRoot?: boolean; serverValidatedRead?: boolean } = {},
 ): Promise<void> {
   if (!target) return;
   const expanded = expandTilde(target);
@@ -208,6 +208,11 @@ export async function assertExternalDirectoryPermission(
   // user on every external path. Defer to Rust, which will accept the
   // path because `restrict_to_project_root` is false.
   if (options.restrictToProjectRoot === false) return;
+
+  // The plugin cannot identify a session-owned bash artifact without copying
+  // Rust's task registry. Forward read calls so Rust can apply that exact,
+  // session-scoped exception while continuing to reject every other path.
+  if (options.serverValidatedRead === true) return;
 
   // restrict_to_project_root is AFT's full-isolation knob — NOT a per-call
   // permission. When it's on, an out-of-root path is hard-blocked: do NOT
@@ -502,6 +507,7 @@ export function registerHoistedTools(
         const filePath = await resolvePathArg(extCtx.cwd, pathArg);
         await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
+          serverValidatedRead: true,
         });
         const rawArgs: Record<string, unknown> = { filePath: pathArg };
         if (offset !== undefined) rawArgs.offset = offset;

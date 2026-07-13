@@ -5238,6 +5238,46 @@ async fn drive_cross_bind_trust_isolation_daemon(input: FakeDaemonInput) {
     wait_for_bash_completion_without_bg_event(&mut stream, 1, 308, &task_id, 2, 305).await;
     settle_until_bg_completion(&mut stream, 1, 4300, &task_id).await;
 
+    let trusted_status = call_tool_response(
+        &mut stream,
+        1,
+        4301,
+        "bash_status",
+        json!({ "params": { "task_id": task_id } }),
+        "trusted bash artifact status",
+    )
+    .await;
+    assert_tool_success(&trusted_status, "trusted bash artifact status");
+    let output_path = trusted_status["output_path"]
+        .as_str()
+        .expect("trusted bash output path")
+        .to_string();
+
+    bind_route_with_principal(
+        &mut stream,
+        3,
+        4302,
+        &root1,
+        "runner",
+        "different-untrusted-session",
+        Some(subc_mcp_principal()),
+    )
+    .await;
+    let untrusted_artifact_read = call_tool_response(
+        &mut stream,
+        3,
+        4303,
+        "read",
+        json!({ "filePath": output_path }),
+        "untrusted cross-session bash artifact read",
+    )
+    .await;
+    assert_tool_error_code(
+        &untrusted_artifact_read,
+        "path_outside_root",
+        "untrusted cross-session bash artifact read",
+    );
+
     let denied_drain = call_tool_response(
         &mut stream,
         2,

@@ -4126,6 +4126,27 @@ impl AppContext {
         req_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_path_with_artifact_session(req_id, path, None)
+    }
+
+    /// Validate a read path, including the narrow exception for a bash artifact
+    /// registered to the requesting session. Mutating tools deliberately use
+    /// [`AppContext::validate_path`] and never receive this exception.
+    pub fn validate_read_path(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_path_with_artifact_session(req_id, path, Some(session_id))
+    }
+
+    fn validate_path_with_artifact_session(
+        &self,
+        req_id: &str,
+        path: &Path,
+        artifact_session_id: Option<&str>,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let config = self.config();
         let force_restrict = self.request_force_restrict(req_id);
         let enforce = config.restrict_to_project_root || force_restrict;
@@ -4179,7 +4200,13 @@ impl AppContext {
         };
 
         if !resolved.starts_with(&resolved_root) {
-            return Err(path_error_response(req_id, path, &resolved_root));
+            let is_owned_bash_artifact = artifact_session_id.is_some_and(|session_id| {
+                self.bash_background
+                    .is_session_owned_artifact_path(session_id, &resolved)
+            });
+            if !is_owned_bash_artifact {
+                return Err(path_error_response(req_id, path, &resolved_root));
+            }
         }
 
         Ok(resolved)

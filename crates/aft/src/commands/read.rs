@@ -602,7 +602,7 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+    let path = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return resp,
     };

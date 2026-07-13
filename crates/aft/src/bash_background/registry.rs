@@ -134,7 +134,14 @@ struct TerminalOutputCache {
     kind: TerminalOutputKind,
     output_path: Option<String>,
     stderr_path: Option<String>,
+    artifact_access: ArtifactRecoveryAccess,
     recovery: Option<RecoveryContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactRecoveryAccess {
+    task_id: String,
+    readable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +155,7 @@ struct RecoveryContext {
     output_path: Option<String>,
     stderr_path: Option<String>,
     include_stderr_path: bool,
+    artifact_access: ArtifactRecoveryAccess,
 }
 
 fn optional_string_bytes(value: Option<&String>) -> u64 {
@@ -167,12 +175,18 @@ fn terminal_output_cache_estimated_bytes(cache: &TerminalOutputCache) -> u64 {
                 )
                 .saturating_add(optional_string_bytes(recovery.output_path.as_ref()))
                 .saturating_add(optional_string_bytes(recovery.stderr_path.as_ref()))
+                .saturating_add(crate::memory::usize_to_u64(
+                    recovery.artifact_access.task_id.len(),
+                ))
         })
         .unwrap_or(0);
     (std::mem::size_of::<TerminalOutputCache>() as u64)
         .saturating_add(crate::memory::usize_to_u64(cache.output_preview.len()))
         .saturating_add(optional_string_bytes(cache.output_path.as_ref()))
         .saturating_add(optional_string_bytes(cache.stderr_path.as_ref()))
+        .saturating_add(crate::memory::usize_to_u64(
+            cache.artifact_access.task_id.len(),
+        ))
         .saturating_add(recovery_bytes)
 }
 
@@ -229,6 +243,7 @@ pub(crate) struct BgTask {
     pub(crate) task_id: String,
     pub(crate) session_id: String,
     pub(crate) paths: TaskPaths,
+    artifact_root: PathBuf,
     pub(crate) started: Instant,
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
@@ -292,6 +307,35 @@ impl BgTaskRegistry {
                 active_wait_sessions: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Return whether `path` is an exact artifact registered to `session_id`.
+    ///
+    /// The requested path is canonicalized and compared with exact artifact
+    /// names under the task directory identity captured at registration time.
+    /// Deliberately do not grant access by `bash-tasks` directory prefix: a
+    /// prefix exception would expose unrelated files and could be widened
+    /// through symlinks or directory replacement.
+    pub fn is_session_owned_artifact_path(&self, session_id: &str, path: &Path) -> bool {
+        let Ok(requested) = fs::canonicalize(path) else {
+            return false;
+        };
+        let Ok(tasks) = self.inner.tasks.lock() else {
+            return false;
+        };
+
+        tasks.values().any(|task| {
+            task.session_id == session_id
+                && [
+                    &task.paths.stdout,
+                    &task.paths.stderr,
+                    &task.paths.exit,
+                    &task.paths.pty,
+                ]
+                .into_iter()
+                .filter_map(|known| known.file_name())
+                .any(|name| task.artifact_root.join(name) == requested)
+        })
     }
 
     pub fn set_harness(&self, harness: Harness) {
@@ -442,6 +486,18 @@ impl BgTaskRegistry {
         buffer: &BgBuffer,
         disk_truncation: DiskTruncation,
     ) -> TerminalOutputCache {
+        let output_readable = buffer
+            .output_path()
+            .is_some_and(|path| self.is_session_owned_artifact_path(&metadata.session_id, &path));
+        let stderr_readable = buffer
+            .stderr_path()
+            .map(|path| self.is_session_owned_artifact_path(&metadata.session_id, path))
+            .unwrap_or(true);
+        let artifact_access = ArtifactRecoveryAccess {
+            task_id: metadata.task_id.clone(),
+            readable: output_readable && stderr_readable,
+        };
+
         if metadata.mode == BgMode::Pty {
             return TerminalOutputCache {
                 output_preview: String::new(),
@@ -449,18 +505,22 @@ impl BgTaskRegistry {
                 kind: TerminalOutputKind::Raw,
                 output_path: buffer.output_path().map(|path| path.display().to_string()),
                 stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+                artifact_access,
                 recovery: None,
             };
         }
 
-        if let Some(structured) =
-            render_structured_output(&metadata.command, buffer, disk_truncation)
-        {
+        if let Some(structured) = render_structured_output(
+            &metadata.command,
+            buffer,
+            disk_truncation,
+            artifact_access.clone(),
+        ) {
             return structured;
         }
 
         if !metadata.compressed {
-            return render_raw_passthrough(buffer, disk_truncation);
+            return render_raw_passthrough(buffer, disk_truncation, artifact_access);
         }
 
         let raw = buffer.read_combined_head_tail(
@@ -469,7 +529,13 @@ impl BgTaskRegistry {
             COMPRESS_INPUT_TAIL_BYTES,
         );
         let compressed = self.compress_output(&metadata.command, raw.text, metadata.exit_code);
-        render_compressed_with_recovery(buffer, compressed, raw.truncated, disk_truncation)
+        render_compressed_with_recovery(
+            buffer,
+            compressed,
+            raw.truncated,
+            disk_truncation,
+            artifact_access,
+        )
     }
 
     fn snapshot_with_terminal_cache(
@@ -651,6 +717,7 @@ impl BgTaskRegistry {
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
+            artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
@@ -758,6 +825,7 @@ impl BgTaskRegistry {
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
+            artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
@@ -855,6 +923,7 @@ impl BgTaskRegistry {
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
+            artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
@@ -2052,6 +2121,7 @@ impl BgTaskRegistry {
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
+            artifact_root: canonical_artifact_root(&paths),
             started,
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
@@ -2884,11 +2954,16 @@ impl BgTaskRegistry {
     }
 }
 
+fn canonical_artifact_root(paths: &TaskPaths) -> PathBuf {
+    fs::canonicalize(&paths.dir).unwrap_or_else(|_| paths.dir.clone())
+}
+
 fn render_compressed_with_recovery(
     buffer: &BgBuffer,
     mut compressed: CompressionResult,
     input_truncated: bool,
     disk_truncation: DiskTruncation,
+    artifact_access: ArtifactRecoveryAccess,
 ) -> TerminalOutputCache {
     // Preserve a single canonical trailing newline. A bare `.trim_end()` strips
     // the legitimate final newline that `echo` and most commands emit, so
@@ -2919,6 +2994,7 @@ fn render_compressed_with_recovery(
         output_path: output_path.clone(),
         stderr_path: stderr_path.clone(),
         include_stderr_path,
+        artifact_access: artifact_access.clone(),
     };
 
     let (output_preview, output_truncated) =
@@ -2929,6 +3005,7 @@ fn render_compressed_with_recovery(
         kind: TerminalOutputKind::Compressed,
         output_path,
         stderr_path,
+        artifact_access,
         recovery: Some(recovery),
     }
 }
@@ -3051,7 +3128,17 @@ fn recovery_marker(recovery: &RecoveryContext) -> Option<String> {
     Some(format!("[{}; {hint}]", parts.join(", ")))
 }
 
+fn bash_status_recovery_hint(access: &ArtifactRecoveryAccess) -> String {
+    let task_id = serde_json::to_string(&access.task_id)
+        .unwrap_or_else(|_| format!("\"{}\"", access.task_id));
+    format!("use bash_status({{taskId: {task_id}}})")
+}
+
 fn recovery_hint(recovery: &RecoveryContext) -> String {
+    if !recovery.artifact_access.readable {
+        return bash_status_recovery_hint(&recovery.artifact_access);
+    }
+
     // AFT stores stdout/stderr separately and combines them in memory. Class caps,
     // middle truncation, and mixed stdout/stderr renders are not line-offset
     // portable. Only a single-file contiguous-prefix drop may use `tail -n +N`.
@@ -3127,13 +3214,40 @@ fn is_recovery_marker(line: &str) -> bool {
         && (line.contains("full output: read ")
             || line.contains("retained output: read ")
             || line.contains("see remaining: tail -n +")
+            || line.contains("use bash_status({taskId:")
             || line.contains("full output unavailable"))
+}
+
+fn structured_output_pointer(
+    total_bytes: u64,
+    output_path: &str,
+    truncated_prefix_bytes: u64,
+    artifact_access: &ArtifactRecoveryAccess,
+) -> String {
+    if artifact_access.readable {
+        return if truncated_prefix_bytes > 0 {
+            retained_json_output_pointer(total_bytes, output_path, truncated_prefix_bytes)
+        } else {
+            json_output_pointer(total_bytes, output_path)
+        };
+    }
+
+    let kb = total_bytes.div_ceil(1024);
+    let hint = bash_status_recovery_hint(artifact_access);
+    if truncated_prefix_bytes > 0 {
+        format!(
+            "[JSON output {kb} KB; truncated {truncated_prefix_bytes} bytes from saved output prefix; retained output: {hint}]"
+        )
+    } else {
+        format!("[JSON output {kb} KB; full output: {hint}]")
+    }
 }
 
 fn render_structured_output(
     command: &str,
     buffer: &BgBuffer,
     disk_truncation: DiskTruncation,
+    artifact_access: ArtifactRecoveryAccess,
 ) -> Option<TerminalOutputCache> {
     if !is_gh_structured_command(command) {
         return None;
@@ -3151,21 +3265,19 @@ fn render_structured_output(
         if !stream_starts_like_json(buffer, StreamKind::Stdout) {
             return None;
         }
-        let output_preview = if disk_truncation.total_prefix_bytes() > 0 {
-            retained_json_output_pointer(
-                stdout_bytes,
-                &output_path,
-                disk_truncation.total_prefix_bytes(),
-            )
-        } else {
-            json_output_pointer(stdout_bytes, &output_path)
-        };
+        let output_preview = structured_output_pointer(
+            stdout_bytes,
+            &output_path,
+            disk_truncation.total_prefix_bytes(),
+            &artifact_access,
+        );
         return Some(TerminalOutputCache {
             output_preview,
             output_truncated: true,
             kind: TerminalOutputKind::Structured,
             output_path: Some(output_path),
             stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+            artifact_access,
             recovery: None,
         });
     }
@@ -3181,6 +3293,7 @@ fn render_structured_output(
         kind: TerminalOutputKind::Structured,
         output_path: Some(output_path),
         stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+        artifact_access,
         recovery: None,
     })
 }
@@ -3188,6 +3301,7 @@ fn render_structured_output(
 fn render_raw_passthrough(
     buffer: &BgBuffer,
     disk_truncation: DiskTruncation,
+    artifact_access: ArtifactRecoveryAccess,
 ) -> TerminalOutputCache {
     let raw = buffer.read_combined_head_tail(
         RAW_PASSTHROUGH_CAP_BYTES,
@@ -3203,6 +3317,7 @@ fn render_raw_passthrough(
             kind: TerminalOutputKind::Raw,
             output_path,
             stderr_path,
+            artifact_access,
             recovery: None,
         };
     }
@@ -3218,6 +3333,7 @@ fn render_raw_passthrough(
         output_path: output_path.clone(),
         stderr_path: stderr_path.clone(),
         include_stderr_path,
+        artifact_access: artifact_access.clone(),
     };
     let (output_preview, output_truncated) =
         render_raw_body_with_recovery_marker(&raw.text, &mut recovery);
@@ -3227,6 +3343,7 @@ fn render_raw_passthrough(
         kind: TerminalOutputKind::Raw,
         output_path,
         stderr_path,
+        artifact_access,
         recovery: Some(recovery),
     }
 }
@@ -3242,7 +3359,12 @@ fn completion_preview_for_cache(
     if cache.kind == TerminalOutputKind::Structured && cache.output_preview.len() > threshold {
         if let Some(path) = cache.output_path.as_deref() {
             return (
-                json_output_pointer(cache.output_preview.len() as u64, path),
+                structured_output_pointer(
+                    cache.output_preview.len() as u64,
+                    path,
+                    0,
+                    &cache.artifact_access,
+                ),
                 true,
             );
         }
@@ -4220,6 +4342,96 @@ mod tests {
         (task_id, task)
     }
 
+    #[test]
+    fn artifact_read_capability_requires_exact_canonical_path_and_session() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (_task_id, task) = insert_terminal_piped_task(
+            &registry,
+            &dir,
+            "printf output",
+            "stdout\n",
+            "stderr\n",
+            true,
+        );
+        fs::write(&task.paths.exit, "0\n").unwrap();
+
+        assert!(registry.is_session_owned_artifact_path("session", &task.paths.stdout));
+        assert!(registry.is_session_owned_artifact_path("session", &task.paths.stderr));
+        assert!(registry.is_session_owned_artifact_path("session", &task.paths.exit));
+        assert!(!registry.is_session_owned_artifact_path("different-session", &task.paths.stdout));
+        assert!(!registry.is_session_owned_artifact_path("session", &task.paths.json));
+
+        let unregistered = task.paths.dir.join("unregistered-output");
+        fs::write(&unregistered, "not a task artifact\n").unwrap();
+        assert!(!registry.is_session_owned_artifact_path("session", &unregistered));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_directory_symlink_does_not_create_a_prefix_exception() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let (_task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "printf output", "stdout\n", "", true);
+        let link = project.join("task-artifacts");
+        std::os::unix::fs::symlink(&task.paths.dir, &link).unwrap();
+        let unregistered = task.paths.dir.join("unregistered-output");
+        fs::write(&unregistered, "not registered\n").unwrap();
+
+        assert!(!registry.is_session_owned_artifact_path("session", &link));
+        assert!(
+            !registry.is_session_owned_artifact_path("session", &link.join("unregistered-output"))
+        );
+        assert!(registry.is_session_owned_artifact_path(
+            "session",
+            &link.join(task.paths.stdout.file_name().unwrap())
+        ));
+
+        let outside = dir.path().join("outside-secret");
+        fs::write(&outside, "must stay private\n").unwrap();
+        fs::remove_file(&task.paths.stdout).unwrap();
+        std::os::unix::fs::symlink(&outside, &task.paths.stdout).unwrap();
+        assert!(!registry.is_session_owned_artifact_path("session", &task.paths.stdout));
+    }
+
+    #[test]
+    fn recovery_footer_uses_bash_status_when_artifact_is_not_registered() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = "bash-unregistered-footer";
+        let paths = task_paths(dir.path(), "session", task_id);
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(
+            &paths.stdout,
+            format!("{}tail\n", "output-line\n".repeat(2_000)),
+        )
+        .unwrap();
+        fs::write(&paths.stderr, "").unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.to_string(),
+            "session".to_string(),
+            "printf output".to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            Some(30_000),
+            true,
+            true,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+
+        let cache = registry
+            .render_terminal_output_from_paths(&metadata, &paths)
+            .expect("terminal render");
+
+        assert!(cache
+            .output_preview
+            .contains("use bash_status({taskId: \"bash-unregistered-footer\"})"));
+        assert!(!cache.output_preview.contains("full output: read "));
+    }
+
     fn insert_terminal_pty_task(
         registry: &BgTaskRegistry,
         dir: &tempfile::TempDir,
@@ -4429,6 +4641,10 @@ mod tests {
             output_path: Some("/tmp/stdout".to_string()),
             stderr_path: None,
             include_stderr_path: false,
+            artifact_access: ArtifactRecoveryAccess {
+                task_id: "bash-test".to_string(),
+                readable: true,
+            },
         };
 
         let marker = recovery_marker(&recovery).expect("disk truncation must emit marker");

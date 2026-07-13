@@ -151,6 +151,32 @@ describe("hoisted tool adapters", () => {
     expect(unbounded.content[0].text).toContain("Showing lines 1-2 of 10");
   });
 
+  test("restricted read forwards external bash artifacts to Rust", async () => {
+    const root = await tempRoot();
+    const artifactPath = join(root, "..", "bash-task.stdout");
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      text: "1: full bash output\n",
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: true,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("read")!, { path: artifactPath }, {
+      ...makeExtContext(),
+      cwd: root,
+    } as never)) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toContain("full bash output");
+    expect(calls).toHaveLength(1);
+    expect(toolArgs(calls[0])).toEqual({ filePath: artifactPath });
+  });
+
   test("read accepts path or filePath, preserves path precedence, and errors clearly when both are absent", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));

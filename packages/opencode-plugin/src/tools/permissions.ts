@@ -267,7 +267,7 @@ export async function assertExternalDirectoryPermission(
   ctx: PluginContext,
   context: ToolContext,
   target: string,
-  options?: { kind?: "file" | "directory" },
+  options?: { kind?: "file" | "directory"; serverValidatedRead?: boolean },
 ): Promise<string | undefined> {
   if (!target) return undefined;
 
@@ -303,6 +303,10 @@ export async function assertExternalDirectoryPermission(
   // footgun). Instead the agent gets a clear denial and the user gets a
   // throttled informational panel explaining the restriction.
   if (ctx.config.restrict_to_project_root === true) {
+    // A session-owned bash artifact lives outside the project by design. The
+    // plugin has no access to Rust's task registry, so read calls cross this
+    // boundary and let Rust apply its exact, session-scoped artifact check.
+    if (options?.serverValidatedRead === true) return undefined;
     notifyRestrictBlocked(ctx, context, absoluteTarget);
     return restrictDenialMessage(absoluteTarget);
   }
