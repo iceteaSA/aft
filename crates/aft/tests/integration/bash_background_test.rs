@@ -399,7 +399,12 @@ fn restricted_read_allows_only_current_session_bash_artifacts() {
         "artifact read was not complete: {read:?}"
     );
     let content = read["content"].as_str().unwrap_or_default();
+    // The unix fixture zero-pads (%04d); cmd's for /L loop cannot, so the
+    // first line differs per platform while the last line matches both.
+    #[cfg(unix)]
     assert!(content.contains("artifact-line-0001"));
+    #[cfg(windows)]
+    assert!(content.contains("artifact-line-1\r\n") || content.contains("artifact-line-1\n"));
     assert!(content.contains("artifact-line-2000"));
 
     assert!(aft.shutdown().success());
