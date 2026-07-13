@@ -62,9 +62,15 @@ fn status_memory_attributes_every_registered_root_and_exposes_residual() {
         "expected at least the two registered roots: {roots:?}"
     );
     for root in [first_root, second_root] {
-        let estimate = roots
-            .get(&root.display().to_string())
-            .expect("registered root estimate");
+        // Look up by the registry's own key form: register_actor keys memory
+        // contexts on ProjectRootId::as_path, which on Windows is the
+        // non-verbatim shape while fs::canonicalize returns `\\?\` paths.
+        let key = ProjectRootId::from_path(&root)
+            .expect("root id for lookup")
+            .as_path()
+            .display()
+            .to_string();
+        let estimate = roots.get(&key).expect("registered root estimate");
         for subsystem in [
             "semantic",
             "trigram",

@@ -4279,8 +4279,15 @@ impl AppContext {
         for (root, context) in contexts {
             roots.insert(root.display().to_string(), context.memory_root_snapshot());
         }
+        // Normalize through the same identity the registry keys on: on Windows
+        // a verbatim `\\?\` current root would otherwise land as a SECOND
+        // entry for an already-registered root and double-count its memory.
         let current_label = current_root
-            .map(|root| root.display().to_string())
+            .map(|root| {
+                cortexkit_paths::ProjectRootId::from_path(root)
+                    .map(|id| id.as_path().display().to_string())
+                    .unwrap_or_else(|_| root.display().to_string())
+            })
             .unwrap_or_else(|| "<unconfigured>".to_string());
         roots
             .entry(current_label)
