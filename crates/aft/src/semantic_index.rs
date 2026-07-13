@@ -4339,13 +4339,30 @@ mod tests {
 
     fn rust_fixture_semantic_output_fingerprint(project_root: &Path) -> (usize, usize, String) {
         let fixture_root = project_root.join("tests/fixtures");
+        // Re-materialize the fixtures with LF bytes before collecting: Windows
+        // checkouts (core.autocrlf) hand collect_chunks CRLF sources, and the
+        // extra byte per line shifts snippet/embed-text cap boundaries — so
+        // post-hoc \r stripping cannot reproduce the LF-computed baseline.
+        let lf_root = tempfile::tempdir().expect("lf fixture root");
         let fixture_files = [
             "imports_rs.rs",
             "member_rs.rs",
             "sample.rs",
             "structure_rs.rs",
         ]
-        .map(|name| fixture_root.join(name));
+        .map(|name| {
+            let source = std::fs::read_to_string(fixture_root.join(name))
+                .expect("read fixture")
+                .replace("\r\n", "\n");
+            // Preserve the tests/fixtures/<name> layout: chunk identity fields
+            // (relative path, qualified name, embed-text header) derive from the
+            // path relative to the project root, so a flat layout re-keys them.
+            let path = lf_root.path().join("tests/fixtures").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("fixture dirs");
+            std::fs::write(&path, source).expect("write LF fixture");
+            path
+        });
+        let project_root = lf_root.path();
         let (chunks, _) = SemanticIndex::collect_chunks(project_root, &fixture_files);
         let normalized = chunks
             .iter()
@@ -4376,6 +4393,13 @@ mod tests {
         )
     }
 
+    // Unix-only: chunk embed text bakes the OS-native relative path into its
+    // header (file-summary chunks), so a Windows run hashes "tests\fixtures\…"
+    // and can never reproduce the unix-captured baseline even with LF-forced
+    // sources. The property under test — the query-free Rust walk reproduces
+    // the old RS_QUERY output byte-for-byte — is platform-independent and is
+    // pinned where the baseline was captured.
+    #[cfg(unix)]
     #[test]
     fn rust_semantic_fixture_output_matches_query_baseline() {
         let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
