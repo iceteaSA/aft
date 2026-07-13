@@ -1808,7 +1808,9 @@ fn subc_bridge_failed_new_root_bind_rolls_back_actor_and_drops_pre_ack_push() {
 fn subc_bridge_callgraph_maintenance_is_per_root() {
     run_subc_bridge_test(
         "subc_bridge_callgraph_maintenance_is_per_root",
-        Duration::from_secs(60),
+        // The driver uses observable response/build polls; this watchdog only catches
+        // hangs and must outlive their shared deadline under full-suite contention.
+        Duration::from_secs(240),
         drive_callgraph_maintenance_daemon,
         |_, _, _| {},
     );
@@ -1818,7 +1820,9 @@ fn subc_bridge_callgraph_maintenance_is_per_root() {
 fn subc_bridge_inspect_dead_code_converges_for_bound_git_root() {
     run_subc_bridge_test_with_dispatch(
         "subc_bridge_inspect_dead_code_converges_for_bound_git_root",
-        Duration::from_secs(75),
+        // Inspect convergence is polled from observable summaries; the watchdog is a
+        // hang backstop, not a bound on cold callgraph execution under suite load.
+        Duration::from_secs(180),
         drive_inspect_dead_code_convergence_daemon,
         |_, _, _| {},
         inspect_dead_code_dispatch,
@@ -4555,6 +4559,18 @@ async fn call_tool_response(
     tool_response_json(&frame)
 }
 
+fn touch_command(path: &std::path::Path) -> String {
+    let rendered = path.to_string_lossy().replace('"', "\\\"");
+    let rendered = if cfg!(windows) {
+        // Git Bash treats bare Windows backslashes as escapes. Forward slashes and
+        // quoting keep the scanner-triggering command pointed at the fixture file.
+        rendered.replace('\\', "/")
+    } else {
+        rendered
+    };
+    format!("touch \"{rendered}\"")
+}
+
 async fn drive_bash_elicitation_allow_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -4562,20 +4578,26 @@ async fn drive_bash_elicitation_allow_daemon(input: FakeDaemonInput) {
     bind_untrusted_elicitation_route(&mut stream, 1, 101, &root1).await;
 
     let touched = root1.join("elicitation-allow.txt");
+    // The bridge runs bash in the bound project root. A relative redirect creates the
+    // same observable file through PowerShell, cmd, or a POSIX shell without translating
+    // an absolute Windows path for a different shell's path grammar.
     send_tool_call(
         &mut stream,
         1,
         102,
         "bash",
-        json!({ "command": format!("touch {}", touched.display()), "compressed": false }),
+        json!({
+            "command": "echo allowed > \"elicitation-allow.txt\"",
+            "compressed": false
+        }),
     )
     .await;
-    let (ask_corr, body) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
+    let (ask_corr, body) = expect_bash_elicitation_request(&mut stream, 1, "echo").await;
     assert!(
         body["params"]["message"]
             .as_str()
             .expect("message")
-            .contains("touch *"),
+            .contains("echo *"),
         "message should render scanner patterns: {body:?}"
     );
     send_bash_elicitation_reply(
@@ -4610,7 +4632,7 @@ async fn drive_bash_elicitation_deny_and_malformed_daemon(input: FakeDaemonInput
         1,
         201,
         "bash",
-        json!({ "command": format!("touch {}", denied.display()), "compressed": false }),
+        json!({ "command": touch_command(&denied), "compressed": false }),
     )
     .await;
     let (ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
@@ -4635,7 +4657,7 @@ async fn drive_bash_elicitation_deny_and_malformed_daemon(input: FakeDaemonInput
             1,
             corr,
             "bash",
-            json!({ "command": format!("touch {}", path.display()), "compressed": false }),
+            json!({ "command": touch_command(&path), "compressed": false }),
         )
         .await;
         let (ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
@@ -4659,7 +4681,7 @@ async fn drive_bash_elicitation_ttl_daemon(input: FakeDaemonInput) {
         1,
         301,
         "bash",
-        json!({ "command": format!("touch {}", touched.display()), "compressed": false }),
+        json!({ "command": touch_command(&touched), "compressed": false }),
     )
     .await;
     let (ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
@@ -4703,7 +4725,7 @@ async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput) {
         1,
         401,
         "bash",
-        json!({ "command": format!("touch {}", touched.display()), "compressed": false }),
+        json!({ "command": touch_command(&touched), "compressed": false }),
     )
     .await;
     let (_ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
@@ -4751,7 +4773,7 @@ async fn drive_bash_no_elicitation_regression_daemon(input: FakeDaemonInput) {
         1,
         102,
         "bash",
-        json!({ "command": format!("touch {}", touched.display()), "compressed": false }),
+        json!({ "command": touch_command(&touched), "compressed": false }),
     )
     .await;
     expect_bash_denied_tool_response(&mut stream, 1, 102, "no elicitation bash deny").await;
@@ -4776,7 +4798,7 @@ async fn drive_first_party_bash_permission_required_regression_daemon(input: Fak
         501,
         "bash",
         json!({
-            "command": format!("touch {}", touched.display()),
+            "command": touch_command(&touched),
             "permissions_requested": true,
             "compressed": false
         }),
@@ -5571,12 +5593,20 @@ async fn poll_inspect_dead_code_until_counts(
     channel: u16,
     first_corr: u64,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // One arithmetic deadline bounds the whole observable poll. Individual inspect
+    // responses may consume most of the budget when cold scans compete with the full
+    // integration suite, but they cannot silently restart a fresh timeout each turn.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut corr = first_corr;
     let mut last_dead_code = Value::Null;
     while Instant::now() < deadline {
         send_tool_call(stream, channel, corr, "inspect", json!({})).await;
-        let frame = read_frame_timeout(stream, "inspect convergence response").await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(frame) =
+            read_frame_within(stream, remaining, "inspect convergence response").await
+        else {
+            break;
+        };
         assert_eq!(frame.header.channel, channel);
         assert_eq!(frame.header.corr, corr);
         let response = tool_response_json(&frame);
@@ -5596,7 +5626,7 @@ async fn poll_inspect_dead_code_until_counts(
         corr += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    panic!("inspect dead_code did not converge within 30s; last summary: {last_dead_code:?}");
+    panic!("inspect dead_code did not converge within 120s; last summary: {last_dead_code:?}");
 }
 
 async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
@@ -5638,8 +5668,24 @@ async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
     });
     send_tool_call(&mut stream, 3, 501, "callers", callers_args.clone()).await;
     send_tool_call(&mut stream, 3, 502, "callers", callers_args.clone()).await;
-    let cold_one = read_frame_timeout(&mut stream, "cold callers response 1").await;
-    let cold_two = read_frame_timeout(&mut stream, "cold callers response 2").await;
+    // The single-flight result count is the invariant. Share one arithmetic response
+    // deadline so full-suite scheduler load cannot fail a correct build at 30 seconds,
+    // while two missing responses still terminate as one bounded hang.
+    let cold_deadline = Instant::now() + Duration::from_secs(90);
+    let cold_one = read_frame_within(
+        &mut stream,
+        cold_deadline.saturating_duration_since(Instant::now()),
+        "cold callers response 1",
+    )
+    .await
+    .expect("cold callers response 1 within shared deadline");
+    let cold_two = read_frame_within(
+        &mut stream,
+        cold_deadline.saturating_duration_since(Instant::now()),
+        "cold callers response 2",
+    )
+    .await
+    .expect("cold callers response 2 within shared deadline");
     let cold_responses = [tool_response_json(&cold_one), tool_response_json(&cold_two)];
     assert_eq!(
         aft::context::callgraph_cold_build_spawn_count_for_test(),
@@ -7738,11 +7784,21 @@ async fn poll_callers_until_ready(
     first_corr: u64,
     arguments: Value,
 ) -> Value {
-    for attempt in 0..80 {
+    // Count-based retries turn into a much shorter deadline when responses are fast and
+    // the background build is slow. Keep one arithmetic budget around the observable
+    // readiness state instead, preserving a hard bound regardless of poll cadence.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut attempt = 0_u64;
+    let mut last_response = Value::Null;
+    while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let corr = first_corr + attempt;
         send_tool_call(stream, channel, corr, "callers", arguments.clone()).await;
-        let frame = read_frame_timeout(stream, "poll callers response").await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(frame) = read_frame_within(stream, remaining, "poll callers response").await
+        else {
+            break;
+        };
         assert_eq!(frame.header.corr, corr);
         let response = tool_response_json(&frame);
         if response["success"].as_bool() == Some(true) {
@@ -7753,8 +7809,10 @@ async fn poll_callers_until_ready(
             Some("callgraph_building"),
             "callers should build or become ready, got {response:?}"
         );
+        last_response = response;
+        attempt += 1;
     }
-    panic!("callgraph store did not become ready after maintenance drain ticks");
+    panic!("callgraph store did not become ready within 90s; last response: {last_response:?}");
 }
 
 fn is_callgraph_building(response: &Value) -> bool {

@@ -345,8 +345,11 @@ fn pending_orchestrated_bash_does_not_starve_push_frames() {
         "configure failed: {configure:?}"
     );
 
+    // The invariant is frame ordering, not one-second delivery. Read the next frame with
+    // a generous hang backstop and assert that the configure push wins the deferred bash
+    // response, so scheduler contention cannot turn correct ordering into a timeout.
     let push = aft
-        .try_read_next_timeout(Duration::from_secs(1))
+        .try_read_next_timeout(Duration::from_secs(12))
         .expect("configure warning push before deferred bash response");
     assert_eq!(
         push["type"], "configure_warnings",
@@ -355,7 +358,7 @@ fn pending_orchestrated_bash_does_not_starve_push_frames() {
 
     let bash_response = loop {
         let value = aft
-            .try_read_next_timeout(Duration::from_secs(3))
+            .try_read_next_timeout(Duration::from_secs(12))
             .expect("deferred bash response after command completion");
         if value["id"] == "bash-drain-orchestrated" {
             break value;

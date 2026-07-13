@@ -983,8 +983,10 @@ fn inspect_command_tier2_changed_file_returns_fresh_without_scheduler_wait() {
 fn inspect_direct_reuse_attaches_to_in_flight_background_category() {
     let _env_lock = env_serial_lock();
     let (_temp_dir, root) = fixture_project();
-    let _delay_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_ROOT", &root.to_string_lossy());
-    let _delay = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_MS", "200");
+    let _wait_for_attach_root = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_WAIT_FOR_WAITER_ROOT",
+        &root.to_string_lossy(),
+    );
     write_file(&root, "src/foo.ts", duplicate_fixture_source());
     write_file(&root, "src/bar.ts", duplicate_fixture_source());
     let ctx = configured_context(&root);
@@ -996,9 +998,23 @@ fn inspect_direct_reuse_attaches_to_in_flight_background_category() {
         ctx.symbol_cache(),
     );
 
+    let starts_before_submit = manager.reuse_start_count_for_test();
     manager
         .submit_tier2_run_with_reuse_background(snapshot.clone(), InspectCategory::Duplicates)
         .expect("queue background duplicate scan");
+
+    // Observe worker execution rather than assuming a queued rayon job has started. The
+    // test seam holds that worker until the direct request registers as its waiter, so
+    // scheduler contention cannot turn this reuse assertion into two sequential scans.
+    let start_deadline = Instant::now() + Duration::from_secs(20);
+    while manager.reuse_start_count_for_test() == starts_before_submit {
+        assert!(
+            Instant::now() < start_deadline,
+            "background duplicate scan never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     let direct = manager.tier2_run_with_reuse_direct(
         snapshot,
         InspectCategory::Duplicates,

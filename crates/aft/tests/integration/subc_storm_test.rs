@@ -433,7 +433,9 @@ fn pool_size_two() {
 fn generation_supersession_mid_drain() {
     subc_bridge_test::run_subc_bridge_test_with_dispatch(
         "generation_supersession_mid_drain",
-        Duration::from_secs(30),
+        // Readiness and watcher drain have their own observable deadlines. This outer
+        // watchdog only detects a hang and must outlive both under suite contention.
+        Duration::from_secs(180),
         drive_generation_supersession_mid_drain,
         |_, _, _| {},
         storm_dispatch,
@@ -717,8 +719,9 @@ async fn drive_generation_supersession_mid_drain(input: FakeDaemonInput) {
         &HashSet::new(),
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(watcher_pending(&tx, &mut rx, &mut corr).await, 0);
+    // The generation handoff is complete when the synthetic watcher backlog reports
+    // empty; polling that state avoids assuming 768 queued events drain within 2s.
+    wait_for_watcher_empty(&tx, &mut rx, &mut corr).await;
 
     let stale_tail_path = "src/superseded_0767.rs";
     write_storm_file(&root.join(stale_tail_path), "stale_tail_marker");
@@ -864,7 +867,9 @@ fn subc_storm_rebinds_stay_live_under_build_and_tool_traffic() {
 fn fresh_worktree_bind_does_not_starve_parent_reads_or_acquire_parent_writers() {
     subc_bridge_test::run_subc_bridge_test_with_dispatch(
         "fresh_worktree_bind_does_not_starve_parent_reads_or_acquire_parent_writers",
-        Duration::from_secs(40),
+        // Root readiness is an observable poll with a 120-second budget. The outer
+        // watchdog is only a hang backstop; the parent-read phase keeps its tight bound.
+        Duration::from_secs(180),
         drive_fresh_worktree_borrow_only_daemon,
         |_, _, _| {},
         storm_dispatch,
@@ -2200,7 +2205,10 @@ async fn wait_for_ready_health(
     roots: &[PathBuf],
     semantic_roots: &HashSet<usize>,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(80);
+    // Readiness is an observable state transition, not a performance assertion. A
+    // generous deadline keeps cold index builds valid under full-suite I/O contention;
+    // each health response still proves the module is live while the poll waits.
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         *corr += 1;
         send_control(tx, *corr, ModuleControlRequest::HealthCheck {});

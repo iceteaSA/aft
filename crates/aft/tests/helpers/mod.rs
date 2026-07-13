@@ -172,6 +172,26 @@ impl AftProcess {
             command.env(key, value);
         }
 
+        #[cfg(windows)]
+        let mut child = {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match command.spawn() {
+                    Ok(child) => break child,
+                    // Windows Application Control can temporarily reject a freshly built
+                    // test binary while its trust check is still in flight. Retry only that
+                    // observable policy result; permanent policy failures still surface at
+                    // the deadline and all other spawn errors fail immediately.
+                    Err(error)
+                        if error.raw_os_error() == Some(4551) && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(error) => panic!("failed to spawn aft binary: {error:?}"),
+                }
+            }
+        };
+        #[cfg(not(windows))]
         let mut child = command.spawn().expect("failed to spawn aft binary");
         let child_pid = child.id();
 
