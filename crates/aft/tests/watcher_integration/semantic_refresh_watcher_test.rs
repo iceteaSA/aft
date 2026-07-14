@@ -43,7 +43,15 @@ impl MockEmbeddingServer {
             while running_for_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ = handle_embedding_request(&mut stream, &release_for_thread);
+                        // Serve each connection on its own thread. The refresh
+                        // request is deliberately held open while the test
+                        // asserts mid-refresh queryability, and a serial accept
+                        // loop would starve the concurrent query embed behind
+                        // it (real backends serve requests concurrently).
+                        let release = Arc::clone(&release_for_thread);
+                        thread::spawn(move || {
+                            let _ = handle_embedding_request(&mut stream, &release);
+                        });
                     }
                     Err(_) => break,
                 }
@@ -69,6 +77,9 @@ impl MockEmbeddingServer {
 impl Drop for MockEmbeddingServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // Unwedge any handler thread still holding a refresh request so it
+        // exits promptly instead of waiting out its 30s panic backstop.
+        self.release_refresh.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.addr);
         if let Some(handle) = self.handle.take() {
             handle.join().expect("embedding server thread");

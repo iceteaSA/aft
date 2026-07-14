@@ -960,6 +960,9 @@ pub struct AppContext {
     semantic_index: RwLock<Option<SemanticIndex>>,
     semantic_index_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RwLock<SemanticIndexStatus>,
+    /// Serializes missing-artifact checks with receiver installation so
+    /// concurrent fallback queries cannot start duplicate reload workers.
+    artifact_reload_lock: parking_lot::Mutex<()>,
     /// True while this context has a cold semantic seed scheduled or actively
     /// collecting/embedding/persisting the full project corpus. The semantic
     /// worker clears it as soon as it proves the cached/incremental path is in use.
@@ -1192,6 +1195,7 @@ impl AppContext {
             semantic_index: RwLock::new(None),
             semantic_index_rx: parking_lot::Mutex::new(None),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
+            artifact_reload_lock: parking_lot::Mutex::new(()),
             semantic_cold_seed_active: Arc::new(AtomicBool::new(false)),
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
             semantic_fingerprint_generation: Arc::new(AtomicU64::new(0)),
@@ -3328,6 +3332,10 @@ impl AppContext {
         &self.semantic_index_status
     }
 
+    pub(crate) fn artifact_reload_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.artifact_reload_lock.lock()
+    }
+
     /// Reset this context's cold semantic seed gate for a newly accepted
     /// configure and return the generation token for the worker being spawned.
     pub fn reset_semantic_cold_seed_gate_for_configure(&self) -> u64 {
@@ -3346,6 +3354,10 @@ impl AppContext {
 
     pub fn semantic_cold_seed_generation_flag(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.semantic_cold_seed_generation)
+    }
+
+    pub fn semantic_cold_seed_generation(&self) -> u64 {
+        self.semantic_cold_seed_generation.load(Ordering::SeqCst)
     }
 
     pub fn semantic_cold_seed_active(&self) -> bool {
@@ -3710,8 +3722,8 @@ impl AppContext {
         search_has_pending_disk_changes
     }
 
-    /// Drop idle root-scoped artifact handles. Persistent data remains on disk
-    /// and each command's existing lazy-open path recreates the handle later.
+    /// Drop idle root-scoped artifact handles. Persistent data remains on disk;
+    /// artifact-backed query paths schedule a background reload on first use.
     /// Returns false when an active build, bash task, inspect scan, or pending
     /// disk update makes eviction unsafe.
     pub fn evict_idle_artifacts(&self) -> bool {
@@ -4114,6 +4126,27 @@ impl AppContext {
         req_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_path_with_artifact_session(req_id, path, None)
+    }
+
+    /// Validate a read path, including the narrow exception for a bash artifact
+    /// registered to the requesting session. Mutating tools deliberately use
+    /// [`AppContext::validate_path`] and never receive this exception.
+    pub fn validate_read_path(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_path_with_artifact_session(req_id, path, Some(session_id))
+    }
+
+    fn validate_path_with_artifact_session(
+        &self,
+        req_id: &str,
+        path: &Path,
+        artifact_session_id: Option<&str>,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let config = self.config();
         let force_restrict = self.request_force_restrict(req_id);
         let enforce = config.restrict_to_project_root || force_restrict;
@@ -4167,7 +4200,13 @@ impl AppContext {
         };
 
         if !resolved.starts_with(&resolved_root) {
-            return Err(path_error_response(req_id, path, &resolved_root));
+            let is_owned_bash_artifact = artifact_session_id.is_some_and(|session_id| {
+                self.bash_background
+                    .is_session_owned_artifact_path(session_id, &resolved)
+            });
+            if !is_owned_bash_artifact {
+                return Err(path_error_response(req_id, path, &resolved_root));
+            }
         }
 
         Ok(resolved)
@@ -4279,8 +4318,15 @@ impl AppContext {
         for (root, context) in contexts {
             roots.insert(root.display().to_string(), context.memory_root_snapshot());
         }
+        // Normalize through the same identity the registry keys on: on Windows
+        // a verbatim `\\?\` current root would otherwise land as a SECOND
+        // entry for an already-registered root and double-count its memory.
         let current_label = current_root
-            .map(|root| root.display().to_string())
+            .map(|root| {
+                cortexkit_paths::ProjectRootId::from_path(root)
+                    .map(|id| id.as_path().display().to_string())
+                    .unwrap_or_else(|_| root.display().to_string())
+            })
             .unwrap_or_else(|| "<unconfigured>".to_string());
         roots
             .entry(current_label)

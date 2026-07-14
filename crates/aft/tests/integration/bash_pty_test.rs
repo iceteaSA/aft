@@ -533,13 +533,13 @@ fn pty_write_python_repl_round_trip() {
     let python = if std::process::Command::new("python3")
         .arg("--version")
         .output()
-        .is_ok()
+        .is_ok_and(|output| output.status.success())
     {
         "python3 -q"
     } else if std::process::Command::new("python")
         .arg("--version")
         .output()
-        .is_ok()
+        .is_ok_and(|output| output.status.success())
     {
         "python -q"
     } else {
@@ -558,11 +558,12 @@ fn pty_write_python_repl_round_trip() {
     );
     let paths = task_paths(storage.path(), SESSION, &task_id);
 
-    // Barrier: wait for the REPL prompt before writing. On cold Windows CI
-    // runners shell + python startup alone can exceed 5s, and measuring the
-    // read deadline from the write (issued before the REPL exists) flaked two
-    // release runs. `-q` suppresses the banner, so the prompt is the first
-    // thing the REPL prints.
+    // Barrier: require a successful version probe before spawning because Windows app
+    // execution aliases start successfully but exit without Python. Then wait for the REPL
+    // prompt before writing. On cold Windows CI runners shell + python startup can exceed
+    // 5s, and measuring the read deadline from the write (issued before the REPL exists)
+    // flaked two release runs. `-q` suppresses the banner, so the prompt is the first thing
+    // the REPL prints.
     read_pty_until(&paths.pty, ">>>", Duration::from_secs(30));
     registry
         .write_pty(&task_id, SESSION, b"print('pty-repl-ok')\n")

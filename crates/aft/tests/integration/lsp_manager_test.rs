@@ -108,7 +108,7 @@ fn executable_protocol_server_script() -> PathBuf {
         let wrapper = dir.join("protocol_lsp_server.cmd");
         fs::write(
             &wrapper,
-            "@echo off\r\nwhere python >nul 2>nul\r\nif %ERRORLEVEL% EQU 0 (python \"%~dp0protocol_lsp_server.py\" & exit /b %ERRORLEVEL%)\r\npy -3 \"%~dp0protocol_lsp_server.py\"\r\n",
+            "@echo off\r\npython --version >nul 2>nul\r\nif %ERRORLEVEL% NEQ 0 goto py_launcher\r\npython \"%~dp0protocol_lsp_server.py\"\r\nexit /b %ERRORLEVEL%\r\n:py_launcher\r\npy -3 \"%~dp0protocol_lsp_server.py\"\r\n",
         )
         .expect("write protocol server cmd wrapper");
         wrapper
@@ -128,14 +128,16 @@ fn executable_protocol_server_script() -> PathBuf {
 
 fn protocol_server_prerequisites_available() -> bool {
     if cfg!(windows) {
+        // A Windows app execution alias can be present but exit after reporting that
+        // Python is unavailable, so only a successful probe makes the fixture runnable.
         std::process::Command::new("python")
             .arg("--version")
             .output()
-            .is_ok()
+            .is_ok_and(|output| output.status.success())
             || std::process::Command::new("py")
                 .args(["-3", "--version"])
                 .output()
-                .is_ok()
+                .is_ok_and(|output| output.status.success())
     } else {
         true
     }

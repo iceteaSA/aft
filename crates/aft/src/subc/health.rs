@@ -225,9 +225,11 @@ pub(super) fn build_health_report(
     // Health replies must stay cheap under any load (subc-health rule: a
     // probe that queues behind busy state lies about liveness and gets the
     // module health-killed). Every read below is try-lock-only: a contended
-    // scheduler lock degrades to an empty root list instead of waiting.
-    let mut roots: Vec<RootHealthSnapshot> = executor
-        .try_actor_entries()
+    // scheduler lock produces a degraded report with an empty root list instead
+    // of waiting.
+    let actor_entries = executor.try_actor_entries();
+    let scheduler_busy = actor_entries.is_none();
+    let mut roots: Vec<RootHealthSnapshot> = actor_entries
         .unwrap_or_default()
         .into_iter()
         .map(|(root_id, ctx)| ctx.try_health_snapshot(root_id.as_path()))
@@ -248,7 +250,9 @@ pub(super) fn build_health_report(
         .iter()
         .filter(|root| !matches!(root.state, RootHealthState::Busy) && !root.is_fully_ready())
         .count();
-    let detail = if busy_roots > 0 {
+    let detail = if scheduler_busy {
+        Some("executor scheduler state could not be snapshotted without contention".to_string())
+    } else if busy_roots > 0 {
         Some(format!(
             "{busy_roots} root actor(s) could not be snapshotted without contention"
         ))
@@ -261,7 +265,9 @@ pub(super) fn build_health_report(
     };
 
     HealthReport {
-        status: if busy_roots > 0 {
+        // Failing to acquire the scheduler snapshot is itself dispatch contention;
+        // reporting Ok with an empty root list would hide the condition being probed.
+        status: if scheduler_busy || busy_roots > 0 {
             HealthStatus::Degraded
         } else {
             HealthStatus::Ok
@@ -427,11 +433,14 @@ mod tests {
             .expect("mutating lock holder starts");
 
         let report = build_health_report(&executor, &HashMap::new(), &DispatchPathMetrics::new());
-        assert_eq!(report.status, HealthStatus::Degraded);
 
+        // Settle the holder before asserting so a verdict failure cannot drop the release
+        // sender and make the worker panic while the test unwinds.
         release_tx.send(()).expect("release held health lock");
         blocker
             .recv_timeout(Duration::from_secs(3))
             .expect("mutating lock holder completes");
+
+        assert_eq!(report.status, HealthStatus::Degraded);
     }
 }

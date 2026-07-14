@@ -4,9 +4,10 @@
  * Contract (issue #125): `restrict_to_project_root` is AFT's full-isolation
  * knob, deliberately NOT conflated with any per-call permission prompt. Pi has
  * no host-level permission/allow-list to bubble to, so the knob is binary:
- *   - restrict_to_project_root: true  → an out-of-root path is HARD-BLOCKED
- *     before any bridge call, with a clear actionable error (which Pi renders
- *     as the tool result — its user surface). No ui.confirm prompt.
+ *   - restrict_to_project_root: true  → ordinary out-of-root paths are
+ *     HARD-BLOCKED before any bridge call. Hoisted reads are forwarded so Rust
+ *     can recognize exact session-owned bash artifacts without duplicating its
+ *     task registry in this plugin; Rust rejects every other external read.
  *   - restrict_to_project_root: false → external paths are allowed; the tool
  *     proceeds to the bridge (Rust accepts them).
  * In-root paths are always allowed and never blocked.
@@ -185,7 +186,7 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
     }
   });
 
-  test("restrict=true blocks hoisted read/write/edit/grep for external absolute, parent-relative, and tilde paths", async () => {
+  test("restrict=true routes hoisted reads to Rust but blocks write/edit/grep external paths", async () => {
     const pathForms = [
       "/outside/hoisted.ts",
       "../outside/hoisted.ts",
@@ -213,10 +214,22 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
           restrictToProjectRoot: true,
         });
 
-        await expect(
-          executeTool(tools.get(entry.toolName)!, entry.params(form), makeExtContext(projectRoot)),
-        ).rejects.toThrow(BLOCK_MESSAGE);
-        expect(calls).toHaveLength(0);
+        const execution = executeTool(
+          tools.get(entry.toolName)!,
+          entry.params(form),
+          makeExtContext(projectRoot),
+        );
+        if (entry.toolName === "read") {
+          await execution;
+          expect(calls).toHaveLength(1);
+          expect(calls[0]).toMatchObject({
+            command: "tool_call",
+            params: { name: "read" },
+          });
+        } else {
+          await expect(execution).rejects.toThrow(BLOCK_MESSAGE);
+          expect(calls).toHaveLength(0);
+        }
       }
     }
   });

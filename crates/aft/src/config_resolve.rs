@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     BackupConfig, Config, InspectConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
+    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::jsonc::strip_jsonc;
 
@@ -209,6 +210,8 @@ pub struct RawSemantic {
     pub api_key_env: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
     pub timeout_ms: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    pub query_timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
     pub max_batch_size: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
@@ -222,6 +225,7 @@ impl RawSemantic {
             && self.base_url.is_none()
             && self.api_key_env.is_none()
             && self.timeout_ms.is_none()
+            && self.query_timeout_ms.is_none()
             && self.max_batch_size.is_none()
             && self.max_files.is_none()
     }
@@ -700,6 +704,7 @@ fn merge_semantic_config(
         base_url: None,
         api_key_env: None,
         timeout_ms: None,
+        query_timeout_ms: None,
         max_batch_size: None,
         max_files: None,
     });
@@ -911,6 +916,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
                 SEMANTIC_SECRET_REASON,
             );
         }
+        if semantic.query_timeout_ms.is_some() {
+            push_drop(dropped, "semantic.query_timeout_ms", tier, USER_ONLY_REASON);
+        }
     }
 
     if let Some(lsp) = &raw.lsp {
@@ -1015,6 +1023,10 @@ fn resolve_semantic_config(raw: Option<&RawSemantic>) -> SemanticBackendConfig {
     }
     if let Some(value) = raw.timeout_ms {
         semantic.timeout_ms = value.min(MAX_SEMANTIC_TIMEOUT_MS);
+    }
+    if let Some(value) = raw.query_timeout_ms {
+        semantic.query_timeout_ms =
+            value.clamp(MIN_SEMANTIC_QUERY_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS);
     }
     if let Some(value) = raw.max_batch_size {
         semantic.max_batch_size = value.min(MAX_SEMANTIC_BATCH_SIZE);
@@ -1561,6 +1573,7 @@ mod tests {
                 "base_url": "https://semantic.example.test",
                 "api_key_env": "AFT_API_KEY",
                 "timeout_ms": 12345,
+                "query_timeout_ms": 2345,
                 "max_batch_size": 12,
                 "max_files": 3456
               },
@@ -1612,6 +1625,7 @@ mod tests {
             Some("AFT_API_KEY")
         );
         assert_eq!(result.config.semantic.timeout_ms, 12345);
+        assert_eq!(result.config.semantic.query_timeout_ms, 2345);
         assert_eq!(result.config.semantic.max_batch_size, 12);
         assert_eq!(result.config.semantic.max_files, 3456);
         assert!(!result.config.inspect.enabled);
@@ -1634,6 +1648,25 @@ mod tests {
         assert!(!result.config.experimental_bash_background);
         assert!(!result.config.bash_long_running_reminder_enabled);
         assert_eq!(result.config.bash_long_running_reminder_interval_ms, 123000);
+    }
+
+    #[test]
+    fn semantic_query_timeout_clamps_to_interactive_budget_range() {
+        let below_min =
+            resolve_config(&[tier("user", r#"{ "semantic": { "query_timeout_ms": 1 } }"#)]);
+        assert_eq!(
+            below_min.config.semantic.query_timeout_ms,
+            MIN_SEMANTIC_QUERY_TIMEOUT_MS
+        );
+
+        let above_max = resolve_config(&[tier(
+            "user",
+            r#"{ "semantic": { "query_timeout_ms": 50000 } }"#,
+        )]);
+        assert_eq!(
+            above_max.config.semantic.query_timeout_ms,
+            MAX_SEMANTIC_QUERY_TIMEOUT_MS
+        );
     }
 
     #[test]
@@ -1663,7 +1696,8 @@ mod tests {
                     "backend": "openai_compatible",
                     "base_url": "https://user.example.test",
                     "api_key_env": "USER_KEY",
-                    "model": "user-model"
+                    "model": "user-model",
+                    "query_timeout_ms": 900
                   },
                   "lsp": {
                     "servers": {
@@ -1690,7 +1724,8 @@ mod tests {
                     "base_url": "https://project.example.test",
                     "api_key_env": "PROJECT_KEY",
                     "model": "project-model",
-                    "timeout_ms": 2222
+                    "timeout_ms": 2222,
+                    "query_timeout_ms": 2222
                   },
                   "lsp": {
                     "servers": {
@@ -1724,6 +1759,7 @@ mod tests {
         );
         assert_eq!(result.config.semantic.model, "project-model");
         assert_eq!(result.config.semantic.timeout_ms, 2222);
+        assert_eq!(result.config.semantic.query_timeout_ms, 900);
         assert_eq!(result.config.lsp_servers.len(), 1);
         assert_eq!(result.config.lsp_servers[0].binary, "rust-analyzer");
         assert!(result.config.disabled_lsp.contains("user-disabled"));
@@ -1742,6 +1778,7 @@ mod tests {
             "semantic.backend",
             "semantic.base_url",
             "semantic.api_key_env",
+            "semantic.query_timeout_ms",
             "lsp.servers",
             "lsp.versions",
             "lsp.auto_install",

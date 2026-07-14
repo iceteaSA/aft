@@ -216,6 +216,9 @@ fn glob_root(
     match indexed {
         Some(discovery) => discovery,
         None => {
+            if search_scope.use_index {
+                super::configure::trigger_search_index_reload_if_evicted(ctx);
+            }
             if !search_scope.use_index {
                 let walk_started = Instant::now();
                 if let Some(outcome) =

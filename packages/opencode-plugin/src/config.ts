@@ -59,8 +59,10 @@ const SemanticConfigSchema = z.object({
   base_url: z.string().trim().min(1).optional(),
   /** Environment variable that contains the API key used by external backends. */
   api_key_env: z.string().trim().min(1).optional(),
-  /** Backend request timeout in milliseconds. */
+  /** Background build request timeout in milliseconds. */
   timeout_ms: z.number().int().positive().optional(),
+  /** Interactive query embedding deadline in milliseconds (clamped to 500..15000). */
+  query_timeout_ms: z.number().int().positive().optional(),
   /** Maximum batch size used by the semantic pipeline. */
   max_batch_size: z.number().int().positive().optional(),
   /** Maximum number of project files to semantically index (default 20000). */

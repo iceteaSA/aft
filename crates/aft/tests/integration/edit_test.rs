@@ -665,12 +665,38 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
     let (_dir, file, mut aft) =
         inline_lsp_diagnostics_fixture("inline-diag-fast", "cfg-inline-fast");
 
+    // Wait for a real diagnostics response before timing the edit under test.
+    // This keeps slow process startup outside the wait_ms assertion, especially
+    // on Windows runners where spawning the fake LSP can take several seconds.
+    let warmup = serde_json::json!({
+        "id": "em-inline-diag-warmup",
+        "command": "edit_match",
+        "file": file.display().to_string(),
+        "match": "let value = 1",
+        "replacement": "let warmed = 1",
+        "diagnostics": true,
+        "wait_ms": 2_000,
+    });
+    let warmup_resp = aft.send(&serde_json::to_string(&warmup).unwrap());
+    assert_eq!(
+        warmup_resp["success"], true,
+        "warmup edit_match should succeed: {warmup_resp:?}"
+    );
+    assert_eq!(
+        warmup_resp["lsp_diagnostics"]
+            .as_array()
+            .expect("warmup lsp_diagnostics array")
+            .len(),
+        2,
+        "warmup must observe the fake LSP diagnostics: {warmup_resp:?}"
+    );
+
     let start = std::time::Instant::now();
     let req = serde_json::json!({
         "id": "em-inline-diag-fast",
         "command": "edit_match",
         "file": file.display().to_string(),
-        "match": "let value = 1",
+        "match": "let warmed = 1",
         "replacement": "let answer = 1",
         "diagnostics": true,
         "wait_ms": 2_000,
@@ -684,9 +710,10 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
         .expect("lsp_diagnostics array");
     assert_eq!(
         diagnostics.len(),
-        2,
-        "expected inline diagnostics: {resp:?}"
+        1,
+        "expected fresh diagnostics after the warm LSP edit: {resp:?}"
     );
+    assert_eq!(diagnostics[0]["message"], "test diagnostic after change");
     assert!(
         elapsed < std::time::Duration::from_millis(4_000),
         "expected event-driven wait, elapsed: {elapsed:?}, resp: {resp:?}"

@@ -2275,12 +2275,18 @@ mod tests {
 
     #[test]
     fn run_external_tool_timeout_kills_subprocess() {
-        // Use `sleep 60` as a long-running process, timeout after 1 second
-        let result = run_external_tool("sleep", &["60"], None, 1);
+        // Use a native long-running command on each platform so the test reaches the
+        // timeout mechanism instead of depending on Unix utilities being on Windows PATH.
+        let (tool, args): (&str, &[&str]) = if cfg!(windows) {
+            ("ping", &["-n", "60", "127.0.0.1"])
+        } else {
+            ("sleep", &["60"])
+        };
+        let result = run_external_tool(tool, args, None, 1);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Timeout { tool, timeout_secs } => {
-                assert_eq!(tool, "sleep");
+                assert_eq!(tool, if cfg!(windows) { "ping" } else { "sleep" });
                 assert_eq!(timeout_secs, 1);
             }
             other => panic!("expected Timeout, got: {:?}", other),
@@ -2289,7 +2295,13 @@ mod tests {
 
     #[test]
     fn run_external_tool_success() {
-        let result = run_external_tool("echo", &["hello"], None, 5);
+        // `echo` is a cmd builtin rather than an executable on Windows.
+        let (tool, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "echo hello"])
+        } else {
+            ("echo", &["hello"])
+        };
+        let result = run_external_tool(tool, args, None, 5);
         assert!(result.is_ok());
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
@@ -2322,12 +2334,17 @@ mod tests {
 
     #[test]
     fn run_external_tool_nonzero_exit() {
-        // `false` always exits with code 1
-        let result = run_external_tool("false", &[], None, 5);
+        // Use cmd's explicit exit on Windows because the Unix `false` utility is absent.
+        let (tool, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "exit /b 1"])
+        } else {
+            ("false", &[])
+        };
+        let result = run_external_tool(tool, args, None, 5);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Failed { tool, .. } => {
-                assert_eq!(tool, "false");
+                assert_eq!(tool, if cfg!(windows) { "cmd" } else { "false" });
             }
             other => panic!("expected Failed, got: {:?}", other),
         }
@@ -2905,8 +2922,13 @@ mod tests {
 
     #[test]
     fn run_external_tool_capture_nonzero_not_error() {
-        // `false` exits with code 1 — capture should still return Ok
-        let result = run_external_tool_capture("false", &[], None, 5);
+        // Use a native non-zero command on each platform so this remains a capture test.
+        let (tool, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "exit /b 1"])
+        } else {
+            ("false", &[])
+        };
+        let result = run_external_tool_capture(tool, args, None, 5);
         assert!(result.is_ok(), "capture should not error on non-zero exit");
         assert_eq!(result.unwrap().exit_code, 1);
     }

@@ -147,6 +147,10 @@ impl AftProcess {
             // this never hangs. Lifecycle tests override it to "0" to exercise
             // the real Building -> drain -> Ready path.
             .env("AFT_CALLGRAPH_BUILD_WAIT_MS", "30000")
+            // Keep the fast pre-15s semantic quiet window in tests: rigs that
+            // assert watcher-driven semantic refresh would otherwise wait out
+            // the production burst-coalescing window on every batch.
+            .env("AFT_SEMANTIC_QUIET_WINDOW_MS", "50")
             // Disable the OS file watcher by default. ~600 integration spawns
             // each installing a recursive FsEventWatcher swamp the single macOS
             // fseventsd daemon, throttling event delivery and flaking the few
@@ -172,6 +176,26 @@ impl AftProcess {
             command.env(key, value);
         }
 
+        #[cfg(windows)]
+        let mut child = {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match command.spawn() {
+                    Ok(child) => break child,
+                    // Windows Application Control can temporarily reject a freshly built
+                    // test binary while its trust check is still in flight. Retry only that
+                    // observable policy result; permanent policy failures still surface at
+                    // the deadline and all other spawn errors fail immediately.
+                    Err(error)
+                        if error.raw_os_error() == Some(4551) && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(error) => panic!("failed to spawn aft binary: {error:?}"),
+                }
+            }
+        };
+        #[cfg(not(windows))]
         let mut child = command.spawn().expect("failed to spawn aft binary");
         let child_pid = child.id();
 

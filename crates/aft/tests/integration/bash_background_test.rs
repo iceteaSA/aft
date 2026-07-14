@@ -53,6 +53,27 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
     dir
 }
 
+fn configure_restricted_background(aft: &mut AftProcess) -> (tempfile::TempDir, tempfile::TempDir) {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let response = aft.send(
+        &json!({
+            "id": "cfg-restricted-bg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "config": user_config(serde_json::json!({
+                "restrict_to_project_root": true,
+                "experimental": { "bash": { "background": true } }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "configure failed: {response:?}");
+    (project, storage)
+}
+
 fn spawn_bg(aft: &mut AftProcess, id: &str, command: &str) -> String {
     let response = aft.send(
         &json!({
@@ -170,6 +191,16 @@ fn cross_platform_echo_command() -> &'static str {
     "echo hello"
 }
 
+#[cfg(unix)]
+fn truncation_sized_output_command() -> &'static str {
+    "i=1; while [ $i -le 2000 ]; do printf 'artifact-line-%04d\\n' \"$i\"; i=$((i+1)); done"
+}
+
+#[cfg(windows)]
+fn truncation_sized_output_command() -> &'static str {
+    "cmd /c \"for /L %i in (1,1,2000) do @echo artifact-line-%i\""
+}
+
 fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
@@ -226,6 +257,156 @@ fn background_bash_spawns_and_completes_cross_platform() {
             .contains("hello"),
         "expected output to contain hello: {completed:?}"
     );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn restricted_read_allows_only_current_session_bash_artifacts() {
+    let mut aft = AftProcess::spawn();
+    // The tempdir handle is only dereferenced by the unix-gated symlink block
+    // below; keep the binding underscore-prefixed so Windows (-D warnings)
+    // compiles while Drop still cleans the directory up.
+    let (_dir, _storage) = configure_restricted_background(&mut aft);
+    let owner_session = "artifact-owner-session";
+    let spawn = aft.send(
+        &json!({
+            "id": "spawn-readable-artifact",
+            "session_id": owner_session,
+            "command": "bash",
+            "params": {
+                "command": truncation_sized_output_command(),
+                "background": true,
+                "compressed": true
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(spawn["success"], true, "spawn failed: {spawn:?}");
+    let task_id = spawn["task_id"].as_str().unwrap();
+
+    let started = Instant::now();
+    let completed = loop {
+        let response = status_with_session(&mut aft, task_id, owner_session);
+        assert_eq!(response["success"], true, "status failed: {response:?}");
+        if response["status"] == "completed" {
+            break response;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "timed out waiting for artifact task: {response:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output_path = Path::new(completed["output_path"].as_str().expect("stdout path"));
+    let preview = completed["output_preview"].as_str().unwrap_or_default();
+    assert!(completed["output_truncated"].as_bool().unwrap_or(false));
+    assert!(
+        preview.contains(&format!("read \"{}\"", output_path.display())),
+        "truncation footer did not advertise the registered artifact: {preview:?}"
+    );
+
+    let write = aft.send(
+        &json!({
+            "id": "write-readable-artifact",
+            "session_id": owner_session,
+            "command": "write",
+            "file": output_path,
+            "content": "must stay blocked\n"
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        write["success"], false,
+        "write escaped restriction: {write:?}"
+    );
+    assert_eq!(
+        write["code"], "path_outside_root",
+        "wrong write error: {write:?}"
+    );
+
+    let edit = aft.send(
+        &json!({
+            "id": "edit-readable-artifact",
+            "session_id": owner_session,
+            "command": "edit_match",
+            "file": output_path,
+            "match": "artifact-line-0001",
+            "replacement": "blocked"
+        })
+        .to_string(),
+    );
+    assert_eq!(edit["success"], false, "edit escaped restriction: {edit:?}");
+    assert_eq!(
+        edit["code"], "path_outside_root",
+        "wrong edit error: {edit:?}"
+    );
+
+    let cross_session = aft.send(
+        &json!({
+            "id": "cross-session-artifact-read",
+            "session_id": "different-session",
+            "command": "read",
+            "file": output_path
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        cross_session["success"], false,
+        "cross-session read leaked: {cross_session:?}"
+    );
+    assert_eq!(cross_session["code"], "path_outside_root");
+
+    #[cfg(unix)]
+    {
+        let artifact_dir = output_path.parent().unwrap();
+        let link = _dir.path().join("artifact-link");
+        std::os::unix::fs::symlink(artifact_dir, &link).unwrap();
+        let unregistered = artifact_dir.join("unregistered-output");
+        std::fs::write(&unregistered, "not registered\n").unwrap();
+        for target in [link.clone(), link.join("unregistered-output")] {
+            let response = aft.send(
+                &json!({
+                    "id": "symlink-artifact-prefix-read",
+                    "session_id": owner_session,
+                    "command": "read",
+                    "file": target
+                })
+                .to_string(),
+            );
+            assert_eq!(
+                response["success"], false,
+                "symlink widened artifact access: {response:?}"
+            );
+            assert_eq!(response["code"], "path_outside_root");
+        }
+    }
+
+    let read = aft.send(
+        &json!({
+            "id": "read-owned-artifact",
+            "session_id": owner_session,
+            "command": "read",
+            "file": output_path
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        read["success"], true,
+        "owned artifact read failed: {read:?}"
+    );
+    assert_eq!(
+        read["complete"], true,
+        "artifact read was not complete: {read:?}"
+    );
+    let content = read["content"].as_str().unwrap_or_default();
+    // The unix fixture zero-pads (%04d); cmd's for /L loop cannot, so the
+    // first line differs per platform while the last line matches both.
+    #[cfg(unix)]
+    assert!(content.contains("artifact-line-0001"));
+    #[cfg(windows)]
+    assert!(content.contains("artifact-line-1\r\n") || content.contains("artifact-line-1\n"));
+    assert!(content.contains("artifact-line-2000"));
+
     assert!(aft.shutdown().success());
 }
 

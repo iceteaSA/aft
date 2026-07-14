@@ -160,6 +160,30 @@ describe("Hoisted tool execute handlers", () => {
     );
   });
 
+  test("restricted read forwards external bash artifacts to Rust without an external-directory ask", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = {
+      ...createMockSdkContext(tmpDir),
+      ask: recordingAsk(askCalls),
+    };
+    const artifactPath = resolve(tmpDir, "../bash-task.stdout");
+    const { calls, tools } = createMockHoistedHarness(
+      () => ({ success: true, text: "1: full bash output\n" }),
+      { restrict_to_project_root: true } as PluginContext["config"],
+    );
+
+    const result = await tools.read.execute({ filePath: artifactPath }, sdkCtx);
+
+    expect(text(result)).toContain("full bash output");
+    expect(askCalls.map((call) => call.permission)).toEqual(["read"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      command: "read",
+      params: { filePath: artifactPath },
+    });
+  });
+
   test("read maps image attachments to OpenCode data URLs and metadata", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);

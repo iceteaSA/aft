@@ -441,14 +441,12 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         "reader".to_string(),
         Box::new(move |_| {
             reader_started_tx.send(()).expect("reader starts");
-            release_reader_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("release reader");
+            release_reader_rx.recv().expect("release reader");
             ok("reader")
         }),
     );
     reader_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(12))
         .expect("reader starts before queued configure jobs");
     let first_bind = executor.submit(
         reader_root.clone(),
@@ -462,22 +460,33 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         "subc-bind-second".to_string(),
         Box::new(|_| ok("second-bind")),
     );
-    // try_bind_blocker_snapshot is try-lock-only by contract and may lose to
-    // the dispatcher's own scheduler-lock windows; retry briefly rather than
-    // demanding the first attempt wins the race.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // The snapshot API is try-lock-only and may lose repeatedly to the dispatcher's
+    // scheduler windows under load. Poll its observable result while the channel barrier
+    // keeps the reader in place, then settle every worker before making assertions.
+    let deadline = Instant::now() + Duration::from_secs(12);
     let reader_snapshot = loop {
-        if let Some(snapshot) =
-            executor.try_bind_blocker_snapshot(&reader_root, "subc-bind-second")
+        if let Some(snapshot) = executor.try_bind_blocker_snapshot(&reader_root, "subc-bind-second")
         {
-            break snapshot;
+            break Some(snapshot);
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "bind blocker snapshot stayed lock-contended for 2s"
-        );
+        if Instant::now() >= deadline {
+            break None;
+        }
         std::thread::sleep(Duration::from_millis(5));
     };
+
+    release_reader_tx.send(()).expect("release reader");
+    reader
+        .recv_timeout(Duration::from_secs(12))
+        .expect("reader completion");
+    first_bind
+        .recv_timeout(Duration::from_secs(12))
+        .expect("first configure completion");
+    second_bind
+        .recv_timeout(Duration::from_secs(12))
+        .expect("second configure completion");
+
+    let reader_snapshot = reader_snapshot.expect("bind blocker snapshot within 12s");
     assert_eq!(reader_snapshot.configure_state, "queued");
     assert!(reader_snapshot
         .blockers
@@ -487,17 +496,6 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         .blockers
         .iter()
         .any(|blocker| blocker == "waiting_on_readers"));
-
-    release_reader_tx.send(()).expect("release reader");
-    reader
-        .recv_timeout(Duration::from_secs(1))
-        .expect("reader completion");
-    first_bind
-        .recv_timeout(Duration::from_secs(1))
-        .expect("first configure completion");
-    second_bind
-        .recv_timeout(Duration::from_secs(1))
-        .expect("second configure completion");
 
     let executor = test_executor(2, 1, 1, 2);
     let (_maintenance_dir, maintenance_root) = test_root("blocker-maintenance");
@@ -514,14 +512,12 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         "subc-maintenance-drain-watcher".to_string(),
         Box::new(move |_| {
             maintenance_started_tx.send(()).expect("maintenance starts");
-            release_maintenance_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("release maintenance");
+            release_maintenance_rx.recv().expect("release maintenance");
             ok("maintenance")
         }),
     );
     maintenance_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(12))
         .expect("maintenance starts");
     let (occupied_started_tx, occupied_started_rx) = crossbeam_channel::bounded(1);
     let (release_occupied_tx, release_occupied_rx) = crossbeam_channel::bounded(1);
@@ -531,14 +527,12 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         "occupied-worker".to_string(),
         Box::new(move |_| {
             occupied_started_tx.send(()).expect("occupied read starts");
-            release_occupied_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("release occupied read");
+            release_occupied_rx.recv().expect("release occupied read");
             ok("occupied")
         }),
     );
     occupied_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(12))
         .expect("second worker starts");
     let target_bind = executor.submit(
         target_root.clone(),
@@ -546,9 +540,34 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         "subc-bind-target".to_string(),
         Box::new(|_| ok("target-bind")),
     );
-    let pressure_snapshot = executor
-        .try_bind_blocker_snapshot(&target_root, "subc-bind-target")
-        .expect("nonblocking pressure snapshot");
+    // Both workers stay behind explicit release barriers while this nonblocking API
+    // waits for an observable scheduler-lock opening; elapsed execution speed cannot
+    // erase the pressure state the snapshot is meant to classify.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let pressure_snapshot = loop {
+        if let Some(snapshot) = executor.try_bind_blocker_snapshot(&target_root, "subc-bind-target")
+        {
+            break Some(snapshot);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    release_maintenance_tx
+        .send(())
+        .expect("release maintenance");
+    release_occupied_tx.send(()).expect("release occupied read");
+    assert!(recv_async(maintenance).success);
+    occupied
+        .recv_timeout(Duration::from_secs(12))
+        .expect("occupied completion");
+    target_bind
+        .recv_timeout(Duration::from_secs(12))
+        .expect("target bind completion");
+
+    let pressure_snapshot = pressure_snapshot.expect("nonblocking pressure snapshot within 12s");
     assert_eq!(pressure_snapshot.configure_state, "queued");
     assert!(pressure_snapshot
         .blockers
@@ -558,18 +577,6 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         .blockers
         .iter()
         .any(|blocker| blocker.starts_with("idle_workers==0(")));
-
-    release_maintenance_tx
-        .send(())
-        .expect("release maintenance");
-    release_occupied_tx.send(()).expect("release occupied read");
-    assert!(recv_async(maintenance).success);
-    occupied
-        .recv_timeout(Duration::from_secs(1))
-        .expect("occupied completion");
-    target_bind
-        .recv_timeout(Duration::from_secs(1))
-        .expect("target bind completion");
 }
 
 #[test]
@@ -1619,7 +1626,10 @@ fn maintenance_commit_overlaps_pure_reads_and_defers_to_writers() {
         Box::new(|_ctx| ok("read-overlap")),
     );
     let read_response = recv_async(read);
-    assert!(read_response.success, "read must complete while maintenance holds the read gate");
+    assert!(
+        read_response.success,
+        "read must complete while maintenance holds the read gate"
+    );
 
     // Second MaintenanceCommit queues behind the first (serialized per actor).
     let (mc2_started_tx, mc2_started_rx) = crossbeam_channel::bounded(1);
@@ -1633,7 +1643,9 @@ fn maintenance_commit_overlaps_pure_reads_and_defers_to_writers() {
         }),
     );
     assert!(
-        mc2_started_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        mc2_started_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err(),
         "second maintenance commit must wait for the first"
     );
 

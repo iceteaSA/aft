@@ -26,8 +26,7 @@ use crate::search_index::{
     SearchIndexSnapshot,
 };
 use crate::semantic_index::{
-    is_onnx_runtime_unavailable, EmbeddingModel, SemanticIndex, SemanticIndexFingerprint,
-    SemanticResult,
+    EmbeddingModel, QueryBudget, SemanticIndex, SemanticIndexFingerprint, SemanticResult,
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
 
@@ -574,9 +573,6 @@ fn handle_external_semantic_or_hybrid_search(
         match embed_query_for_dimension(&params.query, ctx, Some(semantic_index.dimension())) {
             Ok(query_vector) => query_vector,
             Err(error) => {
-                if params.hint == SearchHint::Semantic {
-                    return semantic_error_response(&req.id, &error);
-                }
                 let lexical = collect_lexical_files_from_snapshot(
                     Some(search_index.snapshot()),
                     &params.query,
@@ -1241,6 +1237,7 @@ fn handle_semantic_or_hybrid_search(
                 "disabled",
                 "disabled",
                 "Semantic search is not enabled.".to_string(),
+                false,
                 lexical,
                 warnings,
                 project_root,
@@ -1257,6 +1254,7 @@ fn handle_semantic_or_hybrid_search(
                 "unavailable",
                 "unavailable",
                 format!("Semantic search unavailable: {error}"),
+                false,
                 lexical,
                 warnings,
                 project_root,
@@ -1361,6 +1359,12 @@ fn handle_semantic_or_hybrid_search(
     }
 
     if !semantic_index_loaded(ctx) {
+        let reloading = super::configure::trigger_semantic_index_reload_if_evicted(ctx);
+        let detail = if reloading {
+            "Semantic index is reloading; retry shortly."
+        } else {
+            "Semantic index is not ready yet."
+        };
         return semantic_unavailable_or_fallback_response(
             req,
             ctx,
@@ -1369,7 +1373,8 @@ fn handle_semantic_or_hybrid_search(
             &shape,
             "unavailable",
             "not_ready",
-            "Semantic index is not ready yet.".to_string(),
+            detail.to_string(),
+            false,
             lexical,
             warnings,
             project_root,
@@ -1380,11 +1385,17 @@ fn handle_semantic_or_hybrid_search(
     let query_vector = match embed_query(&params.query, ctx) {
         Ok(query_vector) => query_vector,
         Err(error) => {
-            if params.hint == SearchHint::Semantic
-                || !semantic_degraded_fallback_available(&params, mode, &shape, &lexical)
-            {
-                return semantic_error_response(&req.id, &error);
-            }
+            let lexical = if mode == SearchMode::Semantic {
+                collect_lexical_files(
+                    ctx,
+                    &params.query,
+                    &shape,
+                    params.include_tests,
+                    project_root,
+                )
+            } else {
+                lexical
+            };
 
             return semantic_unavailable_or_fallback_response(
                 req,
@@ -1395,6 +1406,7 @@ fn handle_semantic_or_hybrid_search(
                 "unavailable",
                 "unavailable",
                 format!("Semantic search unavailable: {error}"),
+                true,
                 lexical,
                 warnings,
                 project_root,
@@ -1559,16 +1571,17 @@ fn semantic_unavailable_or_fallback_response(
     semantic_status: &'static str,
     unavailable_status: &'static str,
     detail: String,
+    force_lexical_fallback: bool,
     lexical: LexicalCollection,
     mut warnings: Vec<String>,
     project_root: &Path,
     top_k: usize,
 ) -> Response {
-    if params.hint == SearchHint::Semantic {
+    if params.hint == SearchHint::Semantic && !force_lexical_fallback {
         return semantic_unavailable_response(&req.id, detail);
     }
 
-    let lexical_ready = mode == SearchMode::Hybrid && lexical.ready;
+    let lexical_ready = (mode == SearchMode::Hybrid || force_lexical_fallback) && lexical.ready;
     if lexical_ready {
         let lexical_count = lexical.files.len();
         let lexical_engine_capped = lexical.engine_capped;
@@ -1607,7 +1620,8 @@ fn semantic_unavailable_or_fallback_response(
         );
     }
 
-    if semantic_degraded_fallback_available(params, mode, shape, &lexical) {
+    if force_lexical_fallback || semantic_degraded_fallback_available(params, mode, shape, &lexical)
+    {
         return semantic_unavailable_grep_fallback_response(
             req,
             ctx,
@@ -2126,12 +2140,13 @@ fn embed_query_for_dimension(
     ctx: &AppContext,
     index_dimension: Option<usize>,
 ) -> Result<Vec<f32>, String> {
+    let semantic_config = ctx.config().semantic.clone();
+    let query_budget = QueryBudget::from_config(&semantic_config);
     let mut model_ref = ctx.semantic_embedding_model().lock();
 
     if model_ref.is_none() {
         drop(model_ref);
 
-        let semantic_config = ctx.config().semantic.clone();
         let constructed_model = EmbeddingModel::from_config_for_query(&semantic_config)?;
 
         model_ref = ctx.semantic_embedding_model().lock();
@@ -2150,7 +2165,7 @@ fn embed_query_for_dimension(
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
     let query_vector = model
-        .embed_query_cached(query)
+        .embed_query_cached(query, query_budget)
         .map_err(|error| format!("failed to embed query: {error}"))?;
     drop(model_ref);
 
@@ -2482,22 +2497,6 @@ fn cap_per_file(results: Vec<HybridResult>, cap: usize) -> Vec<HybridResult> {
         }
     }
     capped
-}
-
-fn semantic_error_response(request_id: &str, error: &str) -> Response {
-    if is_onnx_runtime_unavailable(error) {
-        return Response::error(
-            request_id,
-            "semantic_search_unavailable",
-            format!("Semantic search unavailable: {error}"),
-        );
-    }
-
-    Response::error(
-        request_id,
-        "semantic_search_failed",
-        format!("semantic_search: {error}"),
-    )
 }
 
 fn format_lexical_unavailable_text(
@@ -3300,6 +3299,7 @@ mod tests {
                     base_url: None,
                     api_key_env: None,
                     timeout_ms: 5_000,
+                    query_timeout_ms: 3_000,
                     max_batch_size: 64,
                     max_files: 20_000,
                 },
@@ -4222,6 +4222,7 @@ mod tests {
                     base_url: Some(base_url),
                     api_key_env: None,
                     timeout_ms: 5_000,
+                    query_timeout_ms: 3_000,
                     max_batch_size: 64,
                     max_files: 20_000,
                 },

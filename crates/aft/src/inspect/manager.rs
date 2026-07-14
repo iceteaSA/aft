@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{after, bounded, select, Receiver, Sender};
@@ -124,6 +124,7 @@ pub struct InspectManager {
     #[allow(dead_code)]
     pool: Arc<rayon::ThreadPool>,
     in_flight: Mutex<HashMap<JobKey, Vec<Waiter>>>,
+    in_flight_changed: Condvar,
     caches: Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
     oxc_facts_cache: Mutex<OxcFactsCache>,
     soft_deadline: Duration,
@@ -137,6 +138,9 @@ pub struct InspectManager {
     /// `drain_completions`, so the `&AppContext`-side drain polls this counter
     /// to know when to refresh the agent status bar after a background scan.
     reuse_completions: AtomicU64,
+    /// Test observability for distinguishing queued reuse work from a worker that
+    /// has actually begun executing it.
+    reuse_starts: AtomicU64,
 }
 
 impl InspectManager {
@@ -169,6 +173,7 @@ impl InspectManager {
             result_rx: handles.result_rx,
             pool: handles.pool,
             in_flight: Mutex::new(HashMap::new()),
+            in_flight_changed: Condvar::new(),
             caches: Mutex::new(HashMap::new()),
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
@@ -178,6 +183,7 @@ impl InspectManager {
             automatic_tier2_skip_logged: AtomicBool::new(false),
             automatic_tier2_schedule_count: AtomicU64::new(0),
             reuse_completions: AtomicU64::new(0),
+            reuse_starts: AtomicU64::new(0),
         }
     }
 
@@ -798,11 +804,53 @@ impl InspectManager {
             .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
         if let Some(waiters) = in_flight.get_mut(key) {
             waiters.push(Waiter { tx: waiter_tx });
+            self.in_flight_changed.notify_all();
             return Ok(false);
         }
 
         in_flight.insert(key.clone(), vec![Waiter { tx: waiter_tx }]);
         Ok(true)
+    }
+
+    fn wait_for_tier2_reuse_waiter_for_debug(&self, job: &InspectJob) {
+        #[cfg(not(debug_assertions))]
+        let _ = job;
+        #[cfg(debug_assertions)]
+        {
+            const WAIT_ROOT_ENV: &str = "AFT_TEST_TIER2_REUSE_WAIT_FOR_WAITER_ROOT";
+            if std::env::var_os(WAIT_ROOT_ENV).is_none()
+                || !env_project_root_matches(WAIT_ROOT_ENV, &job.project_root)
+            {
+                return;
+            }
+
+            // This test gate releases on the actual waiter registration, not elapsed
+            // wall-clock time, so a queued background job cannot finish before the
+            // direct-reuse request has attached on a contended runner.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                match in_flight.get(&job.key) {
+                    Some(waiters) if waiters.is_empty() => {}
+                    _ => return,
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return;
+                }
+                let (next, wait_result) = self
+                    .in_flight_changed
+                    .wait_timeout(in_flight, deadline.saturating_duration_since(now))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                in_flight = next;
+                if wait_result.timed_out() {
+                    return;
+                }
+            }
+        }
     }
 
     fn spawn_tier2_reuse_job(self: &Arc<Self>, job: InspectJob, options: Tier2ReuseOptions) {
@@ -1047,6 +1095,8 @@ impl InspectManager {
         mut options: Tier2ReuseOptions,
     ) -> InspectResult {
         let started = Instant::now();
+        self.reuse_starts.fetch_add(1, Ordering::SeqCst);
+        self.wait_for_tier2_reuse_waiter_for_debug(&job);
         panic_tier2_reuse_for_debug(&job);
         if !job.category.is_active() {
             let result = InspectResult::failed(
@@ -1699,14 +1749,16 @@ impl InspectManager {
             .ok()
             .and_then(|mut in_flight| in_flight.remove(&result.key))
             .unwrap_or_default();
+        // Publish completion before waking waiters so a direct-reuse caller sees all
+        // completion side effects when its result channel becomes ready.
+        self.reuse_completions.fetch_add(1, Ordering::SeqCst);
         for waiter in waiters {
             let _ = waiter.tx.send(outcome.clone());
         }
-        // Signal the main-thread drain that a background (watcher-driven) Tier-2
-        // scan finished so it can refresh the status bar. This path bypasses
-        // `result_rx`/`drain_completions`, so without this counter the bar's
+        // The counter also signals the main-thread drain that a background
+        // (watcher-driven) Tier-2 scan finished. This path bypasses
+        // `result_rx`/`drain_completions`, so without this signal the bar's
         // counts and `~` marker would only update on a manual `aft_inspect`.
-        self.reuse_completions.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Snapshot the cumulative count of reuse-path (watcher-driven) Tier-2
@@ -1714,6 +1766,11 @@ impl InspectManager {
     /// value to detect background scans that finished since the previous tick.
     pub fn reuse_completion_count(&self) -> u64 {
         self.reuse_completions.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn reuse_start_count_for_test(&self) -> u64 {
+        self.reuse_starts.load(Ordering::SeqCst)
     }
 
     fn completion_outcome(&self, result: InspectResult) -> JobOutcome {

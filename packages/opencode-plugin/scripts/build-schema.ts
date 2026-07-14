@@ -501,8 +501,15 @@ function buildSchema(): Record<string, unknown> {
             type: "integer",
             minimum: 1,
             default: 25000,
+            description: "Background build embedding request timeout in milliseconds.",
+          },
+          query_timeout_ms: {
+            type: "integer",
+            minimum: 500,
+            maximum: 15000,
+            default: 3000,
             description:
-              "Backend request timeout in milliseconds. Default 25000 keeps requests below the bridge transport timeout.",
+              "Interactive query embedding deadline in milliseconds. Project-scoped configs cannot set this field; values are clamped to 500..15000.",
           },
           max_batch_size: {
             type: "integer",

@@ -349,11 +349,13 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       // Resolve relative paths from the same session/project root used by the bridge.
       const filePath = resolvePathFromProjectRoot(projectRoot, file);
 
-      // External-directory check first (mirrors opencode-native ordering in
-      // tool/read.ts:175). Out-of-project paths prompt the user via the
-      // separate `external_directory` permission rule.
+      // Apply OpenCode's external-directory rule first. Under AFT's project
+      // restriction, reads continue to Rust so its session task registry can
+      // distinguish exact bash artifacts from ordinary external paths.
       {
-        const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
+        const denial = await assertExternalDirectoryPermission(ctx, context, filePath, {
+          serverValidatedRead: true,
+        });
         if (denial) return permissionDeniedResponse(denial);
       }
 
