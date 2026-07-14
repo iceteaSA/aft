@@ -1,8 +1,8 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
 use super::{
-    json, Arc, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport, HealthStatus,
-    Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
+    json, Arc, AtomicBool, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport,
+    HealthStatus, Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
     DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
 use crate::context::RootHealthState;
@@ -12,6 +12,7 @@ pub(super) struct DispatchPathMetrics {
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
     pub(super) writer_queued: AtomicUsize,
+    pub(super) writer_active: AtomicBool,
     pub(super) writer_saturation_count: AtomicU64,
     pub(super) control_completion_queued: AtomicUsize,
     pub(super) maintenance_queued: AtomicUsize,
@@ -28,6 +29,7 @@ impl DispatchPathMetrics {
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
             writer_queued: AtomicUsize::new(0),
+            writer_active: AtomicBool::new(false),
             writer_saturation_count: AtomicU64::new(0),
             control_completion_queued: AtomicUsize::new(0),
             maintenance_queued: AtomicUsize::new(0),
@@ -79,6 +81,7 @@ impl DispatchPathMetrics {
             },
             "writer": {
                 "queued": self.writer_queued.load(Ordering::Relaxed),
+                "active": self.writer_active.load(Ordering::Relaxed),
                 "capacity": WRITER_QUEUE_CAPACITY,
                 "saturation_count": self.writer_saturation_count.load(Ordering::Relaxed),
             },

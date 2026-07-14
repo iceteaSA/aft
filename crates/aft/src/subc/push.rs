@@ -1,6 +1,6 @@
 //! Push-frame classification, fan-out, buffering, replay, and background wake plumbing.
 
-use super::wire::{try_enqueue_writer_frame, WriterEnqueueError};
+use super::wire::{try_enqueue_writer_frame, WriterEnqueueOutcome};
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -268,7 +268,7 @@ pub(super) enum PushSendOutcome {
 }
 
 fn try_send_push_body(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     body: &[u8],
@@ -289,9 +289,9 @@ fn try_send_push_body(
         }
     };
     match try_enqueue_writer_frame(writer_tx, metrics, push_frame) {
-        Ok(()) => PushSendOutcome::Sent,
-        Err(WriterEnqueueError::Full(_)) => PushSendOutcome::Backpressure,
-        Err(WriterEnqueueError::Closed) => {
+        WriterEnqueueOutcome::Enqueued => PushSendOutcome::Sent,
+        WriterEnqueueOutcome::Full(_) => PushSendOutcome::Backpressure,
+        WriterEnqueueOutcome::Closed => {
             log::warn!("subc attach: writer closed while sending Push frame");
             PushSendOutcome::PermanentFailure
         }
@@ -299,7 +299,7 @@ fn try_send_push_body(
 }
 
 fn try_send_push_frame(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     frame: &PushFrame,
@@ -315,7 +315,7 @@ fn try_send_push_frame(
 }
 
 fn try_send_bg_stream_frame(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     sub: &BgSub,
@@ -338,9 +338,9 @@ fn try_send_bg_stream_frame(
         }
     };
     match try_enqueue_writer_frame(writer_tx, metrics, frame) {
-        Ok(()) => PushSendOutcome::Sent,
-        Err(WriterEnqueueError::Full(_)) => PushSendOutcome::Backpressure,
-        Err(WriterEnqueueError::Closed) => {
+        WriterEnqueueOutcome::Enqueued => PushSendOutcome::Sent,
+        WriterEnqueueOutcome::Full(_) => PushSendOutcome::Backpressure,
+        WriterEnqueueOutcome::Closed => {
             log::warn!("subc attach: writer closed while sending bg_events stream frame");
             PushSendOutcome::PermanentFailure
         }
@@ -348,7 +348,7 @@ fn try_send_bg_stream_frame(
 }
 
 fn try_send_bg_stream_data(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     sub: &BgSub,
@@ -371,7 +371,7 @@ fn try_send_bg_stream_data(
 }
 
 pub(super) fn try_send_bg_stream_end(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     sub: &BgSub,
@@ -387,7 +387,7 @@ pub(super) fn try_send_bg_stream_end(
 }
 
 pub(super) fn emit_bg_event_wakes(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     bg_subs: &HashMap<RouteChannel, BgSub>,
     bg_wake_pending: &mut HashSet<RouteChannel>,
@@ -478,7 +478,7 @@ pub(super) fn migrate_retry_buffer_to_push_buffer(
 }
 
 pub(super) fn replay_buffered_push_frames(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
@@ -525,7 +525,7 @@ pub(super) fn replay_buffered_push_frames(
 }
 
 fn drain_retry_buffer_for_channel(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     retry_buffer: &mut RetryBuffer,
@@ -567,7 +567,7 @@ fn drain_retry_buffer_for_channel(
 }
 
 pub(super) fn drain_retry_buffers_for_bound_routes(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     retry_buffer: &mut RetryBuffer,
@@ -638,7 +638,7 @@ fn buffer_detached_reliable_push_frame(
 }
 
 fn fan_out_lossy_push_frame(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -679,7 +679,7 @@ fn fan_out_lossy_push_frame(
 }
 
 fn fan_out_reliable_push_frame(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -737,7 +737,7 @@ fn fan_out_reliable_push_frame(
 }
 
 fn process_reliable_push_frame(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -768,7 +768,7 @@ fn process_reliable_push_frame(
 
 #[allow(clippy::too_many_arguments)]
 fn process_reliable_push_and_arm_bg_wake(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -805,7 +805,7 @@ fn process_reliable_push_and_arm_bg_wake(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn drain_reliable_push_turn(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -873,7 +873,7 @@ pub(super) fn drain_reliable_push_turn(
 }
 
 pub(super) fn process_lossy_push_frame(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -894,7 +894,7 @@ pub(super) fn process_lossy_push_frame(
 }
 
 pub(super) fn process_lossy_push_batch(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -915,7 +915,7 @@ pub(super) fn process_lossy_push_batch(
 }
 
 pub(super) fn process_lossy_push_envelope_batch(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -968,7 +968,8 @@ mod tests {
         let mut bg_wake_pending = HashSet::new();
         let mut bg_wake_epoch = HashMap::new();
         let metrics = DispatchPathMetrics::new();
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(RELIABLE_PUSH_DRAIN_BUDGET + 8);
+        let (writer_tx, mut writer_rx) =
+            mpsc::channel::<WriterFrame>(RELIABLE_PUSH_DRAIN_BUDGET + 8);
         let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
         let total = RELIABLE_PUSH_DRAIN_BUDGET + 3;
         let first = (
@@ -1082,7 +1083,7 @@ mod tests {
     #[test]
     fn fan_out_push_frame_routes_session_scoped_and_project_scoped_frames() {
         let (_root_dir, root) = test_root("subc-session-routing-root");
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(8);
         let metrics = DispatchPathMetrics::new();
         let identity1 = route_identity(&root, "session-1");
         let identity2 = route_identity(&root, "session-2");
@@ -1202,7 +1203,7 @@ mod tests {
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(4);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let metrics = DispatchPathMetrics::new();
         let mut push_buffer = HashMap::new();
         buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
@@ -1237,7 +1238,7 @@ mod tests {
             harness: "mcp".to_string(),
             session: "session-1".to_string(),
         };
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(4);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let metrics = DispatchPathMetrics::new();
         let mut push_buffer = HashMap::new();
         buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
@@ -1446,10 +1447,12 @@ mod tests {
     #[test]
     fn fan_out_lossy_push_frame_drops_when_writer_is_full_without_blocking() {
         let (_root_dir, root) = test_root("subc-writer-full-root");
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
+            .try_send(WriterFrame::plain(
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
+            ))
             .expect("prefill writer queue");
 
         let mut root_channels = HashMap::new();
@@ -1500,10 +1503,12 @@ mod tests {
         remember_session_identity(&mut session_identity, &identity);
         let mut retry_buffer = HashMap::new();
         let mut push_buffer = HashMap::new();
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
+            .try_send(WriterFrame::plain(
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
+            ))
             .expect("prefill writer queue");
 
         let result = fan_out_reliable_push_frame(
@@ -1562,10 +1567,12 @@ mod tests {
         remember_session_identity(&mut session_identity, &identity);
         let mut retry_buffer = HashMap::new();
         let mut push_buffer = HashMap::new();
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
+            .try_send(WriterFrame::plain(
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
+            ))
             .expect("prefill writer queue");
 
         let first = completion_frame("fifo-1");
@@ -1638,10 +1645,12 @@ mod tests {
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(2);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(2);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
+            .try_send(WriterFrame::plain(
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
+            ))
             .expect("prefill writer queue");
         let mut push_buffer = HashMap::new();
         for task in ["replay-1", "replay-2", "replay-3"] {
@@ -1731,7 +1740,7 @@ mod tests {
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
-        let (writer_tx, writer_rx) = mpsc::channel::<Frame>(1);
+        let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(1);
         let metrics = DispatchPathMetrics::new();
         drop(writer_rx);
 

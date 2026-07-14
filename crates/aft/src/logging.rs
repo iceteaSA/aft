@@ -497,8 +497,15 @@ pub fn note_callgraph_invalidations(files: usize) {
 }
 
 /// Record a completed subc tool call for slow-call diagnostics and the standing
-/// perf-tick window. The bounded queue is only locked once after response egress.
-pub fn note_tool_call_trace(name: &str, root: &Path, phases: ToolCallPhaseDurations) {
+/// perf-tick window. The writer calls this only after `write_all` has handed the
+/// complete response frame to the transport.
+pub fn note_tool_call_trace(
+    name: &str,
+    root: &Path,
+    channel: u16,
+    corr: u64,
+    phases: ToolCallPhaseDurations,
+) {
     let sample = ToolCallPerfSample {
         total_ms: duration_millis_u64(phases.total),
         queue_ms: duration_millis_u64(phases.queue),
@@ -512,29 +519,51 @@ pub fn note_tool_call_trace(name: &str, root: &Path, phases: ToolCallPhaseDurati
     }
 
     crate::slog_debug!(
-        "tool_call phase name={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} root={}",
+        "tool_call phase name={} channel={} corr={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} root={}",
         name,
+        channel,
+        corr,
         duration_millis_f64(phases.total),
         duration_millis_f64(phases.queue),
         duration_millis_f64(phases.translate),
         duration_millis_f64(phases.execute),
         duration_millis_f64(phases.format),
         duration_millis_f64(phases.finalize),
+        duration_millis_f64(phases.egress),
         duration_millis_f64(phases.egress_enqueue),
+        duration_millis_f64(phases.egress_queue),
+        duration_millis_f64(phases.egress_prepare),
+        duration_millis_f64(phases.egress_write),
+        phases.frame_bytes,
+        phases.writer_queue_depth,
+        phases.writer_active_at_enqueue,
+        phases.writer_queue_was_full,
+        phases.writer_reserve_timeouts,
         root.display(),
     );
 
     if phases.total > SLOW_TOOL_CALL_THRESHOLD {
         crate::slog_warn!(
-            "slow tool_call name={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} root={}",
+            "slow tool_call name={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} root={}",
             name,
+            channel,
+            corr,
             duration_millis_u64(phases.total),
             duration_millis_u64(phases.queue),
             duration_millis_u64(phases.translate),
             duration_millis_u64(phases.execute),
             duration_millis_u64(phases.format),
             duration_millis_u64(phases.finalize),
+            duration_millis_u64(phases.egress),
             duration_millis_u64(phases.egress_enqueue),
+            duration_millis_u64(phases.egress_queue),
+            duration_millis_u64(phases.egress_prepare),
+            duration_millis_u64(phases.egress_write),
+            phases.frame_bytes,
+            phases.writer_queue_depth,
+            phases.writer_active_at_enqueue,
+            phases.writer_queue_was_full,
+            phases.writer_reserve_timeouts,
             root.display(),
         );
     }

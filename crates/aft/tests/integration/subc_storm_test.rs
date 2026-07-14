@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use aft::context::AppContext;
 use aft::executor::{ExecutorConfig, Lane};
 use aft::path_identity::ProjectRootId;
-use aft::protocol::{RawRequest, Response};
+use aft::protocol::{ProgressFrame, ProgressKind, PushFrame, RawRequest, Response};
 use aft::watcher_filter::{
     run_watcher_thread, watcher_dispatch_channel, WatcherDispatchEvent, WatcherFilterConfig,
     WatcherThreadHandle,
@@ -67,6 +67,53 @@ struct StormScale {
     roots: usize,
     sessions_per_root: usize,
     storm_for: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct EgressMeasureConfig {
+    sessions: usize,
+    responses: usize,
+    small_bytes: usize,
+    large_bytes: usize,
+    read_pause: Duration,
+    read_delay: Duration,
+    pushes_per_large_response: usize,
+}
+
+impl EgressMeasureConfig {
+    fn from_env() -> Self {
+        Self {
+            sessions: env_usize("AFT_EGRESS_SESSIONS", 8).clamp(1, 64),
+            responses: env_usize("AFT_EGRESS_RESPONSES", 384).clamp(1, 2_048),
+            small_bytes: env_usize("AFT_EGRESS_SMALL_BYTES", 4 * 1024),
+            large_bytes: env_usize("AFT_EGRESS_LARGE_BYTES", 256 * 1024),
+            read_pause: Duration::from_millis(env_u64("AFT_EGRESS_READ_PAUSE_MS", 500)),
+            read_delay: Duration::from_millis(env_u64("AFT_EGRESS_READ_DELAY_MS", 2)),
+            pushes_per_large_response: env_usize("AFT_EGRESS_PUSHES_PER_LARGE", 2),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EgressObservation {
+    corr: u64,
+    requested_bytes: usize,
+    frame_bytes: usize,
+    latency: Duration,
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(default)
 }
 
 impl StormScale {
@@ -242,8 +289,39 @@ fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "subc_storm_inject_dispatch" => inject_dispatch_events(&req, ctx),
         "subc_storm_inject_raw_paths" => inject_raw_watcher_paths(&req, ctx),
         "subc_storm_watcher_pending" => watcher_pending_response(&req, ctx),
+        "subc_storm_egress_payload" => egress_payload_response(&req, ctx),
         _ => subc_bridge_test::bridge_dispatch(req, ctx),
     }
+}
+
+fn egress_payload_response(req: &RawRequest, ctx: &AppContext) -> Response {
+    let payload_bytes = req
+        .params
+        .get("payload_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let push_count = req
+        .params
+        .get("push_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if let Some(sender) = ctx.progress_sender_handle() {
+        for index in 0..push_count {
+            sender(PushFrame::Progress(ProgressFrame {
+                frame_type: "progress",
+                request_id: format!("{}-push-{index}", req.id),
+                kind: ProgressKind::Stdout,
+                chunk: "p".repeat(256),
+            }));
+        }
+    }
+    Response::success(
+        &req.id,
+        json!({
+            "payload": "x".repeat(payload_bytes),
+            "payload_bytes": payload_bytes,
+        }),
+    )
 }
 
 fn inject_dispatch_events(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -936,6 +1014,109 @@ fn subc_storm_route_bind_deadline_errors_and_retry_recovers() {
         |_, _, _| {},
         storm_dispatch,
     );
+}
+
+#[test]
+#[ignore = "manual M1 measurement rig; emits one raw row per response"]
+fn subc_egress_hol_measurement() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+        .is_test(true)
+        .try_init();
+    let config = EgressMeasureConfig::from_env();
+    eprintln!("EGRESS_CONFIG {config:?}");
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "subc_egress_hol_measurement",
+        Duration::from_secs(180),
+        move |input| drive_egress_measurement_daemon(input, config),
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
+async fn drive_egress_measurement_daemon(input: FakeDaemonInput, config: EgressMeasureConfig) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let mut stream = session.stream;
+    let root = session.root1;
+
+    for channel in 1..=config.sessions as u16 {
+        write_measure_bind(
+            &mut stream,
+            channel,
+            &root,
+            &format!("egress-session-{channel}"),
+        )
+        .await;
+    }
+
+    let mut pending = HashMap::new();
+    let corr_base = 800_000_u64;
+    for index in 0..config.responses {
+        let corr = corr_base + index as u64;
+        let channel = (index % config.sessions + 1) as u16;
+        let large = index % 4 == 0;
+        let payload_bytes = if large {
+            config.large_bytes
+        } else {
+            config.small_bytes
+        };
+        let push_count = if large {
+            config.pushes_per_large_response
+        } else {
+            0
+        };
+        let frame = build_measure_tool_frame(channel, corr, payload_bytes, push_count);
+        write_frame(&mut stream, &frame)
+            .await
+            .expect("write egress measurement request");
+        pending.insert(corr, (payload_bytes, Instant::now()));
+    }
+
+    tokio::time::sleep(config.read_pause).await;
+    let mut observations = Vec::with_capacity(config.responses);
+    let mut push_frames = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(150);
+    while !pending.is_empty() && Instant::now() < deadline {
+        let Some(frame) = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut stream))
+            .await
+            .expect("egress measurement read timeout")
+            .expect("egress measurement frame read")
+        else {
+            break;
+        };
+        match frame.header.ty {
+            FrameType::Response if frame.header.channel != 0 => {
+                if let Some((requested_bytes, started_at)) = pending.remove(&frame.header.corr) {
+                    let observation = EgressObservation {
+                        corr: frame.header.corr,
+                        requested_bytes,
+                        frame_bytes: frame.body.len() + frame.header.encode().len(),
+                        latency: started_at.elapsed(),
+                    };
+                    eprintln!(
+                        "EGRESS_OBS corr={} requested_bytes={} frame_bytes={} latency_ms={:.3}",
+                        observation.corr,
+                        observation.requested_bytes,
+                        observation.frame_bytes,
+                        observation.latency.as_secs_f64() * 1_000.0,
+                    );
+                    observations.push(observation);
+                }
+            }
+            FrameType::Push => push_frames += 1,
+            _ => {}
+        }
+        if !config.read_delay.is_zero() {
+            tokio::time::sleep(config.read_delay).await;
+        }
+    }
+
+    assert!(
+        pending.is_empty(),
+        "measurement responses did not drain: {}",
+        pending.len()
+    );
+    print_egress_summary(&observations, push_frames);
+    drop(stream);
 }
 
 async fn drive_fresh_worktree_borrow_only_daemon(input: FakeDaemonInput) {
@@ -1985,6 +2166,122 @@ fn send_bind_epoch(
         principal: Some(Principal::Direct),
     };
     send_control(tx, corr, request);
+}
+
+async fn write_measure_bind(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    root: &Path,
+    session: &str,
+) {
+    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
+    std::fs::create_dir_all(project_cfg.parent().expect("measurement config parent"))
+        .expect("create measurement config directory");
+    std::fs::write(
+        &project_cfg,
+        serde_json::to_string(&storm_project_config(false, false, false, 0))
+            .expect("measurement config json"),
+    )
+    .expect("write measurement config");
+    let corr = 700_000 + u64::from(channel);
+    let request = ModuleControlRequest::RouteBind {
+        route_channel: channel,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: BindIdentity {
+            project_root: root.to_path_buf(),
+            harness: "opencode".to_string(),
+            session: session.to_string(),
+        },
+        consumer_capabilities: None,
+        principal: Some(Principal::Direct),
+    };
+    let frame = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        corr,
+        serde_json::to_vec(&request).expect("measurement bind body"),
+    )
+    .expect("measurement bind frame");
+    write_frame(stream, &frame)
+        .await
+        .expect("write measurement bind");
+
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(12), read_frame(stream))
+            .await
+            .expect("measurement bind timeout")
+            .expect("measurement bind frame read")
+            .expect("measurement stream closed during bind");
+        if frame.header.ty == FrameType::Response
+            && frame.header.channel == 0
+            && frame.header.corr == corr
+        {
+            break;
+        }
+    }
+}
+
+fn build_measure_tool_frame(
+    channel: u16,
+    corr: u64,
+    payload_bytes: usize,
+    push_count: usize,
+) -> Frame {
+    Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        1,
+        corr,
+        serde_json::to_vec(&json!({
+            "name": "subc_storm_egress_payload",
+            "arguments": {
+                "payload_bytes": payload_bytes,
+                "push_count": push_count,
+            },
+        }))
+        .expect("measurement tool body"),
+    )
+    .expect("measurement tool frame")
+}
+
+fn print_egress_summary(observations: &[EgressObservation], push_frames: usize) {
+    let mut requested_sizes = observations
+        .iter()
+        .map(|observation| observation.requested_bytes)
+        .collect::<Vec<_>>();
+    requested_sizes.sort_unstable();
+    requested_sizes.dedup();
+    for requested_bytes in requested_sizes {
+        let class = observations
+            .iter()
+            .filter(|observation| observation.requested_bytes == requested_bytes)
+            .collect::<Vec<_>>();
+        let mut latencies = class
+            .iter()
+            .map(|observation| observation.latency.as_secs_f64() * 1_000.0)
+            .collect::<Vec<_>>();
+        latencies.sort_by(f64::total_cmp);
+        let p50 = latencies[(latencies.len() - 1) / 2];
+        let p95 = latencies[((latencies.len() - 1) * 95) / 100];
+        let max = latencies[latencies.len() - 1];
+        let mean_frame_bytes = class
+            .iter()
+            .map(|observation| observation.frame_bytes as u64)
+            .sum::<u64>()
+            / class.len() as u64;
+        eprintln!(
+            "EGRESS_SUMMARY requested_bytes={} count={} mean_frame_bytes={} p50_ms={p50:.3} p95_ms={p95:.3} max_ms={max:.3} push_frames={push_frames}",
+            requested_bytes,
+            class.len(),
+            mean_frame_bytes,
+        );
+    }
 }
 
 fn send_control(tx: &mpsc::UnboundedSender<Frame>, corr: u64, request: ModuleControlRequest) {

@@ -8,10 +8,158 @@ use super::{
     Ordering, PathBuf, Response, RouteChannel, ToolCallResult, Value, CONTROL_SEND_TIMEOUT,
     RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
 };
+use crate::run_tool_call::{PhaseTrace, ToolCallEgressTiming, ToolCallPhaseDurations};
 
-pub(super) enum WriterEnqueueError {
-    Full(Frame),
+pub(super) type WriterSender = mpsc::Sender<WriterFrame>;
+
+pub(super) struct ToolResponseWriteTrace {
+    phase_trace: PhaseTrace,
+    name: String,
+    root: PathBuf,
+    session: String,
+    channel: u16,
+    corr: u64,
+    enqueued_at: Option<std::time::Instant>,
+    queue_depth: usize,
+    writer_active_at_enqueue: bool,
+    writer_queue_was_full: bool,
+    reserve_timeouts: u32,
+}
+
+impl ToolResponseWriteTrace {
+    pub(super) fn new(
+        phase_trace: PhaseTrace,
+        name: String,
+        root: PathBuf,
+        session: String,
+        channel: u16,
+        corr: u64,
+    ) -> Self {
+        Self {
+            phase_trace,
+            name,
+            root,
+            session,
+            channel,
+            corr,
+            enqueued_at: None,
+            queue_depth: 0,
+            writer_active_at_enqueue: false,
+            writer_queue_was_full: false,
+            reserve_timeouts: 0,
+        }
+    }
+
+    fn mark_writer_queue_full(&mut self) {
+        self.writer_queue_was_full = true;
+    }
+
+    fn mark_reserve_timeout(&mut self) {
+        self.reserve_timeouts = self.reserve_timeouts.saturating_add(1);
+    }
+
+    fn mark_enqueued(&mut self, queue_depth: usize, writer_active: bool) {
+        self.enqueued_at = Some(std::time::Instant::now());
+        self.queue_depth = queue_depth;
+        self.writer_active_at_enqueue = writer_active;
+    }
+
+    pub(super) fn finish(
+        self,
+        dequeued: std::time::Instant,
+        write_started: std::time::Instant,
+        write_finished: std::time::Instant,
+        frame_bytes: usize,
+    ) -> Option<CompletedToolResponseTrace> {
+        let phases = self.phase_trace.finish(ToolCallEgressTiming {
+            enqueued: self.enqueued_at?,
+            dequeued,
+            write_started,
+            write_finished,
+            frame_bytes,
+            queue_depth: self.queue_depth,
+            writer_active_at_enqueue: self.writer_active_at_enqueue,
+            writer_queue_was_full: self.writer_queue_was_full,
+            reserve_timeouts: self.reserve_timeouts,
+        })?;
+        Some(CompletedToolResponseTrace {
+            name: self.name,
+            root: self.root,
+            session: self.session,
+            channel: self.channel,
+            corr: self.corr,
+            phases,
+        })
+    }
+}
+
+pub(super) struct CompletedToolResponseTrace {
+    pub(super) name: String,
+    pub(super) root: PathBuf,
+    pub(super) session: String,
+    pub(super) channel: u16,
+    pub(super) corr: u64,
+    pub(super) phases: ToolCallPhaseDurations,
+}
+
+pub(super) struct WriterFrame {
+    pub(super) frame: Frame,
+    pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
+}
+
+impl std::ops::Deref for WriterFrame {
+    type Target = Frame;
+
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
+
+impl WriterFrame {
+    pub(super) fn plain(frame: Frame) -> Self {
+        Self {
+            frame,
+            tool_response_trace: None,
+        }
+    }
+
+    fn traced_tool_response(frame: Frame, trace: ToolResponseWriteTrace) -> Self {
+        Self {
+            frame,
+            tool_response_trace: Some(trace),
+        }
+    }
+
+    fn mark_writer_queue_full(&mut self) {
+        if let Some(trace) = self.tool_response_trace.as_mut() {
+            trace.mark_writer_queue_full();
+        }
+    }
+
+    fn mark_reserve_timeout(&mut self) {
+        if let Some(trace) = self.tool_response_trace.as_mut() {
+            trace.mark_reserve_timeout();
+        }
+    }
+
+    fn mark_enqueued(&mut self, queue_depth: usize, writer_active: bool) {
+        if let Some(trace) = self.tool_response_trace.as_mut() {
+            trace.mark_enqueued(queue_depth, writer_active);
+        }
+    }
+}
+
+pub(super) enum WriterEnqueueOutcome {
+    Enqueued,
+    Full(WriterFrame),
     Closed,
+}
+
+impl WriterEnqueueOutcome {
+    #[cfg(test)]
+    fn is_enqueued(&self) -> bool {
+        matches!(self, Self::Enqueued)
+    }
 }
 
 pub(super) fn decrement_counted_channel(counter: &AtomicUsize) {
@@ -34,52 +182,69 @@ pub(super) async fn send_counted_channel<T>(
     }
 }
 
-pub(super) fn try_enqueue_writer_frame(
-    tx: &mpsc::Sender<Frame>,
+fn enqueue_writer_item(
+    permit: mpsc::Permit<'_, WriterFrame>,
     metrics: &DispatchPathMetrics,
-    frame: Frame,
-) -> Result<(), WriterEnqueueError> {
+    mut item: WriterFrame,
+) {
+    let queue_depth = metrics.writer_queued.fetch_add(1, Ordering::Relaxed) + 1;
+    item.mark_enqueued(queue_depth, metrics.writer_active.load(Ordering::Relaxed));
+    permit.send(item);
+}
+
+fn try_enqueue_writer_item(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    mut item: WriterFrame,
+) -> WriterEnqueueOutcome {
     match tx.try_reserve() {
         Ok(permit) => {
-            metrics.writer_queued.fetch_add(1, Ordering::Relaxed);
-            permit.send(frame);
-            Ok(())
+            enqueue_writer_item(permit, metrics, item);
+            WriterEnqueueOutcome::Enqueued
         }
         Err(mpsc::error::TrySendError::Full(())) => {
             metrics
                 .writer_saturation_count
                 .fetch_add(1, Ordering::Relaxed);
-            Err(WriterEnqueueError::Full(frame))
+            item.mark_writer_queue_full();
+            WriterEnqueueOutcome::Full(item)
         }
         Err(mpsc::error::TrySendError::Closed(())) => {
-            drop(frame);
-            Err(WriterEnqueueError::Closed)
+            drop(item);
+            WriterEnqueueOutcome::Closed
         }
     }
 }
 
-pub(super) async fn send_reliable_writer_frame(
-    tx: &mpsc::Sender<Frame>,
+pub(super) fn try_enqueue_writer_frame(
+    tx: &WriterSender,
     metrics: &DispatchPathMetrics,
-    mut frame: Frame,
+    frame: Frame,
+) -> WriterEnqueueOutcome {
+    try_enqueue_writer_item(tx, metrics, WriterFrame::plain(frame))
+}
+
+async fn send_reliable_writer_item(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    mut item: WriterFrame,
     context: &'static str,
 ) -> Result<(), SubcError> {
     let mut warned = false;
     let mut backoff = RELIABLE_WRITER_RETRY_INITIAL_BACKOFF;
 
     loop {
-        match try_enqueue_writer_frame(tx, metrics, frame) {
-            Ok(()) => return Ok(()),
-            Err(WriterEnqueueError::Closed) => return Err(SubcError::WriterClosed),
-            Err(WriterEnqueueError::Full(returned_frame)) => {
-                frame = returned_frame;
+        match try_enqueue_writer_item(tx, metrics, item) {
+            WriterEnqueueOutcome::Enqueued => return Ok(()),
+            WriterEnqueueOutcome::Closed => return Err(SubcError::WriterClosed),
+            WriterEnqueueOutcome::Full(returned_item) => {
+                item = returned_item;
             }
         }
 
         match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.reserve()).await {
             Ok(Ok(permit)) => {
-                metrics.writer_queued.fetch_add(1, Ordering::Relaxed);
-                permit.send(frame);
+                enqueue_writer_item(permit, metrics, item);
                 return Ok(());
             }
             Ok(Err(_)) => return Err(SubcError::WriterClosed),
@@ -87,6 +252,7 @@ pub(super) async fn send_reliable_writer_frame(
                 metrics
                     .writer_saturation_count
                     .fetch_add(1, Ordering::Relaxed);
+                item.mark_reserve_timeout();
                 if !warned {
                     log::warn!(
                         "subc attach: writer queue stayed full while sending {context}; retrying reliable frame"
@@ -101,19 +267,42 @@ pub(super) async fn send_reliable_writer_frame(
     }
 }
 
+pub(super) async fn send_reliable_writer_frame(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+    context: &'static str,
+) -> Result<(), SubcError> {
+    send_reliable_writer_item(tx, metrics, WriterFrame::plain(frame), context).await
+}
+
+pub(super) async fn send_traced_tool_response_frame(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+    trace: ToolResponseWriteTrace,
+) -> Result<(), SubcError> {
+    send_reliable_writer_item(
+        tx,
+        metrics,
+        WriterFrame::traced_tool_response(frame, trace),
+        "tool response",
+    )
+    .await
+}
+
 pub(super) async fn send_frame(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     frame: Frame,
 ) -> Result<(), SubcError> {
-    match try_enqueue_writer_frame(tx, metrics, frame) {
-        Ok(()) => Ok(()),
-        Err(WriterEnqueueError::Closed) => Err(SubcError::WriterClosed),
-        Err(WriterEnqueueError::Full(frame)) => {
+    match try_enqueue_writer_item(tx, metrics, WriterFrame::plain(frame)) {
+        WriterEnqueueOutcome::Enqueued => Ok(()),
+        WriterEnqueueOutcome::Closed => Err(SubcError::WriterClosed),
+        WriterEnqueueOutcome::Full(item) => {
             match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.reserve()).await {
                 Ok(Ok(permit)) => {
-                    metrics.writer_queued.fetch_add(1, Ordering::Relaxed);
-                    permit.send(frame);
+                    enqueue_writer_item(permit, metrics, item);
                     Ok(())
                 }
                 Ok(Err(_)) => Err(SubcError::WriterClosed),
@@ -388,12 +577,12 @@ mod tests {
     #[test]
     fn writer_depth_counter_tracks_enqueued_frames_until_drain() {
         let metrics = DispatchPathMetrics::new();
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(8);
 
         for corr in 1..=3 {
             let frame = Frame::build(FrameType::Ping, control_flags(), 0, 0, corr, Vec::new())
                 .expect("test frame");
-            assert!(try_enqueue_writer_frame(&writer_tx, &metrics, frame).is_ok());
+            assert!(try_enqueue_writer_frame(&writer_tx, &metrics, frame).is_enqueued());
         }
         assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 3);
 
@@ -407,9 +596,11 @@ mod tests {
     #[tokio::test]
     async fn reliable_writer_send_retries_after_timeout_and_preserves_frame() {
         let metrics = Arc::new(DispatchPathMetrics::new());
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(1);
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
+            .try_send(WriterFrame::plain(
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
+            ))
             .expect("prefill writer queue");
 
         let metrics_for_task = Arc::clone(&metrics);
@@ -454,10 +645,12 @@ mod tests {
 
     #[tokio::test]
     async fn control_send_times_out_when_writer_queue_remains_full() {
-        let (writer_tx, _writer_rx) = mpsc::channel::<Frame>(1);
+        let (writer_tx, _writer_rx) = mpsc::channel::<WriterFrame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
-            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap())
+            .try_send(WriterFrame::plain(
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
+            ))
             .expect("prefill writer queue");
         let started = Instant::now();
 

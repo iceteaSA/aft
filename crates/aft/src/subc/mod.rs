@@ -162,7 +162,8 @@ pub fn is_tool_call_admitted_for_test(name: &str) -> bool {
 use self::wire::{
     build_error_frame, build_goodbye_frame, build_tool_response_frame, decrement_counted_channel,
     response_is_fatal_panic, response_message, send_counted_channel, send_frame,
-    send_reliable_writer_frame,
+    send_reliable_writer_frame, send_traced_tool_response_frame, ToolResponseWriteTrace,
+    WriterFrame, WriterSender,
 };
 
 struct DecodedFrame {
@@ -957,7 +958,7 @@ fn mcp_bash_elicitation_reply_is_allow(value: &Value) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn settle_pending_bash_ask_denied(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     pending: PendingBashAsk,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -1002,7 +1003,7 @@ fn take_pending_bash_asks_for_route(
 
 #[allow(clippy::too_many_arguments)]
 async fn settle_pending_bash_asks_for_route(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     route: RouteChannel,
     routes: &HashMap<RouteChannel, RouteIdentity>,
@@ -1028,7 +1029,7 @@ async fn settle_pending_bash_asks_for_route(
 
 #[allow(clippy::too_many_arguments)]
 async fn settle_all_pending_bash_asks(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -1057,7 +1058,7 @@ async fn settle_all_pending_bash_asks(
 
 #[allow(clippy::too_many_arguments)]
 async fn expire_pending_bash_asks(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -1094,7 +1095,7 @@ async fn expire_pending_bash_asks(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_bash_elicitation_reply(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     frame: &Frame,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
@@ -1160,7 +1161,7 @@ async fn handle_bash_elicitation_reply(
 
 #[allow(clippy::too_many_arguments)]
 async fn cancel_pending_bash_ask_for_tool_call(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     route: RouteChannel,
     tool_corr: u64,
@@ -1252,7 +1253,7 @@ fn remove_bg_subscription_index(
 }
 
 fn end_bg_subscription(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
@@ -1472,7 +1473,7 @@ async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStre
 
 #[allow(clippy::too_many_arguments)]
 async fn process_route_bind_completion(
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     completion: RouteBindCompletion,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -1506,7 +1507,7 @@ async fn process_route_bind_completion(
 #[allow(clippy::too_many_arguments)]
 async fn drain_pending_route_bind_completions(
     control_completion_rx: &mut mpsc::Receiver<RouteBindCompletion>,
-    writer_tx: &mpsc::Sender<Frame>,
+    writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -1594,7 +1595,7 @@ where
     }
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
-    let (writer_tx, writer_rx) = mpsc::channel::<Frame>(WRITER_QUEUE_CAPACITY);
+    let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
     let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
     // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
     // the `select!` below: a drain-interval tick (or shutdown) firing while a
@@ -2206,7 +2207,7 @@ where
 
 fn spawn_writer_task<W>(
     mut write: W,
-    mut rx: mpsc::Receiver<Frame>,
+    mut rx: mpsc::Receiver<WriterFrame>,
     metrics: Arc<DispatchPathMetrics>,
 ) -> JoinHandle<Result<(), subc_transport::FrameIoError>>
 where
@@ -2214,25 +2215,56 @@ where
 {
     tokio::spawn(async move {
         let mut write_buffer = Vec::new();
-        while let Some(frame) = rx.recv().await {
+        while let Some(mut queued) = rx.recv().await {
+            let measure = queued.tool_response_trace.is_some();
+            let dequeued = measure.then(Instant::now);
+            metrics.writer_active.store(true, Ordering::Relaxed);
             decrement_counted_channel(&metrics.writer_queued);
-            write_frame_contiguous(&mut write, &frame, &mut write_buffer).await?;
+            let write_timing =
+                write_frame_contiguous(&mut write, &queued.frame, &mut write_buffer, measure).await;
+            metrics.writer_active.store(false, Ordering::Relaxed);
+            let write_timing = write_timing?;
+
+            if let (Some(trace), Some(dequeued), Some(write_timing)) =
+                (queued.tool_response_trace.take(), dequeued, write_timing)
+            {
+                if let Some(completed) = trace.finish(
+                    dequeued,
+                    write_timing.write_started,
+                    write_timing.write_finished,
+                    write_timing.frame_bytes,
+                ) {
+                    log_ctx::with_session(Some(completed.session), || {
+                        crate::logging::note_tool_call_trace(
+                            &completed.name,
+                            &completed.root,
+                            completed.channel,
+                            completed.corr,
+                            completed.phases,
+                        );
+                    });
+                }
+            }
         }
         Ok(())
     })
 }
 
-/// Owns the read half and reads whole frames sequentially. `read_frame` is not
-/// cancellation-safe, so it must run here — never inside the main loop's
-/// `select!` — to keep the inbound stream framed. Each frame (or the terminal
-/// error / EOF) is forwarded over `tx`; the loop consumes them via cancel-safe
-/// `recv()`. Exits on EOF (Ok(None)), a read error, or when `tx` is dropped
-/// (the loop ended and aborted us).
+struct FrameWriteTiming {
+    write_started: Instant,
+    write_finished: Instant,
+    frame_bytes: usize,
+}
+
+/// Encode one complete frame into the existing reusable buffer and write it
+/// without interleaving bytes from another channel. Timing is collected only
+/// for tool responses, so Push and control frames add no clock reads.
 async fn write_frame_contiguous<W>(
     writer: &mut W,
     frame: &Frame,
     buffer: &mut Vec<u8>,
-) -> Result<(), subc_transport::FrameIoError>
+    measure: bool,
+) -> Result<Option<FrameWriteTiming>, subc_transport::FrameIoError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -2248,10 +2280,16 @@ where
     buffer.reserve(header.len() + frame.body.len());
     buffer.extend_from_slice(&header);
     buffer.extend_from_slice(&frame.body);
+    let write_started = measure.then(Instant::now);
     writer
         .write_all(buffer)
         .await
-        .map_err(subc_transport::FrameIoError::Io)
+        .map_err(subc_transport::FrameIoError::Io)?;
+    Ok(write_started.map(|write_started| FrameWriteTiming {
+        write_started,
+        write_finished: Instant::now(),
+        frame_bytes: buffer.len(),
+    }))
 }
 
 fn spawn_reader_task<R>(
@@ -2439,7 +2477,7 @@ fn queue_post_bind_configure_and_completion_maintenance(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_route_bind_completion(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     completion: RouteBindCompletion,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -2607,7 +2645,7 @@ async fn handle_route_bind_completion(
 }
 
 async fn expire_overdue_route_binds(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     metrics: &DispatchPathMetrics,
@@ -2666,7 +2704,7 @@ async fn expire_overdue_route_binds(
 /// and resolves completion on a loop-owned control-completion channel so slow
 /// configure jobs do not block the transport loop.
 async fn handle_control_request(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     frame: &Frame,
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
@@ -2949,7 +2987,7 @@ fn diagnostics_on_edit_from_doc(doc: &str) -> Option<bool> {
 }
 
 async fn send_route_bind_error(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     frame: &Frame,
     code: &str,
     message: &str,
@@ -2968,7 +3006,7 @@ async fn send_route_bind_error(
 }
 
 async fn send_route_bind_error_parts(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     ver: u8,
     corr: u64,
     flags: Flags,
@@ -2987,7 +3025,7 @@ async fn send_route_bind_error_parts(
 /// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
 /// serialized into ONE text block; `isError` carries `success == false`.
 async fn handle_tool_call(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     frame: &Frame,
     mut phase_trace: PhaseTrace,
     routes: &HashMap<RouteChannel, RouteIdentity>,
@@ -3371,37 +3409,39 @@ async fn handle_tool_call(
         };
         let result = ToolCallResult { text, response };
         let fatal = response_is_fatal_panic(&result.response);
-        let enqueued = match build_tool_response_frame(ver, route, corr, flags, &result) {
+        match build_tool_response_frame(ver, route, corr, flags, &result) {
             Ok(response_frame) => {
-                match send_reliable_writer_frame(
-                    &completion_tx,
-                    &completion_metrics,
-                    response_frame,
-                    "tool response",
-                )
-                .await
-                {
-                    Ok(()) => true,
-                    Err(error) => {
-                        log::warn!("subc attach: failed to queue tool response frame: {error}");
-                        false
-                    }
+                let send_result = if let Some(phase_trace) = phase_trace {
+                    let trace = ToolResponseWriteTrace::new(
+                        phase_trace,
+                        bare_name_for_frame,
+                        completion_root,
+                        completion_session,
+                        route.channel,
+                        corr,
+                    );
+                    send_traced_tool_response_frame(
+                        &completion_tx,
+                        &completion_metrics,
+                        response_frame,
+                        trace,
+                    )
+                    .await
+                } else {
+                    send_reliable_writer_frame(
+                        &completion_tx,
+                        &completion_metrics,
+                        response_frame,
+                        "tool response",
+                    )
+                    .await
+                };
+                if let Err(error) = send_result {
+                    log::warn!("subc attach: failed to queue tool response frame: {error}");
                 }
             }
             Err(error) => {
                 log::error!("subc attach: failed to build tool response frame: {error}");
-                false
-            }
-        };
-        if enqueued {
-            if let Some(phases) = phase_trace.and_then(PhaseTrace::finish) {
-                log_ctx::with_session(Some(completion_session), || {
-                    crate::logging::note_tool_call_trace(
-                        &bare_name_for_frame,
-                        &completion_root,
-                        phases,
-                    );
-                });
             }
         }
         if fatal {
@@ -3528,7 +3568,7 @@ async fn await_executor_response(rx: oneshot::Receiver<Response>, request_id: St
         .unwrap_or_else(|_| Response::error(request_id, "internal_error", "executor dropped"))
 }
 async fn signal_fatal_teardown(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     route: Option<RouteChannel>,
     ver: u8,
     corr: u64,

@@ -809,7 +809,7 @@ async fn send_bash_deferred_completion(
 }
 
 pub(super) async fn handle_bash_deferred_completion(
-    tx: &mpsc::Sender<Frame>,
+    tx: &WriterSender,
     done: BashDeferredCompletion,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,

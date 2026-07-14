@@ -24,6 +24,19 @@ pub struct PhaseTrace {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct ToolCallEgressTiming {
+    pub enqueued: Instant,
+    pub dequeued: Instant,
+    pub write_started: Instant,
+    pub write_finished: Instant,
+    pub frame_bytes: usize,
+    pub queue_depth: usize,
+    pub writer_active_at_enqueue: bool,
+    pub writer_queue_was_full: bool,
+    pub reserve_timeouts: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ToolCallPhaseDurations {
     pub queue: Duration,
     pub translate: Duration,
@@ -31,6 +44,15 @@ pub struct ToolCallPhaseDurations {
     pub format: Duration,
     pub finalize: Duration,
     pub egress_enqueue: Duration,
+    pub egress_queue: Duration,
+    pub egress_prepare: Duration,
+    pub egress_write: Duration,
+    pub egress: Duration,
+    pub frame_bytes: usize,
+    pub writer_queue_depth: usize,
+    pub writer_active_at_enqueue: bool,
+    pub writer_queue_was_full: bool,
+    pub writer_reserve_timeouts: u32,
     pub total: Duration,
 }
 
@@ -71,11 +93,7 @@ impl PhaseTrace {
         self.finalize_done = Some(Instant::now());
     }
 
-    pub fn finish(self) -> Option<ToolCallPhaseDurations> {
-        self.finish_at(Instant::now())
-    }
-
-    fn finish_at(self, response_enqueued: Instant) -> Option<ToolCallPhaseDurations> {
+    pub fn finish(self, egress: ToolCallEgressTiming) -> Option<ToolCallPhaseDurations> {
         let executor_submitted = self.executor_submitted?;
         let job_admitted = self.job_admitted?;
         let translate_done = self.translate_done?;
@@ -88,8 +106,17 @@ impl PhaseTrace {
             execute: execute_done.duration_since(translate_done),
             format: format_done.duration_since(execute_done),
             finalize: finalize_done.duration_since(format_done),
-            egress_enqueue: response_enqueued.duration_since(finalize_done),
-            total: response_enqueued.duration_since(self.frame_decoded),
+            egress_enqueue: egress.enqueued.duration_since(finalize_done),
+            egress_queue: egress.dequeued.duration_since(egress.enqueued),
+            egress_prepare: egress.write_started.duration_since(egress.dequeued),
+            egress_write: egress.write_finished.duration_since(egress.write_started),
+            egress: egress.write_finished.duration_since(finalize_done),
+            frame_bytes: egress.frame_bytes,
+            writer_queue_depth: egress.queue_depth,
+            writer_active_at_enqueue: egress.writer_active_at_enqueue,
+            writer_queue_was_full: egress.writer_queue_was_full,
+            writer_reserve_timeouts: egress.reserve_timeouts,
+            total: egress.write_finished.duration_since(self.frame_decoded),
         })
     }
 }
@@ -252,7 +279,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn phase_trace_reports_each_adjacent_delta_and_decode_to_egress_total() {
+    fn phase_trace_reports_execution_and_writer_egress_subphases() {
         let t0 = Instant::now();
         let trace = PhaseTrace {
             frame_decoded: t0,
@@ -264,7 +291,19 @@ mod tests {
             finalize_done: Some(t0 + Duration::from_millis(21)),
         };
 
-        let phases = trace.finish_at(t0 + Duration::from_millis(28)).unwrap();
+        let phases = trace
+            .finish(ToolCallEgressTiming {
+                enqueued: t0 + Duration::from_millis(28),
+                dequeued: t0 + Duration::from_millis(35),
+                write_started: t0 + Duration::from_millis(37),
+                write_finished: t0 + Duration::from_millis(48),
+                frame_bytes: 262_144,
+                queue_depth: 17,
+                writer_active_at_enqueue: true,
+                writer_queue_was_full: true,
+                reserve_timeouts: 2,
+            })
+            .unwrap();
 
         assert_eq!(phases.queue, Duration::from_millis(2));
         assert_eq!(phases.translate, Duration::from_millis(3));
@@ -272,6 +311,15 @@ mod tests {
         assert_eq!(phases.format, Duration::from_millis(5));
         assert_eq!(phases.finalize, Duration::from_millis(6));
         assert_eq!(phases.egress_enqueue, Duration::from_millis(7));
-        assert_eq!(phases.total, Duration::from_millis(28));
+        assert_eq!(phases.egress_queue, Duration::from_millis(7));
+        assert_eq!(phases.egress_prepare, Duration::from_millis(2));
+        assert_eq!(phases.egress_write, Duration::from_millis(11));
+        assert_eq!(phases.egress, Duration::from_millis(27));
+        assert_eq!(phases.frame_bytes, 262_144);
+        assert_eq!(phases.writer_queue_depth, 17);
+        assert!(phases.writer_active_at_enqueue);
+        assert!(phases.writer_queue_was_full);
+        assert_eq!(phases.writer_reserve_timeouts, 2);
+        assert_eq!(phases.total, Duration::from_millis(48));
     }
 }
