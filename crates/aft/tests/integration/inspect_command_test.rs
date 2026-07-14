@@ -14,6 +14,7 @@ use aft::inspect::{
     FileContribution, InspectCache, InspectCategory, InspectManager, InspectScanSuccess,
     InspectSnapshot, JobKey, JobOutcome,
 };
+use aft::lsp::client::LspEvent;
 use aft::lsp::registry::ServerKind;
 use aft::parser::{SymbolCache, TreeSitterProvider};
 use aft::protocol::RawRequest;
@@ -50,6 +51,44 @@ fn write_file(root: &Path, relative_path: &str, contents: &str) -> PathBuf {
     }
     fs::write(&path, contents).expect("write fixture file");
     path
+}
+
+fn file_uri(path: &Path) -> String {
+    let canonical = fs::canonicalize(path).expect("canonical file path");
+    url::Url::from_file_path(canonical)
+        .expect("file URL")
+        .to_string()
+}
+
+fn collect_lsp_notifications(ctx: &AppContext, method: &str, expected: usize) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut notifications = Vec::new();
+
+    while Instant::now() < deadline && notifications.len() < expected {
+        let events = ctx.lsp().drain_events().events;
+        for event in events {
+            if let LspEvent::Notification {
+                method: event_method,
+                params: Some(params),
+                ..
+            } = event
+            {
+                if event_method == method {
+                    notifications.push(params);
+                }
+            }
+        }
+        if notifications.len() < expected {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    assert_eq!(
+        notifications.len(),
+        expected,
+        "expected {expected} {method} notifications"
+    );
+    notifications
 }
 
 fn request(payload: Value) -> RawRequest {
@@ -2575,6 +2614,165 @@ fn inspect_command_diagnostics_scope_actively_pulls_cold_file_and_narrows() {
     assert_eq!(details.len(), 1, "response: {response:#}");
     assert_eq!(details[0]["file"], "src/main.rs");
     assert_eq!(details[0]["message"], "test pull diagnostic");
+}
+
+#[test]
+fn scoped_diagnostics_drains_events_after_each_file() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-drain\"\n");
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        write_file(&root, &format!("src/{name}"), "fn main() {}\n");
+    }
+    let ctx = configured_context(&root);
+    ctx.lsp().override_binary(
+        ServerKind::Rust,
+        PathBuf::from("/definitely/missing/rust-analyzer"),
+    );
+
+    const SEEDED_EVENTS: usize = 64;
+    for index in 0..SEEDED_EVENTS {
+        ctx.lsp().enqueue_event_for_test(LspEvent::Notification {
+            server_kind: ServerKind::Rust,
+            root: root.clone(),
+            method: format!("custom/seeded/{index}"),
+            params: None,
+        });
+    }
+    assert_eq!(ctx.lsp().pending_event_count_for_test(), SEEDED_EVENTS);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-drains-events",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(
+        ctx.lsp().pending_event_count_for_test(),
+        0,
+        "the scoped per-file loop must drain events even when server startup fails"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_closes_only_documents_it_opened_and_can_reopen_them() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-close\"\n");
+    let pre_opened = write_file(&root, "src/a.rs", "fn a() {}\n");
+    let newly_opened = [
+        write_file(&root, "src/b.rs", "fn b() {}\n"),
+        write_file(&root, "src/c.rs", "fn c() {}\n"),
+    ];
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+
+    let config = ctx.config().clone();
+    let open_result = ctx
+        .lsp()
+        .ensure_file_open(&pre_opened, &config)
+        .expect("pre-open document");
+    assert_eq!(open_result.newly_opened.len(), 1);
+    let pre_open_events = collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
+    assert_eq!(pre_open_events[0]["uri"], file_uri(&pre_opened));
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-closes-new-documents",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src",
+        }),
+    );
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+
+    assert!(ctx.lsp().document_is_open_for_test(&pre_opened));
+    for file in &newly_opened {
+        assert!(
+            !ctx.lsp().document_is_open_for_test(file),
+            "scoped inspect must remove newly-opened documents from its store"
+        );
+    }
+
+    let closed = collect_lsp_notifications(&ctx, "custom/documentClosed", newly_opened.len());
+    let mut closed_uris = closed
+        .iter()
+        .map(|params| params["uri"].as_str().expect("closed URI").to_string())
+        .collect::<Vec<_>>();
+    closed_uris.sort();
+    let mut expected_closed_uris = newly_opened
+        .iter()
+        .map(|file| file_uri(file))
+        .collect::<Vec<_>>();
+    expected_closed_uris.sort();
+    assert_eq!(closed_uris, expected_closed_uris);
+    assert!(!closed_uris.contains(&file_uri(&pre_opened)));
+
+    let reopen_result = ctx
+        .lsp()
+        .ensure_file_open(&newly_opened[0], &config)
+        .expect("reopen scoped document");
+    assert_eq!(
+        reopen_result.newly_opened.len(),
+        1,
+        "closed store entries must cause a later didOpen"
+    );
+    let reopened = collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
+    assert_eq!(reopened[0]["uri"], file_uri(&newly_opened[0]));
+}
+
+#[test]
+fn scoped_diagnostics_deadline_closes_documents_opened_before_truncation() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-deadline-close\"\n",
+    );
+    let files = [
+        write_file(&root, "src/a.rs", "fn a() {}\n"),
+        write_file(&root, "src/b.rs", "fn b() {}\n"),
+    ];
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "200");
+
+    let canonical_root = fs::canonicalize(&root).expect("canonical project root");
+    let snapshot = InspectSnapshot::new(
+        canonical_root.clone(),
+        ctx.inspect_dir(),
+        ctx.config(),
+        ctx.symbol_cache(),
+    );
+    let scope = aft::inspect::JobScope::from_roots(
+        canonical_root,
+        vec![fs::canonicalize(root.join("src")).expect("canonical scope")],
+    );
+    let outcome = aft::inspect::run_scoped_diagnostics_with_deadline_for_test(
+        &ctx,
+        &snapshot,
+        &scope,
+        Duration::from_millis(50),
+    );
+    let JobOutcome::Fresh { payload } = outcome else {
+        panic!("deadline-scoped diagnostics must return a fresh bounded payload");
+    };
+    assert_eq!(payload["status"], "incomplete", "payload: {payload:#}");
+
+    for file in &files {
+        assert!(
+            !ctx.lsp().document_is_open_for_test(file),
+            "deadline cleanup must leave no inspect-opened document in the store"
+        );
+    }
+    let closed = collect_lsp_notifications(&ctx, "custom/documentClosed", 1);
+    assert_eq!(closed[0]["uri"], file_uri(&files[0]));
 }
 
 #[test]

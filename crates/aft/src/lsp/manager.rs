@@ -177,11 +177,30 @@ pub enum PullFileOutcome {
     RequestFailed { reason: String },
 }
 
+/// Result of ensuring a document is open in every matching server.
+#[derive(Debug, Clone, Default)]
+pub struct EnsureFileOpenResult {
+    pub server_keys: Vec<ServerKey>,
+    /// Servers that received `textDocument/didOpen` during this call.
+    pub newly_opened: Vec<ServerKey>,
+}
+
+impl EnsureFileOpenResult {
+    pub fn is_empty(&self) -> bool {
+        self.server_keys.is_empty()
+    }
+}
+
 /// Result of `pull_file_diagnostics` for one matching server.
 #[derive(Debug, Clone)]
 pub struct PullFileResult {
     pub server_key: ServerKey,
     pub outcome: PullFileOutcome,
+}
+
+pub(crate) struct TrackedPullFileResult {
+    pub results: Vec<PullFileResult>,
+    pub newly_opened: Vec<ServerKey>,
 }
 
 /// Result of `pull_workspace_diagnostics` for a single server.
@@ -445,16 +464,17 @@ impl LspManager {
     }
     /// Ensure that servers are running for the file and that the document is open
     /// in each server's DocumentStore. Reads file content from disk if not already open.
-    /// Returns the server keys for the file.
+    /// The result identifies which servers were already tracking the document and which
+    /// received `textDocument/didOpen` during this call.
     pub fn ensure_file_open(
         &mut self,
         file_path: &Path,
         config: &Config,
-    ) -> Result<Vec<ServerKey>, LspError> {
+    ) -> Result<EnsureFileOpenResult, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
         let server_keys = self.ensure_server_for_file(&canonical_path, config);
         if server_keys.is_empty() {
-            return Ok(server_keys);
+            return Ok(EnsureFileOpenResult::default());
         }
 
         let uri = uri_for_path(&canonical_path)?;
@@ -465,6 +485,16 @@ impl LspManager {
                 .unwrap_or_default(),
         )
         .to_string();
+        let needs_content = server_keys.iter().any(|key| {
+            !self
+                .documents
+                .get(key)
+                .is_some_and(|store| store.is_open(&canonical_path))
+        });
+        let initial_content = needs_content
+            .then(|| std::fs::read_to_string(&canonical_path).map_err(LspError::Io))
+            .transpose()?;
+        let mut newly_opened = Vec::new();
 
         for key in &server_keys {
             let already_open = self
@@ -473,21 +503,30 @@ impl LspManager {
                 .is_some_and(|store| store.is_open(&canonical_path));
 
             if !already_open {
-                let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
-                if let Some(client) = self.clients.get_mut(key) {
+                let content = initial_content
+                    .as_ref()
+                    .expect("content is loaded when any server needs didOpen");
+                let send_result = if let Some(client) = self.clients.get_mut(key) {
                     client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
                         text_document: TextDocumentItem::new(
                             uri.clone(),
                             language_id.clone(),
                             0,
-                            content,
+                            content.clone(),
                         ),
-                    })?;
+                    })
+                } else {
+                    Ok(())
+                };
+                if let Err(err) = send_result {
+                    let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
+                    return Err(err);
                 }
                 self.documents
                     .entry(key.clone())
                     .or_default()
                     .open(canonical_path.clone());
+                newly_opened.push(key.clone());
                 continue;
             }
 
@@ -505,27 +544,37 @@ impl LspManager {
                 .get(key)
                 .is_some_and(|store| store.is_stale_on_disk(&canonical_path));
             if drifted {
-                let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
+                let content = match std::fs::read_to_string(&canonical_path) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
+                        return Err(LspError::Io(err));
+                    }
+                };
                 let next_version = self
                     .documents
                     .get(key)
                     .and_then(|store| store.version(&canonical_path))
                     .map(|v| v + 1)
                     .unwrap_or(1);
-                if let Some(client) = self.clients.get_mut(key) {
-                    client.send_notification::<DidChangeTextDocument>(
-                        DidChangeTextDocumentParams {
-                            text_document: VersionedTextDocumentIdentifier::new(
-                                uri.clone(),
-                                next_version,
-                            ),
-                            content_changes: vec![TextDocumentContentChangeEvent {
-                                range: None,
-                                range_length: None,
-                                text: content,
-                            }],
-                        },
-                    )?;
+                let send_result = if let Some(client) = self.clients.get_mut(key) {
+                    client.send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier::new(
+                            uri.clone(),
+                            next_version,
+                        ),
+                        content_changes: vec![TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: content,
+                        }],
+                    })
+                } else {
+                    Ok(())
+                };
+                if let Err(err) = send_result {
+                    let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
+                    return Err(err);
                 }
                 if let Some(store) = self.documents.get_mut(key) {
                     store.bump_version(&canonical_path);
@@ -533,13 +582,16 @@ impl LspManager {
             }
         }
 
-        Ok(server_keys)
+        Ok(EnsureFileOpenResult {
+            server_keys,
+            newly_opened,
+        })
     }
 
     pub fn ensure_file_open_default(
         &mut self,
         file_path: &Path,
-    ) -> Result<Vec<ServerKey>, LspError> {
+    ) -> Result<EnsureFileOpenResult, LspError> {
         self.ensure_file_open(file_path, &Config::default())
     }
 
@@ -714,33 +766,59 @@ impl LspManager {
     /// Close a document in all servers that have it open.
     pub fn notify_file_closed(&mut self, file_path: &Path) -> Result<(), LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
-        let uri = uri_for_path(&canonical_path)?;
-        let keys: Vec<ServerKey> = self.documents.keys().cloned().collect();
+        let keys = self
+            .documents
+            .iter()
+            .filter(|(_, store)| store.is_open(&canonical_path))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        self.close_file_for_servers(&canonical_path, &keys)
+    }
 
-        for key in keys {
+    /// Close a document only in the specified servers.
+    ///
+    /// Scoped inspection uses this to release documents it opened without
+    /// disturbing pre-existing editor documents in other server stores.
+    pub(crate) fn close_file_for_servers(
+        &mut self,
+        file_path: &Path,
+        server_keys: &[ServerKey],
+    ) -> Result<(), LspError> {
+        let canonical_path = canonicalize_for_lsp(file_path)?;
+        let uri = uri_for_path(&canonical_path)?;
+        let mut first_error = None;
+
+        for key in server_keys {
             let was_open = self
                 .documents
-                .get(&key)
-                .map(|store| store.is_open(&canonical_path))
-                .unwrap_or(false);
+                .get(key)
+                .is_some_and(|store| store.is_open(&canonical_path));
             if !was_open {
                 continue;
             }
 
-            if let Some(client) = self.clients.get_mut(&key) {
-                client.send_notification::<DidCloseTextDocument>(DidCloseTextDocumentParams {
-                    text_document: TextDocumentIdentifier::new(uri.clone()),
-                })?;
+            if let Some(client) = self.clients.get_mut(key) {
+                if let Err(err) =
+                    client.send_notification::<DidCloseTextDocument>(DidCloseTextDocumentParams {
+                        text_document: TextDocumentIdentifier::new(uri.clone()),
+                    })
+                {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
             }
 
-            if let Some(store) = self.documents.get_mut(&key) {
+            if let Some(store) = self.documents.get_mut(key) {
                 store.close(&canonical_path);
             }
-            self.diagnostics
-                .clear_for_server_file(&key, &canonical_path);
+            self.diagnostics.clear_for_server_file(key, &canonical_path);
         }
 
-        Ok(())
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Get an active client for a file path, if one exists.
@@ -834,6 +912,27 @@ impl LspManager {
     #[doc(hidden)]
     pub fn diagnostics_store_mut_for_test(&mut self) -> &mut DiagnosticsStore {
         &mut self.diagnostics
+    }
+
+    #[doc(hidden)]
+    pub fn enqueue_event_for_test(&self, event: LspEvent) {
+        self.event_tx
+            .send(event)
+            .expect("LSP event receiver should remain connected");
+    }
+
+    #[doc(hidden)]
+    pub fn pending_event_count_for_test(&self) -> usize {
+        self.event_rx.len()
+    }
+
+    #[doc(hidden)]
+    pub fn document_is_open_for_test(&self, file_path: &Path) -> bool {
+        canonicalize_for_lsp(file_path).is_ok_and(|canonical_path| {
+            self.documents
+                .values()
+                .any(|store| store.is_open(&canonical_path))
+        })
     }
 
     /// Error/warning counts across the entire warm diagnostics set (all files
@@ -1140,20 +1239,30 @@ impl LspManager {
         file_path: &Path,
         config: &Config,
     ) -> Result<Vec<PullFileResult>, LspError> {
+        self.pull_file_diagnostics_tracked(file_path, config)
+            .map(|tracked| tracked.results)
+    }
+
+    pub(crate) fn pull_file_diagnostics_tracked(
+        &mut self,
+        file_path: &Path,
+        config: &Config,
+    ) -> Result<TrackedPullFileResult, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
         // Make sure servers are running and the document is open with fresh
         // content (handles disk-drift via DocumentStore::is_stale_on_disk).
-        self.ensure_file_open(&canonical_path, config)?;
-
-        let server_keys = self.ensure_server_for_file(&canonical_path, config);
-        if server_keys.is_empty() {
-            return Ok(Vec::new());
+        let opened = self.ensure_file_open(&canonical_path, config)?;
+        if opened.server_keys.is_empty() {
+            return Ok(TrackedPullFileResult {
+                results: Vec::new(),
+                newly_opened: opened.newly_opened,
+            });
         }
 
         let uri = uri_for_path(&canonical_path)?;
-        let mut results = Vec::with_capacity(server_keys.len());
+        let mut results = Vec::with_capacity(opened.server_keys.len());
 
-        for key in server_keys {
+        for key in opened.server_keys {
             let supports_pull = self
                 .clients
                 .get(&key)
@@ -1191,7 +1300,21 @@ impl LspManager {
             };
 
             let outcome = match self.send_pull_request(&key, params) {
-                Ok(report) => self.ingest_document_report(&key, &canonical_path, report),
+                Ok(report) => {
+                    if matches!(
+                        &report,
+                        lsp_types::DocumentDiagnosticReportResult::Report(
+                            lsp_types::DocumentDiagnosticReport::Full(_)
+                        )
+                    ) {
+                        // The server may publish diagnostics for didOpen before
+                        // returning a full pull response. Apply those older events
+                        // first so the full report remains authoritative. An
+                        // unchanged response must inspect only a previous pull cache.
+                        self.drain_events();
+                    }
+                    self.ingest_document_report(&key, &canonical_path, report)
+                }
                 Err(err) => {
                     if let Some(result) = self.cache_post_initialize_exit(&key, &err) {
                         PullFileOutcome::RequestFailed {
@@ -1222,7 +1345,10 @@ impl LspManager {
             });
         }
 
-        Ok(results)
+        Ok(TrackedPullFileResult {
+            results,
+            newly_opened: opened.newly_opened,
+        })
     }
 
     /// Issue a `workspace/diagnostic` request to a specific server. Cancels

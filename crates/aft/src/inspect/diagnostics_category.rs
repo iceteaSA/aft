@@ -52,6 +52,40 @@ struct DiagnosticsCollection {
     files_without_server: usize,
 }
 
+struct ScopedInspectDocuments<'a> {
+    ctx: &'a AppContext,
+    opened: Vec<(PathBuf, Vec<ServerKey>)>,
+}
+
+impl<'a> ScopedInspectDocuments<'a> {
+    fn new(ctx: &'a AppContext) -> Self {
+        Self {
+            ctx,
+            opened: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, file: PathBuf, server_keys: Vec<ServerKey>) {
+        if !server_keys.is_empty() {
+            self.opened.push((file, server_keys));
+        }
+    }
+}
+
+impl Drop for ScopedInspectDocuments<'_> {
+    fn drop(&mut self) {
+        let mut lsp = self.ctx.lsp();
+        for (file, server_keys) in std::mem::take(&mut self.opened) {
+            if let Err(err) = lsp.close_file_for_servers(&file, &server_keys) {
+                crate::slog_warn!(
+                    "[inspect:diagnostics] failed to close scoped document {}: {err}",
+                    file.display()
+                );
+            }
+        }
+    }
+}
+
 /// Main-thread implementation for the `diagnostics` inspect category.
 ///
 /// The LSP manager is owned by `AppContext` and is part of the serial LSP/status
@@ -108,7 +142,20 @@ fn collect_scoped_diagnostics(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
 ) -> DiagnosticsCollection {
-    let deadline = Instant::now() + INSPECT_DIAGNOSTICS_DEADLINE;
+    collect_scoped_diagnostics_until(
+        ctx,
+        snapshot,
+        scope,
+        Instant::now() + INSPECT_DIAGNOSTICS_DEADLINE,
+    )
+}
+
+fn collect_scoped_diagnostics_until(
+    ctx: &AppContext,
+    snapshot: &InspectSnapshot,
+    scope: &JobScope,
+    deadline: Instant,
+) -> DiagnosticsCollection {
     let config = ctx.config().clone();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     let scoped = scoped_lsp_files(snapshot, scope, &config, &mut tsconfig_membership);
@@ -118,19 +165,45 @@ fn collect_scoped_diagnostics(
         files_without_server: scoped.explicit_files_without_server,
         ..DiagnosticsCollection::default()
     };
+    let mut opened_documents = ScopedInspectDocuments::new(ctx);
 
     for file in files {
         if Instant::now() >= deadline {
             collection.scope_truncated = true;
             break;
         }
-        collect_scoped_file(ctx, &config, &file, deadline, &mut collection);
+        collect_scoped_file(
+            ctx,
+            &config,
+            &file,
+            deadline,
+            &mut collection,
+            &mut opened_documents,
+        );
+        // Pull-only servers may leave didOpen diagnostics, telemetry, and log
+        // notifications queued because they do not enter the push waiter.
+        ctx.lsp().drain_events();
     }
 
     collection.diagnostics =
         scoped_warm_diagnostics(ctx, snapshot, scope, &mut tsconfig_membership);
     collection.sort_and_dedup();
+    drop(opened_documents);
     collection
+}
+
+#[doc(hidden)]
+pub fn run_scoped_diagnostics_with_deadline_for_test(
+    ctx: &AppContext,
+    snapshot: &InspectSnapshot,
+    scope: &JobScope,
+    timeout: Duration,
+) -> JobOutcome {
+    let collection =
+        collect_scoped_diagnostics_until(ctx, snapshot, scope, Instant::now() + timeout);
+    JobOutcome::Fresh {
+        payload: collection.into_payload(snapshot),
+    }
 }
 
 fn collect_scoped_file(
@@ -139,6 +212,7 @@ fn collect_scoped_file(
     file: &Path,
     deadline: Instant,
     collection: &mut DiagnosticsCollection,
+    opened_documents: &mut ScopedInspectDocuments<'_>,
 ) {
     let canonical = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
     let outcomes: EnsureServerOutcomes = {
@@ -171,8 +245,11 @@ fn collect_scoped_file(
 
     let pull_results = {
         let mut lsp = ctx.lsp();
-        match lsp.pull_file_diagnostics(&canonical, config) {
-            Ok(results) => results,
+        match lsp.pull_file_diagnostics_tracked(&canonical, config) {
+            Ok(tracked) => {
+                opened_documents.record(canonical.clone(), tracked.newly_opened);
+                tracked.results
+            }
             Err(err) => {
                 crate::slog_warn!(
                     "[inspect:diagnostics] pull_file_diagnostics failed for {}: {err}",

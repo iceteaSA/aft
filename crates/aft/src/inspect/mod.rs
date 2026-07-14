@@ -1,5 +1,7 @@
 pub mod cache;
 pub(crate) mod diagnostics_category;
+#[doc(hidden)]
+pub use diagnostics_category::run_scoped_diagnostics_with_deadline_for_test;
 pub mod dispatch;
 mod entry_points;
 mod frameworks;

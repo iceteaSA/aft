@@ -402,6 +402,12 @@ fn main() -> io::Result<()> {
                     // LSP 3.17 pull diagnostics. Honor previousResultId for
                     // unchanged-state replies. Fail-mode is controlled by
                     // env var so tests can drive each branch.
+                    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_PULL_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
                     let force_unchanged =
                         std::env::var("AFT_FAKE_LSP_PULL_UNCHANGED").ok().as_deref() == Some("1");
                     let force_error =
