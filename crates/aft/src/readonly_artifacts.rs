@@ -1,30 +1,47 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 // These openers borrow cache artifacts that may be owned by a different AFT
 // session. They therefore only read and verify the opened snapshot; any repair,
 // migration, deletion, or rebuild must be left to the session that owns writes
 // for that project.
-use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
+use crate::cache_freshness::{artifact_generation, ArtifactGeneration};
 use crate::search_index::{
-    artifact_cache_key_with_memo, build_path_filters, resolve_cache_dir,
-    resolve_cache_dir_with_key, walk_project_files, walk_project_files_bounded_matching,
-    SearchIndex,
+    artifact_cache_key_with_memo, resolve_cache_dir, resolve_cache_dir_with_key, SearchIndex,
 };
-use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex};
+use crate::semantic_index::SemanticIndex;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum ReadOnlyArtifact<T> {
     Fresh(T),
     Stale(ReadOnlyStale<T>),
     Absent,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReadOnlyStale<T> {
     pub index: T,
     pub drift_count: usize,
     pub ignore_rules_differ: bool,
+}
+
+impl<T> ReadOnlyArtifact<T> {
+    pub(crate) fn map<U>(self, map: impl FnOnce(T) -> U) -> ReadOnlyArtifact<U> {
+        match self {
+            Self::Fresh(index) => ReadOnlyArtifact::Fresh(map(index)),
+            Self::Stale(stale) => ReadOnlyArtifact::Stale(ReadOnlyStale {
+                index: map(stale.index),
+                drift_count: stale.drift_count,
+                ignore_rules_differ: stale.ignore_rules_differ,
+            }),
+            Self::Absent => ReadOnlyArtifact::Absent,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BorrowedArtifactGeneration {
+    pub path: PathBuf,
+    pub generation: ArtifactGeneration,
 }
 
 #[derive(Debug)]
@@ -61,22 +78,55 @@ pub(crate) fn resolve_git_root_from_user_path(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn search_index_artifact_generation(
+    project_root: &Path,
+    storage_dir: Option<&Path>,
+) -> Option<BorrowedArtifactGeneration> {
+    let cache_dir = search_index_cache_dir(project_root, storage_dir)?;
+    search_artifact_generation_from_cache_dir(cache_dir)
+}
+
+pub(crate) fn search_index_artifact_generation_with_key(
+    project_key: &str,
+    storage_dir: Option<&Path>,
+) -> Option<BorrowedArtifactGeneration> {
+    search_artifact_generation_from_cache_dir(resolve_cache_dir_with_key(project_key, storage_dir))
+}
+
+fn search_artifact_generation_from_cache_dir(
+    cache_dir: PathBuf,
+) -> Option<BorrowedArtifactGeneration> {
+    let path = cache_dir.join("cache.bin");
+    let generation = artifact_generation(&path)?;
+    Some(BorrowedArtifactGeneration { path, generation })
+}
+
 pub(crate) fn open_search_index_read_only(
     project_root: &Path,
     storage_dir: Option<&Path>,
 ) -> ReadOnlyArtifact<SearchIndex> {
-    let cache_dir = match storage_dir {
-        Some(storage_dir) => {
-            match artifact_cache_key_with_memo(project_root, project_root, storage_dir, None) {
-                Ok(project_key) => resolve_cache_dir_with_key(&project_key, Some(storage_dir)),
-                Err(error) => {
-                    crate::slog_warn!("read-only search index unavailable: {}", error);
-                    return ReadOnlyArtifact::Absent;
-                }
-            }
-        }
-        None => resolve_cache_dir(project_root, None),
+    let Some(cache_dir) = search_index_cache_dir(project_root, storage_dir) else {
+        return ReadOnlyArtifact::Absent;
     };
+    open_search_index_from_cache_dir(project_root, cache_dir)
+}
+
+pub(crate) fn open_search_index_read_only_with_key(
+    project_root: &Path,
+    storage_dir: Option<&Path>,
+    project_key: &str,
+) -> ReadOnlyArtifact<SearchIndex> {
+    open_search_index_from_cache_dir(
+        project_root,
+        resolve_cache_dir_with_key(project_key, storage_dir),
+    )
+}
+
+fn open_search_index_from_cache_dir(
+    project_root: &Path,
+    cache_dir: PathBuf,
+) -> ReadOnlyArtifact<SearchIndex> {
     if !cache_dir.join("cache.bin").is_file() {
         return ReadOnlyArtifact::Absent;
     }
@@ -87,127 +137,123 @@ pub(crate) fn open_search_index_read_only(
         return ReadOnlyArtifact::Absent;
     };
 
-    let drift_count = search_drift_count(&index, project_root);
     index.set_ready(true);
-    if drift_count == 0 && !ignore_rules_differ {
-        ReadOnlyArtifact::Fresh(index)
-    } else {
+    if ignore_rules_differ {
         ReadOnlyArtifact::Stale(ReadOnlyStale {
             index,
-            drift_count,
+            drift_count: 0,
             ignore_rules_differ,
         })
+    } else {
+        ReadOnlyArtifact::Fresh(index)
     }
+}
+
+fn search_index_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Option<PathBuf> {
+    match storage_dir {
+        Some(storage_dir) => {
+            match artifact_cache_key_with_memo(project_root, project_root, storage_dir, None) {
+                Ok(project_key) => {
+                    Some(resolve_cache_dir_with_key(&project_key, Some(storage_dir)))
+                }
+                Err(error) => {
+                    crate::slog_warn!("read-only search index unavailable: {}", error);
+                    None
+                }
+            }
+        }
+        None => Some(resolve_cache_dir(project_root, None)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn semantic_index_artifact_generation(
+    project_root: &Path,
+    storage_dir: Option<&Path>,
+) -> Option<BorrowedArtifactGeneration> {
+    let (data_path, _) = semantic_index_location(project_root, storage_dir)?;
+    borrowed_artifact_generation(data_path)
+}
+
+pub(crate) fn semantic_index_artifact_generation_with_key(
+    project_key: &str,
+    storage_dir: Option<&Path>,
+) -> Option<BorrowedArtifactGeneration> {
+    let storage_dir = storage_dir?;
+    borrowed_artifact_generation(
+        storage_dir
+            .join("semantic")
+            .join(project_key)
+            .join("semantic.bin"),
+    )
+}
+
+fn borrowed_artifact_generation(path: PathBuf) -> Option<BorrowedArtifactGeneration> {
+    let generation = artifact_generation(&path)?;
+    Some(BorrowedArtifactGeneration { path, generation })
 }
 
 pub(crate) fn open_semantic_index_read_only(
     project_root: &Path,
     storage_dir: Option<&Path>,
 ) -> ReadOnlyArtifact<SemanticIndex> {
+    let Some((data_path, project_key)) = semantic_index_location(project_root, storage_dir) else {
+        return ReadOnlyArtifact::Absent;
+    };
+    open_semantic_index_from_location(project_root, storage_dir, data_path, &project_key)
+}
+
+pub(crate) fn open_semantic_index_read_only_with_key(
+    project_root: &Path,
+    storage_dir: Option<&Path>,
+    project_key: &str,
+) -> ReadOnlyArtifact<SemanticIndex> {
     let Some(storage_dir) = storage_dir else {
         return ReadOnlyArtifact::Absent;
     };
+    let data_path = storage_dir
+        .join("semantic")
+        .join(project_key)
+        .join("semantic.bin");
+    open_semantic_index_from_location(project_root, Some(storage_dir), data_path, project_key)
+}
+
+fn open_semantic_index_from_location(
+    project_root: &Path,
+    storage_dir: Option<&Path>,
+    data_path: PathBuf,
+    project_key: &str,
+) -> ReadOnlyArtifact<SemanticIndex> {
+    let Some(storage_dir) = storage_dir else {
+        return ReadOnlyArtifact::Absent;
+    };
+    if !data_path.is_file() {
+        return ReadOnlyArtifact::Absent;
+    }
+
+    SemanticIndex::read_from_disk_borrow_tolerant(storage_dir, project_key, project_root)
+        .map(ReadOnlyArtifact::Fresh)
+        .unwrap_or(ReadOnlyArtifact::Absent)
+}
+
+fn semantic_index_location(
+    project_root: &Path,
+    storage_dir: Option<&Path>,
+) -> Option<(PathBuf, String)> {
+    let storage_dir = storage_dir?;
     let project_key =
         match artifact_cache_key_with_memo(project_root, project_root, storage_dir, None) {
             Ok(project_key) => project_key,
             Err(error) => {
                 crate::slog_warn!("read-only semantic index unavailable: {}", error);
-                return ReadOnlyArtifact::Absent;
+                return None;
             }
         };
     let data_path = storage_dir
         .join("semantic")
         .join(&project_key)
         .join("semantic.bin");
-    if !data_path.is_file() {
-        return ReadOnlyArtifact::Absent;
-    }
-
-    let Some(index) =
-        SemanticIndex::read_from_disk_borrow_tolerant(storage_dir, &project_key, project_root)
-    else {
-        return ReadOnlyArtifact::Absent;
-    };
-
-    let drift_count = semantic_drift_count(&index, project_root);
-    if drift_count == 0 {
-        ReadOnlyArtifact::Fresh(index)
-    } else {
-        ReadOnlyArtifact::Stale(ReadOnlyStale {
-            index,
-            drift_count,
-            ignore_rules_differ: false,
-        })
-    }
-}
-
-fn search_drift_count(index: &SearchIndex, project_root: &Path) -> usize {
-    let filters = crate::search_index::PathFilters::default();
-    let current_files = walk_project_files(project_root, &filters);
-    let current_file_set: HashSet<PathBuf> = current_files.iter().cloned().collect();
-    let mut drift_count = 0usize;
-
-    for entry in index.files.iter() {
-        if entry.path.as_os_str().is_empty() {
-            continue;
-        }
-        if !current_file_set.contains(&entry.path) {
-            drift_count += 1;
-            continue;
-        }
-        let cached = FileFreshness {
-            mtime: entry.modified,
-            size: entry.size,
-            content_hash: entry.content_hash,
-        };
-        if crate::cache_freshness::verify_file_strict(&entry.path, &cached)
-            != FreshnessVerdict::HotFresh
-        {
-            drift_count += 1;
-        }
-    }
-
-    drift_count
-        + current_files
-            .into_iter()
-            .filter(|path| !index.path_to_id.contains_key(path))
-            .count()
-}
-
-fn semantic_drift_count(index: &SemanticIndex, project_root: &Path) -> usize {
-    let filters = build_path_filters(&[], &[]).unwrap_or_default();
-    let current_files = walk_project_files_bounded_matching(
-        project_root,
-        &filters,
-        usize::MAX,
-        is_semantic_indexed_extension,
-    )
-    .unwrap_or_default();
-    let current_file_set: HashSet<PathBuf> = current_files.iter().cloned().collect();
-    let indexed_file_set = index.indexed_file_paths();
-    let mut drift_count = 0usize;
-
-    for (path, mtime, size, content_hash) in index.indexed_file_metadata() {
-        if !current_file_set.contains(&path) {
-            drift_count += 1;
-            continue;
-        }
-        let cached = FileFreshness {
-            mtime,
-            size,
-            content_hash,
-        };
-        if crate::cache_freshness::verify_file_strict(&path, &cached) != FreshnessVerdict::HotFresh
-        {
-            drift_count += 1;
-        }
-    }
-
-    drift_count
-        + current_files
-            .into_iter()
-            .filter(|path| !indexed_file_set.contains(path))
-            .count()
+    Some((data_path, project_key))
 }
 
 fn expand_tilde(raw: &str) -> PathBuf {
@@ -274,6 +320,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::context::BORROWED_INDEX_CACHE_CAPACITY;
     use crate::search_index::artifact_cache_key;
     use crate::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
 
@@ -411,8 +458,177 @@ mod tests {
         index.write_to_disk(storage, &artifact_cache_key(root));
     }
 
+    fn borrowed_context(root: &Path, storage: &Path) -> crate::context::AppContext {
+        crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                storage_dir: Some(storage.to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        )
+    }
+
+    fn cached_search_index(
+        ctx: &crate::context::AppContext,
+        root: &Path,
+        storage: &Path,
+    ) -> std::sync::Arc<SearchIndex> {
+        match ctx.open_borrowed_search_index(root, Some(storage)) {
+            ReadOnlyArtifact::Fresh(index)
+            | ReadOnlyArtifact::Stale(ReadOnlyStale { index, .. }) => index,
+            ReadOnlyArtifact::Absent => panic!("expected borrowed search index"),
+        }
+    }
+
     #[test]
-    fn search_opener_reports_fresh_stale_absent() {
+    fn repeated_borrowed_opens_cache_one_load_per_artifact_generation() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        let storage = tempfile::tempdir().expect("storage");
+        build_search_artifact(&root, storage.path());
+        let ctx = borrowed_context(&root, storage.path());
+        search_index_artifact_generation(&root, Some(storage.path()))
+            .expect("seed borrowed artifact generation");
+        let artifact_before = snapshot_dir(storage.path());
+
+        crate::cache_freshness::reset_verify_file_strict_count_for_debug();
+        let first = cached_search_index(&ctx, &root, storage.path());
+        let second = cached_search_index(&ctx, &root, storage.path());
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(ctx.borrowed_index_cache_len_for_test(), 1);
+        assert_eq!(
+            ctx.artifact_cache_key_derivation_count_for_test(),
+            1,
+            "artifact identity should be derived only on the first external search"
+        );
+        assert_eq!(
+            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            0,
+            "neither the first load nor a cache hit may run a corpus census"
+        );
+        assert_eq!(snapshot_dir(storage.path()), artifact_before);
+
+        let added = root.join("src/added.rs");
+        fs::write(&added, "pub fn generation_two() {}\n").expect("add generation file");
+        build_search_artifact(&root, storage.path());
+        let rebuilt_snapshot = snapshot_dir(storage.path());
+        let third = cached_search_index(&ctx, &root, storage.path());
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &third),
+            "an owner rebuild must invalidate the cached rerooted generation"
+        );
+        assert!(third.path_to_id.contains_key(&added));
+        assert_eq!(ctx.borrowed_index_cache_len_for_test(), 1);
+        assert_eq!(ctx.artifact_cache_key_derivation_count_for_test(), 1);
+        assert_eq!(snapshot_dir(storage.path()), rebuilt_snapshot);
+
+        assert!(ctx.evict_idle_artifacts());
+        assert_eq!(ctx.borrowed_index_cache_len_for_test(), 0);
+    }
+
+    #[test]
+    fn repeated_borrowed_semantic_opens_reuse_rerooted_generation() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        let storage = tempfile::tempdir().expect("storage");
+        build_semantic_artifact(&root, storage.path());
+        let ctx = borrowed_context(&root, storage.path());
+        semantic_index_artifact_generation(&root, Some(storage.path()))
+            .expect("seed semantic artifact generation");
+        let artifact_before = snapshot_dir(storage.path());
+
+        let first = match ctx.open_borrowed_semantic_index(&root, Some(storage.path())) {
+            ReadOnlyArtifact::Fresh(index) => index,
+            other => panic!("expected borrowed semantic index, got {other:?}"),
+        };
+        let second = match ctx.open_borrowed_semantic_index(&root, Some(storage.path())) {
+            ReadOnlyArtifact::Fresh(index) => index,
+            other => panic!("expected cached semantic index, got {other:?}"),
+        };
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(ctx.borrowed_index_cache_len_for_test(), 1);
+        assert_eq!(snapshot_dir(storage.path()), artifact_before);
+    }
+
+    #[test]
+    fn borrowed_index_cache_is_bounded_and_idle_evictable() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let storage = tempfile::tempdir().expect("storage");
+        let mut projects = Vec::new();
+        for _ in 0..=BORROWED_INDEX_CACHE_CAPACITY {
+            let (project, root) = fixture_project();
+            build_search_artifact(&root, storage.path());
+            projects.push((project, root));
+        }
+        let ctx = borrowed_context(&projects[0].1, storage.path());
+        let first = cached_search_index(&ctx, &projects[0].1, storage.path());
+        for (_, root) in projects.iter().skip(1) {
+            cached_search_index(&ctx, root, storage.path());
+        }
+        assert_eq!(
+            ctx.borrowed_index_cache_len_for_test(),
+            BORROWED_INDEX_CACHE_CAPACITY
+        );
+        let reloaded_first = cached_search_index(&ctx, &projects[0].1, storage.path());
+        assert!(!std::sync::Arc::ptr_eq(&first, &reloaded_first));
+
+        assert!(ctx.evict_idle_artifacts());
+        assert_eq!(ctx.borrowed_index_cache_len_for_test(), 0);
+    }
+
+    #[test]
+    fn stale_posting_verification_stops_at_injected_file_budget() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        for file_index in 0..20 {
+            fs::write(
+                root.join(format!("src/stale_{file_index}.rs")),
+                "pub fn stale_budget_needle() {}\n",
+            )
+            .expect("write indexed stale candidate");
+        }
+        let storage = tempfile::tempdir().expect("storage");
+        build_search_artifact(&root, storage.path());
+        for file_index in 0..20 {
+            fs::write(
+                root.join(format!("src/stale_{file_index}.rs")),
+                "pub fn changed_after_index_build() {}\n",
+            )
+            .expect("replace indexed stale candidate");
+        }
+        let index = match open_search_index_read_only(&root, Some(storage.path())) {
+            ReadOnlyArtifact::Fresh(index) => index,
+            other => panic!("expected borrowed index, got {other:?}"),
+        };
+        let compiled = match crate::pattern_compile::compile(
+            "stale_budget_needle",
+            crate::pattern_compile::CompileOpts {
+                literal: true,
+                ..crate::pattern_compile::CompileOpts::default()
+            },
+        ) {
+            crate::pattern_compile::CompileResult::Ok(compiled) => compiled,
+            other => panic!("literal compile failed: {other:?}"),
+        };
+
+        let result = index.snapshot().search_grep_bounded(
+            &compiled,
+            &[],
+            &[],
+            &root,
+            10,
+            1,
+            std::time::Duration::from_secs(1),
+        );
+        assert!(result.matches.is_empty());
+        assert!(result.files_searched <= 1);
+        assert!(result.truncated);
+        assert!(result.engine_capped);
+    }
+
+    #[test]
+    fn search_opener_skips_full_corpus_strict_census() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_project, root) = fixture_project();
         let storage = tempfile::tempdir().expect("storage");
@@ -423,10 +639,16 @@ mod tests {
         ));
 
         build_search_artifact(&root, storage.path());
+        crate::cache_freshness::reset_verify_file_strict_count_for_debug();
         assert!(matches!(
             open_search_index_read_only(&root, Some(storage.path())),
             ReadOnlyArtifact::Fresh(_)
         ));
+        assert_eq!(
+            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            0,
+            "a borrowed open must not restore the full-corpus strict hash census"
+        );
 
         fs::write(
             root.join("src/lib.rs"),
@@ -434,13 +656,15 @@ mod tests {
         )
         .expect("mutate fixture");
         match open_search_index_read_only(&root, Some(storage.path())) {
-            ReadOnlyArtifact::Stale(stale) => {
-                assert!(stale.drift_count >= 1);
-                assert!(!stale.ignore_rules_differ);
-                assert!(stale.index.stored_git_head().is_some());
+            ReadOnlyArtifact::Fresh(index) => {
+                assert!(index.stored_git_head().is_some());
             }
-            other => panic!("expected stale artifact, got {other:?}"),
+            other => panic!("expected silently served borrowed artifact, got {other:?}"),
         }
+        assert_eq!(
+            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            0
+        );
     }
 
     #[test]
@@ -511,11 +735,11 @@ mod tests {
         let stale_before = snapshot_dir(storage.path());
         assert!(matches!(
             open_search_index_read_only(&root, Some(storage.path())),
-            ReadOnlyArtifact::Stale(_)
+            ReadOnlyArtifact::Fresh(_)
         ));
         assert!(matches!(
             open_semantic_index_read_only(&root, Some(storage.path())),
-            ReadOnlyArtifact::Stale(_)
+            ReadOnlyArtifact::Fresh(_)
         ));
         assert_eq!(snapshot_dir(storage.path()), stale_before);
         assert!(search_cache_dir.join("cache.bin").is_file());

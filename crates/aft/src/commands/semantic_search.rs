@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -17,10 +18,7 @@ use crate::inspect::job::{is_test_file, is_test_support_file};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
-use crate::readonly_artifacts::{
-    open_search_index_read_only, open_semantic_index_read_only, resolve_git_root_from_user_path,
-    GitRootResolutionError, ReadOnlyArtifact,
-};
+use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact};
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, GrepMatch, GrepResult, IndexStatus, SearchIndex,
     SearchIndexSnapshot,
@@ -193,7 +191,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         .filter(|path| !path.is_empty())
         .map(str::to_string);
     if let Some(requested_path) = requested_path {
-        let external_root = match resolve_git_root_from_user_path(&project_root, &requested_path) {
+        let external_root = match ctx.resolve_external_git_root(&project_root, &requested_path) {
             Ok(root) => root,
             Err(GitRootResolutionError::PathNotFound(path)) => {
                 return Response::error(
@@ -284,10 +282,9 @@ fn handle_external_search(
     external_root: PathBuf,
 ) -> Response {
     let storage_dir = ctx.config().storage_dir.clone();
-    let (search_index, borrow_metadata) = match open_search_index_read_only(
-        &external_root,
-        storage_dir.as_deref(),
-    ) {
+    let (search_index, borrow_metadata) = match ctx
+        .open_borrowed_search_index(&external_root, storage_dir.as_deref())
+    {
         ReadOnlyArtifact::Fresh(index) => {
             let borrow_metadata = ExternalBorrowMetadata::from_search_index(&index);
             (index, borrow_metadata)
@@ -442,10 +439,15 @@ fn handle_external_grep_search(
 
     let literal = effective_mode == SearchMode::Literal;
     let grep_limit = grep_candidate_limit(top_k, include_tests);
-    let mut result =
-        search_index
-            .snapshot()
-            .search_grep(&compiled, &[], &[], external_root, grep_limit);
+    let mut result = search_index.snapshot().search_grep_bounded(
+        &compiled,
+        &[],
+        &[],
+        external_root,
+        grep_limit,
+        grep_executor::MAX_FALLBACK_WALK_FILES,
+        grep_executor::FALLBACK_WALK_BUDGET,
+    );
     result
         .matches
         .retain(|grep_match| grep_match.file.is_file());
@@ -493,7 +495,7 @@ fn handle_external_semantic_or_hybrid_search(
     mode: SearchMode,
     mut warnings: Vec<String>,
     external_root: PathBuf,
-    search_index: SearchIndex,
+    search_index: Arc<SearchIndex>,
     mut borrow_metadata: ExternalBorrowMetadata,
 ) -> Response {
     let lexical = if mode == SearchMode::Hybrid {
@@ -513,7 +515,8 @@ fn handle_external_semantic_or_hybrid_search(
     };
 
     let storage_dir = ctx.config().storage_dir.clone();
-    let semantic_index = match open_semantic_index_read_only(&external_root, storage_dir.as_deref())
+    let semantic_index = match ctx
+        .open_borrowed_semantic_index(&external_root, storage_dir.as_deref())
     {
         ReadOnlyArtifact::Fresh(index) => match semantic_fingerprint_matches_session(ctx, &index) {
             true => Some(index),

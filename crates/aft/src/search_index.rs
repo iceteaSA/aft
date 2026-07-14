@@ -1514,6 +1514,27 @@ impl SearchIndexSnapshot {
             .0
     }
 
+    pub(crate) fn search_grep_bounded(
+        &self,
+        pattern: &CompiledPattern,
+        include: &[String],
+        exclude: &[String],
+        search_root: &Path,
+        max_results: usize,
+        max_files: usize,
+        budget: Duration,
+    ) -> GrepResult {
+        self.search_grep_profiled_with_limits(
+            pattern,
+            include,
+            exclude,
+            search_root,
+            max_results,
+            Some((max_files, budget)),
+        )
+        .0
+    }
+
     pub(crate) fn search_grep_profiled(
         &self,
         pattern: &CompiledPattern,
@@ -1521,6 +1542,25 @@ impl SearchIndexSnapshot {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
+    ) -> (GrepResult, GrepQueryPhaseTimings) {
+        self.search_grep_profiled_with_limits(
+            pattern,
+            include,
+            exclude,
+            search_root,
+            max_results,
+            None,
+        )
+    }
+
+    fn search_grep_profiled_with_limits(
+        &self,
+        pattern: &CompiledPattern,
+        include: &[String],
+        exclude: &[String],
+        search_root: &Path,
+        max_results: usize,
+        verification_limits: Option<(usize, Duration)>,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
@@ -1563,6 +1603,17 @@ impl SearchIndexSnapshot {
         let engine_capped = AtomicBool::new(false);
         let stop_after = max_results.saturating_mul(2);
         let stop_scan = Arc::new(AtomicBool::new(false));
+        let verification_started = Instant::now();
+        let verification_claims = AtomicUsize::new(0);
+        let claim_verification = || {
+            let Some((max_files, budget)) = verification_limits else {
+                return true;
+            };
+            if verification_started.elapsed() >= budget {
+                return false;
+            }
+            verification_claims.fetch_add(1, Ordering::Relaxed) < max_files
+        };
 
         let pread_started = Instant::now();
         let mut matches = if candidate_files.len() > 10 {
@@ -1576,6 +1627,12 @@ impl SearchIndexSnapshot {
                         stop_after,
                     ) {
                         engine_capped.store(true, Ordering::Relaxed);
+                        return Vec::new();
+                    }
+                    if !claim_verification() {
+                        truncated.store(true, Ordering::Relaxed);
+                        engine_capped.store(true, Ordering::Relaxed);
+                        stop_scan.store(true, Ordering::Relaxed);
                         return Vec::new();
                     }
                     search_candidate_file(
@@ -1602,6 +1659,11 @@ impl SearchIndexSnapshot {
         } else {
             let mut matches = Vec::new();
             for file in candidate_files {
+                if !claim_verification() {
+                    truncated.store(true, Ordering::Relaxed);
+                    engine_capped.store(true, Ordering::Relaxed);
+                    break;
+                }
                 matches.extend(search_candidate_file(
                     file,
                     &matcher,

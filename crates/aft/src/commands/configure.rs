@@ -2410,9 +2410,17 @@ fn schedule_artifact_loads(
                             );
                         }
                         crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                            slog_warn!(
-                                "search index is read-only and stale for {} file(s); not repairing shared artifacts",
-                                stale.drift_count
+                            let symbol_files = search_index_symbol_files(&stale.index);
+                            let _ = tx.send(stale.index);
+                            spawn_symbol_cache_prewarm(
+                                root_for_search,
+                                symbol_cache,
+                                symbol_storage,
+                                symbol_project_key,
+                                symbol_cache_generation,
+                                symbol_files,
+                                true,
+                                log_ctx::current_session(),
                             );
                         }
                         crate::readonly_artifacts::ReadOnlyArtifact::Absent => {

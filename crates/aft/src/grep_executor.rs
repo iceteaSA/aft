@@ -918,7 +918,7 @@ pub fn floor_char_boundary_str(content: &str, mut index: usize) -> usize {
 }
 
 /// Prefix of `content` with at most `max_bytes` UTF-8 bytes, truncated on a char boundary.
-pub fn truncate_at_char_boundary<'a>(content: &'a str, max_bytes: usize) -> &'a str {
+pub fn truncate_at_char_boundary(content: &str, max_bytes: usize) -> &str {
     let end = floor_char_boundary_str(content, max_bytes);
     &content[..end]
 }

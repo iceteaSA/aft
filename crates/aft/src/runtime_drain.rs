@@ -2077,9 +2077,11 @@ mod tests {
     #[test]
     fn post_ack_semantic_ready_transition_pushes_status_changed() {
         let root = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.project_root = Some(root.path().to_path_buf());
-        config.semantic_search = true;
+        let config = Config {
+            project_root: Some(root.path().to_path_buf()),
+            semantic_search: true,
+            ..Config::default()
+        };
         let ctx = AppContext::new(default_language_provider_factory(), config);
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         *ctx.semantic_index_status()

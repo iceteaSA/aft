@@ -1348,6 +1348,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_subc_bridge_test_inner<E, F, Fut, A>(
     name: &'static str,
     watchdog: Duration,

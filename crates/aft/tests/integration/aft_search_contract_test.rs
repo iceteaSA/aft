@@ -795,9 +795,10 @@ fn external_semantic_search_hides_drift_prose_and_refreshes_file_summary_snippet
     );
     assert_eq!(response["borrowed"], true);
     assert_eq!(response["semantic_status"], "ready");
-    assert!(response["drift_count"]
-        .as_u64()
-        .is_some_and(|count| count >= 1));
+    assert_eq!(
+        response["drift_count"], 0,
+        "borrowed requests no longer census the external corpus"
+    );
     let text = response["text"].as_str().expect("text");
     assert!(
         !text.contains("borrowed index"),

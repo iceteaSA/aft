@@ -883,6 +883,100 @@ struct WorktreeBridgeCacheEntry {
     git_common_dir: Option<PathBuf>,
 }
 
+pub(crate) const BORROWED_INDEX_CACHE_CAPACITY: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BorrowedIndexCacheKey {
+    canonical_root: PathBuf,
+    artifact: crate::readonly_artifacts::BorrowedArtifactGeneration,
+}
+
+#[derive(Clone, Debug)]
+enum BorrowedIndexCacheValue {
+    Search(crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>),
+    Semantic(crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>>),
+}
+
+#[derive(Debug, Default)]
+struct BorrowedIndexCache {
+    entries: VecDeque<(BorrowedIndexCacheKey, BorrowedIndexCacheValue)>,
+    resolved_roots: VecDeque<(PathBuf, GitEntrySignature)>,
+}
+
+impl BorrowedIndexCache {
+    fn search(
+        &mut self,
+        key: &BorrowedIndexCacheKey,
+    ) -> Option<crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>> {
+        let position = self.entries.iter().position(|(candidate, value)| {
+            candidate == key && matches!(value, BorrowedIndexCacheValue::Search(_))
+        })?;
+        let entry = self.entries.remove(position)?;
+        let BorrowedIndexCacheValue::Search(index) = &entry.1 else {
+            return None;
+        };
+        let index = index.clone();
+        self.entries.push_back(entry);
+        Some(index)
+    }
+
+    fn semantic(
+        &mut self,
+        key: &BorrowedIndexCacheKey,
+    ) -> Option<crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>>> {
+        let position = self.entries.iter().position(|(candidate, value)| {
+            candidate == key && matches!(value, BorrowedIndexCacheValue::Semantic(_))
+        })?;
+        let entry = self.entries.remove(position)?;
+        let BorrowedIndexCacheValue::Semantic(index) = &entry.1 else {
+            return None;
+        };
+        let index = index.clone();
+        self.entries.push_back(entry);
+        Some(index)
+    }
+
+    fn insert(&mut self, key: BorrowedIndexCacheKey, value: BorrowedIndexCacheValue) {
+        self.entries.retain(|(candidate, _)| {
+            candidate.canonical_root != key.canonical_root
+                || candidate.artifact.path != key.artifact.path
+        });
+        self.entries.push_back((key, value));
+        while self.entries.len() > BORROWED_INDEX_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    fn resolved_root(&mut self, requested_root: &Path) -> Option<PathBuf> {
+        let position = self
+            .resolved_roots
+            .iter()
+            .position(|(candidate, _)| candidate == requested_root)?;
+        let entry = self.resolved_roots.remove(position)?;
+        if entry.1 != git_entry_signature(requested_root) {
+            return None;
+        }
+        let root = entry.0.clone();
+        self.resolved_roots.push_back(entry);
+        Some(root)
+    }
+
+    fn remember_resolved_root(&mut self, root: PathBuf) {
+        self.resolved_roots
+            .retain(|(candidate, _)| candidate != &root);
+        let signature = git_entry_signature(&root);
+        self.resolved_roots.push_back((root, signature));
+        while self.resolved_roots.len() > BORROWED_INDEX_CACHE_CAPACITY {
+            self.resolved_roots.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.resolved_roots.clear();
+    }
+}
+
 fn git_entry_signature(project_root: &Path) -> GitEntrySignature {
     match std::fs::symlink_metadata(project_root.join(".git")) {
         Ok(metadata) => GitEntrySignature {
@@ -994,6 +1088,7 @@ pub struct AppContext {
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     artifact_cache_key_derivations: AtomicU64,
+    borrowed_index_cache: parking_lot::Mutex<BorrowedIndexCache>,
     /// Successful git worktree probes, keyed by canonical root and guarded by
     /// the root's `.git` entry shape and modification time.
     worktree_bridge_cache: parking_lot::Mutex<BTreeMap<PathBuf, WorktreeBridgeCacheEntry>>,
@@ -1220,6 +1315,7 @@ impl AppContext {
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
+            borrowed_index_cache: parking_lot::Mutex::new(BorrowedIndexCache::default()),
             worktree_bridge_cache: parking_lot::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             worktree_bridge_probe_spawns: AtomicU64::new(0),
@@ -1354,9 +1450,9 @@ impl AppContext {
         // as "building" is a permanent lie that keeps module health degraded
         // whenever any worktree is bound.
         let borrows_shared_artifacts = self.shared_artifacts_read_only.load(Ordering::SeqCst);
-        let search_index_status = if search_index.as_ref().is_some_and(|index| index.ready) {
-            "ready"
-        } else if borrows_shared_artifacts && config.search_index {
+        let search_index_status = if search_index.as_ref().is_some_and(|index| index.ready)
+            || (borrows_shared_artifacts && config.search_index)
+        {
             "ready"
         } else if config.search_index
             || search_index.as_ref().is_some()
@@ -2067,6 +2163,111 @@ impl AppContext {
     #[cfg(test)]
     pub fn artifact_cache_key_derivation_count_for_test(&self) -> u64 {
         self.artifact_cache_key_derivations.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn resolve_external_git_root(
+        &self,
+        project_root: &Path,
+        requested_path: &str,
+    ) -> Result<PathBuf, crate::readonly_artifacts::GitRootResolutionError> {
+        let raw_path = Path::new(requested_path);
+        let canonical_requested = if raw_path.is_absolute() {
+            std::fs::canonicalize(raw_path).ok()
+        } else {
+            None
+        };
+        if let Some(root) = canonical_requested
+            .as_deref()
+            .and_then(|root| self.borrowed_index_cache.lock().resolved_root(root))
+        {
+            return Ok(root);
+        }
+
+        let root = crate::readonly_artifacts::resolve_git_root_from_user_path(
+            project_root,
+            requested_path,
+        )?;
+        if canonical_requested.as_deref() == Some(root.as_path()) {
+            self.borrowed_index_cache
+                .lock()
+                .remember_resolved_root(root.clone());
+        }
+        Ok(root)
+    }
+
+    pub(crate) fn open_borrowed_search_index(
+        &self,
+        external_root: &Path,
+        storage_dir: Option<&Path>,
+    ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>> {
+        let canonical_root =
+            std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
+        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let Some(artifact) = crate::readonly_artifacts::search_index_artifact_generation_with_key(
+            &project_key,
+            storage_dir,
+        ) else {
+            return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
+        };
+        let key = BorrowedIndexCacheKey {
+            canonical_root: canonical_root.clone(),
+            artifact,
+        };
+        let mut cache = self.borrowed_index_cache.lock();
+        if let Some(index) = cache.search(&key) {
+            return index;
+        }
+
+        let opened = crate::readonly_artifacts::open_search_index_read_only_with_key(
+            &canonical_root,
+            storage_dir,
+            &project_key,
+        )
+        .map(Arc::new);
+        if !matches!(opened, crate::readonly_artifacts::ReadOnlyArtifact::Absent) {
+            cache.insert(key, BorrowedIndexCacheValue::Search(opened.clone()));
+        }
+        opened
+    }
+
+    pub(crate) fn open_borrowed_semantic_index(
+        &self,
+        external_root: &Path,
+        storage_dir: Option<&Path>,
+    ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>> {
+        let canonical_root =
+            std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
+        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let Some(artifact) = crate::readonly_artifacts::semantic_index_artifact_generation_with_key(
+            &project_key,
+            storage_dir,
+        ) else {
+            return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
+        };
+        let key = BorrowedIndexCacheKey {
+            canonical_root: canonical_root.clone(),
+            artifact,
+        };
+        let mut cache = self.borrowed_index_cache.lock();
+        if let Some(index) = cache.semantic(&key) {
+            return index;
+        }
+
+        let opened = crate::readonly_artifacts::open_semantic_index_read_only_with_key(
+            &canonical_root,
+            storage_dir,
+            &project_key,
+        )
+        .map(Arc::new);
+        if !matches!(opened, crate::readonly_artifacts::ReadOnlyArtifact::Absent) {
+            cache.insert(key, BorrowedIndexCacheValue::Semantic(opened.clone()));
+        }
+        opened
+    }
+
+    #[cfg(test)]
+    pub(crate) fn borrowed_index_cache_len_for_test(&self) -> usize {
+        self.borrowed_index_cache.lock().entries.len()
     }
 
     pub fn configure_generation(&self) -> u64 {
@@ -3743,6 +3944,7 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        self.borrowed_index_cache.lock().clear();
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         true

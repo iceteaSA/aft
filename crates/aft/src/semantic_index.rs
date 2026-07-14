@@ -2947,40 +2947,6 @@ impl SemanticIndex {
             .or(self.fingerprint.as_ref())
     }
 
-    pub(crate) fn indexed_file_metadata(&self) -> Vec<(PathBuf, SystemTime, u64, blake3::Hash)> {
-        if let Some(base) = &self.shared_base {
-            return base
-                .file_mtimes
-                .iter()
-                .filter_map(|(path, mtime)| {
-                    let size = base.file_sizes.get(path)?;
-                    let content_hash = base.file_hashes.get(path)?;
-                    Some((self.project_root.join(path), *mtime, *size, *content_hash))
-                })
-                .collect();
-        }
-        self.file_mtimes
-            .iter()
-            .filter_map(|(path, mtime)| {
-                let size = self.file_sizes.get(path)?;
-                let content_hash = self.file_hashes.get(path)?;
-                Some((path.clone(), *mtime, *size, *content_hash))
-            })
-            .collect()
-    }
-
-    pub(crate) fn indexed_file_paths(&self) -> HashSet<PathBuf> {
-        self.shared_base
-            .as_ref()
-            .map(|base| {
-                base.file_mtimes
-                    .keys()
-                    .map(|path| self.project_root.join(path))
-                    .collect()
-            })
-            .unwrap_or_else(|| self.file_mtimes.keys().cloned().collect())
-    }
-
     pub fn backend_label(&self) -> Option<&str> {
         self.fingerprint().map(|f| f.backend.as_str())
     }
