@@ -1539,6 +1539,26 @@ fn subc_bridge_stale_epoch_ingress_is_silent_and_preserves_route_state() {
 }
 
 #[test]
+fn subc_bridge_higher_epoch_routebind_implicitly_replaces_stale_install() {
+    run_subc_bridge_test(
+        "subc_bridge_higher_epoch_routebind_implicitly_replaces_stale_install",
+        Duration::from_secs(30),
+        drive_higher_epoch_routebind_replace_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_same_or_lower_epoch_routebind_preserves_current_install() {
+    run_subc_bridge_test(
+        "subc_bridge_same_or_lower_epoch_routebind_preserves_current_install",
+        Duration::from_secs(30),
+        drive_same_or_lower_epoch_routebind_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_l3_fanout_seq_ordering() {
     run_subc_bridge_test(
         "subc_bridge_l3_fanout_seq_ordering",
@@ -3485,6 +3505,186 @@ async fn drive_stale_epoch_ingress_daemon(input: FakeDaemonInput) {
         tool_response_json(&current)["transport_session"],
         "session-1"
     );
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_higher_epoch_routebind_replace_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        ..
+    } = open_fake_daemon_session(input).await;
+    const CHANNEL: u16 = 13;
+    const OLD_EPOCH: u32 = 1;
+    const NEW_EPOCH: u32 = 2;
+    const BG_CORR: u64 = 1302;
+
+    send_route_bind_with_harness_session_principal_and_doc_epoch(
+        &mut stream,
+        CHANNEL,
+        OLD_EPOCH,
+        1300,
+        &root1,
+        "opencode",
+        "implicit-replace-old",
+        Some(Principal::Direct),
+        minimal_bind_doc(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 1300).await;
+    send_tool_call_epoch(
+        &mut stream,
+        CHANNEL,
+        OLD_EPOCH,
+        1301,
+        "subc_test_echo_session",
+        json!({}),
+    )
+    .await;
+    let old_response = read_frame_timeout(&mut stream, "old route tool response").await;
+    assert_eq!(
+        tool_response_json(&old_response)["transport_session"],
+        "implicit-replace-old"
+    );
+    send_bg_events_subscribe(&mut stream, CHANNEL, BG_CORR).await;
+
+    send_route_bind_with_harness_session_principal_and_doc_epoch(
+        &mut stream,
+        CHANNEL,
+        NEW_EPOCH,
+        1303,
+        &root2,
+        "opencode",
+        "implicit-replace-new",
+        Some(Principal::Direct),
+        minimal_bind_doc(),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_bind_ack = false;
+    let mut saw_old_subscription_end = false;
+    while !(saw_bind_ack && saw_old_subscription_end) {
+        let frame = read_any_frame_until(&mut stream, deadline, "implicit replacement teardown")
+            .await
+            .expect("implicit replacement should ack and end the old subscription");
+        assert_ne!(
+            frame.header.ty,
+            FrameType::Goodbye,
+            "implicit replacement must not emit a route Goodbye"
+        );
+        match frame.header.ty {
+            FrameType::Response if frame.header.channel == 0 && frame.header.corr == 1303 => {
+                let ack: ModuleControlResponse =
+                    serde_json::from_slice(&frame.body).expect("RouteBindAck body");
+                assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+                saw_bind_ack = true;
+            }
+            FrameType::StreamEnd
+                if frame.header.channel == CHANNEL
+                    && frame.header.epoch == OLD_EPOCH
+                    && frame.header.corr == BG_CORR =>
+            {
+                saw_old_subscription_end = true;
+            }
+            FrameType::StreamData | FrameType::Push => {}
+            other => panic!("unexpected frame during implicit replacement: {other:?}"),
+        }
+    }
+
+    send_tool_call_epoch(
+        &mut stream,
+        CHANNEL,
+        OLD_EPOCH,
+        1304,
+        "subc_test_echo_session",
+        json!({}),
+    )
+    .await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(150),
+        "old generation after implicit replacement",
+    )
+    .await;
+
+    send_tool_call_epoch(
+        &mut stream,
+        CHANNEL,
+        NEW_EPOCH,
+        1305,
+        "subc_test_echo_session",
+        json!({}),
+    )
+    .await;
+    let new_response = read_frame_timeout(&mut stream, "replacement route tool response").await;
+    assert_eq!(
+        (new_response.header.channel, new_response.header.epoch),
+        (CHANNEL, NEW_EPOCH)
+    );
+    assert_eq!(
+        tool_response_json(&new_response)["transport_session"],
+        "implicit-replace-new"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_same_or_lower_epoch_routebind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    const CHANNEL: u16 = 14;
+    const INSTALLED_EPOCH: u32 = 2;
+
+    send_route_bind_with_harness_session_principal_and_doc_epoch(
+        &mut stream,
+        CHANNEL,
+        INSTALLED_EPOCH,
+        1400,
+        &root1,
+        "opencode",
+        "epoch-negative-current",
+        Some(Principal::Direct),
+        minimal_bind_doc(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 1400).await;
+    for (epoch, corr) in [(INSTALLED_EPOCH, 1401), (INSTALLED_EPOCH - 1, 1402)] {
+        send_route_bind_with_harness_session_principal_and_doc_epoch(
+            &mut stream,
+            CHANNEL,
+            epoch,
+            corr,
+            &root1,
+            "opencode",
+            "epoch-negative-rejected",
+            Some(Principal::Direct),
+            minimal_bind_doc(),
+        )
+        .await;
+        expect_route_bind_error(&mut stream, corr, "config_divergence").await;
+    }
+
+    send_tool_call_epoch(
+        &mut stream,
+        CHANNEL,
+        INSTALLED_EPOCH,
+        1403,
+        "subc_test_echo_session",
+        json!({}),
+    )
+    .await;
+    let current = read_frame_timeout(&mut stream, "current route after rejected rebinds").await;
+    assert_eq!(
+        (current.header.channel, current.header.epoch),
+        (CHANNEL, INSTALLED_EPOCH)
+    );
+    assert_eq!(
+        tool_response_json(&current)["transport_session"],
+        "epoch-negative-current"
+    );
+
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -6574,6 +6774,17 @@ async fn send_tool_call(
     name: &str,
     arguments: Value,
 ) {
+    send_tool_call_epoch(stream, channel, 1, corr, name, arguments).await;
+}
+
+async fn send_tool_call_epoch(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+) {
     let body = json!({ "name": name, "arguments": arguments });
     send_frame(
         stream,
@@ -6581,7 +6792,7 @@ async fn send_tool_call(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             channel,
-            1,
+            epoch,
             corr,
             serde_json::to_vec(&body).expect("tool call body"),
         )

@@ -144,6 +144,7 @@ impl StormScale {
 #[derive(Debug)]
 struct RouteSpec {
     channel: u16,
+    epoch: u32,
     root_index: usize,
     session: String,
     next_bind_at: Instant,
@@ -1033,6 +1034,17 @@ fn subc_egress_hol_measurement() {
     );
 }
 
+#[test]
+fn subc_storm_same_or_lower_epoch_rebind_is_rejected() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "subc_storm_same_or_lower_epoch_rebind_is_rejected",
+        Duration::from_secs(30),
+        drive_epoch_rebind_rejection_daemon,
+        |_, _, _| {},
+        storm_dispatch,
+    );
+}
+
 async fn drive_egress_measurement_daemon(input: FakeDaemonInput, config: EgressMeasureConfig) {
     let session = subc_bridge_test::open_fake_daemon_session(input).await;
     let mut stream = session.stream;
@@ -1277,9 +1289,10 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
 
     for route in &routes {
         corr += 1;
-        send_bind(
+        send_bind_epoch(
             &tx,
             route.channel,
+            route.epoch,
             corr,
             &roots[route.root_index],
             &route.session,
@@ -1314,15 +1327,20 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
                 .any(|bind| bind.route == route.channel);
             if now >= route.next_bind_at && !route_has_pending_bind {
                 route.bind_count += 1;
+                route.epoch = route
+                    .epoch
+                    .checked_add(1)
+                    .expect("storm route epoch should not overflow");
                 corr += 1;
                 let semantic_enabled = semantic_roots.contains(&route.root_index);
                 let config_change = route.bind_count % 10 == 0 && !semantic_enabled;
                 if !semantic_enabled {
                     touch_between_rebinds(&roots[route.root_index], route.bind_count);
                 }
-                send_bind(
+                send_bind_epoch(
                     &tx,
                     route.channel,
+                    route.epoch,
                     corr,
                     &roots[route.root_index],
                     &route.session,
@@ -1681,6 +1699,56 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
     send_goodbye_and_wait(&tx).await;
 }
 
+async fn drive_epoch_rebind_rejection_daemon(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let (tx, mut rx) = start_io(session.stream);
+    let root = session.root1;
+    let mut corr = 5_000_u64;
+    const CHANNEL: u16 = 9;
+    const INSTALLED_EPOCH: u32 = 2;
+
+    send_bind_epoch(
+        &tx,
+        CHANNEL,
+        INSTALLED_EPOCH,
+        corr,
+        &root,
+        "storm-epoch-current",
+        storm_project_config(false, false, false, 0),
+    );
+    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+    for epoch in [INSTALLED_EPOCH, INSTALLED_EPOCH - 1] {
+        corr += 1;
+        send_bind_epoch(
+            &tx,
+            CHANNEL,
+            epoch,
+            corr,
+            &root,
+            "storm-epoch-rejected",
+            storm_project_config(false, false, false, 0),
+        );
+        let error = expect_error(&mut rx, corr, TOOL_BOUND).await;
+        assert_eq!(
+            error.get("code").and_then(Value::as_str),
+            Some("config_divergence")
+        );
+    }
+
+    corr += 1;
+    send_tool_epoch(
+        &tx,
+        CHANNEL,
+        INSTALLED_EPOCH,
+        corr,
+        "echo",
+        json!({ "case": "fast" }),
+    );
+    let response = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    assert_eq!(response["success"].as_bool(), Some(true));
+    send_goodbye_and_wait(&tx).await;
+}
+
 async fn drive_route_bind_deadline_daemon(input: FakeDaemonInput) {
     let session = subc_bridge_test::open_fake_daemon_session(input).await;
     let (tx, mut rx) = start_io(session.stream);
@@ -1751,6 +1819,7 @@ fn build_route_specs(scale: &StormScale, roots: &[PathBuf]) -> Vec<RouteSpec> {
             let channel = (routes.len() + 1) as u16;
             routes.push(RouteSpec {
                 channel,
+                epoch: 1,
                 root_index,
                 session: format!("storm-r{root_index}-s{session_index}"),
                 next_bind_at: now + Duration::from_millis(1_300 + u64::from(channel % 5) * 80),
@@ -2052,16 +2121,18 @@ fn send_interactive_tool(
     pending_completions: &mut HashMap<String, CompletionTiming>,
 ) {
     match route.tool_count % 4 {
-        0 => send_tool(
+        0 => send_tool_epoch(
             tx,
             route.channel,
+            route.epoch,
             corr,
             "read",
             json!({ "filePath": "README.md", "limit": 20 }),
         ),
-        1 => send_tool(
+        1 => send_tool_epoch(
             tx,
             route.channel,
+            route.epoch,
             corr,
             "write",
             json!({
@@ -2077,9 +2148,10 @@ fn send_interactive_tool(
                     started_at: Instant::now(),
                 },
             );
-            send_tool(
+            send_tool_epoch(
                 tx,
                 route.channel,
+                route.epoch,
                 corr,
                 "subc_test_emit_bash_completed",
                 json!({ "task_id": task_id, "session_id": route.session }),
@@ -2087,9 +2159,10 @@ fn send_interactive_tool(
         }
         _ => {
             let _ = root;
-            send_tool(
+            send_tool_epoch(
                 tx,
                 route.channel,
+                route.epoch,
                 corr,
                 "subc_test_enqueue_watcher_event",
                 json!({}),
@@ -2306,12 +2379,23 @@ fn send_tool(
     name: &str,
     arguments: Value,
 ) {
+    send_tool_epoch(tx, channel, 1, corr, name, arguments);
+}
+
+fn send_tool_epoch(
+    tx: &mpsc::UnboundedSender<Frame>,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+) {
     tx.send(
         Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             channel,
-            1,
+            epoch,
             corr,
             serde_json::to_vec(&json!({ "name": name, "arguments": arguments }))
                 .expect("tool body"),

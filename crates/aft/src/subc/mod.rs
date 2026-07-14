@@ -1269,6 +1269,97 @@ fn end_bg_subscription(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn teardown_installed_route(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    channel: RouteChannel,
+    cancellation_reason: &str,
+    installed_route_epochs: &mut HashMap<u16, u32>,
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    retry_buffer: &mut RetryBuffer,
+    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    shutdown: &Arc<Notify>,
+) -> Result<(), SubcError> {
+    remove_installed_route(installed_route_epochs, channel);
+    end_bg_subscription(
+        tx,
+        metrics,
+        bg_subs,
+        bg_sub_by_session,
+        bg_wake_pending,
+        channel,
+        routes.get(&channel),
+    );
+    settle_pending_bash_asks_for_route(
+        tx,
+        pending_bash_asks,
+        channel,
+        routes,
+        live_roots,
+        route_bash_cancels,
+        shutdown,
+        metrics,
+    )
+    .await?;
+    if let Some(cancel) = route_bash_cancels.remove(&channel) {
+        cancel.token.cancel();
+    }
+    if let Some(pending) = pending_binds.get_mut(&channel) {
+        pending.cancelled = true;
+        log::debug!(
+            "subc attach: cancelled pending RouteBind for route {} on {cancellation_reason}",
+            channel.channel
+        );
+    }
+    let migrated = push::migrate_retry_buffer_to_push_buffer(retry_buffer, channel, push_buffer);
+    if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
+        if migrated > 0 {
+            log::debug!(
+                "subc attach: migrated {migrated} retry-buffered reliable Push frame(s) from route {} into detach replay",
+                channel.channel
+            );
+        }
+        if let Some(meta) = live_roots.get_mut(&identity.root) {
+            let idle_for = meta.last_touched.elapsed();
+            meta.touch();
+            log::debug!(
+                "subc attach: route {} torn down for root {} harness {} session {} (last touched {:?} ago)",
+                channel.channel,
+                identity.root.as_path().display(),
+                identity.harness,
+                identity.session,
+                idle_for
+            );
+        } else {
+            log::debug!(
+                "subc attach: route {} torn down for root {} harness {} session {}",
+                channel.channel,
+                identity.root.as_path().display(),
+                identity.harness,
+                identity.session
+            );
+        }
+    } else {
+        if migrated > 0 {
+            log::debug!(
+                "subc attach: migrated {migrated} retry-buffered reliable Push frame(s) from unbound route {} into detach replay",
+                channel.channel
+            );
+        }
+        log::debug!("subc attach: unbound route {} torn down", channel.channel);
+    }
+    Ok(())
+}
+
 fn remember_session_identity(
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     identity: &RouteIdentity,
@@ -1843,80 +1934,28 @@ where
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
-                        remove_installed_route(&mut installed_route_epochs, channel);
-                        end_bg_subscription(
+                        if let Err(error) = teardown_installed_route(
                             &writer_tx,
                             &dispatch_path_metrics,
+                            channel,
+                            "Goodbye",
+                            &mut installed_route_epochs,
+                            &mut routes,
+                            &mut root_channels,
                             &mut bg_subs,
                             &mut bg_sub_by_session,
                             &mut bg_wake_pending,
-                            channel,
-                            routes.get(&channel),
-                        );
-                        if let Err(error) = settle_pending_bash_asks_for_route(
-                            &writer_tx,
                             &mut pending_bash_asks,
-                            channel,
-                            &routes,
                             &mut live_roots,
                             &mut route_bash_cancels,
+                            &mut pending_binds,
+                            &mut retry_buffer,
+                            &mut push_buffer,
                             &shutdown,
-                            &dispatch_path_metrics,
                         )
                         .await
                         {
                             break Err(error);
-                        }
-                        if let Some(cancel) = route_bash_cancels.remove(&channel) {
-                            cancel.token.cancel();
-                        }
-                        if let Some(pending) = pending_binds.get_mut(&channel) {
-                            pending.cancelled = true;
-                            log::debug!(
-                                "subc attach: cancelled pending RouteBind for route {} on Goodbye",
-                                frame.header.channel
-                            );
-                        }
-                        let migrated = push::migrate_retry_buffer_to_push_buffer(
-                            &mut retry_buffer,
-                            channel,
-                            &mut push_buffer,
-                        );
-                        if let Some(identity) = remove_route_channel(&mut routes, &mut root_channels, channel) {
-                            if migrated > 0 {
-                                log::debug!(
-                                    "subc attach: migrated {migrated} retry-buffered reliable Push frame(s) from route {} into detach replay",
-                                    frame.header.channel
-                                );
-                            }
-                            if let Some(meta) = live_roots.get_mut(&identity.root) {
-                                let idle_for = meta.last_touched.elapsed();
-                                meta.touch();
-                                log::debug!(
-                                    "subc attach: route {} torn down for root {} harness {} session {} (last touched {:?} ago)",
-                                    frame.header.channel,
-                                    identity.root.as_path().display(),
-                                    identity.harness,
-                                    identity.session,
-                                    idle_for
-                                );
-                            } else {
-                                log::debug!(
-                                    "subc attach: route {} torn down for root {} harness {} session {}",
-                                    frame.header.channel,
-                                    identity.root.as_path().display(),
-                                    identity.harness,
-                                    identity.session
-                                );
-                            }
-                        } else {
-                            if migrated > 0 {
-                                log::debug!(
-                                    "subc attach: migrated {migrated} retry-buffered reliable Push frame(s) from unbound route {} into detach replay",
-                                    frame.header.channel
-                                );
-                            }
-                            log::debug!("subc attach: unbound route {} torn down", frame.header.channel);
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
@@ -1948,6 +1987,16 @@ where
                             &mut live_roots,
                             &mut pending_binds,
                             &mut installed_route_epochs,
+                            &mut routes,
+                            &mut root_channels,
+                            &mut bg_subs,
+                            &mut bg_sub_by_session,
+                            &mut bg_wake_pending,
+                            &mut pending_bash_asks,
+                            &mut route_bash_cancels,
+                            &mut retry_buffer,
+                            &mut push_buffer,
+                            &shutdown,
                             &control_completion_tx,
                             &dispatch_path_metrics,
                             &push_senders,
@@ -2703,6 +2752,7 @@ async fn expire_overdue_route_binds(
 /// still reconciles the route's RootConfig through the executor's Mutating lane
 /// and resolves completion on a loop-owned control-completion channel so slow
 /// configure jobs do not block the transport loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_control_request(
     tx: &WriterSender,
     frame: &Frame,
@@ -2711,6 +2761,16 @@ async fn handle_control_request(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    retry_buffer: &mut RetryBuffer,
+    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    shutdown: &Arc<Notify>,
     control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
     push_senders: &PushSenders,
@@ -2729,15 +2789,48 @@ async fn handle_control_request(
             consumer_capabilities,
         } => {
             let route_id = route_key(route_channel, epoch);
-            if epoch == 0 || installed_route_epochs.contains_key(&route_channel) {
+            if epoch == 0 {
                 return send_route_bind_error(
                     tx,
                     frame,
                     "config_divergence",
-                    "route bind uses an invalid or already-installed channel generation",
+                    "route bind uses an invalid channel generation",
                     metrics,
                 )
                 .await;
+            }
+            if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
+                if installed_epoch >= epoch {
+                    return send_route_bind_error(
+                        tx,
+                        frame,
+                        "config_divergence",
+                        "route bind generation is not newer than the installed generation",
+                        metrics,
+                    )
+                    .await;
+                }
+
+                teardown_installed_route(
+                    tx,
+                    metrics,
+                    route_key(route_channel, installed_epoch),
+                    "higher-epoch RouteBind",
+                    installed_route_epochs,
+                    routes,
+                    root_channels,
+                    bg_subs,
+                    bg_sub_by_session,
+                    bg_wake_pending,
+                    pending_bash_asks,
+                    live_roots,
+                    route_bash_cancels,
+                    pending_binds,
+                    retry_buffer,
+                    push_buffer,
+                    shutdown,
+                )
+                .await?;
             }
             if pending_binds.contains_key(&route_id) {
                 return send_route_bind_error(
