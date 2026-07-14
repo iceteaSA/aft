@@ -4274,6 +4274,20 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
             .expect("route 10 goodbye"),
     )
     .await;
+    // Ping/Pong barrier: the slow-configure release below travels through test
+    // state, not the socket, so without this the configure completion can reach
+    // the loop before the Goodbye is decoded (reader starvation under load) and
+    // the bind acks before it is cancelled. Frames on one connection process in
+    // socket order, so the Pong proves the Goodbye was consumed first.
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 1109, Vec::new())
+            .expect("goodbye barrier ping"),
+    )
+    .await;
+    let pong = read_frame_timeout(&mut stream, "goodbye barrier pong").await;
+    assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
+    assert_eq!(pong.header.corr, 1109);
     state.release_slow_configures();
     state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
     tokio::time::sleep(Duration::from_millis(150)).await;
