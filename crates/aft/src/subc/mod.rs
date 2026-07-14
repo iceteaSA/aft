@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -54,10 +55,13 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
-/// Handshake budget. subc binds-before-spawn, so a reachable daemon authenticates
-/// well within this; an unreachable/socket-stale daemon fails loud rather than
-/// silently downgrading to standalone (the --subc contract).
+/// Per-attempt handshake deadline. The initial attach loop has a separate total
+/// budget so a stalled peer cannot consume an unbounded supervisor launch window.
 const AUTH_DEADLINE: Duration = Duration::from_secs(5);
+const ATTACH_RETRY_BUDGET: Duration = Duration::from_secs(60);
+const ATTACH_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const ATTACH_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(5);
+const ATTACH_RETRY_JITTER_PERCENT: u64 = 20;
 
 /// Correlation id for the initial ModuleHello (channel 0).
 const HELLO_CORR: u64 = 1;
@@ -1513,9 +1517,156 @@ pub fn run_subc_mode_for_test(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachErrorClass {
+    Transient,
+    Permanent,
+}
+
+impl fmt::Display for AttachErrorClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transient => f.write_str("transient"),
+            Self::Permanent => f.write_str("permanent"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AttachRetryPolicy {
+    budget: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    jitter_percent: u64,
+}
+
+const ATTACH_RETRY_POLICY: AttachRetryPolicy = AttachRetryPolicy {
+    budget: ATTACH_RETRY_BUDGET,
+    initial_backoff: ATTACH_RETRY_INITIAL_BACKOFF,
+    max_backoff: ATTACH_RETRY_MAX_BACKOFF,
+    jitter_percent: ATTACH_RETRY_JITTER_PERCENT,
+};
+
+/// Retry only failures that can be caused by a daemon bounce or an interrupted
+/// handshake. Protocol and credential failures are permanent for this process.
+fn classify_attach_error(error: &SubcError) -> AttachErrorClass {
+    let transient = match error {
+        SubcError::Connect { source, .. } => is_transient_attach_io(source.kind()),
+        SubcError::Auth { source, .. } => match source {
+            subc_transport::AuthError::Timeout { .. }
+            | subc_transport::AuthError::UnexpectedEof { .. } => true,
+            subc_transport::AuthError::Io { source, .. } => is_transient_attach_io(source.kind()),
+            _ => false,
+        },
+        _ => false,
+    };
+    if transient {
+        AttachErrorClass::Transient
+    } else {
+        AttachErrorClass::Permanent
+    }
+}
+
+fn is_transient_attach_io(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// Read the connection file → resolve the first endpoint → TCP connect → HMAC
-/// handshake. Mirrors the reference `fake-aft-stub::connect_to_subc`.
+/// handshake. Transient initial-attach failures retry on fresh sockets and reread
+/// the file so a daemon bounce can publish a new endpoint or authentication key.
 async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStream, SubcError> {
+    connect_and_authenticate_with_policy(connection_file_path, ATTACH_RETRY_POLICY).await
+}
+
+async fn connect_and_authenticate_with_policy(
+    connection_file_path: &Path,
+    policy: AttachRetryPolicy,
+) -> Result<TcpStream, SubcError> {
+    let started_at = Instant::now();
+    let deadline = started_at + policy.budget;
+    let mut attempt = 0_u32;
+    let mut backoff = policy.initial_backoff;
+    let mut history = Vec::new();
+
+    loop {
+        attempt = attempt.saturating_add(1);
+        let error = match connect_and_authenticate_once(connection_file_path, deadline).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => error,
+        };
+        let class = classify_attach_error(&error);
+        let error_text = error.to_string().lines().collect::<Vec<_>>().join(" ");
+        history.push(format!("attempt {attempt} [{class}]: {error_text}"));
+
+        if class == AttachErrorClass::Permanent {
+            log_attach_final_failure(started_at.elapsed(), &history);
+            return Err(error);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            log_attach_final_failure(started_at.elapsed(), &history);
+            return Err(error);
+        }
+
+        let delay = jittered_attach_delay(backoff, policy.jitter_percent, attempt).min(remaining);
+        log::info!(
+            "subc attach retry: attempt {attempt} failed; error_class={class}; error={error_text}; next_delay={delay:?}"
+        );
+        tokio::time::sleep(delay).await;
+
+        if Instant::now() >= deadline {
+            log_attach_final_failure(started_at.elapsed(), &history);
+            return Err(error);
+        }
+        backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+    }
+}
+
+fn jittered_attach_delay(base: Duration, jitter_percent: u64, attempt: u32) -> Duration {
+    let jitter_percent = jitter_percent.min(100);
+    if jitter_percent == 0 {
+        return base;
+    }
+
+    let mut random_bytes = [0_u8; 8];
+    let random = if getrandom::fill(&mut random_bytes).is_ok() {
+        u64::from_le_bytes(random_bytes)
+    } else {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        u64::from(timestamp) ^ u64::from(attempt)
+    };
+    let span = jitter_percent.saturating_mul(2).saturating_add(1);
+    let multiplier_percent = 100 - jitter_percent + random % span;
+    let base_millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(base_millis.saturating_mul(multiplier_percent) / 100)
+}
+
+fn log_attach_final_failure(elapsed: Duration, history: &[String]) {
+    log::error!(
+        "subc initial attach failed after {} attempt(s) in {elapsed:?}; attempt history: {}",
+        history.len(),
+        history.join(" | ")
+    );
+}
+
+async fn connect_and_authenticate_once(
+    connection_file_path: &Path,
+    deadline: Instant,
+) -> Result<TcpStream, SubcError> {
+    // This read intentionally lives inside the per-attempt function. The daemon
+    // publishes connection files atomically and may change both port and key.
     let conn = connection_file::read(connection_file_path).map_err(|source| {
         SubcError::ConnectionFile {
             path: connection_file_path.to_path_buf(),
@@ -1539,8 +1690,16 @@ async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStre
         })?;
     let addr = SocketAddr::new(ip, endpoint.port);
 
-    let mut stream = TcpStream::connect(addr)
+    let connect_budget = deadline.saturating_duration_since(Instant::now());
+    let mut stream = tokio::time::timeout(connect_budget, TcpStream::connect(addr))
         .await
+        .map_err(|_| SubcError::Connect {
+            endpoint: endpoint_label.clone(),
+            source: io::Error::new(
+                io::ErrorKind::TimedOut,
+                "initial subc attach retry budget elapsed during TCP connect",
+            ),
+        })?
         .map_err(|source| SubcError::Connect {
             endpoint: endpoint_label.clone(),
             source,
@@ -1552,7 +1711,8 @@ async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStre
             source,
         })?;
 
-    authenticate_client(&mut stream, &conn, AUTH_DEADLINE)
+    let auth_budget = AUTH_DEADLINE.min(deadline.saturating_duration_since(Instant::now()));
+    authenticate_client(&mut stream, &conn, auth_budget)
         .await
         .map_err(|source| SubcError::Auth {
             endpoint: endpoint_label,
@@ -3863,6 +4023,141 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{completion_frame, test_ctx, test_root};
     use super::*;
+
+    fn attach_error(kind: io::ErrorKind) -> SubcError {
+        SubcError::Connect {
+            endpoint: "127.0.0.1:1".to_string(),
+            source: io::Error::new(kind, "constructed attach failure"),
+        }
+    }
+
+    fn auth_io_error(kind: io::ErrorKind) -> SubcError {
+        SubcError::Auth {
+            endpoint: "127.0.0.1:1".to_string(),
+            source: subc_transport::AuthError::Io {
+                stage: subc_transport::AuthStage::ServerProof,
+                source: io::Error::new(kind, "constructed auth failure"),
+            },
+        }
+    }
+
+    #[test]
+    fn initial_attach_error_classifier_distinguishes_transient_and_permanent_failures() {
+        let transient_errors = vec![
+            attach_error(io::ErrorKind::ConnectionRefused),
+            attach_error(io::ErrorKind::TimedOut),
+            attach_error(io::ErrorKind::ConnectionReset),
+            auth_io_error(io::ErrorKind::ConnectionAborted),
+            auth_io_error(io::ErrorKind::BrokenPipe),
+            SubcError::Auth {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: subc_transport::AuthError::UnexpectedEof {
+                    stage: subc_transport::AuthStage::ServerProof,
+                    expected: 4,
+                    actual: 0,
+                },
+            },
+            SubcError::Auth {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: subc_transport::AuthError::Timeout {
+                    stage: subc_transport::AuthStage::ServerProof,
+                    deadline: AUTH_DEADLINE,
+                },
+            },
+        ];
+        for error in &transient_errors {
+            assert_eq!(
+                classify_attach_error(error),
+                AttachErrorClass::Transient,
+                "expected transient: {error}"
+            );
+        }
+
+        let permanent_errors = vec![
+            attach_error(io::ErrorKind::PermissionDenied),
+            auth_io_error(io::ErrorKind::InvalidData),
+            SubcError::Auth {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: subc_transport::AuthError::InvalidServerProof,
+            },
+            SubcError::Auth {
+                endpoint: "127.0.0.1:1".to_string(),
+                source: subc_transport::AuthError::DaemonIdMismatch,
+            },
+            SubcError::ConnectionFile {
+                path: PathBuf::from("subc-connection.json"),
+                source: subc_transport::ConnectionFileError::Invalid {
+                    reason: "constructed invalid file".to_string(),
+                },
+            },
+            SubcError::NoEndpoint {
+                path: PathBuf::from("subc-connection.json"),
+            },
+            SubcError::InvalidEndpoint {
+                path: PathBuf::from("subc-connection.json"),
+                endpoint: "not-an-ip:1234".to_string(),
+            },
+        ];
+        for error in &permanent_errors {
+            assert_eq!(
+                classify_attach_error(error),
+                AttachErrorClass::Permanent,
+                "expected permanent: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_attach_unreachable_endpoint_retries_until_budget_then_fails_loud() {
+        let conn_dir = tempfile::tempdir().expect("connection tempdir");
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let port = listener.local_addr().expect("reserved addr").port();
+        drop(listener);
+        connection_file::write_atomic(
+            &conn_path,
+            &connection_file::ConnectionInfo {
+                schema: connection_file::SCHEMA_VERSION,
+                endpoints: vec![connection_file::Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                }],
+                key: vec![0x42; subc_transport::KEY_LEN],
+                daemon_id: [0x24; subc_transport::DAEMON_ID_LEN],
+                pid: std::process::id(),
+                daemon_ver: "subc-test".to_string(),
+            },
+        )
+        .expect("write connection file");
+
+        let policy = AttachRetryPolicy {
+            budget: Duration::from_millis(40),
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(10),
+            jitter_percent: 0,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let started_at = Instant::now();
+        let result = runtime.block_on(connect_and_authenticate_with_policy(&conn_path, policy));
+        let elapsed = started_at.elapsed();
+        let error = match result {
+            Ok(_) => panic!("unreachable endpoint unexpectedly attached"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, SubcError::Connect { .. }), "{error}");
+        assert!(
+            elapsed >= Duration::from_millis(35),
+            "retry budget ended too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "retry budget was not bounded: {elapsed:?}"
+        );
+    }
 
     fn due_maintenance_jobs_without_actor_context(
         live_roots: &mut HashMap<ProjectRootId, RootMeta>,

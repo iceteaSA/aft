@@ -19,7 +19,7 @@ use aft::protocol::{
     BashCompletedFrame, BashLongRunningFrame, ConfigureWarningsFrame, PushFrame, RawRequest,
     Response, StatusChangedFrame,
 };
-use aft::subc::{run_subc_mode, run_subc_mode_for_test};
+use aft::subc::{run_subc_mode, run_subc_mode_for_test, SubcError};
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
@@ -30,6 +30,7 @@ use subc_protocol::{
 };
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 use subc_transport::{authenticate_server, read_frame, write_frame};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
 static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
@@ -49,6 +50,13 @@ pub(super) struct FakeDaemonInput {
     pub(super) state: Arc<BridgeState>,
     pub(super) executor: Arc<Executor>,
     pub(super) user_config_path: std::path::PathBuf,
+}
+
+struct InitialAttachInput {
+    listener: TcpListener,
+    connection_file_path: std::path::PathBuf,
+    key: Vec<u8>,
+    daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
 }
 
 pub(super) struct FakeDaemonSession {
@@ -1449,6 +1457,280 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     run_result.expect("subc mode exits cleanly");
     join_result.expect("fake daemon joins");
     after(&state, &executor_for_check, &roots);
+}
+
+fn initial_attach_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
+    Response::error(
+        req.id,
+        "unexpected_attach_test_dispatch",
+        "initial attach test must not dispatch tool calls",
+    )
+}
+
+fn run_initial_attach_test<F, Fut>(
+    name: &'static str,
+    watchdog: Duration,
+    driver: F,
+) -> (Result<(), SubcError>, Duration)
+where
+    F: FnOnce(InitialAttachInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let _serial = bridge_test_serial_guard();
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn_path = conn_dir.path().join("subc-connection.json");
+    let user_config_path = storage.path().join("user-aft.jsonc");
+
+    let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    std_listener
+        .set_nonblocking(true)
+        .expect("set fake daemon nonblocking");
+    let port = std_listener.local_addr().expect("fake daemon addr").port();
+    let key = vec![0x42; subc_transport::KEY_LEN];
+    let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+    connection_file::write_atomic(
+        &conn_path,
+        &ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+            }],
+            key: key.clone(),
+            daemon_id,
+            pid: std::process::id(),
+            daemon_ver: "subc-test".to_string(),
+        },
+    )
+    .expect("write connection file");
+
+    let conn_path_for_daemon = conn_path.clone();
+    let key_for_daemon = key.clone();
+    let daemon = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fake daemon runtime");
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(std_listener).expect("tokio listener");
+            tokio::time::timeout(
+                watchdog,
+                driver(InitialAttachInput {
+                    listener,
+                    connection_file_path: conn_path_for_daemon,
+                    key: key_for_daemon,
+                    daemon_id,
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name} fake daemon watchdog"));
+        });
+    });
+
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        },
+    ));
+    let executor = Arc::new(Executor::with_config(bridge_executor_config()));
+    let started_at = Instant::now();
+    let result = run_subc_mode_for_test(
+        &conn_path,
+        ctx,
+        executor,
+        initial_attach_dispatch,
+        Some(user_config_path),
+    );
+    let elapsed = started_at.elapsed();
+    daemon.join().expect("fake daemon joins");
+    (result, elapsed)
+}
+
+async fn accept_client_hello_then_close(listener: &TcpListener) {
+    let (mut stream, _) = listener.accept().await.expect("accept aft client");
+    let mut len_bytes = [0_u8; 4];
+    stream
+        .read_exact(&mut len_bytes)
+        .await
+        .expect("read ClientHello length");
+    let len = u32::from_le_bytes(len_bytes);
+    assert!(
+        len <= subc_transport::MAX_AUTH_MESSAGE_LEN,
+        "ClientHello exceeds auth cap: {len}"
+    );
+    let mut body = vec![0_u8; len as usize];
+    stream
+        .read_exact(&mut body)
+        .await
+        .expect("read ClientHello body");
+    serde_json::from_slice::<subc_transport::ClientHello>(&body).expect("decode ClientHello");
+    drop(stream);
+}
+
+async fn complete_initial_attach(
+    listener: &TcpListener,
+    key: &[u8],
+    daemon_id: &[u8; subc_transport::DAEMON_ID_LEN],
+) {
+    let (mut stream, _) = listener.accept().await.expect("accept aft client");
+    authenticate_server(
+        &mut stream,
+        key,
+        daemon_id,
+        "subc-test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("authenticate aft client");
+
+    let hello = read_any_frame_timeout(&mut stream, "ModuleHello").await;
+    assert_eq!(hello.header.ty, FrameType::Hello);
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            hello.header.corr,
+            serde_json::to_vec(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: Vec::new(),
+                subc_capabilities: Vec::new(),
+                storage: None,
+            })
+            .expect("hello ack body"),
+        )
+        .expect("hello ack frame"),
+    )
+    .await;
+    send_connection_goodbye(&mut stream).await;
+}
+
+#[test]
+fn subc_initial_attach_retries_mid_handshake_closes_then_succeeds() {
+    let (result, elapsed) = run_initial_attach_test(
+        "subc_initial_attach_retries_mid_handshake_closes_then_succeeds",
+        Duration::from_secs(10),
+        |input| async move {
+            accept_client_hello_then_close(&input.listener).await;
+            accept_client_hello_then_close(&input.listener).await;
+            complete_initial_attach(&input.listener, &input.key, &input.daemon_id).await;
+        },
+    );
+
+    result.expect("third initial attach attempt succeeds");
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "two exponential backoffs completed too quickly: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "initial attach retry took too long: {elapsed:?}"
+    );
+}
+
+#[test]
+fn subc_initial_attach_definitive_auth_rejection_fails_immediately() {
+    let (result, elapsed) = run_initial_attach_test(
+        "subc_initial_attach_definitive_auth_rejection_fails_immediately",
+        Duration::from_secs(10),
+        |input| async move {
+            let (mut stream, _) = input.listener.accept().await.expect("accept aft client");
+            let mut rejected_daemon_id = input.daemon_id;
+            rejected_daemon_id[0] ^= 0xff;
+            let rejection = authenticate_server(
+                &mut stream,
+                &input.key,
+                &rejected_daemon_id,
+                "subc-test-rejected",
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(
+                rejection.is_err(),
+                "client unexpectedly accepted wrong daemon id"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), input.listener.accept())
+                    .await
+                    .is_err(),
+                "permanent auth rejection was retried"
+            );
+        },
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(SubcError::Auth {
+                source: subc_transport::AuthError::DaemonIdMismatch,
+                ..
+            })
+        ),
+        "unexpected rejection result: {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "permanent auth rejection consumed retry budget: {elapsed:?}"
+    );
+}
+
+#[test]
+fn subc_initial_attach_rereads_rewritten_connection_file() {
+    let (result, elapsed) = run_initial_attach_test(
+        "subc_initial_attach_rereads_rewritten_connection_file",
+        Duration::from_secs(10),
+        |mut input| async move {
+            accept_client_hello_then_close(&input.listener).await;
+
+            let replacement =
+                StdTcpListener::bind("127.0.0.1:0").expect("bind replacement fake daemon");
+            replacement
+                .set_nonblocking(true)
+                .expect("set replacement listener nonblocking");
+            let replacement_port = replacement
+                .local_addr()
+                .expect("replacement daemon addr")
+                .port();
+            let replacement = TcpListener::from_std(replacement).expect("replacement listener");
+            connection_file::write_atomic(
+                &input.connection_file_path,
+                &ConnectionInfo {
+                    schema: SCHEMA_VERSION,
+                    endpoints: vec![Endpoint {
+                        host: "127.0.0.1".to_string(),
+                        port: replacement_port,
+                    }],
+                    key: input.key.clone(),
+                    daemon_id: input.daemon_id,
+                    pid: std::process::id(),
+                    daemon_ver: "subc-test-replacement".to_string(),
+                },
+            )
+            .expect("rewrite connection file");
+
+            // Keep the old endpoint open but unattended. Success on the replacement
+            // proves the retry read the newly published endpoint instead of reusing it.
+            let old_listener = std::mem::replace(&mut input.listener, replacement);
+            complete_initial_attach(&input.listener, &input.key, &input.daemon_id).await;
+            drop(old_listener);
+        },
+    );
+
+    result.expect("attach succeeds through rewritten endpoint");
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "attach did not observe the first retry backoff: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "rewritten endpoint attach took too long: {elapsed:?}"
+    );
 }
 
 #[test]
