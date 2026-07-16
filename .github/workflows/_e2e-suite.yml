@@ -21,9 +21,18 @@ name: E2E Suite
 
 on:
   workflow_call:
+    inputs:
+      cargo_profile:
+        description: "Cargo profile for the aft binaries under test: 'release' (fat LTO, tag releases) or 'stage' (optimized, no LTO — minutes less link time; PR/push)"
+        type: string
+        default: release
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # cargo puts `stage`-profile output under target/stage/, `release` under
+  # target/release/. Every path below derives from this pair.
+  CARGO_PROFILE: ${{ inputs.cargo_profile }}
+  CARGO_PROFILE_DIR: ${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -53,13 +62,14 @@ jobs:
       - name: Build Linux x64 binary in Docker
         run: |
           docker build --platform linux/amd64 \
+            --build-arg CARGO_PROFILE="$CARGO_PROFILE" \
             -t aft-build-linux \
             -f tests/docker/Dockerfile.build-linux .
 
       - name: Extract built binary
         run: |
           CID=$(docker create --platform linux/amd64 aft-build-linux true)
-          docker cp "$CID:/build/target/release/aft" tests/docker/fixtures/aft-linux-x64
+          docker cp "$CID:/build/target/$CARGO_PROFILE_DIR/aft" tests/docker/fixtures/aft-linux-x64
           docker rm "$CID"
 
       # The E2E Dockerfile installs the local package artifacts (npm pack
@@ -108,7 +118,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Build AFT binary (Linux native)
-        run: cargo build --release -p agent-file-tools
+        run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
 
       - name: Build aft-bridge dist
         run: bun run --cwd packages/aft-bridge build
@@ -119,6 +129,8 @@ jobs:
       - name: Run Pi RPC E2E suite
         run: bun test
         working-directory: tests/pi-rpc
+        env:
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}/aft
 
   # ---------------------------------------------------------------------------
   # Windows native e2e — exercises the same OpenCode + plugin + binary stack
@@ -146,7 +158,7 @@ jobs:
           bun-version: latest
 
       - name: Build AFT binary (Windows x64)
-        run: cargo build --release --target x86_64-pc-windows-msvc -p agent-file-tools
+        run: cargo build --profile $env:CARGO_PROFILE --target x86_64-pc-windows-msvc -p agent-file-tools
         shell: pwsh
 
       - name: Install workspace deps + build aft-bridge
@@ -163,7 +175,7 @@ jobs:
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
         shell: pwsh
         env:
-          AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\aft.exe
+          AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}\aft.exe
           AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
 
   # ---------------------------------------------------------------------------
@@ -185,21 +197,29 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Intentionally NO Swatinem/rust-cache on macOS.
-      # rust-cache restore on macos-latest overwrites the just-installed
-      # ~/.cargo/bin/cargo shim with stale cached bytes — the shim then
-      # misreads its own argv as if it were `rustup-init`:
-      #   error: unexpected argument 'build' found
-      #   Usage: rustup-init[EXE] [OPTIONS]
-      # Cold cargo build on macos-latest is ~3min — acceptable cost for
-      # release reliability. See release.yml test-macos for the same fix.
+      # cache-bin: false makes rust-cache safe on macOS: the old failure was
+      # the cached ~/.cargo/bin shim overwriting the fresh cargo shim (which
+      # then misread argv as rustup-init). Excluding bin keeps the dependency
+      # artifacts without touching shims. See _unit-suite.yml unit-macos.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-on-failure: true
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
       - name: Build AFT binary (macOS native)
-        run: cargo build --release -p agent-file-tools
+        run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
+
+      # Ad-hoc sign + exec once: an unsigned fresh binary gets SIGKILLed on
+      # newer macOS, and the first exec pays a syspolicyd assessment that can
+      # take 30-90s under load — pay it here, not inside a harness timeout.
+      - name: Sign and warm the binary
+        run: |
+          codesign -f -s - "target/$CARGO_PROFILE_DIR/aft" 2>/dev/null || true
+          "target/$CARGO_PROFILE_DIR/aft" --version
 
       - name: Install workspace deps + build aft-bridge
         run: |
@@ -212,5 +232,5 @@ jobs:
       - name: Run macOS E2E suite
         run: bash tests/macos-e2e/run.sh
         env:
-          AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}/aft
           AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist

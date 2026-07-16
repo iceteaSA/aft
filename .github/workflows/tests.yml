@@ -81,10 +81,21 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Linux Docker e2e + Pi RPC e2e + macOS native e2e + Windows native e2e.
-  # Reuses the same _e2e-suite.yml that release.yml calls. Gates on `unit`
-  # so e2e only runs when ALL blocking unit jobs (Linux + macOS) pass.
+  # Reuses the same _e2e-suite.yml that release.yml calls.
+  #
+  # Runs IN PARALLEL with the unit stage: e2e jobs build their own binaries
+  # and consume no unit artifacts, so a `needs: unit` gate only serialized
+  # two independent ~19-minute stages (~39 min wall for a ~20 min critical
+  # path). The tradeoff — runner minutes spent on e2e when unit fails — is
+  # accepted for the wall-clock halving. release.yml keeps its own gating.
+  #
+  # PR/push e2e builds use the `stage` cargo profile (optimized, no fat LTO):
+  # same test coverage, minutes less link time per lane. Tag releases run
+  # _e2e-suite.yml with the default `release` profile, so the shipped
+  # fat-LTO binary shape is still e2e-tested before publishing.
   # ---------------------------------------------------------------------------
   e2e:
     name: E2E
-    needs: unit
     uses: ./.github/workflows/_e2e-suite.yml
+    with:
+      cargo_profile: stage

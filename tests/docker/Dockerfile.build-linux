@@ -1,5 +1,6 @@
 FROM --platform=linux/amd64 rust:1-bookworm
+ARG CARGO_PROFILE=release
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-RUN cargo build --release -p agent-file-tools
+RUN cargo build --profile "$CARGO_PROFILE" -p agent-file-tools

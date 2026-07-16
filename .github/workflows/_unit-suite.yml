@@ -43,6 +43,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - uses: taiki-e/install-action@nextest
 
@@ -85,6 +87,10 @@ jobs:
           # which starves ~4-core CI runners. CI runners are otherwise idle,
           # so use every core.
           NEXTEST_TEST_THREADS: "num-cpus"
+          # The release-storm phase runs in its own parallel job
+          # (unit-linux-storm) so its release-profile build is off this
+          # job's critical path.
+          AFT_GATE_SKIP_RELEASE_STORM: "1"
 
       - name: Build all JS packages (release gate)
         # Only at release time: every published JS package must build. At PR
@@ -139,6 +145,32 @@ jobs:
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
 
   # ---------------------------------------------------------------------------
+  # Release-storm latency calibration (Linux, release profile).
+  # Split from unit-linux: the storm phase needs a release-profile build of
+  # the integration binary, which serialized 2-5 minutes behind the debug
+  # gate. As its own job it runs in parallel and shares nothing with the
+  # debug lane. Linux is the storm arbiter (see rust-test-gate.sh); macOS
+  # and Windows skip the phase entirely.
+  # ---------------------------------------------------------------------------
+  unit-linux-storm:
+    name: Release storm (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Release storm tests (production-calibrated latency bounds)
+        run: cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+
+  # ---------------------------------------------------------------------------
   # Rust + plugin tests on macOS
   # Catches macOS-specific code paths: FSEvents watcher behavior (different
   # coalescing latency from inotify), /var vs /private/var symlink
@@ -158,13 +190,16 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
-      # Intentionally NO Swatinem/rust-cache on macOS — rust-cache restore
-      # on macos-latest overwrites the just-installed ~/.cargo/bin/cargo
-      # shim with stale cached bytes, producing:
-      #   error: unexpected argument 'test' found
-      #   Usage: rustup-init[EXE] [OPTIONS]
-      # Observed in release runs 25839773442 and 25840332625. Cold cargo
-      # build is ~3min — acceptable.
+      # cache-bin: false is what makes rust-cache safe on macOS. The failure
+      # that previously banned it here (release runs 25839773442 and
+      # 25840332625) was the cached ~/.cargo/bin shim overwriting the
+      # just-installed cargo shim, which then misread its argv as
+      # rustup-init. Excluding the bin directory keeps the dependency
+      # artifacts (the multi-minute win) without touching the shims.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-on-failure: true
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -199,13 +234,8 @@ jobs:
           AFT_TEST_DIAG: "1"
           # See the Linux job: full core count on otherwise-idle CI runners.
           NEXTEST_TEST_THREADS: "num-cpus"
-          # This job deliberately runs without rust-cache (see above), so the
-          # release-storm phase would cold-build the whole workspace in
-          # release profile every run and blow the job timeout (observed:
-          # debug suite green at 12min, release build still compiling at the
-          # 25min kill). The storm tests exercise no macOS-specific paths;
-          # Linux CI (cached) and the local gate are the release-storm
-          # arbiters.
+          # The storm tests exercise no macOS-specific paths; the dedicated
+          # unit-linux-storm job is the release-storm arbiter.
           AFT_GATE_SKIP_RELEASE_STORM: "1"
 
       # See the Linux job: private-repo release read via the cortexkit-ci
@@ -261,7 +291,12 @@ jobs:
   unit-windows-cargo:
     name: Cargo test (Windows)
     runs-on: windows-2022
-    timeout-minutes: 30
+    # 45 minutes: a cold-cache run (no prior green run saved a cache, e.g.
+    # after a day of cancel-superseded pushes) needs the full workspace
+    # build inside the job; 30 minutes killed those runs right before the
+    # finish line and cache-on-failure could not save what a hard timeout
+    # cancels.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
@@ -270,18 +305,10 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - uses: taiki-e/install-action@nextest
-
-      # Compile-only gate that DENIES warnings. Catches cross-target warnings
-      # (e.g. unix-`cfg` code unused on Windows) that the mac/Linux clippy gates
-      # structurally cannot see, without running the flaky Windows test runtime.
-      # Registry deps are unaffected (cargo caps their lints to `allow`).
-      - name: Cargo check (deny warnings)
-        run: cargo check --workspace --all-targets
-        shell: pwsh
-        env:
-          RUSTFLAGS: "-D warnings"
 
       - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
         # bash shell: the gate helper is a bash script; GitHub Windows runners
@@ -298,6 +325,34 @@ jobs:
           AFT_TEST_DIAG: "1"
           NEXTEST_TEST_THREADS: "4"
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+  # ---------------------------------------------------------------------------
+  # Cross-target warning gate (Windows, compile-only, DENIES warnings).
+  # Split from unit-windows-cargo: with unique RUSTFLAGS it shares no
+  # artifacts with the test build, so running it inline added its full
+  # duration to the Windows critical path. Catches unix-cfg dead-code
+  # warnings the mac/Linux clippy gates structurally cannot see.
+  # ---------------------------------------------------------------------------
+  unit-windows-check:
+    name: Cargo check deny-warnings (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Cargo check (deny warnings)
+        run: cargo check --workspace --all-targets
+        shell: pwsh
+        env:
+          RUSTFLAGS: "-D warnings"
 
   # ---------------------------------------------------------------------------
   # Bash permission flow on Windows
@@ -335,6 +390,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - uses: oven-sh/setup-bun@v2
         with:

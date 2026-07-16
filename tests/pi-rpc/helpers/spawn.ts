@@ -3,6 +3,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  statSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -97,8 +98,13 @@ function childEnv(configDir: string): Record<string, string> {
   // packages/opencode-plugin/src/__tests__/e2e/helpers.ts and
   // packages/pi-plugin/src/__tests__/e2e/helpers.ts (TARGET_DEBUG_BINARY).
   const sep = process.platform === "win32" ? ";" : ":";
+  const explicitBinaryDir = process.env.AFT_BINARY_PATH
+    ? [dirname(process.env.AFT_BINARY_PATH)]
+    : [];
   result.PATH = [
+    ...explicitBinaryDir,
     join(REPO_ROOT, "target", "release"),
+    join(REPO_ROOT, "target", "stage"),
     join(REPO_ROOT, "target", "debug"),
     result.PATH ?? "",
   ].join(sep);
@@ -131,14 +137,21 @@ function childEnv(configDir: string): Record<string, string> {
  */
 function seedBinaryCache(configDir: string): void {
   const ext = process.platform === "win32" ? ".exe" : "";
-  const builtBinary = [
-    join(REPO_ROOT, "target", "release", `aft${ext}`),
-    join(REPO_ROOT, "target", "debug", `aft${ext}`),
-  ].find((candidate) => existsSync(candidate));
-  if (builtBinary === undefined) {
+  // AFT_BINARY_PATH (set by CI) pins the exact build under test. Without it,
+  // pick the NEWEST existing build across profiles: any fixed precedence
+  // order lets a stale binary from an earlier build of another profile
+  // shadow the one just built (the classic target/release-shadows-debug
+  // trap, and its stage-profile sibling).
+  const builtBinary = process.env.AFT_BINARY_PATH
+    ? process.env.AFT_BINARY_PATH
+    : ["release", "stage", "debug"]
+        .map((profile) => join(REPO_ROOT, "target", profile, `aft${ext}`))
+        .filter((candidate) => existsSync(candidate))
+        .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
+  if (builtBinary === undefined || !existsSync(builtBinary)) {
     throw new Error(
-      `No built aft binary at target/release/aft${ext} or target/debug/aft${ext}. ` +
-        "Run: cargo build --release -p agent-file-tools",
+      `No built aft binary (checked AFT_BINARY_PATH and target/{release,stage,debug}/aft${ext}). ` +
+        "Run: cargo build -p agent-file-tools",
     );
   }
   // The cache lookup keys on the version the binary reports (the resolver then
