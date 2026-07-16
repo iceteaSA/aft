@@ -22,14 +22,9 @@ const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
 
 export function runSafetySuite(
-  options: {
-    harnessFactory?: HarnessFactory;
-    name?: string;
-    skipSubcNativeCommandGaps?: boolean;
-  } = {},
+  options: { harnessFactory?: HarnessFactory; name?: string } = {},
 ): void {
-  const suiteDescribe = options.skipSubcNativeCommandGaps ? describe.skip : maybeDescribe;
-  suiteDescribe(options.name ?? "e2e safety commands", () => {
+  maybeDescribe(options.name ?? "e2e safety commands", () => {
     let preparedBinary: PreparedBinary = initialBinary;
     const harnesses: E2EHarness[] = [];
 
@@ -47,17 +42,24 @@ export function runSafetySuite(
       return created;
     }
 
+    const agentCall = (h: E2EHarness, name: string, args: Record<string, unknown> = {}) =>
+      h.bridge.toolCall(undefined, name, args);
+
     test("creates and restores a checkpoint", async () => {
       const h = await harness();
       const filePath = h.path("sample.ts");
       const original = await readTextFile(filePath);
 
-      const checkpoint = await h.bridge.send("checkpoint", {
+      const checkpoint = await agentCall(h, "safety", {
+        op: "checkpoint",
         name: "safe-point",
         files: [filePath],
       });
-      await h.bridge.send("write", { file: filePath, content: "export const changed = true;\n" });
-      const restore = await h.bridge.send("restore_checkpoint", { name: "safe-point" });
+      await agentCall(h, "write", {
+        filePath,
+        content: "export const changed = true;\n",
+      });
+      const restore = await agentCall(h, "safety", { op: "restore", name: "safe-point" });
 
       expect(checkpoint.success).toBe(true);
       expect(restore.success).toBe(true);
@@ -69,13 +71,13 @@ export function runSafetySuite(
       const filePath = h.path("with-errors.ts");
       const original = await readTextFile(filePath);
 
-      const edit = await h.bridge.send("edit_match", {
-        file: filePath,
-        match: "pending",
-        replacement: "ready",
+      const edit = await agentCall(h, "edit", {
+        filePath,
+        oldString: "pending",
+        newString: "ready",
         occurrence: 0,
       });
-      const undo = await h.bridge.send("undo", { file: filePath });
+      const undo = await agentCall(h, "safety", { op: "undo", filePath });
 
       expect(edit.success).toBe(true);
       expect(undo.success).toBe(true);
@@ -87,9 +89,9 @@ export function runSafetySuite(
       const filePath = h.path("history.txt");
       await writeFile(filePath, "v1\n");
 
-      await h.bridge.send("write", { file: filePath, content: "v2\n" });
-      await h.bridge.send("write", { file: filePath, content: "v3\n" });
-      const history = await h.bridge.send("edit_history", { file: filePath });
+      await agentCall(h, "write", { filePath, content: "v2\n" });
+      await agentCall(h, "write", { filePath, content: "v3\n" });
+      const history = await agentCall(h, "safety", { op: "history", filePath });
 
       expect(history.success).toBe(true);
       expect((history.entries as Array<Record<string, unknown>>).length).toBeGreaterThanOrEqual(2);
@@ -100,12 +102,12 @@ export function runSafetySuite(
       const filePath = h.path("undo-stack.txt");
       await writeFile(filePath, "v1\n");
 
-      await h.bridge.send("write", { file: filePath, content: "v2\n" });
-      await h.bridge.send("write", { file: filePath, content: "v3\n" });
-      await h.bridge.send("undo", { file: filePath });
+      await agentCall(h, "write", { filePath, content: "v2\n" });
+      await agentCall(h, "write", { filePath, content: "v3\n" });
+      await agentCall(h, "safety", { op: "undo", filePath });
       expect(await readTextFile(filePath)).toBe("v2\n");
 
-      await h.bridge.send("undo", { file: filePath });
+      await agentCall(h, "safety", { op: "undo", filePath });
       expect(await readTextFile(filePath)).toBe("v1\n");
     });
 
@@ -113,9 +115,9 @@ export function runSafetySuite(
       const h = await harness();
       const filePath = h.path("sample.ts");
 
-      await h.bridge.send("checkpoint", { name: "one", files: [filePath] });
-      await h.bridge.send("checkpoint", { name: "two", files: [filePath] });
-      const response = await h.bridge.send("list_checkpoints");
+      await agentCall(h, "safety", { op: "checkpoint", name: "one", files: [filePath] });
+      await agentCall(h, "safety", { op: "checkpoint", name: "two", files: [filePath] });
+      const response = await agentCall(h, "safety", { op: "list" });
 
       expect(response.success).toBe(true);
       const checkpoints = response.checkpoints as Array<Record<string, unknown>>;
@@ -150,17 +152,14 @@ export function runSafetySuite(
       expect(list).toMatch(/\d+ checkpoint\(s\)/);
       expect(list).toContain("safe-point");
 
-      await h.bridge.send("write", { file: filePath, content: "v3\n" });
+      await agentCall(h, "write", { filePath, content: "v3\n" });
       const undo = toolResultText(await tool.execute({ op: "undo", filePath }, runtime(h)));
       expect(undo).toContain("restored");
       expect(await readTextFile(filePath)).toBe("v1\n");
 
-      await h.bridge.send("write", { file: filePath, content: "v4\n" });
+      await agentCall(h, "write", { filePath, content: "v4\n" });
       const history = toolResultText(await tool.execute({ op: "history", filePath }, runtime(h)));
-      const home = process.env.HOME;
-      const expectedHistoryPath =
-        home && filePath.startsWith(home) ? filePath.replace(home, "~") : filePath;
-      expect(history).toContain(expectedHistoryPath);
+      expect(history).toContain("safety-toolcall.txt");
       expect(history).toMatch(/^1\. /m);
     });
 
@@ -172,7 +171,7 @@ export function runSafetySuite(
 
       try {
         await writeFile(externalFile, "v1\n", "utf8");
-        await h.bridge.send("write", { file: externalFile, content: "v2\n" });
+        await agentCall(h, "write", { filePath: externalFile, content: "v2\n" });
 
         let asks: AskCall[] = [];
         const undo = toolResultText(
@@ -223,7 +222,7 @@ export function runSafetySuite(
       await writeFile(fileB, "content-b\n");
       await writeFile(fileC, "content-c\n");
 
-      const deleteResp = await h.bridge.send("delete_file", {
+      const deleteResp = await agentCall(h, "delete", {
         files: [fileA, fileB, fileC],
       });
       expect(deleteResp.success).toBe(true);
@@ -235,7 +234,7 @@ export function runSafetySuite(
 
       // Operation undo: no `file` param. Restores everything tagged with the
       // most recent op_id atomically.
-      const undoResp = await h.bridge.send("undo");
+      const undoResp = await agentCall(h, "safety", { op: "undo" });
       expect(undoResp.success).toBe(true);
       expect(undoResp.operation).toBe(true);
       expect(undoResp.restored_count).toBe(3);
@@ -256,16 +255,19 @@ export function runSafetySuite(
       await writeFile(`${dir}/top.txt`, "top-content\n");
       await writeFile(`${dir}/nested/inner.txt`, "inner-content\n");
 
-      const deleteResp = await h.bridge.send("delete_file", {
-        file: dir,
+      const deleteResp = await agentCall(h, "delete", {
+        files: [dir],
         recursive: true,
       });
       expect(deleteResp.success).toBe(true);
-      expect(deleteResp.is_directory).toBe(true);
-      expect(deleteResp.files_deleted).toBe(2);
+      expect(deleteResp.complete).toBe(true);
+      const deleted = deleteResp.deleted as Array<Record<string, unknown>>;
+      expect(deleted).toHaveLength(1);
+      expect(deleted[0]?.is_directory).toBe(true);
+      expect(deleted[0]?.files_deleted).toBe(2);
       expect(existsSync(dir)).toBe(false);
 
-      const undoResp = await h.bridge.send("undo");
+      const undoResp = await agentCall(h, "safety", { op: "undo" });
       expect(undoResp.success).toBe(true);
       expect(undoResp.operation).toBe(true);
       expect(undoResp.restored_count).toBe(2);
@@ -288,13 +290,16 @@ export function runSafetySuite(
       await writeFile(outside, "outside\n");
       await symlink(outside, `${dir}/link.txt`);
 
-      const resp = await h.bridge.send("delete_file", {
-        file: dir,
+      const resp = await agentCall(h, "delete", {
+        files: [dir],
         recursive: true,
       });
       expect(resp.success).toBe(false);
-      expect(resp.code).toBe("unsupported_directory_contents");
-      expect(resp.message as string).toContain("link.txt");
+      expect(resp.code).toBe("delete_failed");
+      expect(resp.all_failed).toBe(true);
+      const skipped = resp.skipped_files as Array<Record<string, unknown>>;
+      expect(skipped).toHaveLength(1);
+      expect(skipped[0]?.reason as string).toContain("link.txt");
       // The whole tree, the symlink, and the outside target must be untouched.
       expect(existsSync(dir)).toBe(true);
       expect(existsSync(`${dir}/real.txt`)).toBe(true);

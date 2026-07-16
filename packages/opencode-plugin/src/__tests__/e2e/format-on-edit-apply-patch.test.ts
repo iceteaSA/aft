@@ -126,14 +126,9 @@ async function createToolHarness(
 }
 
 export function runFormatOnEditApplyPatchSuite(
-  options: {
-    harnessFactory?: HarnessFactory;
-    name?: string;
-    skipSubcWriteSidecarGaps?: boolean;
-  } = {},
+  options: { harnessFactory?: HarnessFactory; name?: string } = {},
 ): void {
   maybeDescribe(options.name ?? "e2e format_on_edit apply_patch", () => {
-    const writeSidecarTest = options.skipSubcWriteSidecarGaps ? test.skip : test;
     let preparedBinary: PreparedBinary = initialBinary;
     const harnesses: E2EHarness[] = [];
     const pools: AftTransportPool[] = [];
@@ -303,9 +298,7 @@ EOF
       expect(await readTextFile(h.path("main.rs"))).toBe("fn main() {\n    let x = 42;\n}\n");
     });
 
-    // SUBC GAP: direct native write responses over the subc route lack the
-    // `formatted` / `format_skipped_reason` sidecars asserted below.
-    writeSidecarTest("patch with formatter excluded path", async () => {
+    test("patch with formatter excluded path", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_EXCLUDED_PRESET, [
         biomeExcludedPathShim(),
       ]);
@@ -325,8 +318,8 @@ EOF
       expect(await readTextFile(h.path("scratch", "foo.ts"))).toBe(
         "export    const   foo   = 1;\n",
       );
-      const response = await h.bridge.send("write", {
-        file: h.path("scratch", "probe.ts"),
+      const response = await h.bridge.toolCall(undefined, "write", {
+        filePath: h.path("scratch", "probe.ts"),
         content: "export    const   probe   = 1;\n",
       });
       expect(response.formatted).toBe(false);
@@ -354,9 +347,7 @@ EOF
       expect(await readTextFile(h.path("timeout.ts"))).toBe("export    const   slow   = 1;\n");
     }, 25_000);
 
-    // SUBC GAP: direct native write responses over the subc route lack the
-    // `formatted` / `format_skipped_reason` sidecars asserted below.
-    writeSidecarTest("patch with formatter generic error", async () => {
+    test("patch with formatter generic error", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [genericErrorFormatterShim()]);
 
       const output = await tools.apply_patch.execute(
@@ -371,8 +362,8 @@ EOF
 
       expect(toolResultText(output)).toContain("Created error.ts");
       expect(await readTextFile(h.path("error.ts"))).toBe("export    const   badFormat   = 1;\n");
-      const response = await h.bridge.send("write", {
-        file: h.path("error-probe.ts"),
+      const response = await h.bridge.toolCall(undefined, "write", {
+        filePath: h.path("error-probe.ts"),
         content: "export    const   badFormat   = 2;\n",
       });
       expect(response.formatted).toBe(false);

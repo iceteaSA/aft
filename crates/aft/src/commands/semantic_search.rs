@@ -551,13 +551,20 @@ fn handle_external_semantic_or_hybrid_search(
     };
 
     let Some(semantic_index) = semantic_index else {
-        let lexical = collect_lexical_files_from_snapshot(
-            Some(search_index.snapshot()),
-            &params.query,
-            &shape,
-            params.include_tests,
-            &external_root,
-        );
+        // Hybrid mode already ranked the lexical candidates above; ranking is
+        // the expensive half of an external query, so reuse it and collect
+        // only when the original mode was pure Semantic.
+        let lexical = if mode == SearchMode::Hybrid {
+            lexical
+        } else {
+            collect_lexical_files_from_snapshot(
+                Some(search_index.snapshot()),
+                &params.query,
+                &shape,
+                params.include_tests,
+                &external_root,
+            )
+        };
         return external_lexical_only_response(
             req,
             &params,
@@ -576,13 +583,17 @@ fn handle_external_semantic_or_hybrid_search(
         match embed_query_for_dimension(&params.query, ctx, Some(semantic_index.dimension())) {
             Ok(query_vector) => query_vector,
             Err(error) => {
-                let lexical = collect_lexical_files_from_snapshot(
-                    Some(search_index.snapshot()),
-                    &params.query,
-                    &shape,
-                    params.include_tests,
-                    &external_root,
-                );
+                let lexical = if mode == SearchMode::Hybrid {
+                    lexical
+                } else {
+                    collect_lexical_files_from_snapshot(
+                        Some(search_index.snapshot()),
+                        &params.query,
+                        &shape,
+                        params.include_tests,
+                        &external_root,
+                    )
+                };
                 return external_lexical_only_response(
                     req,
                     &params,
@@ -1248,15 +1259,31 @@ fn handle_semantic_or_hybrid_search(
             );
         }
         SemanticIndexStatus::Failed(error) => {
+            let retrying_read_only_snapshot = ctx.shared_artifacts_read_only()
+                && super::configure::trigger_semantic_index_reload_if_evicted(ctx);
+            let (semantic_status, status, detail) = if retrying_read_only_snapshot {
+                (
+                    "building",
+                    "reloading",
+                    "Semantic index is reloading from the shared read-only snapshot; retry shortly."
+                        .to_string(),
+                )
+            } else {
+                (
+                    "unavailable",
+                    "unavailable",
+                    format!("Semantic search unavailable: {error}"),
+                )
+            };
             return semantic_unavailable_or_fallback_response(
                 req,
                 ctx,
                 &params,
                 mode,
                 &shape,
-                "unavailable",
-                "unavailable",
-                format!("Semantic search unavailable: {error}"),
+                semantic_status,
+                status,
+                detail,
                 false,
                 lexical,
                 warnings,
@@ -3432,6 +3459,38 @@ mod tests {
             }),
             "expected lexical fallback result, got {results:?}"
         );
+    }
+
+    #[test]
+    fn read_only_failed_snapshot_retries_on_semantic_query() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let ctx = test_context(project.path());
+        ctx.update_config(|config| {
+            config.semantic_search = true;
+            config.storage_dir = Some(storage.path().to_path_buf());
+        });
+        ctx.set_canonical_cache_root(project.path().to_path_buf());
+        ctx.set_cache_writer_capabilities(false, true);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            SemanticIndexStatus::Failed("shared snapshot absent".to_string());
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request_with_hint("retry snapshot", 5, "semantic"),
+            &ctx,
+        ));
+
+        assert_eq!(response["success"], false);
+        assert_eq!(response["code"], "semantic_unavailable");
+        assert!(response["message"]
+            .as_str()
+            .expect("semantic error message")
+            .contains("reloading"));
+        assert!(ctx.semantic_index_rx().lock().is_some());
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
     }
 
     #[test]

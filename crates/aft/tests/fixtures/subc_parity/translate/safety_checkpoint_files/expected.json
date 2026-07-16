@@ -2,7 +2,7 @@
   "args": {
     "files": [
       "<PROJECT_ROOT>/src/main.ts",
-      "docs/guide.md"
+      "<PROJECT_ROOT>/docs/guide.md"
     ],
     "name": "before-edit"
   },

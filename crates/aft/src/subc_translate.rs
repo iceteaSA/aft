@@ -203,7 +203,7 @@ pub fn subc_translate_with_context(
         "move" => translate_move(agent_args, project_root),
         "import" => translate_import(agent_args),
         "refactor" => translate_refactor(agent_args),
-        "safety" => translate_safety(agent_args),
+        "safety" => translate_safety(agent_args, project_root),
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
@@ -982,7 +982,7 @@ fn translate_refactor(args: &Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_safety(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_safety(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let op = map_in
         .get("op")
@@ -1010,22 +1010,45 @@ fn translate_safety(args: &Value) -> Result<Translated, TranslateError> {
         return Err(invalid_request(format!("'name' is required for '{op}' op")));
     }
 
+    let resolve_path = |value: &Value| -> Result<Value, TranslateError> {
+        let path = value
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| invalid_request("aft_safety: paths must be non-empty strings"))?;
+        Ok(Value::String(
+            resolve_path_from_project_root(project_root, path)
+                .to_string_lossy()
+                .into_owned(),
+        ))
+    };
+
     let mut out = Map::new();
     insert_present_renamed(&mut out, &map_in, "name", "name");
     let files = map_in
         .get("files")
         .and_then(Value::as_array)
         .filter(|items| !items.is_empty())
-        .cloned();
+        .map(|items| {
+            items
+                .iter()
+                .map(resolve_path)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
 
     if op == "checkpoint" {
         if let Some(files) = files {
             out.insert("files".to_string(), Value::Array(files));
         } else if let Some(file_path) = map_in.get("filePath") {
-            out.insert("files".to_string(), Value::Array(vec![file_path.clone()]));
+            out.insert(
+                "files".to_string(),
+                Value::Array(vec![resolve_path(file_path)?]),
+            );
         }
     } else {
-        insert_present_renamed(&mut out, &map_in, "filePath", "file");
+        if let Some(file_path) = map_in.get("filePath") {
+            out.insert("file".to_string(), resolve_path(file_path)?);
+        }
         if let Some(files) = files {
             out.insert("files".to_string(), Value::Array(files));
         }

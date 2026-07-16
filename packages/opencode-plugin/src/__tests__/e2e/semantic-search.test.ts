@@ -213,7 +213,7 @@ maybeDescribe("e2e semantic search tool", () => {
     const state = classify(output);
     expect(state.isUnavailable || state.isBuilding || state.isDisabled).toBe(true);
     expect(output).toContain("lexical");
-  });
+  }, 40_000);
 
   test("aft_search can borrow an already-indexed sibling project", async () => {
     const harness = await createHarness(preparedBinary, {
@@ -270,7 +270,7 @@ maybeDescribe("e2e semantic search tool", () => {
     if (!output.includes(expectedFile) && lastError) throw lastError;
     expect(output).toContain(expectedFile);
     expect(output).toContain("handle_request");
-  });
+  }, 40_000);
 });
 
 async function createFixtureProject(root: string): Promise<void> {

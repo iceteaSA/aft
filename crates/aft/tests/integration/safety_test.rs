@@ -361,6 +361,43 @@ fn symlink_to_outside_file_blocks_recursive_delete() {
 
 #[cfg(unix)]
 #[test]
+fn batch_with_only_failed_recursive_delete_reports_failure() {
+    let dir = temp_dir("delete_recursive_batch_all_failed");
+    let target_dir = temp_dir("delete_recursive_batch_all_failed_target");
+    let outside_file = target_dir.join("outside.txt");
+    let symlink = dir.join("outside-link.txt");
+
+    fs::write(&outside_file, "outside").unwrap();
+    std::os::unix::fs::symlink(&outside_file, &symlink).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-file-batch-all-failed",
+        "command": "delete_file",
+        "files": [dir.display().to_string()],
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "delete_failed");
+    assert_eq!(resp["all_failed"], true);
+    assert_eq!(resp["complete"], false);
+    assert_eq!(resp["skipped_files"].as_array().unwrap().len(), 1);
+    let message = resp["message"].as_str().expect("failure message");
+    assert!(message.contains("delete failed for all 1 file(s)"));
+    assert!(message.contains(&dir.display().to_string()));
+    assert!(message.contains("symlink"));
+    assert!(dir.exists(), "directory should remain intact");
+    assert!(symlink.exists(), "symlink should remain intact");
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
 fn symlink_to_directory_blocks_recursive_delete() {
     let dir = temp_dir("delete_recursive_blocks_dir_symlink");
     let target_dir = temp_dir("delete_recursive_blocks_dir_symlink_target");

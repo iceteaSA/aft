@@ -358,6 +358,9 @@ export async function createHarness(
         poolOptions,
         configOverrides,
         subcConnectionFile: rig.connectionFile,
+        // The test runner can itself be a supervised module. Never relay that ambient
+        // principal into this isolated daemon, whose launch nonce belongs to its own AFT.
+        subcConsumerIdentity: null,
       });
       bridge = trackSubcSessions(
         pool.getBridge(tempDir),

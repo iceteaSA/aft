@@ -1,7 +1,7 @@
 {
   "args": {
     "files": [
-      "src/main.ts"
+      "<PROJECT_ROOT>/src/main.ts"
     ],
     "name": "single-file"
   },

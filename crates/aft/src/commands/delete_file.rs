@@ -5,6 +5,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use lsp_types::FileChangeType;
+use serde_json::Value;
 
 use crate::context::AppContext;
 use crate::edit;
@@ -49,6 +50,40 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
                     "reason": resp.data.get("message").and_then(|v| v.as_str()).unwrap_or("delete failed"),
                 })),
             }
+        }
+        if deleted.is_empty() && !skipped.is_empty() {
+            let message = format!(
+                "delete failed for all {} file(s):\n{}",
+                skipped.len(),
+                skipped
+                    .iter()
+                    .map(|entry| {
+                        let file = entry
+                            .get("file")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .or_else(|| entry.get("file").map(Value::to_string))
+                            .unwrap_or_default();
+                        let reason = entry
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("delete failed");
+                        format!("  {file}: {reason}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            return Response::error_with_data(
+                req.id.clone(),
+                "delete_failed",
+                message,
+                serde_json::json!({
+                    "complete": false,
+                    "all_failed": true,
+                    "deleted": deleted,
+                    "skipped_files": skipped,
+                }),
+            );
         }
         return Response::success(
             &req.id,

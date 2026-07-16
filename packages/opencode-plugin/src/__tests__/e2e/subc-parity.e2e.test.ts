@@ -76,17 +76,10 @@ maybeDescribe(describeName, () => {
   runFormatOnEditApplyPatchSuite({
     harnessFactory,
     name: "subc parity: format_on_edit apply_patch",
-    skipSubcWriteSidecarGaps: true,
   });
-  // SUBC GAP: safety/undo still depends on native commands that the subc AFT
-  // tool manifest does not admit (`checkpoint`, `restore_checkpoint`,
-  // `list_checkpoints`, `edit_history`, `edit_match`, `delete_file`,
-  // `undo_preview`, and `undo`). Keep this suite explicit but skipped until the
-  // production manifest/gate grows those safety commands.
   runSafetySuite({
     harnessFactory,
-    name: "subc parity: safety/undo (SUBC GAP: native safety commands missing)",
-    skipSubcNativeCommandGaps: true,
+    name: "subc parity: safety/undo",
   });
 
   test("server-rendered text matches NDJSON for representative tool calls", async () => {

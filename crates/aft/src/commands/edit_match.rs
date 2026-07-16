@@ -1035,9 +1035,15 @@ fn handle_single_file_edit_match(
                 // aimed at the only (or Nth) match. Teach the indexing instead
                 // of just rejecting.
                 let hint = if occ == positions.len() {
-                    format!(" 'occurrence' is 0-indexed: the last occurrence is {}.", occ - 1)
+                    format!(
+                        " 'occurrence' is 0-indexed: the last occurrence is {}.",
+                        occ - 1
+                    )
                 } else {
-                    format!(" 'occurrence' is 0-indexed (valid range: 0-{}).", positions.len() - 1)
+                    format!(
+                        " 'occurrence' is 0-indexed (valid range: 0-{}).",
+                        positions.len() - 1
+                    )
                 };
                 return Response::error(
                     &req.id,
