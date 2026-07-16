@@ -169,11 +169,49 @@ export function expandTilde(input: string): string {
   return input;
 }
 
-/** Resolve a user path exactly as a bridge request will: `~` expands to home,
- * absolute paths are preserved; relative paths are rooted at the
- * session/project root. */
+/**
+ * Decode an RFC 8089 `file:` URL to a local path. Models routinely spell
+ * local targets as file:///path (or file:/path, file://localhost/path);
+ * rejecting them only produces failed tool calls. MUST match the Rust
+ * decoder (subc_translate.rs decode_file_url) so the plugin's permission
+ * gates judge the same target the server resolves. Returns the input
+ * unchanged when it is not a decodable local file URL.
+ */
+export function decodeFileUrl(target: string): string {
+  if (!target.startsWith("file:")) return target;
+  const rest = target.slice("file:".length);
+  let pathPart: string;
+  if (rest.startsWith("//")) {
+    const after = rest.slice(2);
+    const slash = after.indexOf("/");
+    const authority = slash === -1 ? after : after.slice(0, slash);
+    const p = slash === -1 ? "" : after.slice(slash);
+    if (authority === "" || authority === "localhost") pathPart = p;
+    else if (process.platform === "win32") pathPart = `//${authority}${p}`;
+    else return target;
+  } else if (rest.startsWith("/")) {
+    pathPart = rest;
+  } else {
+    return target;
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathPart);
+  } catch {
+    decoded = pathPart;
+  }
+  // file:///C:/x decodes to /C:/x — strip the slash for the drive form.
+  if (process.platform === "win32" && /^\/[A-Za-z]:/.test(decoded)) {
+    return decoded.slice(1);
+  }
+  return decoded;
+}
+
+/** Resolve a user path exactly as a bridge request will: file: URLs decode
+ * to local paths, `~` expands to home, absolute paths are preserved;
+ * relative paths are rooted at the session/project root. */
 export function resolvePathFromProjectRoot(projectRoot: string, target: string): string {
-  const expanded = expandTilde(target);
+  const expanded = expandTilde(decodeFileUrl(target));
   return path.isAbsolute(expanded) ? expanded : path.resolve(projectRoot, expanded);
 }
 

@@ -296,3 +296,45 @@ fn main_dispatch_has_no_agent_edit_or_search_aliases() {
     assert!(src.contains("\"edit_match\" =>"));
     assert!(src.contains("\"outline\" =>"));
 }
+
+#[test]
+fn file_urls_decode_to_local_paths_in_translate() {
+    use aft::subc_translate::resolve_path_from_project_root;
+    let root = std::path::Path::new(if cfg!(windows) { "C:\\proj" } else { "/proj" });
+
+    // RFC 8089 spellings of the same local file all resolve identically.
+    let plain = resolve_path_from_project_root(root, "/etc/hosts");
+    assert_eq!(
+        resolve_path_from_project_root(root, "file:///etc/hosts"),
+        plain
+    );
+    assert_eq!(
+        resolve_path_from_project_root(root, "file:/etc/hosts"),
+        plain
+    );
+    assert_eq!(
+        resolve_path_from_project_root(root, "file://localhost/etc/hosts"),
+        plain
+    );
+
+    // Percent-encoded characters decode (space in a file name).
+    let spaced = resolve_path_from_project_root(root, "file:///tmp/a%20b.md");
+    assert_eq!(spaced, resolve_path_from_project_root(root, "/tmp/a b.md"));
+
+    // A non-local authority is not a local path: left as-is on unix (becomes
+    // a relative path under the root, matching the old rejected behavior)
+    // rather than silently pointing at some other file.
+    if cfg!(unix) {
+        let unc = resolve_path_from_project_root(root, "file://server/share/x.txt");
+        assert!(
+            unc.starts_with(root),
+            "non-local authority must not decode on unix: {unc:?}"
+        );
+    }
+
+    // Windows drive-letter form.
+    if cfg!(windows) {
+        let drive = resolve_path_from_project_root(root, "file:///C:/temp/x.txt");
+        assert_eq!(drive, std::path::PathBuf::from("C:\\temp\\x.txt"));
+    }
+}

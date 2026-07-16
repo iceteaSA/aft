@@ -59,8 +59,76 @@ fn expand_tilde(target: &str) -> String {
     target.to_string()
 }
 
+/// Decode an RFC 8089 `file:` URL to a local filesystem path.
+///
+/// Agents (and users pasting editor links) routinely spell local paths as
+/// `file:///path`, `file:/path`, or `file://localhost/path`; rejecting those
+/// only produces failed tool calls. Accepts empty/`localhost` authorities and
+/// percent-decodes the path. A `file://server/share` form (non-local
+/// authority) becomes a UNC path on Windows and is left undecoded elsewhere.
+/// Grants no extra access: the decoded path flows through the same
+/// resolution and permission checks as any literal path — the plugins apply
+/// the SAME decoding before their permission gates so both layers judge the
+/// identical target.
+fn decode_file_url(target: &str) -> Option<String> {
+    let rest = target.strip_prefix("file:")?;
+    let path_part = if let Some(after) = rest.strip_prefix("//") {
+        let (authority, path) = match after.find('/') {
+            Some(index) => after.split_at(index),
+            None => (after, ""),
+        };
+        match authority {
+            "" | "localhost" => path.to_string(),
+            server if cfg!(windows) => format!("//{server}{path}"),
+            _ => return None,
+        }
+    } else {
+        // RFC 8089 minimal form: `file:/path` (exactly one slash).
+        if !rest.starts_with('/') {
+            return None;
+        }
+        rest.to_string()
+    };
+    let decoded = percent_decode(&path_part);
+    // `file:///C:/path` decodes to `/C:/path`; strip the leading slash so the
+    // drive-letter form is a valid Windows absolute path.
+    if cfg!(windows) {
+        let bytes = decoded.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+        {
+            return Some(decoded[1..].to_string());
+        }
+    }
+    Some(decoded)
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &input[index + 1..index + 3];
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn resolve_path_from_project_root(project_root: &Path, target: &str) -> PathBuf {
-    let expanded = expand_tilde(target);
+    let target = decode_file_url(target)
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(target));
+    let expanded = expand_tilde(&target);
     let path = Path::new(&expanded);
     let joined = if path.is_absolute() {
         path.to_path_buf()

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { resolveAftStorageRoot } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
 import { sendIgnoredMessage } from "../shared/ignored-message.js";
@@ -159,6 +160,29 @@ function isSystemTempPath(target: string): boolean {
 }
 
 /**
+ * Whether a path has the shape of a bash task artifact under the AFT storage
+ * root: <storage>/<harness>/bash-tasks/<task-dir>/<artifact-file>.
+ *
+ * Truncated bash output points agents at these files, and they live outside
+ * every project by design. An external-directory prompt here stalls
+ * unattended sessions for a read the server validates anyway: Rust's
+ * validate_read_path only serves the file when the requesting session OWNS
+ * the task (BgTaskRegistry::is_session_owned_artifact_path) and never allows
+ * writes. The shape check is deliberately narrow — exactly one path segment
+ * per level below bash-tasks — so nothing else under the storage root is
+ * exempted.
+ */
+function isBashTaskArtifactPath(target: string): boolean {
+  const storageRoot = normalizePath(resolveAftStorageRoot());
+  const normalizedTarget = normalizePath(target);
+  if (!containsPath(storageRoot, normalizedTarget)) return false;
+  const relative = normalizedTarget.slice(storageRoot.length).replace(/^[/\\]+/, "");
+  const segments = relative.split(/[/\\]+/);
+  // <harness>/bash-tasks/<task-dir>/<artifact-file>
+  return segments.length === 4 && segments[1] === "bash-tasks";
+}
+
+/**
  * Convert POSIX-style drive paths to Windows drive paths.
  *
  * Mirrors `AppFileSystem.windowsPath` in opencode core — these forms can
@@ -312,6 +336,14 @@ export async function assertExternalDirectoryPermission(
   }
 
   if (isSystemTempPath(absoluteTarget)) return undefined;
+
+  // Bash task artifacts under the AFT storage root: skip the external
+  // prompt for server-validated reads — Rust only serves them to the owning
+  // session, so the prompt protected nothing and stalled unattended runs
+  // whenever a truncation footer pointed the agent at its own task output.
+  if (options?.serverValidatedRead === true && isBashTaskArtifactPath(absoluteTarget)) {
+    return undefined;
+  }
 
   if (typeof context.ask !== "function") return UNSUPPORTED_ASK_HOST;
 
