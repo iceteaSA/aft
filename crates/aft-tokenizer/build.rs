@@ -119,6 +119,13 @@ fn main() {
     }
     writeln!(out, "];").unwrap();
 
+    // Avoid touching the checked-in source when regeneration produces identical
+    // bytes. Rewriting a Cargo input here invalidates every dependent crate and
+    // turns each subsequent build into another full rebuild.
+    if fs::read(&dest).is_ok_and(|current| current == out) {
+        return;
+    }
+
     // Publish atomically: write to a pid-tagged temp in the SAME directory
     // (rename is only atomic within a filesystem) then rename over dest.
     let tmp = dest.with_extension(format!("rs.tmp.{}", std::process::id()));

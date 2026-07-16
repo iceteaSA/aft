@@ -67,6 +67,13 @@ exit 64
 "#,
     );
 
+    // Pay the macOS first-exec assessment for the freshly written shims HERE,
+    // in setup. The login-shell probe inside aft runs under a 3s timeout; on a
+    // busy syspolicyd the first exec of a new inode can take longer than
+    // that, which times out the probe and fails the test spuriously.
+    let _ = std::process::Command::new(&fake_shell).status();
+    let _ = std::process::Command::new(&tool_path).status();
+
     let login_path = format!("{}:/usr/bin:/bin", fake_bin.display());
     let mut aft = AftProcess::spawn_with_env(&[
         // The harness defaults AFT_TEST_RAW_PATH=1 (PATH isolation for

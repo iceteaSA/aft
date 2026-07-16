@@ -33,6 +33,18 @@ run_phase() {
 run_phase "cargo test --workspace --lib --bins --quiet" \
   cargo test --workspace --lib --bins --quiet
 
+# macOS: the first exec of a freshly-linked binary pays a syspolicyd
+# assessment that can take 30-90s when the daemon is busy (it caches per
+# inode afterwards). Integration tests spawn target/debug/aft; without this
+# warm-up the whole first wave of spawning tests queues behind one
+# assessment and dies together at the per-test timeout. Build + ad-hoc sign
+# + exec once so the assessment happens HERE, visibly, instead of as a
+# 90-test failure storm.
+if [[ "$(uname)" == "Darwin" ]]; then
+  run_phase "warm target/debug/aft exec assessment (macOS syspolicyd)" \
+    bash -c 'cargo build -p agent-file-tools --quiet && codesign -f -s - target/debug/aft 2>/dev/null && target/debug/aft --version >/dev/null'
+fi
+
 run_phase "cargo nextest run --workspace -E kind(test) - binary(=watcher_integration)" \
   cargo nextest run --workspace -E 'kind(test) - binary(=watcher_integration)'
 

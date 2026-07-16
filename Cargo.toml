@@ -7,15 +7,16 @@ lto = true
 codegen-units = 1
 strip = true
 
-# Local staging builds (dev binaries for the daemon/NDJSON caches). Thin LTO +
-# parallel codegen gets within a few percent of fat-LTO performance at a
-# fraction of the link time (the fat-LTO + codegen-units=1 final step is
-# single-threaded and routinely 15-50 min on a contended box). GitHub releases
-# keep [profile.release] — maximum optimization for shipped binaries.
+# Local staging builds (dev binaries for the daemon/NDJSON caches). No LTO +
+# default parallel codegen: a dev-bounce binary is rebuilt many times a day,
+# and LTO buys ~10-15% runtime at a link cost that dominates every iteration
+# (dist-grade linking on dev builds was the wrong trade; grok-build measured
+# the same split at 2.2x build time). GitHub releases keep [profile.release]
+# (fat LTO, stripped) — maximum optimization for shipped binaries.
 [profile.stage]
 inherits = "release"
-lto = "thin"
-codegen-units = 4
+lto = false
+codegen-units = 16
 # Line tables + symbol names so `sample`/Instruments on a staged dev module
 # resolves real function names (release inherits strip=true, which left a
 # 91%-CPU thread anonymous during live diagnosis). Costs a few MB of binary

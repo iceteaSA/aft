@@ -525,8 +525,6 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct EnvVarGuard {
         key: &'static str,
         old_value: Option<OsString>,
@@ -637,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_login_shell_candidates_includes_fallbacks() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::process_env_lock();
         let _shell_guard = EnvVarGuard::set("SHELL", "/opt/zerobrew/bin/fish");
         let candidates = login_shell_candidates();
         assert_eq!(candidates[0], PathBuf::from("/opt/zerobrew/bin/fish"));
@@ -647,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_memo_written_and_read() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let _cache_guard = EnvVarGuard::set("AFT_CACHE_DIR", temp.path().to_str().unwrap());
 
@@ -660,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_bounded_re_probe() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::process_env_lock();
         reset_effective_path_state();
 
         let temp = tempfile::tempdir().unwrap();

@@ -104,13 +104,10 @@ pub(crate) fn well_known_windows_bin_dirs(_userprofile: Option<&std::ffi::OsStr>
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
-
-    static PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn find_on_path_manual_returns_null_when_path_unset() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_env::process_env_lock();
         let saved = std::env::var_os("PATH");
         std::env::remove_var("PATH");
         assert!(find_on_path_manual("aft-nonexistent-tool-xyzzy").is_none());
@@ -122,7 +119,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn find_on_path_manual_finds_executable_in_single_dir() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_env::process_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let bin_path = dir.path().join("opencode-test-bin");
         fs::write(&bin_path, "#!/bin/sh\necho ok\n").unwrap();
@@ -146,7 +143,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn find_on_path_manual_skips_non_executable_file() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_env::process_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let bin_path = dir.path().join("opencode-test-bin");
         fs::write(&bin_path, "not executable\n").unwrap();

@@ -7,6 +7,7 @@
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidate};
+use crate::context::SubcLifecycleAdmission;
 use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, LangId};
@@ -46,6 +47,8 @@ const REFRESH_WORKER_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
+#[cfg(test)]
+type ColdBuildBeforePublishObserver = dyn Fn() + Send + Sync + 'static;
 // THREAD-LOCAL, not a process-global: the observer fires synchronously on the
 // thread running the cold build, and the only caller (a test) installs and
 // clears it on its own thread. A process-global `Mutex<Option<...>>` raced
@@ -55,11 +58,18 @@ type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 thread_local! {
     static COLD_BUILD_SWAP_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildSwapObserver>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static COLD_BUILD_BEFORE_PUBLISH_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildBeforePublishObserver>>> =
+        const { std::cell::RefCell::new(None) };
     static MIGRATION_AVAILABLE_DISK_OVERRIDE: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
     static MIGRATION_FAIL_AFTER_TEMP_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MIGRATION_FORCE_BACKUP_BUDGET_EXHAUSTED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static PUBLISH_ADMISSION: std::cell::RefCell<Option<(crate::root_cache::ArtifactPublishEpoch, u64)>> =
+        const { std::cell::RefCell::new(None) };
+    static REFRESH_COMMIT_ADMISSION: std::cell::RefCell<Option<(SubcLifecycleAdmission, Arc<std::sync::atomic::AtomicU64>, u64)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 mod dead_code_projection;
@@ -69,6 +79,22 @@ pub use dead_code_projection::project_dead_code_snapshot;
 pub fn set_cold_build_swap_observer(observer: Option<Arc<ColdBuildSwapObserver>>) {
     COLD_BUILD_SWAP_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
 }
+
+#[cfg(test)]
+fn set_cold_build_before_publish_observer(observer: Option<Arc<ColdBuildBeforePublishObserver>>) {
+    COLD_BUILD_BEFORE_PUBLISH_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_cold_build_before_publish_observer() {
+    let observer = COLD_BUILD_BEFORE_PUBLISH_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer();
+    }
+}
+
+#[cfg(not(test))]
+fn notify_cold_build_before_publish_observer() {}
 
 #[doc(hidden)]
 pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
@@ -83,6 +109,82 @@ pub fn set_legacy_migration_fail_after_temp_copy_for_test(enabled: bool) {
 #[doc(hidden)]
 pub fn set_legacy_migration_backup_budget_exhausted_for_test(enabled: bool) {
     MIGRATION_FORCE_BACKUP_BUDGET_EXHAUSTED.with(|slot| slot.set(enabled));
+}
+
+struct PublishAdmissionGuard {
+    previous: Option<(crate::root_cache::ArtifactPublishEpoch, u64)>,
+}
+
+impl Drop for PublishAdmissionGuard {
+    fn drop(&mut self) {
+        PUBLISH_ADMISSION.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+pub(crate) fn with_publish_epoch<R>(
+    epoch: crate::root_cache::ArtifactPublishEpoch,
+    expected: u64,
+    run: impl FnOnce() -> R,
+) -> R {
+    let previous = PUBLISH_ADMISSION.with(|slot| slot.replace(Some((epoch, expected))));
+    let _guard = PublishAdmissionGuard { previous };
+    run()
+}
+
+fn publish_if_current<R>(publish: impl FnOnce() -> Result<R>) -> Result<R> {
+    let admission = PUBLISH_ADMISSION.with(|slot| slot.borrow().clone());
+    match admission {
+        Some((epoch, expected)) => epoch
+            .run_if_current(expected, publish)
+            .unwrap_or(Err(CallGraphStoreError::Superseded)),
+        None => publish(),
+    }
+}
+
+struct RefreshCommitAdmissionGuard {
+    previous: Option<(
+        SubcLifecycleAdmission,
+        Arc<std::sync::atomic::AtomicU64>,
+        u64,
+    )>,
+}
+
+impl Drop for RefreshCommitAdmissionGuard {
+    fn drop(&mut self) {
+        REFRESH_COMMIT_ADMISSION.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+fn with_refresh_commit_admission<R>(
+    lifecycle: SubcLifecycleAdmission,
+    generation_flag: Arc<std::sync::atomic::AtomicU64>,
+    expected_generation: u64,
+    run: impl FnOnce() -> R,
+) -> R {
+    let previous = REFRESH_COMMIT_ADMISSION
+        .with(|slot| slot.replace(Some((lifecycle, generation_flag, expected_generation))));
+    let _guard = RefreshCommitAdmissionGuard { previous };
+    run()
+}
+
+fn commit_incremental_if_current(tx: Transaction<'_>) -> Result<()> {
+    let admission = REFRESH_COMMIT_ADMISSION.with(|slot| slot.borrow().clone());
+    let commit = || {
+        publish_if_current(|| {
+            tx.commit()?;
+            Ok(())
+        })
+    };
+    match admission {
+        Some((lifecycle, generation_flag, expected_generation)) => lifecycle
+            .run_if_current(generation_flag.as_ref(), expected_generation, commit)
+            .unwrap_or(Err(CallGraphStoreError::Superseded)),
+        None => commit(),
+    }
 }
 
 fn notify_cold_build_swap_observer(temp_path: &Path, target_path: &Path) {
@@ -101,6 +203,7 @@ pub enum CallGraphStoreError {
     Lock(crate::fs_lock::AcquireError),
     MissingCallerData { file: String },
     Unavailable(String),
+    Superseded,
     StaleFiles(Vec<String>),
 }
 
@@ -117,6 +220,9 @@ impl fmt::Display for CallGraphStoreError {
             }
             Self::Unavailable(message) => {
                 write!(formatter, "callgraph store unavailable: {message}")
+            }
+            Self::Superseded => {
+                write!(formatter, "callgraph store build superseded before publish")
             }
             Self::StaleFiles(files) => {
                 write!(
@@ -182,10 +288,44 @@ struct RefreshRoot {
 }
 
 #[derive(Clone)]
+pub(crate) struct CallgraphRefreshTicket {
+    lifecycle: SubcLifecycleAdmission,
+    generation_flag: Arc<std::sync::atomic::AtomicU64>,
+    expected_generation: u64,
+    publish_epoch: crate::root_cache::ArtifactPublishEpoch,
+    expected_publish_epoch: u64,
+}
+
+impl CallgraphRefreshTicket {
+    pub(crate) fn new(
+        lifecycle: SubcLifecycleAdmission,
+        generation_flag: Arc<std::sync::atomic::AtomicU64>,
+        expected_generation: u64,
+        publish_epoch: crate::root_cache::ArtifactPublishEpoch,
+        expected_publish_epoch: u64,
+    ) -> Self {
+        Self {
+            lifecycle,
+            generation_flag,
+            expected_generation,
+            publish_epoch,
+            expected_publish_epoch,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        self.lifecycle
+            .is_current(self.generation_flag.as_ref(), self.expected_generation)
+            && self.publish_epoch.current() == self.expected_publish_epoch
+    }
+}
+
+#[derive(Clone)]
 struct RefreshBatch {
     root: RefreshRoot,
     paths: BTreeSet<PathBuf>,
     pending_sinks: Vec<PendingCallGraphStorePaths>,
+    ticket: Option<CallgraphRefreshTicket>,
 }
 
 impl RefreshBatch {
@@ -199,8 +339,12 @@ impl RefreshBatch {
         &mut self,
         paths: impl IntoIterator<Item = PathBuf>,
         sink: PendingCallGraphStorePaths,
+        ticket: Option<CallgraphRefreshTicket>,
     ) {
         self.paths.extend(paths);
+        if ticket.is_some() {
+            self.ticket = ticket;
+        }
         if !self
             .pending_sinks
             .iter()
@@ -300,6 +444,7 @@ impl RefreshWorker {
         root: RefreshRoot,
         paths: Vec<PathBuf>,
         pending_sink: PendingCallGraphStorePaths,
+        ticket: Option<CallgraphRefreshTicket>,
     ) -> bool {
         let mut queue = self
             .shared
@@ -311,7 +456,7 @@ impl RefreshWorker {
             return false;
         }
         if let Some(batch) = queue.queued.get_mut(&root) {
-            batch.merge(paths, pending_sink);
+            batch.merge(paths, pending_sink, ticket);
         } else {
             queue.order.push_back(root.clone());
             queue.queued.insert(
@@ -320,6 +465,7 @@ impl RefreshWorker {
                     root,
                     paths: paths.into_iter().collect(),
                     pending_sinks: vec![pending_sink],
+                    ticket,
                 },
             );
         }
@@ -380,6 +526,32 @@ pub fn enqueue_callgraph_store_refresh(
     paths: Vec<PathBuf>,
     pending_sink: PendingCallGraphStorePaths,
 ) -> bool {
+    enqueue_callgraph_store_refresh_inner(callgraph_dir, project_root, paths, pending_sink, None)
+}
+
+pub(crate) fn enqueue_callgraph_store_refresh_fenced(
+    callgraph_dir: PathBuf,
+    project_root: PathBuf,
+    paths: Vec<PathBuf>,
+    pending_sink: PendingCallGraphStorePaths,
+    ticket: CallgraphRefreshTicket,
+) -> bool {
+    enqueue_callgraph_store_refresh_inner(
+        callgraph_dir,
+        project_root,
+        paths,
+        pending_sink,
+        Some(ticket),
+    )
+}
+
+fn enqueue_callgraph_store_refresh_inner(
+    callgraph_dir: PathBuf,
+    project_root: PathBuf,
+    paths: Vec<PathBuf>,
+    pending_sink: PendingCallGraphStorePaths,
+    ticket: Option<CallgraphRefreshTicket>,
+) -> bool {
     if paths.is_empty() {
         return true;
     }
@@ -397,6 +569,7 @@ pub fn enqueue_callgraph_store_refresh(
         },
         paths,
         pending_sink,
+        ticket,
     )
 }
 
@@ -467,6 +640,16 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
 }
 
 fn process_callgraph_refresh_batch(batch: &RefreshBatch) {
+    if batch
+        .ticket
+        .as_ref()
+        .is_some_and(|ticket| !ticket.is_current())
+    {
+        // Superseded before starting: park the paths so the next configure's
+        // pending replay (or unbind cleanup) decides their fate.
+        batch.defer();
+        return;
+    }
     let paths = batch.paths.iter().cloned().collect::<Vec<_>>();
     let _watchdog = RefreshWorkerWatchdog::start(&paths);
     let store = match CallGraphStore::open_ready(
@@ -498,13 +681,41 @@ fn process_callgraph_refresh_batch(batch: &RefreshBatch) {
     if !test_seam.delay.is_zero() {
         std::thread::sleep(test_seam.delay);
     }
+    if batch
+        .ticket
+        .as_ref()
+        .is_some_and(|ticket| !ticket.is_current())
+    {
+        batch.defer();
+        return;
+    }
     let refresh_result = if test_seam.fail_refresh {
         Err(CallGraphStoreError::Unavailable(
             "injected refresh worker failure".to_string(),
         ))
+    } else if let Some(ticket) = &batch.ticket {
+        with_publish_epoch(
+            ticket.publish_epoch.clone(),
+            ticket.expected_publish_epoch,
+            || {
+                with_refresh_commit_admission(
+                    ticket.lifecycle.clone(),
+                    Arc::clone(&ticket.generation_flag),
+                    ticket.expected_generation,
+                    || store.refresh_files(&paths).map(|_| ()),
+                )
+            },
+        )
     } else {
         store.refresh_files(&paths).map(|_| ())
     };
+    if matches!(refresh_result, Err(CallGraphStoreError::Superseded)) {
+        // The commit lost the fence race: a newer configure or publication
+        // owns the store now. Defer instead of stale-marking — the paths were
+        // never committed, and the replacement generation re-indexes them.
+        batch.defer();
+        return;
+    }
     if let Err(error) = refresh_result {
         crate::slog_warn!("callgraph store refresh failed: {}", error);
         match store.mark_files_stale(&paths) {
@@ -1296,9 +1507,45 @@ impl CallGraphStore {
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<(Self, ColdBuildStats)> {
+        Self::cold_build_with_lease_chunked_inner(
+            callgraph_dir,
+            project_root,
+            files,
+            chunk_size,
+            false,
+        )
+    }
+
+    pub(crate) fn force_cold_build_with_lease_chunked(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        files: &[PathBuf],
+        chunk_size: usize,
+    ) -> Result<(Self, ColdBuildStats)> {
+        Self::cold_build_with_lease_chunked_inner(
+            callgraph_dir,
+            project_root,
+            files,
+            chunk_size,
+            true,
+        )
+    }
+
+    fn cold_build_with_lease_chunked_inner(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        files: &[PathBuf],
+        chunk_size: usize,
+        require_new_publication: bool,
+    ) -> Result<(Self, ColdBuildStats)> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
+            if require_new_publication {
+                return Err(CallGraphStoreError::Unavailable(
+                    "forced rebuild could not acquire the writer lease".to_string(),
+                ));
+            }
             let store = match Self::open_readonly(callgraph_dir.clone(), project_root.clone())? {
                 Some(store) => store.into_inner(),
                 None => Self::borrow_only_empty(callgraph_dir, project_root, project_key)?,
@@ -1525,20 +1772,28 @@ impl CallGraphStore {
             stats
         };
 
-        verify_writer_lease(&writer_lease)?;
-        // Move the finished build to its final generation path. This target is
-        // brand-new and owned by us, so the rename never hits an open file.
-        remove_sqlite_file_set(&gen_path);
-        crate::fs_lock::rename_over(&temp_path, &gen_path)?;
-        crate::fs_lock::sync_parent(&gen_path);
-        remove_sqlite_sidecars(&gen_path);
+        notify_cold_build_before_publish_observer();
+        let publication = publish_if_current(|| {
+            verify_writer_lease(&writer_lease)?;
+            // Move the finished build to its final generation path. This target is
+            // brand-new and owned by us, so the rename never hits an open file.
+            remove_sqlite_file_set(&gen_path);
+            crate::fs_lock::rename_over(&temp_path, &gen_path)?;
+            crate::fs_lock::sync_parent(&gen_path);
+            remove_sqlite_sidecars(&gen_path);
 
-        notify_cold_build_swap_observer(&temp_path, &gen_path);
+            notify_cold_build_swap_observer(&temp_path, &gen_path);
 
-        // Atomically publish the new generation, then best-effort GC old ones.
-        verify_writer_lease(&writer_lease)?;
-        publish_pointer(callgraph_dir, project_key, &generation)?;
-        gc_old_generations(callgraph_dir, project_key, &generation);
+            // Atomically publish the new generation, then best-effort GC old ones.
+            verify_writer_lease(&writer_lease)?;
+            publish_pointer(callgraph_dir, project_key, &generation)?;
+            gc_old_generations(callgraph_dir, project_key, &generation);
+            Ok(())
+        });
+        if matches!(publication, Err(CallGraphStoreError::Superseded)) {
+            remove_sqlite_file_set(&temp_path);
+        }
+        publication?;
         Ok((stats, generation))
     }
 
@@ -2202,7 +2457,7 @@ impl CallGraphStore {
         profile.method_dispatch += started.elapsed();
 
         let started = Instant::now();
-        tx.commit()?;
+        commit_incremental_if_current(tx)?;
         profile.commit += started.elapsed();
         profile.total = total_started.elapsed();
         Ok((
@@ -4129,16 +4384,22 @@ fn publish_migrated_generation(
     writer_lease: Arc<crate::root_cache::WriterLease>,
     method: &str,
 ) -> Result<String> {
-    verify_writer_lease(&writer_lease)?;
     let gen_path = callgraph_dir.join(generation);
-    remove_sqlite_file_set(&gen_path);
-    rename_sqlite_file_set(temp_path, &gen_path)?;
-    crate::fs_lock::sync_parent(&gen_path);
+    let publication = publish_if_current(|| {
+        verify_writer_lease(&writer_lease)?;
+        remove_sqlite_file_set(&gen_path);
+        rename_sqlite_file_set(temp_path, &gen_path)?;
+        crate::fs_lock::sync_parent(&gen_path);
 
-    verify_writer_lease(&writer_lease)?;
-    publish_pointer(callgraph_dir, project_key, generation)?;
-    write_migration_manifest(callgraph_dir, generation, source, migrated_bytes, method)?;
-    Ok(generation.to_string())
+        verify_writer_lease(&writer_lease)?;
+        publish_pointer(callgraph_dir, project_key, generation)?;
+        write_migration_manifest(callgraph_dir, generation, source, migrated_bytes, method)?;
+        Ok(generation.to_string())
+    });
+    if matches!(publication, Err(CallGraphStoreError::Superseded)) {
+        remove_sqlite_file_set(temp_path);
+    }
+    publication
 }
 
 fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
@@ -4736,18 +4997,21 @@ fn reconcile_workspace_roots(
         });
     }
 
-    let tx = conn.transaction()?;
-    tx.execute(
-        "UPDATE OR IGNORE backend_file_state
-         SET workspace_root = ?1
-         WHERE workspace_root <> ?1",
-        params![&current_root],
-    )?;
-    tx.execute(
-        "DELETE FROM backend_file_state WHERE workspace_root <> ?1",
-        params![&current_root],
-    )?;
-    tx.commit()?;
+    publish_if_current(|| {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE OR IGNORE backend_file_state
+             SET workspace_root = ?1
+             WHERE workspace_root <> ?1",
+            params![&current_root],
+        )?;
+        tx.execute(
+            "DELETE FROM backend_file_state WHERE workspace_root <> ?1",
+            params![&current_root],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })?;
 
     crate::slog_info!(
         "callgraph store re-rooted from {} to {}",
@@ -6036,6 +6300,25 @@ fn resolve_exported_symbol(
     requested: &str,
     depth: usize,
 ) -> Option<(String, String)> {
+    let mut visited = std::collections::HashMap::new();
+    resolve_exported_symbol_inner(index, file, requested, depth, &mut visited)
+}
+
+/// Re-export graphs are frequently cyclic (barrel files re-exporting each
+/// other, `pub use` cycles). The depth cap alone bounds path LENGTH, not path
+/// COUNT: with wildcard fan-out the walk explores branching^depth paths and a
+/// single resolution can burn CPU-minutes. The memo prunes re-visits of a
+/// (file, symbol) pair — but only when the earlier visit had at least as much
+/// remaining depth budget (a shallower re-visit can reach leaves the deeper
+/// first visit had to cut off at the cap, so plain visited-set pruning would
+/// lose resolutions the capped walk finds).
+fn resolve_exported_symbol_inner(
+    index: &ProjectIndex<'_>,
+    file: &str,
+    requested: &str,
+    depth: usize,
+    visited: &mut std::collections::HashMap<(String, String), usize>,
+) -> Option<(String, String)> {
     if depth > 16 {
         return None;
     }
@@ -6063,6 +6346,21 @@ fn resolve_exported_symbol(
         return Some((file.to_string(), default));
     }
 
+    // Memo check sits after the local-export fast paths: the common direct
+    // hit never allocates the key, and a hit through the memo would have
+    // returned above anyway.
+    match visited.entry((file.to_string(), requested.to_string())) {
+        std::collections::hash_map::Entry::Occupied(mut seen) => {
+            if *seen.get() <= depth {
+                return None;
+            }
+            seen.insert(depth);
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(depth);
+        }
+    }
+
     for reexport in index.reexports_for(file) {
         let mut next_requested = requested.to_string();
         let matches = if reexport.wildcard {
@@ -6077,9 +6375,13 @@ fn resolve_exported_symbol(
             continue;
         }
         if let Some(target_file) = &reexport.target_file {
-            if let Some(target) =
-                resolve_exported_symbol(index, target_file, &next_requested, depth + 1)
-            {
+            if let Some(target) = resolve_exported_symbol_inner(
+                index,
+                target_file,
+                &next_requested,
+                depth + 1,
+                visited,
+            ) {
                 return Some(target);
             }
         }
@@ -9576,14 +9878,18 @@ fn unix_seconds_now() -> i64 {
         .as_secs() as i64
 }
 
+/// Serializes every test that drives the process-wide refresh worker
+/// (enqueue/flush swap the shared worker slot; a concurrent flush can shut a
+/// worker down between another test's enqueue and its flush, deferring the
+/// batch and zeroing that test's seam counts).
+#[cfg(test)]
+pub(crate) static REFRESH_WORKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod refresh_worker_tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex as TestMutex;
     use tempfile::tempdir;
-
-    static REFRESH_WORKER_TEST_LOCK: TestMutex<()> = TestMutex::new(());
 
     fn ready_store_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let temp = tempdir().unwrap();
@@ -9619,6 +9925,214 @@ mod refresh_worker_tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn forced_rebuild_without_writer_capability_cannot_report_old_store_as_ready() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempdir().unwrap();
+        let main = temp.path().join("main");
+        let root = temp.path().join("worktree");
+        fs::create_dir_all(&main).unwrap();
+        let mut git = std::process::Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(git.arg("init").arg(&main))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source = main.join("lib.rs");
+        fs::write(&source, "pub fn marker() {}\n").unwrap();
+        for args in [
+            vec![
+                "-C",
+                main.to_str().unwrap(),
+                "config",
+                "user.email",
+                "test@example.com",
+            ],
+            vec![
+                "-C",
+                main.to_str().unwrap(),
+                "config",
+                "user.name",
+                "AFT Test",
+            ],
+            vec!["-C", main.to_str().unwrap(), "add", "lib.rs"],
+            vec!["-C", main.to_str().unwrap(), "commit", "-m", "fixture"],
+        ] {
+            let mut command = std::process::Command::new("git");
+            assert!(crate::test_env::apply_hermetic_git_env(command.args(args))
+                .status()
+                .unwrap()
+                .success());
+        }
+        let mut worktree = std::process::Command::new("git");
+        assert!(crate::test_env::apply_hermetic_git_env(
+            worktree
+                .arg("-C")
+                .arg(&main)
+                .args(["worktree", "add", "--detach"])
+                .arg(&root),
+        )
+        .status()
+        .unwrap()
+        .success());
+
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        let callgraph_dir = temp.path().join("callgraph").join(&project_key);
+        crate::root_cache::configure_artifact_access(&root, &project_key, true);
+        let source = root.join("lib.rs");
+        let error =
+            CallGraphStore::force_cold_build_with_lease_chunked(callgraph_dir, root, &[source], 1)
+                .expect_err("borrow-only forced rebuild must remain unsatisfied");
+
+        assert!(matches!(error, CallGraphStoreError::Unavailable(_)));
+    }
+
+    #[test]
+    fn fenced_refresh_with_stale_lifecycle_generation_defers_paths_without_commit() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+
+        let lifecycle = SubcLifecycleAdmission::default();
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let publish_epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            lifecycle,
+            Arc::clone(&generation),
+            7,
+            publish_epoch.clone(),
+            publish_epoch.current(),
+        );
+        // Supersede before the worker runs: the batch must defer, not commit.
+        generation.store(8, std::sync::atomic::Ordering::SeqCst);
+
+        enqueue_callgraph_store_refresh_fenced(
+            callgraph_dir,
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            ticket,
+        );
+        assert!(flush_callgraph_store_refreshes_with_budget(
+            Duration::from_secs(5)
+        ));
+        assert_eq!(
+            callgraph_refresh_worker_test_counts(&root).0,
+            0,
+            "superseded batch must not reach refresh_files"
+        );
+        assert!(
+            pending.lock().contains(&source),
+            "superseded batch must defer its paths to the pending sink"
+        );
+        clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    #[test]
+    fn fenced_refresh_with_advanced_publish_epoch_defers_paths_without_commit() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+
+        let lifecycle = SubcLifecycleAdmission::default();
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let publish_epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let expected_epoch = publish_epoch.current();
+        let ticket = CallgraphRefreshTicket::new(
+            lifecycle,
+            generation,
+            3,
+            publish_epoch.clone(),
+            expected_epoch,
+        );
+        // A cold build published a replacement generation after enqueue.
+        publish_epoch.next();
+
+        enqueue_callgraph_store_refresh_fenced(
+            callgraph_dir,
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            ticket,
+        );
+        assert!(flush_callgraph_store_refreshes_with_budget(
+            Duration::from_secs(5)
+        ));
+        assert_eq!(
+            callgraph_refresh_worker_test_counts(&root).0,
+            0,
+            "epoch-superseded batch must not reach refresh_files"
+        );
+        assert!(
+            pending.lock().contains(&source),
+            "epoch-superseded batch must defer its paths to the pending sink"
+        );
+        clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    #[test]
+    fn fenced_refresh_with_current_ticket_commits_normally() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+
+        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
+
+        let lifecycle = SubcLifecycleAdmission::default();
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let publish_epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            lifecycle,
+            generation,
+            5,
+            publish_epoch.clone(),
+            publish_epoch.current(),
+        );
+
+        enqueue_callgraph_store_refresh_fenced(
+            callgraph_dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            ticket,
+        );
+        assert!(flush_callgraph_store_refreshes_with_budget(
+            Duration::from_secs(5)
+        ));
+        assert_eq!(
+            callgraph_refresh_worker_test_counts(&root).0,
+            1,
+            "current ticket must run the refresh"
+        );
+        assert!(
+            pending.lock().is_empty(),
+            "committed batch must not defer paths"
+        );
+
+        let store = CallGraphStore::open_readonly(callgraph_dir, root.clone())
+            .unwrap()
+            .expect("published generation must remain readable");
+        let tree = store.call_tree(Path::new("main.rs"), "entry", 1).unwrap();
+        assert_eq!(
+            tree.children[0].name, "new_leaf",
+            "fenced commit must actually persist the refreshed content"
+        );
+        clear_callgraph_refresh_worker_test_seam(&root);
     }
 
     #[test]
@@ -10092,6 +10606,75 @@ export function leaf() {}
             collect_source_freshness(&path, source).expect("collect freshness from source");
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn superseded_cold_build_cannot_publish_after_newer_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        let callgraph_dir = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("lib.rs");
+        std::fs::write(&source, "pub fn old_generation_marker() {}\n").unwrap();
+        let files = vec![source.clone()];
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let old_epoch = epoch.next();
+        let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let old_epoch_flag = epoch.clone();
+        let old_dir = callgraph_dir.path().to_path_buf();
+        let old_root = root.path().to_path_buf();
+        let old_files = files.clone();
+        let old = std::thread::spawn(move || {
+            set_cold_build_before_publish_observer(Some(Arc::new(move || {
+                reached_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })));
+            let result = with_publish_epoch(old_epoch_flag, old_epoch, || {
+                CallGraphStore::cold_build_with_lease(old_dir, old_root, &old_files)
+            });
+            set_cold_build_before_publish_observer(None);
+            result
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("older build did not reach its publication barrier");
+
+        std::fs::write(&source, "pub fn new_generation_marker() {}\n").unwrap();
+        let new_epoch = epoch.next();
+        let new_store = with_publish_epoch(epoch.clone(), new_epoch, || {
+            CallGraphStore::cold_build_with_lease(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+            )
+        })
+        .expect("newer build should publish");
+        drop(new_store);
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            old.join().unwrap(),
+            Err(CallGraphStoreError::Superseded)
+        ));
+
+        let current = CallGraphStore::open_readonly(
+            callgraph_dir.path().to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .unwrap()
+        .expect("current callgraph generation");
+        assert_eq!(
+            current
+                .nodes_matching("new_generation_marker")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(current
+            .nodes_matching("old_generation_marker")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -11245,6 +11828,125 @@ mod build_pool_tests {
             .unwrap_or(1);
         let expected = cores.div_ceil(2).clamp(1, 8);
         assert_eq!(size, expected, "pool size must be div_ceil(2).clamp(1,8)");
+    }
+}
+
+#[cfg(test)]
+mod reexport_resolution_tests {
+    use super::*;
+
+    fn barrel_index(files: Vec<(String, DbFileIndex)>) -> ProjectIndex<'static> {
+        ProjectIndex {
+            project_root: PathBuf::from("/fixture"),
+            files: files.into_iter().collect(),
+            caller_data: HashMap::new(),
+            workspace_crate_prefixes: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn barrel_file(reexport_targets: &[&str]) -> DbFileIndex {
+        DbFileIndex {
+            lang: None,
+            exports: HashSet::new(),
+            default_export: None,
+            export_aliases: HashMap::new(),
+            node_by_scoped: HashMap::new(),
+            node_by_bare: HashMap::new(),
+            module_targets: HashMap::new(),
+            reexports: reexport_targets
+                .iter()
+                .map(|target| ReexportIndex {
+                    target_file: Some((*target).to_string()),
+                    named: HashMap::new(),
+                    wildcard: true,
+                })
+                .collect(),
+        }
+    }
+
+    /// A dense wildcard re-export cycle (barrel files re-exporting each
+    /// other) must resolve in O(files), not O(branching^depth). Without the
+    /// resolver's memoization, resolving a MISSING symbol through this
+    /// 12-file complete digraph explores ~11^16 paths and this test never
+    /// finishes: the depth cap bounds path length, not path count, and one
+    /// such resolution can pin a worker thread at 100% CPU indefinitely.
+    #[test]
+    fn missing_symbol_in_dense_wildcard_reexport_cycle_terminates() {
+        let names: Vec<String> = (0..12).map(|i| format!("src/barrel{i}.ts")).collect();
+        let files = names
+            .iter()
+            .map(|name| {
+                let targets: Vec<&str> = names
+                    .iter()
+                    .filter(|other| *other != name)
+                    .map(String::as_str)
+                    .collect();
+                (name.clone(), barrel_file(&targets))
+            })
+            .collect();
+        let index = barrel_index(files);
+
+        assert_eq!(
+            resolve_exported_symbol(&index, "src/barrel0.ts", "does_not_exist", 0),
+            None
+        );
+    }
+
+    /// Depth-dominance counterexample: the walk first reaches `shared` down a
+    /// 16-hop chain (no budget left for its leaf), then reaches it again
+    /// directly at depth 1. Plain visited-set pruning would skip the second
+    /// visit and lose a resolution the capped resolver finds; the
+    /// depth-dominance memo revisits because the second arrival is shallower.
+    #[test]
+    fn shallow_revisit_after_deep_capped_visit_still_resolves() {
+        let mut leaf = barrel_file(&[]);
+        leaf.exports.insert("deep_symbol".to_string());
+        let mut files: Vec<(String, DbFileIndex)> = Vec::new();
+        // entry -> chain0 -> chain1 -> ... -> chain14 -> shared -> leaf
+        // entry's SECOND reexport goes straight to shared.
+        files.push((
+            "src/entry.ts".to_string(),
+            barrel_file(&["src/chain0.ts", "src/shared.ts"]),
+        ));
+        for i in 0..15 {
+            let next = if i == 14 {
+                "src/shared.ts".to_string()
+            } else {
+                format!("src/chain{}.ts", i + 1)
+            };
+            files.push((format!("src/chain{i}.ts"), barrel_file(&[&next])));
+        }
+        files.push(("src/shared.ts".to_string(), barrel_file(&["src/leaf.ts"])));
+        files.push(("src/leaf.ts".to_string(), leaf));
+        let index = barrel_index(files);
+
+        assert_eq!(
+            resolve_exported_symbol(&index, "src/entry.ts", "deep_symbol", 0),
+            Some(("src/leaf.ts".to_string(), "deep_symbol".to_string())),
+            "a shallower re-visit must not be pruned by a deeper capped visit"
+        );
+    }
+
+    #[test]
+    fn symbol_reachable_through_reexport_cycle_still_resolves() {
+        let mut leaf = barrel_file(&[]);
+        leaf.exports.insert("real_symbol".to_string());
+        let index = barrel_index(vec![
+            (
+                "src/a.ts".to_string(),
+                barrel_file(&["src/b.ts", "src/a.ts"]),
+            ),
+            (
+                "src/b.ts".to_string(),
+                barrel_file(&["src/a.ts", "src/leaf.ts"]),
+            ),
+            ("src/leaf.ts".to_string(), leaf),
+        ]);
+
+        assert_eq!(
+            resolve_exported_symbol(&index, "src/a.ts", "real_symbol", 0),
+            Some(("src/leaf.ts".to_string(), "real_symbol".to_string()))
+        );
     }
 }
 

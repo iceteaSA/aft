@@ -2903,6 +2903,13 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&fake_tsgo, fs::Permissions::from_mode(0o755)).unwrap();
+        // Pay the macOS first-exec assessment for the fresh shim in setup:
+        // under a busy syspolicyd it can exceed the checker timeout inside
+        // validate_full and fail this test as a spurious "timeout" skip.
+        let _ = std::process::Command::new(&fake_tsgo)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
 
         let mut config = Config {
             project_root: Some(dir.path().to_path_buf()),
