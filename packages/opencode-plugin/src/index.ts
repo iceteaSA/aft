@@ -205,13 +205,14 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.46.0";
+const ANNOUNCEMENT_VERSION = "0.47.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "TUI sidebar fixed on OpenCode 1.17.x: the panel is precompiled against the host runtime (no more import failures or frozen values), and it now works when the TUI is attached to a serve/Desktop host from another directory.",
-  "Search index changes persist on clean shutdown, so restarts and cross-worktree searches see current results.",
-  "Cross-project search: sessions can search sibling checkouts read-only, serving borrowed indexes with drift warnings instead of failing.",
-  "Duplicate detection requires a 10-line minimum span, ending flags on 3-4 line idiomatic blocks.",
-  "Pi edit tool supports batch edits[] arrays, matching OpenCode.",
+  "Big background CPU cuts: semantic re-embeds coalesce behind a 15s quiet window instead of firing per edit, file-change processing is sliced and budgeted, and a callgraph resolver bug that could pin a core at 100% on cyclic barrel re-exports is fixed.",
+  "Faster search: indexed grep and glob skip a per-query filesystem walk (2-4x faster), and cross-project search reuses cached artifacts (~40x faster).",
+  "bash with wait:true now detaches to the background the moment you send a new message instead of blocking the conversation.",
+  "apply_patch failures show the nearest-miss file lines so a failed patch is fixable in one shot; batch edits support replaceAll per item.",
+  "Groovy, Gradle, and Jenkinsfile support in outline, zoom, search, and AST tools.",
+  "Fixed: LSP memory growth during repeated scoped diagnostics (#160), fresh LSP auto-installs picked up without restart (#153), and truthful delete results for symlinked directories and failed batches.",
 ];
 
 /**
