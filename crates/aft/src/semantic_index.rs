@@ -540,7 +540,29 @@ fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
 /// failures and timeouts; query requests use the same classification but have a
 /// one-attempt policy.
 fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout()
+    if error.is_connect() || error.is_timeout() {
+        return true;
+    }
+    // A connection reset/abort mid-request is the backend dying between
+    // accept and response (local backends do this when they crash or restart
+    // under load) — the same "temporarily failing" class as a refused
+    // connection, just later in the exchange. reqwest surfaces it as a plain
+    // send error, so classify from the io source chain.
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) {
+                return true;
+            }
+        }
+        source = std::error::Error::source(inner);
+    }
+    false
 }
 
 fn embedding_response_read_error_is_transient(error: &reqwest::Error) -> bool {
@@ -4772,7 +4794,17 @@ Connection: close
             embedding_failure_is_transient(&error),
             "body read failures should be transient-marked: {error}"
         );
-        assert!(error.contains("response read failed"));
+        // The mock closes the socket after writing a truncated body. Whether
+        // the client observes that as a body-read EOF or as a send-stage
+        // connection reset is an OS-level race (Windows sends RST when the
+        // socket closes with unread request bytes, and under load the mock's
+        // single read can return early). Both shapes are the backend dying
+        // mid-exchange and both must carry the transient marker; the message
+        // prefix differs by stage.
+        assert!(
+            error.contains("response read failed") || error.contains("request failed"),
+            "unexpected error shape: {error}"
+        );
     }
 
     fn test_vector_for_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
