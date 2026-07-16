@@ -206,7 +206,10 @@ fn body_read_stall_aborts_within_timeout() {
         )
         .expect("write stall headers");
         stream.flush().expect("flush stall headers");
-        thread::sleep(Duration::from_secs(30));
+        // Must dwarf the assert bound below so a broken stall-abort cannot
+        // sneak under it; the thread detaches on MockServer drop, so the
+        // long sleep never blocks test teardown.
+        thread::sleep(Duration::from_secs(120));
     });
     let mut aft = configure_with_storage(project.path(), storage.path());
     let started = Instant::now();
@@ -226,8 +229,13 @@ fn body_read_stall_aborts_within_timeout() {
         .as_str()
         .unwrap_or_default()
         .contains("Body read stalled"));
+    // The product timeout is BODY_CHUNK_TIMEOUT (15s). The bound checks that
+    // the abort FIRED (vs riding out the mock's 120s stall), not its
+    // precision — a contended Windows CI runner adds tens of seconds of
+    // scheduling overhead on top of the timer (memory 6987), which flaked the
+    // old 22s bound.
     assert!(
-        started.elapsed() < Duration::from_secs(22),
+        started.elapsed() < Duration::from_secs(75),
         "stall timeout took too long: {:?}",
         started.elapsed()
     );

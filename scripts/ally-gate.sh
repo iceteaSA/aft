@@ -14,7 +14,9 @@
 #   ALLY=user@host scripts/ally-gate.sh      # override target machine
 set -euo pipefail
 
-ALLY="${ALLY:-ufuka@192.168.1.47}"
+# The Ally takes DHCP leases; if this address goes stale, ping-sweep the /24
+# and probe ssh as ufuka (hostname reports AsusAllyKO).
+ALLY="${ALLY:-ufuka@192.168.1.42}"
 FILTER="${1:-test(status_memory) | test(refresh_worker_tests) | test(subc_storm) | test(subc_bridge) | test(bash_background)}"
 
 # Direct git-over-ssh to Windows sshd is broken by cmd.exe quoting (the
