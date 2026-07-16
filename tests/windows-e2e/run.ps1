@@ -689,8 +689,10 @@ function Invoke-AftNdjsonScenario {
     }
 }
 
-# Plugin log path on Windows -- Node's os.tmpdir() resolves to $env:TEMP.
-$PluginLog = Join-Path $env:TEMP "aft-plugin.log"
+# Plugin log path on Windows: the plugin writes durable rotated logs under
+# the CortexKit data root (resolveAftLogPath -> LOCALAPPDATA\cortexkit\aft\logs),
+# not the old %TEMP% single file.
+$PluginLog = Join-Path $CacheBase "cortexkit\aft\logs\aft-plugin.log"
 if (Test-Path $PluginLog) { Remove-Item $PluginLog -Force }
 
 # ---------------------------------------------------------------------------
@@ -762,8 +764,10 @@ if (-not $logExists) {
     # didn't expect. Node's os.tmpdir() on Windows resolves to %TEMP% but
     # may be different under cmd.exe vs PowerShell tokens.
     $candidates = @(
+        (Join-Path $env:TEMP "aft-plugin.log"),
         (Join-Path $env:USERPROFILE "AppData\Local\Temp\aft-plugin.log"),
         (Join-Path $env:LOCALAPPDATA "Temp\aft-plugin.log"),
+        (Join-Path $env:APPDATA "cortexkit\aft\logs\aft-plugin.log"),
         "C:\Windows\Temp\aft-plugin.log"
     )
     foreach ($p in $candidates) {
