@@ -8403,7 +8403,16 @@ async fn expect_status_sentinel_without_marker_before(
             FrameType::Push => {
                 assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
                 let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-                if sentinel_channels != expected_channels {
+                // The ordering guarantee under test is PER-CHANNEL. A frame on a
+                // channel outside the expected set is a pre-goodbye straggler
+                // that was fanned out while that channel was still bound and was
+                // sitting in the budgeted egress queue; the real daemon drops
+                // module frames on released channels, so it asserts nothing
+                // about ordering on the live channels. Only forbid the stale
+                // marker where the guarantee applies.
+                if sentinel_channels != expected_channels
+                    && expected_channels.contains(&frame.header.channel)
+                {
                     assert_ne!(
                         push_marker(&body),
                         Some(forbidden_marker),
