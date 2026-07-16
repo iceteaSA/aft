@@ -4661,6 +4661,10 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
             "lossy-pressure",
             pressure_task,
             HashSet::from([6]),
+            // Channel 7 binds with the SAME session ("session-6") and may join
+            // the route table mid-burst; same-session delivery to it is
+            // legitimate, only other channels would be a leak.
+            HashSet::from([6, 7]),
         )
         .await;
     assert!(
@@ -4677,6 +4681,7 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
             "lossy-pressure",
             2047,
             HashSet::from([6]),
+            HashSet::from([6, 7]),
         )
         .await;
         assert_eq!(final_pressure_pushes.len(), 1);
@@ -7946,10 +7951,15 @@ async fn expect_route_bind_ack_status_and_bash_completed_pushes(
     corr: u64,
     marker: &str,
     task_id: &str,
-    expected_channels: HashSet<u16>,
+    required_channels: HashSet<u16>,
+    allowed_channels: HashSet<u16>,
 ) -> (Vec<Value>, Vec<Value>) {
-    // 90s: the lossy-pressure test waits through a 2048-frame burst here; under
-    // contended CI the burst is load-proportionally slow (memory 6987).
+    // required vs allowed: pushes emitted DURING a configure fan out to the
+    // channels bound at drain time. The in-flight bind's own channel joins the
+    // route table when its completion is processed, and the loop prioritizes
+    // bind completions over push drains — so whether the binding channel also
+    // receives the frames is a scheduling race. Frames on it are legitimate
+    // same-session delivery, not a leak; only channels outside `allowed` are.
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut ack_seen = false;
     let mut status_pushes = Vec::new();
@@ -7957,7 +7967,10 @@ async fn expect_route_bind_ack_status_and_bash_completed_pushes(
     let mut bash_pushes = Vec::new();
     let mut bash_channels = HashSet::new();
 
-    while !ack_seen || status_channels != expected_channels || bash_channels != expected_channels {
+    while !ack_seen
+        || !status_channels.is_superset(&required_channels)
+        || !bash_channels.is_superset(&required_channels)
+    {
         let now = Instant::now();
         assert!(
             now < deadline,
@@ -7990,22 +8003,26 @@ async fn expect_route_bind_ack_status_and_bash_completed_pushes(
                 let body: Value = serde_json::from_slice(&frame.body).expect("push body");
                 if push_marker(&body) == Some(marker) {
                     assert!(
-                        expected_channels.contains(&frame.header.channel),
+                        allowed_channels.contains(&frame.header.channel),
                         "status push {marker} leaked to unexpected channel {}",
                         frame.header.channel
                     );
-                    status_channels.insert(frame.header.channel);
-                    status_pushes.push(body);
+                    if required_channels.contains(&frame.header.channel) {
+                        status_channels.insert(frame.header.channel);
+                        status_pushes.push(body);
+                    }
                 } else if push_type(&body) == Some("bash_completed")
                     && push_task_id(&body) == Some(task_id)
                 {
                     assert!(
-                        expected_channels.contains(&frame.header.channel),
+                        allowed_channels.contains(&frame.header.channel),
                         "bash push {task_id} leaked to unexpected channel {}",
                         frame.header.channel
                     );
-                    bash_channels.insert(frame.header.channel);
-                    bash_pushes.push(body);
+                    if required_channels.contains(&frame.header.channel) {
+                        bash_channels.insert(frame.header.channel);
+                        bash_pushes.push(body);
+                    }
                 }
             }
             other => panic!(
@@ -8014,8 +8031,8 @@ async fn expect_route_bind_ack_status_and_bash_completed_pushes(
         }
     }
 
-    assert_eq!(status_channels, expected_channels);
-    assert_eq!(bash_channels, expected_channels);
+    assert_eq!(status_channels, required_channels);
+    assert_eq!(bash_channels, required_channels);
     (status_pushes, bash_pushes)
 }
 
@@ -8328,15 +8345,15 @@ async fn expect_status_pushes_for_marker_seq(
     stream: &mut tokio::net::TcpStream,
     marker: &str,
     seq: u64,
-    expected_channels: HashSet<u16>,
+    required_channels: HashSet<u16>,
+    allowed_channels: HashSet<u16>,
 ) -> Vec<Value> {
-    // 90s: waits for the coalesced latest of a 2048-frame burst; load-heavy on
-    // contended CI runners (memory 6987).
+    // required vs allowed: see expect_route_bind_ack_status_and_bash_completed_pushes.
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut pushes = Vec::new();
     let mut channels = HashSet::new();
 
-    while channels != expected_channels {
+    while !channels.is_superset(&required_channels) {
         let now = Instant::now();
         assert!(
             now < deadline,
@@ -8354,12 +8371,14 @@ async fn expect_status_pushes_for_marker_seq(
                 let body: Value = serde_json::from_slice(&frame.body).expect("push body");
                 if push_marker(&body) == Some(marker) && push_seq(&body) == Some(seq) {
                     assert!(
-                        expected_channels.contains(&frame.header.channel),
+                        allowed_channels.contains(&frame.header.channel),
                         "status push {marker} seq {seq} leaked to unexpected channel {}",
                         frame.header.channel
                     );
-                    channels.insert(frame.header.channel);
-                    pushes.push(body);
+                    if required_channels.contains(&frame.header.channel) {
+                        channels.insert(frame.header.channel);
+                        pushes.push(body);
+                    }
                 }
             }
             other => panic!(
@@ -8368,7 +8387,7 @@ async fn expect_status_pushes_for_marker_seq(
         }
     }
 
-    assert_eq!(channels, expected_channels);
+    assert_eq!(channels, required_channels);
     pushes
 }
 

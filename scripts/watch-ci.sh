@@ -11,7 +11,21 @@ set -uo pipefail
 REPO="${REPO:-cortexkit/aft}"
 RID="${1:-}"
 if [ -z "$RID" ]; then
-  RID=$(gh run list --repo "$REPO" --branch main --limit 1 --json databaseId --jq '.[0].databaseId')
+  # Grabbing the newest run right after a push races run creation and latches
+  # a stale (often already-failed) run. Resolve the run FOR THE LOCAL HEAD SHA,
+  # polling until it appears.
+  HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+  for _ in $(seq 1 40); do
+    RID=$(gh run list --repo "$REPO" --branch main --limit 5 \
+      --json databaseId,headSha \
+      --jq ".[] | select(.headSha==\"$HEAD_SHA\") | .databaseId" | head -1)
+    [ -n "$RID" ] && break
+    sleep 15
+  done
+  if [ -z "$RID" ]; then
+    echo "no CI run appeared for HEAD $HEAD_SHA" >&2
+    exit 2
+  fi
 fi
 echo "watching run $RID (fail-fast)"
 
