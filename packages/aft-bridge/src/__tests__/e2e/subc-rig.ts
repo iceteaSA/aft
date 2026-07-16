@@ -430,7 +430,7 @@ async function resolveFetchedSubcCoreCachePath(): Promise<{
     };
   }
 
-  return { path: resolve(FETCHED_SUBC_CORE_CACHE_ROOT, tag, `subc-core`) };
+  return { path: resolve(FETCHED_SUBC_CORE_CACHE_ROOT, tag, `ck-subc`) };
 }
 
 function fetchedSubcCoreTarget(): string | null {

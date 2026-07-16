@@ -157,7 +157,7 @@ pub(super) enum WriterEnqueueOutcome {
 
 impl WriterEnqueueOutcome {
     #[cfg(test)]
-    fn is_enqueued(&self) -> bool {
+    pub(super) fn is_enqueued(&self) -> bool {
         matches!(self, Self::Enqueued)
     }
 }

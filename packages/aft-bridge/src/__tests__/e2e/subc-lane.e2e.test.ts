@@ -37,6 +37,7 @@ maybeDescribe(describeName, () => {
       poolOptions: { timeoutMs: 15_000 },
       configOverrides: {},
       subcConnectionFile: rig.connectionFile,
+      subcConsumerIdentity: null,
       onBgEventsNudge: (root, session) => nudges.push({ root, session, at: Date.now() }),
     });
     pools.push(pool);

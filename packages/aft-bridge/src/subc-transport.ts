@@ -20,10 +20,12 @@
 import type { RouteHandle } from "@cortexkit/subc-client";
 import {
   type BindIdentity,
+  type ConsumerIdentity,
   connectionFileExists,
   isConsumerReconnectTransient,
   type RequestOptions,
   type RouteTarget,
+  StaleRouteHandleError,
   SubcCallError,
   SubcClient,
   SubcError,
@@ -55,7 +57,11 @@ export interface SubcSubscriptionLike {
  * seam without standing up a daemon; the real `SubcClient` satisfies it.
  */
 export interface SubcClientLike {
-  routeOpen(target: RouteTarget, identity: BindIdentity): Promise<RouteHandle>;
+  routeOpen(
+    target: RouteTarget,
+    identity: BindIdentity,
+    opts?: { consumerIdentity?: ConsumerIdentity | null },
+  ): Promise<RouteHandle>;
   request(route: RouteHandle, body: unknown, opts?: RequestOptions): Promise<unknown>;
   subscribe(
     route: RouteHandle,
@@ -108,6 +114,11 @@ export interface SubcTransportPoolOptions {
   connectionFile: string;
   /** Harness identity carried in every BindIdentity ("opencode" | "pi" | …). */
   harness: string;
+  /**
+   * Explicit route consumer identity. Undefined preserves subc-client's environment-derived
+   * production identity; null is used by hermetic tests that run inside another module.
+   */
+  consumerIdentity?: ConsumerIdentity | null;
   /** Handshake timeout forwarded to SubcClient.connect. */
   handshakeTimeoutMs?: number;
   /**
@@ -162,6 +173,7 @@ class BgSubscription {
     private readonly identity: BindIdentity,
     private readonly acquireClient: () => Promise<SubcClientLike>,
     private readonly dropClient: (client: SubcClientLike) => void,
+    private readonly consumerIdentity: ConsumerIdentity | null | undefined,
     private readonly onNudge: () => void,
     private readonly sleep: (ms: number) => Promise<void>,
   ) {
@@ -205,6 +217,7 @@ class BgSubscription {
         route = await client.routeOpen(
           { kind: "tool_provider", module_id: AFT_MODULE_ID },
           this.identity,
+          { consumerIdentity: this.consumerIdentity },
         );
       } catch (err) {
         // routeOpen failed. If it signals a dead CONNECTION, drop the shared
@@ -271,8 +284,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isUnknownChannelError(err: unknown): boolean {
-  return err instanceof SubcError && err.code === "unknown_channel";
+function isRouteProvenAbsentError(err: unknown): boolean {
+  return (
+    (err instanceof SubcError && err.code === "unknown_channel") ||
+    err instanceof StaleRouteHandleError
+  );
 }
 
 /**
@@ -478,6 +494,7 @@ export class SubcTransportPool implements AftTransportPool {
   readonly harness: string;
   private readonly connectionFile: string;
   private readonly handshakeTimeoutMs?: number;
+  private readonly consumerIdentity: ConsumerIdentity | null | undefined;
   private readonly connectFn: (opts: {
     connectionFile: string;
     handshakeTimeoutMs?: number;
@@ -506,6 +523,7 @@ export class SubcTransportPool implements AftTransportPool {
     this.connectionFile = options.connectionFile;
     this.harness = options.harness;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs;
+    this.consumerIdentity = options.consumerIdentity;
     this.connectFn = options.connect ?? ((opts) => SubcClient.connect(opts));
     this.onBgEventsNudge = options.onBgEventsNudge;
     this.bgBackoffSleep =
@@ -583,8 +601,9 @@ export class SubcTransportPool implements AftTransportPool {
    * Open-or-reuse a route for `identity` and send `body` as a data-plane Request.
    * Rd reconnect is mutation-safe by construction: transport failures surface to
    * the caller after clearing stale route/client state so the NEXT call
-   * re-establishes. The only in-place retry is `unknown_channel`, where the daemon
-   * proves the route was absent and the request was not delivered to the module.
+   * re-establishes. The only in-place retries are route-absence proofs: either the
+   * daemon returns `unknown_channel`, or the client rejects a stale handle before
+   * writing. In both cases, the request was not delivered to the module.
    * Tool-level errors come back as normal replies with `success:false` and are
    * returned, not thrown.
    */
@@ -662,7 +681,7 @@ export class SubcTransportPool implements AftTransportPool {
             this.transportFailures = 0;
             this.dropClient(client);
           } else if (
-            !isUnknownChannelError(err) &&
+            !isRouteProvenAbsentError(err) &&
             ++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES
           ) {
             // A run of non-transient throws (timeouts / route GOODBYEs) with no
@@ -699,13 +718,13 @@ export class SubcTransportPool implements AftTransportPool {
         return await requestOnRoute(route);
       } catch (err) {
         if (
-          isUnknownChannelError(err) &&
+          isRouteProvenAbsentError(err) &&
           this.isCurrentSession(key, record) &&
           this.client === client
         ) {
-          // The daemon says this channel does not exist, so the request was not
-          // delivered to the module. Reopen the route and resend once; all other
-          // route/request failures keep the no-auto-retry mutation-safety rule.
+          // Either the daemon says the channel does not exist, or the client
+          // rejected the stale handle before writing. Reopen and resend once; all
+          // other failures keep the no-auto-retry mutation-safety rule.
           clearRouteEntry(entry);
           ({ route, entry } = await openRoute());
           try {
@@ -779,7 +798,9 @@ export class SubcTransportPool implements AftTransportPool {
     // the same identity awaits this same open instead of minting a second channel.
     const entry: RouteEntry = { client, opening: null, handle: null, closed: false };
     const opening = client
-      .routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity)
+      .routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
+        consumerIdentity: this.consumerIdentity,
+      })
       .then((route) => {
         // A close/shutdown may have raced this open, or this entry may have been
         // replaced by a transient drop/reopen. In both cases, release the freshly
@@ -832,6 +853,7 @@ export class SubcTransportPool implements AftTransportPool {
       identity,
       () => this.ensureClient(),
       (client) => this.dropClient(client),
+      this.consumerIdentity,
       onNudge,
       this.bgBackoffSleep,
     );

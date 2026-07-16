@@ -3225,9 +3225,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df83966032f99632967b73f87ad470fbf1b3701db5d98031cde68f0b4ee5b501"
+checksum = "6f906b86ae7c0f6928c12d3eeec1c3a39e1662b6c4b0daa6c226c3408dc78ee7"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",

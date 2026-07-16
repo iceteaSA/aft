@@ -5,6 +5,7 @@ import {
   type RouteHandle,
   type RouteTarget,
   SocketClosedError,
+  StaleRouteHandleError,
   SubcCallError,
   SubcError,
 } from "@cortexkit/subc-client";
@@ -68,6 +69,8 @@ function fakeRouteHandle(channel: number): RouteHandle {
 /** Records every routeOpen/request/subscribe so a test can assert caching + bodies. */
 class FakeClient implements SubcClientLike {
   routeOpens: BindIdentity[] = [];
+  routeConsumerIdentities: Array<{ module_id: string; launch_nonce: string } | null | undefined> =
+    [];
   requests: {
     route: RouteHandle;
     channel: number;
@@ -86,8 +89,13 @@ class FakeClient implements SubcClientLike {
 
   constructor(private readonly onRequest: (channel: number, body: unknown) => Promise<unknown>) {}
 
-  async routeOpen(_target: RouteTarget, identity: BindIdentity): Promise<RouteHandle> {
+  async routeOpen(
+    _target: RouteTarget,
+    identity: BindIdentity,
+    opts?: { consumerIdentity?: { module_id: string; launch_nonce: string } | null },
+  ): Promise<RouteHandle> {
     this.routeOpens.push(identity);
+    this.routeConsumerIdentities.push(opts?.consumerIdentity);
     if (this.routeOpenError) {
       const err = this.routeOpenError;
       this.routeOpenError = null;
@@ -197,6 +205,20 @@ describe("SubcTransport.toolCall", () => {
       todos: 0,
       tier2_stale: false,
     });
+  });
+
+  test("forwards an explicit direct consumer identity override to route.open", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake-subc-connection.json",
+      harness: "opencode",
+      consumerIdentity: null,
+      connect: async () => client,
+    });
+
+    await pool.getBridge("/work/proj").toolCall("sess", "read", { filePath: "a.ts" });
+
+    expect(client.routeConsumerIdentities).toEqual([null]);
   });
 
   test("preview:true is placed at the top level of the request body", async () => {
@@ -313,11 +335,14 @@ describe("SubcTransport Rd reconnect", () => {
     expect(madeClients).toBe(2); // the dead client was dropped, a fresh one connected
   });
 
-  test("unknown_channel reopens the route and resends once", async () => {
+  test.each([
+    ["unknown_channel", () => new SubcError("unknown channel 1", "unknown_channel")],
+    ["stale_route_handle", () => new StaleRouteHandleError(fakeRouteHandle(1))],
+  ])("%s reopens the route and resends once", async (_name, routeAbsentError) => {
     let calls = 0;
     const client = new FakeClient(async () => {
       calls += 1;
-      if (calls === 1) throw new SubcError("unknown channel 1", "unknown_channel");
+      if (calls === 1) throw routeAbsentError();
       return envelope({ id: "r", success: true, text: "resent after reopen" });
     });
     const { pool } = poolWith(client);

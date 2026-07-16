@@ -16,6 +16,8 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
+import type { ConsumerIdentity } from "@cortexkit/subc-client";
+
 import { BridgePool, type PoolOptions } from "./pool.js";
 import { RevivableTransportPool } from "./revivable-transport.js";
 import { SubcTransportPool } from "./subc-transport.js";
@@ -36,6 +38,8 @@ export interface AftTransportFactoryOptions {
    * relative paths are resolved against the user's home directory.
    */
   subcConnectionFile?: string;
+  /** Test/in-process override for route principal identity. Production leaves this undefined. */
+  subcConsumerIdentity?: ConsumerIdentity | null;
   /**
    * Subc path: idle bg-completion wake handler (a `{op:"bg_events"}` nudge). The
    * handler MUST force a drain (the nudge is payload-less). Ignored standalone.
@@ -92,6 +96,7 @@ async function createConcreteAftTransportPool(
     return new SubcTransportPool({
       connectionFile,
       harness: opts.harness,
+      consumerIdentity: opts.subcConsumerIdentity,
       onBgEventsNudge: opts.onBgEventsNudge,
     });
   }

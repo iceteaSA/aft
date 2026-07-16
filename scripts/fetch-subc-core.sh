@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUBC_CORE_TAG="subc-core-v0.1.1"
-SUBC_CORE_WIRE_VERSION="1"
+SUBC_CORE_TAG="subc-core-v0.3.0"
+SUBC_CORE_WIRE_VERSION="2"
 SUBC_REPO="cortexkit/subconscious"
-BIN_NAME="subc-core"
+BIN_NAME="ck-subc"
 CACHE_DIR="$HOME/.cache/aft-ci/subc-core/$SUBC_CORE_TAG"
 
 fail() {
@@ -66,7 +66,7 @@ sidecar_matches() {
   local sidecar="$2"
   local expected actual
   expected="$(read_expected_sha "$sidecar")"
-  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  [[ "$expected" == "$EXPECTED_SHA256" ]] || return 1
   actual="$(sha256_file "$file")"
   [[ "$actual" == "$expected" ]]
 }
@@ -99,6 +99,14 @@ extract_cached_binary() {
 }
 
 TARGET="$(resolve_target)"
+case "$TARGET" in
+  darwin-arm64)
+    EXPECTED_SHA256="6c5876f3c1ea5d3fc6a710fe724113985b6c0a61a76744af4f7a43c5d474756b"
+    ;;
+  linux-x64)
+    EXPECTED_SHA256="628d75df30862b6caddc008a0da388c8c00326d040be9aaec8b150d6155ae9dc"
+    ;;
+esac
 SHA256_TOOL="$(resolve_sha256_tool)"
 TARBALL_NAME="$BIN_NAME-$TARGET.tar.gz"
 SIDECAR_NAME="$TARBALL_NAME.sha256"
@@ -125,11 +133,10 @@ echo "Fetching $TARBALL_NAME from $SUBC_REPO@$SUBC_CORE_TAG" >&2
 gh release download "$SUBC_CORE_TAG" \
   --repo "$SUBC_REPO" \
   --dir "$stage_dir" \
-  --pattern "$TARBALL_NAME" \
-  --pattern "$SIDECAR_NAME"
+  --pattern "$TARBALL_NAME"
 
 [[ -f "$stage_dir/$TARBALL_NAME" ]] || fail "Missing downloaded asset: $TARBALL_NAME"
-[[ -f "$stage_dir/$SIDECAR_NAME" ]] || fail "Missing downloaded asset: $SIDECAR_NAME"
+printf '%s\n' "$EXPECTED_SHA256" > "$stage_dir/$SIDECAR_NAME"
 verify_or_fail "$stage_dir/$TARBALL_NAME" "$stage_dir/$SIDECAR_NAME"
 extract_cached_binary "$stage_dir/$TARBALL_NAME" "$stage_dir"
 
