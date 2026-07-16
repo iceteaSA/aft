@@ -206,7 +206,10 @@ impl AllocatorMemorySnapshot {
         }
     }
 
-    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    // Not cfg-gated to the fallback platforms: linux-gnu also uses this at
+    // RUNTIME when the host glibc predates mallinfo2 (< 2.33), which only
+    // manifests on release binaries built against an old glibc floor.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn not_estimated(reason: &'static str) -> Self {
         Self {
             status: "not_estimated_on_this_platform",
@@ -375,7 +378,28 @@ fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
-    let statistics = unsafe { libc::mallinfo2() };
+    // mallinfo2 exists only in glibc >= 2.33. Release Linux binaries link
+    // against an older glibc floor (cross gnu images, kept old so dlopen and
+    // wide distro compatibility hold), so a link-time reference to the symbol
+    // fails the release build even though native CI (glibc 2.35) links fine.
+    // Resolve it at runtime instead and report honestly when it is absent.
+    use std::sync::OnceLock;
+    type Mallinfo2Fn = unsafe extern "C" fn() -> libc::mallinfo2;
+    static MALLINFO2: OnceLock<Option<Mallinfo2Fn>> = OnceLock::new();
+    let resolved = MALLINFO2.get_or_init(|| {
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
+        if symbol.is_null() {
+            None
+        } else {
+            // SAFETY: glibc declares mallinfo2 as `struct mallinfo2 (*)(void)`;
+            // the signature matches Mallinfo2Fn exactly.
+            Some(unsafe { std::mem::transmute::<*mut libc::c_void, Mallinfo2Fn>(symbol) })
+        }
+    });
+    let Some(mallinfo2) = resolved else {
+        return AllocatorMemorySnapshot::not_estimated("mallinfo2_requires_glibc_2_33");
+    };
+    let statistics = unsafe { mallinfo2() };
     let mapped_bytes = statistics.hblkhd as u64;
     let bytes_in_use = (statistics.uordblks as u64).saturating_add(mapped_bytes);
     let size_allocated = (statistics.arena as u64).saturating_add(mapped_bytes);
