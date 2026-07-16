@@ -1,8 +1,9 @@
 use crate as aft;
 use crate::callgraph_store::CallGraphStore;
 use crate::context::{
-    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-    SemanticRefreshRequest, WatcherDrainApplyPhase, WatcherDrainPhase, WatcherDrainSliceState,
+    AppContext, CallGraphStoreBuildEvent, SemanticIndexEvent, SemanticIndexStatus,
+    SemanticRefreshEvent, SemanticRefreshRequest, WatcherDrainApplyPhase, WatcherDrainPhase,
+    WatcherDrainSliceState,
 };
 use crate::log_ctx;
 use crate::lsp::client::LspEvent;
@@ -10,6 +11,8 @@ use crate::protocol::PushFrame;
 use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +28,168 @@ pub const WATCHER_DRAIN_SLICE_BUDGET: Duration = Duration::from_millis(250);
 const WATCHER_DRAIN_UNIT_WARN_AFTER: Duration = Duration::from_secs(5);
 const WATCHER_DRAIN_UNIT_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
+
+#[cfg(test)]
+struct ArtifactDrainCommitGate {
+    context_id: usize,
+    reached_tx: crossbeam_channel::Sender<()>,
+    release_rx: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static ARTIFACT_DRAIN_COMMIT_GATE: OnceLock<Mutex<Option<ArtifactDrainCommitGate>>> =
+    OnceLock::new();
+#[cfg(test)]
+static ARTIFACT_DRAIN_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+struct SemanticRefreshRecoveryGate {
+    context_id: usize,
+    reached_tx: crossbeam_channel::Sender<()>,
+    release_rx: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static SEMANTIC_REFRESH_RECOVERY_GATE: OnceLock<Mutex<Option<SemanticRefreshRecoveryGate>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+struct WatcherPhaseCommitGate {
+    target: PathBuf,
+    reached_tx: crossbeam_channel::Sender<()>,
+    release_rx: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<Mutex<Option<WatcherPhaseCommitGate>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_watcher_phase_commit_gate_for_test(
+    target: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *WATCHER_PHASE_COMMIT_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("watcher phase commit gate mutex poisoned") = Some(WatcherPhaseCommitGate {
+        target,
+        reached_tx,
+        release_rx,
+    });
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
+    let mut slot = WATCHER_PHASE_COMMIT_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("watcher phase commit gate mutex poisoned");
+    if !slot.as_ref().is_some_and(|gate| gate.target == path) {
+        return;
+    }
+    let gate = slot.take();
+    drop(slot);
+    if let Some(gate) = gate {
+        let _ = gate.reached_tx.send(());
+        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+    }
+}
+
+#[cfg(not(test))]
+fn wait_on_watcher_phase_commit_gate_for_test(_path: &Path) {}
+
+#[cfg(test)]
+fn install_artifact_drain_commit_gate_for_test(
+    ctx: &AppContext,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *ARTIFACT_DRAIN_COMMIT_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("artifact drain commit gate mutex poisoned") = Some(ArtifactDrainCommitGate {
+        context_id: ctx as *const AppContext as usize,
+        reached_tx,
+        release_rx,
+    });
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_artifact_drain_commit_gate_for_test(ctx: &AppContext) {
+    let mut slot = ARTIFACT_DRAIN_COMMIT_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("artifact drain commit gate mutex poisoned");
+    if !slot
+        .as_ref()
+        .is_some_and(|gate| gate.context_id == ctx as *const AppContext as usize)
+    {
+        return;
+    }
+    let gate = slot.take();
+    drop(slot);
+    if let Some(gate) = gate {
+        let _ = gate.reached_tx.send(());
+        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+    }
+}
+
+#[cfg(not(test))]
+fn wait_on_artifact_drain_commit_gate_for_test(_ctx: &AppContext) {}
+
+#[cfg(test)]
+fn install_semantic_refresh_recovery_gate_for_test(
+    ctx: &AppContext,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *SEMANTIC_REFRESH_RECOVERY_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("semantic refresh recovery gate mutex poisoned") =
+        Some(SemanticRefreshRecoveryGate {
+            context_id: ctx as *const AppContext as usize,
+            reached_tx,
+            release_rx,
+        });
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_semantic_refresh_recovery_gate_for_test(ctx: &AppContext) {
+    let mut slot = SEMANTIC_REFRESH_RECOVERY_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("semantic refresh recovery gate mutex poisoned");
+    if !slot
+        .as_ref()
+        .is_some_and(|gate| gate.context_id == ctx as *const AppContext as usize)
+    {
+        return;
+    }
+    let gate = slot.take();
+    drop(slot);
+    if let Some(gate) = gate {
+        let _ = gate.reached_tx.send(());
+        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+    }
+}
+
+#[cfg(not(test))]
+fn wait_on_semantic_refresh_recovery_gate_for_test(_ctx: &AppContext) {}
 
 struct WatcherDrainUnitGuard<'a> {
     phase: &'static str,
@@ -139,14 +304,22 @@ pub fn drain_configure_warning_events(ctx: &AppContext) {
 }
 
 pub fn drain_inspect_events(ctx: &AppContext) {
-    let drained = ctx.inspect_manager().drain_completions();
-    // Watcher-driven Tier-2 scans complete via the reuse path, which bypasses
-    // `result_rx`/`drain_completions`. Poll the manager's reuse counter so a
-    // background scan still refreshes the bar (#3) — otherwise the counts and
-    // `~` marker would only update on a manual `aft_inspect`.
-    let reuse_completed = ctx.take_new_reuse_completions();
+    drain_inspect_events_for_generation(ctx, ctx.configure_generation());
+}
+
+pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: u64) {
+    let Some((drained, reuse_completed)) = ctx.run_if_subc_bound_generation(generation, || {
+        let drained = ctx.inspect_manager().drain_completions();
+        // Watcher-driven Tier-2 scans complete via the reuse path, which bypasses
+        // `result_rx`/`drain_completions`. Poll the manager's reuse counter so a
+        // background scan still refreshes the bar (#3), otherwise the counts and
+        // `~` marker would only update on a manual `aft_inspect`.
+        (drained, ctx.take_new_reuse_completions())
+    }) else {
+        return;
+    };
     // A completed background Tier-2 scan refreshes the agent status-bar counts
-    // to the freshly-persisted aggregate, and clears the stale marker — so the
+    // to the freshly-persisted aggregate, and clears the stale marker, so the
     // bar reflects the new numbers on the next tool result without waiting for
     // an explicit aft_inspect call.
     if drained > 0 || reuse_completed {
@@ -155,19 +328,12 @@ pub fn drain_inspect_events(ctx: &AppContext) {
                 .inspect_manager()
                 .latest_tier2_counts(ctx.inspect_dir(), project_root);
             // Don't clear the `~` stale marker until the whole serial Tier-2
-            // cycle has drained — while any category is still in flight the
+            // cycle has drained. While any category is still in flight the
             // already-persisted categories may predate the latest edit, so
-            // claiming fresh would be premature (#20). `None` counts preserve
-            // the last-known value rather than fabricating a `0` (#1).
+            // claiming fresh would be premature. `None` counts preserve the
+            // last-known value rather than fabricating a `0`.
             let stale = ctx.inspect_manager().tier2_any_in_flight();
             ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, None, stale);
-            // Push the refreshed snapshot so the sidebar reflects the new Tier-2
-            // counts immediately. `update_status_bar_tier2` only mutates the
-            // in-memory counts (which the agent status bar reads live on each
-            // tool result); the push-driven sidebar would otherwise keep showing
-            // the pre-population snapshot — where `status_bar` was null and the
-            // Code Health section stayed hidden — until some unrelated event
-            // happened to emit a status frame.
             ctx.status_emitter().signal(ctx.build_status_snapshot());
         }
     }
@@ -256,7 +422,7 @@ pub fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
 }
 
 pub fn drain_search_index_events(ctx: &AppContext) {
-    let (latest, disconnected) = {
+    let (latest, disconnected, receiver_generation, receiver_epoch) = {
         let rx_ref = ctx
             .search_index_rx()
             .read()
@@ -277,55 +443,88 @@ pub fn drain_search_index_events(ctx: &AppContext) {
                 }
             }
         }
-        (latest, disconnected)
+        (
+            latest,
+            disconnected,
+            ctx.search_index_rx_generation(),
+            ctx.search_index_rx_epoch(),
+        )
     };
 
-    let mut status_changed = false;
     let mut installed_index = false;
     if let Some(mut index) = latest {
-        let pending_paths = ctx.take_pending_search_index_paths();
-        if !pending_paths.is_empty() {
-            replay_search_index_pending_updates(ctx, &mut index, pending_paths);
+        wait_on_artifact_drain_commit_gate_for_test(ctx);
+        installed_index = ctx
+            .with_current_search_index_rx(receiver_generation, receiver_epoch, |receiver| {
+                let pending_paths = ctx.take_pending_search_index_paths();
+                if !pending_paths.is_empty() {
+                    replay_search_index_pending_updates(ctx, &mut index, pending_paths);
+                }
+                *ctx.search_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                *receiver = None;
+                true
+            })
+            .unwrap_or(false);
+        if !installed_index {
+            return;
         }
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        installed_index = true;
-        status_changed = true;
+    } else if disconnected {
+        let cleared = ctx
+            .with_current_search_index_rx(receiver_generation, receiver_epoch, |receiver| {
+                *receiver = None;
+                let mut search_index = ctx
+                    .search_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if search_index.as_ref().is_some_and(|index| !index.ready) {
+                    *search_index = None;
+                }
+                true
+            })
+            .unwrap_or(false);
+        if !cleared {
+            return;
+        }
     }
 
-    if disconnected || installed_index {
-        *ctx.search_index_rx()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        if disconnected && !installed_index {
-            let _ = ctx.take_pending_search_index_paths();
-        }
-        status_changed = true;
-    }
-
-    if status_changed {
+    if installed_index || disconnected {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
 }
 
-/// Install a background-built callgraph store once its cold build completes.
-/// Mirrors `drain_search_index_events`: drains the receiver, installs the
-/// freshest store, replays paths that changed during the build, and clears the
-/// receiver. On build failure (channel disconnected with nothing installed) the
-/// receiver is cleared so a later op can retry the cold build.
 pub fn drain_callgraph_store_events(ctx: &AppContext) {
-    let (latest, disconnected) = {
+    let (latest, settled, disconnected, fulfilled_force_token, receiver_generation, receiver_epoch) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
 
         let mut latest = None;
+        let mut settled = false;
+        let mut fulfilled_force_token = None;
         let mut disconnected = false;
         loop {
             match rx.try_recv() {
-                Ok(store) => latest = Some(store),
+                Ok(CallGraphStoreBuildEvent::Ready {
+                    store,
+                    fulfilled_force_token: token,
+                    publication_epoch,
+                }) => {
+                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
+                        latest = Some(store);
+                        fulfilled_force_token = token;
+                    } else {
+                        // A newer configure advanced the persist epoch after this
+                        // build published; its generation is already superseded on
+                        // disk, so treat the event as settled instead of installing
+                        // the stale handle in RAM.
+                        drop(store);
+                        settled = true;
+                    }
+                }
+                Ok(CallGraphStoreBuildEvent::Settled) => settled = true,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -333,61 +532,86 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                 }
             }
         }
-        (latest, disconnected)
+        (
+            latest,
+            settled,
+            disconnected,
+            fulfilled_force_token,
+            ctx.callgraph_store_rx_generation(),
+            ctx.callgraph_store_rx_epoch(),
+        )
     };
 
-    let mut status_changed = false;
-    let mut installed = false;
+    let ready_received = latest.is_some();
+    let terminal = ready_received || settled || disconnected;
+    if !terminal {
+        return;
+    }
+    wait_on_artifact_drain_commit_gate_for_test(ctx);
+
+    let mut reopened = None;
     if let Some(store) = latest {
-        // Replay source files that changed while the cold build was running so
-        // the freshly-installed store reflects mid-build edits.
-        let pending = ctx
-            .take_pending_callgraph_store_paths()
-            .into_iter()
-            .filter(|path| !watcher_path_is_generated_for_callgraph(ctx, path))
-            .collect::<Vec<_>>();
-        // Release the cold-build writer lease before waking the refresh worker.
-        // The worker opens through the generation pointer when it processes the
-        // batch, so a concurrent later swap still targets the current generation.
+        // Release the cold-build writer lease before opening the published
+        // generation through its read-only pointer.
         drop(store);
-        if !pending.is_empty() {
-            ctx.enqueue_callgraph_store_refresh(pending);
-        }
         if let Some(project_root) = ctx.callgraph_project_root() {
             match CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root) {
-                Ok(Some(store)) => {
-                    *ctx.callgraph_store()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));
-                    installed = true;
+                Ok(Some(store)) => reopened = Some(Arc::new(store)),
+                Ok(None) => {
+                    crate::slog_warn!(
+                        "callgraph store build completed without a readable published generation"
+                    );
                 }
-                Ok(None) => {}
                 Err(error) => {
                     crate::slog_warn!("failed to install read-only callgraph store: {}", error);
                 }
             }
         }
-        status_changed = installed;
+    }
+
+    let mut pending = Vec::new();
+    let installed =
+        ctx.with_current_callgraph_store_rx(receiver_generation, receiver_epoch, |receiver| {
+            let installed = if let Some(store) = reopened {
+                *ctx.callgraph_store()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
+                pending = ctx
+                    .take_pending_callgraph_store_paths()
+                    .into_iter()
+                    .filter(|path| !watcher_path_is_generated_for_callgraph(ctx, path))
+                    .collect();
+                true
+            } else {
+                false
+            };
+            if terminal {
+                *receiver = None;
+            }
+            if installed {
+                if let Some(force_token) = fulfilled_force_token {
+                    ctx.fulfill_callgraph_store_force_token(force_token);
+                }
+            }
+            installed
+        });
+    let Some(installed) = installed else {
+        return;
+    };
+
+    if installed {
+        if !pending.is_empty() {
+            let _ = ctx.enqueue_callgraph_store_refresh(pending);
+        }
         let _ = ctx.request_tier2_refresh_pull();
     }
-
-    if disconnected || installed {
-        *ctx.callgraph_store_rx().lock() = None;
-        if disconnected && !installed {
-            // Build failed: discard pending paths (no store to apply them to);
-            // a later op restarts the build and re-walks the project.
-            let _ = ctx.take_pending_callgraph_store_paths();
-        }
-        status_changed = true;
-    }
-
-    if status_changed {
+    if terminal {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
 }
 
 pub fn drain_semantic_index_events(ctx: &AppContext) {
-    let (events, disconnected) = {
+    let (events, disconnected, receiver_generation, receiver_epoch) = {
         let rx_ref = ctx.semantic_index_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
@@ -405,17 +629,25 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                 }
             }
         }
-        (events, disconnected)
+        (
+            events,
+            disconnected,
+            ctx.semantic_index_rx_generation(),
+            ctx.semantic_index_rx_epoch(),
+        )
     };
 
     if events.is_empty() && !disconnected {
         return;
     }
 
-    let mut keep_receiver = true;
+    wait_on_artifact_drain_commit_gate_for_test(ctx);
+    let mut terminal = false;
     let mut status_changed = false;
     let mut replay_refresh_paths = Vec::new();
     let mut replay_corpus_refresh = false;
+    let mut cold_seed_resumes = Vec::new();
+
     for event in events {
         match event {
             SemanticIndexEvent::Progress {
@@ -424,48 +656,110 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                 entries_done,
                 entries_total,
             } => {
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::Building {
-                        stage,
-                        files,
-                        entries_done,
-                        entries_total,
-                    };
-                // Push progress to the sidebar. Without this, a long rebuild
-                // (e.g. a slow local embedding backend re-indexing after a prior
-                // failure) leaves the sidebar showing the stale prior state —
-                // "failed" with an old error — for the entire build, even though
-                // it is actively embedding. Progress transitions are exactly
-                // when the user needs to see "building".
+                let committed = ctx
+                    .with_current_semantic_index_rx(
+                        receiver_generation,
+                        receiver_epoch,
+                        |_receiver| {
+                            *ctx.semantic_index_status()
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                SemanticIndexStatus::Building {
+                                    stage,
+                                    files,
+                                    entries_done,
+                                    entries_total,
+                                };
+                            true
+                        },
+                    )
+                    .unwrap_or(false);
+                if !committed {
+                    return;
+                }
                 status_changed = true;
             }
             SemanticIndexEvent::ColdSeedGateCleared => {
-                ctx.resume_deferred_work_after_semantic_cold_seed_gate_cleared();
+                let resume = ctx.with_current_semantic_index_rx(
+                    receiver_generation,
+                    receiver_epoch,
+                    |_receiver| ctx.take_semantic_cold_seed_resume(true),
+                );
+                let Some(resume) = resume else {
+                    return;
+                };
+                cold_seed_resumes.push(resume);
             }
             SemanticIndexEvent::Ready(mut index) => {
-                mark_semantic_corpus_refresh_success(ctx);
-                let pending_paths = ctx.take_pending_semantic_index_paths();
-                for path in pending_paths {
-                    if watcher_path_is_semantic_source(&path) {
-                        index.invalidate_file(&path);
-                        replay_refresh_paths.push(path);
-                    }
-                }
-                replay_corpus_refresh = ctx.take_pending_semantic_corpus_refresh();
-                *ctx.semantic_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::ready();
-                keep_receiver = false;
+                let committed = ctx.with_current_semantic_index_rx(
+                    receiver_generation,
+                    receiver_epoch,
+                    |receiver| {
+                        mark_semantic_corpus_refresh_success(ctx);
+                        let mut refresh_paths = Vec::new();
+                        for path in ctx.take_pending_semantic_index_paths() {
+                            if watcher_path_is_semantic_source(&path) {
+                                index.invalidate_file(&path);
+                                refresh_paths.push(path);
+                            }
+                        }
+                        let corpus_refresh = ctx.take_pending_semantic_corpus_refresh();
+                        *ctx.semantic_index()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                        *ctx.semantic_index_status()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            SemanticIndexStatus::ready();
+                        *receiver = None;
+                        (
+                            ctx.take_semantic_cold_seed_resume(false),
+                            refresh_paths,
+                            corpus_refresh,
+                        )
+                    },
+                );
+                let Some((resume, refresh_paths, corpus_refresh)) = committed else {
+                    return;
+                };
+                cold_seed_resumes.push(resume);
+                replay_refresh_paths.extend(refresh_paths);
+                replay_corpus_refresh = corpus_refresh;
+                terminal = true;
                 status_changed = true;
-                ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
             }
             SemanticIndexEvent::Failed(error) => {
+                let committed = ctx.with_current_semantic_index_rx(
+                    receiver_generation,
+                    receiver_epoch,
+                    |receiver| {
+                        let _ = ctx.take_pending_semantic_index_paths();
+                        let _ = ctx.take_pending_semantic_corpus_refresh();
+                        *ctx.semantic_index()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                        ctx.clear_semantic_refresh_worker();
+                        *ctx.semantic_index_status()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            SemanticIndexStatus::Failed(error);
+                        *receiver = None;
+                        ctx.take_semantic_cold_seed_resume(false)
+                    },
+                );
+                let Some(resume) = committed else {
+                    return;
+                };
+                cold_seed_resumes.push(resume);
+                terminal = true;
+                status_changed = true;
+            }
+        }
+    }
+
+    if disconnected && !terminal {
+        let committed =
+            ctx.with_current_semantic_index_rx(receiver_generation, receiver_epoch, |receiver| {
                 let _ = ctx.take_pending_semantic_index_paths();
                 let _ = ctx.take_pending_semantic_corpus_refresh();
                 *ctx.semantic_index()
@@ -475,37 +769,31 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                 *ctx.semantic_index_status()
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::Failed(error);
-                keep_receiver = false;
-                status_changed = true;
-                ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
-            }
-        }
-    }
-
-    if disconnected && keep_receiver {
-        let _ = ctx.take_pending_semantic_index_paths();
-        let _ = ctx.take_pending_semantic_corpus_refresh();
-        *ctx.semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        ctx.clear_semantic_refresh_worker();
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Failed(
-            "semantic index build worker disconnected before reporting completion".to_string(),
-        );
-        keep_receiver = false;
+                    SemanticIndexStatus::Failed(
+                        "semantic index build worker disconnected before reporting completion"
+                            .to_string(),
+                    );
+                *receiver = None;
+                ctx.take_semantic_cold_seed_resume(false)
+            });
+        let Some(resume) = committed else {
+            return;
+        };
+        cold_seed_resumes.push(resume);
         status_changed = true;
-        ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
     }
 
-    if !keep_receiver {
-        *ctx.semantic_index_rx().lock() = None;
+    for resume in cold_seed_resumes {
+        ctx.apply_semantic_cold_seed_resume(resume);
     }
 
     if replay_corpus_refresh {
-        if ctx.canonical_cache_root_opt().is_some() {
+        let replayed = ctx.run_if_subc_bound_generation(receiver_generation, || {
+            if ctx.semantic_index_rx_epoch() != receiver_epoch
+                || ctx.canonical_cache_root_opt().is_none()
+            {
+                return false;
+            }
             *ctx.semantic_index_status()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -526,42 +814,54 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                         "semantic corpus refresh worker unavailable".to_string(),
                     );
             }
-            status_changed = true;
-        }
-    } else if !replay_refresh_paths.is_empty() {
-        {
-            let mut status = ctx
-                .semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                for path in &replay_refresh_paths {
-                    status.add_refreshing_file(path.clone());
-                }
-                status_changed = true;
-            }
-        }
-        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
-            sender
-                .send(SemanticRefreshRequest::Files {
-                    paths: replay_refresh_paths.clone(),
-                })
-                .is_ok()
+            true
         });
-        if !sent {
-            crate::slog_warn!(
-                "semantic refresh worker unavailable; dropping {} replayed file(s)",
-                replay_refresh_paths.len()
-            );
-            let mut status = ctx
-                .semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for path in &replay_refresh_paths {
-                status.cancel_refreshing_file(path);
-            }
-            status_changed = true;
+        if replayed != Some(true) {
+            return;
         }
+        status_changed = true;
+    } else if !replay_refresh_paths.is_empty() {
+        let replayed = ctx.run_if_subc_bound_generation(receiver_generation, || {
+            if ctx.semantic_index_rx_epoch() != receiver_epoch {
+                return false;
+            }
+            {
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in &replay_refresh_paths {
+                        status.add_refreshing_file(path.clone());
+                    }
+                }
+            }
+            let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+                sender
+                    .send(SemanticRefreshRequest::Files {
+                        paths: replay_refresh_paths.clone(),
+                    })
+                    .is_ok()
+            });
+            if !sent {
+                crate::slog_warn!(
+                    "semantic refresh worker unavailable; dropping {} replayed file(s)",
+                    replay_refresh_paths.len()
+                );
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for path in &replay_refresh_paths {
+                    status.cancel_refreshing_file(path);
+                }
+            }
+            true
+        });
+        if replayed != Some(true) {
+            return;
+        }
+        status_changed = true;
     }
 
     if status_changed {
@@ -572,11 +872,21 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
 pub const MAX_RETRY_ATTEMPTS: usize = 6;
 pub const BREAKER_TRIP_THRESHOLD: usize = 3;
 
+#[cfg(test)]
+static SEMANTIC_REFRESH_RETRY_DELAY_OVERRIDE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// Backoff for live semantic refresh retries after a transient embedding backend
 /// failure. Mirrors the cold-build retry cadence (15s -> 30s -> 60s capped) so
 /// a down backend cannot spin the watcher/refresh loop hot while still
 /// self-healing once the backend returns.
 fn semantic_refresh_retry_backoff(attempt: usize) -> Duration {
+    #[cfg(test)]
+    {
+        let override_ms = SEMANTIC_REFRESH_RETRY_DELAY_OVERRIDE_MS.load(Ordering::SeqCst);
+        if override_ms != u64::MAX {
+            return Duration::from_millis(override_ms);
+        }
+    }
     // Test seam, intentionally matching the build-level retry override.
     if let Ok(raw) = std::env::var("AFT_SEMANTIC_RETRY_BACKOFF_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
@@ -695,28 +1005,63 @@ fn ensure_semantic_refresh_probe_scheduled(ctx: &AppContext) {
 }
 
 fn maybe_fire_semantic_refresh_probe(ctx: &AppContext) {
-    if !ctx.take_semantic_refresh_probe_ready() {
-        return;
-    }
-    if !semantic_refresh_circuit_is_open(ctx) {
-        return;
-    }
+    let generation = ctx.semantic_refresh_generation();
+    let _ = ctx.run_if_subc_bound_generation(generation, || {
+        if !ctx.take_semantic_refresh_probe_ready() {
+            return;
+        }
+        if !semantic_refresh_circuit_is_open(ctx) {
+            return;
+        }
 
-    let pending_paths = ctx.take_pending_semantic_index_paths();
-    if pending_paths.is_empty() {
-        return;
-    }
+        if ctx.take_pending_semantic_corpus_refresh() {
+            // Stamp the status BEFORE sending: the worker emits CorpusStarted
+            // only after walking the project, and an unbind cancellation in
+            // that window preserves corpus intent by reading
+            // corpus_refresh_in_flight() from the status. A send without the
+            // stamp would lose the intent entirely.
+            let previous_status = {
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let previous = status.clone();
+                *status = SemanticIndexStatus::Building {
+                    stage: "refreshing_corpus".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                };
+                previous
+            };
+            let sent = ctx
+                .semantic_refresh_sender()
+                .is_some_and(|sender| sender.send(SemanticRefreshRequest::Corpus).is_ok());
+            if !sent {
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = previous_status;
+                ctx.mark_pending_semantic_corpus_refresh();
+            }
+            return;
+        }
 
-    let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
-        sender
-            .send(SemanticRefreshRequest::Files {
-                paths: pending_paths.clone(),
-            })
-            .is_ok()
+        let pending_paths = ctx.take_pending_semantic_index_paths();
+        if pending_paths.is_empty() {
+            return;
+        }
+
+        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+            sender
+                .send(SemanticRefreshRequest::Files {
+                    paths: pending_paths.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            ctx.add_pending_semantic_index_paths(pending_paths);
+        }
     });
-    if !sent {
-        ctx.add_pending_semantic_index_paths(pending_paths);
-    }
 }
 
 pub fn schedule_semantic_refresh_retry(
@@ -727,7 +1072,7 @@ pub fn schedule_semantic_refresh_retry(
     if paths.is_empty() {
         return false;
     }
-    let Some(sender) = ctx.semantic_refresh_sender() else {
+    if ctx.semantic_refresh_sender().is_none() {
         return false;
     };
 
@@ -758,17 +1103,32 @@ pub fn schedule_semantic_refresh_retry(
     );
 
     let session_id = log_ctx::current_session();
+    let generation = ctx.semantic_refresh_generation();
+    let generation_flag = ctx.configure_generation_flag();
+    let lifecycle = ctx.subc_lifecycle_admission();
+    let (sender_slot, pending_paths_slot) = ctx.semantic_refresh_retry_slots();
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
             thread::sleep(delay);
-            let _ = sender.send(SemanticRefreshRequest::Files { paths: retry_paths });
+            let _ = lifecycle.run_if_current(&generation_flag, generation, || {
+                let sent = sender_slot.lock().as_ref().is_some_and(|sender| {
+                    sender
+                        .send(SemanticRefreshRequest::Files {
+                            paths: retry_paths.clone(),
+                        })
+                        .is_ok()
+                });
+                if !sent {
+                    pending_paths_slot.lock().extend(retry_paths);
+                }
+            });
         });
     });
     true
 }
 
 pub fn drain_semantic_refresh_events(ctx: &AppContext) {
-    let (events, disconnected) = {
+    let (events, disconnected, receiver_generation, receiver_epoch) = {
         let rx_ref = ctx.semantic_refresh_event_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
@@ -786,7 +1146,12 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 }
             }
         }
-        (events, disconnected)
+        (
+            events,
+            disconnected,
+            ctx.semantic_refresh_generation(),
+            ctx.semantic_refresh_epoch(),
+        )
     };
 
     if events.is_empty() && !disconnected {
@@ -794,10 +1159,16 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
         return;
     }
 
-    let had_events = !events.is_empty();
-    let mut status_changed = false;
-    let mut replay_refresh_paths = Vec::new();
-    for event in events {
+    wait_on_artifact_drain_commit_gate_for_test(ctx);
+    let committed = ctx.with_current_semantic_refresh_rx(
+        receiver_generation,
+        receiver_epoch,
+        || {
+        let had_events = !events.is_empty();
+        let mut status_changed = false;
+        let mut replay_refresh_paths = Vec::new();
+        let mut schedule_breaker_probe = false;
+        for event in events {
         match event {
             SemanticRefreshEvent::Started { paths } => {
                 let mut status = ctx
@@ -888,7 +1259,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 if aft::semantic_index::embedding_failure_is_transient(&error) {
                     if record_semantic_refresh_transient_failure(ctx) {
                         ctx.add_pending_semantic_index_paths(paths);
-                        ensure_semantic_refresh_probe_scheduled(ctx);
+                        schedule_breaker_probe = true;
                     } else if !schedule_semantic_refresh_retry(ctx, paths.clone(), &error) {
                         aft::slog_warn!(
                             "semantic refresh worker unavailable; preserving {} transiently failed file(s) for retry",
@@ -928,6 +1299,9 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .is_some();
+                    ctx.mark_pending_semantic_corpus_refresh();
+                    ctx.trip_semantic_refresh_circuit(BREAKER_TRIP_THRESHOLD);
+                    schedule_breaker_probe = true;
                     if has_index {
                         aft::slog_warn!(
                             "semantic corpus refresh hit a transient backend error ({}); keeping the existing index",
@@ -959,11 +1333,10 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                     status_changed = true;
                 }
             }
+            }
         }
-    }
 
-    if disconnected {
-        ctx.clear_semantic_refresh_worker();
+        if disconnected {
         let refreshing_paths = {
             let status = ctx
                 .semantic_index_status()
@@ -1020,6 +1393,28 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
             for path in &replay_refresh_paths {
                 status.cancel_refreshing_file(path);
             }
+            status_changed = true;
+        }
+        }
+
+        (status_changed, schedule_breaker_probe)
+    },
+    );
+    let Some((mut status_changed, schedule_breaker_probe)) = committed else {
+        return;
+    };
+    if schedule_breaker_probe && semantic_refresh_circuit_is_open(ctx) {
+        ensure_semantic_refresh_probe_scheduled(ctx);
+    }
+    if disconnected {
+        if let Some(disconnected_build_epoch) =
+            ctx.clear_semantic_refresh_worker_if_current(receiver_generation, receiver_epoch)
+        {
+            wait_on_semantic_refresh_recovery_gate_for_test(ctx);
+            let _ = crate::commands::configure::restart_semantic_artifacts_after_refresh_disconnect(
+                ctx,
+                disconnected_build_epoch,
+            );
             status_changed = true;
         }
     }
@@ -1146,6 +1541,18 @@ pub fn spawn_search_corpus_refresh(
     root: std::path::PathBuf,
     config: Arc<aft::config::Config>,
 ) {
+    let generation = ctx.configure_generation();
+    let _ = ctx.run_if_subc_bound_generation(generation, || {
+        spawn_search_corpus_refresh_admitted(ctx, root, config, generation);
+    });
+}
+
+fn spawn_search_corpus_refresh_admitted(
+    ctx: &AppContext,
+    root: std::path::PathBuf,
+    config: Arc<aft::config::Config>,
+    generation: u64,
+) {
     {
         let mut search_index = ctx
             .search_index()
@@ -1160,21 +1567,39 @@ pub fn spawn_search_corpus_refresh(
         crossbeam_channel::Sender<aft::search_index::SearchIndex>,
         crossbeam_channel::Receiver<aft::search_index::SearchIndex>,
     ) = crossbeam_channel::unbounded();
-    *ctx.search_index_rx()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+    let receiver_epoch = ctx.install_search_index_rx(rx, generation);
+    let receiver_terminal_guard = ctx.search_index_rx_terminal_guard(receiver_epoch);
     ctx.reset_symbol_cache();
 
     let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
     let project_key = ctx.memoized_artifact_cache_key(&root);
     let session_id = log_ctx::current_session();
+    let generation_flag = ctx.configure_generation_flag();
+    let content_generation = ctx.configure_content_generation();
+    let content_generation_flag = ctx.configure_content_generation_flag();
+    let persist_epoch_flag = ctx.search_persist_epoch_flag();
+    let persist_epoch = ctx.next_search_persist_epoch();
+    let lifecycle = ctx.subc_lifecycle_admission();
     thread::spawn(move || {
+        let _terminal_guard = receiver_terminal_guard;
         log_ctx::with_session(session_id, || {
+            let Some(_permit) =
+                crate::cold_build_limiter::acquire_blocking_while("search corpus refresh", || {
+                    lifecycle.is_current(&generation_flag, generation)
+                })
+            else {
+                return;
+            };
+            if !lifecycle.is_current(&generation_flag, generation)
+                || persist_epoch_flag.current() != persist_epoch
+            {
+                return;
+            }
             let cache_dir = aft::search_index::resolve_cache_dir_with_key(
                 &project_key,
                 config.storage_dir.as_deref(),
             );
-            let _cache_lock = if shared_artifacts_read_only {
+            let cache_lock = if shared_artifacts_read_only {
                 None
             } else {
                 match aft::search_index::CacheLock::acquire(&cache_dir, &root) {
@@ -1194,11 +1619,18 @@ pub fn spawn_search_corpus_refresh(
                 &cache_dir,
             );
             wait_on_search_rebuild_publish_gate_for_test();
-            if !shared_artifacts_read_only {
-                let head = index.stored_git_head().map(str::to_owned);
-                index.write_to_disk(&cache_dir, head.as_deref());
+            if cache_lock.is_some()
+                && content_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                    == content_generation
+            {
+                let _ = persist_epoch_flag.run_if_current(persist_epoch, || {
+                    let head = index.stored_git_head().map(str::to_owned);
+                    index.write_to_disk(&cache_dir, head.as_deref());
+                });
             }
-            let _ = tx.send(index);
+            let _ = lifecycle.run_if_current(&generation_flag, generation, || {
+                let _ = tx.send(index);
+            });
         });
     });
 }
@@ -1208,94 +1640,95 @@ pub fn refresh_project_corpus(
     reason: &str,
     _invalidate_ignore_paths: bool,
 ) -> bool {
-    let Some(root) = ctx.canonical_cache_root_opt() else {
-        return false;
-    };
-    if !ctx.heavy_root_work_allowed() {
-        return false;
-    }
-    let config = ctx.config();
-    let mut status_changed = false;
-
-    if ctx.callgraph_writer() {
-        // Do NOT cold-build the callgraph store synchronously here. This function
-        // runs on the single-threaded dispatch loop from `drain_watcher_events`,
-        // which fires before EVERY request (and on idle ticks). A full O(repo)
-        // `refresh_corpus` (= `cold_build`: parse all files + resolve refs +
-        // rewrite SQLite) blocks ALL queued requests — including `configure` and
-        // `bash` — for its entire duration, which exceeds the 30s transport
-        // timeout on a large repo. On a long-lived bridge (OpenCode Desktop) an
-        // FSEvents overflow triggers this drain, so the user sees configure/bash
-        // time out (regression: the watcher-overflow path that calls this is new
-        // in 0.39.1; the ignore-rule path that also calls this had the same
-        // latent inline block, just rarely triggered).
-        //
-        // Instead, drop the resident store and force a BACKGROUND rebuild: the
-        // next `callgraph_store_for_ops()` spawns the cold build off-thread and
-        // returns `Building` (callgraph ops + dead_code projection already handle
-        // `Building`/unavailable gracefully). This mirrors the search/semantic
-        // refreshes below, which are already async. A build already in flight
-        // keeps running; the resident drop + force flag make the next op converge
-        // to a fresh full rebuild.
-        // Mirror the original "act only when the callgraph is actually loaded or
-        // building" guard, but reschedule instead of inline-building.
-        let callgraph_store_resident = {
-            let guard = ctx
-                .callgraph_store()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.is_some()
+    let generation = ctx.configure_generation();
+    ctx.run_if_subc_bound_generation(generation, || {
+        let Some(root) = ctx.canonical_cache_root_opt() else {
+            return false;
         };
-        if callgraph_store_resident || ctx.callgraph_store_rx().lock().is_some() {
-            *ctx.callgraph_store()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            ctx.mark_callgraph_store_force_rebuild();
-            status_changed = true;
-            aft::slog_info!(
-                "callgraph store scheduled for background rebuild after {}",
-                reason
-            );
-        }
-    }
+        let config = ctx.config();
+        let mut status_changed = false;
 
-    if config.search_index && !ctx.shared_artifacts_read_only() {
-        spawn_search_corpus_refresh(ctx, root.clone(), config.clone());
-        status_changed = true;
-        aft::slog_info!("started search index refresh after {}", reason);
-    }
-
-    if config.semantic_search && !ctx.shared_artifacts_read_only() {
-        if let Some(sender) = ctx.semantic_refresh_sender() {
-            *ctx.semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                SemanticIndexStatus::Building {
-                    stage: "refreshing_corpus".to_string(),
-                    files: None,
-                    entries_done: None,
-                    entries_total: None,
-                };
-            match sender.send(SemanticRefreshRequest::Corpus) {
-                Ok(()) => {
-                    status_changed = true;
-                }
-                Err(error) => {
-                    *ctx.semantic_index_status()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        SemanticIndexStatus::Failed(format!(
-                            "semantic corpus refresh worker unavailable: {error}"
-                        ));
-                    status_changed = true;
-                }
+        if ctx.callgraph_writer() {
+            // Do NOT cold-build the callgraph store synchronously here. This function
+            // runs on the single-threaded dispatch loop from `drain_watcher_events`,
+            // which fires before EVERY request (and on idle ticks). A full O(repo)
+            // `refresh_corpus` (= `cold_build`: parse all files + resolve refs +
+            // rewrite SQLite) blocks ALL queued requests — including `configure` and
+            // `bash` — for its entire duration, which exceeds the 30s transport
+            // timeout on a large repo. On a long-lived bridge (OpenCode Desktop) an
+            // FSEvents overflow triggers this drain, so the user sees configure/bash
+            // time out (regression: the watcher-overflow path that calls this is new
+            // in 0.39.1; the ignore-rule path that also calls this had the same
+            // latent inline block, just rarely triggered).
+            //
+            // Instead, drop the resident store and force a BACKGROUND rebuild: the
+            // next `callgraph_store_for_ops()` spawns the cold build off-thread and
+            // returns `Building` (callgraph ops + dead_code projection already handle
+            // `Building`/unavailable gracefully). This mirrors the search/semantic
+            // refreshes below, which are already async. A build already in flight
+            // keeps running; the resident drop + force flag make the next op converge
+            // to a fresh full rebuild.
+            // Mirror the original "act only when the callgraph is actually loaded or
+            // building" guard, but reschedule instead of inline-building.
+            let callgraph_store_resident = {
+                let guard = ctx
+                    .callgraph_store()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.is_some()
+            };
+            if callgraph_store_resident || ctx.callgraph_store_rx().lock().is_some() {
+                *ctx.callgraph_store()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                ctx.mark_callgraph_store_force_rebuild();
+                status_changed = true;
+                aft::slog_info!(
+                    "callgraph store scheduled for background rebuild after {}",
+                    reason
+                );
             }
-        } else if ctx.semantic_index_rx().lock().is_some() {
-            ctx.mark_pending_semantic_corpus_refresh();
         }
-    }
 
-    status_changed
+        if config.search_index && !ctx.shared_artifacts_read_only() {
+            spawn_search_corpus_refresh_admitted(ctx, root.clone(), config.clone(), generation);
+            status_changed = true;
+            aft::slog_info!("started search index refresh after {}", reason);
+        }
+
+        if config.semantic_search && !ctx.shared_artifacts_read_only() {
+            if let Some(sender) = ctx.semantic_refresh_sender() {
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    SemanticIndexStatus::Building {
+                        stage: "refreshing_corpus".to_string(),
+                        files: None,
+                        entries_done: None,
+                        entries_total: None,
+                    };
+                match sender.send(SemanticRefreshRequest::Corpus) {
+                    Ok(()) => {
+                        status_changed = true;
+                    }
+                    Err(error) => {
+                        *ctx.semantic_index_status()
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            SemanticIndexStatus::Failed(format!(
+                                "semantic corpus refresh worker unavailable: {error}"
+                            ));
+                        status_changed = true;
+                    }
+                }
+            } else if ctx.semantic_index_rx().lock().is_some() {
+                ctx.mark_pending_semantic_corpus_refresh();
+            }
+        }
+
+        status_changed
+    })
+    .unwrap_or(false)
 }
 
 pub fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
@@ -1306,13 +1739,66 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
     if ctx.canonical_cache_root_opt().is_none() {
         return false;
     }
-    ctx.clear_pending_index_updates();
-    ctx.reset_symbol_cache();
-    let _ = ctx.mark_status_bar_tier2_stale();
-    ctx.clear_tsconfig_membership_cache();
-    let mut status_changed = true;
+    let generation = ctx.configure_generation();
+    let Some(mut status_changed) = ctx.run_if_subc_bound_generation(generation, || {
+        if let Some(root) = ctx.canonical_cache_root_opt() {
+            // A rescan means watcher events were LOST. Same-size,
+            // preserved-mtime edits are exactly what stat-first verification
+            // misses, so the memo must downgrade to strict content
+            // verification, not just to stat-first.
+            crate::cache_freshness::invalidate_verify_memo_strict(&root);
+        }
+        ctx.clear_pending_index_updates();
+        ctx.reset_symbol_cache();
+        let _ = ctx.mark_status_bar_tier2_stale();
+        ctx.clear_tsconfig_membership_cache();
+        true
+    }) else {
+        return false;
+    };
 
     status_changed |= refresh_project_corpus(ctx, "watcher overflow", false);
+
+    // The shared corpus refresh only reconciles what is resident or has a live
+    // worker. After lost events that is not enough: nothing may be resident
+    // (evicted root), no refresh worker may exist yet, and read-only roots
+    // skip watcher path application entirely. Force the reconciliation for
+    // each lane regardless of residency.
+    let hardened = ctx.run_if_subc_bound_generation(generation, || {
+        let config = ctx.config();
+        if ctx.callgraph_writer()
+            && config.callgraph_store
+            && ctx.pending_callgraph_store_force_token().is_none()
+        {
+            // The corpus refresh above forces a rebuild only when a store was
+            // resident or building; lost events invalidate the disk
+            // generation either way.
+            ctx.mark_callgraph_store_force_rebuild();
+        }
+        if ctx.shared_artifacts_read_only() {
+            // Read-only roots reconcile by re-opening the shared artifacts:
+            // drop the resident snapshots so the evicted-reload path fires on
+            // the next query.
+            ctx.search_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if config.semantic_search {
+                ctx.semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+        } else if config.semantic_search
+            && ctx.semantic_refresh_sender().is_none()
+            && ctx.semantic_index_rx().lock().is_none()
+        {
+            // No worker exists to receive the corpus request and none is
+            // building; retain the intent so the next worker replays it.
+            ctx.mark_pending_semantic_corpus_refresh();
+        }
+    });
+    status_changed |= hardened.is_some();
     status_changed
 }
 
@@ -1387,6 +1873,7 @@ fn apply_watcher_path_phase(
         {
             let _watchdog = WatcherDrainUnitGuard::start(stage, &path);
             delay_watcher_unit_for_test();
+            wait_on_watcher_phase_commit_gate_for_test(&path);
             apply(&path);
         }
         paths.push_back(path);
@@ -1470,8 +1957,28 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
     else {
         return;
     };
+    let lifecycle_generation = ctx.configure_generation();
+    // Mid-slice unbind: every per-path mutation below is lifecycle-gated, so
+    // continuing would burn the whole batch as no-ops and DROP the paths at
+    // Complete. Abort with the phase intact instead — the continuation is
+    // retained across lifecycle-only generation changes and the rebind
+    // rebases and replays it.
+    if ctx
+        .run_if_subc_bound_generation(lifecycle_generation, || ())
+        .is_none()
+    {
+        state.phase = WatcherDrainPhase::Apply {
+            stage,
+            paths,
+            remaining,
+            oversized_inline_batch,
+        };
+        return;
+    }
     if !paths.is_empty() || remaining > 0 {
-        ctx.invalidate_warm_verify_memo();
+        let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+            ctx.invalidate_warm_verify_memo();
+        });
     }
     let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
     let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
@@ -1488,7 +1995,9 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
                     if heavy_root_work_allowed && ctx.inspect_writer() {
-                        ctx.add_pending_tier2_paths([path.to_path_buf()]);
+                        let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                            ctx.add_pending_tier2_paths([path.to_path_buf()]);
+                        });
                     }
                 },
             ),
@@ -1512,7 +2021,9 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                             && !oversized_inline_batch
                             && search_build_in_progress
                         {
-                            ctx.add_pending_search_index_paths([path.to_path_buf()]);
+                            let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                                ctx.add_pending_search_index_paths([path.to_path_buf()])
+                            });
                         }
                         if heavy_root_work_allowed
                             && !shared_artifacts_read_only
@@ -1520,7 +2031,9 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                             && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
                             && watcher_path_is_semantic_source(path)
                         {
-                            ctx.add_pending_semantic_index_paths([path.to_path_buf()]);
+                            let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                                ctx.add_pending_semantic_index_paths([path.to_path_buf()])
+                            });
                         }
                     },
                 )
@@ -1533,9 +2046,11 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
                     if !shared_artifacts_read_only {
-                        if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
-                            symbol_cache.invalidate(path);
-                        }
+                        let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                            if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
+                                symbol_cache.invalidate(path);
+                            }
+                        });
                     }
                 },
             ),
@@ -1546,7 +2061,12 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 heavy_root_work_allowed && !oversized_inline_batch,
-                refresh_callgraph_store_for_watcher,
+                |ctx, changed| {
+                    let _ = ctx.enqueue_callgraph_store_refresh_for_generation(
+                        changed.iter().cloned(),
+                        lifecycle_generation,
+                    );
+                },
             ),
             WatcherDrainApplyPhase::SearchIndex => apply_watcher_path_phase(
                 WatcherDrainApplyPhase::SearchIndex,
@@ -1559,17 +2079,19 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                         && !shared_artifacts_read_only
                         && !oversized_inline_batch
                     {
-                        let mut index_ref = ctx
-                            .search_index()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some(index) = index_ref.as_mut() {
-                            if path.exists() {
-                                index.update_file(path);
-                            } else {
-                                index.remove_file(path);
+                        let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                            let mut index_ref = ctx
+                                .search_index()
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(index) = index_ref.as_mut() {
+                                if path.exists() {
+                                    index.update_file(path);
+                                } else {
+                                    index.remove_file(path);
+                                }
                             }
-                        }
+                        });
                     }
                 },
             ),
@@ -1587,27 +2109,29 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     {
                         return;
                     }
-                    let invalidated = {
-                        let mut semantic_index_ref = ctx
-                            .semantic_index()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        semantic_index_ref.as_mut().is_some_and(|index| {
-                            index.invalidate_file(path);
-                            true
-                        })
-                    };
-                    if invalidated {
-                        let mut status = ctx
-                            .semantic_index_status()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                            status.add_refreshing_file(path.to_path_buf());
-                            semantic_refresh_paths.push(path.to_path_buf());
-                            status_changed = true;
+                    let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                        let invalidated = {
+                            let mut semantic_index_ref = ctx
+                                .semantic_index()
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            semantic_index_ref.as_mut().is_some_and(|index| {
+                                index.invalidate_file(path);
+                                true
+                            })
+                        };
+                        if invalidated {
+                            let mut status = ctx
+                                .semantic_index_status()
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                                status.add_refreshing_file(path.to_path_buf());
+                                semantic_refresh_paths.push(path.to_path_buf());
+                                status_changed = true;
+                            }
                         }
-                    }
+                    });
                 },
             ),
             WatcherDrainApplyPhase::LspDiagnostics => apply_watcher_path_phase(
@@ -1617,19 +2141,44 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
-                    if !path.exists() {
-                        status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
-                        return;
-                    }
-                    let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
-                    status_changed |= stale.changed;
-                    if stale.had_entries {
-                        ctx.lsp_resync_changed_file_for_diagnostics(path);
-                    }
+                    let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                        if !path.exists() {
+                            status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
+                            return;
+                        }
+                        let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
+                        status_changed |= stale.changed;
+                        if stale.had_entries {
+                            ctx.lsp_resync_changed_file_for_diagnostics(path);
+                        }
+                    });
                 },
             ),
             WatcherDrainApplyPhase::Complete => true,
         };
+
+        // Per-path mutations are lifecycle-gated no-ops once the root unbinds,
+        // so a stage that overlapped an unbind may have skipped paths (their
+        // `remaining` was still decremented). Rewind the CURRENT stage (every
+        // stage action is idempotent) and park the continuation; the rebased
+        // replay after rebind re-runs it in full. This check must cover the
+        // budget-exhausted park as well: a mid-stage park that kept the
+        // decremented `remaining` would permanently skip the gated paths.
+        if ctx
+            .run_if_subc_bound_generation(lifecycle_generation, || ())
+            .is_none()
+        {
+            state.status_changed = status_changed;
+            state.semantic_refresh_paths = semantic_refresh_paths;
+            remaining = paths.len();
+            state.phase = WatcherDrainPhase::Apply {
+                stage,
+                paths,
+                remaining,
+                oversized_inline_batch,
+            };
+            return;
+        }
 
         if !completed {
             state.status_changed = status_changed;
@@ -1662,26 +2211,46 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
     }
 
     if !semantic_refresh_paths.is_empty() {
-        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
-            sender
-                .send(SemanticRefreshRequest::Files {
-                    paths: semantic_refresh_paths.clone(),
-                })
-                .is_ok()
-        });
-        if !sent {
-            aft::slog_warn!(
-                "semantic refresh worker unavailable; dropping {} refreshing file(s)",
-                semantic_refresh_paths.len()
-            );
-            let mut status = ctx
-                .semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for path in &semantic_refresh_paths {
-                status.cancel_refreshing_file(path);
+        // Distinguish "root unbound" (None) from "worker unavailable"
+        // (Some(false)): losing admission here must PARK the collected paths
+        // for the post-rebind replay, not drop them — the per-path
+        // invalidation already ran, so these paths are the only record that
+        // the semantic index is stale for them.
+        match ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+            ctx.semantic_refresh_sender().is_some_and(|sender| {
+                sender
+                    .send(SemanticRefreshRequest::Files {
+                        paths: semantic_refresh_paths.clone(),
+                    })
+                    .is_ok()
+            })
+        }) {
+            Some(true) => {}
+            Some(false) => {
+                aft::slog_warn!(
+                    "semantic refresh worker unavailable; dropping {} refreshing file(s)",
+                    semantic_refresh_paths.len()
+                );
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for path in &semantic_refresh_paths {
+                    status.cancel_refreshing_file(path);
+                }
+                status_changed = true;
             }
-            status_changed = true;
+            None => {
+                state.status_changed = status_changed;
+                state.semantic_refresh_paths = semantic_refresh_paths;
+                state.phase = WatcherDrainPhase::Apply {
+                    stage: WatcherDrainApplyPhase::Complete,
+                    paths,
+                    remaining: 0,
+                    oversized_inline_batch,
+                };
+                return;
+            }
         }
     }
 
@@ -1699,13 +2268,29 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
     let started = Instant::now();
     let configure_generation = ctx.configure_generation();
-    let mut state = ctx
-        .watcher_drain_slice()
-        .lock()
-        .take()
-        .filter(|state| state.configure_generation == configure_generation)
-        .unwrap_or_else(|| WatcherDrainSliceState::new(configure_generation));
+    let content_generation = ctx.configure_content_generation();
     let mut outcome = DrainBatchOutcome::default();
+    // Admission before touching the continuation: an unbound invocation must
+    // leave the retained state in place for the rebind to rebase, not take
+    // and drop it.
+    if ctx
+        .run_if_subc_bound_generation(configure_generation, || ())
+        .is_none()
+    {
+        return outcome;
+    }
+    let mut state = match ctx.watcher_drain_slice().lock().take() {
+        Some(state) if state.configure_generation == configure_generation => state,
+        // Lifecycle-only generation change (transient unbind + equivalent
+        // rebind): the retained paths are still valid for this configuration.
+        // Rebase onto the current generation and replay — every apply phase
+        // is idempotent (re-indexing an unchanged file is a no-op).
+        Some(mut state) if state.configure_content_generation == content_generation => {
+            state.configure_generation = configure_generation;
+            state
+        }
+        _ => WatcherDrainSliceState::new(configure_generation, content_generation),
+    };
     let mut dispatch_events_received = 0usize;
     let mut watcher_failed = None;
     let mut root_deleted = false;
@@ -1741,11 +2326,14 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                         path.display()
                     );
                     if !state.rescan_required {
-                        if ctx.heavy_root_work_allowed() {
-                            ctx.rebuild_gitignore();
-                        } else {
-                            ctx.clear_gitignore();
-                        }
+                        let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
+                        let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
+                            if heavy_root_work_allowed {
+                                ctx.rebuild_gitignore();
+                            } else {
+                                ctx.clear_gitignore();
+                            }
+                        });
                     }
                 }
                 Ok(WatcherDispatchEvent::RootDeleted) => {
@@ -1819,8 +2407,18 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             ctx.status_emitter().signal(ctx.build_status_snapshot());
         }
         ctx.tick_tier2_refresh_scheduler(state.scheduler_changed_path_count);
-        state.rescan_required = false;
-        state.ignore_changed = false;
+        // Acknowledge the rescan only if the whole refresh sequence ran under
+        // the original lifecycle generation: an unbind advances the
+        // generation, and the internal admission gates then made parts of the
+        // sequence no-ops. Keeping the flag parks the rescan for the
+        // post-rebind replay instead of acknowledging a partial one.
+        if ctx
+            .run_if_subc_bound_generation(configure_generation, || ())
+            .is_some()
+        {
+            state.rescan_required = false;
+            state.ignore_changed = false;
+        }
         state.status_changed = false;
         state.scheduler_changed_path_count = 0;
     } else if matches!(state.phase, WatcherDrainPhase::Collect) {
@@ -1829,7 +2427,14 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         if ignore_changed {
             state.status_changed |= refresh_corpus_after_ignore_change(ctx);
             project_corpus_refresh_requested = true;
-            state.ignore_changed = false;
+            // Same partial-sequence rule as the rescan path: acknowledge only
+            // when the refresh ran fully under this lifecycle generation.
+            if ctx
+                .run_if_subc_bound_generation(configure_generation, || ())
+                .is_some()
+            {
+                state.ignore_changed = false;
+            }
         }
 
         if max_paths > 0 && !state.pending_paths.is_empty() {
@@ -1859,11 +2464,21 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 } else {
                     paths.len()
                 };
-                if ctx.mark_status_bar_tier2_stale() {
+                if ctx
+                    .run_if_subc_bound_generation(configure_generation, || {
+                        ctx.mark_status_bar_tier2_stale()
+                    })
+                    .unwrap_or(false)
+                {
                     state.status_changed = true;
                 }
-                if paths.iter().any(|path| watcher_path_is_tsconfig(path)) {
-                    ctx.clear_tsconfig_membership_cache();
+                if paths.iter().any(|path| watcher_path_is_tsconfig(path))
+                    && ctx
+                        .run_if_subc_bound_generation(configure_generation, || {
+                            ctx.clear_tsconfig_membership_cache();
+                        })
+                        .is_some()
+                {
                     state.status_changed = true;
                 }
 
@@ -1908,7 +2523,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         .as_ref()
         .is_some_and(|rx| !rx.is_empty());
     outcome.has_more = state.has_pending_work() || receiver_has_more;
-    if state.configure_generation == ctx.configure_generation() {
+    // Retain the continuation across lifecycle-only generation changes (a
+    // mid-drain unbind advances the generation; the rebind rebases). Only a
+    // content change — a real reconfigure — discards it.
+    if state.configure_content_generation == ctx.configure_content_generation() {
         *ctx.watcher_drain_slice().lock() = Some(state);
     }
     outcome
@@ -2008,6 +2626,7 @@ pub(crate) fn configure_search_order_context_for_test(
         reset_filter_registry: false,
         clear_failed_spawns: false,
         warm_callgraph_store: false,
+        supersede_artifact_persistence: false,
         artifact_load_starts: Vec::new(),
     });
 
@@ -2040,6 +2659,150 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         (ctx, tx)
+    }
+
+    #[test]
+    fn newer_watcher_refresh_prevents_older_configure_build_from_overwriting_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let source = root_path.join("marker.rs");
+        std::fs::write(&source, "fn old_generation_marker() {}\n").unwrap();
+
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root_path.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root_path.clone());
+        ctx.set_harness(crate::harness::Harness::Opencode);
+
+        let project_key = ctx.memoized_artifact_cache_key(&root_path);
+        let cache_dir =
+            crate::search_index::resolve_cache_dir_with_key(&project_key, Some(storage.path()));
+        let mut older_index = crate::search_index::SearchIndex::build(&root_path);
+        let older_epoch = ctx.next_search_persist_epoch();
+        let persist_epoch = ctx.search_persist_epoch_flag();
+        let (older_reached_tx, older_reached_rx) = std::sync::mpsc::channel();
+        let (older_release_tx, older_release_rx) = std::sync::mpsc::channel();
+        let older_root = root_path.clone();
+        let older_cache = cache_dir.clone();
+        let older_writer = std::thread::spawn(move || {
+            older_reached_tx.send(()).unwrap();
+            older_release_rx.recv().unwrap();
+            let _lock = crate::search_index::CacheLock::acquire(&older_cache, &older_root)
+                .expect("older build should acquire the persistence lock");
+            let _ = persist_epoch.run_if_current(older_epoch, || {
+                older_index.write_to_disk(&older_cache, None);
+            });
+        });
+        older_reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("older configure build did not reach its persistence barrier");
+
+        std::fs::write(&source, "fn new_watcher_marker() {}\n").unwrap();
+        spawn_search_corpus_refresh(&ctx, root_path.clone(), ctx.config());
+        let refresh_rx = ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("watcher refresh receiver")
+            .clone();
+        refresh_rx
+            .recv_timeout(Duration::from_secs(12))
+            .expect("watcher refresh did not complete");
+
+        older_release_tx.send(()).unwrap();
+        older_writer.join().unwrap();
+
+        let disk = crate::search_index::SearchIndex::read_from_disk(&cache_dir, &root_path)
+            .expect("persisted search index");
+        assert_eq!(
+            disk.grep("new_watcher_marker", true, &[], &[], &root_path, 10)
+                .matches
+                .len(),
+            1,
+            "newer watcher refresh must remain on disk"
+        );
+        assert!(
+            disk.grep("old_generation_marker", true, &[], &[], &root_path, 10)
+                .matches
+                .is_empty(),
+            "older configure build must not overwrite the newer watcher refresh"
+        );
+    }
+
+    #[test]
+    fn watcher_phase_dequeued_before_unbind_cannot_index_after_teardown() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let root = root.as_path();
+        let source = root.join("changed.rs");
+        std::fs::write(&source, "fn watcher_marker() {}\n").unwrap();
+        let (ctx, watcher_tx) = watcher_context(root);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::search_index::SearchIndex::new());
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(vec![source.clone()]))
+            .unwrap();
+
+        let ctx = Arc::new(ctx);
+        let (reached_rx, release_tx) = install_watcher_phase_commit_gate_for_test(source.clone());
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            while drain_watcher_events_bounded(&drain_ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {}
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("watcher phase did not reach its commit barrier");
+        ctx.mark_subc_unbound();
+        release_tx.send(()).unwrap();
+        drain.join().unwrap();
+
+        {
+            let search = ctx
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                search
+                    .as_ref()
+                    .expect("search index")
+                    .grep("watcher_marker", true, &[], &[], root, 10)
+                    .matches
+                    .is_empty(),
+                "watcher work dequeued before teardown must not mutate the index after unbind"
+            );
+        }
+
+        // The unapplied path survives the unbound window in the retained
+        // continuation; an equivalent rebind rebases and replays it.
+        ctx.mark_subc_bound();
+        let mut guard = 0;
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            guard += 1;
+            assert!(guard < 16, "rebased replay must finish");
+        }
+        let search = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            search
+                .as_ref()
+                .expect("search index")
+                .grep("watcher_marker", true, &[], &[], root, 10)
+                .matches
+                .len(),
+            1,
+            "post-rebind replay must apply the retained watcher path"
+        );
     }
 
     #[test]
@@ -2119,6 +2882,1072 @@ mod tests {
         assert!(matches!(
             pushed,
             crate::protocol::PushFrame::StatusChanged(_)
+        ));
+    }
+
+    #[test]
+    fn watcher_overflow_invalidates_artifact_freshness_memo() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("semantic.bin");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let generation = crate::cache_freshness::artifact_generation(&artifact);
+        let ticket = crate::cache_freshness::capture_verify_ticket(&canonical_root);
+        assert!(
+            crate::cache_freshness::record_verify_completed_if_unchanged(
+                &canonical_root,
+                crate::cache_freshness::VerifyArtifact::Semantic,
+                generation,
+                ticket,
+            )
+        );
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &canonical_root,
+                crate::cache_freshness::VerifyArtifact::Semantic,
+                generation,
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Skip
+        );
+
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(canonical_root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(canonical_root.clone());
+        refresh_project_after_watcher_rescan(&ctx);
+
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &canonical_root,
+                crate::cache_freshness::VerifyArtifact::Semantic,
+                generation,
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Strict,
+            "lost watcher events force STRICT verification: stat-first would \
+             miss same-size, preserved-mtime edits made during the gap"
+        );
+    }
+
+    #[test]
+    fn superseded_callgraph_worker_settles_receiver_and_allows_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_chunk_size: 1,
+                ..Config::default()
+            },
+        );
+        let generation = ctx.configure_generation();
+        let (worker_tx, worker_rx) = crossbeam_channel::unbounded();
+        ctx.note_callgraph_store_rx_generation(generation);
+        ctx.next_callgraph_store_rx_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(worker_rx);
+
+        drain_callgraph_store_events(&ctx);
+        assert!(
+            ctx.callgraph_store_rx().lock().is_some(),
+            "an empty running receiver remains in flight"
+        );
+        ctx.next_callgraph_persist_epoch();
+        worker_tx.send(CallGraphStoreBuildEvent::Settled).unwrap();
+        drain_callgraph_store_events(&ctx);
+        assert!(
+            ctx.callgraph_store_rx().lock().is_none(),
+            "a superseded worker must explicitly retire its receiver"
+        );
+
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            crate::context::CallgraphStoreAccess::Building
+                | crate::context::CallgraphStoreAccess::Ready(_)
+        ));
+        assert!(
+            ctx.callgraph_store_rx().lock().is_some()
+                || ctx
+                    .callgraph_store()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some(),
+            "a later operation must be able to retry the callgraph build"
+        );
+    }
+
+    #[test]
+    fn failed_forced_callgraph_build_preserves_durable_demand() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let force_token = ctx.mark_callgraph_store_force_rebuild();
+        assert_eq!(ctx.pending_callgraph_store_force_token(), Some(force_token));
+
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.note_callgraph_store_rx_generation(generation);
+        ctx.next_callgraph_store_rx_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(rx);
+        tx.send(CallGraphStoreBuildEvent::Settled).unwrap();
+        drain_callgraph_store_events(&ctx);
+
+        assert!(
+            ctx.pending_callgraph_store_force_token().is_some(),
+            "the current failed forced build must preserve retry demand"
+        );
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+    }
+
+    #[test]
+    fn newer_forced_callgraph_demand_survives_older_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn marker() {}\n").unwrap();
+        let project_root = std::fs::canonicalize(root.path()).unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(project_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(project_root.clone());
+        let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+            ctx.callgraph_store_dir(),
+            project_root,
+            &[source],
+            1,
+        )
+        .unwrap();
+        let older = ctx.mark_callgraph_store_force_rebuild();
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.note_callgraph_store_rx_generation(generation);
+        ctx.next_callgraph_store_rx_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(rx);
+        tx.send(CallGraphStoreBuildEvent::Ready {
+            store,
+            fulfilled_force_token: Some(older),
+            publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
+        })
+        .unwrap();
+        let newer = ctx.mark_callgraph_store_force_rebuild();
+
+        drain_callgraph_store_events(&ctx);
+
+        assert!(ctx.callgraph_store().read().unwrap().is_some());
+        assert_eq!(ctx.pending_callgraph_store_force_token(), Some(newer));
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            crate::context::CallgraphStoreAccess::Building
+        ));
+        assert!(ctx.callgraph_store_rx().lock().is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ctx.pending_callgraph_store_force_token().is_some() {
+            drain_callgraph_store_events(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "newer forced callgraph rebuild did not publish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ctx.callgraph_store().read().unwrap().is_some());
+    }
+
+    #[test]
+    fn callgraph_ready_without_published_pointer_settles_and_preserves_pending_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn marker() {}\n").unwrap();
+        let project_root = std::fs::canonicalize(root.path()).unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(project_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_chunk_size: 1,
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(project_root.clone());
+        let callgraph_dir = ctx.callgraph_store_dir();
+        let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+            callgraph_dir.clone(),
+            project_root,
+            &[source],
+            1,
+        )
+        .unwrap();
+        let pointer = callgraph_dir.join(format!("{}.current", store.project_key()));
+        std::fs::remove_file(pointer).unwrap();
+
+        let pending = root.path().join("pending.rs");
+        ctx.add_pending_callgraph_store_paths([pending.clone()]);
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        {
+            let mut receiver = ctx.callgraph_store_rx().lock();
+            ctx.note_callgraph_store_rx_generation(generation);
+            ctx.next_callgraph_store_rx_epoch();
+            *receiver = Some(rx);
+        }
+        tx.send(CallGraphStoreBuildEvent::Ready {
+            store,
+            fulfilled_force_token: None,
+            publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
+        })
+        .unwrap();
+        drop(tx);
+
+        drain_callgraph_store_events(&ctx);
+
+        assert!(
+            ctx.callgraph_store_rx().lock().is_none(),
+            "Ready is terminal even when reopening the pointer fails"
+        );
+        assert_eq!(
+            ctx.take_pending_callgraph_store_paths(),
+            vec![pending],
+            "failed reopen must preserve pending watcher paths for the retry"
+        );
+    }
+
+    #[test]
+    fn stale_callgraph_receiver_cannot_clear_newer_same_generation_receiver() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        let generation = ctx.configure_generation();
+        let (old_tx, old_rx) = crossbeam_channel::unbounded();
+        ctx.note_callgraph_store_rx_generation(generation);
+        ctx.next_callgraph_store_rx_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(old_rx);
+        old_tx.send(CallGraphStoreBuildEvent::Settled).unwrap();
+        let (reached, release) = install_artifact_drain_commit_gate_for_test(&ctx);
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_callgraph_store_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stale callgraph receiver was not dequeued");
+
+        let (_new_tx, new_rx) = crossbeam_channel::unbounded();
+        ctx.note_callgraph_store_rx_generation(generation);
+        ctx.next_callgraph_store_rx_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(new_rx);
+        release.send(()).unwrap();
+        drain.join().unwrap();
+
+        assert!(
+            ctx.callgraph_store_rx().lock().is_some(),
+            "a stale callgraph drain must not clear the replacement receiver"
+        );
+        assert!(
+            ctx.pending_callgraph_store_force_token().is_none(),
+            "a stale terminal event must not create force demand for its replacement"
+        );
+    }
+
+    #[test]
+    fn dequeued_search_completion_cannot_clear_newer_same_generation_receiver() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        let generation = ctx.configure_generation();
+        let (old_tx, old_rx) = crossbeam_channel::unbounded();
+        old_tx
+            .send(crate::search_index::SearchIndex::new())
+            .unwrap();
+        ctx.note_search_index_rx_generation(generation);
+        ctx.next_search_index_rx_epoch();
+        *ctx.search_index_rx()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(old_rx);
+        let (reached, release) = install_artifact_drain_commit_gate_for_test(&ctx);
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_search_index_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old search completion was not dequeued");
+
+        let (_new_tx, new_rx) = crossbeam_channel::unbounded();
+        ctx.note_search_index_rx_generation(generation);
+        ctx.next_search_index_rx_epoch();
+        *ctx.search_index_rx()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(new_rx);
+        release.send(()).unwrap();
+        drain.join().unwrap();
+
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "an older same-generation receiver must not publish after replacement"
+        );
+        assert!(
+            ctx.search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "an older same-generation drain must not clear the newer receiver"
+        );
+    }
+
+    #[test]
+    fn rescan_arriving_while_unbound_executes_fully_after_rebind() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, watcher_tx) = watcher_context(&root);
+        // Warm Skip memo: the rescan's strict invalidation is its observable
+        // effect, so the memo downgrade proves the refresh actually ran.
+        let artifact = root.join("artifact.bin");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        let generation = crate::cache_freshness::artifact_generation(&artifact);
+        let ticket = crate::cache_freshness::capture_verify_ticket(&root);
+        assert!(
+            crate::cache_freshness::record_verify_completed_if_unchanged(
+                &root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                generation,
+                ticket,
+            )
+        );
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired)
+            .unwrap();
+
+        // While unbound the drain must not consume (and then lose) the
+        // rescan: nothing may execute, so the memo stays warm.
+        ctx.mark_subc_unbound();
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                generation,
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Skip,
+            "an unbound drain must not run (or half-run) the rescan"
+        );
+
+        // After rebind the retained rescan executes in full: strict memo and
+        // acknowledged flag.
+        ctx.mark_subc_bound();
+        let mut guard = 0;
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            guard += 1;
+            assert!(guard < 16, "rescan replay must finish");
+        }
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                generation,
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Strict,
+            "the post-rebind drain must execute the retained rescan strictly"
+        );
+        assert!(
+            !ctx.watcher_drain_slice()
+                .lock()
+                .as_ref()
+                .is_some_and(|state| state.rescan_required),
+            "a fully-bound rescan must be acknowledged"
+        );
+    }
+
+    #[test]
+    fn budget_interrupted_stage_rewinds_when_unbind_lands_mid_stage() {
+        // An unbind mid-stage makes the remaining per-path actions gated
+        // no-ops while `remaining` still decrements. The park must rewind the
+        // stage so the post-rebind replay re-runs it in full — for BOTH park
+        // shapes (budget-exhausted and stage-complete).
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        std::fs::write(&first, "fn first_marker() {}\n").unwrap();
+        std::fs::write(&second, "fn second_marker() {}\n").unwrap();
+        let (ctx, watcher_tx) = watcher_context(&root);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::search_index::SearchIndex::new());
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(vec![
+                first.clone(),
+                second.clone(),
+            ]))
+            .unwrap();
+
+        // Gate on the SECOND path so the unbind lands after `first` was
+        // already applied within the same stage pass.
+        let ctx = Arc::new(ctx);
+        let (reached_rx, release_tx) = install_watcher_phase_commit_gate_for_test(second.clone());
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            while drain_watcher_events_bounded(&drain_ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {}
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("watcher phase did not reach the second path");
+        ctx.mark_subc_unbound();
+        release_tx.send(()).unwrap();
+        drain.join().unwrap();
+
+        ctx.mark_subc_bound();
+        let mut guard = 0;
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            guard += 1;
+            assert!(guard < 32, "rebased replay must finish");
+        }
+        let search = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = search.as_ref().expect("search index");
+        for (marker, path) in [("first_marker", &first), ("second_marker", &second)] {
+            assert_eq!(
+                index.grep(marker, true, &[], &[], &root, 10).matches.len(),
+                1,
+                "post-rebind replay must apply {} ({})",
+                marker,
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn pending_paths_retained_across_transient_unbind_repair_next_installed_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let source = root.join("edited-during-unbind.rs");
+        std::fs::write(&source, "fn repaired_marker() {}\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+
+        // Watcher recorded the edit while a build was in flight, then the
+        // route unbound. The transient-unbind cleanup retires the receiver but
+        // must keep the pending path: it is the only record that any artifact
+        // a pre-unbind worker persisted is content-stale.
+        ctx.add_pending_search_index_paths([source.clone()]);
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+
+        // Equivalent rebind starts a replacement build; its install must
+        // replay the retained path into the fresh index.
+        ctx.mark_subc_bound();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut stale_index = crate::search_index::SearchIndex::build(&root);
+        // Simulate the pre-unbind worker's artifact predating the edit.
+        stale_index.remove_file(&source);
+        tx.send(stale_index).unwrap();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+
+        drain_search_index_events(&ctx);
+
+        let search = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            search
+                .as_ref()
+                .expect("installed search index")
+                .grep("repaired_marker", true, &[], &[], &root, 10)
+                .matches
+                .len(),
+            1,
+            "retained pending path must repair the stale artifact on install"
+        );
+    }
+
+    #[test]
+    fn disconnected_search_refresh_clears_nonready_index_and_preserves_pending_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let mut index = crate::search_index::SearchIndex::new();
+        index.ready = false;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        let pending = root.path().join("pending.rs");
+        ctx.add_pending_search_index_paths([pending.clone()]);
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        drop(tx);
+        ctx.install_search_index_rx(rx, generation);
+
+        drain_search_index_events(&ctx);
+
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a disconnected refresh must not leave a permanently non-ready index"
+        );
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert_eq!(ctx.take_pending_search_index_paths(), vec![pending]);
+    }
+
+    #[test]
+    fn dequeued_search_completion_cannot_publish_after_unbind() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(crate::search_index::SearchIndex::new()).unwrap();
+        ctx.note_search_index_rx_generation(generation);
+        *ctx.search_index_rx()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+        let (reached, release) = install_artifact_drain_commit_gate_for_test(&ctx);
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_search_index_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("search completion was not dequeued");
+        ctx.mark_subc_unbound();
+        release.send(()).unwrap();
+        drain.join().unwrap();
+
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a dequeued completion must re-check lifecycle admission at commit"
+        );
+    }
+
+    #[test]
+    fn dequeued_semantic_completion_cannot_publish_after_unbind() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(SemanticIndexEvent::Ready(
+            crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3),
+        ))
+        .unwrap();
+        ctx.note_semantic_index_rx_generation(generation);
+        *ctx.semantic_index_rx().lock() = Some(rx);
+        let (reached, release) = install_artifact_drain_commit_gate_for_test(&ctx);
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_semantic_index_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("semantic completion was not dequeued");
+        ctx.mark_subc_unbound();
+        release.send(()).unwrap();
+        drain.join().unwrap();
+
+        assert!(
+            ctx.semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a dequeued completion must re-check lifecycle admission at commit"
+        );
+    }
+
+    #[test]
+    fn dequeued_semantic_refresh_cannot_publish_after_unbind() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        event_tx
+            .send(SemanticRefreshEvent::CorpusCompleted {
+                index: crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3),
+                changed: 0,
+                added: 0,
+                deleted: 0,
+                total_processed: 0,
+            })
+            .unwrap();
+        let (reached, release) = install_artifact_drain_commit_gate_for_test(&ctx);
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_semantic_refresh_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("semantic refresh completion was not dequeued");
+        ctx.mark_subc_unbound();
+        release.send(()).unwrap();
+        drain.join().unwrap();
+
+        assert!(
+            ctx.semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a dequeued refresh must re-check lifecycle admission at commit"
+        );
+    }
+
+    #[test]
+    fn dequeued_semantic_refresh_cannot_publish_after_bound_replacement() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let (old_request_tx, _old_request_rx) = crossbeam_channel::unbounded();
+        let (old_event_tx, old_event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            old_request_tx,
+            old_event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        old_event_tx
+            .send(SemanticRefreshEvent::CorpusCompleted {
+                index: crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3),
+                changed: 0,
+                added: 0,
+                deleted: 0,
+                total_processed: 0,
+            })
+            .unwrap();
+        let (reached, release) = install_artifact_drain_commit_gate_for_test(&ctx);
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_semantic_refresh_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old semantic refresh completion was not dequeued");
+
+        let (new_request_tx, _new_request_rx) = crossbeam_channel::unbounded();
+        let (_new_event_tx, new_event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            new_request_tx,
+            new_event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        release.send(()).unwrap();
+        drain.join().unwrap();
+
+        assert!(
+            ctx.semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "an old refresh event must not be relabeled as the replacement worker"
+        );
+        assert!(
+            ctx.semantic_refresh_event_rx().lock().is_some(),
+            "the stale drain must not clear the replacement refresh receiver"
+        );
+    }
+
+    #[test]
+    fn current_semantic_refresh_disconnect_requests_full_reload() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        crate::commands::configure::set_semantic_refresh_restart_result_for_test(Some(true));
+        struct RestartOverrideReset;
+        impl Drop for RestartOverrideReset {
+            fn drop(&mut self) {
+                crate::commands::configure::set_semantic_refresh_restart_result_for_test(None);
+            }
+        }
+        let _reset = RestartOverrideReset;
+
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let (_build_tx, build_rx) = crossbeam_channel::unbounded();
+        let disconnected_build_epoch =
+            ctx.install_semantic_index_rx(build_rx, ctx.configure_generation());
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            disconnected_build_epoch,
+        );
+        drop(event_tx);
+
+        drain_semantic_refresh_events(&ctx);
+
+        assert_eq!(
+            crate::commands::configure::semantic_refresh_restart_attempts_for_test(),
+            1
+        );
+        assert!(
+            ctx.semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "recovery must force a full reload rather than retain an index without a refresh worker"
+        );
+        assert!(ctx.semantic_refresh_event_rx().lock().is_none());
+        assert!(
+            ctx.semantic_index_rx().lock().is_none(),
+            "a build receiver from the disconnected refresh generation must not be adopted"
+        );
+        assert!(matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Building { stage, .. } if stage == "restarting_refresh_worker"
+        ));
+    }
+
+    #[test]
+    fn finished_refresh_worker_wakes_maintenance_after_last_event_is_drained() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        crate::commands::configure::set_semantic_refresh_restart_result_for_test(Some(true));
+        struct RestartOverrideReset;
+        impl Drop for RestartOverrideReset {
+            fn drop(&mut self) {
+                crate::commands::configure::set_semantic_refresh_restart_result_for_test(None);
+            }
+        }
+        let _reset = RestartOverrideReset;
+
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (event_sent_tx, event_sent_rx) = crossbeam_channel::bounded(1);
+        let (finish_tx, finish_rx) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            event_tx
+                .send(SemanticRefreshEvent::Started { paths: Vec::new() })
+                .unwrap();
+            event_sent_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        });
+        let worker_slot = Arc::new(Mutex::new(Some(worker)));
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::clone(&worker_slot),
+            ctx.semantic_index_rx_epoch(),
+        );
+        event_sent_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drain_semantic_refresh_events(&ctx);
+        assert!(
+            !ctx.completion_drains_have_work(),
+            "a live worker with an empty event queue should not cause maintenance churn"
+        );
+
+        finish_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ctx.completion_drains_have_work() {
+            assert!(
+                Instant::now() < deadline,
+                "finished refresh worker did not wake maintenance"
+            );
+            std::thread::yield_now();
+        }
+        drain_semantic_refresh_events(&ctx);
+
+        assert_eq!(
+            crate::commands::configure::semantic_refresh_restart_attempts_for_test(),
+            1
+        );
+        assert!(ctx.semantic_refresh_event_rx().lock().is_none());
+    }
+
+    #[test]
+    fn semantic_disconnect_does_not_overwrite_replacement_loader_state() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        ));
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let (old_request_tx, _old_request_rx) = crossbeam_channel::unbounded();
+        let (old_event_tx, old_event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            old_request_tx,
+            old_event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        drop(old_event_tx);
+        let (reached, release) = install_semantic_refresh_recovery_gate_for_test(&ctx);
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_semantic_refresh_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old worker was not cleared before recovery");
+
+        let (build_tx, build_rx) = crossbeam_channel::unbounded::<SemanticIndexEvent>();
+        ctx.install_semantic_index_rx(build_rx, ctx.configure_generation());
+        let (new_request_tx, _new_request_rx) = crossbeam_channel::unbounded();
+        let (new_event_tx, new_event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            new_request_tx,
+            new_event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "replacement_loader".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        release.send(()).unwrap();
+        drain.join().unwrap();
+
+        assert!(ctx.semantic_index_rx().lock().is_some());
+        assert!(ctx.semantic_refresh_event_rx().lock().is_some());
+        assert!(matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Building { stage, .. } if stage == "replacement_loader"
+        ));
+        drop(build_tx);
+        drop(new_event_tx);
+    }
+
+    #[test]
+    fn semantic_disconnect_preserves_newer_build_receiver_before_refresh_install() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let (old_request_tx, _old_request_rx) = crossbeam_channel::unbounded();
+        let (old_event_tx, old_event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            old_request_tx,
+            old_event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        drop(old_event_tx);
+        let (reached, release) = install_semantic_refresh_recovery_gate_for_test(&ctx);
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_semantic_refresh_events(&drain_ctx));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("semantic refresh recovery did not reach the post-clear gate");
+
+        let (_replacement_tx, replacement_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_index_rx(replacement_rx, ctx.configure_generation());
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "replacement_loader".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        release.send(()).unwrap();
+        drain.join().unwrap();
+
+        assert!(
+            ctx.semantic_index_rx().lock().is_some(),
+            "the old disconnect must not retire a newer build receiver while its refresh worker is being installed"
+        );
+        assert!(matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Building { stage, .. } if stage == "replacement_loader"
+        ));
+    }
+
+    #[test]
+    fn delayed_semantic_retry_targets_same_generation_replacement_worker() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        SEMANTIC_REFRESH_RETRY_DELAY_OVERRIDE_MS.store(20, Ordering::SeqCst);
+        struct RetryDelayReset;
+        impl Drop for RetryDelayReset {
+            fn drop(&mut self) {
+                SEMANTIC_REFRESH_RETRY_DELAY_OVERRIDE_MS.store(u64::MAX, Ordering::SeqCst);
+            }
+        }
+        let _delay_reset = RetryDelayReset;
+
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        let (old_request_tx, _old_request_rx) = crossbeam_channel::unbounded();
+        let (_old_event_tx, old_event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            old_request_tx,
+            old_event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        let retry_path = root.path().join("retry.rs");
+        assert!(schedule_semantic_refresh_retry(
+            &ctx,
+            vec![retry_path.clone()],
+            "transient embedding failure",
+        ));
+
+        let (new_request_tx, new_request_rx) = crossbeam_channel::unbounded();
+        let (_new_event_tx, new_event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            new_request_tx,
+            new_event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+
+        let request = new_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retry should resolve the replacement sender when it fires");
+        assert!(matches!(
+            request,
+            SemanticRefreshRequest::Files { paths } if paths == vec![retry_path]
         ));
     }
 
@@ -2397,7 +4226,7 @@ mod watcher_slice_tests {
     }
 
     #[test]
-    fn watcher_generation_change_discards_continuation() {
+    fn watcher_lifecycle_generation_change_rebases_continuation() {
         let temp = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(temp.path());
         tx.send(WatcherDispatchEvent::Paths(
@@ -2410,6 +4239,45 @@ mod watcher_slice_tests {
         assert_eq!(first.processed, 2);
         assert!(first.has_more);
 
+        // A lifecycle-only generation change (transient unbind + equivalent
+        // rebind) must NOT lose the in-flight paths: the continuation rebases
+        // onto the new generation and keeps draining.
+        ctx.advance_configure_generation();
+        let second = drain_watcher_events_bounded(&ctx, 2);
+        assert_eq!(second.processed, 2);
+        assert!(second.has_more);
+
+        let mut guard = 0;
+        while drain_watcher_events_bounded(&ctx, 2).has_more {
+            guard += 1;
+            assert!(guard < 16, "rebased continuation must finish draining");
+        }
+        assert_eq!(ctx.watcher_drain_pending_path_count(), 0);
+        assert_eq!(
+            ctx.pending_tier2_paths().len(),
+            5,
+            "every path survives the lifecycle-only generation change"
+        );
+    }
+
+    #[test]
+    fn watcher_content_generation_change_discards_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(temp.path());
+        tx.send(WatcherDispatchEvent::Paths(
+            (0..5)
+                .map(|index| temp.path().join(format!("old-content-{index}.txt")))
+                .collect(),
+        ))
+        .unwrap();
+        let first = drain_watcher_events_bounded(&ctx, 2);
+        assert_eq!(first.processed, 2);
+        assert!(first.has_more);
+
+        // A real reconfigure (content change) rebuilds artifacts wholesale;
+        // the stale continuation is discarded, not replayed.
+        ctx.configure_content_generation_flag()
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ctx.advance_configure_generation();
         let second = drain_watcher_events_bounded(&ctx, 2);
 

@@ -140,6 +140,7 @@ async fn write_connection_file(conn_dir: &Path) -> TcpListener {
     let conn_path = conn_dir.join("subc-connection.json");
     let conn = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
         endpoints: vec![Endpoint {
             host: "127.0.0.1".to_string(),
             port,

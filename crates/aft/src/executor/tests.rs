@@ -116,6 +116,86 @@ fn actor_entries_return_roots_and_contexts() {
 }
 
 #[test]
+fn cancel_queued_maintenance_preserves_interactive_work_and_actor() {
+    let executor = test_executor(1, 1, 1, 1);
+    let (_dir, root) = test_root("cancel-maintenance");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (interactive_started_tx, interactive_started_rx) = crossbeam_channel::bounded(1);
+    let (release_interactive_tx, release_interactive_rx) = crossbeam_channel::bounded(1);
+    let interactive = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "interactive-blocker".to_string(),
+        Box::new(move |_| {
+            interactive_started_tx
+                .send(())
+                .expect("signal interactive start");
+            release_interactive_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release interactive blocker");
+            ok("interactive-blocker")
+        }),
+    );
+    interactive_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("interactive blocker starts");
+
+    let executed = Arc::new(AtomicUsize::new(0));
+    let mutating_executed = Arc::clone(&executed);
+    let cancelled_mutating = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::Mutating,
+        "cancelled-mutating".to_string(),
+        Box::new(move |_| {
+            mutating_executed.fetch_add(1, Ordering::AcqRel);
+            ok("cancelled-mutating")
+        }),
+    );
+    let commit_executed = Arc::clone(&executed);
+    let cancelled_commit = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "cancelled-commit".to_string(),
+        Box::new(move |_| {
+            commit_executed.fetch_add(1, Ordering::AcqRel);
+            ok("cancelled-commit")
+        }),
+    );
+
+    assert_eq!(executor.cancel_queued_maintenance(&root), 2);
+    for response in [recv_async(cancelled_mutating), recv_async(cancelled_commit)] {
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "maintenance_cancelled");
+    }
+    assert_eq!(executed.load(Ordering::Acquire), 0);
+    assert!(executor.actor_registered(&root));
+
+    release_interactive_tx
+        .send(())
+        .expect("release interactive blocker");
+    assert!(
+        interactive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .success
+    );
+
+    let follow_up = executor.submit(
+        root,
+        Lane::PureRead,
+        "interactive-follow-up".to_string(),
+        Box::new(|_| ok("interactive-follow-up")),
+    );
+    assert!(
+        follow_up
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .success
+    );
+}
+
+#[test]
 fn cross_actor_isolation() {
     let executor = test_executor(4, 2, 3, 2);
     let (_dir_a, root_a) = test_root("isolation-a");
@@ -1279,6 +1359,12 @@ fn newer_interactive_mutator_beats_older_same_actor_maintenance_mutator() {
 
 #[test]
 fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
+    // This test shares the process-wide refresh worker with the
+    // refresh_worker_tests group; without the lock, its flush can shut the
+    // worker down mid-batch for a concurrently running peer test.
+    let _refresh_guard = crate::callgraph_store::REFRESH_WORKER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
     let root_dir = tempfile::Builder::new()
         .prefix("aft-executor-callgraph-offload-")
@@ -1494,6 +1580,7 @@ fn starved_bind_promotes_over_pure_reads() {
         job: Box::new(|_ctx| ok("subc-bind-42")),
         completion: CompletionSender::Sync(tx.clone()),
         queued_at: now - INTERACTIVE_WRITER_PROMOTION_AGE - Duration::from_secs(1),
+        cancellation: None,
     };
     let read_job = QueuedJob {
         request_id: "read-1".to_string(),
@@ -1501,6 +1588,7 @@ fn starved_bind_promotes_over_pure_reads() {
         job: Box::new(|_ctx| ok("read-1")),
         completion: CompletionSender::Sync(tx),
         queued_at: now,
+        cancellation: None,
     };
     // Read arrived FIRST in arrival order; the starved bind must still win.
     actor.push_job(JobClass::Interactive, Lane::PureRead, read_job);
@@ -1532,6 +1620,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             job: Box::new(|_ctx| ok("subc-bind-7")),
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: now,
+            cancellation: None,
         },
     );
     actor.push_job(
@@ -1543,6 +1632,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             job: Box::new(|_ctx| ok("read-2")),
             completion: CompletionSender::Sync(tx),
             queued_at: now,
+            cancellation: None,
         },
     );
 
@@ -1571,6 +1661,7 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             job: Box::new(|_ctx| ok("read-3")),
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: Instant::now(),
+            cancellation: None,
         },
     );
     actor.push_job(
@@ -1582,6 +1673,7 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             job: Box::new(|_ctx| ok("edit-1")),
             completion: CompletionSender::Sync(tx),
             queued_at: Instant::now(),
+            cancellation: None,
         },
     );
 
@@ -1654,4 +1746,286 @@ fn maintenance_commit_overlaps_pure_reads_and_defers_to_writers() {
     mc2_started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("second maintenance commit runs after the first");
+}
+
+#[test]
+fn cancel_cancellable_mutating_removes_queued_job_and_settles_receiver() {
+    let executor = test_executor(2, 1, 2, 2);
+    let (_dir, root) = test_root("cancel-queued");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    // First mutating job blocks on its own cancellation token so the second
+    // stays queued deterministically (no timing or gate-release involved).
+    let (first_started_tx, first_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (first_rx, first_token) = executor.submit_cancellable_async(
+        root.clone(),
+        Lane::Mutating,
+        "first-blocking".to_string(),
+        Box::new(move |_ctx| {
+            first_started_tx.send(()).expect("signal first start");
+            let token = current_job_cancellation().expect("cancellable job sees its own token");
+            while !token.cancel_requested_before_commit() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Response::error(
+                "first-blocking",
+                "request_cancelled",
+                "cancelled at checkpoint",
+            )
+        }),
+    );
+    first_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first mutating job starts");
+
+    let executed = Arc::new(AtomicUsize::new(0));
+    let executed_probe = Arc::clone(&executed);
+    let (second_rx, second_token) = executor.submit_cancellable_async(
+        root.clone(),
+        Lane::Mutating,
+        "second-queued".to_string(),
+        Box::new(move |_ctx| {
+            executed_probe.fetch_add(1, Ordering::SeqCst);
+            ok("second-queued")
+        }),
+    );
+    assert_eq!(
+        executor.try_mutating_job_state_label(&root, "second-queued"),
+        Some("queued"),
+        "second mutating job must be queued behind the running first"
+    );
+
+    let outcome = executor.cancel_job(&root, &second_token);
+    assert_eq!(outcome, JobCancelOutcome::QueuedRemoved);
+    let second_response = recv_async(second_rx);
+    assert!(!second_response.success);
+    assert_eq!(
+        second_response.data.get("code").and_then(|v| v.as_str()),
+        Some("request_cancelled")
+    );
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        0,
+        "queued-cancelled job must never execute"
+    );
+
+    // Cancel the first (running) job rather than releasing a gate.
+    let outcome = executor.cancel_job(&root, &first_token);
+    assert_eq!(outcome, JobCancelOutcome::RunningSignalled);
+    let first_response = recv_async(first_rx);
+    assert_eq!(
+        first_response.data.get("code").and_then(|v| v.as_str()),
+        Some("request_cancelled")
+    );
+}
+
+#[test]
+fn cancel_cancellable_mutating_signals_running_job_and_preserves_actor() {
+    let executor = test_executor(2, 1, 2, 2);
+    let (_dir, root) = test_root("cancel-running");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (running_rx, running_token) = executor.submit_cancellable_async(
+        root.clone(),
+        Lane::Mutating,
+        "running-configure".to_string(),
+        Box::new(move |_ctx| {
+            started_tx.send(()).expect("signal running start");
+            let token = current_job_cancellation().expect("cancellable job sees its own token");
+            while !token.cancel_requested_before_commit() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Response::error(
+                "running-configure",
+                "request_cancelled",
+                "cancelled at checkpoint",
+            )
+        }),
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("running job starts");
+    assert_eq!(
+        executor.try_mutating_job_state_label(&root, "running-configure"),
+        Some("running"),
+    );
+
+    let outcome = executor.cancel_job(&root, &running_token);
+    assert_eq!(outcome, JobCancelOutcome::RunningSignalled);
+    let response = recv_async(running_rx);
+    assert_eq!(
+        response.data.get("code").and_then(|v| v.as_str()),
+        Some("request_cancelled")
+    );
+    // The completion event settles scheduler state asynchronously after the
+    // receiver resolves, and the label probe is try-lock (None = contended):
+    // poll until the settled state is observable.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match executor.try_mutating_job_state_label(&root, "running-configure") {
+            Some("not_found") => break,
+            _ if Instant::now() >= deadline => {
+                panic!("cancelled job must fully settle scheduler state within 5s")
+            }
+            _ => thread::sleep(Duration::from_millis(2)),
+        }
+    }
+
+    // Actor must remain usable: a follow-up mutating job completes normally.
+    let follow_up = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "follow-up".to_string(),
+        Box::new(|_ctx| ok("follow-up")),
+    );
+    let response = follow_up
+        .recv_timeout(Duration::from_secs(5))
+        .expect("follow-up mutating job completes");
+    assert!(
+        response.success,
+        "actor must stay usable after cancellation"
+    );
+}
+
+#[test]
+fn cancel_job_after_commit_seal_reports_committed_and_lets_job_finish() {
+    let executor = test_executor(2, 1, 2, 2);
+    let (_dir, root) = test_root("cancel-committed");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    let (sealed_tx, sealed_rx) = crossbeam_channel::bounded::<()>(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+    let (rx, token) = executor.submit_cancellable_async(
+        root.clone(),
+        Lane::Mutating,
+        "committed-configure".to_string(),
+        Box::new(move |_ctx| {
+            let token = current_job_cancellation().expect("cancellable job sees its own token");
+            assert!(token.try_seal_committed(), "uncancelled seal must win");
+            sealed_tx.send(()).expect("signal seal");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release committed job");
+            ok("committed-configure")
+        }),
+    );
+    sealed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("job seals its commit");
+
+    let outcome = executor.cancel_job(&root, &token);
+    assert_eq!(outcome, JobCancelOutcome::RunningCommitted);
+    assert!(
+        !token.cancel_requested_before_commit(),
+        "a sealed job must not observe the late cancel"
+    );
+
+    release_tx.send(()).expect("release job");
+    let response = recv_async(rx);
+    assert!(response.success, "committed job finishes normally");
+}
+
+#[test]
+fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
+    // Queue M1, Heavy, M2 then cancel M2 (second Mutating). The order ladder
+    // must keep [Mutating, HeavyInit] — removing the FIRST Mutating occurrence
+    // would corrupt it to [HeavyInit, Mutating] and dispatch Heavy before M1.
+    let mut actor = ActorState::new(test_ctx());
+    let (tx, _rx) = crossbeam_channel::bounded::<Response>(3);
+    let m2_token = JobCancellation::new();
+    actor.push_job(
+        JobClass::Interactive,
+        Lane::Mutating,
+        QueuedJob {
+            request_id: "m1".to_string(),
+            command: "executor::Interactive::Mutating".to_string(),
+            job: Box::new(|_ctx| ok("m1")),
+            completion: CompletionSender::Sync(tx.clone()),
+            queued_at: Instant::now(),
+            cancellation: None,
+        },
+    );
+    actor.push_job(
+        JobClass::Interactive,
+        Lane::HeavyInit,
+        QueuedJob {
+            request_id: "h1".to_string(),
+            command: "executor::Interactive::HeavyInit".to_string(),
+            job: Box::new(|_ctx| ok("h1")),
+            completion: CompletionSender::Sync(tx.clone()),
+            queued_at: Instant::now(),
+            cancellation: None,
+        },
+    );
+    actor.push_job(
+        JobClass::Interactive,
+        Lane::Mutating,
+        QueuedJob {
+            request_id: "m2".to_string(),
+            command: "executor::Interactive::Mutating".to_string(),
+            job: Box::new(|_ctx| ok("m2")),
+            completion: CompletionSender::Sync(tx),
+            queued_at: Instant::now(),
+            cancellation: Some(m2_token.clone()),
+        },
+    );
+
+    let removed = actor
+        .remove_queued_cancellable(&m2_token)
+        .expect("m2 removed");
+    assert_eq!(removed.request_id, "m2");
+
+    // Arrival-order head must still be M1's lane, and popping in order must
+    // yield m1 then h1 with a consistent ladder.
+    let queues = actor.class_queues_mut(JobClass::Interactive);
+    assert_eq!(queues.front_lane(), Some(Lane::Mutating));
+    let first = queues.pop_front_job(Lane::Mutating).expect("m1 pops");
+    assert_eq!(first.request_id, "m1");
+    assert_eq!(queues.front_lane(), Some(Lane::HeavyInit));
+    let second = queues.pop_front_job(Lane::HeavyInit).expect("h1 pops");
+    assert_eq!(second.request_id, "h1");
+    assert!(!queues.has_queued_jobs(), "ladder fully consistent");
+}
+
+#[test]
+fn cancel_and_seal_race_has_exactly_one_winner() {
+    // The canceller and the committing job race on the shared state machine;
+    // whatever interleaving occurs, exactly one side wins: seal-won means the
+    // cancel reports committed, cancel-won means the seal fails and the job
+    // must abort. Both-win (mutate + discarded completion) must be impossible.
+    for _ in 0..200 {
+        let token = JobCancellation::new();
+        token.mark_running();
+        let seal_token = token.clone();
+        let cancel_token = token.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let seal_barrier = Arc::clone(&barrier);
+        let sealer = thread::spawn(move || {
+            seal_barrier.wait();
+            seal_token.try_seal_committed()
+        });
+        let canceller = thread::spawn(move || {
+            barrier.wait();
+            cancel_token.signal_cancel()
+        });
+        let seal_won = sealer.join().expect("sealer thread");
+        let cancel_observed = canceller.join().expect("canceller thread");
+        if seal_won {
+            // The job proceeds to mutate; the canceller must know the commit
+            // happened (observed committed, i.e. RunningCommitted outcome).
+            assert_eq!(
+                cancel_observed, JOB_CANCEL_STATE_COMMITTED,
+                "seal won but canceller was told the job would abort"
+            );
+            assert!(!token.cancel_requested_before_commit());
+        } else {
+            // The cancel won; the job must abort and later checkpoints agree.
+            assert_ne!(
+                cancel_observed, JOB_CANCEL_STATE_COMMITTED,
+                "cancel won but observed a committed state"
+            );
+            assert!(token.cancel_requested_before_commit());
+        }
+    }
 }

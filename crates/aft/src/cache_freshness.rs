@@ -21,8 +21,7 @@ thread_local! {
 static WATCHED_HASH_FILE: OnceLock<Mutex<Option<(PathBuf, usize)>>> = OnceLock::new();
 
 const VERIFY_MEMO_TTL: Duration = Duration::from_secs(10 * 60);
-static VERIFY_MEMO: OnceLock<Mutex<BTreeMap<(PathBuf, VerifyArtifact), VerifyMemoEntry>>> =
-    OnceLock::new();
+static VERIFY_MEMO: OnceLock<Mutex<VerifyMemo>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VerifyArtifact {
@@ -54,6 +53,12 @@ struct VerifyMemoEntry {
     verify_completed_at: Instant,
     generation: ArtifactGeneration,
     invalidated: bool,
+}
+
+#[derive(Default)]
+struct VerifyMemo {
+    entries: BTreeMap<(PathBuf, VerifyArtifact), VerifyMemoEntry>,
+    invalidation_tickets: BTreeMap<PathBuf, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,8 +128,8 @@ pub(crate) fn artifact_generation(path: &Path) -> Option<ArtifactGeneration> {
     })
 }
 
-fn verify_memo() -> &'static Mutex<BTreeMap<(PathBuf, VerifyArtifact), VerifyMemoEntry>> {
-    VERIFY_MEMO.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn verify_memo() -> &'static Mutex<VerifyMemo> {
+    VERIFY_MEMO.get_or_init(|| Mutex::new(VerifyMemo::default()))
 }
 
 pub(crate) fn warm_verify_plan(
@@ -138,7 +143,7 @@ pub(crate) fn warm_verify_plan(
     let memo = verify_memo()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(entry) = memo.get(&(root.to_path_buf(), artifact)) else {
+    let Some(entry) = memo.entries.get(&(root.to_path_buf(), artifact)) else {
         return WarmVerifyPlan::Strict;
     };
     if entry.generation != generation {
@@ -151,36 +156,83 @@ pub(crate) fn warm_verify_plan(
     }
 }
 
+pub(crate) fn capture_verify_ticket(root: &Path) -> u64 {
+    verify_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .invalidation_tickets
+        .get(root)
+        .copied()
+        .unwrap_or(0)
+}
+
+pub(crate) fn record_verify_completed_if_unchanged(
+    root: &Path,
+    artifact: VerifyArtifact,
+    generation: Option<ArtifactGeneration>,
+    ticket: u64,
+) -> bool {
+    let Some(generation) = generation else {
+        return false;
+    };
+    let mut memo = verify_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let current_ticket = memo.invalidation_tickets.get(root).copied().unwrap_or(0);
+    if current_ticket != ticket {
+        return false;
+    }
+    memo.entries.insert(
+        (root.to_path_buf(), artifact),
+        VerifyMemoEntry {
+            verify_completed_at: Instant::now(),
+            generation,
+            invalidated: false,
+        },
+    );
+    true
+}
+
+#[cfg(test)]
 pub(crate) fn record_verify_completed(
     root: &Path,
     artifact: VerifyArtifact,
     generation: Option<ArtifactGeneration>,
 ) {
-    let Some(generation) = generation else {
-        return;
-    };
-    verify_memo()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            (root.to_path_buf(), artifact),
-            VerifyMemoEntry {
-                verify_completed_at: Instant::now(),
-                generation,
-                invalidated: false,
-            },
-        );
+    let ticket = capture_verify_ticket(root);
+    let _ = record_verify_completed_if_unchanged(root, artifact, generation, ticket);
 }
 
 pub(crate) fn invalidate_verify_memo(root: &Path) {
     let mut memo = verify_memo()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for ((memo_root, _), entry) in memo.iter_mut() {
+    let ticket = memo
+        .invalidation_tickets
+        .entry(root.to_path_buf())
+        .or_insert(0);
+    *ticket = ticket.wrapping_add(1);
+    for ((memo_root, _), entry) in &mut memo.entries {
         if memo_root == root {
             entry.invalidated = true;
         }
     }
+}
+
+/// Forget all completed verification for a root after an interval in which its
+/// filesystem watcher was stopped. A normal watcher invalidation can use
+/// stat-first verification, but an unobserved interval must hash content because
+/// size and mtime may both have been preserved by an external writer.
+pub(crate) fn invalidate_verify_memo_strict(root: &Path) {
+    let mut memo = verify_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ticket = memo
+        .invalidation_tickets
+        .entry(root.to_path_buf())
+        .or_insert(0);
+    *ticket = ticket.wrapping_add(1);
+    memo.entries.retain(|(memo_root, _), _| memo_root != root);
 }
 
 pub fn collect(path: &Path) -> std::io::Result<FileFreshness> {
@@ -201,7 +253,13 @@ pub fn verify_file(path: &Path, cached: &FileFreshness) -> FreshnessVerdict {
 
 pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdict {
     #[cfg(debug_assertions)]
-    STRICT_VERIFY_FILE_CALLS.fetch_add(1, Ordering::Relaxed);
+    {
+        STRICT_VERIFY_FILE_CALLS.fetch_add(1, Ordering::Relaxed);
+        strict_verify_paths_for_debug()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_path_buf());
+    }
     verify_file_inner(path, cached, true)
 }
 
@@ -266,15 +324,40 @@ fn strict_verify_pool_size() -> usize {
 }
 
 #[cfg(debug_assertions)]
+fn strict_verify_paths_for_debug() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    static STRICT_VERIFY_FILE_PATHS: OnceLock<std::sync::Mutex<Vec<PathBuf>>> = OnceLock::new();
+    STRICT_VERIFY_FILE_PATHS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn reset_verify_file_strict_count_for_debug() {
     STRICT_VERIFY_FILE_CALLS.store(0, Ordering::Relaxed);
+    strict_verify_paths_for_debug()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn verify_file_strict_count_for_debug() -> usize {
     STRICT_VERIFY_FILE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Strict-verification count attributed to one root. The bare process-global
+/// count is meaningless under parallel tests (any concurrent semantic or
+/// search load increments it); tests asserting "MY operation ran no strict
+/// verification" must count only paths under their own fixture root.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn verify_file_strict_count_under_for_debug(root: &Path) -> usize {
+    strict_verify_paths_for_debug()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|path| path.starts_with(root))
+        .count()
 }
 
 #[cfg(debug_assertions)]
@@ -594,6 +677,41 @@ mod warm_reload_tests {
         assert_eq!(
             warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_two)),
             WarmVerifyPlan::Strict
+        );
+    }
+
+    #[test]
+    fn invalidation_between_verify_and_record_prevents_false_fresh_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let artifact = dir.path().join("cache.bin");
+        fs::create_dir(&root).unwrap();
+        fs::write(&artifact, b"stable-generation").unwrap();
+        let generation = artifact_generation(&artifact).unwrap();
+
+        let stale_ticket = capture_verify_ticket(&root);
+        invalidate_verify_memo(&root);
+        assert!(!record_verify_completed_if_unchanged(
+            &root,
+            VerifyArtifact::Search,
+            Some(generation),
+            stale_ticket,
+        ));
+        assert_eq!(
+            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation)),
+            WarmVerifyPlan::Strict
+        );
+
+        let current_ticket = capture_verify_ticket(&root);
+        assert!(record_verify_completed_if_unchanged(
+            &root,
+            VerifyArtifact::Search,
+            Some(generation),
+            current_ticket,
+        ));
+        assert_eq!(
+            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation)),
+            WarmVerifyPlan::Skip
         );
     }
 

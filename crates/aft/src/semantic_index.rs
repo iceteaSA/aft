@@ -2960,29 +2960,24 @@ impl SemanticIndex {
         self.fingerprint = Some(fingerprint);
     }
 
-    /// Write the semantic index to disk using atomic temp+rename pattern
-    pub fn write_to_disk(&self, storage_dir: &Path, project_key: &str) {
+    /// Write the semantic index to disk using atomic temp+rename pattern.
+    /// Empty indexes are persisted too so a completed rebuild cannot leave an
+    /// older non-empty snapshot visible to the next process.
+    pub fn write_to_disk(&self, storage_dir: &Path, project_key: &str) -> bool {
         if self.shared_base.is_some() {
             let mut private = self.clone();
             private.materialize_shared_base();
-            private.write_to_disk(storage_dir, project_key);
-            return;
-        }
-        // Don't persist empty indexes — they would be loaded on next startup
-        // and prevent a fresh build that might find files.
-        if self.entries.is_empty() {
-            slog_info!("skipping semantic index persistence (0 entries)");
-            return;
+            return private.write_to_disk(storage_dir, project_key);
         }
         let dir = storage_dir.join("semantic").join(project_key);
         let data_path = dir.join("semantic.bin");
         let access = crate::root_cache::ArtifactAccess::for_root(&self.project_root);
         if !access.allows_write(project_key, &data_path) {
-            return;
+            return false;
         }
         if let Err(e) = fs::create_dir_all(&dir) {
             slog_warn!("failed to create semantic cache dir: {}", e);
-            return;
+            return false;
         }
         let tmp_path = dir.join(format!(
             "semantic.bin.tmp.{}.{}",
@@ -3005,19 +3000,20 @@ impl SemanticIndex {
             Err(e) => {
                 slog_warn!("failed to write semantic index: {}", e);
                 let _ = fs::remove_file(&tmp_path);
-                return;
+                return false;
             }
         };
-        if let Err(e) = fs::rename(&tmp_path, &data_path) {
+        if let Err(e) = crate::fs_lock::rename_over(&tmp_path, &data_path) {
             slog_warn!("failed to rename semantic index: {}", e);
             let _ = fs::remove_file(&tmp_path);
-            return;
+            return false;
         }
         slog_info!(
             "semantic index persisted: {} entries, {:.1} KB",
             self.entries.len(),
             bytes_written as f64 / 1024.0
         );
+        true
     }
 
     /// Read the semantic index from disk
@@ -3066,12 +3062,6 @@ impl SemanticIndex {
             1,
         ) {
             Ok(index) => {
-                if index.entries.is_empty() {
-                    slog_info!(
-                    "cached semantic index is empty, will rebuild without deleting the shared artifact"
-                );
-                    return None;
-                }
                 if let Some(expected) = expected_fingerprint {
                     let matches = index
                         .fingerprint()
@@ -4804,6 +4794,48 @@ Connection: close
 
     fn test_project_root() -> PathBuf {
         std::env::current_dir().unwrap()
+    }
+
+    #[test]
+    fn empty_snapshot_replaces_nonempty_and_loads_as_valid_tombstone() {
+        let project = tempfile::tempdir().expect("create project");
+        let storage = tempfile::tempdir().expect("create storage");
+        let source = project.path().join("lib.rs");
+        write_rust_file(&source, "persisted_symbol");
+        let populated = build_test_index(project.path(), std::slice::from_ref(&source));
+        assert!(populated.write_to_disk(storage.path(), "project"));
+
+        let data_path = storage.path().join("semantic/project/semantic.bin");
+        let populated_bytes = fs::read(&data_path).expect("read populated snapshot");
+        let empty = SemanticIndex::new(project.path().to_path_buf(), populated.dimension());
+        assert!(empty.write_to_disk(storage.path(), "project"));
+        let empty_bytes = fs::read(&data_path).expect("read explicit empty snapshot");
+        assert_ne!(empty_bytes, populated_bytes);
+        let decoded = SemanticIndex::from_bytes(&empty_bytes, project.path())
+            .expect("decode explicit empty snapshot");
+        assert_eq!(decoded.entry_count(), 0);
+        for _ in 0..2 {
+            let loaded = SemanticIndex::read_from_disk(
+                storage.path(),
+                "project",
+                project.path(),
+                false,
+                None,
+            )
+            .expect("explicit empty snapshot remains loadable");
+            assert_eq!(loaded.entry_count(), 0);
+        }
+    }
+
+    #[test]
+    fn persistence_failure_is_reported_to_caller() {
+        let project = tempfile::tempdir().expect("create project");
+        let storage_parent = tempfile::tempdir().expect("create storage parent");
+        let storage_file = storage_parent.path().join("not-a-directory");
+        fs::write(&storage_file, b"occupied").expect("create blocking file");
+        let empty = SemanticIndex::new(project.path().to_path_buf(), 3);
+
+        assert!(!empty.write_to_disk(&storage_file, "project"));
     }
 
     #[test]

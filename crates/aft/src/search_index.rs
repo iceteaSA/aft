@@ -940,12 +940,12 @@ impl SearchIndex {
         self.snapshot().candidates(query)
     }
 
-    pub fn write_to_disk(&mut self, cache_dir: &Path, git_head: Option<&str>) {
+    pub fn write_to_disk(&mut self, cache_dir: &Path, git_head: Option<&str>) -> bool {
         if !artifact_write_allowed(&self.project_root, cache_dir, &cache_dir.join("cache.bin")) {
-            return;
+            return false;
         }
         let Some(plan) = CacheWritePlan::from_index(self, git_head) else {
-            return;
+            return false;
         };
 
         let write_result = {
@@ -967,9 +967,11 @@ impl SearchIndex {
                 self.file_trigram_count = Arc::new(plan.file_trigram_count);
                 self.git_head = plan.git_head.filter(|head| !head.is_empty());
                 self.ignore_rules_fingerprint = plan.ignore_fingerprint;
+                true
             }
             Err(error) => {
                 log::warn!("search index: failed to write disk cache: {}", error);
+                false
             }
         }
     }
@@ -1245,6 +1247,10 @@ impl SearchIndex {
         self.git_head.as_deref()
     }
 
+    pub(crate) fn configured_max_file_size(&self) -> u64 {
+        self.max_file_size
+    }
+
     pub(crate) fn set_ready(&mut self, ready: bool) {
         self.ready = ready;
     }
@@ -1296,8 +1302,15 @@ impl SearchIndex {
         verify_strategy: cache_freshness::VerifyStrategy,
     ) -> Self {
         if let Some(mut baseline) = baseline {
+            if baseline.max_file_size != max_file_size {
+                return match cache_dir {
+                    Some(cache_dir) => {
+                        SearchIndex::build_with_limit_to_cache_dir(root, max_file_size, cache_dir)
+                    }
+                    None => SearchIndex::build_with_limit(root, max_file_size),
+                };
+            }
             baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            baseline.max_file_size = max_file_size;
             let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
             if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
                 return match cache_dir {
@@ -5518,6 +5531,49 @@ mod tests {
         let result = refreshed.grep("newtoken", true, &[], &[], &project, 10);
 
         assert_eq!(result.total_matches, 1);
+    }
+
+    #[test]
+    fn max_file_size_change_reclassifies_unchanged_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("file.txt");
+        fs::write(&file, "unchanged-limit-token-with-enough-bytes\n").expect("write file");
+
+        let indexed = SearchIndex::build_with_limit(&project, 128);
+        assert_eq!(
+            indexed
+                .grep("unchanged-limit-token", true, &[], &[], &project, 10)
+                .total_matches,
+            1
+        );
+        let lowered = SearchIndex::rebuild_or_refresh(&project, 8, None, Some(indexed), None);
+        let canonical_file = fs::canonicalize(&file).expect("canonical file");
+        let lowered_id = *lowered
+            .path_to_id
+            .get(&canonical_file)
+            .expect("lowered file id");
+        assert!(
+            lowered.unindexed_files.contains(&lowered_id),
+            "lowering the limit must classify an unchanged oversized file as unindexed"
+        );
+
+        let raised = SearchIndex::rebuild_or_refresh(&project, 128, None, Some(lowered), None);
+        let raised_id = *raised
+            .path_to_id
+            .get(&canonical_file)
+            .expect("raised file id");
+        assert!(
+            !raised.unindexed_files.contains(&raised_id),
+            "raising the limit must index a previously unindexed unchanged file"
+        );
+        assert_eq!(
+            raised
+                .grep("unchanged-limit-token", true, &[], &[], &project, 10)
+                .total_matches,
+            1
+        );
     }
 
     #[test]

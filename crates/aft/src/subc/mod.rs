@@ -311,6 +311,7 @@ struct RootMeta {
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
+    unbound_quiesced: bool,
 }
 
 #[derive(Debug)]
@@ -325,6 +326,11 @@ struct PendingBind {
     corr: u64,
     ver: u8,
     flags: Flags,
+    /// Exact-job cancellation for the submitted configure: Goodbye and
+    /// deadline expiry cancel the executor job operationally (queued jobs are
+    /// removed, running configures return at their next checkpoint) instead of
+    /// only marking bookkeeping.
+    cancellation: crate::executor::JobCancellation,
 }
 
 struct RouteBindCompletion {
@@ -375,6 +381,7 @@ struct BgSub {
 
 struct MaintenanceCompletion {
     root_id: ProjectRootId,
+    kind: MaintenanceDrainKind,
     response: Response,
     empty_bg_sessions: Vec<(String, u64)>,
     requeue_kind: Option<MaintenanceDrainKind>,
@@ -439,12 +446,18 @@ impl RootMeta {
             diagnostics_on_edit: false,
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
+            unbound_quiesced: false,
         }
     }
 
-    fn touch(&mut self) {
+    fn note_activity(&mut self) {
         self.last_touched = Instant::now();
+    }
+
+    fn reactivate_bound(&mut self) {
+        self.note_activity();
         self.idle_artifacts_evicted = false;
+        self.unbound_quiesced = false;
     }
 }
 
@@ -503,20 +516,26 @@ fn due_maintenance_jobs(
             let kinds_with_work: Vec<MaintenanceDrainKind> = match executor_actor_context {
                 Some(ctx) => INITIAL_MAINTENANCE_DRAIN_KINDS
                     .into_iter()
-                    .filter(|kind| match kind {
-                        MaintenanceDrainKind::Watcher => ctx.watcher_drain_has_work(),
-                        MaintenanceDrainKind::Lsp => ctx.lsp_drain_has_work(),
-                        MaintenanceDrainKind::ConfigureTail => ctx.configure_tail_has_work(),
-                        // Every CompletionDrains source is visible at this enqueue site:
-                        // AppContext probes completion queues, this loop owns bg wakes,
-                        // and queued continuations bypass probing via maintenance_pending.
-                        // New drain sources must expose a probe here rather than making
-                        // every subscribed root fail open again.
-                        MaintenanceDrainKind::CompletionDrains => {
-                            root_has_pending_bg_wake || ctx.completion_drains_have_work()
+                    .filter(|kind| {
+                        if meta.unbound_quiesced && !matches!(kind, MaintenanceDrainKind::Lsp) {
+                            return false;
+                        }
+                        match kind {
+                            MaintenanceDrainKind::Watcher => ctx.watcher_drain_has_work(),
+                            MaintenanceDrainKind::Lsp => ctx.lsp_drain_has_work(),
+                            MaintenanceDrainKind::ConfigureTail => ctx.configure_tail_has_work(),
+                            // Every CompletionDrains source is visible at this enqueue site:
+                            // AppContext probes completion queues, this loop owns bg wakes,
+                            // and queued continuations bypass probing via maintenance_pending.
+                            // New drain sources must expose a probe here rather than making
+                            // every subscribed root fail open again.
+                            MaintenanceDrainKind::CompletionDrains => {
+                                root_has_pending_bg_wake || ctx.completion_drains_have_work()
+                            }
                         }
                     })
                     .collect(),
+                None if meta.unbound_quiesced => Vec::new(),
                 // No context handle (actor gone mid-tick): enqueue everything.
                 None => INITIAL_MAINTENANCE_DRAIN_KINDS.to_vec(),
             };
@@ -646,14 +665,48 @@ fn allocator_pressure_relief_after_idle_sweep(
     }
 }
 
-/// Reap root-scoped resources from the existing subc maintenance loop. The
-/// actor remains registered so a bound route can continue to receive requests;
-/// only disposable handles are cleared and the next request reopens them.
+fn quiesce_unbound_root(
+    root_id: &ProjectRootId,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Arc<Executor>,
+) {
+    let Some(meta) = live_roots.get_mut(root_id) else {
+        return;
+    };
+
+    let ctx = executor.actor_context(root_id);
+    if let Some(ctx) = ctx.as_ref() {
+        // Close lifecycle admission before touching scheduler queues. A running
+        // ConfigureTail cannot release gates, install a watcher, or reserve a
+        // callgraph build after this transition becomes visible.
+        ctx.mark_subc_unbound();
+    }
+    let cancelled = executor.cancel_queued_maintenance(root_id);
+    // Transient unbind keeps the root WARM: the watcher stays running (its
+    // events accumulate and replay on rebind, so no unobserved gap exists) and
+    // resident artifacts stay resident. Host restarts unbind every root and
+    // rebind seconds later; stopping the watcher here would force strict
+    // re-verification plus a full callgraph rebuild on every restart. The
+    // expensive teardown (watcher stop + gap invalidation) belongs to the
+    // idle-TTL reaper and the root-deleted path.
+    let discarded = ctx
+        .map(|ctx| crate::commands::configure::cancel_deferred_configure_maintenance(&ctx))
+        .unwrap_or(0);
+    meta.unbound_quiesced = true;
+    meta.maintenance_queued_kinds.clear();
+    meta.maintenance_pending = meta.maintenance_jobs_in_flight > 0;
+    log::debug!(
+        "subc attach: quiesced unbound root {} (cancelled {} queued maintenance job(s), cancelled {} configure maintenance job(s))",
+        root_id.as_path().display(),
+        cancelled,
+        discarded
+    );
+}
+
 fn reap_idle_roots(
     now: Instant,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
-    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     executor: &Arc<Executor>,
 ) -> usize {
     let pending_bind_roots = pending_binds
@@ -663,12 +716,12 @@ fn reap_idle_roots(
     let candidates = live_roots
         .iter()
         .filter_map(|(root_id, meta)| {
-            let has_bound_session = root_channels
-                .get(root_id)
-                .is_some_and(|channels| !channels.is_empty());
+            // The TTL applies to unbound roots too: a transient unbind (host
+            // restart) keeps the root warm — watcher running, artifacts
+            // resident — and rebinding within the TTL costs nothing. Only a
+            // root that stays unbound past the TTL pays the full teardown.
             if meta.idle_artifacts_evicted
-                || (has_bound_session
-                    && now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL)
+                || now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL
                 || meta.active_bash_waits > 0
                 || meta.maintenance_pending
                 || !meta.maintenance_queued_kinds.is_empty()
@@ -685,17 +738,42 @@ fn reap_idle_roots(
         let Some(ctx) = executor.actor_context(&root_id) else {
             continue;
         };
+        // A TTL-aged unbound root retained its watcher-derived pending paths
+        // across the transient-unbind window (they repair artifacts a
+        // pre-unbind worker persisted). The strict gap invalidation below
+        // subsumes their purpose, and leaving them would block eviction
+        // forever through `artifact_eviction_blocked`. Disposal is
+        // TRANSACTIONAL: a secondary blocker (running bash, in-flight build)
+        // can still abort the eviction below, and the root may rebind before
+        // the next reap attempt — the taken paths are the only repair record
+        // for already-consumed watcher events, so they are restored on every
+        // abort path and dropped only after eviction succeeds.
+        let taken_pending = ctx
+            .subc_unbound_quiesced()
+            .then(|| ctx.take_pending_reconciliation_state());
         if ctx.artifact_eviction_blocked() {
+            if let Some(pending) = taken_pending {
+                ctx.restore_pending_reconciliation_state(pending);
+            }
             continue;
         }
         let memory_before = ctx.memory_root_snapshot();
         if !ctx.evict_idle_artifacts() {
+            if let Some(pending) = taken_pending {
+                ctx.restore_pending_reconciliation_state(pending);
+            }
             continue;
         }
+        drop(taken_pending);
         // The watcher backend owns the OS watcher and can block while joining
         // on macOS. Request shutdown here, but let a dedicated reaper thread
         // perform the join rather than holding up an executor maintenance lane.
         ctx.stop_watcher_runtime_in_background();
+        // The watcher is now stopped: edits during the idle interval go
+        // unobserved, so a later warm reload must not trust the verify memo
+        // (same-size, preserved-mtime edits would pass stat-first) and the
+        // callgraph store must reconcile instead of reopening as fresh.
+        ctx.invalidate_artifacts_after_watcher_gap();
         if let Some(meta) = live_roots.get_mut(&root_id) {
             meta.idle_artifacts_evicted = true;
         }
@@ -772,6 +850,14 @@ fn submit_due_maintenance_jobs(
             metrics,
         );
     }
+}
+
+fn should_requiesce_after_maintenance(
+    meta: &RootMeta,
+    completed_kind: MaintenanceDrainKind,
+    bind_pending: bool,
+) -> bool {
+    meta.unbound_quiesced && completed_kind != MaintenanceDrainKind::Lsp && !bind_pending
 }
 
 fn note_maintenance_completion(
@@ -1256,7 +1342,29 @@ fn remove_bg_subscription_index(
     }
 }
 
-fn end_bg_subscription(
+fn route_removal_will_quiesce_root(
+    root: &ProjectRootId,
+    route: RouteChannel,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    has_pending_bind: bool,
+    replacement_root: Option<&ProjectRootId>,
+) -> bool {
+    let removes_last_route = root_channels
+        .get(root)
+        .is_some_and(|channels| channels.len() == 1 && channels.contains(&route));
+    removes_last_route && !has_pending_bind && replacement_root != Some(root)
+}
+
+fn should_quiesce_removed_root(
+    root: &ProjectRootId,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    has_pending_bind: bool,
+    replacement_root: Option<&ProjectRootId>,
+) -> bool {
+    !root_channels.contains_key(root) && !has_pending_bind && replacement_root != Some(root)
+}
+
+async fn end_bg_subscription(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
@@ -1264,21 +1372,23 @@ fn end_bg_subscription(
     bg_wake_pending: &mut HashSet<RouteChannel>,
     channel: RouteChannel,
     identity: Option<&RouteIdentity>,
-) {
-    if let Some(sub) = bg_subs.get(&channel).copied() {
-        let _ = push::try_send_bg_stream_end(writer_tx, metrics, channel, &sub);
-        bg_subs.remove(&channel);
+) -> Result<(), SubcError> {
+    if let Some(sub) = bg_subs.remove(&channel) {
         bg_wake_pending.remove(&channel);
         remove_bg_subscription_index(bg_sub_by_session, channel, identity);
+        push::send_reliable_bg_stream_end(writer_tx, metrics, channel, &sub).await?;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn teardown_installed_route(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
+    executor: &Arc<Executor>,
     channel: RouteChannel,
     cancellation_reason: &str,
+    replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -1302,7 +1412,8 @@ async fn teardown_installed_route(
         bg_wake_pending,
         channel,
         routes.get(&channel),
-    );
+    )
+    .await?;
     settle_pending_bash_asks_for_route(
         tx,
         pending_bash_asks,
@@ -1319,12 +1430,31 @@ async fn teardown_installed_route(
     }
     if let Some(pending) = pending_binds.get_mut(&channel) {
         pending.cancelled = true;
+        let outcome = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
         log::debug!(
-            "subc attach: cancelled pending RouteBind for route {} on {cancellation_reason}",
+            "subc attach: cancelled pending RouteBind for route {} on {cancellation_reason} (configure job: {outcome:?})",
             channel.channel
         );
     }
     let migrated = push::migrate_retry_buffer_to_push_buffer(retry_buffer, channel, push_buffer);
+    if let Some(identity) = routes.get(&channel) {
+        let has_pending_bind = pending_binds
+            .values()
+            .any(|pending| pending.bind_root_id == identity.root);
+        if route_removal_will_quiesce_root(
+            &identity.root,
+            channel,
+            root_channels,
+            has_pending_bind,
+            replacement_root,
+        ) {
+            if let Some(ctx) = executor.actor_context(&identity.root) {
+                // Fence deferred admissions before the final route disappears
+                // from the loop-owned routing tables.
+                ctx.mark_subc_unbound();
+            }
+        }
+    }
     if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
         if migrated > 0 {
             log::debug!(
@@ -1334,7 +1464,7 @@ async fn teardown_installed_route(
         }
         if let Some(meta) = live_roots.get_mut(&identity.root) {
             let idle_for = meta.last_touched.elapsed();
-            meta.touch();
+            meta.note_activity();
             log::debug!(
                 "subc attach: route {} torn down for root {} harness {} session {} (last touched {:?} ago)",
                 channel.channel,
@@ -1351,6 +1481,17 @@ async fn teardown_installed_route(
                 identity.harness,
                 identity.session
             );
+        }
+        let has_pending_bind = pending_binds
+            .values()
+            .any(|pending| pending.bind_root_id == identity.root);
+        if should_quiesce_removed_root(
+            &identity.root,
+            root_channels,
+            has_pending_bind,
+            replacement_root,
+        ) {
+            quiesce_unbound_root(&identity.root, live_roots, executor);
         }
     } else {
         if migrated > 0 {
@@ -1667,7 +1808,7 @@ async fn connect_and_authenticate_once(
 ) -> Result<TcpStream, SubcError> {
     // This read intentionally lives inside the per-attempt function. The daemon
     // publishes connection files atomically and may change both port and key.
-    let conn = connection_file::read(connection_file_path).map_err(|source| {
+    let conn = connection_file::read_for_client(connection_file_path).map_err(|source| {
         SubcError::ConnectionFile {
             path: connection_file_path.to_path_buf(),
             source,
@@ -1956,6 +2097,7 @@ where
             warn_slow_pending_binds(&mut pending_binds, &executor);
             if let Err(error) = expire_overdue_route_binds(
                 &writer_tx,
+                &executor,
                 &mut pending_binds,
                 &mut installed_route_epochs,
                 &dispatch_path_metrics,
@@ -2097,8 +2239,10 @@ where
                         if let Err(error) = teardown_installed_route(
                             &writer_tx,
                             &dispatch_path_metrics,
+                            &executor,
                             channel,
                             "Goodbye",
+                            None,
                             &mut installed_route_epochs,
                             &mut routes,
                             &mut root_channels,
@@ -2200,7 +2344,7 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         if bg_subs.contains_key(&channel) {
-                            end_bg_subscription(
+                            if let Err(error) = end_bg_subscription(
                                 &writer_tx,
                                 &dispatch_path_metrics,
                                 &mut bg_subs,
@@ -2208,7 +2352,11 @@ where
                                 &mut bg_wake_pending,
                                 channel,
                                 routes.get(&channel),
-                            );
+                            )
+                            .await
+                            {
+                                break Err(error);
+                            }
                         }
                         if let Err(error) = cancel_pending_bash_ask_for_tool_call(
                             &writer_tx,
@@ -2318,7 +2466,7 @@ where
             Some(root_id) = bash_poll_touch_rx.recv() => {
                 decrement_counted_channel(&dispatch_path_metrics.bash_poll_touch_queued);
                 if let Some(meta) = live_roots.get_mut(&root_id) {
-                    meta.touch();
+                    meta.note_activity();
                 }
             }
             Some(completion) = maintenance_rx.recv() => {
@@ -2326,16 +2474,23 @@ where
                 let root_id = completion.root_id.clone();
                 let response = completion.response;
                 let response_is_fatal = response_is_fatal_panic(&response);
-                if let Some(meta) = live_roots.get_mut(&root_id) {
-                    let defer_requeue = pending_binds
-                        .values()
-                        .any(|pending| pending.bind_root_id == root_id);
+                let bind_pending = pending_binds
+                    .values()
+                    .any(|pending| pending.bind_root_id == root_id);
+                let requiesce = if let Some(meta) = live_roots.get_mut(&root_id) {
+                    let defer_requeue = meta.unbound_quiesced || bind_pending;
                     note_maintenance_completion(
                         meta,
                         completion.requeue_kind,
                         response_is_fatal,
                         defer_requeue,
                     );
+                    should_requiesce_after_maintenance(meta, completion.kind, bind_pending)
+                } else {
+                    false
+                };
+                if requiesce {
+                    quiesce_unbound_root(&root_id, &mut live_roots, &executor);
                 }
                 push::clear_stale_bg_wakes_for_empty_sessions(
                     &root_id,
@@ -2366,7 +2521,6 @@ where
                     Instant::now(),
                     &mut live_roots,
                     &pending_binds,
-                    &root_channels,
                     &executor,
                 );
                 if reaped > 0 {
@@ -2386,6 +2540,13 @@ where
             }
         }
     };
+
+    // Sweep pending binds on EVERY loop exit (channel-0 Goodbye, EOF, fatal,
+    // error): ExecutorInner::drop joins worker threads, so a configure still
+    // parked at a cancellation checkpoint would wedge module shutdown.
+    for pending in pending_binds.values() {
+        let _ = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
+    }
 
     let mut loop_result = loop_result;
     if !pending_bash_asks.is_empty() {
@@ -2712,6 +2873,16 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             completion.inserted_new_actor,
         );
+        let has_pending_bind = pending_binds
+            .values()
+            .any(|pending| pending.bind_root_id == completion.bind_root_id);
+        if !root_channels
+            .get(&completion.bind_root_id)
+            .is_some_and(|channels| !channels.is_empty())
+            && !has_pending_bind
+        {
+            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
+        }
         remove_installed_route(installed_route_epochs, route_id);
         return Ok(());
     };
@@ -2734,6 +2905,16 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             inserted_new_actor,
         );
+        let has_pending_bind = pending_binds
+            .values()
+            .any(|pending| pending.bind_root_id == completion.bind_root_id);
+        if !root_channels
+            .get(&completion.bind_root_id)
+            .is_some_and(|channels| !channels.is_empty())
+            && !has_pending_bind
+        {
+            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
+        }
         log::debug!(
             "subc attach: discarded completed RouteBind for cancelled route {} root {}",
             completion.route,
@@ -2760,6 +2941,16 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             inserted_new_actor,
         );
+        let has_pending_bind = pending_binds
+            .values()
+            .any(|pending| pending.bind_root_id == completion.bind_root_id);
+        if !root_channels
+            .get(&completion.bind_root_id)
+            .is_some_and(|channels| !channels.is_empty())
+            && !has_pending_bind
+        {
+            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
+        }
         let message = response_message(response, fallback);
         let fatal = response_is_fatal_panic(response);
         let error_code = route_bind_error_code_for_configure_response(response);
@@ -2794,11 +2985,11 @@ async fn handle_route_bind_completion(
     insert_route_channel(routes, root_channels, route_id, completion.identity);
     let restore_watcher = live_roots
         .get(&completion.bind_root_id)
-        .is_some_and(|meta| meta.idle_artifacts_evicted);
+        .is_some_and(|meta| meta.idle_artifacts_evicted || meta.unbound_quiesced);
     live_roots
         .entry(completion.bind_root_id.clone())
         .and_modify(|meta| {
-            meta.touch();
+            meta.reactivate_bound();
             meta.diagnostics_on_edit = completion.diagnostics_on_edit;
             meta.maintenance_poisoned = false;
         })
@@ -2807,8 +2998,9 @@ async fn handle_route_bind_completion(
         meta.diagnostics_on_edit = completion.diagnostics_on_edit;
         meta.maintenance_poisoned = false;
     }
-    if restore_watcher {
-        if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
+    if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
+        ctx.mark_subc_bound();
+        if restore_watcher {
             crate::commands::configure::ensure_project_watcher(&ctx);
         }
     }
@@ -2855,6 +3047,7 @@ async fn handle_route_bind_completion(
 
 async fn expire_overdue_route_binds(
     tx: &WriterSender,
+    executor: &Arc<Executor>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     metrics: &DispatchPathMetrics,
@@ -2882,6 +3075,10 @@ async fn expire_overdue_route_binds(
         if let Some(pending) = pending_binds.get_mut(&route) {
             pending.cancelled = true;
             pending.deadline_reported = true;
+            let outcome = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
+            log::debug!(
+                "subc attach: cancelled overdue RouteBind configure for route {route} ({outcome:?})"
+            );
         }
         remove_installed_route(installed_route_epochs, route);
         let age_ms = age.as_millis().min(u128::from(u64::MAX)) as u64;
@@ -2959,6 +3156,7 @@ async fn handle_control_request(
                 )
                 .await;
             }
+            let mut bind_root_id = None;
             if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                 if installed_epoch >= epoch {
                     return send_route_bind_error(
@@ -2971,11 +3169,26 @@ async fn handle_control_request(
                     .await;
                 }
 
+                let replacement_root = match ProjectRootId::from_path(&identity.project_root) {
+                    Ok(root_id) => root_id,
+                    Err(error) => {
+                        return send_route_bind_error(
+                            tx,
+                            frame,
+                            "config_divergence",
+                            &format!("invalid route project root: {error}"),
+                            metrics,
+                        )
+                        .await;
+                    }
+                };
                 teardown_installed_route(
                     tx,
                     metrics,
+                    executor,
                     route_key(route_channel, installed_epoch),
                     "higher-epoch RouteBind",
+                    Some(&replacement_root),
                     installed_route_epochs,
                     routes,
                     root_channels,
@@ -2991,6 +3204,7 @@ async fn handle_control_request(
                     shutdown,
                 )
                 .await?;
+                bind_root_id = Some(replacement_root);
             }
             if pending_binds.contains_key(&route_id) {
                 return send_route_bind_error(
@@ -3002,19 +3216,21 @@ async fn handle_control_request(
                 )
                 .await;
             }
-
-            let bind_root_id = match ProjectRootId::from_path(&identity.project_root) {
-                Ok(root_id) => root_id,
-                Err(error) => {
-                    return send_route_bind_error(
-                        tx,
-                        frame,
-                        "config_divergence",
-                        &format!("invalid route project root: {error}"),
-                        metrics,
-                    )
-                    .await;
-                }
+            let bind_root_id = match bind_root_id {
+                Some(root_id) => root_id,
+                None => match ProjectRootId::from_path(&identity.project_root) {
+                    Ok(root_id) => root_id,
+                    Err(error) => {
+                        return send_route_bind_error(
+                            tx,
+                            frame,
+                            "config_divergence",
+                            &format!("invalid route project root: {error}"),
+                            metrics,
+                        )
+                        .await;
+                    }
+                },
             };
 
             // Reconcile RootConfig: build a configure request from the bind
@@ -3103,6 +3319,20 @@ async fn handle_control_request(
 
             let configure_request_id = configure_req.id.clone();
             installed_route_epochs.insert(route_channel, epoch);
+            if let Some(meta) = live_roots.get_mut(&bind_root_id) {
+                meta.maintenance_queued_kinds.clear();
+                meta.maintenance_pending = meta.maintenance_jobs_in_flight > 0;
+            }
+            let (configure_rx, configure_cancellation) = executor.submit_cancellable_async(
+                bind_root_id.clone(),
+                Lane::Mutating,
+                configure_request_id.clone(),
+                Box::new(move |ctx| {
+                    log_ctx::with_session(Some(configure_session.clone()), || {
+                        dispatch(configure_req, ctx)
+                    })
+                }),
+            );
             pending_binds.insert(
                 route_id,
                 PendingBind {
@@ -3116,21 +3346,8 @@ async fn handle_control_request(
                     corr: frame.header.corr,
                     ver: frame.header.ver,
                     flags: frame.header.flags,
+                    cancellation: configure_cancellation,
                 },
-            );
-            if let Some(meta) = live_roots.get_mut(&bind_root_id) {
-                meta.maintenance_queued_kinds.clear();
-                meta.maintenance_pending = meta.maintenance_jobs_in_flight > 0;
-            }
-            let configure_rx = executor.submit_async(
-                bind_root_id.clone(),
-                Lane::Mutating,
-                configure_request_id.clone(),
-                Box::new(move |ctx| {
-                    log_ctx::with_session(Some(configure_session.clone()), || {
-                        dispatch(configure_req, ctx)
-                    })
-                }),
             );
 
             let completion_tx = control_completion_tx.clone();
@@ -3330,7 +3547,7 @@ async fn handle_tool_call(
         .get(&identity.root)
         .is_some_and(|meta| meta.idle_artifacts_evicted);
     if let Some(meta) = live_roots.get_mut(&identity.root) {
-        meta.touch();
+        meta.reactivate_bound();
     }
     if restore_watcher {
         if let Some(ctx) = executor.actor_context(&identity.root) {
@@ -3347,12 +3564,18 @@ async fn handle_tool_call(
         })
     ) {
         if let Some(old_sub) = bg_subs.get(&route_id).copied() {
-            let _ = push::try_send_bg_stream_end(tx, metrics, route_id, &old_sub);
+            push::send_reliable_bg_stream_end(tx, metrics, route_id, &old_sub).await?;
         }
         if !identity.trust.allows_bash_observation() {
             bg_subs.remove(&route_id);
             bg_wake_pending.remove(&route_id);
             remove_bg_subscription_index(bg_sub_by_session, route_id, Some(&identity));
+            let denied_sub = BgSub {
+                corr: frame.header.corr,
+                ver: frame.header.ver,
+                flags: frame.header.flags,
+            };
+            push::send_reliable_bg_stream_end(tx, metrics, route_id, &denied_sub).await?;
             return Ok(());
         }
         bg_subs.insert(
@@ -3486,7 +3709,7 @@ async fn handle_tool_call(
                 .entry(identity.root.clone())
                 .or_insert_with(|| RootMeta::new(Instant::now()));
             meta.active_bash_waits = meta.active_bash_waits.saturating_add(1);
-            meta.touch();
+            meta.reactivate_bound();
 
             let route_cancel =
                 route_bash_cancels
@@ -3540,7 +3763,7 @@ async fn handle_tool_call(
             .entry(identity.root.clone())
             .or_insert_with(|| RootMeta::new(Instant::now()));
         meta.active_bash_waits = meta.active_bash_waits.saturating_add(1);
-        meta.touch();
+        meta.reactivate_bound();
 
         let route_cancel =
             route_bash_cancels
@@ -3727,6 +3950,10 @@ fn submit_maintenance_job(
     );
     let response_id = request_id.clone();
     let completion_root_id = root_id.clone();
+    let maintenance_generation = executor
+        .actor_context(&root_id)
+        .map(|ctx| ctx.configure_generation())
+        .unwrap_or(0);
     let (outcome_tx, outcome_rx) = oneshot::channel::<MaintenanceJobOutcome>();
     // ConfigureTail runs deferred configure mutations and needs the actor
     // epoch write gate. The other drain kinds only mutate subsystem state
@@ -3774,7 +4001,7 @@ fn submit_maintenance_job(
                     runtime_drain::drain_callgraph_store_events(ctx);
                     runtime_drain::drain_semantic_index_events(ctx);
                     runtime_drain::drain_semantic_refresh_events(ctx);
-                    runtime_drain::drain_inspect_events(ctx);
+                    runtime_drain::drain_inspect_events_for_generation(ctx, maintenance_generation);
                     let empty_bg_sessions = bg_sessions_to_check
                         .into_iter()
                         .filter(|(session, _)| {
@@ -3807,6 +4034,7 @@ fn submit_maintenance_job(
             &completion_metrics.maintenance_queued,
             MaintenanceCompletion {
                 root_id: completion_root_id,
+                kind,
                 response,
                 empty_bg_sessions: outcome.empty_bg_sessions,
                 requeue_kind: outcome.requeue_kind,
@@ -4108,6 +4336,58 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_wire_version_is_rejected_before_tcp_connect() {
+        let conn_dir = tempfile::tempdir().expect("connection tempdir");
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let port = listener.local_addr().expect("listener addr").port();
+        connection_file::write_atomic(
+            &conn_path,
+            &connection_file::ConnectionInfo {
+                schema: connection_file::SCHEMA_VERSION,
+                wire_version: Some(PROTOCOL_VERSION.wrapping_add(1)),
+                endpoints: vec![connection_file::Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                }],
+                key: vec![0x42; subc_transport::KEY_LEN],
+                daemon_id: [0x24; subc_transport::DAEMON_ID_LEN],
+                pid: std::process::id(),
+                daemon_ver: "subc-test".to_string(),
+            },
+        )
+        .expect("write connection file");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let result = runtime.block_on(connect_and_authenticate_with_policy(
+            &conn_path,
+            AttachRetryPolicy {
+                budget: Duration::from_secs(1),
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(10),
+                jitter_percent: 0,
+            },
+        ));
+        assert!(matches!(
+            result,
+            Err(SubcError::ConnectionFile {
+                source: connection_file::ConnectionFileError::WireVersionMismatch { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
     fn initial_attach_unreachable_endpoint_retries_until_budget_then_fails_loud() {
         let conn_dir = tempfile::tempdir().expect("connection tempdir");
         let conn_path = conn_dir.path().join("subc-connection.json");
@@ -4118,6 +4398,7 @@ mod tests {
             &conn_path,
             &connection_file::ConnectionInfo {
                 schema: connection_file::SCHEMA_VERSION,
+                wire_version: Some(PROTOCOL_VERSION),
                 endpoints: vec![connection_file::Endpoint {
                     host: "127.0.0.1".to_string(),
                     port,
@@ -4296,6 +4577,27 @@ mod tests {
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        // Seed a completed warm verification so the test can prove eviction
+        // downgrades it to Strict rather than passing vacuously.
+        let seeded_generation =
+            crate::cache_freshness::artifact_generation(&cache_dir.join("cache.bin"))
+                .expect("seeded artifact generation");
+        crate::cache_freshness::record_verify_completed(
+            &canonical_root,
+            crate::cache_freshness::VerifyArtifact::Search,
+            Some(seeded_generation),
+        );
+        assert!(
+            matches!(
+                crate::cache_freshness::warm_verify_plan(
+                    canonical_root.as_path(),
+                    crate::cache_freshness::VerifyArtifact::Search,
+                    Some(seeded_generation),
+                ),
+                crate::cache_freshness::WarmVerifyPlan::Skip
+            ),
+            "memo must be warm before eviction for the downgrade assertion to bite"
+        );
 
         let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
         let _dispatch_tx = dispatch_tx;
@@ -4329,17 +4631,26 @@ mod tests {
         assert!(message.contains("parser_pool"));
 
         assert_eq!(
-            reap_idle_roots(
-                Instant::now(),
-                &mut live_roots,
-                &HashMap::new(),
-                &HashMap::new(),
-                &executor,
-            ),
+            reap_idle_roots(Instant::now(), &mut live_roots, &HashMap::new(), &executor),
             1
         );
         assert!(ctx.search_index().read().unwrap().is_none());
         assert_eq!(ctx.watcher_registry_count(), 0);
+        // The watcher stopped with the eviction, so the idle interval is
+        // unobserved: the pre-seeded warm-verify memo (Skip) must fall back to
+        // strict content verification (stat-first would miss same-size,
+        // preserved-mtime edits made while nobody was watching).
+        assert!(
+            matches!(
+                crate::cache_freshness::warm_verify_plan(
+                    canonical_root.as_path(),
+                    crate::cache_freshness::VerifyArtifact::Search,
+                    Some(seeded_generation),
+                ),
+                crate::cache_freshness::WarmVerifyPlan::Strict
+            ),
+            "idle eviction must force strict re-verification"
+        );
         assert!(
             crate::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root).is_some()
         );
@@ -4351,38 +4662,279 @@ mod tests {
     }
 
     #[test]
-    fn idle_root_reaper_keeps_recent_bound_roots_and_evicts_unbound_roots() {
-        let (_root_dir, root) = test_root("idle-root-live-session-gate");
+    fn idle_root_reaper_applies_ttl_to_unbound_roots() {
+        let (_root_dir, root) = test_root("idle-root-ttl-gate");
         let ctx = test_ctx();
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), ctx));
         let now = Instant::now();
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(now))]);
-        let root_channels = HashMap::from([(root.clone(), HashSet::from([route_key(7, 1)]))]);
 
+        // A recently-unbound root stays warm: a transient unbind (host
+        // restart) must not pay the strict-verify + forced-rebuild teardown
+        // on the next maintenance sweep.
         assert_eq!(
-            reap_idle_roots(
-                now,
-                &mut live_roots,
-                &HashMap::new(),
-                &root_channels,
-                &executor,
-            ),
+            reap_idle_roots(now, &mut live_roots, &HashMap::new(), &executor),
             0
         );
         assert!(!live_roots[&root].idle_artifacts_evicted);
 
+        // Past the TTL the same unbound root pays the full teardown. The
+        // pending reconciliation paths retained across the transient-unbind
+        // window would block eviction forever through
+        // `artifact_eviction_blocked`; the reaper disposes them because the
+        // strict gap invalidation subsumes their purpose.
+        let ctx = executor.actor_context(&root).expect("actor context");
+        ctx.mark_subc_unbound();
+        ctx.add_pending_search_index_paths([root.as_path().join("retained.rs")]);
         assert_eq!(
             reap_idle_roots(
-                now,
+                now + IDLE_ROOT_TTL,
                 &mut live_roots,
-                &HashMap::new(),
                 &HashMap::new(),
                 &executor,
             ),
             1
         );
         assert!(live_roots[&root].idle_artifacts_evicted);
+        assert!(
+            ctx.take_pending_search_index_paths().is_empty(),
+            "TTL eviction must dispose retained pending reconciliation paths"
+        );
+    }
+
+    #[test]
+    fn blocked_ttl_eviction_restores_taken_pending_reconciliation_state() {
+        let (_root_dir, root) = test_root("ttl-eviction-blocked-restore");
+        let ctx = test_ctx();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        ctx.mark_subc_unbound();
+
+        // Retained pending path from the transient-unbind window plus a
+        // SECONDARY eviction blocker (a non-ready resident search index, the
+        // dirty-index blocker in artifact_eviction_blocked). Disposal must be
+        // transactional: the blocked eviction may be followed by a rebind, and
+        // the path is the only repair record for its consumed watcher event.
+        let pending = root.as_path().join("edited-while-unbound.rs");
+        ctx.add_pending_search_index_paths([pending.clone()]);
+        let dirty_source = root.as_path().join("dirty.rs");
+        std::fs::write(&dirty_source, "fn dirty() {}\n").expect("dirty source");
+        let mut dirty = crate::search_index::SearchIndex::new();
+        dirty.ready = true;
+        dirty.update_file(&dirty_source);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dirty);
+        assert!(ctx.artifact_eviction_blocked());
+
+        let mut live_roots = HashMap::new();
+        let mut meta = RootMeta::new(Instant::now());
+        meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        live_roots.insert(root.clone(), meta);
+
+        assert_eq!(
+            reap_idle_roots(Instant::now(), &mut live_roots, &HashMap::new(), &executor),
+            0,
+            "the dirty index must still block this eviction"
+        );
+        assert_eq!(
+            ctx.take_pending_search_index_paths(),
+            vec![pending],
+            "a blocked eviction must restore the taken pending paths"
+        );
+    }
+
+    #[test]
+    fn unbound_root_quiesces_maintenance_without_removing_actor() {
+        let (_root_dir, root) = test_root("unbound-root-quiesce");
+        let ctx = test_ctx();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut meta = RootMeta::new(Instant::now());
+        meta.maintenance_pending = true;
+        meta.maintenance_jobs_in_flight = 1;
+        meta.maintenance_queued_kinds
+            .push_back(MaintenanceDrainKind::ConfigureTail);
+        let mut live_roots = HashMap::from([(root.clone(), meta)]);
+        // Warm state planted before the unbind: quiesce must keep it.
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::search_index::SearchIndex::new());
+        ctx.set_cache_writer_capabilities(true, true);
+        let pending = root.as_path().join("pending.rs");
+        ctx.add_pending_search_index_paths([pending.clone()]);
+        // A warm verify memo must survive the transient unbind: the watcher
+        // keeps running, so no unobserved window exists and the next warm
+        // reload must not pay a strict full-corpus re-hash.
+        let canonical_root = root.as_path().to_path_buf();
+        let artifact = canonical_root.join("cache.bin");
+        std::fs::write(&artifact, b"warm-artifact").expect("write artifact");
+        let seeded_generation = crate::cache_freshness::artifact_generation(&artifact);
+        crate::cache_freshness::record_verify_completed(
+            &canonical_root,
+            crate::cache_freshness::VerifyArtifact::Search,
+            seeded_generation,
+        );
+        assert!(matches!(
+            crate::cache_freshness::warm_verify_plan(
+                &canonical_root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                seeded_generation,
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Skip
+        ));
+        // A live watcher runtime must survive quiesce (its events accumulate
+        // for the rebind replay).
+        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
+        let _dispatch_tx = dispatch_tx;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let join = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+        ctx.install_watcher_runtime(
+            dispatch_rx,
+            crate::watcher_filter::WatcherThreadHandle::new(shutdown, join),
+        );
+        assert!(ctx.watcher_runtime_active());
+
+        quiesce_unbound_root(&root, &mut live_roots, &executor);
+        let meta = &live_roots[&root];
+        assert!(meta.unbound_quiesced);
+        assert!(ctx.subc_unbound_quiesced());
+        assert!(meta.maintenance_pending);
+        assert!(meta.maintenance_queued_kinds.is_empty());
+        assert!(executor.actor_registered(&root));
+        // Transient unbind keeps the root warm: resident artifacts stay
+        // resident, no forced callgraph rebuild is planted, and pending
+        // reconciliation paths survive for the rebind replay.
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "quiesce must not evict resident artifacts"
+        );
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token(),
+            None,
+            "quiesce must not force a callgraph rebuild"
+        );
+        assert_eq!(
+            ctx.take_pending_search_index_paths(),
+            vec![pending],
+            "quiesce must retain pending watcher-derived paths"
+        );
+        assert!(
+            matches!(
+                crate::cache_freshness::warm_verify_plan(
+                    &canonical_root,
+                    crate::cache_freshness::VerifyArtifact::Search,
+                    seeded_generation,
+                ),
+                crate::cache_freshness::WarmVerifyPlan::Skip
+            ),
+            "quiesce must not invalidate the warm verify memo"
+        );
+        assert!(
+            ctx.watcher_runtime_active(),
+            "quiesce must not stop a running watcher"
+        );
+        ctx.stop_watcher_runtime();
+
+        let meta = live_roots.get_mut(&root).expect("root metadata");
+        note_maintenance_completion(
+            meta,
+            Some(MaintenanceDrainKind::ConfigureTail),
+            false,
+            meta.unbound_quiesced,
+        );
+        assert!(!meta.maintenance_pending);
+        assert!(meta.maintenance_queued_kinds.is_empty());
+    }
+
+    #[test]
+    fn same_root_higher_epoch_replacement_does_not_quiesce_between_generations() {
+        let (_dir, root) = test_root("same-root-replacement");
+        let route = route_key(7, 1);
+        let installed_channels = HashMap::from([(root.clone(), HashSet::from([route]))]);
+        let root_channels = HashMap::new();
+
+        assert!(!route_removal_will_quiesce_root(
+            &root,
+            route,
+            &installed_channels,
+            false,
+            Some(&root),
+        ));
+        assert!(route_removal_will_quiesce_root(
+            &root,
+            route,
+            &installed_channels,
+            false,
+            None,
+        ));
+        assert!(!should_quiesce_removed_root(
+            &root,
+            &root_channels,
+            false,
+            Some(&root),
+        ));
+        assert!(should_quiesce_removed_root(
+            &root,
+            &root_channels,
+            false,
+            None,
+        ));
+        assert!(!should_quiesce_removed_root(
+            &root,
+            &root_channels,
+            true,
+            None,
+        ));
+    }
+
+    #[test]
+    fn root_quiesces_only_after_its_last_route_is_removed_and_reactivates_on_bind() {
+        let (_root_dir, root) = test_root("unbound-root-route-count");
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let mut root_channels = HashMap::from([(
+            root.clone(),
+            HashSet::from([route_key(7, 1), route_key(8, 1)]),
+        )]);
+
+        remove_root_channel(&mut root_channels, &root, route_key(7, 1));
+        if !root_channels.contains_key(&root) {
+            quiesce_unbound_root(&root, &mut live_roots, &executor);
+        }
+        assert!(!live_roots[&root].unbound_quiesced);
+
+        remove_root_channel(&mut root_channels, &root, route_key(8, 1));
+        if !root_channels.contains_key(&root) {
+            quiesce_unbound_root(&root, &mut live_roots, &executor);
+        }
+        assert!(live_roots[&root].unbound_quiesced);
+
+        live_roots
+            .get_mut(&root)
+            .expect("root metadata")
+            .note_activity();
+        assert!(
+            live_roots[&root].unbound_quiesced,
+            "late asynchronous activity must not reactivate an unbound root"
+        );
+
+        live_roots
+            .get_mut(&root)
+            .expect("root metadata")
+            .reactivate_bound();
+        assert!(!live_roots[&root].unbound_quiesced);
     }
 
     #[test]
@@ -4459,6 +5011,24 @@ mod tests {
             INITIAL_MAINTENANCE_JOB_COUNT
         );
         assert!(!live_roots[&poisoned_root].maintenance_pending);
+    }
+
+    #[test]
+    fn due_maintenance_jobs_do_not_restart_quiesced_root_work() {
+        let (_dir, root) = test_root("maintenance-unbound");
+        let mut meta = RootMeta::new(Instant::now());
+        meta.unbound_quiesced = true;
+        let mut live_roots = HashMap::from([(root.clone(), meta)]);
+
+        let (due, deferred) = due_maintenance_jobs_without_actor_context(
+            &mut live_roots,
+            MAINTENANCE_SUBMIT_BUDGET,
+            &HashSet::new(),
+        );
+
+        assert!(due.is_empty());
+        assert!(!deferred);
+        assert!(!live_roots[&root].maintenance_pending);
     }
 
     #[test]
@@ -4740,6 +5310,28 @@ mod tests {
     }
 
     #[test]
+    fn parked_lsp_completion_never_requiesces_or_cancels_a_pending_bind() {
+        let mut meta = RootMeta::new(Instant::now());
+        meta.unbound_quiesced = true;
+
+        assert!(!should_requiesce_after_maintenance(
+            &meta,
+            MaintenanceDrainKind::Lsp,
+            false,
+        ));
+        assert!(!should_requiesce_after_maintenance(
+            &meta,
+            MaintenanceDrainKind::ConfigureTail,
+            true,
+        ));
+        assert!(should_requiesce_after_maintenance(
+            &meta,
+            MaintenanceDrainKind::ConfigureTail,
+            false,
+        ));
+    }
+
+    #[test]
     fn maintenance_pending_clears_and_poison_stops_requeue_after_fatal() {
         let (_dir, root) = test_root("maintenance-fatal");
         let mut live_roots = HashMap::new();
@@ -4922,6 +5514,7 @@ mod tests {
                 corr: 91,
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
+                cancellation: crate::executor::JobCancellation::new(),
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);

@@ -1,6 +1,6 @@
 //! Push-frame classification, fan-out, buffering, replay, and background wake plumbing.
 
-use super::wire::{try_enqueue_writer_frame, WriterEnqueueOutcome};
+use super::wire::{send_reliable_writer_frame, try_enqueue_writer_frame, WriterEnqueueOutcome};
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -370,20 +370,23 @@ fn try_send_bg_stream_data(
     )
 }
 
-pub(super) fn try_send_bg_stream_end(
+pub(super) async fn send_reliable_bg_stream_end(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
     sub: &BgSub,
-) -> PushSendOutcome {
-    try_send_bg_stream_frame(
-        writer_tx,
-        metrics,
-        channel,
-        sub,
+) -> Result<(), SubcError> {
+    let frame = Frame::build_with_version(
+        sub.ver,
         FrameType::StreamEnd,
+        sub.flags,
+        channel.channel,
+        channel.epoch,
+        sub.corr,
         Vec::new(),
     )
+    .map_err(SubcError::FrameBuild)?;
+    send_reliable_writer_frame(writer_tx, metrics, frame, "bg_events StreamEnd").await
 }
 
 pub(super) fn emit_bg_event_wakes(
@@ -941,6 +944,46 @@ pub(super) fn process_lossy_push_envelope_batch(
 mod tests {
     use super::super::test_support::*;
     use super::*;
+
+    #[tokio::test]
+    async fn bg_stream_end_waits_for_writer_capacity_instead_of_dropping() {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(1);
+        let blocker = Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new())
+            .expect("build blocker frame");
+        assert!(try_enqueue_writer_frame(&writer_tx, &metrics, blocker).is_enqueued());
+
+        let send_tx = writer_tx.clone();
+        let send_metrics = Arc::clone(&metrics);
+        let send = tokio::spawn(async move {
+            send_reliable_bg_stream_end(
+                &send_tx,
+                &send_metrics,
+                route_key(7, 3),
+                &BgSub {
+                    corr: 41,
+                    ver: PROTOCOL_VERSION,
+                    flags: control_flags(),
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished(), "StreamEnd was dropped on backpressure");
+
+        let first = writer_rx.recv().await.expect("blocker frame");
+        assert_eq!(first.header.ty, FrameType::Ping);
+        tokio::time::timeout(Duration::from_secs(1), send)
+            .await
+            .expect("StreamEnd enqueue timed out")
+            .expect("StreamEnd task panicked")
+            .expect("StreamEnd enqueue failed");
+        let terminal = writer_rx.recv().await.expect("StreamEnd frame");
+        assert_eq!(terminal.header.ty, FrameType::StreamEnd);
+        assert_eq!(terminal.header.channel, 7);
+        assert_eq!(terminal.header.epoch, 3);
+        assert_eq!(terminal.header.corr, 41);
+    }
 
     #[tokio::test]
     async fn reliable_push_drain_budget_defers_without_reordering() {

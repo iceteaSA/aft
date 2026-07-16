@@ -2779,6 +2779,10 @@ mod watcher_filter_tests {
             ctx.add_pending_semantic_index_paths(pending);
 
             std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                ctx.completion_drains_have_work(),
+                "a ready breaker probe must schedule completion draining without another event"
+            );
             drain_semantic_refresh_events(&ctx);
 
             let mut batches = Vec::new();
@@ -2792,6 +2796,34 @@ mod watcher_filter_tests {
             assert!(request_rx
                 .recv_timeout(std::time::Duration::from_millis(50))
                 .is_err());
+        });
+    }
+
+    #[test]
+    fn transient_corpus_refresh_failure_retries_without_another_watcher_event() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        with_semantic_retry_backoff_ms(1, || {
+            let ctx = make_ctx_with_root(&root);
+            let (request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+            event_tx
+                .send(SemanticRefreshEvent::CorpusFailed {
+                    error: transient_embedding_error(),
+                })
+                .unwrap();
+
+            drain_semantic_refresh_events(&ctx);
+
+            assert!(semantic_refresh_circuit_is_open(&ctx));
+            assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drain_semantic_refresh_events(&ctx);
+
+            assert!(matches!(
+                request_rx.recv_timeout(std::time::Duration::from_secs(1)),
+                Ok(SemanticRefreshRequest::Corpus)
+            ));
         });
     }
 

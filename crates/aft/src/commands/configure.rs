@@ -38,6 +38,20 @@ static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static SEMANTIC_STALE_GENERATION_SIGNAL: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static CONFIGURE_ARTIFACT_LOAD_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static CONFIGURE_ARTIFACT_LOAD_CANCELLATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static CONFIGURE_DEFERRED_DELAY_REACHED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static CONFIGURE_ARTIFACT_POST_GATE_REACHED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static SEMANTIC_REFRESH_RESTART_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEMANTIC_REFRESH_RESTART_RESULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 fn note_configure_artifact_load_attempt() {
     CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
@@ -51,6 +65,54 @@ pub fn reset_configure_artifact_load_attempts_for_test() {
 #[doc(hidden)]
 pub fn configure_artifact_load_attempts_for_test() -> usize {
     CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn note_configure_artifact_load_cancellation_for_test() {
+    CONFIGURE_ARTIFACT_LOAD_CANCELLATIONS.fetch_add(1, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn reset_configure_artifact_load_cancellations_for_test() {
+    CONFIGURE_ARTIFACT_LOAD_CANCELLATIONS.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn configure_artifact_load_cancellations_for_test() -> usize {
+    CONFIGURE_ARTIFACT_LOAD_CANCELLATIONS.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn delay_configure_artifact_load_after_gate_for_test() {
+    CONFIGURE_ARTIFACT_POST_GATE_REACHED.fetch_add(1, Ordering::SeqCst);
+    let delay_ms = CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS.load(Ordering::SeqCst);
+    if delay_ms > 0 {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+}
+
+#[cfg(not(test))]
+fn delay_configure_artifact_load_after_gate_for_test() {}
+
+#[cfg(test)]
+fn reset_configure_deferred_delay_reached_for_test() {
+    CONFIGURE_DEFERRED_DELAY_REACHED.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn configure_deferred_delay_reached_for_test() -> usize {
+    CONFIGURE_DEFERRED_DELAY_REACHED.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn set_configure_artifact_post_gate_delay_for_test(delay_ms: u64) {
+    CONFIGURE_ARTIFACT_POST_GATE_REACHED.store(0, Ordering::SeqCst);
+    CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS.store(delay_ms, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn configure_artifact_post_gate_reached_for_test() -> usize {
+    CONFIGURE_ARTIFACT_POST_GATE_REACHED.load(Ordering::SeqCst)
 }
 
 #[doc(hidden)]
@@ -99,11 +161,15 @@ fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> boo
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 15_000;
 
 /// Test seam: rigs that assert on semantic refresh timing override the quiet
-/// window instead of waiting out the production window.
+/// window instead of waiting out the production window. The override is
+/// clamped to the production window so a stray environment value cannot
+/// silently stretch the refresh cadence (values above the default would delay
+/// re-embeds indefinitely; values below it are exactly what tests need).
 fn semantic_refresh_quiet_window() -> Duration {
     let from_env = std::env::var("AFT_SEMANTIC_QUIET_WINDOW_MS")
         .ok()
-        .and_then(|value| value.parse::<u64>().ok());
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|ms| ms.min(SEMANTIC_REFRESH_QUIET_WINDOW_MS));
     Duration::from_millis(from_env.unwrap_or(SEMANTIC_REFRESH_QUIET_WINDOW_MS))
 }
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
@@ -152,6 +218,8 @@ fn run_configure_deferred_walk_synchronously_for_test() -> bool {
 }
 
 fn delay_configure_deferred_maintenance_for_test() {
+    #[cfg(test)]
+    CONFIGURE_DEFERRED_DELAY_REACHED.fetch_add(1, Ordering::SeqCst);
     sleep_from_env_ms("AFT_TEST_CONFIGURE_DEFERRED_MAINTENANCE_DELAY_MS");
 }
 
@@ -207,7 +275,7 @@ fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBu
     paths
 }
 
-fn install_project_watcher_with<W, E, F>(
+fn start_project_watcher_with<W, E, F>(
     ctx: &AppContext,
     root_path: &Path,
     extra_watch_paths: Vec<PathBuf>,
@@ -219,12 +287,6 @@ fn install_project_watcher_with<W, E, F>(
         + Send
         + 'static,
 {
-    // Stop the previous watcher/filter runtime before replacing it
-    // (re-configure). The OS watcher itself is owned by that runtime thread, so
-    // shutting it down here drops the recursive watch and prevents stale filter
-    // threads from accumulating across reconfigures.
-    ctx.stop_watcher_runtime();
-
     let generation = WATCHER_GENERATION
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
@@ -283,6 +345,25 @@ fn install_project_watcher_with<W, E, F>(
     }
 }
 
+#[cfg(test)]
+fn install_project_watcher_with<W, E, F>(
+    ctx: &AppContext,
+    root_path: &Path,
+    extra_watch_paths: Vec<PathBuf>,
+    attach: F,
+) where
+    W: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+        + Send
+        + 'static,
+{
+    // The OS watcher is owned by its runtime thread. Join it before installing
+    // the replacement so stale filter threads cannot accumulate.
+    ctx.stop_watcher_runtime();
+    start_project_watcher_with(ctx, root_path, extra_watch_paths, attach);
+}
+
 fn file_watcher_sync_start_for_test() -> bool {
     std::env::var("AFT_TEST_SYNC_FILE_WATCHER_START").is_ok_and(|value| value == "1")
 }
@@ -301,13 +382,17 @@ fn file_watcher_disabled_for_test() -> bool {
     std::env::var("AFT_TEST_DISABLE_FILE_WATCHER").is_ok_and(|value| value == "1")
 }
 
-fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
+fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
     if file_watcher_disabled_for_test() {
-        ctx.stop_watcher_runtime();
         return;
     }
     let extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
-    install_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
+    start_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
+}
+
+fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
+    ctx.stop_watcher_runtime();
+    start_project_watcher(ctx, root_path);
 }
 
 /// Restore the watcher after an idle root released its runtime. Artifact stores
@@ -316,6 +401,15 @@ fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
 pub(crate) fn ensure_project_watcher(ctx: &AppContext) {
     if ctx.watcher_runtime_active() {
         return;
+    }
+    // A dead-but-installed runtime means the watcher failed while drains were
+    // suppressed (unbound root): events since the failure are lost, so the
+    // retained warm state must not be trusted. Clean up the corpse and apply
+    // the same gap invalidation a deliberate watcher stop applies. Roots
+    // whose watcher was stopped deliberately (idle eviction, root deletion)
+    // have no installed handle here and were already invalidated at the stop.
+    if ctx.take_finished_watcher_runtime() {
+        ctx.invalidate_artifacts_after_watcher_gap();
     }
     let Some(root_path) = ctx.canonical_cache_root_opt() else {
         return;
@@ -1530,6 +1624,26 @@ fn configure_warm_key(
     )
 }
 
+/// Cooperative cancellation checkpoint for foreground configure phases.
+///
+/// A cancelled RouteBind (route Goodbye or bind-deadline expiry) signals the
+/// configure job's [`crate::executor::JobCancellation`]; the running configure
+/// observes it here at phase boundaries and returns early instead of finishing
+/// a bind nobody is waiting for. Once the commit phase begins the token is
+/// sealed and later cancels are ignored, so `AppContext` is never abandoned
+/// half-mutated.
+fn configure_cancelled(req_id: &str) -> Option<Response> {
+    let token = crate::executor::current_job_cancellation()?;
+    if token.cancel_requested_before_commit() {
+        return Some(Response::error(
+            req_id,
+            "request_cancelled",
+            "configure cancelled: the requesting route was torn down or its bind deadline expired",
+        ));
+    }
+    None
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -1540,6 +1654,9 @@ fn configure_warm_key(
 /// Stderr log: `[aft] project root set: <path>`
 /// Stderr log: `[aft] watcher started: <path>`
 pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
     let params = req.params.get("params").unwrap_or(&req.params);
     let harness = match params.get("harness") {
         Some(raw) => match serde_json::from_value::<Harness>(raw.clone()) {
@@ -1604,6 +1721,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
     debug_assert!(canonical_cache_root.is_absolute());
     ctx.begin_configure_ack_phase("worktree_probe");
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
     let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(ctx, &canonical_cache_root);
 
     let previous_config = ctx.config();
@@ -1629,6 +1749,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // cross-bind escalation: a later low-trust bind inheriting an earlier
     // high-trust bind's capability by simply omitting tiers).
     ctx.begin_configure_ack_phase("config_resolve");
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
     let tiers = match resolve_config_tiers_for_configure(params, &root_path) {
         Ok(tiers) => tiers,
         Err(error) => return Response::error(&req.id, "invalid_request", error),
@@ -1788,6 +1911,18 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             !missing.search && !missing.semantic
         }
     {
+        // Equivalent-configure fast path: same commit boundary as the full
+        // path — session binding registration is a state mutation. The seal
+        // races the canceller atomically; losing means abort without mutating.
+        if let Some(token) = crate::executor::current_job_cancellation() {
+            if !token.try_seal_committed() {
+                return Response::error(
+                    &req.id,
+                    "request_cancelled",
+                    "configure cancelled: the requesting route was torn down or its bind deadline expired",
+                );
+            }
+        }
         let first_session_bind = ctx.note_configure_session_binding(
             canonical_cache_root.clone(),
             req.session().to_string(),
@@ -1812,6 +1947,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 reset_filter_registry: false,
                 clear_failed_spawns: false,
                 warm_callgraph_store: false,
+                supersede_artifact_persistence: false,
                 artifact_load_starts: Vec::new(),
             });
             slog_debug!(
@@ -1874,6 +2010,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let artifact_key_needed = !home_match
         && (next_config.search_index || next_config.semantic_search || next_config.callgraph_store);
     ctx.begin_configure_ack_phase("cache_key_resolve");
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
     let project_key = if artifact_key_needed {
         Some(
             match ctx.memoized_artifact_cache_key_for_configure(
@@ -1902,6 +2041,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     ctx.begin_configure_ack_phase("artifact_owner_claim");
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
     let artifact_owner_claim = if let Some(project_key) = project_key.as_ref() {
         if is_worktree_bridge {
             Some(crate::artifact_owner::open_read_only_borrow(
@@ -1948,6 +2090,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
     ctx.begin_configure_ack_phase("storage_capability_probe");
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
     let root_cache_storage_ok = match crate::root_cache::storage_allows_root_keyed(&storage_root) {
         Ok(true) => true,
         Ok(false) => {
@@ -1974,6 +2119,20 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let heavy_root_work_allowed =
         !home_match && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
+    // Commit seal: past this point the configure mutates AppContext and must
+    // run to completion. The seal races the canceller atomically — exactly one
+    // wins. Losing the race means a Goodbye/deadline cancel landed first and
+    // its caller was told RunningSignalled, so abort WITHOUT mutating; winning
+    // means later cancels see RunningCommitted and discard the completion.
+    if let Some(token) = crate::executor::current_job_cancellation() {
+        if !token.try_seal_committed() {
+            return Response::error(
+                &req.id,
+                "request_cancelled",
+                "configure cancelled: the requesting route was torn down or its bind deadline expired",
+            );
+        }
+    }
     ctx.begin_configure_ack_phase("state_commit");
     // Commit phase: no validation returns after this point.
     if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
@@ -2086,14 +2245,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             semantic_search,
         ));
     } else {
-        // Note: We intentionally only WARN on rapid reconfigure (rather than tracking
-        // JoinHandles to cancel old threads) because:
-        //   1. Old thread results are dropped when ctx.search_index_rx() is reset
-        //   2. Atomic tempfile writes via std::fs::rename are race-safe (last writer wins)
-        //   3. Only CPU is wasted; no correctness issue
-        //   4. Tracking handles would add complexity for negligible benefit
-        // If reconfigure rate becomes a real problem, switch to a single
-        // generation-counter + cancellation-token pattern.
+        // We intentionally only warn on rapid reconfigure rather than joining old
+        // workers. Generation gates discard their in-memory results, while
+        // content/fingerprint generations, per-worker persistence epochs, and
+        // artifact-specific disk locks prevent a superseded worker from overwriting a
+        // newer artifact. The remaining cost is bounded duplicate CPU work.
         if search_build_in_progress {
             slog_warn!(
                 "search index build cancelled (superseded by generation {})",
@@ -2116,16 +2272,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *ctx.search_index_rx()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        ctx.retire_search_index_rx();
         *ctx.semantic_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *ctx.semantic_index_rx().lock() = None;
+        ctx.retire_semantic_index_rx();
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        ctx.retire_callgraph_store_rx();
         if previous_project_root.as_ref() == Some(&root_path) {
             ctx.mark_callgraph_store_force_rebuild();
         }
@@ -2170,6 +2325,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         reset_filter_registry: !equivalent_warm_config,
         clear_failed_spawns,
         warm_callgraph_store: next_config.callgraph_store && !home_match && !equivalent_warm_config,
+        supersede_artifact_persistence: !equivalent_warm_config,
         artifact_load_starts,
     });
 
@@ -2258,17 +2414,17 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let semantic_enabled = config.semantic_search;
     drop(config);
 
-    let search_missing = search_enabled
-        && ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none()
-        && ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none();
+    let search_index_missing = ctx
+        .search_index()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_none();
+    let search_not_building = ctx
+        .search_index_rx()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_none();
+    let search_missing = search_enabled && search_index_missing && search_not_building;
     let semantic_not_building = !matches!(
         &*ctx
             .semantic_index_status()
@@ -2276,14 +2432,20 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         SemanticIndexStatus::Building { .. }
     );
+    let semantic_index_missing = ctx
+        .semantic_index()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_none();
+    let semantic_receiver_missing = ctx.semantic_index_rx().lock().is_none();
+    let semantic_refresh_missing = !semantic_index_missing
+        && !ctx.is_worktree_bridge()
+        && !ctx.shared_artifacts_read_only()
+        && ctx.semantic_refresh_sender().is_none();
     let semantic_missing = semantic_enabled
         && semantic_not_building
-        && ctx
-            .semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none()
-        && ctx.semantic_index_rx().lock().is_none();
+        && semantic_receiver_missing
+        && (semantic_index_missing || semantic_refresh_missing);
 
     ArtifactLoadNeeds {
         search: search_missing,
@@ -2314,31 +2476,147 @@ fn start_artifact_loads(starts: Vec<crossbeam_channel::Sender<()>>) -> bool {
     started
 }
 
-/// Start a writer-owned trigram reload after an idle eviction. The caller keeps
-/// serving the current request through the bounded fallback walk.
+/// Start a trigram reload after an idle eviction. The caller keeps serving the
+/// current request through the bounded fallback walk. Read-only roots reopen the
+/// shared snapshot without acquiring a writer lease.
 pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
-    if ctx.shared_artifacts_read_only() || ctx.canonical_cache_root_opt().is_none() {
+    if ctx.canonical_cache_root_opt().is_none() {
         return false;
     }
-    start_artifact_loads(schedule_missing_artifact_loads(ctx, true, false))
+    let generation = ctx.configure_generation();
+    ctx.run_if_subc_bound_generation(generation, || {
+        start_artifact_loads(schedule_missing_artifact_loads(ctx, true, false))
+    })
+    .unwrap_or(false)
 }
 
-/// Start a writer-owned semantic reload after an idle eviction without blocking
-/// the current query. Failed and disabled indexes retain their existing behavior.
+#[cfg(test)]
+pub(crate) fn set_semantic_refresh_restart_result_for_test(result: Option<bool>) {
+    SEMANTIC_REFRESH_RESTART_ATTEMPTS.with(|attempts| attempts.set(0));
+    SEMANTIC_REFRESH_RESTART_RESULT_OVERRIDE.with(|override_result| override_result.set(result));
+}
+
+#[cfg(test)]
+pub(crate) fn semantic_refresh_restart_attempts_for_test() -> usize {
+    SEMANTIC_REFRESH_RESTART_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn restart_semantic_artifacts_after_refresh_disconnect(
+    ctx: &AppContext,
+    disconnected_build_epoch: u64,
+) -> bool {
+    #[cfg(test)]
+    SEMANTIC_REFRESH_RESTART_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+
+    let generation = ctx.configure_generation();
+    // `run_if_subc_bound_generation` holds the lifecycle admission mutex. This
+    // accessor also consults that mutex, so capture it before entering admission.
+    let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
+    ctx.run_if_subc_bound_generation(generation, || {
+        let _reload_guard = ctx.artifact_reload_guard();
+        if ctx.semantic_refresh_event_rx().lock().is_some() {
+            return true;
+        }
+        let (has_build_receiver, build_epoch) = {
+            let receiver = ctx.semantic_index_rx().lock();
+            (receiver.is_some(), ctx.semantic_index_rx_epoch())
+        };
+        if has_build_receiver {
+            if ctx.shared_artifacts_read_only() || build_epoch != disconnected_build_epoch {
+                return true;
+            }
+            // This build belongs to the refresh worker that just died. If it
+            // later publishes Ready, the index would be installed without a
+            // worker capable of keeping it current. Re-check its epoch under
+            // the receiver lock so a concurrently installed replacement wins.
+            if ctx.retire_semantic_index_rx_if_epoch(build_epoch).is_none() {
+                return true;
+            }
+        }
+        let config = ctx.config();
+        let semantic_enabled = config.semantic_search;
+        drop(config);
+        if !semantic_enabled
+            || !heavy_root_work_allowed
+            || ctx.shared_artifacts_read_only()
+            || ctx.canonical_cache_root_opt().is_none()
+        {
+            *ctx.semantic_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Failed(
+                "semantic refresh worker disconnected and could not be restarted".to_string(),
+            );
+            return false;
+        }
+
+        #[cfg(test)]
+        if let Some(result) = SEMANTIC_REFRESH_RESTART_RESULT_OVERRIDE.with(std::cell::Cell::get) {
+            *ctx.semantic_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = if result {
+                SemanticIndexStatus::Building {
+                    stage: "restarting_refresh_worker".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                }
+            } else {
+                SemanticIndexStatus::Failed(
+                    "semantic refresh worker disconnected and could not be restarted".to_string(),
+                )
+            };
+            return result;
+        }
+
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let started = start_artifact_loads(schedule_artifact_loads(ctx, false, true));
+        if !started {
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Failed(
+                "semantic refresh worker disconnected and could not be restarted".to_string(),
+            );
+        }
+        started
+    })
+    .unwrap_or(false)
+}
+
+/// Start a semantic reload after an idle eviction without blocking the current
+/// query. Writer-owned failed indexes retain their no-retry behavior; read-only
+/// roots may retry a previously absent shared snapshot.
 pub(crate) fn trigger_semantic_index_reload_if_evicted(ctx: &AppContext) -> bool {
-    if ctx.shared_artifacts_read_only()
-        || ctx.canonical_cache_root_opt().is_none()
-        || !matches!(
-            &*ctx
-                .semantic_index_status()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
-        )
-    {
+    if ctx.canonical_cache_root_opt().is_none() {
         return false;
     }
-    start_artifact_loads(schedule_missing_artifact_loads(ctx, false, true))
+    let reloadable = match &*ctx
+        .semantic_index_status()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        SemanticIndexStatus::Ready { refreshing, .. } => refreshing.is_empty(),
+        SemanticIndexStatus::Failed(_) => ctx.shared_artifacts_read_only(),
+        SemanticIndexStatus::Disabled | SemanticIndexStatus::Building { .. } => false,
+    };
+    if !reloadable {
+        return false;
+    }
+    let generation = ctx.configure_generation();
+    ctx.run_if_subc_bound_generation(generation, || {
+        start_artifact_loads(schedule_missing_artifact_loads(ctx, false, true))
+    })
+    .unwrap_or(false)
 }
 
 fn schedule_artifact_loads(
@@ -2355,6 +2633,9 @@ fn schedule_artifact_loads(
     drop(config);
     let is_worktree_bridge = ctx.is_worktree_bridge();
     let configure_generation = ctx.configure_generation();
+    let configure_content_generation = ctx.configure_content_generation();
+    let configure_content_generation_flag = ctx.configure_content_generation_flag();
+    let subc_lifecycle = ctx.subc_lifecycle_admission();
     let semantic_cold_seed_generation = ctx.semantic_cold_seed_generation();
     let semantic_fingerprint_generation = ctx.semantic_fingerprint_generation();
     let symbol_cache_generation = if load_search {
@@ -2375,17 +2656,29 @@ fn schedule_artifact_loads(
         let session_id_for_bg = log_ctx::current_session();
         let search_generation = configure_generation;
         let search_generation_flag = ctx.configure_generation_flag();
+        let search_content_generation = configure_content_generation;
+        let search_content_generation_flag = Arc::clone(&configure_content_generation_flag);
+        let search_lifecycle = subc_lifecycle.clone();
         let (tx, rx) = unbounded::<SearchIndex>();
-        *ctx.search_index_rx()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
+        let search_rx_epoch = ctx.install_search_index_rx(rx, search_generation);
+        let search_rx_terminal_guard = ctx.search_index_rx_terminal_guard(search_rx_epoch);
+        let search_persist_epoch_flag = ctx.search_persist_epoch_flag();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         artifact_load_starts.push(start_tx);
 
         #[cfg(debug_assertions)]
         mark_search_rebuild_spawn_for_debug();
         thread::spawn(move || {
+            let _terminal_guard = search_rx_terminal_guard;
             if start_rx.recv().is_err() {
+                #[cfg(test)]
+                note_configure_artifact_load_cancellation_for_test();
+                return;
+            }
+            delay_configure_artifact_load_after_gate_for_test();
+            if !search_lifecycle.is_current(search_generation_flag.as_ref(), search_generation) {
+                #[cfg(test)]
+                note_configure_artifact_load_cancellation_for_test();
                 return;
             }
             log_ctx::with_session(session_id_for_bg.clone(), || {
@@ -2397,30 +2690,42 @@ fn schedule_artifact_loads(
                     ) {
                         crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
                             let symbol_files = search_index_symbol_files(&index);
-                            let _ = tx.send(index);
-                            spawn_symbol_cache_prewarm(
-                                root_for_search,
-                                symbol_cache,
-                                symbol_storage,
-                                symbol_project_key,
-                                symbol_cache_generation,
-                                symbol_files,
-                                true,
-                                log_ctx::current_session(),
+                            let _ = search_lifecycle.run_if_current(
+                                search_generation_flag.as_ref(),
+                                search_generation,
+                                || {
+                                    let _ = tx.send(index);
+                                    spawn_symbol_cache_prewarm(
+                                        root_for_search,
+                                        symbol_cache,
+                                        symbol_storage,
+                                        symbol_project_key,
+                                        symbol_cache_generation,
+                                        symbol_files,
+                                        true,
+                                        log_ctx::current_session(),
+                                    );
+                                },
                             );
                         }
                         crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
                             let symbol_files = search_index_symbol_files(&stale.index);
-                            let _ = tx.send(stale.index);
-                            spawn_symbol_cache_prewarm(
-                                root_for_search,
-                                symbol_cache,
-                                symbol_storage,
-                                symbol_project_key,
-                                symbol_cache_generation,
-                                symbol_files,
-                                true,
-                                log_ctx::current_session(),
+                            let _ = search_lifecycle.run_if_current(
+                                search_generation_flag.as_ref(),
+                                search_generation,
+                                || {
+                                    let _ = tx.send(stale.index);
+                                    spawn_symbol_cache_prewarm(
+                                        root_for_search,
+                                        symbol_cache,
+                                        symbol_storage,
+                                        symbol_project_key,
+                                        symbol_cache_generation,
+                                        symbol_files,
+                                        true,
+                                        log_ctx::current_session(),
+                                    );
+                                },
                             );
                         }
                         crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
@@ -2432,13 +2737,42 @@ fn schedule_artifact_loads(
                     return;
                 }
 
-                let _permit =
-                    crate::cold_build_limiter::acquire_blocking("search index post-configure load");
+                let Some(search_persist_epoch) = search_lifecycle.run_if_current(
+                    search_generation_flag.as_ref(),
+                    search_generation,
+                    || search_persist_epoch_flag.next(),
+                ) else {
+                    return;
+                };
+                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while(
+                    "search index post-configure load",
+                    || {
+                        search_lifecycle
+                            .is_current(search_generation_flag.as_ref(), search_generation)
+                    },
+                ) else {
+                    return;
+                };
+                if search_persist_epoch_flag.current() != search_persist_epoch {
+                    return;
+                }
                 // HEAD freshness is deliberately probed after the bind ack. The
                 // helper bounds git so a wedged repository cannot pin maintenance.
                 let current_head = current_git_head(&root_for_search);
+                let _cache_lock = if is_worktree_bridge_for_search {
+                    None
+                } else {
+                    match CacheLock::acquire(&cache_dir, &root_for_search) {
+                        Ok(lock) => Some(lock),
+                        Err(error) => {
+                            slog_warn!("failed to acquire search artifact lock: {}", error);
+                            return;
+                        }
+                    }
+                };
                 let cache_path = cache_dir.join("cache.bin");
                 let artifact_generation = cache_freshness::artifact_generation(&cache_path);
+                let verify_ticket = cache_freshness::capture_verify_ticket(&root_for_search);
                 let verify_plan = cache_freshness::warm_verify_plan(
                     &root_for_search,
                     VerifyArtifact::Search,
@@ -2448,7 +2782,10 @@ fn schedule_artifact_loads(
                 let mut persist_to_disk = true;
                 let mut record_completed_verify = true;
                 let mut index = match baseline {
-                    Some(mut index) if index.stored_git_head() == current_head.as_deref() => {
+                    Some(mut index)
+                        if index.stored_git_head() == current_head.as_deref()
+                            && index.configured_max_file_size() == search_index_max_file_size =>
+                    {
                         index.set_ready(false);
                         match verify_plan {
                             WarmVerifyPlan::Skip => {
@@ -2457,9 +2794,6 @@ fn schedule_artifact_loads(
                                 record_completed_verify = false;
                             }
                             WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => {
-                                let _cache_lock = (!is_worktree_bridge_for_search)
-                                    .then(|| CacheLock::acquire(&cache_dir, &root_for_search).ok())
-                                    .flatten();
                                 let strategy = match verify_plan {
                                     WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
                                     WarmVerifyPlan::Strict => VerifyStrategy::Strict,
@@ -2478,11 +2812,6 @@ fn schedule_artifact_loads(
                         if let Some(index) = baseline.as_mut() {
                             index.set_ready(false);
                         }
-                        let _cache_lock = if is_worktree_bridge_for_search {
-                            None
-                        } else {
-                            CacheLock::acquire(&cache_dir, &root_for_search).ok()
-                        };
                         let strategy = match verify_plan {
                             WarmVerifyPlan::Strict => VerifyStrategy::Strict,
                             WarmVerifyPlan::Skip | WarmVerifyPlan::StatFirst => {
@@ -2501,31 +2830,55 @@ fn schedule_artifact_loads(
                         index
                     }
                 };
-                if !is_worktree_bridge_for_search && persist_to_disk {
-                    let head = index.stored_git_head().map(str::to_owned);
-                    index.write_to_disk(&cache_dir, head.as_deref());
+                // Once admitted, a build may finish generation-safe disk
+                // persistence after its last route closes. This avoids throwing
+                // away expensive completed work and rebuilding it on rebind.
+                // Lifecycle admission still gates permit acquisition, in-memory
+                // publication, refresh-worker startup, and symbol prewarming.
+                let generation_current = || {
+                    search_content_generation_flag.load(Ordering::SeqCst)
+                        == search_content_generation
+                };
+                let mut persistence_succeeded = !persist_to_disk;
+                if generation_current() && !is_worktree_bridge_for_search && persist_to_disk {
+                    let published =
+                        search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
+                            let head = index.stored_git_head().map(str::to_owned);
+                            index.write_to_disk(&cache_dir, head.as_deref())
+                        });
+                    persistence_succeeded = published == Some(true);
+                    if published.is_none() {
+                        slog_info!(
+                            "search index persistence skipped for superseded worker epoch {}",
+                            search_persist_epoch
+                        );
+                    }
                 }
-                if record_completed_verify {
-                    cache_freshness::record_verify_completed(
+                if generation_current() && record_completed_verify && persistence_succeeded {
+                    let _ = cache_freshness::record_verify_completed_if_unchanged(
                         &root_for_search,
                         VerifyArtifact::Search,
                         cache_freshness::artifact_generation(&cache_path),
+                        verify_ticket,
                     );
                 }
                 let symbol_files = search_index_symbol_files(&index);
-                if search_generation_flag.load(Ordering::SeqCst) == search_generation {
-                    let _ = tx.send(index);
-                    spawn_symbol_cache_prewarm(
-                        root_for_search,
-                        symbol_cache,
-                        symbol_storage,
-                        symbol_project_key,
-                        symbol_cache_generation,
-                        symbol_files,
-                        false,
-                        log_ctx::current_session(),
-                    );
-                } else {
+                if search_lifecycle
+                    .run_if_current(search_generation_flag.as_ref(), search_generation, || {
+                        let _ = tx.send(index);
+                        spawn_symbol_cache_prewarm(
+                            root_for_search,
+                            symbol_cache,
+                            symbol_storage,
+                            symbol_project_key,
+                            symbol_cache_generation,
+                            symbol_files,
+                            false,
+                            log_ctx::current_session(),
+                        );
+                    })
+                    .is_none()
+                {
                     slog_info!(
                         "search index build result discarded for stale generation {}",
                         search_generation
@@ -2545,14 +2898,30 @@ fn schedule_artifact_loads(
             entries_total: None,
         };
         let (tx, rx) = unbounded::<SemanticIndexEvent>();
-        *ctx.semantic_index_rx().lock() = Some(rx);
+        let semantic_rx_epoch = ctx.install_semantic_index_rx(rx, configure_generation);
+        let semantic_rx_terminal_guard = ctx.semantic_index_rx_terminal_guard(semantic_rx_epoch);
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         artifact_load_starts.push(start_tx);
         let semantic_root = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
+        let semantic_load_generation = configure_generation;
+        let semantic_load_generation_flag = ctx.configure_generation_flag();
+        let semantic_load_lifecycle = subc_lifecycle.clone();
         let session_id = log_ctx::current_session();
         thread::spawn(move || {
+            let _terminal_guard = semantic_rx_terminal_guard;
             if start_rx.recv().is_err() {
+                #[cfg(test)]
+                note_configure_artifact_load_cancellation_for_test();
+                return;
+            }
+            delay_configure_artifact_load_after_gate_for_test();
+            if !semantic_load_lifecycle.is_current(
+                semantic_load_generation_flag.as_ref(),
+                semantic_load_generation,
+            ) {
+                #[cfg(test)]
+                note_configure_artifact_load_cancellation_for_test();
                 return;
             }
             log_ctx::with_session(session_id, || {
@@ -2578,7 +2947,13 @@ fn schedule_artifact_loads(
                         )
                     }
                 };
-                let _ = tx.send(event);
+                let _ = semantic_load_lifecycle.run_if_current(
+                    semantic_load_generation_flag.as_ref(),
+                    semantic_load_generation,
+                    || {
+                        let _ = tx.send(event);
+                    },
+                );
             });
         });
     } else if load_semantic {
@@ -2594,15 +2969,20 @@ fn schedule_artifact_loads(
             crossbeam_channel::Sender<SemanticIndexEvent>,
             crossbeam_channel::Receiver<SemanticIndexEvent>,
         ) = unbounded();
-        *ctx.semantic_index_rx().lock() = Some(rx);
+        let semantic_rx_epoch = ctx.install_semantic_index_rx(rx, configure_generation);
+        let semantic_rx_terminal_guard = ctx.semantic_index_rx_terminal_guard(semantic_rx_epoch);
+        let semantic_persist_epoch_flag = ctx.semantic_persist_epoch_flag();
+        let semantic_persist_lock = ctx.semantic_persist_lock();
+        let semantic_verify_ticket = cache_freshness::capture_verify_ticket(&canonical_cache_root);
 
         let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
         let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
         let refresh_worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
-        ctx.install_semantic_refresh_worker(
+        ctx.install_semantic_refresh_worker_for_build_epoch(
             refresh_tx,
             refresh_event_rx,
             Arc::clone(&refresh_worker_slot),
+            semantic_rx_epoch,
         );
 
         let root_clone = canonical_cache_root.clone();
@@ -2616,14 +2996,35 @@ fn schedule_artifact_loads(
         let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
         let semantic_generation = configure_generation;
         let semantic_generation_flag = ctx.configure_generation_flag();
+        let semantic_lifecycle = subc_lifecycle.clone();
         let semantic_fingerprint_generation_flag = ctx.semantic_fingerprint_generation_flag();
         let session_id_for_bg2 = log_ctx::current_session();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         artifact_load_starts.push(start_tx);
         thread::spawn(move || {
+            let _terminal_guard = semantic_rx_terminal_guard;
             if start_rx.recv().is_err() {
+                #[cfg(test)]
+                note_configure_artifact_load_cancellation_for_test();
                 return;
             }
+            delay_configure_artifact_load_after_gate_for_test();
+            if !semantic_lifecycle
+                .is_current(semantic_generation_flag.as_ref(), semantic_generation)
+            {
+                #[cfg(test)]
+                note_configure_artifact_load_cancellation_for_test();
+                return;
+            }
+            let Some(semantic_persist_epoch) = semantic_lifecycle.run_if_current(
+                semantic_generation_flag.as_ref(),
+                semantic_generation,
+                || semantic_persist_epoch_flag.next(),
+            ) else {
+                #[cfg(test)]
+                note_configure_artifact_load_cancellation_for_test();
+                return;
+            };
             note_configure_artifact_load_attempt();
             log_ctx::with_session(session_id_for_bg2, || {
                 // Cap file count to bound memory on huge project roots (e.g.,
@@ -2658,6 +3059,7 @@ fn schedule_artifact_loads(
                     model: crate::semantic_index::EmbeddingModel,
                     persist_to_disk: bool,
                     record_verify_completion: bool,
+                    verified_artifact_generation: Option<cache_freshness::ArtifactGeneration>,
                 }
 
                 let build_once = || -> Result<SemanticBuildReady, String> {
@@ -2688,15 +3090,18 @@ fn schedule_artifact_loads(
                             }
                         });
 
+                    let mut verified_artifact_generation = None;
                     if let Some(ref dir) = semantic_storage {
                         let data_path = dir
                             .join("semantic")
                             .join(&semantic_project_key)
                             .join("semantic.bin");
+                        verified_artifact_generation =
+                            cache_freshness::artifact_generation(&data_path);
                         let verify_plan = cache_freshness::warm_verify_plan(
                             &root_clone,
                             VerifyArtifact::Semantic,
-                            cache_freshness::artifact_generation(&data_path),
+                            verified_artifact_generation,
                         );
                         if let Some(cached) = SemanticIndex::read_from_disk(
                             dir,
@@ -2716,6 +3121,7 @@ fn schedule_artifact_loads(
                                     model,
                                     persist_to_disk: false,
                                     record_verify_completion: false,
+                                    verified_artifact_generation,
                                 });
                             }
                             // Try incremental refresh: re-embed only changed/new files,
@@ -2801,6 +3207,7 @@ fn schedule_artifact_loads(
                                         model,
                                         persist_to_disk,
                                         record_verify_completion: true,
+                                        verified_artifact_generation,
                                     });
                                 }
                                 Err(error) => {
@@ -2831,6 +3238,7 @@ fn schedule_artifact_loads(
                                             model,
                                             persist_to_disk: false,
                                             record_verify_completion: false,
+                                            verified_artifact_generation,
                                         });
                                     }
                                     // Permanent failure (dimension mismatch, etc.): the
@@ -2921,6 +3329,7 @@ fn schedule_artifact_loads(
                         model,
                         persist_to_disk: true,
                         record_verify_completion: true,
+                        verified_artifact_generation,
                     })
                 };
 
@@ -2941,6 +3350,12 @@ fn schedule_artifact_loads(
                 // Err (receiver dropped) and this thread exits without competing
                 // with the fresh build.
                 let build_result = loop {
+                    if !semantic_lifecycle
+                        .is_current(semantic_generation_flag.as_ref(), semantic_generation)
+                    {
+                        clear_cold_seed_active();
+                        return;
+                    }
                     let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
                     match attempt_result {
                         Ok(Err(ref error))
@@ -3001,9 +3416,20 @@ fn schedule_artifact_loads(
                     }
                 };
 
-                let persist_completed_index = |index: &SemanticIndex, reason: &str| {
+                // A worker admitted while bound may finish fingerprint-safe disk
+                // persistence after unbind. The completed artifact is reusable on
+                // the next bind; lifecycle admission separately prevents memory
+                // publication and refresh-worker startup after route teardown.
+                let persist_completed_index = |index: &SemanticIndex,
+                                               reason: &str,
+                                               write_artifact: bool,
+                                               record_verify_completion: bool,
+                                               verified_artifact_generation: Option<
+                    cache_freshness::ArtifactGeneration,
+                >|
+                 -> bool {
                     if is_worktree_bridge_for_semantic {
-                        return;
+                        return false;
                     }
                     let Some(dir) = semantic_storage.as_ref() else {
                         // Should be unreachable now that configure defaults
@@ -3011,7 +3437,14 @@ fn schedule_artifact_loads(
                         slog_warn!(
                             "semantic index persistence skipped for {reason}: no storage_dir resolved"
                         );
-                        return;
+                        return false;
+                    };
+                    let _persist_order = semantic_persist_lock.lock();
+                    let Ok(_cache_lock) =
+                        SemanticIndexLock::acquire(dir, &semantic_project_key, &root_clone)
+                    else {
+                        slog_warn!("semantic index persistence lock unavailable for {reason}");
+                        return false;
                     };
                     if semantic_fingerprint_generation_flag
                         .load(std::sync::atomic::Ordering::SeqCst)
@@ -3021,17 +3454,59 @@ fn schedule_artifact_loads(
                             "semantic index persistence skipped for {reason}: semantic fingerprint changed after generation {} started",
                             semantic_generation
                         );
-                        return;
+                        return false;
                     }
-                    index.write_to_disk(dir, &semantic_project_key);
+                    let data_path = dir
+                        .join("semantic")
+                        .join(&semantic_project_key)
+                        .join("semantic.bin");
+                    if cache_freshness::artifact_generation(&data_path)
+                        != verified_artifact_generation
+                    {
+                        slog_info!(
+                            "semantic index persistence skipped for {reason}: artifact generation changed after verification"
+                        );
+                        return false;
+                    }
+                    if write_artifact {
+                        let published = semantic_persist_epoch_flag
+                            .run_if_current(semantic_persist_epoch, || {
+                                index.write_to_disk(dir, &semantic_project_key)
+                            });
+                        if published != Some(true) {
+                            if published.is_none() {
+                                slog_info!(
+                                    "semantic index persistence skipped for superseded worker epoch {}",
+                                    semantic_persist_epoch
+                                );
+                            }
+                            return false;
+                        }
+                    }
+                    if record_verify_completion {
+                        let generation = cache_freshness::artifact_generation(&data_path);
+                        let _ = cache_freshness::record_verify_completed_if_unchanged(
+                            &root_clone,
+                            VerifyArtifact::Semantic,
+                            generation,
+                            semantic_verify_ticket,
+                        );
+                    }
+                    true
                 };
 
-                if semantic_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                    != semantic_generation
+                if !semantic_lifecycle
+                    .is_current(semantic_generation_flag.as_ref(), semantic_generation)
                 {
                     if let SemanticBuildOutcome::Ready(ready) = &outcome {
                         if ready.persist_to_disk {
-                            persist_completed_index(&ready.index, "stale generation discard");
+                            persist_completed_index(
+                                &ready.index,
+                                "stale generation discard",
+                                true,
+                                false,
+                                ready.verified_artifact_generation,
+                            );
                         }
                     }
                     note_semantic_stale_generation_discard();
@@ -3050,44 +3525,47 @@ fn schedule_artifact_loads(
                             model,
                             persist_to_disk,
                             record_verify_completion,
+                            verified_artifact_generation,
                         } = ready;
-                        if persist_to_disk {
-                            persist_completed_index(&index, "current generation publish");
-                        }
-                        if record_verify_completion {
-                            let generation = semantic_storage.as_ref().and_then(|dir| {
-                                cache_freshness::artifact_generation(
-                                    &dir.join("semantic")
-                                        .join(&semantic_project_key)
-                                        .join("semantic.bin"),
-                                )
-                            });
-                            cache_freshness::record_verify_completed(
-                                &root_clone,
-                                VerifyArtifact::Semantic,
-                                generation,
+                        if persist_to_disk || record_verify_completion {
+                            let _ = persist_completed_index(
+                                &index,
+                                "completed build",
+                                persist_to_disk,
+                                record_verify_completion,
+                                verified_artifact_generation,
                             );
                         }
-                        let worker_index = index.clone();
-                        let worker_handle = spawn_semantic_refresh_worker(
-                            root_clone.clone(),
-                            worker_index,
-                            model,
-                            semantic_config.max_batch_size.max(1),
-                            semantic_config.max_files,
-                            refresh_rx,
-                            refresh_event_tx,
-                            log_ctx::current_session(),
-                        );
-                        if let Ok(mut slot) = refresh_worker_slot.lock() {
-                            *slot = Some(worker_handle);
-                        }
-                        SemanticIndexEvent::Ready(index)
+                        semantic_lifecycle.run_if_current(
+                            semantic_generation_flag.as_ref(),
+                            semantic_generation,
+                            || {
+                                let worker_index = index.clone();
+                                let worker_handle = spawn_semantic_refresh_worker(
+                                    root_clone.clone(),
+                                    worker_index,
+                                    model,
+                                    semantic_config.max_batch_size.max(1),
+                                    semantic_config.max_files,
+                                    refresh_rx,
+                                    refresh_event_tx,
+                                    log_ctx::current_session(),
+                                );
+                                if let Ok(mut slot) = refresh_worker_slot.lock() {
+                                    *slot = Some(worker_handle);
+                                }
+                                SemanticIndexEvent::Ready(index)
+                            },
+                        )
                     }
-                    SemanticBuildOutcome::Failed(error) => SemanticIndexEvent::Failed(error),
+                    SemanticBuildOutcome::Failed(error) => semantic_lifecycle.run_if_current(
+                        semantic_generation_flag.as_ref(),
+                        semantic_generation,
+                        || SemanticIndexEvent::Failed(error),
+                    ),
                 };
 
-                if tx.send(event).is_err() {
+                if event.is_none_or(|event| tx.send(event).is_err()) {
                     clear_cold_seed_active();
                 }
             });
@@ -3110,8 +3588,43 @@ fn replay_configure_session(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
     }
 }
 
-pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
-    for job in ctx.drain_configure_maintenance() {
+fn forget_configure_job_binding(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
+    if job.run_bash_replay {
+        ctx.forget_configure_session_binding(&job.canonical_cache_root, &job.session_id);
+    }
+}
+
+fn cancel_unbound_configure_jobs(
+    ctx: &AppContext,
+    jobs: impl IntoIterator<Item = ConfigureMaintenanceJob>,
+) {
+    let mut cancelled_any = false;
+    for job in jobs {
+        cancelled_any = true;
+        forget_configure_job_binding(ctx, &job);
+    }
+    if cancelled_any {
+        ctx.invalidate_configure_warm_state();
+    }
+    ctx.cancel_unbound_artifact_work();
+}
+
+pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
+    let jobs = ctx.drain_configure_maintenance();
+    let cancelled = jobs.len();
+    cancel_unbound_configure_jobs(ctx, jobs);
+    cancelled
+}
+
+#[doc(hidden)]
+pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
+    let mut jobs = ctx.drain_configure_maintenance().into_iter();
+    while let Some(job) = jobs.next() {
+        if ctx.subc_unbound_quiesced() {
+            cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
+            return;
+        }
+
         if ctx.configure_generation() != job.generation {
             slog_info!(
                 "dropping stale configure maintenance for generation {} (current {})",
@@ -3122,9 +3635,7 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             // bash replay is per-(root, session) and gated on the first bind
             // of that session; forget the binding so the session's next bind
             // replays its tasks instead of losing them to the dropped job.
-            if job.run_bash_replay {
-                ctx.forget_configure_session_binding(&job.canonical_cache_root, &job.session_id);
-            }
+            forget_configure_job_binding(ctx, &job);
             continue;
         }
 
@@ -3142,12 +3653,29 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
         }
 
         delay_configure_deferred_maintenance_for_test();
-
         // Artifact workers are created in a blocked state during configure so
         // no deserialization can race ahead of the bind acknowledgement. The
-        // configure tail is scheduled only after the response is delivered.
-        for start in &job.artifact_load_starts {
-            let _ = start.send(());
+        // lifecycle gate makes the bound check and gate release one admission:
+        // final-route teardown either precedes all starts or follows all starts.
+        if ctx
+            .run_if_subc_bound_generation(job.generation, || {
+                if job.supersede_artifact_persistence {
+                    ctx.next_search_persist_epoch();
+                    ctx.next_semantic_persist_epoch();
+                    ctx.next_callgraph_persist_epoch();
+                }
+                for start in &job.artifact_load_starts {
+                    let _ = start.send(());
+                }
+            })
+            .is_none()
+        {
+            if ctx.subc_unbound_quiesced() {
+                cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
+                return;
+            }
+            forget_configure_job_binding(ctx, &job);
+            continue;
         }
 
         if job.format_tool_cache_clear_needed {
@@ -3241,12 +3769,37 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
         }
 
         if job.refresh_project_runtime {
-            // FSEvents startup can synchronously wait for seconds on very large
-            // roots; configure returns before this maintenance step attaches.
-            if !job.home_match {
-                install_project_watcher(ctx, &job.canonical_cache_root);
-            } else {
-                ctx.stop_watcher_runtime();
+            if ctx
+                .run_if_subc_bound_generation(job.generation, || ())
+                .is_none()
+            {
+                if ctx.subc_unbound_quiesced() {
+                    cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
+                    return;
+                }
+                forget_configure_job_binding(ctx, &job);
+                continue;
+            }
+
+            // Joining a prior FSEvents thread can block in the OS. Do that
+            // outside lifecycle admission, then reacquire admission only for
+            // the atomic watcher start. An unbind or superseding configure that
+            // wins during the join prevents the replacement from being started.
+            ctx.stop_watcher_runtime();
+            if ctx
+                .run_if_subc_bound_generation(job.generation, || {
+                    if !job.home_match {
+                        start_project_watcher(ctx, &job.canonical_cache_root);
+                    }
+                })
+                .is_none()
+            {
+                if ctx.subc_unbound_quiesced() {
+                    cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
+                    return;
+                }
+                forget_configure_job_binding(ctx, &job);
+                continue;
             }
         }
 
@@ -3294,6 +3847,14 @@ pub(crate) fn drain_deferred_configure_maintenance(ctx: &AppContext) {
                     }
                 }
             }
+            if ctx.subc_unbound_quiesced() {
+                cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
+                return;
+            }
+            if ctx.configure_generation() != job.generation {
+                forget_configure_job_binding(ctx, &job);
+                continue;
+            }
         }
 
         ctx.status_emitter().signal(ctx.build_status_snapshot());
@@ -3312,15 +3873,21 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        configure_artifact_load_attempts_for_test, external_ignore_watch_paths,
-        install_project_watcher_with, parse_lsp_paths_extra,
-        reset_configure_artifact_load_attempts_for_test, semantic_build_retry_backoff,
-        should_clear_failed_spawns, validate_storage_dir,
+        configure_artifact_load_attempts_for_test, configure_artifact_load_cancellations_for_test,
+        configure_artifact_post_gate_reached_for_test, configure_deferred_delay_reached_for_test,
+        external_ignore_watch_paths, install_project_watcher_with, parse_lsp_paths_extra,
+        reset_configure_artifact_load_attempts_for_test,
+        reset_configure_artifact_load_cancellations_for_test,
+        reset_configure_deferred_delay_reached_for_test, semantic_build_retry_backoff,
+        set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
+        validate_storage_dir,
     };
+    use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackendConfig};
-    use crate::context::AppContext;
+    use crate::context::{AppContext, SemanticRefreshRequest};
     use crate::parser::TreeSitterProvider;
     use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
+    use crate::search_index::CacheLock;
     use std::process::Command;
 
     fn test_context() -> AppContext {
@@ -3516,6 +4083,24 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({ "search_index": true, "semantic_search": false }))],
+        }))
+    }
+
+    fn configure_search_with_max_file_size(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        max_file_size: u64,
+    ) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "search_index_max_file_size": max_file_size,
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))],
         }))
     }
 
@@ -4140,8 +4725,8 @@ mod tests {
 
     #[test]
     fn sibling_clone_same_artifact_key_opens_shared_artifacts_read_only() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let owner = temp.path().join("owner");
@@ -4228,8 +4813,8 @@ mod tests {
 
     #[test]
     fn worktree_then_main_claim_sequence_ends_with_main_owner() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let main = temp.path().join("main");
@@ -4275,9 +4860,112 @@ mod tests {
     }
 
     #[test]
-    fn main_then_worktree_keeps_main_owner_and_worktree_borrows_read_only() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
+    fn artifact_replacement_after_locked_memo_record_is_not_marked_fresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let cache_dir = temp.path().join("search-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let artifact = cache_dir.join("cache.bin");
+        std::fs::write(&artifact, b"generation-a").unwrap();
+        let generation_a = cache_freshness::artifact_generation(&artifact);
+        let ticket = cache_freshness::capture_verify_ticket(&root);
+        let lock = CacheLock::acquire(&cache_dir, &root).unwrap();
+        let (attempted_tx, attempted_rx) = crossbeam_channel::bounded(1);
+        let (acquired_tx, acquired_rx) = crossbeam_channel::bounded(1);
+        let writer_cache = cache_dir.clone();
+        let writer_root = root.clone();
+        let writer_artifact = artifact.clone();
+        let writer = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _lock = CacheLock::acquire(&writer_cache, &writer_root).unwrap();
+            acquired_tx.send(()).unwrap();
+            std::fs::write(writer_artifact, b"generation-b-longer").unwrap();
+        });
+        attempted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(cache_freshness::record_verify_completed_if_unchanged(
+            &root,
+            VerifyArtifact::Search,
+            generation_a,
+            ticket,
+        ));
+        drop(lock);
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+        let generation_b = cache_freshness::artifact_generation(&artifact);
+        assert_ne!(generation_b, generation_a);
+        assert_ne!(
+            cache_freshness::warm_verify_plan(&root, VerifyArtifact::Search, generation_b),
+            WarmVerifyPlan::Skip,
+            "a later atomic replacement must not inherit the prior generation's memo"
+        );
+    }
+
+    #[test]
+    fn persisted_search_cache_reconfigures_max_file_size_on_same_head() {
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("large.rs"), "x".repeat(256)).unwrap();
+        let ctx = test_context();
+
+        let initial = handle_configure_for_test(
+            &configure_search_with_max_file_size(&project, &storage, 512),
+            &ctx,
+        );
+        assert!(initial.success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .unwrap()
+                .configured_max_file_size(),
+            512
+        );
+
+        let lowered = handle_configure_for_test(
+            &configure_search_with_max_file_size(&project, &storage, 64),
+            &ctx,
+        );
+        assert!(lowered.success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .unwrap()
+                .configured_max_file_size(),
+            64,
+            "the persisted same-HEAD cache must honor a lowered size limit"
+        );
+
+        let raised = handle_configure_for_test(
+            &configure_search_with_max_file_size(&project, &storage, 512),
+            &ctx,
+        );
+        assert!(raised.success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .unwrap()
+                .configured_max_file_size(),
+            512,
+            "the persisted same-HEAD cache must honor a raised size limit"
+        );
+    }
+
+    #[test]
+    fn main_then_worktree_keeps_main_owner_and_worktree_borrows_read_only() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let main = temp.path().join("main");
@@ -4324,8 +5012,8 @@ mod tests {
 
     #[test]
     fn main_bind_self_heals_live_worktree_owner_manifest() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let main = temp.path().join("main");
@@ -4380,9 +5068,9 @@ mod tests {
 
     #[test]
     fn stale_generation_semantic_build_persists_and_followup_refreshes_incrementally() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _env_lock = home_env_mutex();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         super::reset_semantic_stale_generation_discards_for_test();
         let server = CountingEmbeddingServer::start();
         let temp = tempfile::tempdir().unwrap();
@@ -4475,10 +5163,11 @@ mod tests {
 
     #[test]
     fn equivalent_reconfigure_reloads_evicted_semantic_index_from_disk() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _env_lock = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "1");
         let server = CountingEmbeddingServer::start();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -4540,14 +5229,78 @@ mod tests {
             embedded_before_reload,
             "semantic reload re-embedded corpus content instead of reading semantic.bin"
         );
+
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        assert!(ctx.semantic_index().read().unwrap().is_some());
+        assert!(ctx.semantic_refresh_sender().is_none());
+
+        ctx.mark_subc_bound();
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(
+            response.success,
+            "equivalent rebind failed: {:?}",
+            response.data
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        let refresh_sender = ctx
+            .semantic_refresh_sender()
+            .expect("writer rebind must restore semantic refresh worker");
+
+        let source = project.join("src/lib.rs");
+        std::fs::write(
+            &source,
+            "pub fn semantic_symbol_after_rebind() -> bool { true }\n",
+        )
+        .unwrap();
+        {
+            let mut index = ctx.semantic_index().write().unwrap();
+            index
+                .as_mut()
+                .expect("semantic index")
+                .invalidate_file(&source);
+        }
+        ctx.semantic_index_status()
+            .write()
+            .unwrap()
+            .start_refreshing_file(source.clone());
+        let inputs_before_refresh = server.non_probe_input_count();
+        refresh_sender
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![source],
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            crate::runtime_drain::drain_semantic_refresh_events(&ctx);
+            if server.non_probe_input_count() > inputs_before_refresh
+                && ctx
+                    .semantic_index_status()
+                    .read()
+                    .unwrap()
+                    .refreshing_count()
+                    == 0
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "watcher-style semantic refresh did not complete after equivalent rebind: inputs {} -> {}, status {:?}, receiver_present={}",
+            inputs_before_refresh,
+            server.non_probe_input_count(),
+            *ctx.semantic_index_status().read().unwrap(),
+            ctx.semantic_refresh_event_rx().lock().is_some(),
+        );
     }
 
     #[test]
     fn semantic_query_reloads_evicted_index_once_without_reconfigure() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _env_lock = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let server = CountingEmbeddingServer::start();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -4621,10 +5374,10 @@ mod tests {
 
     #[test]
     fn grep_query_reloads_evicted_trigram_index_from_cache() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _env_lock = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let storage = temp.path().join("storage");
@@ -4695,10 +5448,10 @@ mod tests {
 
     #[test]
     fn linked_worktree_configure_defers_read_only_artifact_loads_without_cold_builds() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         init_git_fixture(&main);
@@ -4766,16 +5519,109 @@ mod tests {
             "read-only fallback grep failed: {:?}",
             grep.data
         );
-        assert!(!super::trigger_semantic_index_reload_if_evicted(&ctx));
-        assert!(ctx.search_index_rx().read().unwrap().is_none());
-        assert!(ctx.semantic_index_rx().lock().is_none());
-        assert_eq!(configure_artifact_load_attempts_for_test(), 0);
+        assert!(super::trigger_semantic_index_reload_if_evicted(&ctx));
+        assert!(
+            ctx.search_index_rx().read().unwrap().is_some(),
+            "read-only grep should reopen its evicted shared search snapshot"
+        );
+        assert!(
+            ctx.semantic_index_rx().lock().is_some(),
+            "read-only semantic query should reopen its evicted shared snapshot"
+        );
         assert!(ctx.shared_artifacts_read_only());
         assert_eq!(
             ctx.artifact_owner_status().map(|status| status.mode),
             owner_before.map(|status| status.mode),
             "read-only fallback must not acquire an owner lease"
         );
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+    }
+
+    #[test]
+    fn read_only_absent_search_loader_wakes_completion_drain() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
+            config.search_index = true;
+        });
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_cache_writer_capabilities(false, true);
+
+        let starts = super::schedule_artifact_loads(&ctx, true, false);
+        assert_eq!(starts.len(), 1);
+        assert!(super::start_artifact_loads(starts));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if ctx.completion_drains_have_work() {
+                crate::runtime_drain::drain_search_index_events(&ctx);
+            }
+            if ctx
+                .search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal empty loader receiver did not wake and retire through maintenance"
+            );
+            std::thread::yield_now();
+        }
+
+        assert!(
+            super::trigger_search_index_reload_if_evicted(&ctx),
+            "a later query must be able to retry the read-only snapshot"
+        );
+        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+    }
+
+    #[test]
+    fn semantic_refresh_disconnect_restart_installs_replacement_loaders() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_guard = home_env_mutex();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
+            config.semantic_search = true;
+        });
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        set_configure_artifact_post_gate_delay_for_test(500);
+        struct DelayReset;
+        impl Drop for DelayReset {
+            fn drop(&mut self) {
+                set_configure_artifact_post_gate_delay_for_test(0);
+            }
+        }
+        let _delay_reset = DelayReset;
+
+        assert!(super::restart_semantic_artifacts_after_refresh_disconnect(
+            &ctx,
+            ctx.semantic_index_rx_epoch(),
+        ));
+        assert!(ctx.semantic_index_rx().lock().is_some());
+        assert!(ctx.semantic_refresh_event_rx().lock().is_some());
+
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while configure_artifact_load_cancellations_for_test() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "replacement semantic loader did not observe lifecycle cancellation"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -4845,9 +5691,9 @@ mod tests {
 
     #[test]
     fn configure_artifact_loads_start_only_from_post_ack_maintenance() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -4892,6 +5738,292 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn unbound_configure_cancellation_clears_gated_loaders_and_rebind_can_retry() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+        reset_configure_artifact_load_attempts_for_test();
+        reset_configure_artifact_load_cancellations_for_test();
+
+        assert!(handle_configure_for_test(&req, &ctx).success);
+        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        ctx.mark_subc_unbound();
+        assert!(super::cancel_deferred_configure_maintenance(&ctx) > 0);
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(!ctx.configure_tail_has_work());
+        let cancel_deadline = Instant::now() + Duration::from_secs(2);
+        while configure_artifact_load_cancellations_for_test() == 0 {
+            assert!(
+                Instant::now() < cancel_deadline,
+                "cancelled artifact loader did not observe its disconnected gate"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            configure_artifact_load_attempts_for_test(),
+            0,
+            "cancelling a gated configure must not start its artifact loader"
+        );
+
+        assert!(handle_configure_for_test(&req, &ctx).success);
+        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        ctx.mark_subc_bound();
+        super::drain_deferred_configure_maintenance(&ctx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while configure_artifact_load_attempts_for_test() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "rebind did not replace the cancelled artifact loader"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn artifact_worker_rechecks_lifecycle_after_its_start_gate() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        struct ResetPostGateDelay;
+        impl Drop for ResetPostGateDelay {
+            fn drop(&mut self) {
+                set_configure_artifact_post_gate_delay_for_test(0);
+            }
+        }
+        let _reset = ResetPostGateDelay;
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+        let ctx = Arc::new(test_context());
+        reset_configure_artifact_load_attempts_for_test();
+        reset_configure_artifact_load_cancellations_for_test();
+        set_configure_artifact_post_gate_delay_for_test(500);
+
+        assert!(handle_configure_for_test(&req, &ctx).success);
+        ctx.mark_subc_bound();
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            super::drain_deferred_configure_maintenance(&drain_ctx);
+        });
+
+        let reached_deadline = Instant::now() + Duration::from_secs(2);
+        while configure_artifact_post_gate_reached_for_test() == 0 {
+            assert!(
+                Instant::now() < reached_deadline,
+                "artifact worker did not cross its start gate"
+            );
+            std::thread::yield_now();
+        }
+        ctx.mark_subc_unbound();
+        super::cancel_deferred_configure_maintenance(&ctx);
+        drain.join().unwrap();
+
+        let cancel_deadline = Instant::now() + Duration::from_secs(2);
+        while configure_artifact_load_cancellations_for_test() == 0 {
+            assert!(
+                Instant::now() < cancel_deadline,
+                "worker did not reject the now-unbound lifecycle"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(configure_artifact_load_attempts_for_test(), 0);
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+    }
+
+    #[test]
+    fn superseded_configure_tail_does_not_cancel_current_artifact_receiver() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _delay = EnvVarGuard::set("AFT_TEST_CONFIGURE_DEFERRED_MAINTENANCE_DELAY_MS", "500");
+        reset_configure_deferred_delay_reached_for_test();
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+        let ctx = Arc::new(test_context());
+        assert!(handle_configure_for_test(&req, &ctx).success);
+        ctx.mark_subc_bound();
+
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            super::drain_deferred_configure_maintenance(&drain_ctx);
+        });
+        let reached_deadline = Instant::now() + Duration::from_secs(2);
+        while configure_deferred_delay_reached_for_test() == 0 {
+            assert!(
+                Instant::now() < reached_deadline,
+                "configure tail did not reach the controlled delay"
+            );
+            std::thread::yield_now();
+        }
+
+        let current_generation = ctx.advance_configure_generation();
+        let current_persist_epoch = ctx.next_search_persist_epoch();
+        let (current_tx, current_rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(current_rx, current_generation);
+        drain.join().unwrap();
+
+        assert!(
+            ctx.search_index_rx().read().unwrap().is_some(),
+            "a superseded configure tail must not clear the current generation's receiver"
+        );
+        assert_eq!(
+            ctx.search_persist_epoch_flag().current(),
+            current_persist_epoch,
+            "a stale configure tail must not invalidate a newer worker's persistence epoch"
+        );
+        drop(current_tx);
+        ctx.search_index_rx().write().unwrap().take();
+    }
+
+    #[test]
+    fn unbind_during_configure_tail_delay_does_not_release_artifact_loader() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _delay = EnvVarGuard::set("AFT_TEST_CONFIGURE_DEFERRED_MAINTENANCE_DELAY_MS", "500");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let ctx = Arc::new(test_context());
+        let req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+        reset_configure_artifact_load_attempts_for_test();
+        reset_configure_artifact_load_cancellations_for_test();
+
+        assert!(handle_configure_for_test(&req, &ctx).success);
+        ctx.mark_subc_bound();
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            super::drain_deferred_configure_maintenance(&drain_ctx);
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ctx.configure_maintenance_job_count_for_test() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "configure tail did not leave the queue"
+            );
+            std::thread::yield_now();
+        }
+
+        ctx.mark_subc_unbound();
+        assert_eq!(super::cancel_deferred_configure_maintenance(&ctx), 0);
+        drain.join().unwrap();
+        let cancel_deadline = Instant::now() + Duration::from_secs(2);
+        while configure_artifact_load_cancellations_for_test() == 0 {
+            assert!(
+                Instant::now() < cancel_deadline,
+                "in-flight configure tail did not cancel its gated artifact loader"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(configure_artifact_load_attempts_for_test(), 0);
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+    }
+
+    #[test]
+    fn non_equivalent_reconfigure_retires_superseded_callgraph_receiver() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(first_root.path());
+        init_git_fixture(second_root.path());
+        let ctx = test_context();
+        let config = [user_tier(json!({
+            "search_index": false,
+            "semantic_search": false,
+            "callgraph_store": false
+        }))];
+        let first = configure_request_with_params(json!({
+            "project_root": first_root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": config.clone()
+        }));
+        assert!(handle_configure_for_test(&first, &ctx).success);
+
+        let generation = ctx.configure_generation();
+        let (_old_tx, old_rx) = crossbeam_channel::unbounded();
+        ctx.note_callgraph_store_rx_generation(generation);
+        let old_epoch = ctx.next_callgraph_store_rx_epoch();
+        let old_persist_epoch = ctx.next_callgraph_persist_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(old_rx);
+
+        let second = configure_request_with_params(json!({
+            "project_root": second_root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": config
+        }));
+        assert!(handle_configure_for_test(&second, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        assert!(
+            ctx.callgraph_store_rx().lock().is_none(),
+            "a non-equivalent configure must retire the superseded receiver"
+        );
+        assert!(
+            ctx.callgraph_store_rx_epoch() > old_epoch,
+            "receiver retirement must invalidate a dequeued stale completion"
+        );
+        assert!(
+            ctx.callgraph_persist_epoch_flag().current() > old_persist_epoch,
+            "receiver retirement must also invalidate stale disk publication"
+        );
     }
 
     #[test]
@@ -5048,8 +6180,8 @@ mod tests {
 
     #[test]
     fn dead_artifact_owner_manifest_is_taken_over_on_configure() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let owner = temp.path().join("owner");
@@ -5307,6 +6439,7 @@ mod tests {
                 None => std::env::remove_var("USERPROFILE"),
             }
         }
+        drop(_guard);
 
         assert!(response.success);
         assert!(ctx.is_degraded(), "expected degraded mode for HOME root");
@@ -5357,7 +6490,12 @@ mod tests {
         let req = configure_request_with_params(json!({
             "project_root": subdir,
             "harness": "opencode",
-            "config": [user_tier(json!({ "search_index": true }))],
+            "storage_dir": temp.path().join("storage"),
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false,
+            }))],
         }));
         let response = handle_configure_for_test(&req, &ctx);
 
@@ -5371,6 +6509,7 @@ mod tests {
                 None => std::env::remove_var("USERPROFILE"),
             }
         }
+        drop(_guard);
 
         assert!(response.success);
         assert!(

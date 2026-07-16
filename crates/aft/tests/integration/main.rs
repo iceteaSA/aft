@@ -100,10 +100,10 @@ mod status_compression_test;
 mod status_disk_scope_test;
 mod status_memory_test;
 mod subc_bridge_test;
-mod subc_plumbing_drift_test;
 #[cfg(unix)]
 mod subc_detach_test;
 mod subc_format_test;
+mod subc_plumbing_drift_test;
 mod subc_storm_test;
 mod subc_translate_test;
 mod symbol_cache_persist_test;

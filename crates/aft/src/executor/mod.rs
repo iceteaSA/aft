@@ -6,7 +6,7 @@ mod tests;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
     thread::{self, JoinHandle},
@@ -197,6 +197,164 @@ pub struct BindBlockerSnapshot {
     pub blockers: Vec<String>,
 }
 
+/// Cooperative cancellation for one cancellable executor job.
+///
+/// One atomic state machine (pending → running → committed | cancelled) is
+/// shared by the executor, the canceller, and the job. `cancel` and
+/// `try_seal_committed` race through compare-exchange on the same cell, so
+/// exactly one wins: a cancel that lands first makes the seal fail (the job
+/// must abort before mutating), and a seal that lands first makes the cancel
+/// report `RunningCommitted` (the mutation tail finishes normally). A job
+/// observes cancellation only at its own checkpoints
+/// ([`JobCancellation::cancel_requested_before_commit`]).
+#[derive(Debug, Clone)]
+pub struct JobCancellation {
+    inner: Arc<JobCancellationInner>,
+}
+
+#[derive(Debug)]
+struct JobCancellationInner {
+    state: AtomicU8,
+}
+
+const JOB_CANCEL_STATE_PENDING: u8 = 0;
+const JOB_CANCEL_STATE_RUNNING: u8 = 1;
+const JOB_CANCEL_STATE_COMMITTED: u8 = 2;
+const JOB_CANCEL_STATE_CANCELLED: u8 = 3;
+
+impl JobCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(JobCancellationInner {
+                state: AtomicU8::new(JOB_CANCEL_STATE_PENDING),
+            }),
+        }
+    }
+
+    fn mark_running(&self) {
+        let _ = self.inner.state.compare_exchange(
+            JOB_CANCEL_STATE_PENDING,
+            JOB_CANCEL_STATE_RUNNING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Seal the job as committed. Returns `false` when a cancel already won
+    /// the race: the job must return early WITHOUT mutating, because the
+    /// canceller was told `RunningSignalled` and will discard its completion.
+    #[must_use]
+    pub fn try_seal_committed(&self) -> bool {
+        loop {
+            let current = self.state();
+            match current {
+                JOB_CANCEL_STATE_CANCELLED => return false,
+                JOB_CANCEL_STATE_COMMITTED => return true,
+                _ => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            current,
+                            JOB_CANCEL_STATE_COMMITTED,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move to cancelled unless the job already sealed its commit. Returns the
+    /// state the transition observed (`COMMITTED` when the seal won).
+    fn signal_cancel(&self) -> u8 {
+        loop {
+            let current = self.state();
+            match current {
+                JOB_CANCEL_STATE_COMMITTED | JOB_CANCEL_STATE_CANCELLED => return current,
+                _ => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            current,
+                            JOB_CANCEL_STATE_CANCELLED,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        return current;
+                    }
+                }
+            }
+        }
+    }
+
+    fn state(&self) -> u8 {
+        self.inner.state.load(Ordering::SeqCst)
+    }
+
+    /// True when a cancel won the state race and the job must abort.
+    pub fn cancel_requested_before_commit(&self) -> bool {
+        self.state() == JOB_CANCEL_STATE_CANCELLED
+    }
+
+    fn same_token(&self, other: &JobCancellation) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// Outcome of [`Executor::cancel_job`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCancelOutcome {
+    /// The job had not started; it was removed from the queue and its
+    /// completion settled with `request_cancelled`.
+    QueuedRemoved,
+    /// The job is running; its token is signalled and the job returns through
+    /// its normal completion path at the next checkpoint.
+    RunningSignalled,
+    /// The job already sealed its commit; it finishes normally and the caller
+    /// must discard its late completion.
+    RunningCommitted,
+    /// No queued or tracked job matched the token.
+    NotFound,
+}
+
+thread_local! {
+    static CURRENT_JOB_CANCELLATION: std::cell::RefCell<Option<JobCancellation>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The cancellation token of the job running on this worker thread, when the
+/// job was submitted through [`Executor::submit_cancellable_async`].
+pub fn current_job_cancellation() -> Option<JobCancellation> {
+    CURRENT_JOB_CANCELLATION.with(|slot| slot.borrow().clone())
+}
+
+struct CurrentJobCancellationGuard {
+    previous: Option<JobCancellation>,
+}
+
+impl CurrentJobCancellationGuard {
+    fn install(token: Option<JobCancellation>) -> Self {
+        let previous = CURRENT_JOB_CANCELLATION.with(|slot| slot.replace(token));
+        Self { previous }
+    }
+}
+
+impl Drop for CurrentJobCancellationGuard {
+    fn drop(&mut self) {
+        CURRENT_JOB_CANCELLATION.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RunningJob {
     root_id: ProjectRootId,
@@ -329,6 +487,26 @@ impl Executor {
         self.wake_scheduler();
     }
 
+    /// Cancel maintenance jobs that have not started for one retained actor.
+    ///
+    /// Interactive work and already-running maintenance remain untouched. Each
+    /// cancelled job receives a normal completion so its caller can settle
+    /// bookkeeping through the same path as an executed job.
+    pub fn cancel_queued_maintenance(&self, root_id: &ProjectRootId) -> usize {
+        let cancelled = {
+            let mut state = self.inner.state.lock();
+            state
+                .actors
+                .get_mut(root_id)
+                .map(|actor| actor.maintenance.cancel_queued_jobs())
+                .unwrap_or(0)
+        };
+        if cancelled > 0 {
+            self.wake_scheduler();
+        }
+        cancelled
+    }
+
     /// Return whether scheduler state currently has an actor for this root.
     pub fn actor_registered(&self, root_id: &ProjectRootId) -> bool {
         let state = self.inner.state.lock();
@@ -420,6 +598,83 @@ impl Executor {
         completion_rx
     }
 
+    /// Submit an interactive job with an exact-job cancellation token.
+    ///
+    /// The returned token cancels THIS job only (queued: removed and settled
+    /// with `request_cancelled`; running: signalled cooperatively). The job
+    /// observes the token via [`current_job_cancellation`].
+    pub fn submit_cancellable_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        let cancellation = JobCancellation::new();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_with_completion_cancellable(
+            root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Async(completion_tx),
+            Some(cancellation.clone()),
+        );
+        (completion_rx, cancellation)
+    }
+
+    /// Cancel one exact job by its token.
+    ///
+    /// Queued jobs are removed and settled immediately; running jobs are
+    /// signalled and return through their normal completion path at the next
+    /// cooperative checkpoint. Jobs that sealed their commit finish normally.
+    pub fn cancel_job(&self, root_id: &ProjectRootId, token: &JobCancellation) -> JobCancelOutcome {
+        // Signal BEFORE actor lookup, deliberately: a job whose actor was
+        // already torn down (fatal teardown, root removal) must still abort at
+        // its next checkpoint, so the token is cancelled regardless. The
+        // outcome must then reflect what the signal actually did — reporting
+        // NotFound for a token that was RUNNING at signal time would mislead
+        // the caller into treating a signalled job as nonexistent.
+        let observed = token.signal_cancel();
+        let (outcome, settled) = {
+            let mut state = self.inner.state.lock();
+            let Some(actor) = state.actors.get_mut(root_id) else {
+                return match observed {
+                    JOB_CANCEL_STATE_COMMITTED => JobCancelOutcome::RunningCommitted,
+                    JOB_CANCEL_STATE_RUNNING | JOB_CANCEL_STATE_PENDING => {
+                        JobCancelOutcome::RunningSignalled
+                    }
+                    _ => JobCancelOutcome::NotFound,
+                };
+            };
+            match actor.remove_queued_cancellable(token) {
+                Some(queued) => (JobCancelOutcome::QueuedRemoved, Some(queued)),
+                None => match observed {
+                    // The seal won the race: the job commits and finishes.
+                    JOB_CANCEL_STATE_COMMITTED => (JobCancelOutcome::RunningCommitted, None),
+                    // RUNNING at signal time, or PENDING at signal time but
+                    // dispatched before we took the scheduler lock: either way
+                    // the job aborts at its next checkpoint.
+                    JOB_CANCEL_STATE_RUNNING | JOB_CANCEL_STATE_PENDING => {
+                        (JobCancelOutcome::RunningSignalled, None)
+                    }
+                    // Already cancelled by an earlier call and no longer queued.
+                    _ => (JobCancelOutcome::NotFound, None),
+                },
+            }
+        };
+        if let Some(queued) = settled {
+            queued.completion.send(Response::error(
+                queued.request_id,
+                "request_cancelled",
+                "request cancelled before execution",
+            ));
+            self.wake_scheduler();
+        }
+        outcome
+    }
+
     pub fn submit_maintenance_async(
         &self,
         root_id: ProjectRootId,
@@ -448,6 +703,22 @@ impl Executor {
         job: ExecutorJob,
         completion: CompletionSender,
     ) {
+        self.submit_with_completion_cancellable(
+            root_id, job_class, lane, request_id, job, completion, None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_with_completion_cancellable(
+        &self,
+        root_id: ProjectRootId,
+        job_class: JobClass,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob,
+        completion: CompletionSender,
+        cancellation: Option<JobCancellation>,
+    ) {
         let command = job_command(job_class, lane);
         let mut job = Some(job);
         let mut completion = Some(completion);
@@ -468,6 +739,7 @@ impl Executor {
                             request_id: request_id.clone(),
                             command,
                             queued_at: Instant::now(),
+                            cancellation: cancellation.clone(),
                         },
                     );
                     None
@@ -892,6 +1164,12 @@ impl ActorState {
             || self.maintenance.has_queued_mutating_job(request_id)
     }
 
+    fn remove_queued_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob> {
+        self.interactive
+            .remove_cancellable(token)
+            .or_else(|| self.maintenance.remove_cancellable(token))
+    }
+
     fn pending_configure_count(&self) -> usize {
         usize::from(
             self.mutating_inflight
@@ -986,8 +1264,59 @@ impl ClassQueues {
         fail_queued_job_queue(&mut self.maintenance_commit);
     }
 
+    fn cancel_queued_jobs(&mut self) -> usize {
+        self.order.clear();
+        cancel_queued_job_queue(&mut self.pure_reads)
+            + cancel_queued_job_queue(&mut self.lsp_status)
+            + cancel_queued_job_queue(&mut self.heavy_init)
+            + cancel_queued_job_queue(&mut self.mutating)
+            + cancel_queued_job_queue(&mut self.maintenance_commit)
+    }
+
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
         self.mutating.iter().any(|job| job.request_id == request_id)
+    }
+
+    /// Remove the queued job carrying this exact cancellation token.
+    ///
+    /// `order` holds one lane entry per push, and per-lane entries pair FIFO
+    /// with the lane queue: the k-th occurrence of a lane in `order`
+    /// corresponds to the k-th element of that lane's queue. Removing the
+    /// FIRST matching order entry for a job deeper in its lane queue would
+    /// shift the pairing and reorder the survivors, so the occurrence at the
+    /// job's own queue position is removed instead.
+    fn remove_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob> {
+        for lane in [
+            Lane::PureRead,
+            Lane::SerialLspStatus,
+            Lane::HeavyInit,
+            Lane::Mutating,
+            Lane::MaintenanceCommit,
+        ] {
+            let queue = self.queue_mut(lane);
+            let position = queue.iter().position(|queued| {
+                queued
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.same_token(token))
+            });
+            if let Some(position) = position {
+                let removed = queue.remove(position);
+                let mut occurrence = 0usize;
+                if let Some(order_position) = self.order.iter().position(|entry| {
+                    if *entry != lane {
+                        return false;
+                    }
+                    let matched = occurrence == position;
+                    occurrence += 1;
+                    matched
+                }) {
+                    self.order.remove(order_position);
+                }
+                return removed;
+            }
+        }
+        None
     }
 
     fn queued_configure_count(&self) -> usize {
@@ -1024,6 +1353,7 @@ struct QueuedJob {
     request_id: String,
     command: String,
     queued_at: Instant,
+    cancellation: Option<JobCancellation>,
 }
 
 fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
@@ -1032,6 +1362,18 @@ fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
             .completion
             .send(actor_fatal_response(queued.request_id));
     }
+}
+
+fn cancel_queued_job_queue(queue: &mut VecDeque<QueuedJob>) -> usize {
+    let cancelled = queue.len();
+    for queued in queue.drain(..) {
+        queued.completion.send(Response::error(
+            queued.request_id,
+            "maintenance_cancelled",
+            "maintenance cancelled because the actor has no bound routes",
+        ));
+    }
+    cancelled
 }
 
 fn job_command(job_class: JobClass, lane: Lane) -> String {
@@ -1098,6 +1440,7 @@ struct RunJob {
     request_id: String,
     command: String,
     heavy_permit: Option<HeavyPermit>,
+    cancellation: Option<JobCancellation>,
 }
 
 struct CompletionEvent {
@@ -1419,6 +1762,9 @@ fn try_admit_actor(
 
     let queued = actor.pop_front_job(job_class, lane)?;
     actor.deficit -= JOB_COST;
+    if let Some(cancellation) = queued.cancellation.as_ref() {
+        cancellation.mark_running();
+    }
     if lane == Lane::Mutating {
         actor.mutating_inflight = Some(RunningMutatingJob {
             request_id: queued.request_id.clone(),
@@ -1459,6 +1805,7 @@ fn try_admit_actor(
         request_id: queued.request_id,
         command: queued.command,
         heavy_permit,
+        cancellation: queued.cancellation,
     })
 }
 
@@ -1492,6 +1839,7 @@ fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
 }
 
 fn run_lane_job(run_job: &mut RunJob) -> Response {
+    let _cancellation_ctx = CurrentJobCancellationGuard::install(run_job.cancellation.clone());
     let missing_request_id = run_job.request_id.clone();
     let job = std::mem::replace(
         &mut run_job.job,

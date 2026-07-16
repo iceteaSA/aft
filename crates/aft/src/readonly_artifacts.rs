@@ -503,7 +503,7 @@ mod tests {
             "artifact identity should be derived only on the first external search"
         );
         assert_eq!(
-            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            crate::cache_freshness::verify_file_strict_count_under_for_debug(&root),
             0,
             "neither the first load nor a cache hit may run a corpus census"
         );
@@ -645,7 +645,7 @@ mod tests {
             ReadOnlyArtifact::Fresh(_)
         ));
         assert_eq!(
-            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            crate::cache_freshness::verify_file_strict_count_under_for_debug(&root),
             0,
             "a borrowed open must not restore the full-corpus strict hash census"
         );
@@ -662,7 +662,7 @@ mod tests {
             other => panic!("expected silently served borrowed artifact, got {other:?}"),
         }
         assert_eq!(
-            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            crate::cache_freshness::verify_file_strict_count_under_for_debug(&root),
             0
         );
     }

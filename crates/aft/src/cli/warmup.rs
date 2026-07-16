@@ -1,6 +1,9 @@
 use aft::callgraph_store::CallGraphStore;
 use aft::config::Config;
-use aft::context::{AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus};
+use aft::context::{
+    AppContext, CallGraphStoreBuildEvent, CallgraphStoreAccess, SemanticIndexEvent,
+    SemanticIndexStatus,
+};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
 use serde_json::json;
@@ -52,6 +55,9 @@ pub fn run(args: Vec<OsString>) -> Result<(), WarmupError> {
 
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
     configure(&ctx, &root, &storage_dir, args.areas, args.force)?;
+    // Normal daemon binds run this tail after acknowledging the client. Warmup
+    // has no request loop, so it must release the artifact start gates itself.
+    aft::commands::configure::drain_deferred_configure_maintenance(&ctx);
 
     // The callgraph store has no configure flag; building is triggered by
     // calling `callgraph_store_for_ops` once (warm-opens an existing store, or
@@ -327,7 +333,7 @@ fn configure(
 fn wait_until_ready(
     ctx: &AppContext,
     areas: WarmupAreas,
-    callgraph_override: Option<SubsystemState>,
+    mut callgraph_override: Option<SubsystemState>,
     timeout_ms: u64,
     quiet: bool,
 ) -> Result<(), WarmupError> {
@@ -338,12 +344,27 @@ fn wait_until_ready(
         drain_semantic_index_events(ctx);
         if areas.callgraph {
             drain_callgraph_store_events(ctx);
+            if callgraph_override.is_none()
+                && ctx.callgraph_store_rx().lock().is_none()
+                && ctx
+                    .callgraph_store()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none()
+            {
+                callgraph_override = trigger_callgraph_warm(ctx);
+            }
         }
 
         let snapshot = WarmupSnapshot::from_context(ctx, &callgraph_override);
         if !quiet {
             let labels = snapshot.labels();
             labels.print_transitions(&mut last_labels);
+        }
+        if let Some(failure) = snapshot.failure() {
+            return Err(WarmupError::runtime(format!(
+                "aft warmup failed: {failure}"
+            )));
         }
         if snapshot.is_terminal() {
             if !quiet {
@@ -412,6 +433,20 @@ impl WarmupSnapshot {
             && self.semantic_index.is_terminal()
             && self.symbol_cache.is_terminal()
             && self.callgraph_store.is_terminal()
+    }
+
+    fn failure(&self) -> Option<String> {
+        [
+            ("search_index", &self.search_index),
+            ("semantic_index", &self.semantic_index),
+            ("symbol_cache", &self.symbol_cache),
+            ("callgraph_store", &self.callgraph_store),
+        ]
+        .into_iter()
+        .find_map(|(name, state)| match state {
+            SubsystemState::Failed(error) => Some(format!("{name}: {error}")),
+            _ => None,
+        })
     }
 
     fn labels(&self) -> WarmupLabels {
@@ -578,20 +613,32 @@ fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
 // warmup CLI is a one-shot with no live status consumer or mid-build edit
 // stream, so it keeps leaner drains without status-emitter signals. Do not
 // deduplicate them unless that behavior changes.
-/// Install the finished callgraph store once the background cold build sends it
-/// over `callgraph_store_rx`. Mirrors `main::drain_callgraph_store_events` but
-/// without the status-emitter signal (warmup has no sidebar consumer).
 fn drain_callgraph_store_events(ctx: &AppContext) {
-    let (latest, disconnected) = {
+    let (latest, settled, disconnected, fulfilled_force_token, receiver_generation, receiver_epoch) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
         let mut latest = None;
+        let mut settled = false;
+        let mut fulfilled_force_token = None;
         let mut disconnected = false;
         loop {
             match rx.try_recv() {
-                Ok(store) => latest = Some(store),
+                Ok(CallGraphStoreBuildEvent::Ready {
+                    store,
+                    fulfilled_force_token: token,
+                    publication_epoch,
+                }) => {
+                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
+                        latest = Some(store);
+                        fulfilled_force_token = token;
+                    } else {
+                        drop(store);
+                        settled = true;
+                    }
+                }
+                Ok(CallGraphStoreBuildEvent::Settled) => settled = true,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -599,34 +646,54 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                 }
             }
         }
-        (latest, disconnected)
+        (
+            latest,
+            settled,
+            disconnected,
+            fulfilled_force_token,
+            ctx.callgraph_store_rx_generation(),
+            ctx.callgraph_store_rx_epoch(),
+        )
     };
 
-    let mut installed = false;
+    let terminal = latest.is_some() || settled || disconnected;
+    if !terminal {
+        return;
+    }
+    let mut reopened = None;
     if let Some(store) = latest {
-        let pending = ctx.take_pending_callgraph_store_paths();
         drop(store);
-        if !pending.is_empty() {
-            ctx.enqueue_callgraph_store_refresh(pending);
-        }
         if let Some(project_root) = ctx.callgraph_project_root() {
             if let Ok(Some(store)) =
                 CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root)
             {
-                *ctx.callgraph_store()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(std::sync::Arc::new(store));
-                installed = true;
+                reopened = Some(std::sync::Arc::new(store));
             }
         }
     }
 
-    if disconnected || installed {
-        *ctx.callgraph_store_rx().lock() = None;
-        if disconnected && !installed {
-            let _ = ctx.take_pending_callgraph_store_paths();
-        }
+    let mut pending = Vec::new();
+    let installed =
+        ctx.with_current_callgraph_store_rx(receiver_generation, receiver_epoch, |receiver| {
+            let installed = if let Some(store) = reopened {
+                *ctx.callgraph_store()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
+                pending = ctx.take_pending_callgraph_store_paths();
+                true
+            } else {
+                false
+            };
+            *receiver = None;
+            if installed {
+                if let Some(force_token) = fulfilled_force_token {
+                    ctx.fulfill_callgraph_store_force_token(force_token);
+                }
+            }
+            installed
+        });
+    if installed == Some(true) && !pending.is_empty() {
+        let _ = ctx.enqueue_callgraph_store_refresh(pending);
     }
 }
 
@@ -648,9 +715,9 @@ fn callgraph_store_state(
     {
         return SubsystemState::Ready;
     }
-    // No store, no in-flight build: the cold build finished without producing a
-    // store (failure already drained) — report ready so warmup doesn't hang.
-    SubsystemState::Ready
+    // The previous attempt terminated without a usable pointer. The wait loop
+    // retriggers the cold build and eventually reports its hard error or timeout.
+    SubsystemState::Pending("retrying".to_string())
 }
 
 fn drain_search_index_events(ctx: &AppContext) {
@@ -767,6 +834,67 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<OsString> {
         items.iter().map(OsString::from).collect()
+    }
+
+    static WARMUP_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn search_only_warmup_releases_post_configure_start_gate() {
+        let _env_lock = WARMUP_ENV_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
+        let _storage = EnvGuard::set("AFT_STORAGE_DIR", storage.path().as_os_str());
+        let _watcher = EnvGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("1"));
+
+        let result = run(vec![
+            OsString::from("--root"),
+            root.path().as_os_str().to_os_string(),
+            OsString::from("--only"),
+            OsString::from("search"),
+            OsString::from("--timeout"),
+            OsString::from("5000"),
+            OsString::from("--quiet"),
+        ]);
+
+        assert!(result.is_ok(), "search warmup failed: {result:?}");
+    }
+
+    #[test]
+    fn failed_subsystem_is_reported_as_warmup_error() {
+        let snapshot = WarmupSnapshot {
+            search_index: SubsystemState::Ready,
+            semantic_index: SubsystemState::Failed("backend unavailable".to_string()),
+            symbol_cache: SubsystemState::Ready,
+            callgraph_store: SubsystemState::Disabled,
+        };
+        assert_eq!(
+            snapshot.failure().as_deref(),
+            Some("semantic_index: backend unavailable")
+        );
     }
 
     #[test]

@@ -819,7 +819,7 @@ pub(super) async fn handle_bash_deferred_completion(
 ) -> Result<(), SubcError> {
     if let Some(meta) = live_roots.get_mut(&done.root) {
         meta.active_bash_waits = meta.active_bash_waits.saturating_sub(1);
-        meta.touch();
+        meta.note_activity();
     }
     let route_id = done.route;
     let remove_route_cancel = if let Some(cancel) = route_bash_cancels.get_mut(&route_id) {

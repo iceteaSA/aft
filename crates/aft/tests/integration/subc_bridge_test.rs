@@ -370,6 +370,11 @@ impl BridgeState {
         self.cv.notify_all();
     }
 
+    fn slow_configure_started_count(&self) -> usize {
+        let guard = self.inner.lock().expect("bridge state lock");
+        guard.slow_configure_started
+    }
+
     fn wait_for_slow_configure_finished(&self, expected: usize) {
         self.wait_until("slow configure finished", |inner| {
             inner.slow_configure_finished >= expected
@@ -555,23 +560,33 @@ impl BridgeState {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.slow_configure_started += 1;
         self.cv.notify_all();
+        let cancellation = aft::executor::current_job_cancellation();
         let deadline = Instant::now() + Duration::from_secs(30);
         while !guard.slow_configure_release {
+            // Operational cancellation is a first-class exit: a Goodbye or
+            // deadline expiry must settle this configure WITHOUT a manual
+            // release, or the cancellation tests prove nothing.
+            if cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
+            {
+                guard.slow_configure_finished += 1;
+                self.cv.notify_all();
+                return;
+            }
             let now = Instant::now();
             assert!(
                 now < deadline,
                 "timed out waiting for slow configure release"
             );
-            let remaining = deadline.saturating_duration_since(now);
-            let (next, result) = self
+            let remaining = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(25));
+            let (next, _result) = self
                 .cv
                 .wait_timeout(guard, remaining)
                 .expect("bridge state condvar");
             guard = next;
-            assert!(
-                !result.timed_out() || guard.slow_configure_release,
-                "timed out waiting for slow configure release"
-            );
         }
         guard.slow_configure_finished += 1;
         self.cv.notify_all();
@@ -1365,6 +1380,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
     let _serial = bridge_test_serial_guard();
+    crate::test_helpers::disable_in_process_file_watcher();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let _env_guards = env_setup();
     let state = Arc::new(BridgeState::default());
@@ -1394,6 +1410,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
     let conn = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
         endpoints: vec![Endpoint {
             host: "127.0.0.1".to_string(),
             port,
@@ -1495,6 +1512,7 @@ where
         &conn_path,
         &ConnectionInfo {
             schema: SCHEMA_VERSION,
+            wire_version: Some(PROTOCOL_VERSION),
             endpoints: vec![Endpoint {
                 host: "127.0.0.1".to_string(),
                 port,
@@ -1703,6 +1721,7 @@ fn subc_initial_attach_rereads_rewritten_connection_file() {
                 &input.connection_file_path,
                 &ConnectionInfo {
                     schema: SCHEMA_VERSION,
+                    wire_version: Some(PROTOCOL_VERSION),
                     endpoints: vec![Endpoint {
                         host: "127.0.0.1".to_string(),
                         port: replacement_port,
@@ -1914,6 +1933,16 @@ fn subc_bridge_cancelled_first_bind_does_not_orphan_later_bind() {
 }
 
 #[test]
+fn subc_bridge_goodbye_removes_queued_bind_without_starting_it() {
+    run_subc_bridge_test(
+        "subc_bridge_goodbye_removes_queued_bind_without_starting_it",
+        Duration::from_secs(45),
+        drive_goodbye_removes_queued_bind_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bind_deadline_rolls_back_and_fresh_bind_succeeds() {
     run_subc_bridge_test(
         "subc_bridge_bind_deadline_rolls_back_and_fresh_bind_succeeds",
@@ -2101,6 +2130,7 @@ fn subc_bridge_rejects_malformed_fed_harness_on_bind() {
     let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
     let conn = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
         endpoints: vec![Endpoint {
             host: "127.0.0.1".to_string(),
             port,
@@ -2503,6 +2533,7 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
     let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
     let conn = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
         endpoints: vec![Endpoint {
             host: "127.0.0.1".to_string(),
             port,
@@ -4288,7 +4319,8 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
     let pong = read_frame_timeout(&mut stream, "goodbye barrier pong").await;
     assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
     assert_eq!(pong.header.corr, 1109);
-    state.release_slow_configures();
+    // NO manual release: the Goodbye's operational cancellation must itself
+    // settle the stuck configure, or this test proves only bookkeeping.
     state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
     tokio::time::sleep(Duration::from_millis(150)).await;
     send_tool_call(&mut stream, 10, 1111, "echo", json!({ "case": "fast" })).await;
@@ -4330,8 +4362,8 @@ async fn drive_cancelled_first_bind_does_not_orphan_later_bind_daemon(input: Fak
 
     send_route_bind(&mut stream, 21, 210, &slow_root).await;
     send_route_goodbye(&mut stream, 20, 201).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    state.release_slow_configures();
+    // NO manual release: cancelling route 20's configure must free the
+    // mutating lane so route 21's queued configure runs and acks.
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
     expect_route_bind_ack(&mut stream, 210).await;
     send_tool_call(&mut stream, 21, 211, "echo", json!({ "case": "fast" })).await;
@@ -4378,7 +4410,8 @@ async fn drive_bind_deadline_recovery_daemon(input: FakeDaemonInput) {
         inner.slow_configure_started > slow_bind_base
     });
     expect_route_bind_error(&mut stream, 300, "actor_not_ready").await;
-    state.release_slow_configures();
+    // NO manual release: deadline expiry must operationally cancel the stuck
+    // configure so the fresh bind below does not queue behind it.
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
 
     send_route_bind(&mut stream, 31, 310, &slow_root).await;
@@ -4418,6 +4451,69 @@ async fn drive_route_close_recreates_unregistered_actor_daemon(input: FakeDaemon
         tool_response_json(&rebound)["success"].as_bool(),
         Some(true)
     );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_goodbye_removes_queued_bind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        slow_root,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    // First same-root configure runs (blocked at the cancellation-aware gate);
+    // second same-root bind queues behind it in the mutating lane.
+    let slow_bind_base = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        40,
+        400,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("slow route 40 configure started", |inner| {
+        inner.slow_configure_started > slow_bind_base
+    });
+    send_route_bind(&mut stream, 41, 410, &slow_root).await;
+
+    // Goodbye the QUEUED bind: its configure must be removed without ever
+    // starting (started count stays at base + 1).
+    send_route_goodbye(&mut stream, 41, 411).await;
+    // Barrier so the Goodbye is consumed before we cancel the first bind.
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 412, Vec::new())
+            .expect("queued-cancel barrier ping"),
+    )
+    .await;
+    let pong = read_frame_timeout(&mut stream, "queued-cancel barrier pong").await;
+    assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
+
+    // Cancel the first via Goodbye too; operational cancellation settles it.
+    send_route_goodbye(&mut stream, 40, 401).await;
+    state.wait_for_slow_configure_finished(slow_bind_base + 1);
+    assert_eq!(
+        state.slow_configure_started_count(),
+        slow_bind_base + 1,
+        "queued bind's configure must never start after its route Goodbye"
+    );
+
+    // A third same-root bind succeeds cleanly.
+    send_route_bind(&mut stream, 42, 420, &slow_root).await;
+    expect_route_bind_ack(&mut stream, 420).await;
+    send_tool_call(&mut stream, 42, 421, "echo", json!({ "case": "fast" })).await;
+    let fresh = read_frame_timeout(&mut stream, "fresh bind after queued-bind removal").await;
+    assert_eq!(fresh.header.channel, 42);
+    assert_eq!(fresh.header.corr, 421);
+    assert_eq!(tool_response_json(&fresh)["success"].as_bool(), Some(true));
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -5913,6 +6009,11 @@ async fn drive_cross_bind_trust_isolation_daemon(input: FakeDaemonInput) {
     assert!(tool_result_text(&untrusted_write).contains("outside the project root"));
 
     send_bg_events_subscribe(&mut stream, 2, 305).await;
+    let denied_bg_stream = read_frame_timeout(&mut stream, "untrusted bg_events termination").await;
+    assert_eq!(denied_bg_stream.header.ty, FrameType::StreamEnd);
+    assert_eq!(denied_bg_stream.header.channel, 2);
+    assert_eq!(denied_bg_stream.header.corr, 305);
+
     send_tool_call(
         &mut stream,
         1,

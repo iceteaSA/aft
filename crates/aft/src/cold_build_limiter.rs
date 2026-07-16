@@ -23,10 +23,27 @@ pub fn try_acquire() -> Option<ColdBuildPermit> {
 /// call from dedicated background threads, never the dispatch thread or an
 /// executor worker.
 pub fn acquire_blocking(kind: &str) -> ColdBuildPermit {
+    acquire_blocking_while(kind, || true).expect("unconditional cold-build admission")
+}
+
+/// Wait for a build slot while `admitted` remains true. The predicate is checked
+/// before every attempt, so a root that becomes unbound does not consume a slot
+/// after spending time queued behind the process-wide cap.
+pub fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option<ColdBuildPermit> {
     let started = Instant::now();
     let mut logged = false;
     loop {
+        if !admitted() {
+            return None;
+        }
         if let Some(permit) = GLOBAL_COLD_BUILD_LIMITER.try_acquire() {
+            // The root can become unbound after the pre-attempt check but
+            // before the permit CAS succeeds. Recheck while owning the slot;
+            // dropping the permit here returns it before any build starts.
+            if !admitted() {
+                drop(permit);
+                return None;
+            }
             if logged {
                 crate::slog_info!(
                     "maintenance build slot acquired after {}ms wait: {}",
@@ -34,7 +51,7 @@ pub fn acquire_blocking(kind: &str) -> ColdBuildPermit {
                     kind
                 );
             }
-            return permit;
+            return Some(permit);
         }
         if !logged {
             crate::slog_info!(
@@ -111,7 +128,7 @@ impl Drop for ColdBuildPermit {
 mod tests {
     use super::*;
 
-    // Both tests mutate the process-global limiter; run them one at a time.
+    // These tests mutate the process-global limiter; run them one at a time.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         M.get_or_init(|| std::sync::Mutex::new(()))
@@ -152,6 +169,48 @@ mod tests {
         assert!(!waiter.is_finished(), "waiter must block while cap is full");
         drop(held.pop());
         waiter.join().expect("waiter finishes after release");
+        drop(held);
+    }
+
+    #[test]
+    fn admission_revoked_between_check_and_permit_drops_the_slot() {
+        let _serial = serial();
+        let before = GLOBAL_COLD_BUILD_LIMITER.available.load(Ordering::Acquire);
+        let checks = AtomicUsize::new(0);
+
+        let permit = acquire_blocking_while("revoked-after-cas", || {
+            checks.fetch_add(1, Ordering::SeqCst) == 0
+        });
+
+        assert!(permit.is_none());
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            GLOBAL_COLD_BUILD_LIMITER.available.load(Ordering::Acquire),
+            before,
+            "revoked admission must return the just-acquired slot"
+        );
+    }
+
+    #[test]
+    fn conditional_waiter_cancels_without_consuming_a_released_slot() {
+        let _serial = serial();
+        let mut held = Vec::new();
+        while let Some(permit) = try_acquire() {
+            held.push(permit);
+        }
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let waiter_admitted = Arc::clone(&admitted);
+        let waiter = std::thread::spawn(move || {
+            acquire_blocking_while("conditional waiter", || {
+                waiter_admitted.load(Ordering::SeqCst)
+            })
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        admitted.store(false, Ordering::SeqCst);
+        assert!(
+            waiter.join().expect("conditional waiter joins").is_none(),
+            "revoked work must leave the cold-build queue without taking a permit"
+        );
         drop(held);
     }
 }

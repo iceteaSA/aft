@@ -36,6 +36,185 @@ pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
+
+/// Canonicalize a path that may no longer exist (pending callgraph paths
+/// legitimately include deleted files): canonicalize the nearest existing
+/// ancestor of the ORIGINAL spelling and re-append the missing tail, so alias
+/// spellings (macOS /var vs /private/var) normalize even for dead paths.
+///
+/// Symlink semantics match the callgraph store's `normalize_file_path`
+/// (filesystem-first): `root/link/../x` where `link` targets a foreign
+/// directory canonicalizes to the FOREIGN parent, not a lexical `root/x`.
+/// Lexical `.`/`..` resolution applies only past the deepest existing
+/// component (a nonexistent component cannot be a symlink) and to the tail
+/// appended onto an already-canonical, symlink-free base.
+/// Component-wise lenient canonicalization with filesystem-first semantics
+/// (matching the callgraph store's `normalize_file_path`): each existing
+/// component — including symlinks — resolves through the filesystem; genuinely
+/// absent components accumulate on a missing stack and resolve lexically. `..`
+/// pops the missing stack first, and only when the stack is empty does it take
+/// the parent of the canonical base (symlink-free, so a lexical parent is
+/// sound there). Handles re-entry: in `dead/../link/../x`, `dead/..` drains
+/// back to the existing base and `link` (a symlink) resolves through the
+/// filesystem instead of being erased lexically.
+///
+/// Returns `None` — and containment fails closed — where realpath would not
+/// resolve either: a dangling symlink or other filesystem error on an existing
+/// component (the store falls back to the raw spelling for those, which
+/// `relative_path` keeps as an absolute out-of-root key), and `..` traversal
+/// through a non-directory (realpath ENOTDIR).
+fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Some(canonical);
+    }
+    let mut resolved = PathBuf::new();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                resolved.push(component.as_os_str());
+                // Canonicalize the anchor so a missing child directly under a
+                // drive/UNC root compares in the same (verbatim) spelling as a
+                // canonicalized root on Windows; "/" is a no-op on Unix.
+                if let Ok(canonical_anchor) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical_anchor;
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if missing.pop().is_none() {
+                    if !resolved.as_os_str().is_empty() && !resolved.is_dir() {
+                        // `file/..` — realpath rejects with ENOTDIR.
+                        return None;
+                    }
+                    resolved.pop();
+                }
+            }
+            Component::Normal(name) => {
+                if missing.is_empty() {
+                    let candidate = resolved.join(name);
+                    match std::fs::canonicalize(&candidate) {
+                        Ok(canonical) => resolved = canonical,
+                        Err(_) => match std::fs::symlink_metadata(&candidate) {
+                            // Genuinely absent: lexical from here until `..`
+                            // drains back.
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                missing.push(name.to_owned())
+                            }
+                            // Exists but does not canonicalize (dangling
+                            // symlink) or the probe itself failed: fail closed.
+                            _ => return None,
+                        },
+                    }
+                } else {
+                    missing.push(name.to_owned());
+                }
+            }
+        }
+    }
+    for name in missing {
+        resolved.push(name);
+    }
+    Some(resolved)
+}
+
+/// Root-containment check for pending callgraph replay paths.
+///
+/// Relative paths are project-root-relative by the callgraph store's own
+/// contract (`normalize_file_path`), so they are resolved against each root
+/// rather than the process CWD. Both sides are lenient-canonicalized
+/// (component-wise, filesystem-first) before the prefix comparison: raw-spelling
+/// acceptance would let `root/../foreign` or a symlinked escape pass, and a
+/// bare textual check false-drops alias spellings (macOS /var vs
+/// /private/var) and deleted files.
+fn pending_path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    if path.is_relative() {
+        // Project-root-relative by contract, and only for prefix-free
+        // spellings: Windows drive-relative (`C:foo`) and root-relative
+        // (`\foo`) forms are "relative" to std but `join` replaces the root
+        // for them, resolving through the drive CWD instead of the project.
+        let has_prefix_or_root = path.components().next().is_some_and(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            )
+        });
+        if has_prefix_or_root {
+            return false;
+        }
+        // A lexical escape via `..` still fails the canonical prefix check
+        // after joining. Unresolvable spellings fail closed.
+        return roots.iter().any(|root| {
+            let joined = root.join(path);
+            match (canonicalize_lenient(&joined), canonicalize_lenient(root)) {
+                (Some(path), Some(root)) => path.starts_with(&root),
+                _ => false,
+            }
+        });
+    }
+    let Some(canonical_path) = canonicalize_lenient(path) else {
+        return false;
+    };
+    roots.iter().any(|root| {
+        canonicalize_lenient(root)
+            .is_some_and(|canonical_root| canonical_path.starts_with(&canonical_root))
+    })
+}
+
+/// Serializes the daemon's bound/unbound transition with admission of deferred
+/// root work. The lock covers only the bounded decision and worker-start commit;
+/// call sites must not wait for worker completion or run a scan while holding it.
+#[derive(Clone, Default)]
+pub(crate) struct SubcLifecycleAdmission {
+    unbound: Arc<parking_lot::Mutex<bool>>,
+}
+
+impl SubcLifecycleAdmission {
+    fn mark_bound(&self) {
+        *self.unbound.lock() = false;
+    }
+
+    fn mark_unbound(&self, configure_generation: &AtomicU64) {
+        let mut unbound = self.unbound.lock();
+        if !*unbound {
+            *unbound = true;
+            configure_generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn is_current(&self, generation: &AtomicU64, expected: u64) -> bool {
+        let unbound = self.unbound.lock();
+        !*unbound && generation.load(Ordering::SeqCst) == expected
+    }
+
+    fn advance_generation(&self, generation: &AtomicU64) -> u64 {
+        let _unbound = self.unbound.lock();
+        generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+    }
+
+    pub(crate) fn run_if_current<R>(
+        &self,
+        generation: &AtomicU64,
+        expected: u64,
+        action: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let unbound = self.unbound.lock();
+        if *unbound || generation.load(Ordering::SeqCst) != expected {
+            return None;
+        }
+        Some(action())
+    }
+
+    pub(crate) fn is_bound(&self) -> bool {
+        !*self.unbound.lock()
+    }
+
+    fn is_unbound(&self) -> bool {
+        !self.is_bound()
+    }
+}
+
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT: Duration = Duration::from_secs(5);
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_POLL: Duration = Duration::from_millis(10);
 
@@ -211,6 +390,12 @@ pub(crate) enum WatcherDrainPhase {
 #[derive(Debug)]
 pub(crate) struct WatcherDrainSliceState {
     pub(crate) configure_generation: u64,
+    /// Content identity of the configuration this continuation was built
+    /// under. A lifecycle-only generation change (route unbind/rebind with an
+    /// equivalent config) preserves the continuation by REBASING it onto the
+    /// new generation; a content change discards it (the new configuration
+    /// rebuilds artifacts wholesale).
+    pub(crate) configure_content_generation: u64,
     pub(crate) phase: WatcherDrainPhase,
     pub(crate) pending_paths: VecDeque<PathBuf>,
     pub(crate) ignore_changed: bool,
@@ -221,10 +406,22 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) path_slice_count: usize,
 }
 
+/// Pending watcher-derived reconciliation state taken out of the context for
+/// a transactional TTL teardown: committed (dropped) once eviction succeeds,
+/// restored when a secondary blocker aborts the eviction.
+pub(crate) struct PendingReconciliationState {
+    search: BTreeSet<PathBuf>,
+    callgraph: BTreeSet<PathBuf>,
+    tier2: BTreeSet<PathBuf>,
+    semantic: BTreeSet<PathBuf>,
+    corpus_refresh: bool,
+}
+
 impl WatcherDrainSliceState {
-    pub(crate) fn new(configure_generation: u64) -> Self {
+    pub(crate) fn new(configure_generation: u64, configure_content_generation: u64) -> Self {
         Self {
             configure_generation,
+            configure_content_generation,
             phase: WatcherDrainPhase::Collect,
             pending_paths: VecDeque::new(),
             ignore_changed: false,
@@ -241,6 +438,55 @@ impl WatcherDrainSliceState {
             || !self.pending_paths.is_empty()
             || self.ignore_changed
             || self.rescan_required
+    }
+}
+
+#[doc(hidden)]
+pub enum CallGraphStoreBuildEvent {
+    Ready {
+        store: CallGraphStore,
+        fulfilled_force_token: Option<u64>,
+        publication_epoch: u64,
+    },
+    Settled,
+}
+
+struct CallGraphStoreBuildSettlement {
+    tx: crossbeam_channel::Sender<CallGraphStoreBuildEvent>,
+    sent: bool,
+    force_token: Option<u64>,
+    publication_epoch: u64,
+}
+
+impl CallGraphStoreBuildSettlement {
+    fn new(
+        tx: crossbeam_channel::Sender<CallGraphStoreBuildEvent>,
+        force_token: Option<u64>,
+        publication_epoch: u64,
+    ) -> Self {
+        Self {
+            tx,
+            sent: false,
+            force_token,
+            publication_epoch,
+        }
+    }
+
+    fn ready(&mut self, store: CallGraphStore) {
+        let _ = self.tx.send(CallGraphStoreBuildEvent::Ready {
+            store,
+            fulfilled_force_token: self.force_token,
+            publication_epoch: self.publication_epoch,
+        });
+        self.sent = true;
+    }
+}
+
+impl Drop for CallGraphStoreBuildSettlement {
+    fn drop(&mut self) {
+        if !self.sent {
+            let _ = self.tx.send(CallGraphStoreBuildEvent::Settled);
+        }
     }
 }
 
@@ -261,6 +507,9 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) reset_filter_registry: bool,
     pub(crate) clear_failed_spawns: bool,
     pub(crate) warm_callgraph_store: bool,
+    /// Advance disk-publication epochs in the post-ack configure tail. This can
+    /// wait for an already-committing writer, so it must never run on bind.
+    pub(crate) supersede_artifact_persistence: bool,
     /// One-shot gates for artifact workers created during configure. The
     /// configure tail opens them only after the bind response has been produced.
     pub(crate) artifact_load_starts: Vec<crossbeam_channel::Sender<()>>,
@@ -335,6 +584,13 @@ struct SemanticRefreshCircuit {
     open: AtomicBool,
     probe_in_flight: AtomicBool,
     probe_ready: AtomicBool,
+    probe_token: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SemanticColdSeedResume {
+    request_tier2: bool,
+    warm_callgraph: bool,
 }
 
 fn ensure_refreshing_path(refreshing: &mut Vec<PathBuf>, path: PathBuf) {
@@ -410,6 +666,27 @@ impl SemanticIndexStatus {
 
     pub fn cancel_refreshing_file(&mut self, path: &Path) {
         self.finish_refreshing_file(path, false);
+    }
+
+    /// Take every file currently tracked as refreshing, clearing the
+    /// accounting. Used when the refresh worker is cancelled outright: the
+    /// caller re-queues the paths for a replacement worker.
+    pub fn take_refreshing_files(&mut self) -> Vec<PathBuf> {
+        if let Self::Ready {
+            refreshing,
+            accounting,
+        } = self
+        {
+            accounting.clear();
+            std::mem::take(refreshing)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// True while a corpus-wide (not per-file) refresh is running.
+    pub fn corpus_refresh_in_flight(&self) -> bool {
+        matches!(self, Self::Building { stage, .. } if stage == "refreshing_corpus")
     }
 
     pub fn complete_refreshing_file(&mut self, path: &Path) {
@@ -513,6 +790,26 @@ pub enum SemanticRefreshEvent {
     CorpusFailed {
         error: String,
     },
+}
+
+pub(crate) struct ReceiverTerminalGuard {
+    terminal_epoch: Arc<AtomicU64>,
+    epoch: u64,
+}
+
+impl ReceiverTerminalGuard {
+    fn new(terminal_epoch: Arc<AtomicU64>, epoch: u64) -> Self {
+        Self {
+            terminal_epoch,
+            epoch,
+        }
+    }
+}
+
+impl Drop for ReceiverTerminalGuard {
+    fn drop(&mut self) {
+        self.terminal_epoch.fetch_max(self.epoch, Ordering::SeqCst);
+    }
 }
 
 pub type SemanticRefreshWorkerSlot = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
@@ -915,7 +1212,7 @@ impl BorrowedIndexCache {
         let BorrowedIndexCacheValue::Search(index) = &entry.1 else {
             return None;
         };
-        let index = index.clone();
+        let index = (*index).clone();
         self.entries.push_back(entry);
         Some(index)
     }
@@ -931,7 +1228,7 @@ impl BorrowedIndexCache {
         let BorrowedIndexCacheValue::Semantic(index) = &entry.1 else {
             return None;
         };
-        let index = index.clone();
+        let index = (*index).clone();
         self.entries.push_back(entry);
         Some(index)
     }
@@ -1040,12 +1337,21 @@ pub struct AppContext {
     /// the same atomic so the decision cannot drift after configure returns.
     heavy_root_work_allowed: Arc<AtomicBool>,
     callgraph_store: RwLock<Option<Arc<ReadonlyCallGraphStore>>>,
-    callgraph_store_force_rebuild: parking_lot::Mutex<bool>,
-    callgraph_store_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
+    callgraph_store_force_requested: AtomicU64,
+    callgraph_store_force_fulfilled: AtomicU64,
+    callgraph_store_rx:
+        parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>>,
+    callgraph_store_rx_generation: AtomicU64,
+    callgraph_store_rx_epoch: AtomicU64,
+    callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
     search_index: RwLock<Option<SearchIndex>>,
     search_index_rx: RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>>,
+    search_index_rx_generation: AtomicU64,
+    search_index_rx_epoch: AtomicU64,
+    search_index_rx_terminal_epoch: Arc<AtomicU64>,
+    search_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
@@ -1053,6 +1359,11 @@ pub struct AppContext {
     pending_tier2_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     semantic_index: RwLock<Option<SemanticIndex>>,
     semantic_index_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
+    semantic_index_rx_generation: AtomicU64,
+    semantic_index_rx_epoch: AtomicU64,
+    semantic_index_rx_terminal_epoch: Arc<AtomicU64>,
+    semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
+    semantic_persist_lock: Arc<parking_lot::Mutex<()>>,
     semantic_index_status: RwLock<SemanticIndexStatus>,
     /// Serializes missing-artifact checks with receiver installation so
     /// concurrent fallback queries cannot start duplicate reload workers.
@@ -1066,22 +1377,33 @@ pub struct AppContext {
     semantic_cold_seed_generation: Arc<AtomicU64>,
     semantic_fingerprint_generation: Arc<AtomicU64>,
     semantic_callgraph_warm_deferred: AtomicBool,
-    pending_semantic_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
+    pending_semantic_index_paths: Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>,
     pending_semantic_corpus_refresh: parking_lot::Mutex<bool>,
     semantic_refresh_tx:
-        parking_lot::Mutex<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>,
+        Arc<parking_lot::Mutex<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>>,
     semantic_refresh_event_rx:
         parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticRefreshEvent>>>,
+    semantic_refresh_generation: AtomicU64,
+    semantic_refresh_epoch: AtomicU64,
+    semantic_refresh_build_epoch: AtomicU64,
     semantic_refresh_worker: parking_lot::Mutex<Option<SemanticRefreshWorkerSlot>>,
     semantic_refresh_retry_attempts: parking_lot::Mutex<BTreeMap<PathBuf, usize>>,
     semantic_refresh_circuit: Arc<SemanticRefreshCircuit>,
     semantic_embedding_model: parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>,
+    watcher_runtime_lock: parking_lot::Mutex<()>,
     watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_drain_slice: parking_lot::Mutex<Option<WatcherDrainSliceState>>,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
     lsp_manager: parking_lot::Mutex<LspManager>,
     configure_generation: Arc<AtomicU64>,
+    /// Advances only when the warm configuration changes, not on route
+    /// teardown. Already-admitted workers use it to decide whether their disk
+    /// artifact is still configuration-compatible after becoming unbound.
+    configure_content_generation: Arc<AtomicU64>,
+    /// Set only by the daemon route lifecycle. Standalone contexts remain bound.
+    /// Deferred maintenance uses the same gate for the state check and admission.
+    subc_lifecycle: SubcLifecycleAdmission,
     configure_warm_state: parking_lot::Mutex<ConfigureWarmState>,
     configure_phase_timing: parking_lot::Mutex<ConfigurePhaseTiming>,
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
@@ -1197,8 +1519,89 @@ pub enum CallgraphStoreAccess {
 #[derive(Clone, Copy)]
 enum CallgraphBackgroundWork {
     Ensure,
-    ForceRebuild,
+    ForceRebuild(u64),
     LegacyMigration,
+}
+
+#[cfg(test)]
+struct CallgraphBuildStartGate {
+    root: PathBuf,
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static CALLGRAPH_BUILD_START_GATE: std::sync::OnceLock<
+    parking_lot::Mutex<Option<CallgraphBuildStartGate>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_callgraph_build_start_gate(
+    root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *CALLGRAPH_BUILD_START_GATE
+        .get_or_init(|| parking_lot::Mutex::new(None))
+        .lock() = Some(CallgraphBuildStartGate {
+        root,
+        reached: reached_tx,
+        release: release_rx,
+    });
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_callgraph_build_start_gate(root: &Path) {
+    let mut slot = CALLGRAPH_BUILD_START_GATE
+        .get_or_init(|| parking_lot::Mutex::new(None))
+        .lock();
+    if !slot.as_ref().is_some_and(|gate| gate.root == root) {
+        return;
+    }
+    let gate = slot.take();
+    drop(slot);
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(5));
+    }
+}
+
+#[cfg(not(test))]
+fn wait_on_callgraph_build_start_gate(_root: &Path) {}
+
+#[cfg(test)]
+static REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+struct RemoveCallgraphPointerBeforeInlineReopenGuard;
+
+#[cfg(test)]
+impl Drop for RemoveCallgraphPointerBeforeInlineReopenGuard {
+    fn drop(&mut self) {
+        REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn remove_callgraph_pointer_before_inline_reopen_for_test(
+    callgraph_dir: &Path,
+    store: &CallGraphStore,
+) {
+    if REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN.swap(false, Ordering::SeqCst) {
+        let pointer = callgraph_dir.join(format!("{}.current", store.project_key()));
+        std::fs::remove_file(pointer).expect("remove callgraph pointer before inline reopen");
+    }
+}
+
+#[cfg(not(test))]
+fn remove_callgraph_pointer_before_inline_reopen_for_test(
+    _callgraph_dir: &Path,
+    _store: &CallGraphStore,
+) {
 }
 
 /// Inline wait window for a callgraph-store cold build before returning
@@ -1274,12 +1677,20 @@ impl AppContext {
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
             callgraph_store: RwLock::new(None),
-            callgraph_store_force_rebuild: parking_lot::Mutex::new(false),
+            callgraph_store_force_requested: AtomicU64::new(0),
+            callgraph_store_force_fulfilled: AtomicU64::new(0),
             callgraph_store_rx: parking_lot::Mutex::new(None),
+            callgraph_store_rx_generation: AtomicU64::new(0),
+            callgraph_store_rx_epoch: AtomicU64::new(0),
+            callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
             search_index: RwLock::new(None),
             search_index_rx: RwLock::new(None),
+            search_index_rx_generation: AtomicU64::new(0),
+            search_index_rx_epoch: AtomicU64::new(0),
+            search_index_rx_terminal_epoch: Arc::new(AtomicU64::new(0)),
+            search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
             inspect_manager: Arc::new(InspectManager::with_heavy_root_work_gate(Arc::clone(
@@ -1289,26 +1700,37 @@ impl AppContext {
             pending_tier2_paths: parking_lot::Mutex::new(BTreeSet::new()),
             semantic_index: RwLock::new(None),
             semantic_index_rx: parking_lot::Mutex::new(None),
+            semantic_index_rx_generation: AtomicU64::new(0),
+            semantic_index_rx_epoch: AtomicU64::new(0),
+            semantic_index_rx_terminal_epoch: Arc::new(AtomicU64::new(0)),
+            semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
+            semantic_persist_lock: Arc::new(parking_lot::Mutex::new(())),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
             artifact_reload_lock: parking_lot::Mutex::new(()),
             semantic_cold_seed_active: Arc::new(AtomicBool::new(false)),
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
             semantic_fingerprint_generation: Arc::new(AtomicU64::new(0)),
             semantic_callgraph_warm_deferred: AtomicBool::new(false),
-            pending_semantic_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
+            pending_semantic_index_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
             pending_semantic_corpus_refresh: parking_lot::Mutex::new(false),
-            semantic_refresh_tx: parking_lot::Mutex::new(None),
+            semantic_refresh_tx: Arc::new(parking_lot::Mutex::new(None)),
             semantic_refresh_event_rx: parking_lot::Mutex::new(None),
+            semantic_refresh_generation: AtomicU64::new(0),
+            semantic_refresh_epoch: AtomicU64::new(0),
+            semantic_refresh_build_epoch: AtomicU64::new(0),
             semantic_refresh_worker: parking_lot::Mutex::new(None),
             semantic_refresh_retry_attempts: parking_lot::Mutex::new(BTreeMap::new()),
             semantic_refresh_circuit: Arc::new(SemanticRefreshCircuit::default()),
             semantic_embedding_model: parking_lot::Mutex::new(None),
+            watcher_runtime_lock: parking_lot::Mutex::new(()),
             watcher: parking_lot::Mutex::new(None),
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_drain_slice: parking_lot::Mutex::new(None),
             watcher_thread: parking_lot::Mutex::new(None),
             lsp_manager: parking_lot::Mutex::new(lsp_manager),
             configure_generation: Arc::new(AtomicU64::new(0)),
+            configure_content_generation: Arc::new(AtomicU64::new(0)),
+            subc_lifecycle: SubcLifecycleAdmission::default(),
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
@@ -1930,9 +2352,37 @@ impl AppContext {
     }
 
     pub fn advance_configure_generation(&self) -> u64 {
-        self.configure_generation
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1)
+        self.subc_lifecycle
+            .advance_generation(self.configure_generation.as_ref())
+    }
+
+    pub(crate) fn mark_subc_bound(&self) {
+        self.subc_lifecycle.mark_bound();
+    }
+
+    pub(crate) fn mark_subc_unbound(&self) {
+        self.subc_lifecycle
+            .mark_unbound(self.configure_generation.as_ref());
+    }
+
+    pub(crate) fn subc_unbound_quiesced(&self) -> bool {
+        self.subc_lifecycle.is_unbound()
+    }
+
+    pub(crate) fn subc_lifecycle_admission(&self) -> SubcLifecycleAdmission {
+        self.subc_lifecycle.clone()
+    }
+
+    pub(crate) fn run_if_subc_bound_generation<R>(
+        &self,
+        expected_generation: u64,
+        action: impl FnOnce() -> R,
+    ) -> Option<R> {
+        self.subc_lifecycle.run_if_current(
+            self.configure_generation.as_ref(),
+            expected_generation,
+            action,
+        )
     }
 
     /// Record the warm-maintenance key for a successful configure and return
@@ -1951,6 +2401,8 @@ impl AppContext {
         let generation = if equivalent {
             self.configure_generation()
         } else {
+            self.configure_content_generation
+                .fetch_add(1, Ordering::SeqCst);
             self.advance_configure_generation()
         };
         state.generation = generation;
@@ -1964,6 +2416,10 @@ impl AppContext {
             .key
             .as_deref()
             .is_some_and(|current| current == key)
+    }
+
+    pub(crate) fn invalidate_configure_warm_state(&self) {
+        self.configure_warm_state.lock().key = None;
     }
 
     pub fn note_configure_session_binding(&self, root: PathBuf, session_id: String) -> bool {
@@ -2012,7 +2468,13 @@ impl AppContext {
         let search_pending = self
             .search_index_rx
             .try_read()
-            .map(|rx| rx.as_ref().is_some_and(|rx| !rx.is_empty()))
+            .map(|slot| {
+                slot.as_ref().is_some_and(|receiver| {
+                    !receiver.is_empty()
+                        || self.search_index_rx_terminal_epoch.load(Ordering::SeqCst)
+                            == self.search_index_rx_epoch()
+                })
+            })
             .unwrap_or(true);
         if search_pending {
             return true;
@@ -2029,7 +2491,11 @@ impl AppContext {
             .semantic_index_rx
             .lock()
             .as_ref()
-            .is_some_and(|rx| !rx.is_empty())
+            .is_some_and(|receiver| {
+                !receiver.is_empty()
+                    || self.semantic_index_rx_terminal_epoch.load(Ordering::SeqCst)
+                        == self.semantic_index_rx_epoch()
+            })
         {
             return true;
         }
@@ -2038,6 +2504,23 @@ impl AppContext {
             .lock()
             .as_ref()
             .is_some_and(|rx| !rx.is_empty())
+        {
+            return true;
+        }
+        if self.semantic_refresh_probe_ready() && self.semantic_refresh_event_rx.lock().is_some() {
+            return true;
+        }
+        if self
+            .semantic_refresh_worker
+            .lock()
+            .as_ref()
+            .is_some_and(|worker_slot| match worker_slot.try_lock() {
+                Ok(handle) => handle
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(_)) => true,
+            })
         {
             return true;
         }
@@ -2054,6 +2537,11 @@ impl AppContext {
 
     pub(crate) fn drain_configure_maintenance(&self) -> Vec<ConfigureMaintenanceJob> {
         self.configure_maintenance_jobs.lock().drain(..).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_maintenance_job_count_for_test(&self) -> usize {
+        self.configure_maintenance_jobs.lock().len()
     }
 
     /// Peek the memoized artifact key without deriving it. Passive readers
@@ -2276,6 +2764,14 @@ impl AppContext {
 
     pub fn configure_generation_flag(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.configure_generation)
+    }
+
+    pub(crate) fn configure_content_generation(&self) -> u64 {
+        self.configure_content_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn configure_content_generation_flag(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.configure_content_generation)
     }
 
     pub(crate) fn begin_configure_ack_phase(&self, phase: &'static str) {
@@ -2590,7 +3086,7 @@ impl AppContext {
     }
 
     pub fn heavy_root_work_allowed(&self) -> bool {
-        self.heavy_root_work_allowed.load(Ordering::SeqCst)
+        self.heavy_root_work_allowed.load(Ordering::SeqCst) && !self.subc_lifecycle.is_unbound()
     }
 
     pub fn add_degraded_reason(&self, reason: impl Into<String>) -> bool {
@@ -2632,15 +3128,21 @@ impl AppContext {
         &self.callgraph_store
     }
 
-    pub fn mark_callgraph_store_force_rebuild(&self) {
-        *self.callgraph_store_force_rebuild.lock() = true;
+    pub fn mark_callgraph_store_force_rebuild(&self) -> u64 {
+        self.callgraph_store_force_requested
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
     }
 
-    fn take_callgraph_store_force_rebuild(&self) -> bool {
-        let mut force = self.callgraph_store_force_rebuild.lock();
-        let was_forced = *force;
-        *force = false;
-        was_forced
+    pub(crate) fn pending_callgraph_store_force_token(&self) -> Option<u64> {
+        let requested = self.callgraph_store_force_requested.load(Ordering::SeqCst);
+        let fulfilled = self.callgraph_store_force_fulfilled.load(Ordering::SeqCst);
+        (requested > fulfilled).then_some(requested)
+    }
+
+    pub fn fulfill_callgraph_store_force_token(&self, token: u64) {
+        self.callgraph_store_force_fulfilled
+            .fetch_max(token, Ordering::SeqCst);
     }
 
     pub fn callgraph_store_dir(&self) -> PathBuf {
@@ -2670,31 +3172,33 @@ impl AppContext {
             return Ok(None);
         }
         self.revalidate_callgraph_store_generation();
-        if let Some(store) = {
-            let guard = self
-                .callgraph_store
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.as_ref().map(Arc::clone)
-        } {
-            self.schedule_legacy_callgraph_migration_if_needed(
-                store.as_ref(),
-                store.project_root().to_path_buf(),
-                self.callgraph_store_dir(),
-            );
-            return Ok(Some(store));
+        let force_token = self.pending_callgraph_store_force_token();
+        if force_token.is_none() {
+            if let Some(store) = {
+                let guard = self
+                    .callgraph_store
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.as_ref().map(Arc::clone)
+            } {
+                self.schedule_legacy_callgraph_migration_if_needed(
+                    store.as_ref(),
+                    store.project_root().to_path_buf(),
+                    self.callgraph_store_dir(),
+                );
+                return Ok(Some(store));
+            }
         }
 
         let Some(project_root) = self.callgraph_project_root() else {
             return Ok(None);
         };
         let callgraph_dir = self.callgraph_store_dir();
-        let force_rebuild = self.take_callgraph_store_force_rebuild();
 
         // Preserve a readable legacy fallback while writer-capable processes
         // migrate it on the cold-build lane. Opening before the writer path is
         // also the cheap fast path for an already-published root generation.
-        if !force_rebuild {
+        if force_token.is_none() {
             if let Some(store) =
                 CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone())?
             {
@@ -2718,37 +3222,59 @@ impl AppContext {
         if !self.callgraph_writer() {
             return Ok(None);
         }
+        let build_generation = self.configure_generation();
+        let persist_epoch_flag = self.callgraph_persist_epoch_flag();
+        let Some(persist_epoch) = self
+            .run_if_subc_bound_generation(build_generation, || self.next_callgraph_persist_epoch())
+        else {
+            return Ok(None);
+        };
         let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-        if force_rebuild {
-            let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
-                callgraph_dir.clone(),
-                project_root.clone(),
-                &files,
-                self.config().callgraph_chunk_size,
-            )?;
-            drop(store);
-        } else {
-            let (store, _stats) = CallGraphStore::ensure_built_with_lease_chunked(
-                callgraph_dir.clone(),
-                project_root.clone(),
-                &files,
-                self.config().callgraph_chunk_size,
-            )?;
-            drop(store);
-        }
+        let (store, _stats) = crate::callgraph_store::with_publish_epoch(
+            persist_epoch_flag.clone(),
+            persist_epoch,
+            || {
+                if force_token.is_some() {
+                    CallGraphStore::force_cold_build_with_lease_chunked(
+                        callgraph_dir.clone(),
+                        project_root.clone(),
+                        &files,
+                        self.config().callgraph_chunk_size,
+                    )
+                    .map(|(store, _stats)| (store, ()))
+                } else {
+                    CallGraphStore::ensure_built_with_lease_chunked(
+                        callgraph_dir.clone(),
+                        project_root.clone(),
+                        &files,
+                        self.config().callgraph_chunk_size,
+                    )
+                    .map(|(store, _stats)| (store, ()))
+                }
+            },
+        )?;
+        drop(store);
 
         let Some(store) = CallGraphStore::open_readonly(callgraph_dir, project_root)? else {
             return Ok(None);
         };
         let store = Arc::new(store);
-        {
+        self.run_if_subc_bound_generation(build_generation, || {
+            if persist_epoch_flag.current() != persist_epoch {
+                return None;
+            }
             let mut guard = self
                 .callgraph_store
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = Some(Arc::clone(&store));
-        }
-        Ok(Some(store))
+            if let Some(force_token) = force_token {
+                self.fulfill_callgraph_store_force_token(force_token);
+            }
+            Some(Arc::clone(&store))
+        })
+        .flatten()
+        .map_or(Ok(None), |store| Ok(Some(store)))
     }
 
     /// Resolve the project root used for the callgraph store: prefer the
@@ -2796,24 +3322,28 @@ impl AppContext {
         if !self.heavy_root_work_allowed() {
             return CallgraphStoreAccess::Unavailable;
         }
+        let operation_generation = self.configure_generation();
 
         // Converge to a newer generation another process (or a local cold
         // rebuild) may have published: if our resident store is superseded, drop
         // it so the open path below reopens via the pointer. Cheap pointer read.
         self.revalidate_callgraph_store_generation();
-        if let Some(store) = {
-            let guard = self
-                .callgraph_store
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.as_ref().map(Arc::clone)
-        } {
-            self.schedule_legacy_callgraph_migration_if_needed(
-                store.as_ref(),
-                store.project_root().to_path_buf(),
-                self.callgraph_store_dir(),
-            );
-            return CallgraphStoreAccess::Ready(store);
+        let force_token = self.pending_callgraph_store_force_token();
+        if force_token.is_none() {
+            if let Some(store) = {
+                let guard = self
+                    .callgraph_store
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.as_ref().map(Arc::clone)
+            } {
+                self.schedule_legacy_callgraph_migration_if_needed(
+                    store.as_ref(),
+                    store.project_root().to_path_buf(),
+                    self.callgraph_store_dir(),
+                );
+                return CallgraphStoreAccess::Ready(store);
+            }
         }
 
         // A background build is already running; don't start a second one.
@@ -2826,18 +3356,21 @@ impl AppContext {
         };
         let callgraph_dir = self.callgraph_store_dir();
 
-        let force_rebuild = *self.callgraph_store_force_rebuild.lock();
-        if !force_rebuild {
+        if force_token.is_none() {
             match CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone()) {
                 Ok(Some(store)) => {
                     let store = Arc::new(store);
-                    {
+                    let installed = self.run_if_subc_bound_generation(operation_generation, || {
                         let mut guard = self
                             .callgraph_store
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         *guard = Some(Arc::clone(&store));
-                    }
+                        Arc::clone(&store)
+                    });
+                    let Some(store) = installed else {
+                        return CallgraphStoreAccess::Unavailable;
+                    };
                     self.schedule_legacy_callgraph_migration_if_needed(
                         store.as_ref(),
                         project_root.clone(),
@@ -2876,8 +3409,8 @@ impl AppContext {
         // `AFT_CALLGRAPH_BUILD_WAIT_MS` (default 0) optionally waits a bounded
         // window inline for the build to land before returning `Building`; tests
         // set it large so fixture builds resolve to `Ready` synchronously.
-        let work = if force_rebuild {
-            CallgraphBackgroundWork::ForceRebuild
+        let work = if let Some(force_token) = force_token {
+            CallgraphBackgroundWork::ForceRebuild(force_token)
         } else {
             CallgraphBackgroundWork::Ensure
         };
@@ -2888,50 +3421,100 @@ impl AppContext {
 
         let wait = callgraph_build_wait_window();
         if !wait.is_zero() {
-            let received = {
+            let (received, receiver_generation, receiver_epoch) = {
                 let rx_ref = self.callgraph_store_rx.lock();
                 let Some(rx) = rx_ref.as_ref() else {
                     return CallgraphStoreAccess::Building;
                 };
-                rx.recv_timeout(wait)
+                (
+                    rx.recv_timeout(wait),
+                    self.callgraph_store_rx_generation(),
+                    self.callgraph_store_rx_epoch(),
+                )
             };
             match received {
-                Ok(store) => {
-                    // Replay any source files the watcher saw during the wait so
-                    // the installed store reflects mid-build edits (mirrors the
-                    // drain install path). Empty in the common case.
-                    let pending = self.take_pending_callgraph_store_paths();
+                Ok(CallGraphStoreBuildEvent::Ready {
+                    store,
+                    fulfilled_force_token,
+                    publication_epoch,
+                }) => {
+                    if self.callgraph_persist_epoch_flag().current() != publication_epoch {
+                        // Superseded publication: a newer configure owns the
+                        // pointer. Clear the receiver and report Building so the
+                        // replacement build's event installs instead.
+                        drop(store);
+                        let _ = self.with_current_callgraph_store_rx(
+                            receiver_generation,
+                            receiver_epoch,
+                            |receiver| {
+                                *receiver = None;
+                            },
+                        );
+                        return CallgraphStoreAccess::Building;
+                    }
                     // The completed build owns the writer lease until dropped;
-                    // release it before the refresh worker lazily opens the newly
-                    // published generation.
+                    // release it before reopening the published generation.
+                    remove_callgraph_pointer_before_inline_reopen_for_test(&callgraph_dir, &store);
                     drop(store);
-                    if !pending.is_empty() {
-                        self.enqueue_callgraph_store_refresh(pending);
-                    }
-                    let ready = match CallGraphStore::open_readonly(
-                        callgraph_dir.clone(),
-                        project_root.clone(),
-                    ) {
-                        Ok(Some(store)) => Arc::new(store),
-                        Ok(None) => return CallgraphStoreAccess::Building,
-                        Err(error) => return CallgraphStoreAccess::Error(error),
+                    let reopened =
+                        CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone());
+                    let mut pending = Vec::new();
+                    let outcome = self.with_current_callgraph_store_rx(
+                        receiver_generation,
+                        receiver_epoch,
+                        |receiver| {
+                            *receiver = None;
+                            match reopened {
+                                Ok(Some(store)) => {
+                                    let ready = Arc::new(store);
+                                    pending = self.take_pending_callgraph_store_paths();
+                                    *self
+                                        .callgraph_store
+                                        .write()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(Arc::clone(&ready));
+                                    if let Some(force_token) = fulfilled_force_token {
+                                        self.fulfill_callgraph_store_force_token(force_token);
+                                    }
+                                    CallgraphStoreAccess::Ready(ready)
+                                }
+                                Ok(None) => CallgraphStoreAccess::Building,
+                                Err(error) => CallgraphStoreAccess::Error(error),
+                            }
+                        },
+                    );
+                    let Some(outcome) = outcome else {
+                        return if self.subc_unbound_quiesced()
+                            || self.configure_generation() != receiver_generation
+                        {
+                            CallgraphStoreAccess::Unavailable
+                        } else {
+                            CallgraphStoreAccess::Building
+                        };
                     };
-                    {
-                        let mut guard = self
-                            .callgraph_store
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        *guard = Some(Arc::clone(&ready));
+                    if !pending.is_empty() {
+                        let _ = self.enqueue_callgraph_store_refresh(pending);
                     }
-                    *self.callgraph_store_rx.lock() = None;
-                    let _ = self.request_tier2_refresh_pull();
-                    return CallgraphStoreAccess::Ready(ready);
+                    if matches!(&outcome, CallgraphStoreAccess::Ready(_)) {
+                        let _ = self.request_tier2_refresh_pull();
+                    }
+                    return outcome;
+                }
+                Ok(CallGraphStoreBuildEvent::Settled) => {
+                    let _ = self.with_current_callgraph_store_rx(
+                        receiver_generation,
+                        receiver_epoch,
+                        |receiver| *receiver = None,
+                    );
+                    return CallgraphStoreAccess::Building;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    // Build failed before sending; clear the receiver so a later
-                    // op restarts the build instead of waiting on a dead channel.
-                    *self.callgraph_store_rx.lock() = None;
+                    let _ = self.with_current_callgraph_store_rx(
+                        receiver_generation,
+                        receiver_epoch,
+                        |receiver| *receiver = None,
+                    );
                 }
             }
         }
@@ -2988,7 +3571,20 @@ impl AppContext {
         if !self.heavy_root_work_allowed() || !self.callgraph_writer() {
             return false;
         }
+        let generation = self.configure_generation();
+        self.run_if_subc_bound_generation(generation, || {
+            self.spawn_callgraph_store_cold_build_admitted(project_root, callgraph_dir, work)
+        })
+        .unwrap_or(false)
+    }
 
+    /// Start a callgraph worker after lifecycle admission has been acquired.
+    fn spawn_callgraph_store_cold_build_admitted(
+        &self,
+        project_root: PathBuf,
+        callgraph_dir: PathBuf,
+        work: CallgraphBackgroundWork,
+    ) -> bool {
         let session_id = crate::log_ctx::current_session();
         let chunk_size = self.config().callgraph_chunk_size;
         let build_generation = self.configure_generation();
@@ -3009,49 +3605,65 @@ impl AppContext {
             return false;
         };
 
-        if matches!(work, CallgraphBackgroundWork::ForceRebuild) {
-            // Consume the force flag now so a follow-up request doesn't queue a
-            // second forced build while this one is in flight.
-            self.take_callgraph_store_force_rebuild();
-        }
-        let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStore>();
+        let force_token = match work {
+            CallgraphBackgroundWork::ForceRebuild(token) => Some(token),
+            CallgraphBackgroundWork::Ensure | CallgraphBackgroundWork::LegacyMigration => None,
+        };
+        let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStoreBuildEvent>();
+        self.note_callgraph_store_rx_generation(build_generation);
+        self.next_callgraph_store_rx_epoch();
         *rx_guard = Some(rx);
+        let persist_epoch = self.next_callgraph_persist_epoch();
+        let persist_epoch_flag = self.callgraph_persist_epoch_flag();
 
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
 
         std::thread::spawn(move || {
             let _permit = permit;
+            let mut settlement = CallGraphStoreBuildSettlement::new(tx, force_token, persist_epoch);
             crate::log_ctx::with_session(session_id, || {
-                let built = match work {
-                    CallgraphBackgroundWork::LegacyMigration => {
-                        CallGraphStore::migrate_legacy_with_lease(
-                            callgraph_dir.clone(),
-                            project_root.clone(),
-                        )
-                    }
-                    CallgraphBackgroundWork::ForceRebuild => {
-                        let files =
-                            crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                        CallGraphStore::cold_build_with_lease_chunked(
-                            callgraph_dir.clone(),
-                            project_root.clone(),
-                            &files,
-                            chunk_size,
-                        )
-                        .map(|(store, _)| Some(store))
-                    }
-                    CallgraphBackgroundWork::Ensure => {
-                        let files =
-                            crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                        CallGraphStore::ensure_built_with_lease_chunked(
-                            callgraph_dir.clone(),
-                            project_root.clone(),
-                            &files,
-                            chunk_size,
-                        )
-                        .map(|(store, _)| Some(store))
-                    }
-                };
+                wait_on_callgraph_build_start_gate(&project_root);
+                if persist_epoch_flag.current() != persist_epoch {
+                    crate::slog_info!(
+                        "callgraph store background work skipped for superseded epoch {}",
+                        persist_epoch
+                    );
+                    return;
+                }
+                let built = crate::callgraph_store::with_publish_epoch(
+                    persist_epoch_flag,
+                    persist_epoch,
+                    || match work {
+                        CallgraphBackgroundWork::LegacyMigration => {
+                            CallGraphStore::migrate_legacy_with_lease(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                            )
+                        }
+                        CallgraphBackgroundWork::ForceRebuild(_) => {
+                            let files = crate::callgraph::walk_project_files(&project_root)
+                                .collect::<Vec<_>>();
+                            CallGraphStore::force_cold_build_with_lease_chunked(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                                &files,
+                                chunk_size,
+                            )
+                            .map(|(store, _)| Some(store))
+                        }
+                        CallgraphBackgroundWork::Ensure => {
+                            let files = crate::callgraph::walk_project_files(&project_root)
+                                .collect::<Vec<_>>();
+                            CallGraphStore::ensure_built_with_lease_chunked(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                                &files,
+                                chunk_size,
+                            )
+                            .map(|(store, _)| Some(store))
+                        }
+                    },
+                );
                 match built {
                     Ok(Some(store)) => {
                         if store.is_legacy_migration() {
@@ -3081,7 +3693,7 @@ impl AppContext {
                             }
                         }
                         if generation_flag.load(Ordering::SeqCst) == build_generation {
-                            let _ = tx.send(store);
+                            settlement.ready(store);
                         } else {
                             crate::slog_info!(
                                 "callgraph store warm build result discarded for stale generation {}",
@@ -3090,10 +3702,14 @@ impl AppContext {
                         }
                     }
                     Ok(None) => {}
+                    Err(crate::callgraph_store::CallGraphStoreError::Superseded) => {
+                        crate::slog_info!(
+                            "callgraph store disk publication skipped for superseded epoch {}",
+                            persist_epoch
+                        );
+                    }
                     Err(error) => {
                         crate::slog_warn!("callgraph store background work failed: {}", error);
-                        // Dropping tx disconnects the channel; the drain clears
-                        // the receiver so a later op can retry the work.
                     }
                 }
             });
@@ -3105,8 +3721,67 @@ impl AppContext {
     /// main loop once the cold build completes).
     pub fn callgraph_store_rx(
         &self,
-    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStore>>> {
+    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>> {
         &self.callgraph_store_rx
+    }
+
+    /// Commit a dequeued result only while its lifecycle and receiver identity
+    /// remain current. Lifecycle admission is intentionally acquired first,
+    /// matching worker-start paths and preventing a lock-order cycle.
+    #[doc(hidden)]
+    pub fn with_current_callgraph_store_rx<R>(
+        &self,
+        generation: u64,
+        epoch: u64,
+        action: impl FnOnce(&mut Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>) -> R,
+    ) -> Option<R> {
+        self.run_if_subc_bound_generation(generation, || {
+            let mut receiver = self.callgraph_store_rx.lock();
+            if receiver.is_none()
+                || self.callgraph_store_rx_generation() != generation
+                || self.callgraph_store_rx_epoch() != epoch
+            {
+                return None;
+            }
+            Some(action(&mut receiver))
+        })
+        .flatten()
+    }
+
+    pub(crate) fn retire_callgraph_store_rx(&self) {
+        let mut receiver = self.callgraph_store_rx.lock();
+        *receiver = None;
+        self.next_callgraph_store_rx_epoch();
+    }
+
+    pub(crate) fn note_callgraph_store_rx_generation(&self, generation: u64) {
+        self.callgraph_store_rx_generation
+            .store(generation, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn callgraph_store_rx_generation(&self) -> u64 {
+        self.callgraph_store_rx_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_callgraph_store_rx_epoch(&self) -> u64 {
+        self.callgraph_store_rx_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    #[doc(hidden)]
+    pub fn callgraph_store_rx_epoch(&self) -> u64 {
+        self.callgraph_store_rx_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_callgraph_persist_epoch(&self) -> u64 {
+        self.callgraph_persist_epoch.next()
+    }
+
+    #[doc(hidden)]
+    pub fn callgraph_persist_epoch_flag(&self) -> crate::root_cache::ArtifactPublishEpoch {
+        self.callgraph_persist_epoch.clone()
     }
 
     /// Record source-file paths that could not be applied to the writable store
@@ -3118,9 +3793,19 @@ impl AppContext {
         self.pending_callgraph_store_paths.lock().extend(paths);
     }
 
-    /// Queue a refresh on the process-wide store worker. Writer-ineligible roots
-    /// retain the invalidation for replay instead of touching shared store state.
     pub fn enqueue_callgraph_store_refresh<I>(&self, paths: I) -> bool
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let generation = self.configure_generation();
+        self.enqueue_callgraph_store_refresh_for_generation(paths, generation)
+    }
+
+    pub(crate) fn enqueue_callgraph_store_refresh_for_generation<I>(
+        &self,
+        paths: I,
+        generation: u64,
+    ) -> bool
     where
         I: IntoIterator<Item = PathBuf>,
     {
@@ -3128,29 +3813,65 @@ impl AppContext {
         if paths.is_empty() {
             return true;
         }
-        if !self.heavy_root_work_allowed() {
-            return false;
-        }
-        if !self.callgraph_writer() {
-            self.add_pending_callgraph_store_paths(paths);
-            return false;
-        }
-        let Some(project_root) = self.callgraph_project_root() else {
-            self.add_pending_callgraph_store_paths(paths);
-            return false;
-        };
-        crate::callgraph_store::enqueue_callgraph_store_refresh(
-            self.callgraph_store_dir(),
-            project_root,
-            paths,
-            Arc::clone(&self.pending_callgraph_store_paths),
-        )
+        self.run_if_subc_bound_generation(generation, || {
+            if !self.callgraph_writer() {
+                self.add_pending_callgraph_store_paths(paths);
+                return false;
+            }
+            let Some(project_root) = self.callgraph_project_root() else {
+                self.add_pending_callgraph_store_paths(paths);
+                return false;
+            };
+
+            // The ticket fences the batch against lifecycle transitions and
+            // cold-build publications: a superseded batch defers its paths to
+            // the pending sink instead of committing into a store generation
+            // that a newer configure no longer owns.
+            let ticket = crate::callgraph_store::CallgraphRefreshTicket::new(
+                self.subc_lifecycle_admission(),
+                self.configure_generation_flag(),
+                generation,
+                self.callgraph_persist_epoch_flag(),
+                self.callgraph_persist_epoch_flag().current(),
+            );
+            crate::callgraph_store::enqueue_callgraph_store_refresh_fenced(
+                self.callgraph_store_dir(),
+                project_root,
+                paths,
+                Arc::clone(&self.pending_callgraph_store_paths),
+                ticket,
+            )
+        })
+        .unwrap_or(false)
     }
 
     /// Take and clear paths waiting for a ready writable store.
+    ///
+    /// Paths outside the current project root are dropped: the pending sink is
+    /// shared with detached refresh batches, so a batch superseded by a root
+    /// change can defer paths from the PREVIOUS root after configure cleared
+    /// the sink. Replaying those would index foreign files into the new root's
+    /// store (refresh accepts absolute out-of-root paths).
     pub fn take_pending_callgraph_store_paths(&self) -> Vec<PathBuf> {
+        let roots: Vec<PathBuf> = [
+            self.canonical_cache_root_opt(),
+            self.config().project_root.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         std::mem::take(&mut *self.pending_callgraph_store_paths.lock())
             .into_iter()
+            .filter(|path| {
+                let in_root = pending_path_in_roots(path, &roots);
+                if !in_root {
+                    crate::slog_debug!(
+                        "dropping pending callgraph path outside current root: {}",
+                        path.display()
+                    );
+                }
+                in_root
+            })
             .collect()
     }
 
@@ -3162,6 +3883,85 @@ impl AppContext {
     /// Access the search-index build receiver.
     pub fn search_index_rx(&self) -> &RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>> {
         &self.search_index_rx
+    }
+
+    pub(crate) fn install_search_index_rx(
+        &self,
+        receiver: crossbeam_channel::Receiver<SearchIndex>,
+        generation: u64,
+    ) -> u64 {
+        let mut slot = self
+            .search_index_rx
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.note_search_index_rx_generation(generation);
+        let epoch = self.next_search_index_rx_epoch();
+        *slot = Some(receiver);
+        epoch
+    }
+
+    pub(crate) fn search_index_rx_terminal_guard(&self, epoch: u64) -> ReceiverTerminalGuard {
+        ReceiverTerminalGuard::new(Arc::clone(&self.search_index_rx_terminal_epoch), epoch)
+    }
+
+    /// Keep generation/epoch validation and receiver mutation under the same
+    /// lock used by receiver installation.
+    pub(crate) fn with_current_search_index_rx<R>(
+        &self,
+        generation: u64,
+        epoch: u64,
+        action: impl FnOnce(&mut Option<crossbeam_channel::Receiver<SearchIndex>>) -> R,
+    ) -> Option<R> {
+        self.run_if_subc_bound_generation(generation, || {
+            let mut receiver = self
+                .search_index_rx
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if receiver.is_none()
+                || self.search_index_rx_generation() != generation
+                || self.search_index_rx_epoch() != epoch
+            {
+                return None;
+            }
+            Some(action(&mut receiver))
+        })
+        .flatten()
+    }
+
+    pub(crate) fn retire_search_index_rx(&self) {
+        let mut receiver = self
+            .search_index_rx
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *receiver = None;
+        self.next_search_index_rx_epoch();
+    }
+
+    pub(crate) fn note_search_index_rx_generation(&self, generation: u64) {
+        self.search_index_rx_generation
+            .store(generation, Ordering::SeqCst);
+    }
+
+    pub(crate) fn search_index_rx_generation(&self) -> u64 {
+        self.search_index_rx_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_search_index_rx_epoch(&self) -> u64 {
+        self.search_index_rx_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub(crate) fn search_index_rx_epoch(&self) -> u64 {
+        self.search_index_rx_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_search_persist_epoch(&self) -> u64 {
+        self.search_persist_epoch.next()
+    }
+
+    pub(crate) fn search_persist_epoch_flag(&self) -> crate::root_cache::ArtifactPublishEpoch {
+        self.search_persist_epoch.clone()
     }
 
     pub fn add_pending_search_index_paths<I>(&self, paths: I)
@@ -3218,6 +4018,161 @@ impl AppContext {
         self.pending_tier2_paths.lock().clear();
         self.pending_semantic_index_paths.lock().clear();
         *self.pending_semantic_corpus_refresh.lock() = false;
+    }
+
+    /// Take the retained pending reconciliation state for a transactional
+    /// teardown. The caller commits the disposal by dropping the returned
+    /// state after eviction succeeds, or restores it with
+    /// [`Self::restore_pending_reconciliation_state`] when eviction is blocked
+    /// by a secondary blocker (running bash, in-flight builds): the paths are
+    /// the only repair record for consumed watcher events, and the root may
+    /// rebind before the next reap attempt.
+    pub(crate) fn take_pending_reconciliation_state(&self) -> PendingReconciliationState {
+        PendingReconciliationState {
+            search: std::mem::take(&mut *self.pending_search_index_paths.lock()),
+            callgraph: std::mem::take(&mut *self.pending_callgraph_store_paths.lock()),
+            tier2: std::mem::take(&mut *self.pending_tier2_paths.lock()),
+            semantic: std::mem::take(&mut *self.pending_semantic_index_paths.lock()),
+            corpus_refresh: std::mem::take(&mut *self.pending_semantic_corpus_refresh.lock()),
+        }
+    }
+
+    pub(crate) fn restore_pending_reconciliation_state(&self, state: PendingReconciliationState) {
+        self.pending_search_index_paths.lock().extend(state.search);
+        self.pending_callgraph_store_paths
+            .lock()
+            .extend(state.callgraph);
+        self.pending_tier2_paths.lock().extend(state.tier2);
+        self.pending_semantic_index_paths
+            .lock()
+            .extend(state.semantic);
+        if state.corpus_refresh {
+            *self.pending_semantic_corpus_refresh.lock() = true;
+        }
+    }
+
+    /// Cancel artifact work that no longer has a bound daemon route to consume it.
+    /// `mark_subc_unbound` advances the generation under the lifecycle admission
+    /// gate before this cleanup runs. Clearing receivers lets a later rebind
+    /// schedule fresh work instead of adopting a disconnected worker forever.
+    ///
+    /// Pending watcher-derived path sets are RETAINED: a pre-unbind artifact
+    /// worker may legitimately finish generation-safe disk persistence during
+    /// the unbound window (content generation and persist epochs deliberately
+    /// do not advance on route teardown), and those paths are the only record
+    /// that its artifact is content-stale. Rebind replays them. Disposal of
+    /// pending state belongs to non-equivalent configure and TTL eviction
+    /// (transactional take in the TTL reaper), whose strict invalidation
+    /// subsumes their purpose.
+    pub(crate) fn cancel_unbound_artifact_work(&self) {
+        // A cancelled non-ready search corpus refresh left the resident index
+        // marked not-ready; retiring its receiver alone would strand it
+        // (equivalent rebind only reloads a MISSING index). Drop the resident
+        // index too so the rebind's artifact setup reloads from disk and the
+        // retained pending paths repair it on install.
+        let search_refresh_cancelled = self
+            .search_index_rx
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        self.retire_search_index_rx();
+        if search_refresh_cancelled {
+            let mut resident = self
+                .search_index
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if resident.as_ref().is_some_and(|index| !index.ready) {
+                *resident = None;
+            }
+        }
+        self.retire_callgraph_store_rx();
+        let semantic_cancelled = self.semantic_index_rx.lock().is_some();
+        self.retire_semantic_index_rx();
+        let semantic_refresh_cancelled = self.semantic_refresh_event_rx.lock().is_some();
+        self.clear_semantic_refresh_worker();
+        self.reset_semantic_cold_seed_gate_for_configure();
+        let _ = self.inspect_manager.discard_completions();
+        let _ = self.take_new_reuse_completions();
+        if semantic_cancelled || semantic_refresh_cancelled {
+            let has_index = self
+                .semantic_index
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            // In-flight refreshing files were consumed from the watcher; the
+            // cancelled worker will never re-embed them. Transfer them to the
+            // retained pending set so the rebind's replacement worker does.
+            {
+                let mut status = self
+                    .semantic_index_status
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let refreshing = status.take_refreshing_files();
+                if !refreshing.is_empty() {
+                    self.pending_semantic_index_paths.lock().extend(refreshing);
+                }
+                if status.corpus_refresh_in_flight() {
+                    *self.pending_semantic_corpus_refresh.lock() = true;
+                }
+                *status = if has_index {
+                    SemanticIndexStatus::ready()
+                } else {
+                    SemanticIndexStatus::Disabled
+                };
+            }
+        }
+    }
+
+    /// Gate every watcher-maintained artifact after the last route detaches. Files
+    /// may change before the watcher is restored, so a later bind must reconcile
+    /// from disk instead of serving retained snapshots that missed those edits.
+    pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
+        self.next_search_persist_epoch();
+        self.next_semantic_persist_epoch();
+        self.next_callgraph_persist_epoch();
+
+        self.search_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.semantic_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.callgraph_store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Keep semantic status reloadable when the feature is enabled: the
+        // query path's self-healing reload only fires from Ready (or Failed on
+        // read-only roots), so Disabled would strand an already-bound root
+        // with no way back short of a reconfigure. The advanced persist epoch
+        // and strict verify memo force the reload to re-verify from disk.
+        *self
+            .semantic_index_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = if self.config().semantic_search {
+            SemanticIndexStatus::ready()
+        } else {
+            SemanticIndexStatus::Disabled
+        };
+        // A force token is only fulfillable by a local writer build; read-only
+        // roots follow the owner's published pointer and would be stuck
+        // permanently unavailable behind an unfulfillable token.
+        if self.callgraph_writer() {
+            self.mark_callgraph_store_force_rebuild();
+        }
+
+        if let Some(root) = self
+            .canonical_cache_root_opt()
+            .or_else(|| self.config().project_root.clone())
+        {
+            crate::cache_freshness::invalidate_verify_memo_strict(&root);
+        }
+        self.borrowed_index_cache.lock().clear();
+        self.inspect_manager.evict_idle_caches();
+        self.reset_symbol_cache();
+        self.clear_tsconfig_membership_cache();
     }
 
     fn drain_search_index_events_for_graceful_shutdown(&self) {
@@ -3313,8 +4268,7 @@ impl AppContext {
         }
 
         let git_head = index.stored_git_head().map(str::to_owned);
-        index.write_to_disk(&cache_dir, git_head.as_deref());
-        true
+        index.write_to_disk(&cache_dir, git_head.as_deref())
     }
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
@@ -3440,6 +4394,7 @@ impl AppContext {
     }
 
     fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
+        let generation = self.configure_generation();
         if !self.inspect_writer()
             || !self.heavy_root_work_allowed()
             || !manager.automatic_tier2_refresh_allowed()
@@ -3447,6 +4402,16 @@ impl AppContext {
         {
             return;
         }
+        let _ = self.run_if_subc_bound_generation(generation, || {
+            self.start_tier2_refresh_admitted(reason, manager);
+        });
+    }
+
+    fn start_tier2_refresh_admitted(
+        &self,
+        reason: Tier2TriggerReason,
+        manager: Arc<InspectManager>,
+    ) {
         let Some(snapshot) = self.tier2_refresh_snapshot() else {
             return;
         };
@@ -3529,6 +4494,95 @@ impl AppContext {
         &self.semantic_index_rx
     }
 
+    pub(crate) fn install_semantic_index_rx(
+        &self,
+        receiver: crossbeam_channel::Receiver<SemanticIndexEvent>,
+        generation: u64,
+    ) -> u64 {
+        let mut slot = self.semantic_index_rx.lock();
+        self.note_semantic_index_rx_generation(generation);
+        let epoch = self.next_semantic_index_rx_epoch();
+        *slot = Some(receiver);
+        epoch
+    }
+
+    pub(crate) fn semantic_index_rx_terminal_guard(&self, epoch: u64) -> ReceiverTerminalGuard {
+        ReceiverTerminalGuard::new(Arc::clone(&self.semantic_index_rx_terminal_epoch), epoch)
+    }
+
+    /// Keep generation/epoch validation and receiver mutation under the same
+    /// lock used by receiver installation.
+    pub(crate) fn with_current_semantic_index_rx<R>(
+        &self,
+        generation: u64,
+        epoch: u64,
+        action: impl FnOnce(&mut Option<crossbeam_channel::Receiver<SemanticIndexEvent>>) -> R,
+    ) -> Option<R> {
+        self.run_if_subc_bound_generation(generation, || {
+            let mut receiver = self.semantic_index_rx.lock();
+            if receiver.is_none()
+                || self.semantic_index_rx_generation() != generation
+                || self.semantic_index_rx_epoch() != epoch
+            {
+                return None;
+            }
+            Some(action(&mut receiver))
+        })
+        .flatten()
+    }
+
+    pub(crate) fn retire_semantic_index_rx(&self) {
+        let mut receiver = self.semantic_index_rx.lock();
+        *receiver = None;
+        self.next_semantic_index_rx_epoch();
+    }
+
+    /// Retire a build receiver only if no replacement changed its epoch after
+    /// the caller inspected it. `None` means a newer receiver won the race;
+    /// `Some(false)` means the inspected epoch is still current but empty.
+    pub(crate) fn retire_semantic_index_rx_if_epoch(&self, expected_epoch: u64) -> Option<bool> {
+        let mut receiver = self.semantic_index_rx.lock();
+        if self.semantic_index_rx_epoch() != expected_epoch {
+            return None;
+        }
+        let retired = receiver.take().is_some();
+        if retired {
+            self.next_semantic_index_rx_epoch();
+        }
+        Some(retired)
+    }
+
+    pub(crate) fn note_semantic_index_rx_generation(&self, generation: u64) {
+        self.semantic_index_rx_generation
+            .store(generation, Ordering::SeqCst);
+    }
+
+    pub(crate) fn semantic_index_rx_generation(&self) -> u64 {
+        self.semantic_index_rx_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_semantic_index_rx_epoch(&self) -> u64 {
+        self.semantic_index_rx_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub(crate) fn semantic_index_rx_epoch(&self) -> u64 {
+        self.semantic_index_rx_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_semantic_persist_epoch(&self) -> u64 {
+        self.semantic_persist_epoch.next()
+    }
+
+    pub(crate) fn semantic_persist_epoch_flag(&self) -> crate::root_cache::ArtifactPublishEpoch {
+        self.semantic_persist_epoch.clone()
+    }
+
+    pub(crate) fn semantic_persist_lock(&self) -> Arc<parking_lot::Mutex<()>> {
+        Arc::clone(&self.semantic_persist_lock)
+    }
+
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
         &self.semantic_index_status
     }
@@ -3591,46 +4645,57 @@ impl AppContext {
         self.resume_semantic_cold_seed_deferred_work(true);
     }
 
-    fn resume_semantic_cold_seed_deferred_work(&self, force: bool) {
+    pub(crate) fn take_semantic_cold_seed_resume(&self, force: bool) -> SemanticColdSeedResume {
         let was_active = self.semantic_cold_seed_active.swap(false, Ordering::SeqCst);
-        let had_deferred_callgraph = self.semantic_callgraph_warm_deferred();
+        let warm_callgraph = self
+            .semantic_callgraph_warm_deferred
+            .swap(false, Ordering::SeqCst);
+        SemanticColdSeedResume {
+            request_tier2: force || was_active || warm_callgraph,
+            warm_callgraph,
+        }
+    }
 
-        if force || was_active || had_deferred_callgraph {
+    pub(crate) fn apply_semantic_cold_seed_resume(&self, resume: SemanticColdSeedResume) {
+        if resume.request_tier2 {
             let _ = self.request_tier2_refresh_pull();
         }
 
-        if self
-            .semantic_callgraph_warm_deferred
-            .swap(false, Ordering::SeqCst)
+        if !resume.warm_callgraph
+            || !self.config().callgraph_store
+            || !self.heavy_root_work_allowed()
         {
-            if !self.config().callgraph_store || !self.heavy_root_work_allowed() {
-                return;
-            }
+            return;
+        }
 
-            match self.callgraph_store_for_ops() {
-                CallgraphStoreAccess::Ready(_) => {
-                    crate::slog_debug!(
-                        "deferred callgraph store warm completed after semantic cold seed gate cleared"
-                    );
-                }
-                CallgraphStoreAccess::Building => {
-                    crate::slog_info!(
-                        "deferred callgraph store warm scheduled after semantic cold seed gate cleared"
-                    );
-                }
-                CallgraphStoreAccess::Unavailable => {
-                    crate::slog_info!(
-                        "deferred callgraph store warm unavailable after semantic cold seed gate cleared"
-                    );
-                }
-                CallgraphStoreAccess::Error(error) => {
-                    crate::slog_warn!(
-                        "deferred callgraph store warm failed after semantic cold seed gate cleared: {}",
-                        error
-                    );
-                }
+        match self.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(_) => {
+                crate::slog_debug!(
+                    "deferred callgraph store warm completed after semantic cold seed gate cleared"
+                );
+            }
+            CallgraphStoreAccess::Building => {
+                crate::slog_info!(
+                    "deferred callgraph store warm scheduled after semantic cold seed gate cleared"
+                );
+            }
+            CallgraphStoreAccess::Unavailable => {
+                crate::slog_info!(
+                    "deferred callgraph store warm unavailable after semantic cold seed gate cleared"
+                );
+            }
+            CallgraphStoreAccess::Error(error) => {
+                crate::slog_warn!(
+                    "deferred callgraph store warm failed after semantic cold seed gate cleared: {}",
+                    error
+                );
             }
         }
+    }
+
+    fn resume_semantic_cold_seed_deferred_work(&self, force: bool) {
+        let resume = self.take_semantic_cold_seed_resume(force);
+        self.apply_semantic_cold_seed_resume(resume);
     }
 
     #[doc(hidden)]
@@ -3650,16 +4715,110 @@ impl AppContext {
         event_rx: crossbeam_channel::Receiver<SemanticRefreshEvent>,
         worker_slot: SemanticRefreshWorkerSlot,
     ) {
+        self.install_semantic_refresh_worker_for_build_epoch(
+            sender,
+            event_rx,
+            worker_slot,
+            self.semantic_index_rx_epoch(),
+        );
+    }
+
+    pub(crate) fn install_semantic_refresh_worker_for_build_epoch(
+        &self,
+        sender: crossbeam_channel::Sender<SemanticRefreshRequest>,
+        event_rx: crossbeam_channel::Receiver<SemanticRefreshEvent>,
+        worker_slot: SemanticRefreshWorkerSlot,
+        build_epoch: u64,
+    ) {
         self.clear_semantic_refresh_worker();
-        *self.semantic_refresh_tx.lock() = Some(sender);
-        *self.semantic_refresh_event_rx.lock() = Some(event_rx);
-        *self.semantic_refresh_worker.lock() = Some(worker_slot);
+        {
+            let mut receiver = self.semantic_refresh_event_rx.lock();
+            let mut request = self.semantic_refresh_tx.lock();
+            let mut worker = self.semantic_refresh_worker.lock();
+            self.semantic_refresh_generation
+                .store(self.configure_generation(), Ordering::SeqCst);
+            self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
+            self.semantic_refresh_build_epoch
+                .store(build_epoch, Ordering::SeqCst);
+            *receiver = Some(event_rx);
+            *request = Some(sender);
+            *worker = Some(worker_slot);
+        }
+    }
+
+    pub(crate) fn semantic_refresh_generation(&self) -> u64 {
+        self.semantic_refresh_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn semantic_refresh_epoch(&self) -> u64 {
+        self.semantic_refresh_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Serialize refresh event commit with worker replacement. The receiver
+    /// lock also couples the generation and epoch to the dequeued channel.
+    pub(crate) fn with_current_semantic_refresh_rx<R>(
+        &self,
+        generation: u64,
+        epoch: u64,
+        action: impl FnOnce() -> R,
+    ) -> Option<R> {
+        self.run_if_subc_bound_generation(generation, || {
+            let receiver = self.semantic_refresh_event_rx.lock();
+            if receiver.is_none()
+                || self.semantic_refresh_generation() != generation
+                || self.semantic_refresh_epoch() != epoch
+            {
+                return None;
+            }
+            Some(action())
+        })
+        .flatten()
+    }
+
+    pub(crate) fn clear_semantic_refresh_worker_if_current(
+        &self,
+        generation: u64,
+        epoch: u64,
+    ) -> Option<u64> {
+        let worker_slot = {
+            let mut receiver = self.semantic_refresh_event_rx.lock();
+            if receiver.is_none()
+                || self.semantic_refresh_generation() != generation
+                || self.semantic_refresh_epoch() != epoch
+            {
+                return None;
+            }
+            let disconnected_build_epoch = self.semantic_refresh_build_epoch.load(Ordering::SeqCst);
+            self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
+            let mut request = self.semantic_refresh_tx.lock();
+            let mut worker = self.semantic_refresh_worker.lock();
+            *receiver = None;
+            *request = None;
+            self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
+            self.invalidate_semantic_refresh_probe();
+            (worker.take(), disconnected_build_epoch)
+        };
+        if let Some(worker_slot) = worker_slot.0 {
+            if let Ok(mut handle) = worker_slot.lock() {
+                drop(handle.take());
+            }
+        }
+        Some(worker_slot.1)
     }
 
     pub fn clear_semantic_refresh_worker(&self) {
-        *self.semantic_refresh_tx.lock() = None;
-        *self.semantic_refresh_event_rx.lock() = None;
-        if let Some(worker_slot) = self.semantic_refresh_worker.lock().take() {
+        let worker_slot = {
+            let mut receiver = self.semantic_refresh_event_rx.lock();
+            let mut request = self.semantic_refresh_tx.lock();
+            let mut worker = self.semantic_refresh_worker.lock();
+            *receiver = None;
+            *request = None;
+            self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
+            self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
+            self.invalidate_semantic_refresh_probe();
+            worker.take()
+        };
+        if let Some(worker_slot) = worker_slot {
             if let Ok(mut handle) = worker_slot.lock() {
                 drop(handle.take());
             }
@@ -3670,6 +4829,18 @@ impl AppContext {
         &self,
     ) -> Option<crossbeam_channel::Sender<SemanticRefreshRequest>> {
         self.semantic_refresh_tx.lock().clone()
+    }
+
+    pub(crate) fn semantic_refresh_retry_slots(
+        &self,
+    ) -> (
+        Arc<parking_lot::Mutex<Option<crossbeam_channel::Sender<SemanticRefreshRequest>>>>,
+        Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>,
+    ) {
+        (
+            Arc::clone(&self.semantic_refresh_tx),
+            Arc::clone(&self.pending_semantic_index_paths),
+        )
     }
 
     pub fn semantic_refresh_event_rx(
@@ -3720,6 +4891,21 @@ impl AppContext {
         self.semantic_refresh_circuit_is_open()
     }
 
+    pub fn trip_semantic_refresh_circuit(&self, trip_threshold: usize) {
+        self.semantic_refresh_circuit
+            .consecutive_transient_failures
+            .store(trip_threshold, Ordering::SeqCst);
+        if !self
+            .semantic_refresh_circuit
+            .open
+            .swap(true, Ordering::SeqCst)
+        {
+            crate::slog_warn!(
+                "embedding backend appears down; suspending active retries, will resume on next change or successful probe"
+            );
+        }
+    }
+
     pub fn reset_semantic_refresh_transient_failure_count(&self) {
         self.semantic_refresh_circuit
             .consecutive_transient_failures
@@ -3750,10 +4936,13 @@ impl AppContext {
         self.semantic_refresh_circuit
             .probe_in_flight
             .load(Ordering::SeqCst)
-            || self
-                .semantic_refresh_circuit
-                .probe_ready
-                .load(Ordering::SeqCst)
+            || self.semantic_refresh_probe_ready()
+    }
+
+    pub fn semantic_refresh_probe_ready(&self) -> bool {
+        self.semantic_refresh_circuit
+            .probe_ready
+            .load(Ordering::SeqCst)
     }
 
     pub fn take_semantic_refresh_probe_ready(&self) -> bool {
@@ -3762,39 +4951,48 @@ impl AppContext {
             .swap(false, Ordering::SeqCst)
     }
 
-    pub fn ensure_semantic_refresh_probe_scheduled(&self, delay: Duration) {
-        if self
-            .semantic_refresh_circuit
+    fn invalidate_semantic_refresh_probe(&self) {
+        self.semantic_refresh_circuit
+            .probe_token
+            .fetch_add(1, Ordering::SeqCst);
+        self.semantic_refresh_circuit
             .probe_ready
-            .load(Ordering::SeqCst)
-        {
-            return;
-        }
-        if self
-            .semantic_refresh_circuit
+            .store(false, Ordering::SeqCst);
+        self.semantic_refresh_circuit
             .probe_in_flight
-            .swap(true, Ordering::SeqCst)
-        {
-            return;
-        }
-        if self
-            .semantic_refresh_circuit
-            .probe_ready
-            .load(Ordering::SeqCst)
-        {
-            self.semantic_refresh_circuit
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub fn ensure_semantic_refresh_probe_scheduled(&self, delay: Duration) {
+        let receiver = self.semantic_refresh_event_rx.lock();
+        if receiver.is_none()
+            || self
+                .semantic_refresh_circuit
+                .probe_ready
+                .load(Ordering::SeqCst)
+            || self
+                .semantic_refresh_circuit
                 .probe_in_flight
-                .store(false, Ordering::SeqCst);
+                .swap(true, Ordering::SeqCst)
+        {
             return;
         }
+        let probe_token = self
+            .semantic_refresh_circuit
+            .probe_token
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        drop(receiver);
 
         let circuit = Arc::clone(&self.semantic_refresh_circuit);
         let session_id = crate::log_ctx::current_session();
         std::thread::spawn(move || {
             crate::log_ctx::with_session(session_id, || {
                 std::thread::sleep(delay);
-                circuit.probe_ready.store(true, Ordering::SeqCst);
-                circuit.probe_in_flight.store(false, Ordering::SeqCst);
+                if circuit.probe_token.load(Ordering::SeqCst) == probe_token {
+                    circuit.probe_ready.store(true, Ordering::SeqCst);
+                    circuit.probe_in_flight.store(false, Ordering::SeqCst);
+                }
             });
         });
     }
@@ -3851,6 +5049,7 @@ impl AppContext {
         rx: crossbeam_channel::Receiver<WatcherDispatchEvent>,
         runtime: WatcherThreadHandle,
     ) {
+        let _runtime_guard = self.watcher_runtime_lock.lock();
         let replaced = self.watcher_thread.lock().replace(runtime);
         if let Some(runtime) = replaced {
             self.app.watcher_stopped();
@@ -3865,6 +5064,7 @@ impl AppContext {
     /// Stop the watcher filter thread (if any) and clear the dispatch receiver.
     /// Used on reconfigure, watcher failure, root deletion, and test teardown.
     pub fn stop_watcher_runtime(&self) {
+        let _runtime_guard = self.watcher_runtime_lock.lock();
         if let Some(runtime) = self.watcher_thread.lock().take() {
             self.app.watcher_stopped();
             runtime.shutdown_and_join();
@@ -3879,6 +5079,7 @@ impl AppContext {
     /// idle-root and root-deleted cleanup performs the join on a detached
     /// reaper thread instead.
     pub fn stop_watcher_runtime_in_background(&self) {
+        let _runtime_guard = self.watcher_runtime_lock.lock();
         if let Some(runtime) = self.watcher_thread.lock().take() {
             self.app.watcher_stopped();
             std::thread::spawn(move || runtime.shutdown_and_join());
@@ -3888,6 +5089,30 @@ impl AppContext {
         *self.watcher.lock() = None;
     }
 
+    /// Remove a watcher runtime whose OS thread already exited (backend
+    /// failure while the root was unbound and drains were suppressed).
+    /// Returns true when a finished corpse was actually removed so the caller
+    /// can apply watcher-gap invalidation exactly once.
+    pub(crate) fn take_finished_watcher_runtime(&self) -> bool {
+        let _runtime_guard = self.watcher_runtime_lock.lock();
+        let finished = self
+            .watcher_thread
+            .lock()
+            .as_ref()
+            .is_some_and(|runtime| runtime.is_finished());
+        if !finished {
+            return false;
+        }
+        if let Some(runtime) = self.watcher_thread.lock().take() {
+            self.app.watcher_stopped();
+            std::thread::spawn(move || runtime.shutdown_and_join());
+        }
+        *self.watcher_rx.lock() = None;
+        *self.watcher_drain_slice.lock() = None;
+        *self.watcher.lock() = None;
+        true
+    }
+
     /// Process-scoped watcher count used by maintenance diagnostics and
     /// regression tests. The count drops as soon as shutdown is requested.
     pub fn watcher_registry_count(&self) -> usize {
@@ -3895,14 +5120,34 @@ impl AppContext {
     }
 
     pub(crate) fn watcher_runtime_active(&self) -> bool {
-        self.watcher_thread.lock().is_some()
+        let _runtime_guard = self.watcher_runtime_lock.lock();
+        // A finished thread is a dead runtime even while its handle is still
+        // installed (the backend can fail while drains are suppressed for an
+        // unbound root, leaving the queued error undrained). Treating it as
+        // active would block watcher restoration on rebind.
+        let thread_live = self
+            .watcher_thread
+            .lock()
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_finished());
+        thread_live && self.watcher_rx.lock().is_some()
     }
 
     /// Return whether artifact eviction would discard work that still needs a
     /// live handle. Callers use this as the single safety gate before clearing
     /// resident stores and inspect caches.
     pub fn artifact_eviction_blocked(&self) -> bool {
+        let semantic_refresh_in_flight = match &*self
+            .semantic_index_status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            SemanticIndexStatus::Building { .. } => true,
+            SemanticIndexStatus::Ready { refreshing, .. } => !refreshing.is_empty(),
+            SemanticIndexStatus::Disabled | SemanticIndexStatus::Failed(_) => false,
+        };
         if crate::runtime_drain::any_build_in_flight(self)
+            || semantic_refresh_in_flight
             || self.inspect_manager.tier2_any_in_flight()
             || !self.bash_background.running_tasks().is_empty()
             || !self.pending_callgraph_store_paths.lock().is_empty()
@@ -4538,6 +5783,247 @@ impl AppContext {
 }
 
 #[cfg(test)]
+mod subc_lifecycle_admission_tests {
+    use super::*;
+
+    #[test]
+    fn route_teardown_does_not_supersede_disk_artifact_compatibility() {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        ctx.note_configure_warm_key("config-a".to_string());
+        let content_generation = ctx.configure_content_generation();
+        let lifecycle_generation = ctx.configure_generation();
+        let search_epoch = ctx.next_search_persist_epoch();
+        let semantic_epoch = ctx.next_semantic_persist_epoch();
+        let search_persist_epoch = ctx.search_persist_epoch_flag();
+        let semantic_persist_epoch = ctx.semantic_persist_epoch_flag();
+
+        ctx.mark_subc_unbound();
+        assert!(ctx.configure_generation() > lifecycle_generation);
+        assert_eq!(ctx.configure_content_generation(), content_generation);
+        assert_eq!(search_persist_epoch.current(), search_epoch);
+        assert_eq!(semantic_persist_epoch.current(), semantic_epoch);
+
+        ctx.mark_subc_bound();
+        ctx.note_configure_warm_key("config-b".to_string());
+        assert!(ctx.configure_content_generation() > content_generation);
+        let replacement_search_epoch = ctx.next_search_persist_epoch();
+        let replacement_semantic_epoch = ctx.next_semantic_persist_epoch();
+        assert!(replacement_search_epoch > search_epoch);
+        assert!(replacement_semantic_epoch > semantic_epoch);
+        assert_eq!(search_persist_epoch.current(), replacement_search_epoch);
+        assert_eq!(semantic_persist_epoch.current(), replacement_semantic_epoch);
+    }
+
+    #[test]
+    fn lifecycle_gate_serializes_unbind_with_worker_start_commit() {
+        let admission = SubcLifecycleAdmission::default();
+        let generation = Arc::new(AtomicU64::new(11));
+        let expected = generation.load(Ordering::SeqCst);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let worker_admission = admission.clone();
+        let worker_generation = Arc::clone(&generation);
+        let worker_starts = Arc::clone(&starts);
+        let worker = std::thread::spawn(move || {
+            worker_admission.run_if_current(&worker_generation, expected, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                worker_starts.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let unbind_admission = admission.clone();
+        let unbind_generation = Arc::clone(&generation);
+        let (unbound_tx, unbound_rx) = std::sync::mpsc::channel();
+        let unbind = std::thread::spawn(move || {
+            unbind_admission.mark_unbound(&unbind_generation);
+            unbound_tx.send(()).unwrap();
+        });
+
+        assert!(
+            unbound_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "unbind must wait for an admitted worker-start commit"
+        );
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_some());
+        unbound_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        unbind.join().unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(
+            admission
+                .run_if_current(&generation, generation.load(Ordering::SeqCst), || {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                })
+                .is_none(),
+            "worker starts after unbind must be denied"
+        );
+    }
+
+    #[test]
+    fn unbound_artifact_cancellation_clears_semantic_refresh_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(temp.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(temp.path().to_path_buf(), 3));
+        let mut status = SemanticIndexStatus::ready();
+        status.add_refreshing_file(temp.path().join("changed.rs"));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+
+        ctx.cancel_unbound_artifact_work();
+
+        assert!(ctx.semantic_refresh_event_rx().lock().is_none());
+        assert!(matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
+        ));
+    }
+
+    #[test]
+    fn terminal_empty_search_receiver_reports_completion_work() {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let epoch = ctx.install_search_index_rx(receiver, ctx.configure_generation());
+        let terminal_guard = ctx.search_index_rx_terminal_guard(epoch);
+        drop(sender);
+        drop(terminal_guard);
+
+        assert!(
+            ctx.completion_drains_have_work(),
+            "an empty disconnected one-shot receiver must wake the completion drain"
+        );
+    }
+
+    #[test]
+    fn conditional_semantic_receiver_retire_preserves_replacement_epoch() {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        let (_old_sender, old_receiver) = crossbeam_channel::unbounded();
+        let old_epoch = ctx.install_semantic_index_rx(old_receiver, ctx.configure_generation());
+        let (_replacement_sender, replacement_receiver) = crossbeam_channel::unbounded();
+        let replacement_epoch =
+            ctx.install_semantic_index_rx(replacement_receiver, ctx.configure_generation());
+
+        assert!(replacement_epoch > old_epoch);
+        assert_eq!(ctx.retire_semantic_index_rx_if_epoch(old_epoch), None);
+        assert!(ctx.semantic_index_rx().lock().is_some());
+        assert_eq!(ctx.semantic_index_rx_epoch(), replacement_epoch);
+    }
+
+    #[test]
+    fn stale_terminal_guard_cannot_hide_newer_finished_receiver() {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        let (old_sender, old_receiver) = crossbeam_channel::unbounded();
+        let old_epoch = ctx.install_search_index_rx(old_receiver, ctx.configure_generation());
+        let old_guard = ctx.search_index_rx_terminal_guard(old_epoch);
+        let (current_sender, current_receiver) = crossbeam_channel::unbounded();
+        let current_epoch =
+            ctx.install_search_index_rx(current_receiver, ctx.configure_generation());
+        let current_guard = ctx.search_index_rx_terminal_guard(current_epoch);
+        drop(old_sender);
+        drop(current_sender);
+
+        drop(current_guard);
+        drop(old_guard);
+
+        assert!(current_epoch > old_epoch);
+        assert_eq!(
+            ctx.search_index_rx_terminal_epoch.load(Ordering::SeqCst),
+            current_epoch,
+            "a stale worker must not move the terminal watermark backward"
+        );
+        assert!(ctx.completion_drains_have_work());
+    }
+
+    #[test]
+    fn finished_semantic_refresh_worker_reports_completion_work() {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let worker_slot = Arc::new(Mutex::new(Some(std::thread::spawn(|| {}))));
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::clone(&worker_slot),
+            ctx.semantic_index_rx_epoch(),
+        );
+        drop(event_tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !worker_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not finish"
+            );
+            std::thread::yield_now();
+        }
+
+        assert!(
+            ctx.completion_drains_have_work(),
+            "a finished refresh worker must wake the completion drain after its event queue empties"
+        );
+    }
+
+    #[test]
+    fn unbound_lifecycle_rejects_all_deferred_worker_starts() {
+        let admission = SubcLifecycleAdmission::default();
+        let generation = Arc::new(AtomicU64::new(7));
+        admission.mark_unbound(&generation);
+        let expected = generation.load(Ordering::SeqCst);
+        let starts = Arc::new(AtomicUsize::new(0));
+
+        let workers = (0..16)
+            .map(|_| {
+                let admission = admission.clone();
+                let generation = Arc::clone(&generation);
+                let starts = Arc::clone(&starts);
+                std::thread::spawn(move || {
+                    admission.run_if_current(&generation, expected, || {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            assert!(worker.join().unwrap().is_none());
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
 mod force_restrict_tests {
     use super::*;
     use crate::language::StubProvider;
@@ -4666,7 +6152,7 @@ mod callgraph_store_for_ops_tests {
         }
     }
 
-    fn force_async_callgraph_builds() -> CallgraphWaitWindowEnvGuard {
+    fn callgraph_build_wait_ms(ms: u64) -> CallgraphWaitWindowEnvGuard {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
         let guard = LOCK
             .get_or_init(|| StdMutex::new(()))
@@ -4675,12 +6161,16 @@ mod callgraph_store_for_ops_tests {
         let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
         // SAFETY: serialized by LOCK above and restored by the returned guard.
         unsafe {
-            std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", "0");
+            std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", ms.to_string());
         }
         CallgraphWaitWindowEnvGuard {
             _guard: guard,
             previous,
         }
+    }
+
+    fn force_async_callgraph_builds() -> CallgraphWaitWindowEnvGuard {
+        callgraph_build_wait_ms(0)
     }
 
     fn cold_build_context() -> Arc<AppContext> {
@@ -5107,6 +6597,348 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
+    fn inline_wait_settled_event_clears_superseded_receiver() {
+        let _env_guard = callgraph_build_wait_ms(2_000);
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
+        let project_root = std::fs::canonicalize(project.path()).expect("canonical project root");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_chunk_size: 1,
+                ..Config::default()
+            },
+        ));
+        let (reached, release) = install_callgraph_build_start_gate(project_root);
+        let request_ctx = Arc::clone(&ctx);
+        let request = std::thread::spawn(move || request_ctx.callgraph_store_for_ops());
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("callgraph worker did not reach start barrier");
+
+        ctx.next_callgraph_persist_epoch();
+        release.send(()).unwrap();
+        assert!(matches!(
+            request.join().expect("callgraph request thread"),
+            CallgraphStoreAccess::Building
+        ));
+        assert!(
+            ctx.callgraph_store_rx().lock().is_none(),
+            "inline Settled handling must retire the matching receiver"
+        );
+        assert!(
+            ctx.callgraph_store()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "Settled must not reopen and install an older persisted store"
+        );
+    }
+
+    #[test]
+    fn inline_ready_without_published_pointer_settles_and_preserves_pending_paths() {
+        let _env_guard = callgraph_build_wait_ms(2_000);
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_chunk_size: 1,
+                ..Config::default()
+            },
+        );
+        let pending = project.path().join("pending.rs");
+        ctx.add_pending_callgraph_store_paths([pending.clone()]);
+        REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN.store(true, Ordering::SeqCst);
+        let _remove_pointer_guard = RemoveCallgraphPointerBeforeInlineReopenGuard;
+
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert!(
+            ctx.callgraph_store_rx().lock().is_none(),
+            "inline Ready must settle after the published pointer disappears"
+        );
+        assert_eq!(
+            ctx.take_pending_callgraph_store_paths(),
+            vec![pending],
+            "inline reopen failure must preserve pending watcher paths"
+        );
+    }
+
+    #[test]
+    fn take_pending_callgraph_store_paths_drops_paths_outside_current_root() {
+        let project = TempDir::new().expect("project tempdir");
+        let foreign = TempDir::new().expect("foreign tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let inside = project.path().join("kept.rs");
+        // A late-deferring batch from a superseded root writes into the shared
+        // pending sink; replaying it into the NEW root's store would index a
+        // foreign project's files.
+        let outside = foreign.path().join("previous-root-file.rs");
+        // Lexical escape: starts_with(project) is true on the raw spelling but
+        // the path resolves outside the root.
+        let dotdot_escape = project
+            .path()
+            .join("..")
+            .join(
+                foreign
+                    .path()
+                    .file_name()
+                    .expect("foreign tempdir has a name"),
+            )
+            .join("escaped.rs");
+        ctx.add_pending_callgraph_store_paths([inside.clone(), outside, dotdot_escape]);
+
+        assert_eq!(
+            ctx.take_pending_callgraph_store_paths(),
+            vec![inside],
+            "pending replay must drop foreign and dot-dot-escaping paths"
+        );
+    }
+
+    #[test]
+    fn watcher_gap_invalidation_keeps_semantic_reloadable_and_skips_readonly_force_token() {
+        let project = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(project.path().to_path_buf());
+        // Read-only root: a force token could only be fulfilled by a local
+        // writer build, which this root will never run.
+        ctx.set_cache_writer_capabilities(false, true);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+
+        ctx.invalidate_artifacts_after_watcher_gap();
+
+        assert!(
+            matches!(
+                &*ctx
+                    .semantic_index_status()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                SemanticIndexStatus::Ready { .. }
+            ),
+            "semantic-enabled root must stay reloadable (Disabled has no self-healing path)"
+        );
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token(),
+            None,
+            "read-only root must not be stuck behind an unfulfillable force token"
+        );
+    }
+
+    #[test]
+    fn watcher_gap_invalidation_marks_force_rebuild_for_writer_roots() {
+        let project = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(project.path().to_path_buf());
+        ctx.set_cache_writer_capabilities(true, true);
+
+        ctx.invalidate_artifacts_after_watcher_gap();
+
+        assert!(
+            ctx.pending_callgraph_store_force_token().is_some(),
+            "writer roots must still reconcile the store after the unobserved interval"
+        );
+        assert!(
+            matches!(
+                &*ctx
+                    .semantic_index_status()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                SemanticIndexStatus::Disabled
+            ),
+            "semantic-disabled config maps to Disabled status"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn take_pending_callgraph_store_paths_drops_symlink_dotdot_escape() {
+        let project = TempDir::new().expect("project tempdir");
+        let foreign = TempDir::new().expect("foreign tempdir");
+        std::fs::create_dir_all(foreign.path().join("dir")).expect("foreign dir");
+        std::fs::write(foreign.path().join("secret.rs"), "pub fn s() {}\n").expect("secret");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        // `root/link` targets a foreign directory; `root/link/../secret.rs`
+        // therefore resolves to `foreign/secret.rs` under filesystem-first
+        // semantics (matching the store's normalize_file_path). A lexical-first
+        // filter would erase `link/..` and wrongly keep it as `root/secret.rs`.
+        std::os::unix::fs::symlink(foreign.path().join("dir"), project.path().join("link"))
+            .expect("plant symlink");
+        let escape = project.path().join("link").join("..").join("secret.rs");
+        // Dead component below the symlink: full canonicalization fails, so
+        // the ancestor walk must reach and resolve `link` BEFORE any lexical
+        // `..` resolution — a lexical-first pass would erase `dead/../..` and
+        // wrongly keep this as `root/deep-secret.rs`.
+        let dead_component_escape = project
+            .path()
+            .join("link")
+            .join("dead")
+            .join("..")
+            .join("..")
+            .join("deep-secret.rs");
+        // Re-entry: `dead/..` drains back to the project root, then `link`
+        // (an EXISTING symlink) must resolve through the filesystem — a
+        // one-shot lexical pass over the dead tail would erase `link/..` too
+        // and wrongly keep this as `root/reentry-secret.rs`.
+        std::fs::write(foreign.path().join("reentry-secret.rs"), "pub fn r() {}\n")
+            .expect("reentry secret");
+        let reentry_escape = project
+            .path()
+            .join("dead")
+            .join("..")
+            .join("link")
+            .join("..")
+            .join("reentry-secret.rs");
+        // Dangling symlink whose `..` re-enters the root: the store cannot
+        // canonicalize it either and keeps the raw absolute spelling as an
+        // out-of-root key, so containment must fail closed (a repaired-target
+        // race could otherwise index outside the root).
+        std::os::unix::fs::symlink(
+            foreign.path().join("nonexistent-target"),
+            project.path().join("dangling"),
+        )
+        .expect("plant dangling symlink");
+        let dangling_reentry = project
+            .path()
+            .join("dangling")
+            .join("..")
+            .join("via-dangling.rs");
+        // `..` traversal through a regular file: realpath rejects with
+        // ENOTDIR; lexically popping the file would fabricate containment.
+        std::fs::write(project.path().join("plain.rs"), "pub fn p() {}\n").expect("plain file");
+        let through_file = project
+            .path()
+            .join("plain.rs")
+            .join("..")
+            .join("via-file.rs");
+        let kept = project.path().join("kept.rs");
+        ctx.add_pending_callgraph_store_paths([
+            escape,
+            dead_component_escape,
+            reentry_escape,
+            dangling_reentry,
+            through_file,
+            kept.clone(),
+        ]);
+
+        assert_eq!(
+            ctx.take_pending_callgraph_store_paths(),
+            vec![kept],
+            "symlink-plus-dotdot escapes must be dropped with filesystem-first semantics"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn take_pending_callgraph_store_paths_drops_drive_relative_paths() {
+        // Guard-sensitivity: exercise the classifier directly against a root
+        // ON THE DRIVE CWD's drive, where join() replaces the root and the
+        // joined path can genuinely resolve under the drive CWD — without the
+        // early Prefix/RootDir rejection, a `C:file-under-cwd` spelling whose
+        // drive CWD happens to sit inside the root would pass the post-join
+        // prefix check.
+        let cwd = std::env::current_dir().expect("drive cwd");
+        let cwd_file = PathBuf::from(format!(
+            "{}under-drive-cwd.rs",
+            cwd.components()
+                .next()
+                .map(|prefix| prefix.as_os_str().to_string_lossy().into_owned())
+                .expect("drive prefix")
+        ));
+        assert!(cwd_file.is_relative(), "C:foo must classify as relative");
+        assert!(
+            !pending_path_in_roots(&cwd_file, &[cwd.clone()]),
+            "drive-relative spelling must be rejected even when the drive CWD is inside the root"
+        );
+        assert!(
+            !pending_path_in_roots(Path::new(r"\root-relative.rs"), &[cwd]),
+            "root-relative spelling must be rejected"
+        );
+
+        let project = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let kept = project.path().join("kept.rs");
+        ctx.add_pending_callgraph_store_paths([
+            PathBuf::from("C:drive-relative.rs"),
+            PathBuf::from(r"\root-relative.rs"),
+            kept.clone(),
+        ]);
+
+        assert_eq!(
+            ctx.take_pending_callgraph_store_paths(),
+            vec![kept],
+            "drive-relative and root-relative spellings must be rejected"
+        );
+    }
+
+    #[test]
+    fn take_pending_callgraph_store_paths_keeps_relative_and_deleted_paths() {
+        let project = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        // Relative paths are project-root-relative by the callgraph store's
+        // contract, and pending paths legitimately reference deleted files.
+        let relative = PathBuf::from("src/relative.rs");
+        let deleted = project.path().join("never-created.rs");
+        ctx.add_pending_callgraph_store_paths([relative.clone(), deleted.clone()]);
+
+        let mut taken = ctx.take_pending_callgraph_store_paths();
+        taken.sort();
+        let mut expected = vec![relative, deleted];
+        expected.sort();
+        assert_eq!(
+            taken, expected,
+            "root-relative and deleted in-root paths must survive the filter"
+        );
+    }
+
+    #[test]
     fn concurrent_cold_callgraph_store_for_ops_spawns_one_build() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
@@ -5169,6 +7001,250 @@ mod callgraph_store_for_ops_tests {
         rx.recv_timeout(Duration::from_secs(30))
             .expect("background cold build should complete");
         *ctx.callgraph_store_rx.lock() = None;
+    }
+
+    #[test]
+    fn watcher_gap_invalidation_gates_resident_artifacts_and_forces_strict_verify() {
+        let root = TempDir::new().expect("project tempdir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical project root");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(canonical_root.clone()),
+                ..Config::default()
+            },
+        );
+        *ctx.search_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SearchIndex::build(&canonical_root));
+        *ctx.semantic_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(canonical_root.clone(), 3));
+        *ctx.semantic_index_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+
+        let artifact = canonical_root.join("verify-artifact.bin");
+        std::fs::write(&artifact, b"same-size").expect("write verification artifact");
+        let generation =
+            crate::cache_freshness::artifact_generation(&artifact).expect("artifact generation");
+        crate::cache_freshness::record_verify_completed(
+            &canonical_root,
+            crate::cache_freshness::VerifyArtifact::Search,
+            Some(generation),
+        );
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &canonical_root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                Some(generation),
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Skip
+        );
+
+        ctx.invalidate_artifacts_after_watcher_gap();
+
+        assert!(ctx
+            .search_index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+        assert!(ctx
+            .semantic_index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+        assert!(ctx.pending_callgraph_store_force_token().is_some());
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &canonical_root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                Some(generation),
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Strict
+        );
+    }
+
+    #[test]
+    fn cancelled_semantic_refresh_transfers_refreshing_files_to_pending() {
+        let root = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        *ctx.semantic_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.path().to_path_buf(), 3));
+        let refreshing_path = root.path().join("src/lib.rs");
+        {
+            let mut status = ctx
+                .semantic_index_status
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *status = SemanticIndexStatus::ready();
+            status.start_refreshing_file(refreshing_path.clone());
+        }
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+
+        ctx.cancel_unbound_artifact_work();
+
+        // The cancelled worker will never re-embed the in-flight file; the
+        // retained pending set is the only record for the replacement worker.
+        assert_eq!(
+            ctx.pending_semantic_index_paths
+                .lock()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![refreshing_path],
+            "cancelled in-flight refresh files must transfer to the pending set"
+        );
+        assert!(matches!(
+            &*ctx
+                .semantic_index_status
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
+        ));
+    }
+
+    #[test]
+    fn unbind_before_corpus_started_preserves_corpus_intent() {
+        // The probe stamps `refreshing_corpus` before sending, but the worker
+        // emits CorpusStarted only after walking the project. An unbind in
+        // that window must re-derive the corpus intent from the stamped
+        // status, not lose it.
+        let root = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        *ctx.semantic_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.path().to_path_buf(), 3));
+        *ctx.semantic_index_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "refreshing_corpus".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+
+        ctx.cancel_unbound_artifact_work();
+
+        assert!(
+            *ctx.pending_semantic_corpus_refresh.lock(),
+            "corpus intent stamped before CorpusStarted must survive the cancellation"
+        );
+    }
+
+    #[test]
+    fn cancelled_search_corpus_refresh_drops_nonready_resident_index() {
+        let root = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        // A corpus refresh in flight: resident index marked non-ready plus an
+        // installed receiver. Cancelling only the receiver would strand the
+        // non-ready resident (equivalent rebind reloads only a MISSING index).
+        let mut refreshing = SearchIndex::new();
+        refreshing.ready = false;
+        *ctx.search_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(refreshing);
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+
+        ctx.cancel_unbound_artifact_work();
+
+        assert!(
+            ctx.search_index
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a cancelled corpus refresh must drop the non-ready resident so rebind reloads it"
+        );
+        assert!(ctx
+            .search_index_rx
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[test]
+    fn active_semantic_file_refresh_blocks_idle_eviction_until_completion() {
+        let root = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        *ctx.semantic_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.path().to_path_buf(), 3));
+        let refreshing_path = root.path().join("src/lib.rs");
+        {
+            let mut status = ctx
+                .semantic_index_status
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *status = SemanticIndexStatus::ready();
+            status.start_refreshing_file(refreshing_path.clone());
+        }
+
+        assert!(ctx.artifact_eviction_blocked());
+        assert!(!ctx.evict_idle_artifacts());
+        assert!(ctx
+            .semantic_index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some());
+
+        ctx.semantic_index_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .complete_refreshing_file(&refreshing_path);
+        assert!(ctx.evict_idle_artifacts());
+        assert!(ctx
+            .semantic_index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
     }
 }
 
@@ -5923,5 +7999,159 @@ mod verify_memo_watcher_tests {
             ),
             crate::cache_freshness::WarmVerifyPlan::StatFirst
         );
+    }
+}
+
+#[cfg(test)]
+mod watcher_runtime_state_tests {
+    use super::*;
+    use crate::language::StubProvider;
+
+    fn test_context() -> AppContext {
+        AppContext::new(Box::new(StubProvider), Config::default())
+    }
+
+    #[test]
+    fn finished_watcher_thread_reports_inactive_and_is_reclaimed_with_invalidation() {
+        let root = tempfile::tempdir().expect("project tempdir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical root");
+        let ctx = AppContext::new(
+            Box::new(StubProvider),
+            Config {
+                project_root: Some(canonical_root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(canonical_root.clone());
+        // Suppress the physical FSEvents reinstall (parallel in-process tests
+        // must not install real OS watchers); the property under test is the
+        // corpse reclaim + invalidation, not the reinstall.
+        struct DisableWatcherGuard;
+        impl Drop for DisableWatcherGuard {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("AFT_TEST_DISABLE_FILE_WATCHER") };
+            }
+        }
+        let _env_lock = crate::test_env::process_env_lock();
+        unsafe { std::env::set_var("AFT_TEST_DISABLE_FILE_WATCHER", "1") };
+        let _disable_watcher = DisableWatcherGuard;
+        // Warm state the corpse reclaim must invalidate: resident index +
+        // warm Skip memo.
+        *ctx.search_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::search_index::SearchIndex::new());
+        let artifact = canonical_root.join("artifact.bin");
+        std::fs::write(&artifact, b"artifact").expect("artifact");
+        let generation = crate::cache_freshness::artifact_generation(&artifact);
+        crate::cache_freshness::record_verify_completed(
+            &canonical_root,
+            crate::cache_freshness::VerifyArtifact::Search,
+            generation,
+        );
+
+        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
+        let _dispatch_tx = dispatch_tx;
+        // A thread that exits on its own models a backend failure while the
+        // root was unbound (drains suppressed, queued error undrained).
+        let join = std::thread::spawn(|| {});
+        ctx.install_watcher_runtime(
+            dispatch_rx,
+            WatcherThreadHandle::new(Arc::new(AtomicBool::new(false)), join),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while ctx.watcher_runtime_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a finished watcher thread must report the runtime inactive"
+            );
+            std::thread::yield_now();
+        }
+
+        // The production entry point: rebind restoration must reclaim the
+        // corpse, invalidate the unobserved-window state, and reinstall.
+        crate::commands::configure::ensure_project_watcher(&ctx);
+
+        assert!(
+            ctx.search_index
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "corpse reclaim must drop resident artifacts (events since the failure are lost)"
+        );
+        assert_eq!(
+            crate::cache_freshness::warm_verify_plan(
+                &canonical_root,
+                crate::cache_freshness::VerifyArtifact::Search,
+                generation,
+            ),
+            crate::cache_freshness::WarmVerifyPlan::Strict,
+            "corpse reclaim must force strict re-verification"
+        );
+        assert!(
+            !ctx.take_finished_watcher_runtime(),
+            "reclaim is one-shot; the corpse is gone after ensure_project_watcher"
+        );
+    }
+
+    #[test]
+    fn watcher_runtime_requires_both_thread_and_dispatch_receiver() {
+        let ctx = test_context();
+        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let join = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(dispatch_tx);
+        });
+        ctx.install_watcher_runtime(
+            dispatch_rx,
+            WatcherThreadHandle::new(Arc::clone(&shutdown), join),
+        );
+        assert!(ctx.watcher_runtime_active());
+
+        *ctx.watcher_rx.lock() = None;
+        assert!(
+            !ctx.watcher_runtime_active(),
+            "a thread without its dispatch receiver is not a usable watcher runtime"
+        );
+        ctx.stop_watcher_runtime();
+    }
+}
+
+#[cfg(test)]
+mod semantic_probe_tests {
+    use super::*;
+
+    #[test]
+    fn cleared_semantic_worker_invalidates_orphaned_probe_timer() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        let worker_slot = Arc::new(Mutex::new(None));
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            worker_slot,
+            ctx.semantic_index_rx_epoch(),
+        );
+
+        ctx.ensure_semantic_refresh_probe_scheduled(Duration::from_millis(20));
+        assert!(ctx.semantic_refresh_probe_is_scheduled());
+        ctx.clear_semantic_refresh_worker();
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(!ctx.semantic_refresh_probe_ready());
+        assert!(!ctx.semantic_refresh_probe_is_scheduled());
+        assert!(!ctx.completion_drains_have_work());
     }
 }

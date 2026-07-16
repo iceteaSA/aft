@@ -532,6 +532,14 @@ impl InspectManager {
         drained
     }
 
+    pub fn discard_completions(&self) -> usize {
+        let mut discarded = 0usize;
+        while self.result_rx.try_recv().is_ok() {
+            discarded += 1;
+        }
+        discarded
+    }
+
     pub fn cache_for_snapshot(
         &self,
         snapshot: &InspectSnapshot,
@@ -4055,13 +4063,14 @@ export function bannerUnused() {}
     #[test]
     fn tier2_read_cached_freshness_does_not_hash_unchanged_contributions() {
         let (_dir, manager, snapshot, scope, _files) = duplicate_cache_fixture();
+        let fixture_root = snapshot.project_root.clone();
 
         crate::cache_freshness::reset_hash_file_if_small_count_for_debug();
         crate::cache_freshness::reset_verify_file_strict_count_for_debug();
         assert_fresh(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
 
         assert_eq!(
-            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            crate::cache_freshness::verify_file_strict_count_under_for_debug(&fixture_root),
             0,
             "dispatch-thread inspect freshness must not use strict verification"
         );
@@ -4085,6 +4094,7 @@ export function bannerUnused() {}
 
         crate::cache_freshness::reset_hash_file_if_small_count_for_debug();
         crate::cache_freshness::reset_verify_file_strict_count_for_debug();
+        let fixture_root = snapshot.project_root.clone();
         let warm_payload =
             fresh_payload(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
 
@@ -4095,7 +4105,7 @@ export function bannerUnused() {}
             "warm unchanged read must return the byte-identical aggregate as the cold scan"
         );
         assert_eq!(
-            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            crate::cache_freshness::verify_file_strict_count_under_for_debug(&fixture_root),
             0,
             "dispatch-thread warm read must not use strict verification"
         );

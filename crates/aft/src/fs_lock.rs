@@ -638,39 +638,27 @@ fn atomic_write_lock_metadata(path: &Path, metadata: &LockMetadata) -> io::Resul
     write_result
 }
 
+#[cfg(any(windows, test))]
+fn rename_over_with(
+    from: &Path,
+    to: &Path,
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    replace(from, to)
+}
+
 #[cfg(windows)]
 pub(crate) fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
-    // std::fs::rename on Windows maps to MoveFileExW with
-    // MOVEFILE_REPLACE_EXISTING, which atomically replaces an existing
-    // destination. Try that FIRST: an unconditional `remove_file(to)` before
-    // the rename opens a window where `to` does not exist, and a concurrent
-    // reader (e.g. the heartbeat poll) landing in that gap reads NotFound ->
-    // LockGone (terminal) and kills the heartbeat thread. That race made
-    // heartbeat_survives_transient_malformed_and_recovers flaky on Windows CI.
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        // Fall back to a copy-over (NOT remove-then-rename) when the atomic
-        // replace is refused (e.g. the destination is briefly open by another
-        // handle, or AV/indexer holds the temp source). `fs::copy` opens `to`
-        // with create+truncate and overwrites its bytes in place — the
-        // destination path never stops existing, so a concurrent heartbeat
-        // poll can never read NotFound -> LockGone (terminal). The earlier
-        // remove-then-rename fallback left a window where, if the second
-        // rename also failed, `to` was permanently deleted; copy-over closes
-        // that race class entirely. Worst case a reader observes a partially
-        // written file and gets Malformed, which is transient and retried —
-        // never fatal. Best-effort cleanup of the temp source afterward.
-        Err(original) => match fs::copy(from, to) {
-            Ok(_) => {
-                let _ = fs::remove_file(from);
-                Ok(())
-            }
-            // Both the atomic replace and the copy-over failed. Leave `to`
-            // untouched (copy create+truncate only proceeds once it can open
-            // the destination) and surface the original rename error.
-            Err(_) => Err(original),
-        },
-    }
+    // MoveFileExW with MOVEFILE_REPLACE_EXISTING is the only replacement path
+    // here that preserves the old destination on failure. A copy fallback
+    // truncates the destination before copying and can expose partial bytes or
+    // destroy the last valid artifact if the copy fails midway. Callers retain
+    // their temp file cleanup and retry policy when an open handle prevents the
+    // atomic replacement.
+    // Closure instead of the bare `fs::rename` fn item: the generic fn item
+    // instantiates with concrete reference lifetimes and fails the
+    // higher-ranked `FnOnce(&Path, &Path)` bound on some targets.
+    rename_over_with(from, to, |from, to| fs::rename(from, to))
 }
 
 #[cfg(not(windows))]
@@ -1107,6 +1095,33 @@ mod tests {
     }
 
     #[test]
+    fn failed_atomic_replacement_preserves_existing_destination() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source = dir.path().join("source.tmp");
+        let destination = dir.path().join("artifact.bin");
+        fs::write(&source, b"new artifact").expect("write source");
+        fs::write(&destination, b"valid old artifact").expect("write destination");
+
+        let error = rename_over_with(&source, &destination, |_from, _to| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected replacement failure",
+            ))
+        })
+        .expect_err("replacement must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read(&destination).expect("read preserved destination"),
+            b"valid old artifact"
+        );
+        assert_eq!(
+            fs::read(&source).expect("read retained source"),
+            b"new artifact"
+        );
+    }
+
+    #[test]
     fn heartbeat_updates_lockfile_timestamp() {
         let (_dir, path) = test_lock_path();
         let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
@@ -1123,13 +1138,6 @@ mod tests {
         // heartbeat advances eventually", not "it advances within N
         // heartbeat intervals".
         //
-        // On Windows, `rename_over` does `remove_file(to)` then
-        // `fs::rename(from, to)` because Windows can't atomically replace
-        // an open file. There's a brief window where the lockfile doesn't
-        // exist. If the poller hits that window, `read_lock_metadata`
-        // returns `Io(NotFound)`. Production callers already handle this
-        // (see `remove_lock_if_owned`), so the test treats `NotFound` the
-        // same as "no update yet" and keeps polling.
         let deadline = std::time::Instant::now() + Duration::from_millis(2_000);
         let mut updated = initial;
         while std::time::Instant::now() < deadline {
