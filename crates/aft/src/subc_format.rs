@@ -652,8 +652,15 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                 ]
                 .join("\n")
             } else {
-                let file = import_string_field(response, "path")
-                    .or_else(|| ctx.safety_file_arg.clone())
+                // Prefer the agent's own path spelling: translate resolves a
+                // relative filePath against the project root before the undo
+                // runs, so the response's `path` is absolute — echoing that
+                // back at an agent that said "src/a.ts" reads as a different
+                // file and costs a follow-up read.
+                let file = ctx
+                    .safety_file_arg
+                    .clone()
+                    .or_else(|| import_string_field(response, "path"))
                     .unwrap_or_else(|| "(file)".to_string());
                 let backup =
                     import_string_field(response, "backup_id").unwrap_or_else(|| "—".to_string());
