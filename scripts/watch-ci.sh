@@ -31,8 +31,12 @@ echo "watching run $RID (fail-fast)"
 
 while true; do
   STATUS=$(gh run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
+  # 'Bash permission e2e (Windows)' is continue-on-error in PR mode
+  # (_unit-suite.yml strict=false): its job-level conclusion still reads
+  # 'failure' in the API, but it does not gate the run. Fail-fast must not
+  # fire on it; the run-level conclusion check below remains authoritative.
   FAILED_JOB=$(gh run view "$RID" --repo "$REPO" --json jobs \
-    --jq '[.jobs[] | select(.conclusion=="failure")][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
+    --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | contains("Bash permission") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"

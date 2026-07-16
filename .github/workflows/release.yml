@@ -35,11 +35,12 @@ jobs:
   # Run the full E2E matrix (Linux Docker + Pi RPC + Windows native +
   # macOS native) at release time. Reuses the same workflow tests.yml runs
   # at PR time — single source of truth, so PR-time and release-time e2e
-  # can never drift. Build/publish jobs below `needs:` this job, so an e2e
-  # regression blocks the release.
+  # can never drift. Runs IN PARALLEL with unit (they share no artifacts);
+  # every publishing job still `needs:` BOTH, so a regression in either
+  # blocks the release exactly as before. Release e2e keeps the default
+  # `release` cargo profile: the shipped fat-LTO binary shape is tested.
   e2e:
     name: E2E
-    needs: unit
     uses: ./.github/workflows/_e2e-suite.yml
 
   publish-crates:
@@ -103,10 +104,18 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+  # ---------------------------------------------------------------------------
+  # Binary builds: NO `needs:` — they start immediately, in parallel with the
+  # test stages. They are pure compute with no side effects (artifacts are
+  # only uploaded to the run); every job that PUBLISHES anything still gates
+  # on unit+e2e (publish-crates directly, github-release/publish-npm through
+  # publish-crates), so a test regression blocks the release exactly as
+  # before. A red run wastes some build minutes — accepted for cutting the
+  # release critical path roughly in half.
+  # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
     runs-on: macos-26
-    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
 
@@ -117,6 +126,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+
+      # cache-bin:false is what makes rust-cache safe on macOS (see
+      # _unit-suite.yml unit-macos).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-on-failure: true
 
       # Safety net: if someone retags HEAD without running release.sh,
       # Cargo.toml.version stays stale. Bake the tag's version into the
@@ -140,7 +156,6 @@ jobs:
   build-darwin-x64:
     name: Build macOS x64
     runs-on: macos-26
-    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
 
@@ -151,6 +166,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-on-failure: true
 
       - name: Sync versions from tag
         run: node scripts/version-sync.mjs --from-tag
@@ -170,7 +190,6 @@ jobs:
   build-linux-arm64:
     name: Build Linux ARM64
     runs-on: ubuntu-latest
-    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
 
@@ -185,8 +204,12 @@ jobs:
       - name: Sync versions from tag
         run: node scripts/version-sync.mjs --from-tag
 
+      # Prebuilt binary via binstall — `cargo install cross` compiled it from
+      # source for 2-3 minutes on every release.
       - name: Install cross
-        run: cargo install cross --version 0.2.5 --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
 
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
@@ -202,7 +225,6 @@ jobs:
   build-linux-x64:
     name: Build Linux x64
     runs-on: ubuntu-latest
-    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
 
@@ -214,9 +236,11 @@ jobs:
 
       - name: Sync versions from tag
         run: node scripts/version-sync.mjs --from-tag
-      
+
       - name: Install cross
-        run: cargo install cross --version 0.2.5 --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
 
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
@@ -232,7 +256,6 @@ jobs:
   build-win32-x64:
     name: Build Windows x64
     runs-on: windows-latest
-    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
 
@@ -263,7 +286,6 @@ jobs:
     # cross-compiles to aarch64-pc-windows-msvc via the MSVC ARM64 cross
     # toolchain bundled in the Visual Studio Build Tools on the runner.
     runs-on: windows-latest
-    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
 
