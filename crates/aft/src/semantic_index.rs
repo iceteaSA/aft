@@ -532,7 +532,9 @@ fn embedding_response_body_is_transient(status: reqwest::StatusCode, raw: &str) 
 }
 
 fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout()
+    // Retryable == transient-at-send-stage: a backend that refused, timed
+    // out, or died mid-exchange deserves the same in-request retry ladder.
+    embedding_send_error_is_transient(error)
 }
 
 /// Whether a send-time error means the backend is *unreachable or temporarily
@@ -547,7 +549,10 @@ fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
     // accept and response (local backends do this when they crash or restart
     // under load) — the same "temporarily failing" class as a refused
     // connection, just later in the exchange. reqwest surfaces it as a plain
-    // send error, so classify from the io source chain.
+    // send error. Classify from the io source chain where one exists; hyper
+    // errors like IncompleteMessage ("connection closed before message
+    // completed") carry no io source, so fall back to known phrases in the
+    // chain's rendered messages.
     let mut source = std::error::Error::source(error);
     while let Some(inner) = source {
         if let Some(io) = inner.downcast_ref::<std::io::Error>() {
@@ -556,9 +561,19 @@ fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
                 std::io::ErrorKind::ConnectionReset
                     | std::io::ErrorKind::ConnectionAborted
                     | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
             ) {
                 return true;
             }
+        }
+        let rendered = inner.to_string().to_ascii_lowercase();
+        if rendered.contains("connection reset")
+            || rendered.contains("connection aborted")
+            || rendered.contains("connection closed")
+            || rendered.contains("broken pipe")
+            || rendered.contains("unexpected end of file")
+        {
+            return true;
         }
         source = std::error::Error::source(inner);
     }
