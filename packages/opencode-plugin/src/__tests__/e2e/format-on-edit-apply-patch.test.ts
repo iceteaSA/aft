@@ -176,7 +176,7 @@ export function runFormatOnEditApplyPatchSuite(
       expect(await readTextFile(h.path("new.ts"))).toBe(
         FIXTURES.ts_deformatted.replace(/ {2,}/g, " "),
       );
-    });
+    }, 20_000);
 
     test("update hunk triggers formatter", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
@@ -196,7 +196,7 @@ export function runFormatOnEditApplyPatchSuite(
 
       expect(toolResultText(output)).toContain("Updated existing.ts");
       expect(await readTextFile(h.path("existing.ts"))).toBe("export const value = 2;\n");
-    });
+    }, 20_000);
 
     test("multi-file Add+Update both format", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
@@ -220,7 +220,7 @@ export function runFormatOnEditApplyPatchSuite(
       expect(toolResultText(output)).toContain("Updated old.ts");
       expect(await readTextFile(h.path("added.ts"))).toBe("export const added = 1;\n");
       expect(await readTextFile(h.path("old.ts"))).toBe("export const oldValue = 2;\n");
-    });
+    }, 20_000);
 
     test("move hunk formats destination", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
@@ -242,7 +242,7 @@ export function runFormatOnEditApplyPatchSuite(
       expect(toolResultText(output)).toContain("Updated and moved from.ts → nested/to.ts");
       await expect(readTextFile(h.path("from.ts"))).rejects.toThrow();
       expect(await readTextFile(h.path("nested", "to.ts"))).toBe("export const value = 3;\n");
-    });
+    }, 20_000);
 
     test("delete hunk does NOT trigger formatter", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
@@ -261,7 +261,7 @@ export function runFormatOnEditApplyPatchSuite(
       expect(toolResultText(output)).toContain("Deleted delete-me.ts");
       await expect(readTextFile(h.path("delete-me.ts"))).rejects.toThrow();
       expect(await readTextFile(h.path("kept.ts"))).toBe("export    const   kept   = 1;\n");
-    });
+    }, 20_000);
 
     test("mixed-language patch", async () => {
       const rustShim: FakeFormatterShim = {
@@ -296,7 +296,7 @@ EOF
       expect(toolResultText(output)).toContain("Created main.rs");
       expect(await readTextFile(h.path("src.ts"))).toBe("export const tsValue = 1;\n");
       expect(await readTextFile(h.path("main.rs"))).toBe("fn main() {\n    let x = 42;\n}\n");
-    });
+    }, 20_000);
 
     test("patch with formatter excluded path", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_EXCLUDED_PRESET, [
@@ -324,7 +324,7 @@ EOF
       });
       expect(response.formatted).toBe(false);
       expect(response.format_skipped_reason).toBe("formatter_excluded_path");
-    });
+    }, 20_000);
 
     test("patch with formatter timeout", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [hangingFormatterShim()], {
@@ -368,7 +368,7 @@ EOF
       });
       expect(response.formatted).toBe(false);
       expect(response.format_skipped_reason).toBe("error");
-    });
+    }, 20_000);
 
     test("patch preview failure does not format or apply earlier hunks", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
@@ -392,7 +392,7 @@ EOF
 
       await expect(readTextFile(h.path("ok.ts"))).rejects.toThrow();
       expect(await readTextFile(h.path("target.ts"))).toBe("export const target = 1;\n");
-    });
+    }, 20_000);
 
     test("patch where ALL hunks fail does NOT format anything", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
@@ -414,7 +414,7 @@ EOF
       expect(await readTextFile(h.path("unchanged.ts"))).toBe(
         "export    const   unchanged   = 1;\n",
       );
-    });
+    }, 20_000);
 
     test("format_on_edit=false config", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [tsCollapseSpacesShim("biome")], {

@@ -194,14 +194,14 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.47.0";
+const ANNOUNCEMENT_VERSION = "0.47.1";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Big background CPU cuts: semantic re-embeds coalesce behind a 15s quiet window instead of firing per edit, file-change processing is sliced and budgeted, and a callgraph resolver bug that could pin a core at 100% on cyclic barrel re-exports is fixed.",
-  "Faster search: indexed grep and glob skip a per-query filesystem walk (2-4x faster), and cross-project search reuses cached artifacts (~40x faster).",
-  "bash with wait:true now detaches to the background the moment you send a new message instead of blocking the conversation.",
-  "apply_patch failures show the nearest-miss file lines so a failed patch is fixable in one shot; batch edits support replaceAll per item.",
-  "Groovy, Gradle, and Jenkinsfile support in outline, zoom, search, and AST tools.",
-  "Fixed: LSP memory growth during repeated scoped diagnostics (#160), fresh LSP auto-installs picked up without restart (#153), and truthful delete results for symlinked directories and failed batches.",
+  "Fixed: apply_patch could delete a file when a patch moved it to its own path — same-path moves are now plain in-place updates.",
+  "Fixed: moving a symlink across filesystems turned it into a regular file; the link itself is now preserved.",
+  "Fixed: a failed delete could leave a phantom undo entry, so the next undo reverted the wrong operation.",
+  "Fixed: a crashed process could leave a stale lock that permanently disabled update checks.",
+  "Paths can be given as file: URLs (#162), and reading your own background task's output files no longer prompts for permission (#161).",
+  "Faster hot paths: warm symbol lookups skip re-hashing unchanged files, search reads each posting list once per query, snippets stream only the needed lines, and edits no longer copy the whole undo history per mutation.",
 ];
 
 /**
