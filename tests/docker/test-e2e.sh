@@ -38,7 +38,22 @@ PLATFORM="${AFT_E2E_PLATFORM:-linux}"
 AIMOCK_RUN_DIR="${AFT_E2E_TEMP_ROOT:-${TMPDIR:-/tmp}/aimock-$$}"
 mkdir -p "$AIMOCK_RUN_DIR"
 export TMPDIR="$AIMOCK_RUN_DIR"
-PLUGIN_LOG="${AFT_E2E_PLUGIN_LOG:-$AIMOCK_RUN_DIR/aft-plugin.log}"
+# The plugin writes its log to the durable AFT log directory (rotating sink),
+# not $TMPDIR — mirror resolveAftLogPath(): AFT_CACHE_DIR/aft, else
+# XDG_DATA_HOME, else ~/.local/share, + cortexkit/aft/logs/. The old
+# $TMPDIR/aft-plugin.log default silently matched nothing once durable
+# logging shipped, and the startup checks all grep this file.
+if [ -n "${AFT_E2E_PLUGIN_LOG:-}" ]; then
+    PLUGIN_LOG="$AFT_E2E_PLUGIN_LOG"
+elif [ -n "${AFT_CACHE_DIR:-}" ]; then
+    PLUGIN_LOG="$AFT_CACHE_DIR/aft/logs/aft-plugin.log"
+else
+    PLUGIN_LOG="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/aft/logs/aft-plugin.log"
+fi
+# Start every run from a clean log so greps can't match a previous run's
+# lines (the durable log persists across runs on non-container hosts).
+mkdir -p "$(dirname "$PLUGIN_LOG")"
+: > "$PLUGIN_LOG"
 AIMOCK_PID=""
 
 # Platform-specific paths for the broken-ONNX scenario.

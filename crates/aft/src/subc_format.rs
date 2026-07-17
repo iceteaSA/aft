@@ -2674,14 +2674,119 @@ fn format_status(data: &Value) -> String {
     {
         return text.to_string();
     }
-    let mut summary = data.clone();
-    let memory = summary
-        .as_object_mut()
-        .and_then(|summary| summary.remove("memory"));
-    let pretty = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string());
-    match memory.as_ref() {
-        Some(memory) => format!("{pretty}\n\n{}", format_memory_block(memory)),
-        None => pretty,
+
+    // Compact human-readable summary. The full snapshot stays available to
+    // first-party consumers via structuredContent; the agent-facing text was
+    // previously a pretty-printed JSON dump that reached six figures of
+    // characters on fleet-scale daemons.
+    let mut lines = Vec::new();
+    let version = data.get("version").and_then(Value::as_str).unwrap_or("?");
+    let root = data
+        .get("project_root")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    lines.push(format!("AFT {version} — {root}"));
+
+    if data.get("degraded").and_then(Value::as_bool) == Some(true) {
+        let reasons = data
+            .get("degraded_reasons")
+            .and_then(Value::as_array)
+            .map(|reasons| {
+                reasons
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unspecified".to_string());
+        lines.push(format!("DEGRADED: {reasons}"));
+    }
+
+    let search = status_field(data, "search_index", "status");
+    let semantic = {
+        let state = status_field(data, "semantic_index", "status");
+        let stage = data
+            .pointer("/semantic_index/stage")
+            .and_then(Value::as_str);
+        let model = data
+            .pointer("/semantic_index/model")
+            .and_then(Value::as_str);
+        let mut s = state;
+        if let Some(stage) = stage {
+            s = format!("{s} ({stage})");
+        }
+        if let Some(model) = model {
+            s = format!("{s} [{model}]");
+        }
+        s
+    };
+    let callgraph = data
+        .pointer("/features/callgraph_store")
+        .and_then(Value::as_bool)
+        .map(|on| if on { "enabled" } else { "disabled" })
+        .unwrap_or("?");
+    lines.push(format!(
+        "indexes: search {search} | semantic {semantic} | callgraph {callgraph}"
+    ));
+
+    if let Some(features) = data.get("features").and_then(Value::as_object) {
+        let flags = features
+            .iter()
+            .map(|(name, value)| match value {
+                Value::Bool(true) => format!("{name} on"),
+                Value::Bool(false) => format!("{name} off"),
+                other => format!("{name} {}", value_as_display(other)),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("features: {flags}"));
+    }
+
+    if let Some(disk) = data.get("disk").and_then(Value::as_object) {
+        let storage = disk
+            .get("storage_dir")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let trigram = format_optional_memory_bytes(disk.get("trigram_disk_bytes"));
+        let semantic_disk = format_optional_memory_bytes(disk.get("semantic_disk_bytes"));
+        lines.push(format!(
+            "storage: {storage} (trigram {trigram}, semantic {semantic_disk})"
+        ));
+    }
+
+    let tracked = data
+        .pointer("/session/tracked_files")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let checkpoints = data
+        .pointer("/session/checkpoints")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let lsp = data.get("lsp_servers").and_then(Value::as_u64).unwrap_or(0);
+    lines.push(format!(
+        "session: {tracked} tracked file(s), {checkpoints} checkpoint(s) | lsp servers: {lsp}"
+    ));
+
+    if let Some(memory) = data.get("memory") {
+        lines.push(String::new());
+        lines.push(format_memory_block(memory));
+    }
+
+    lines.join("\n")
+}
+
+fn status_field(data: &Value, section: &str, key: &str) -> String {
+    data.pointer(&format!("/{section}/{key}"))
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string()
+}
+
+fn value_as_display(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 

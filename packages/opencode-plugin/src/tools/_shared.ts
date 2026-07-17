@@ -194,12 +194,29 @@ export function decodeFileUrl(target: string): string {
   } else {
     return target;
   }
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(pathPart);
-  } catch {
-    decoded = pathPart;
+  // Byte-wise tolerant percent-decode, matching Rust's percent_decode
+  // EXACTLY: each valid %HH decodes independently; malformed escapes stay
+  // literal. decodeURIComponent is all-or-nothing (throws on one malformed
+  // %ZZ, leaving VALID escapes like %2e%2e encoded too) — that divergence
+  // let a crafted URL read as in-project here while Rust resolved the
+  // decoded ../ out of the project, splitting the permission check from
+  // the filesystem target.
+  const bytes: number[] = [];
+  for (let i = 0; i < pathPart.length; ) {
+    if (pathPart[i] === "%" && i + 2 < pathPart.length) {
+      const hex = pathPart.slice(i + 1, i + 3);
+      if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+        bytes.push(Number.parseInt(hex, 16));
+        i += 3;
+        continue;
+      }
+    }
+    const cp = pathPart.codePointAt(i) as number;
+    const ch = String.fromCodePoint(cp);
+    for (const b of Buffer.from(ch, "utf8")) bytes.push(b);
+    i += ch.length;
   }
+  const decoded = Buffer.from(bytes).toString("utf8");
   // file:///C:/x decodes to /C:/x — strip the slash for the drive form.
   if (process.platform === "win32" && /^\/[A-Za-z]:/.test(decoded)) {
     return decoded.slice(1);

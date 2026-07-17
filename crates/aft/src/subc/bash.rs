@@ -833,9 +833,15 @@ pub(super) async fn handle_bash_deferred_completion(
     }
 
     if let Some(result) = done.result {
-        if routes.contains_key(&route_id) {
-            let frame =
-                build_tool_response_frame(done.ver, done.route, done.corr, done.flags, &result)?;
+        if let Some(identity) = routes.get(&route_id) {
+            let frame = build_tool_response_frame(
+                done.ver,
+                done.route,
+                done.corr,
+                done.flags,
+                &result,
+                identity.trust,
+            )?;
             send_reliable_writer_frame(tx, metrics, frame, "deferred bash response").await?;
         } else {
             log::debug!(

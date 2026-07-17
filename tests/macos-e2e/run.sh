@@ -154,11 +154,15 @@ cat > "$OC_CONFIG_DIR/opencode.json" <<EOF
 }
 EOF
 
-# AFT — both experimentals on so we exercise the full ONNX/semantic path
+# AFT — both experimentals on so we exercise the full ONNX/semantic path.
+# auto_update stays false: the auto-update hook npm-installs the registry
+# version over the locally packed plugin whenever the pack's version differs
+# from npm latest, silently swapping the code under test for published code.
 cat > "$OC_CONFIG_DIR/aft.jsonc" <<'EOF'
 {
   "experimental_search_index": true,
-  "experimental_semantic_search": true
+  "experimental_semantic_search": true,
+  "auto_update": false
 }
 EOF
 

@@ -4,9 +4,9 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 
 use super::{
-    control_flags, fmt, mpsc, AtomicUsize, DispatchPathMetrics, ErrorBody, Flags, Frame, FrameType,
-    Ordering, PathBuf, Response, RouteChannel, ToolCallResult, Value, CONTROL_SEND_TIMEOUT,
-    RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
+    control_flags, fmt, mpsc, AtomicUsize, BindTrust, DispatchPathMetrics, ErrorBody, Flags, Frame,
+    FrameType, Ordering, PathBuf, Response, RouteChannel, ToolCallResult, Value,
+    CONTROL_SEND_TIMEOUT, RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
 };
 use crate::run_tool_call::{PhaseTrace, ToolCallEgressTiming, ToolCallPhaseDurations};
 
@@ -364,6 +364,9 @@ impl Serialize for FlatToolResponse<'_> {
 
 struct ToolResponseEnvelope<'a> {
     result: &'a ToolCallResult,
+    /// First-party binds get the full flat response in `structuredContent`
+    /// for the plugin re-lift; untrusted (MCP) binds get text-only.
+    include_structured: bool,
 }
 
 impl Serialize for ToolResponseEnvelope<'_> {
@@ -371,7 +374,8 @@ impl Serialize for ToolResponseEnvelope<'_> {
     where
         S: Serializer,
     {
-        let mut envelope = serializer.serialize_struct("ToolResponseEnvelope", 3)?;
+        let fields = if self.include_structured { 3 } else { 2 };
+        let mut envelope = serializer.serialize_struct("ToolResponseEnvelope", fields)?;
         envelope.serialize_field(
             "content",
             &[TextContent {
@@ -380,13 +384,15 @@ impl Serialize for ToolResponseEnvelope<'_> {
             }],
         )?;
         envelope.serialize_field("isError", &!self.result.response.success)?;
-        envelope.serialize_field(
-            "structuredContent",
-            &FlatToolResponse {
-                response: &self.result.response,
-                text: &self.result.text,
-            },
-        )?;
+        if self.include_structured {
+            envelope.serialize_field(
+                "structuredContent",
+                &FlatToolResponse {
+                    response: &self.result.response,
+                    text: &self.result.text,
+                },
+            )?;
+        }
         envelope.end()
     }
 }
@@ -404,9 +410,9 @@ pub(super) fn build_tool_response_frame(
     corr: u64,
     flags: Flags,
     result: &ToolCallResult,
+    trust: BindTrust,
 ) -> Result<Frame, SubcError> {
-    // `content`/`isError` is the MCP-native surface a GENERIC host reads (and a
-    // generic host ignores `structuredContent`, per the MCP spec). The
+    // `content`/`isError` is the MCP-native surface a GENERIC host reads. The
     // FIRST-PARTY AFT plugin instead reads `structuredContent`, which carries
     // the full flat standalone shape ({id, success, ...data, text}) so every
     // structured sidecar the plugin drives UI from — status_bar, bg_completions
@@ -415,7 +421,18 @@ pub(super) fn build_tool_response_frame(
     // unchanged. SubcTransport.toolCall re-lifts `structuredContent` straight to
     // the flat ToolCallResult, so nothing downstream of the transport differs
     // from the NDJSON path.
-    let body = serde_json::to_vec(&ToolResponseEnvelope { result }).map_err(SubcError::Json)?;
+    //
+    // UNTRUSTED binds (MCP hosts via subc-mcp) get text-only replies: they
+    // have no re-lift layer, we declare no outputSchema (so omitting is
+    // MCP-spec-clean), and hosts like Claude Code prefer `structuredContent`
+    // for model input when present — feeding the model a raw JSON dump with
+    // the rendered text buried inside it, at a multiple of the token cost.
+    let include_structured = !matches!(trust, BindTrust::Untrusted);
+    let body = serde_json::to_vec(&ToolResponseEnvelope {
+        result,
+        include_structured,
+    })
+    .map_err(SubcError::Json)?;
 
     Frame::build_with_version(
         ver,
@@ -718,6 +735,7 @@ mod tests {
             42,
             control_flags(),
             &result,
+            BindTrust::FirstParty,
         )
         .unwrap();
         let expected_body = serde_json::to_vec(&json!({
@@ -754,6 +772,7 @@ mod tests {
             43,
             control_flags(),
             &err_result,
+            BindTrust::FirstParty,
         )
         .unwrap();
         let err_body: Value = serde_json::from_slice(&err_frame.body).unwrap();
@@ -768,5 +787,26 @@ mod tests {
             json!(["a", "b"])
         );
         assert_eq!(err_body["structuredContent"]["text"], json!("error text"));
+
+        // UNTRUSTED (MCP) binds get text-only replies: no structuredContent
+        // key at all. Generic MCP hosts have no re-lift layer, and hosts like
+        // Claude Code feed structuredContent to the model verbatim when
+        // present, a raw JSON dump at a multiple of the token cost.
+        let untrusted_frame = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            44,
+            control_flags(),
+            &result,
+            BindTrust::Untrusted,
+        )
+        .unwrap();
+        let untrusted_body: Value = serde_json::from_slice(&untrusted_frame.body).unwrap();
+        assert_eq!(untrusted_body["content"][0]["text"], json!("rendered text"));
+        assert_eq!(untrusted_body["isError"], json!(false));
+        assert!(
+            untrusted_body.get("structuredContent").is_none(),
+            "untrusted binds must not receive structuredContent: {untrusted_body}"
+        );
     }
 }

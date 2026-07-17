@@ -321,6 +321,21 @@ fn file_urls_decode_to_local_paths_in_translate() {
     let spaced = resolve_path_from_project_root(root, "file:///tmp/a%20b.md");
     assert_eq!(spaced, resolve_path_from_project_root(root, "/tmp/a b.md"));
 
+    // Malformed-escape traversal: each VALID %HH decodes independently even
+    // when a later escape (%ZZ) is malformed. %2e%2e -> .. must escape the
+    // project just as a literal ../ would. This is the exact input the TS
+    // decoder must agree with (decodeURIComponent would keep the whole string
+    // encoded on the malformed %ZZ, diverging from this).
+    let malformed = resolve_path_from_project_root(root, "file:///proj/%2e%2e/%ZZ/../secret");
+    assert!(
+        !malformed.starts_with(std::path::Path::new(if cfg!(windows) {
+            "C:\\proj"
+        } else {
+            "/proj"
+        })),
+        "malformed-escape traversal must resolve OUT of /proj: {malformed:?}"
+    );
+
     // A non-local authority is not a local path: left as-is on unix (becomes
     // a relative path under the root, matching the old rejected behavior)
     // rather than silently pointing at some other file.

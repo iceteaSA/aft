@@ -5281,14 +5281,13 @@ async fn expect_bash_denied_tool_response(
     channel: u16,
     corr: u64,
     label: &str,
-) -> Value {
+) {
     let frame = read_frame_timeout(stream, label).await;
     assert_eq!(frame.header.channel, channel);
     assert_eq!(frame.header.corr, corr);
     assert!(tool_result_is_error(&frame), "{label} should be an error");
-    let response = tool_response_json(&frame);
-    assert_tool_error_code(&response, "bash_denied_untrusted", label);
-    response
+    // These deny paths all serve UNTRUSTED binds: text-only contract.
+    assert_untrusted_tool_error(&frame, "cannot run shell commands", label);
 }
 
 async fn send_route_goodbye(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64) {
@@ -5356,6 +5355,19 @@ async fn call_tool_response(
 ) -> Value {
     let frame = call_tool_frame(stream, channel, corr, name, arguments, label).await;
     tool_response_json(&frame)
+}
+
+/// Tool call over an UNTRUSTED bind — returns the text-only reply.
+async fn call_untrusted_tool_text(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    label: &str,
+) -> (String, bool) {
+    let frame = call_tool_frame(stream, channel, corr, name, arguments, label).await;
+    untrusted_tool_response_text(&frame)
 }
 
 fn touch_command(path: &std::path::Path) -> String {
@@ -5489,9 +5501,7 @@ async fn drive_bash_elicitation_ttl_daemon(input: FakeDaemonInput) {
         .expect("pending ask should deny at the test TTL");
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 301);
-    assert!(tool_result_is_error(&frame));
-    let response = tool_response_json(&frame);
-    assert_tool_error_code(&response, "bash_denied_untrusted", "ttl deny");
+    assert_untrusted_tool_error(&frame, "cannot run shell commands", "ttl deny");
     assert!(!touched.exists(), "timed-out ask must not spawn");
 
     send_bash_elicitation_reply(
@@ -5543,9 +5553,7 @@ async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput) {
     );
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 401);
-    assert!(tool_result_is_error(&frame));
-    let response = tool_response_json(&frame);
-    assert_tool_error_code(&response, "bash_denied_untrusted", "goodbye deny");
+    assert_untrusted_tool_error(&frame, "cannot run shell commands", "goodbye deny");
     assert!(!touched.exists(), "GOODBYE-denied bash must not spawn");
 
     send_connection_goodbye(&mut stream).await;
@@ -5731,7 +5739,7 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
         "untrusted out-of-root write should mention containment: {:?}",
         tool_result_text(&untrusted_out_root)
     );
-    let validate_out_root = call_tool_response(
+    let validate_out_root = call_tool_frame(
         &mut stream,
         2,
         204,
@@ -5740,9 +5748,9 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
         "untrusted out-of-root validate_path",
     )
     .await;
-    assert_tool_error_code(
+    assert_untrusted_tool_error(
         &validate_out_root,
-        "path_outside_root",
+        "outside the project root",
         "untrusted out-of-root validate_path",
     );
 
@@ -5752,7 +5760,7 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
     ));
     std::fs::write(&untrusted_temp_file, "temp should stay blocked\n")
         .expect("write forced-restrict temp fixture");
-    let untrusted_temp_read = call_tool_response(
+    let untrusted_temp_read = call_tool_frame(
         &mut stream,
         2,
         205,
@@ -5761,9 +5769,9 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
         "untrusted system-temp read",
     )
     .await;
-    assert_tool_error_code(
+    assert_untrusted_tool_error(
         &untrusted_temp_read,
-        "path_outside_root",
+        "outside the project root",
         "untrusted system-temp read",
     );
     let _ = std::fs::remove_file(&untrusted_temp_file);
@@ -5786,7 +5794,7 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
             json!({ "task_ids": ["bash-denied"] }),
         ),
     ] {
-        let denied = call_tool_response(
+        let denied = call_tool_frame(
             &mut stream,
             2,
             corr,
@@ -5795,7 +5803,7 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
             "untrusted bash-family deny",
         )
         .await;
-        assert_tool_error_code(&denied, "bash_denied_untrusted", name);
+        assert_untrusted_tool_error(&denied, "cannot run shell commands", name);
     }
 
     send_connection_goodbye(&mut stream).await;
@@ -5825,7 +5833,8 @@ async fn drive_fed_harness_untrusted_daemon(input: FakeDaemonInput) {
     )
     .await;
 
-    let in_root_read = call_tool_response(
+    // fed:* binds are untrusted: replies are text-only (no structuredContent).
+    let (in_root_text, in_root_err) = call_untrusted_tool_text(
         &mut stream,
         1,
         102,
@@ -5834,9 +5843,16 @@ async fn drive_fed_harness_untrusted_daemon(input: FakeDaemonInput) {
         "fed in-root read",
     )
     .await;
-    assert_tool_success(&in_root_read, "fed in-root read");
+    assert!(
+        !in_root_err,
+        "fed in-root read should succeed: {in_root_text}"
+    );
+    assert!(
+        in_root_text.contains("fed inside"),
+        "fed in-root read should render file content: {in_root_text}"
+    );
 
-    let out_of_root_read = call_tool_response(
+    let out_of_root_read = call_tool_frame(
         &mut stream,
         1,
         103,
@@ -5845,9 +5861,9 @@ async fn drive_fed_harness_untrusted_daemon(input: FakeDaemonInput) {
         "fed out-of-root read",
     )
     .await;
-    assert_tool_error_code(
+    assert_untrusted_tool_error(
         &out_of_root_read,
-        "path_outside_root",
+        "outside the project root",
         "fed out-of-root read",
     );
 
@@ -5869,7 +5885,7 @@ async fn drive_fed_harness_untrusted_daemon(input: FakeDaemonInput) {
             json!({ "task_ids": ["bash-denied"] }),
         ),
     ] {
-        let denied = call_tool_response(
+        let denied = call_tool_frame(
             &mut stream,
             1,
             corr,
@@ -5878,7 +5894,7 @@ async fn drive_fed_harness_untrusted_daemon(input: FakeDaemonInput) {
             "fed harness bash-family deny",
         )
         .await;
-        assert_tool_error_code(&denied, "bash_denied_untrusted", name);
+        assert_untrusted_tool_error(&denied, "cannot run shell commands", name);
     }
 
     send_connection_goodbye(&mut stream).await;
@@ -6092,7 +6108,7 @@ async fn drive_cross_bind_trust_isolation_daemon(input: FakeDaemonInput) {
         Some(subc_mcp_principal()),
     )
     .await;
-    let untrusted_artifact_read = call_tool_response(
+    let untrusted_artifact_read = call_tool_frame(
         &mut stream,
         3,
         4303,
@@ -6101,13 +6117,13 @@ async fn drive_cross_bind_trust_isolation_daemon(input: FakeDaemonInput) {
         "untrusted cross-session bash artifact read",
     )
     .await;
-    assert_tool_error_code(
+    assert_untrusted_tool_error(
         &untrusted_artifact_read,
-        "path_outside_root",
+        "outside the project root",
         "untrusted cross-session bash artifact read",
     );
 
-    let denied_drain = call_tool_response(
+    let denied_drain = call_tool_frame(
         &mut stream,
         2,
         4400,
@@ -6116,9 +6132,9 @@ async fn drive_cross_bind_trust_isolation_daemon(input: FakeDaemonInput) {
         "untrusted drain denied",
     )
     .await;
-    assert_tool_error_code(
+    assert_untrusted_tool_error(
         &denied_drain,
-        "bash_denied_untrusted",
+        "cannot run shell commands",
         "untrusted drain denied",
     );
 
@@ -6134,7 +6150,7 @@ async fn drive_cross_bind_trust_isolation_daemon(input: FakeDaemonInput) {
     assert_tool_success(&trusted_after_drain, "trusted completion still available");
     assert_bg_completion_matching(&trusted_after_drain, &task_id, "cross-bind-completion");
 
-    let untrusted_after_completion = call_tool_response(
+    let untrusted_after_frame = call_tool_frame(
         &mut stream,
         2,
         4402,
@@ -6143,10 +6159,16 @@ async fn drive_cross_bind_trust_isolation_daemon(input: FakeDaemonInput) {
         "untrusted finalizer skips completions",
     )
     .await;
-    assert_tool_success(
-        &untrusted_after_completion,
-        "untrusted finalizer skips completions",
+    // Untrusted reply is text-only; `echo` has no server formatter, so its
+    // text IS the serialized flat response — parse it to keep the
+    // bg_completions absence assertion exact.
+    let (untrusted_text, untrusted_err) = untrusted_tool_response_text(&untrusted_after_frame);
+    assert!(
+        !untrusted_err,
+        "untrusted finalizer skips completions should succeed: {untrusted_text}"
     );
+    let untrusted_after_completion: Value =
+        serde_json::from_str(&untrusted_text).expect("echo text is the serialized flat response");
     assert!(
         untrusted_after_completion.get("bg_completions").is_none(),
         "untrusted response must not observe trusted bg completions: {untrusted_after_completion:?}"
@@ -8547,6 +8569,36 @@ fn tool_response_json(frame: &Frame) -> Value {
         "tool response missing structuredContent envelope: {body}"
     );
     structured.clone()
+}
+
+/// Read an UNTRUSTED bind's tool reply: text-only, `structuredContent`
+/// deliberately absent (an MCP host like Claude Code feeds structuredContent
+/// to the model as a raw JSON dump when present). Returns (text, isError)
+/// and fails if the envelope regresses to carrying the structured sidecar.
+fn untrusted_tool_response_text(frame: &Frame) -> (String, bool) {
+    let body: Value = serde_json::from_slice(&frame.body).expect("tool result body");
+    assert!(
+        body.get("structuredContent").is_none(),
+        "untrusted reply must be text-only, got structuredContent: {body}"
+    );
+    let text = body["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("untrusted reply missing content text: {body}"))
+        .to_string();
+    let is_error = body["isError"].as_bool().expect("isError");
+    (text, is_error)
+}
+
+/// Untrusted-bind error contract: isError plus a descriptive message. The
+/// machine-readable `code` lives only in the structured lane (first-party
+/// plugins); MCP hosts read prose, so assert on a message fragment.
+fn assert_untrusted_tool_error(frame: &Frame, message_fragment: &str, label: &str) {
+    let (text, is_error) = untrusted_tool_response_text(frame);
+    assert!(is_error, "{label} should be an error, got: {text}");
+    assert!(
+        text.contains(message_fragment),
+        "{label} text should mention '{message_fragment}': {text}"
+    );
 }
 
 /// Wait until a finished bg task's completion is actually attached in-band to a

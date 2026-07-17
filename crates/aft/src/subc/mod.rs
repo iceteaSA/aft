@@ -3632,6 +3632,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
+            bind_trust,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
@@ -3669,6 +3670,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
+            bind_trust,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
@@ -3694,6 +3696,7 @@ async fn handle_tool_call(
                         frame.header.corr,
                         frame.header.flags,
                         &result,
+                        bind_trust,
                     )?;
                     return send_reliable_writer_frame(
                         tx,
@@ -3885,7 +3888,7 @@ async fn handle_tool_call(
         };
         let result = ToolCallResult { text, response };
         let fatal = response_is_fatal_panic(&result.response);
-        match build_tool_response_frame(ver, route, corr, flags, &result) {
+        match build_tool_response_frame(ver, route, corr, flags, &result, bind_trust) {
             Ok(response_frame) => {
                 let send_result = if let Some(phase_trace) = phase_trace {
                     let trace = ToolResponseWriteTrace::new(

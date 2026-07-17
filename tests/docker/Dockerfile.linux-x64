@@ -74,10 +74,15 @@ RUN echo '{ \
   } \
 }' > /root/.config/opencode/opencode.json
 
-# AFT config — all experimental features ON (to trigger ONNX path)
+# AFT config — all experimental features ON (to trigger ONNX path).
+# auto_update MUST stay false in the e2e image: the auto-update hook
+# npm-installs the registry version over the locally packed plugin whenever
+# the pack's version differs from npm latest, silently swapping the code
+# under test for published code.
 RUN echo '{ \
   "experimental_search_index": true, \
-  "experimental_semantic_search": true \
+  "experimental_semantic_search": true, \
+  "auto_update": false \
 }' > /root/.config/opencode/aft.jsonc
 
 # TUI config

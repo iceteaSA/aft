@@ -5,6 +5,7 @@ import { resolve, sep } from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import {
   coerceOptionalInt,
+  decodeFileUrl,
   expandTilde,
   optionalInt,
   resolvePathFromProjectRoot,
@@ -123,5 +124,38 @@ describe("resolvePathFromProjectRoot", () => {
 
   test("roots relative paths at the project root", () => {
     expect(resolvePathFromProjectRoot(root, "src/file.ts")).toBe(resolve(root, "src/file.ts"));
+  });
+
+  test("decodes RFC 8089 file: URLs to local paths", () => {
+    expect(resolvePathFromProjectRoot(root, "file:///abs/file.ts")).toBe("/abs/file.ts");
+    expect(resolvePathFromProjectRoot(root, "file:/abs/file.ts")).toBe("/abs/file.ts");
+    expect(resolvePathFromProjectRoot(root, "file://localhost/abs/file.ts")).toBe("/abs/file.ts");
+    expect(resolvePathFromProjectRoot(root, "file:///tmp/a%20b.md")).toBe("/tmp/a b.md");
+  });
+});
+
+// This decoder MUST agree with the Rust percent_decode (subc_translate.rs):
+// each valid %HH decodes independently, malformed escapes stay literal. A
+// decodeURIComponent-based decoder throws on one malformed %ZZ and leaves the
+// WHOLE string encoded, so valid %2e%2e stayed encoded here while Rust
+// decoded ../ out of the project — a permission-vs-filesystem split.
+describe("decodeFileUrl parity with the Rust decoder", () => {
+  test("valid escapes decode even when a later escape is malformed", () => {
+    // %2e%2e -> ".." must be produced despite the trailing malformed %ZZ, so
+    // downstream path resolution escapes the project exactly as Rust does.
+    expect(decodeFileUrl("file:///proj/%2e%2e/%ZZ/../secret")).toBe("/proj/../%ZZ/../secret");
+  });
+
+  test("non-file targets pass through untouched", () => {
+    expect(decodeFileUrl("/plain/abs")).toBe("/plain/abs");
+    expect(decodeFileUrl("relative/path")).toBe("relative/path");
+  });
+
+  test("non-local authority is not treated as a local path", () => {
+    // On unix this is left as the original URL (no decode) so it never
+    // silently points at some other local file.
+    if (process.platform !== "win32") {
+      expect(decodeFileUrl("file://server/share/x.txt")).toBe("file://server/share/x.txt");
+    }
   });
 });
