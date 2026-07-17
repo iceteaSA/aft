@@ -375,6 +375,11 @@ impl BridgeState {
         guard.slow_configure_started
     }
 
+    fn slow_configure_finished_count(&self) -> usize {
+        let guard = self.inner.lock().expect("bridge state lock");
+        guard.slow_configure_finished
+    }
+
     fn wait_for_slow_configure_finished(&self, expected: usize) {
         self.wait_until("slow configure finished", |inner| {
             inner.slow_configure_finished >= expected
@@ -4109,15 +4114,16 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
     let flood_count = 512_u64;
     const TEST_WRITER_QUEUE_CAPACITY: u64 = 256;
     const TEST_RELIABLE_PUSH_DRAIN_BUDGET: u64 = 32;
-    // Two drain batches of slack covers the loop finishing its current batch
-    // plus one more before observing the completed bind job on a fast box; a
-    // contended CI runner (loop turns run ~5x slower relative to the fake
-    // daemon's socket reads) can legitimately fit several more batches in
-    // that window. The invariant under test is "bounded, not starved" —
-    // priority means the ack rides within queue-capacity-plus-slack instead
-    // of waiting out the whole 512-frame flood, so extra batch slack keeps
-    // the assertion meaningful without making it a wall-clock bet.
-    const ACK_AFTER_RELEASE_PUSH_BOUND: u64 =
+    // The counting baseline is the CONFIGURE-FINISHED flag, not the release:
+    // release -> finished crosses two thread wakes (configure thread, executor
+    // worker) whose scheduling latency is unbounded on a contended runner — a
+    // hot frame loop on a 2-core CI box can drain the entire remaining flood
+    // before those threads get a core (observed: ack behind 511/512 on
+    // Windows CI). Frames counted after the finished flag are loop-owned
+    // work: completion channel handoff, pre-turn bind drain, and the FIFO
+    // writer queue the ack rides behind — that is the priority mechanism
+    // under test, so a bound here is meaningful on any box.
+    const ACK_AFTER_FINISH_PUSH_BOUND: u64 =
         TEST_WRITER_QUEUE_CAPACITY + 6 * TEST_RELIABLE_PUSH_DRAIN_BUDGET;
     send_tool_call(
         &mut stream,
@@ -4129,15 +4135,22 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
     .await;
 
     let mut flood_seen = 0_u64;
-    let mut flood_after_release_before_ack = 0_u64;
+    let mut flood_after_finish_before_ack = 0_u64;
     let mut flood_response_seen = false;
     let mut saw_flood = false;
+    let mut configure_finished = false;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for RouteBindAck during reliable flood"
         );
+        if !configure_finished {
+            // Non-blocking poll: once the configure job has finished, the bind
+            // completion is en route to the loop and every flood frame read
+            // from here on is loop-owned latency.
+            configure_finished = state.slow_configure_finished_count() > slow_bind_base;
+        }
         let frame = read_any_frame_timeout(&mut stream, "RouteBindAck during reliable flood").await;
         match frame.header.ty {
             FrameType::Push => {
@@ -4146,11 +4159,12 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
                     && push_task_id(&body).is_some_and(|task| task.starts_with(flood_prefix))
                 {
                     flood_seen += 1;
-                    if saw_flood {
-                        flood_after_release_before_ack += 1;
-                    } else {
+                    if !saw_flood {
                         saw_flood = true;
                         state.release_slow_configures();
+                    }
+                    if configure_finished {
+                        flood_after_finish_before_ack += 1;
                     }
                 }
             }
@@ -4162,12 +4176,13 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
                 let ack: ModuleControlResponse =
                     serde_json::from_slice(&frame.body).expect("RouteBindAck body");
                 assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
-                // The bind acknowledgment can sit behind flood frames already queued for writing.
-                // The writer queue holds 256 frames, and the loop may finish two 32-frame
-                // reliable batches before it observes the completed bind job.
+                // The ack can legitimately sit behind flood frames already in
+                // the FIFO writer queue (capacity 256) plus a few 32-frame
+                // drain batches; anything far beyond that means the pre-turn
+                // bind drain lost priority to the flood.
                 assert!(
-                    flood_after_release_before_ack <= ACK_AFTER_RELEASE_PUSH_BOUND,
-                    "RouteBindAck waited behind {flood_after_release_before_ack} reliable Push frames after release"
+                    flood_after_finish_before_ack <= ACK_AFTER_FINISH_PUSH_BOUND,
+                    "RouteBindAck waited behind {flood_after_finish_before_ack} reliable Push frames after configure finished"
                 );
                 break;
             }
