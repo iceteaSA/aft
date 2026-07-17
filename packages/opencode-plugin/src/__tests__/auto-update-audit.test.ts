@@ -1,6 +1,15 @@
 /// <reference path="../bun-test.d.ts" />
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -161,5 +170,77 @@ describe("auto-update audit regressions", () => {
 
     resolveLatest("0.1.0");
     await waitFor(() => !existsSync(lockPath), "timed out waiting for auto-update lock release");
+  });
+
+  test("reclaims a fresh lock whose owner process has exited", async () => {
+    const storageDir = createStorageDir();
+    const lockDir = join(storageDir, "opencode");
+    const lockPath = join(lockDir, "last-update-check.json.lock");
+    mkdirSync(lockDir, { recursive: true });
+    const child = spawnSync(process.execPath, ["-e", ""]);
+    expect(child.status).toBe(0);
+    if (!child.pid) throw new Error("spawned child did not report a pid");
+    writeFileSync(lockPath, JSON.stringify({ pid: child.pid, startedMs: Date.now() }));
+
+    const { __test__ } = await freshIndexImport();
+    const lock = __test__.claimCheckSlot(storageDir, 0);
+
+    expect(lock).not.toBeNull();
+    const replacement = JSON.parse(readFileSync(lockPath, "utf-8"));
+    expect(replacement.pid).toBe(process.pid);
+    expect(typeof replacement.startedMs).toBe("number");
+    lock?.release();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("reclaims an old empty lock using its filesystem timestamp", async () => {
+    const storageDir = createStorageDir();
+    const lockDir = join(storageDir, "opencode");
+    const lockPath = join(lockDir, "last-update-check.json.lock");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(lockPath, "");
+    const old = new Date(Date.now() - 61 * 60 * 1000);
+    utimesSync(lockPath, old, old);
+
+    const { __test__ } = await freshIndexImport();
+    const lock = __test__.claimCheckSlot(storageDir, 0);
+
+    expect(lock).not.toBeNull();
+    expect(JSON.parse(readFileSync(lockPath, "utf-8")).pid).toBe(process.pid);
+    lock?.release();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("does not reclaim a fresh lock owned by a live process", async () => {
+    const storageDir = createStorageDir();
+    const lockDir = join(storageDir, "opencode");
+    const lockPath = join(lockDir, "last-update-check.json.lock");
+    mkdirSync(lockDir, { recursive: true });
+    const owner = { pid: process.pid, startedMs: Date.now() };
+    writeFileSync(lockPath, JSON.stringify(owner));
+
+    const killSpy = spyOn(process, "kill");
+    const { __test__ } = await freshIndexImport();
+    const lock = __test__.claimCheckSlot(storageDir, 0);
+
+    expect(lock).toBeNull();
+    expect(killSpy).toHaveBeenCalledWith(process.pid, 0);
+    expect(JSON.parse(readFileSync(lockPath, "utf-8"))).toEqual(owner);
+    killSpy.mockRestore();
+  });
+
+  test("release preserves a replacement lock owned by another acquisition", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    const { __test__ } = await freshIndexImport();
+    const lock = __test__.claimCheckSlot(storageDir, 0);
+    expect(lock).not.toBeNull();
+
+    const replacement = { pid: process.pid, startedMs: Date.now() + 1 };
+    writeFileSync(lockPath, JSON.stringify(replacement));
+    lock?.release();
+
+    expect(existsSync(lockPath)).toBe(true);
+    expect(JSON.parse(readFileSync(lockPath, "utf-8"))).toEqual(replacement);
   });
 });

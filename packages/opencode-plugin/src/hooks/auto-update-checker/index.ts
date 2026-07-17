@@ -6,6 +6,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
@@ -39,7 +40,18 @@ type CheckSlotLock = {
   release: () => void;
 };
 
+type CheckLockOwner = {
+  pid: number;
+  startedMs: number;
+};
+
+type CheckLockState = {
+  pid: number | null;
+  startedMs: number;
+};
+
 const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const CHECK_LOCK_STALE_MS = 60 * 60 * 1000; // 1 hour
 const DEFAULT_INIT_DELAY_MS = 5_000;
 // v0.27 commit 11 deferral: the legacy `last-update-check.json` file is read at
 // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
@@ -179,26 +191,44 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
 
     mkdirSync(dirname(file), { recursive: true });
     const lockPath = `${file}.lock`;
-    let lockFd: number;
+    const owner = { pid: process.pid, startedMs: Date.now() };
+    let lockFd: number | null = null;
     try {
       // `wx` maps to O_CREAT | O_EXCL | O_WRONLY: exactly one process wins.
       lockFd = openSync(lockPath, "wx");
-      writeFileSync(lockFd, JSON.stringify({ pid: process.pid, startedMs: Date.now() }));
+      writeFileSync(lockFd, JSON.stringify(owner));
+      closeSync(lockFd);
+      lockFd = null;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-        warn(`[auto-update-checker] Could not acquire update lock: ${String(err)}`);
+      if (lockFd !== null) {
+        try {
+          closeSync(lockFd);
+        } catch {
+          // The process no longer needs the descriptor; lock ownership is path-based.
+        }
       }
-      return null;
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (!isOrphanedCheckLock(lockPath)) return null;
+
+      // Replacing the orphan atomically avoids a remove/create interval in which
+      // another process could mistake the lock as available and start a second update.
+      const replacementPath = `${lockPath}.tmp.${process.pid}`;
+      writeFileSync(replacementPath, JSON.stringify(owner), { encoding: "utf-8", mode: 0o600 });
+      try {
+        renameSync(replacementPath, lockPath);
+      } catch (replaceError) {
+        rmSync(replacementPath, { force: true });
+        throw replaceError;
+      }
     }
 
     const lock: CheckSlotLock = {
       release: () => {
-        try {
-          closeSync(lockFd);
-        } catch {
-          // best-effort
+        // A stalled owner can resume after its lock was reclaimed. Only remove the
+        // pathname when it still names this acquisition, not a replacement owner.
+        if (checkLockIsOwnedBy(lockPath, owner)) {
+          rmSync(lockPath, { force: true });
         }
-        rmSync(lockPath, { force: true });
       },
     };
 
@@ -217,6 +247,49 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
   } catch (err) {
     warn(`[auto-update-checker] Could not coordinate via timestamp file: ${String(err)}`);
     return null;
+  }
+}
+
+function isOrphanedCheckLock(lockPath: string): boolean {
+  const state = readCheckLockState(lockPath);
+  const ageMs = Date.now() - state.startedMs;
+  if (ageMs >= CHECK_LOCK_STALE_MS) return true;
+  if (state.pid === null) return false;
+
+  try {
+    process.kill(state.pid, 0);
+    return false;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return true;
+    if (code === "EPERM") return false;
+    throw err;
+  }
+}
+
+function readCheckLockState(lockPath: string): CheckLockState {
+  const fallbackStartedMs = statSync(lockPath).mtimeMs;
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, "utf-8")) as Partial<CheckLockOwner>;
+    const pid =
+      Number.isSafeInteger(parsed.pid) && (parsed.pid ?? 0) > 0 ? (parsed.pid ?? null) : null;
+    const startedMs =
+      typeof parsed.startedMs === "number" && Number.isFinite(parsed.startedMs)
+        ? parsed.startedMs
+        : fallbackStartedMs;
+    return { pid, startedMs };
+  } catch {
+    // A crash between exclusive creation and metadata write leaves an empty lock.
+    return { pid: null, startedMs: fallbackStartedMs };
+  }
+}
+
+function checkLockIsOwnedBy(lockPath: string, owner: CheckLockOwner): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, "utf-8")) as Partial<CheckLockOwner>;
+    return parsed.pid === owner.pid && parsed.startedMs === owner.startedMs;
+  } catch {
+    return false;
   }
 }
 
@@ -413,5 +486,7 @@ function showToast(
   if (typeof tui?.showToast !== "function") return;
   tui.showToast({ body: { title, message, variant, duration } }).catch(() => {});
 }
+
+export const __test__ = { claimCheckSlot };
 
 export type { AutoUpdateCheckerOptions } from "./types.js";
