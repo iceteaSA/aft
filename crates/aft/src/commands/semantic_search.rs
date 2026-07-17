@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -2708,13 +2709,104 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
     enrich_snippets_from_source_with_context(results, project_root, None)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SnippetReadPlan {
+    fixed_last_line: Option<usize>,
+    summary_nonempty_lines: usize,
+}
+
+impl SnippetReadPlan {
+    fn include_through(&mut self, line: u32) {
+        let line = line as usize;
+        self.fixed_last_line = Some(
+            self.fixed_last_line
+                .map_or(line, |current| current.max(line)),
+        );
+    }
+
+    fn include_summary_lines(&mut self, count: usize) {
+        self.summary_nonempty_lines = self.summary_nonempty_lines.max(count);
+    }
+
+    fn is_satisfied(&self, line_index: usize, nonempty_lines: usize) -> bool {
+        self.fixed_last_line
+            .is_none_or(|last_line| line_index >= last_line)
+            && nonempty_lines >= self.summary_nonempty_lines
+    }
+}
+
+fn snippet_read_plans(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+) -> (HashMap<PathBuf, SnippetReadPlan>, HashMap<usize, Symbol>) {
+    let mut plans = HashMap::<PathBuf, SnippetReadPlan>::new();
+    let mut rank0_targets = HashMap::new();
+
+    for (rank, result) in results.iter().enumerate() {
+        if result.source == "lexical" {
+            continue;
+        }
+
+        let budget = snippet_line_budget(rank);
+        if budget == 0 {
+            continue;
+        }
+
+        let plan = plans.entry(result.file.clone()).or_default();
+        if matches!(result.kind, SymbolKind::FileSummary) {
+            plan.include_summary_lines(budget);
+            continue;
+        }
+
+        plan.include_through(result.end_line);
+        if should_expand_rank0_snippet(rank, result, project_root) {
+            let target =
+                symbol_for_rank0_render(result, ctx).unwrap_or_else(|| symbol_from_result(result));
+            plan.include_through(target.range.end_line);
+            rank0_targets.insert(rank, target);
+        }
+    }
+
+    (plans, rank0_targets)
+}
+
+fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
+    let file = fs::File::open(path).ok()?;
+    let mut lines = Vec::new();
+    let mut nonempty_lines = 0usize;
+
+    // Read each source once and stop after every requested symbol range and
+    // FileSummary budget is satisfied. Any error before that boundary discards
+    // the whole partial read, matching the previous read_to_string behavior.
+    for (line_index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.ok()?;
+        if !line.trim().is_empty() {
+            nonempty_lines += 1;
+        }
+        lines.push(line);
+
+        if plan.is_satisfied(line_index, nonempty_lines) {
+            break;
+        }
+    }
+
+    Some(lines)
+}
+
 fn enrich_snippets_from_source_with_context(
     results: &mut [HybridResult],
     project_root: &Path,
     ctx: Option<&AppContext>,
 ) -> bool {
-    // Cache reads so two top-3 hits in the same file read it once.
-    let mut file_lines: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+    let (plans, rank0_targets) = snippet_read_plans(results, project_root, ctx);
+    let file_lines = plans
+        .into_iter()
+        .map(|(path, plan)| {
+            let lines = read_bounded_snippet_lines(&path, plan);
+            (path, lines)
+        })
+        .collect::<HashMap<_, _>>();
     let mut incomplete = false;
 
     for (rank, result) in results.iter_mut().enumerate() {
@@ -2732,11 +2824,9 @@ fn enrich_snippets_from_source_with_context(
             continue;
         }
 
-        let lines = file_lines.entry(result.file.clone()).or_insert_with(|| {
-            std::fs::read_to_string(&result.file)
-                .ok()
-                .map(|content| content.lines().map(str::to_string).collect())
-        });
+        let lines = file_lines
+            .get(&result.file)
+            .and_then(|lines| lines.as_ref());
 
         if matches!(result.kind, SymbolKind::FileSummary) {
             if let Some(lines) = lines {
@@ -2766,7 +2856,8 @@ fn enrich_snippets_from_source_with_context(
         }
 
         if should_expand_rank0_snippet(rank, result, project_root) {
-            let rendered = render_rank0_symbol_snippet(result, lines, ctx);
+            let rendered =
+                render_rank0_symbol_snippet(result, lines, ctx, rank0_targets.get(&rank));
             match rendered.status {
                 BudgetedSymbolRenderStatus::Complete => {
                     // Append the full-body notice only for Complete so callers know
@@ -2800,22 +2891,114 @@ fn enrich_snippets_from_source_with_context(
     incomplete
 }
 
+#[cfg(test)]
+fn enrich_snippets_from_source_reference(
+    results: &mut [HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+) -> bool {
+    let mut file_lines: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+    let mut incomplete = false;
+
+    for (rank, result) in results.iter_mut().enumerate() {
+        if result.source == "lexical" {
+            continue;
+        }
+
+        let budget = snippet_line_budget(rank);
+        if budget == 0 {
+            if result.end_line >= result.start_line {
+                incomplete = true;
+            }
+            result.snippet = String::new();
+            continue;
+        }
+
+        let lines = file_lines.entry(result.file.clone()).or_insert_with(|| {
+            fs::read_to_string(&result.file)
+                .ok()
+                .map(|content| content.lines().map(str::to_string).collect())
+        });
+
+        if matches!(result.kind, SymbolKind::FileSummary) {
+            if let Some(lines) = lines {
+                result.snippet = lines
+                    .iter()
+                    .filter(|line| !line.trim().is_empty())
+                    .take(budget)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            continue;
+        }
+
+        let Some(lines) = lines else {
+            result.snippet = String::new();
+            continue;
+        };
+
+        let start = (result.start_line as usize).min(lines.len());
+        let end = ((result.end_line as usize) + 1).min(lines.len());
+        if start >= end {
+            result.snippet = String::new();
+            continue;
+        }
+
+        if should_expand_rank0_snippet(rank, result, project_root) {
+            let rendered = render_rank0_symbol_snippet(result, lines, ctx, None);
+            match rendered.status {
+                BudgetedSymbolRenderStatus::Complete => {
+                    result.snippet = append_rank0_full_symbol_notice(rendered.content);
+                    continue;
+                }
+                BudgetedSymbolRenderStatus::Truncated | BudgetedSymbolRenderStatus::Menu => {
+                    result.snippet = rendered.content;
+                    incomplete = true;
+                    continue;
+                }
+            }
+        }
+
+        let range_len = end - start;
+        let shown = range_len.min(budget);
+        let mut snippet = lines[start..start + shown].join("\n");
+        let remaining = range_len - shown;
+        if remaining > 0 {
+            snippet.push_str(&format!("\n+{remaining} more lines"));
+            incomplete = true;
+        }
+        result.snippet = snippet;
+    }
+
+    incomplete
+}
+
 fn render_rank0_symbol_snippet(
     result: &HybridResult,
     lines: &[String],
     ctx: Option<&AppContext>,
+    planned_target: Option<&Symbol>,
 ) -> crate::commands::symbol_render::BudgetedSymbolRender {
-    let target = symbol_for_rank0_render(result, ctx).unwrap_or_else(|| symbol_from_result(result));
+    let fallback_target;
+    let target = match planned_target {
+        Some(target) => target,
+        None => {
+            fallback_target =
+                symbol_for_rank0_render(result, ctx).unwrap_or_else(|| symbol_from_result(result));
+            &fallback_target
+        }
+    };
     let outline = ctx.and_then(|ctx| {
-        if might_have_container_members(&target) {
-            build_container_outline(ctx, &result.file, &target).ok()
+        if might_have_container_members(target) {
+            build_container_outline(ctx, &result.file, target).ok()
         } else {
             None
         }
     });
 
     render_symbol_within_budget(
-        &target,
+        target,
         lines,
         crate::parser::detect_language(&result.file),
         outline.as_ref(),
@@ -4362,22 +4545,144 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&path, &body).expect("write symbol file");
+        snippet_hit(
+            path,
+            name,
+            SymbolKind::Function,
+            0,
+            body_lines.saturating_sub(1) as u32,
+            0.5,
+        )
+    }
+
+    fn snippet_hit(
+        file: PathBuf,
+        name: &str,
+        kind: SymbolKind,
+        start_line: u32,
+        end_line: u32,
+        score: f32,
+    ) -> HybridResult {
         HybridResult {
-            file: path,
+            file,
             name: name.to_string(),
-            kind: SymbolKind::Function,
-            start_line: 0,
-            end_line: (body_lines.saturating_sub(1)) as u32,
+            kind,
+            start_line,
+            end_line,
             exported: false,
             snippet: String::new(),
-            score: 0.5,
+            score,
             source: "semantic",
-            semantic_score: Some(0.5),
+            semantic_score: Some(score),
             lexical_score: None,
             hybrid_boosted: false,
             cap_protected: false,
             lexical_generated_artifact: false,
         }
+    }
+
+    #[test]
+    fn bounded_snippet_enrichment_matches_full_read_reference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mid.rs");
+        std::fs::write(
+            &path,
+            "preamble one\npreamble two\n\n/// Explains target.\n#[inline]\nfn target() {\n    work();\n}\nmarker after required range\n",
+        )
+        .expect("write fixture");
+        let hit = snippet_hit(
+            path,
+            "target",
+            SymbolKind::Function,
+            5,
+            7,
+            HIGH_CONFIDENCE_COSINE_FLOOR,
+        );
+        let mut bounded = vec![hit.clone()];
+        let mut reference = vec![hit];
+
+        let bounded_incomplete = enrich_snippets_from_source(&mut bounded, dir.path());
+        let reference_incomplete =
+            enrich_snippets_from_source_reference(&mut reference, dir.path(), None);
+
+        assert_eq!(bounded[0].snippet, reference[0].snippet);
+        assert_eq!(bounded_incomplete, reference_incomplete);
+        assert!(bounded[0].snippet.contains("Explains target"));
+        assert!(bounded[0].snippet.contains(RANK0_FULL_SYMBOL_NOTICE));
+    }
+
+    #[test]
+    fn bounded_snippet_reader_stops_before_later_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bounded.rs");
+        std::fs::write(&path, "line0\nline1\nline2\nmarker-must-not-be-read\n")
+            .expect("write fixture");
+        let plan = SnippetReadPlan {
+            fixed_last_line: Some(2),
+            summary_nonempty_lines: 0,
+        };
+
+        let lines = read_bounded_snippet_lines(&path, plan).expect("bounded read");
+
+        assert_eq!(lines, vec!["line0", "line1", "line2"]);
+    }
+
+    #[test]
+    fn bounded_snippet_reader_ignores_invalid_utf8_only_beyond_required_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("invalid-tail.rs");
+        std::fs::write(&path, b"line0\nline1\n\xff\n").expect("write fixture");
+
+        let mut valid_prefix = vec![snippet_hit(
+            path.clone(),
+            "prefix",
+            SymbolKind::Function,
+            0,
+            1,
+            0.5,
+        )];
+        let valid_incomplete = enrich_snippets_from_source(&mut valid_prefix, dir.path());
+        assert_eq!(valid_prefix[0].snippet, "line0\nline1");
+        assert!(!valid_incomplete);
+
+        let mut invalid_range = vec![snippet_hit(
+            path,
+            "invalid",
+            SymbolKind::Function,
+            0,
+            2,
+            0.5,
+        )];
+        let invalid_incomplete = enrich_snippets_from_source(&mut invalid_range, dir.path());
+        assert!(invalid_range[0].snippet.is_empty());
+        assert!(!invalid_incomplete);
+    }
+
+    #[test]
+    fn file_summary_and_symbol_share_one_bounded_file_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shared.rs");
+        std::fs::write(
+            &path,
+            "\nsummary one\n\nfn target() {\n}\nsummary two\nsummary three\nmarker after requirements\n",
+        )
+        .expect("write fixture");
+        let symbol = snippet_hit(path.clone(), "target", SymbolKind::Function, 3, 4, 0.5);
+        let mut summary = snippet_hit(path, "shared.rs", SymbolKind::FileSummary, 0, 0, 0.5);
+        summary.snippet = "persisted summary".to_string();
+        let original = vec![symbol, summary];
+        let (plans, _) = snippet_read_plans(&original, dir.path(), None);
+        assert_eq!(plans.len(), 1, "same-file hits must share one read plan");
+
+        let mut bounded = original.clone();
+        let mut reference = original;
+        let bounded_incomplete = enrich_snippets_from_source(&mut bounded, dir.path());
+        let reference_incomplete =
+            enrich_snippets_from_source_reference(&mut reference, dir.path(), None);
+
+        assert_eq!(bounded[0].snippet, reference[0].snippet);
+        assert_eq!(bounded[1].snippet, reference[1].snippet);
+        assert_eq!(bounded_incomplete, reference_incomplete);
     }
 
     #[test]
