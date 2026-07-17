@@ -194,14 +194,14 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.47.1";
+const ANNOUNCEMENT_VERSION = "0.47.2";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Fixed: apply_patch could delete a file when a patch moved it to its own path — same-path moves are now plain in-place updates.",
-  "Fixed: moving a symlink across filesystems turned it into a regular file; the link itself is now preserved.",
-  "Fixed: a failed delete could leave a phantom undo entry, so the next undo reverted the wrong operation.",
-  "Fixed: a crashed process could leave a stale lock that permanently disabled update checks.",
-  "Paths can be given as file: URLs (#162), and reading your own background task's output files no longer prompts for permission (#161).",
-  "Faster hot paths: warm symbol lookups skip re-hashing unchanged files, search reads each posting list once per query, snippets stream only the needed lines, and edits no longer copy the whole undo history per mutation.",
+  "Fixed: apply_patch wrote mixed line endings when editing CRLF (Windows) files; the file's dominant line ending is now preserved.",
+  "Fixed: inlining a function argument like twice(1 + 2) could change operator precedence; non-atomic arguments are now parenthesized.",
+  "Fixed: removing one name from a Python import with an aliased sibling (from m import a, b as c) could delete the whole line.",
+  "Fixed: bash_watch could report a match that spanned the stdout/stderr seam; streams are now scanned independently.",
+  "GitHub and GitLab file links (…/blob/…) now read raw file content in aft_outline/aft_zoom, and documentation heading lookups tolerate numeric prefixes, link labels, emoji, and anchor slugs.",
+  "bash now finds tools on a PATH exported from your shell rc (e.g. zsh .zshrc), and several warm hot paths got faster.",
 ];
 
 /**
