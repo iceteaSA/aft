@@ -718,6 +718,20 @@ pub(crate) fn is_duplicate_import_request(
     block: &ImportBlock,
     req: &ImportRequest<'_>,
 ) -> bool {
+    if lang == LangId::Python && req.names.is_empty() && req.default_import.is_none() {
+        return block.imports.iter().any(|imp| {
+            matches!(
+                &imp.form,
+                ImportForm::Python {
+                    from_import: false,
+                    named,
+                } if named.iter().any(|specifier| {
+                    specifier_imported_name(specifier) == req.module_path
+                })
+            )
+        });
+    }
+
     if !uses_form_aware_dedup(lang) {
         return is_duplicate_with_namespace(
             block,
@@ -1874,23 +1888,25 @@ fn parse_py_import_statement(source: &str, node: &Node) -> Option<ImportStatemen
     let raw_text = source[node.byte_range()].to_string();
     let byte_range = node.byte_range();
 
-    // Find the dotted_name child (the module name)
-    let mut module_path = String::new();
+    // Keep every module specifier verbatim. A single Python import statement can
+    // bind several modules, and aliases must remain in the model so removing or
+    // merging one binding cannot silently delete its siblings.
+    let mut specifiers = Vec::new();
     let mut c = node.walk();
     if c.goto_first_child() {
         loop {
-            if c.node().kind() == "dotted_name" {
-                module_path = source[c.node().byte_range()].to_string();
-                break;
+            let child = c.node();
+            if matches!(child.kind(), "dotted_name" | "aliased_import") {
+                specifiers.push(source[child.byte_range()].trim().to_string());
             }
             if !c.goto_next_sibling() {
                 break;
             }
         }
     }
-    if module_path.is_empty() {
-        return None;
-    }
+    let module_path = specifiers
+        .first()
+        .map(|specifier| specifier_imported_name(specifier).to_string())?;
 
     let group = classify_group_py(&module_path);
 
@@ -1905,7 +1921,7 @@ fn parse_py_import_statement(source: &str, node: &Node) -> Option<ImportStatemen
         raw_text,
         form: ImportForm::Python {
             from_import: false,
-            named: Vec::new(),
+            named: specifiers,
         },
     })
 }
@@ -1940,6 +1956,11 @@ fn parse_py_import_from_statement(source: &str, node: &Node) -> Option<ImportSta
                 "relative_import" => {
                     // from . import X or from ..module import X
                     module_path = source[child.byte_range()].to_string();
+                }
+                "aliased_import" => {
+                    // Store the full `source as local` spelling so later edits
+                    // can match either name and reproduce the alias unchanged.
+                    names.push(source[child.byte_range()].trim().to_string());
                 }
                 _ => {}
             }
@@ -2665,7 +2686,7 @@ mod tests {
         match &block.imports[0].form {
             ImportForm::Python { from_import, named } => {
                 assert!(!from_import, "`import os` is not a from-import");
-                assert!(named.is_empty());
+                assert_eq!(named, &["os"]);
             }
             other => panic!("expected Python import, got {other:?}"),
         }
@@ -3131,6 +3152,24 @@ import { c } from 'charlie';
     }
 
     #[test]
+    fn parse_py_import_statement_preserves_aliases_and_siblings() {
+        let source = "import alpha, beta as local_beta\n";
+        let (_, block) = parse_py(source);
+        let imp = &block.imports[0];
+        assert_eq!(imp.module_path, "alpha");
+        assert!(imp.names.is_empty());
+        match &imp.form {
+            ImportForm::Python { from_import, named } => {
+                assert!(!from_import);
+                assert_eq!(named, &["alpha", "beta as local_beta"]);
+                assert!(specifier_matches(&named[1], "beta"));
+                assert!(specifier_matches(&named[1], "local_beta"));
+            }
+            other => panic!("expected Python import, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_py_from_import() {
         let source = "from collections import OrderedDict\nfrom typing import List, Optional\n";
         let (_, block) = parse_py(source);
@@ -3141,6 +3180,23 @@ import { c } from 'charlie';
         assert_eq!(block.imports[1].module_path, "typing");
         assert!(block.imports[1].names.contains(&"List".to_string()));
         assert!(block.imports[1].names.contains(&"Optional".to_string()));
+    }
+
+    #[test]
+    fn parse_py_from_import_preserves_aliases() {
+        let source = "from module import alpha, beta as local_beta\n";
+        let (_, block) = parse_py(source);
+        let imp = &block.imports[0];
+        assert_eq!(imp.names, ["alpha", "beta as local_beta"]);
+        assert!(specifier_matches(&imp.names[1], "beta"));
+        assert!(specifier_matches(&imp.names[1], "local_beta"));
+        assert_eq!(
+            imp.form,
+            ImportForm::Python {
+                from_import: true,
+                named: vec!["alpha".to_string(), "beta as local_beta".to_string()],
+            }
+        );
     }
 
     #[test]

@@ -1,0 +1,4 @@
+from m import a
+from m import a, b as c
+
+value = (a, c)

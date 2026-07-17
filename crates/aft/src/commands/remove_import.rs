@@ -150,7 +150,12 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         .iter()
         .enumerate()
         .filter(|(_, imp)| {
-            if imp.module_path != module {
+            let module_matches = if lang == LangId::Python {
+                python_import_matches_module(imp, module)
+            } else {
+                imp.module_path == module
+            };
+            if !module_matches {
                 return false;
             }
             if matches!(lang, LangId::C | LangId::Cpp) {
@@ -180,7 +185,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
     let new_source = if let Some(ref target_name) = name {
         remove_name_from_imports(&source, &matching, target_name, lang)
     } else {
-        remove_entire_imports(&source, &matching)
+        remove_entire_imports(&source, &matching, lang, module)
     };
     let removed = new_source != source;
 
@@ -295,6 +300,30 @@ fn remove_name_from_imports(
     let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
     for (_, imp) in matching {
+        if lang == LangId::Python {
+            if let Some(specifiers) = python_plain_import_specifiers(imp) {
+                if specifiers
+                    .iter()
+                    .any(|specifier| imports::specifier_matches(specifier, target_name))
+                {
+                    let remaining: Vec<&str> = specifiers
+                        .iter()
+                        .filter(|specifier| !imports::specifier_matches(specifier, target_name))
+                        .map(String::as_str)
+                        .collect();
+                    if remaining.is_empty() {
+                        edits.push((line_range(source, &imp.byte_range), String::new()));
+                    } else {
+                        edits.push((
+                            imp.byte_range.clone(),
+                            format!("import {}", remaining.join(", ")),
+                        ));
+                    }
+                }
+                continue;
+            }
+        }
+
         if lang == LangId::Scala {
             if let Some(replacement) = remove_name_from_scala_import(imp, target_name) {
                 match replacement {
@@ -495,20 +524,68 @@ fn normalize_scala_selector(selector: &str) -> String {
 }
 
 /// Remove entire import statements for all matching imports.
-fn remove_entire_imports(source: &str, matching: &[(usize, &imports::ImportStatement)]) -> String {
+fn remove_entire_imports(
+    source: &str,
+    matching: &[(usize, &imports::ImportStatement)],
+    lang: LangId,
+    module: &str,
+) -> String {
     let mut result = source.to_string();
     // Process in reverse order to preserve byte offsets
-    let mut ranges: Vec<std::ops::Range<usize>> = matching
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = matching
         .iter()
-        .map(|(_, imp)| line_range(source, &imp.byte_range))
+        .map(|(_, imp)| {
+            if lang == LangId::Python {
+                if let Some(specifiers) = python_plain_import_specifiers(imp) {
+                    let remaining: Vec<&str> = specifiers
+                        .iter()
+                        .filter(|specifier| imports::specifier_imported_name(specifier) != module)
+                        .map(String::as_str)
+                        .collect();
+                    if !remaining.is_empty() {
+                        return (
+                            imp.byte_range.clone(),
+                            format!("import {}", remaining.join(", ")),
+                        );
+                    }
+                }
+            }
+            (line_range(source, &imp.byte_range), String::new())
+        })
         .collect();
-    ranges.sort_by(|a, b| b.start.cmp(&a.start));
+    edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
 
-    for range in ranges {
-        result = format!("{}{}", &result[..range.start], &result[range.end..]);
+    for (range, replacement) in edits {
+        result = format!(
+            "{}{}{}",
+            &result[..range.start],
+            replacement,
+            &result[range.end..]
+        );
     }
 
     result
+}
+
+fn python_plain_import_specifiers(imp: &imports::ImportStatement) -> Option<&[String]> {
+    match &imp.form {
+        imports::ImportForm::Python {
+            from_import: false,
+            named,
+        } => Some(named),
+        _ => None,
+    }
+}
+
+fn python_import_matches_module(imp: &imports::ImportStatement, module: &str) -> bool {
+    python_plain_import_specifiers(imp).map_or_else(
+        || imp.module_path == module,
+        |specifiers| {
+            specifiers
+                .iter()
+                .any(|specifier| imports::specifier_imported_name(specifier) == module)
+        },
+    )
 }
 
 /// Expand a byte range to include the full line (including trailing newline).

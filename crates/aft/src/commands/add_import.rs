@@ -315,6 +315,14 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
                 && imp.namespace_import.is_none()
                 && imp.default_import.is_none()
                 && !imp.names.is_empty()
+                && (lang != LangId::Python
+                    || matches!(
+                        imp.form,
+                        imports::ImportForm::Python {
+                            from_import: true,
+                            ..
+                        }
+                    ))
         })
     } else {
         None

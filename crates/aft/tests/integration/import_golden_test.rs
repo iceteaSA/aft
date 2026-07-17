@@ -380,6 +380,44 @@ fn scenarios() -> Vec<Scenario> {
             }],
         },
         Scenario {
+            name: "py_remove_name_preserves_aliased_sibling",
+            ext: "py",
+            input: "from m import a, b as c\n\nvalue = c\n",
+            ops: &[Op::Remove {
+                module: "m",
+                name: Some("a"),
+            }],
+        },
+        Scenario {
+            name: "py_remove_alias_by_local_name",
+            ext: "py",
+            input: "from m import a, b as c\n\nvalue = a\n",
+            ops: &[Op::Remove {
+                module: "m",
+                name: Some("c"),
+            }],
+        },
+        Scenario {
+            name: "py_remove_plain_module_preserves_aliased_sibling",
+            ext: "py",
+            input: "import a, b as c\n\nvalue = c\n",
+            ops: &[Op::Remove {
+                module: "a",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "py_add_merge_preserves_aliased_sibling",
+            ext: "py",
+            input: "from m import a, b as c\n\nvalue = c\n",
+            ops: &[Op::Add {
+                module: "m",
+                names: &["d"],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
             name: "py_organize_grouped",
             ext: "py",
             input: "from . import local\nimport requests\nimport os\n\nx = 1\n",
@@ -391,6 +429,12 @@ fn scenarios() -> Vec<Scenario> {
             name: "py_organize_multi_module_no_data_loss",
             ext: "py",
             input: "import os, sys\nimport abc\n\nx = 1\n",
+            ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "py_organize_alias_aware_dedup",
+            ext: "py",
+            input: "from m import a\nfrom m import a, b as c\n\nvalue = (a, c)\n",
             ops: &[Op::Organize],
         },
         Scenario {
