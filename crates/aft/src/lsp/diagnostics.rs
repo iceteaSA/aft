@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -88,6 +88,9 @@ pub struct DiagnosticEntry {
 pub struct DiagnosticsStore {
     /// Primary store keyed by `(ServerKey, canonical file path)`.
     entries: HashMap<(ServerKey, PathBuf), DiagnosticEntry>,
+    /// Secondary lookup from a file to every server with a cached report.
+    /// Every mutation of `entries` must update this index in the same operation.
+    by_file: HashMap<PathBuf, HashSet<ServerKey>>,
     /// Insertion/access order for LRU eviction. Most-recently-touched
     /// entries are at the END of the vector.
     order: Vec<(ServerKey, PathBuf)>,
@@ -111,6 +114,7 @@ impl DiagnosticsStore {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            by_file: HashMap::new(),
             order: Vec::new(),
             capacity,
             next_epoch: 0,
@@ -132,6 +136,7 @@ impl DiagnosticsStore {
                 self.evict_lru();
             }
         }
+        self.debug_assert_index_consistent();
     }
 
     /// Number of currently-tracked entries.
@@ -203,10 +208,22 @@ impl DiagnosticsStore {
                         .saturating_add(crate::memory::path_bytes(path))
                         .saturating_add(std::mem::size_of::<Instant>() as u64)
                 });
+        let by_file_bytes = self.by_file.iter().fold(0u64, |bytes, (path, servers)| {
+            let server_bytes = servers.iter().fold(0u64, |server_bytes, server| {
+                server_bytes
+                    .saturating_add(std::mem::size_of_val(server) as u64)
+                    .saturating_add(crate::memory::path_bytes(&server.root))
+            });
+            bytes
+                .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+                .saturating_add(crate::memory::path_bytes(path))
+                .saturating_add(server_bytes)
+        });
         crate::memory::MemoryEstimate::estimated(
             entry_bytes
                 .saturating_add(order_bytes)
-                .saturating_add(publish_bytes),
+                .saturating_add(publish_bytes)
+                .saturating_add(by_file_bytes),
         )
         .count("diagnostic_entries", self.entries.len())
         .count("diagnostics", diagnostic_count)
@@ -285,6 +302,7 @@ impl DiagnosticsStore {
 
         if self.entries.contains_key(&key) {
             self.entries.insert(key.clone(), entry);
+            self.index_entry(&key);
             self.touch_existing(&key);
         } else {
             // New entry — apply LRU cap before inserting.
@@ -292,8 +310,10 @@ impl DiagnosticsStore {
                 self.evict_lru();
             }
             self.entries.insert(key.clone(), entry);
+            self.index_entry(&key);
             self.order.push(key);
         }
+        self.debug_assert_index_consistent();
     }
 
     /// Compatibility wrapper for the legacy push path that knows only the
@@ -317,33 +337,54 @@ impl DiagnosticsStore {
     /// Get current diagnostics for a specific file (across all servers).
     /// Watcher-stale entries are kept for bookkeeping but are not surfaced.
     pub fn for_file(&self, file: &Path) -> Vec<&StoredDiagnostic> {
-        self.entries
-            .iter()
-            .filter(|((_, stored_file), entry)| stored_file == file && !entry.stale)
-            .flat_map(|(_, entry)| entry.diagnostics.iter())
-            .collect()
+        let Some(servers) = self.by_file.get(file) else {
+            return Vec::new();
+        };
+        let file = file.to_path_buf();
+        let mut diagnostics = Vec::new();
+        for server in servers {
+            if let Some(entry) = self.entries.get(&(server.clone(), file.clone())) {
+                if !entry.stale {
+                    diagnostics.extend(&entry.diagnostics);
+                }
+            }
+        }
+        diagnostics
     }
 
     /// Get the full per-server entry for a file. Useful when callers need
     /// to know epoch/resultId, not just the diagnostics array.
     pub fn entries_for_file(&self, file: &Path) -> Vec<(&ServerKey, &DiagnosticEntry)> {
-        self.entries
+        let Some(servers) = self.by_file.get(file) else {
+            return Vec::new();
+        };
+        let file = file.to_path_buf();
+        servers
             .iter()
-            .filter(|((_, stored_file), _)| stored_file == file)
-            .map(|((key, _), entry)| (key, entry))
+            .filter_map(|server| {
+                self.entries
+                    .get_key_value(&(server.clone(), file.clone()))
+                    .map(|((stored_server, _), entry)| (stored_server, entry))
+            })
             .collect()
     }
 
     /// True if any server has an entry (fresh or stale) for this file.
     pub fn has_any_report_for_file(&self, file: &Path) -> bool {
-        self.entries.keys().any(|(_, f)| f == file)
+        self.by_file.contains_key(file)
     }
 
     /// True if any server has a non-stale report for this file.
     pub fn has_any_fresh_report_for_file(&self, file: &Path) -> bool {
-        self.entries
-            .iter()
-            .any(|((_, stored_file), entry)| stored_file == file && !entry.stale)
+        let Some(servers) = self.by_file.get(file) else {
+            return false;
+        };
+        let file = file.to_path_buf();
+        servers.iter().any(|server| {
+            self.entries
+                .get(&(server.clone(), file.clone()))
+                .is_some_and(|entry| !entry.stale)
+        })
     }
 
     /// True if this exact server instance has an entry (fresh or stale) for
@@ -497,19 +538,26 @@ impl DiagnosticsStore {
             .retain(|(stored_key, _)| stored_key.kind != server);
         self.last_publish_at_for_file
             .retain(|(stored_key, _), _| stored_key.kind != server);
+        self.by_file.retain(|_, servers| {
+            servers.retain(|stored_key| stored_key.kind != server);
+            !servers.is_empty()
+        });
         if self.entries.len() != before {
             self.generation = self.generation.wrapping_add(1);
         }
+        self.debug_assert_index_consistent();
     }
 
     /// Drop one cached report for a specific server/file pair.
     pub fn clear_for_server_file(&mut self, key: &ServerKey, file: &Path) {
         let cache_key = (key.clone(), file.to_path_buf());
         if self.entries.remove(&cache_key).is_some() {
+            self.unindex_entry(&cache_key);
             self.generation = self.generation.wrapping_add(1);
         }
         self.order.retain(|entry_key| entry_key != &cache_key);
         self.last_publish_at_for_file.remove(&cache_key);
+        self.debug_assert_index_consistent();
     }
 
     /// Drop every cached report for a file across all servers. Used when a file
@@ -518,16 +566,21 @@ impl DiagnosticsStore {
     /// exists), inflating the error/warning counts surfaced in the status bar
     /// and `aft_inspect`. Returns true if any entry was removed.
     pub fn clear_for_file(&mut self, file: &Path) -> bool {
-        let before = self.entries.len();
-        self.entries
-            .retain(|(_, stored_file), _| stored_file != file);
-        let removed = self.entries.len() != before;
+        let Some(servers) = self.by_file.remove(file) else {
+            self.debug_assert_index_consistent();
+            return false;
+        };
+        let mut removed = false;
+        for server in servers {
+            let cache_key = (server, file.to_path_buf());
+            removed |= self.entries.remove(&cache_key).is_some();
+            self.last_publish_at_for_file.remove(&cache_key);
+        }
         if removed {
             self.generation = self.generation.wrapping_add(1);
             self.order.retain(|(_, stored_file)| stored_file != file);
-            self.last_publish_at_for_file
-                .retain(|(_, stored_file), _| stored_file != file);
         }
+        self.debug_assert_index_consistent();
         removed
     }
 
@@ -539,14 +592,18 @@ impl DiagnosticsStore {
     /// proves freshness. Returns `(had_entries, changed)` where `changed` is true
     /// only if at least one previously-fresh entry became stale.
     pub fn mark_stale_for_file(&mut self, file: &Path) -> (bool, bool) {
-        let mut had_entries = false;
+        let Some(servers) = self.by_file.get(file) else {
+            return (false, false);
+        };
+        let had_entries = !servers.is_empty();
         let mut changed = false;
-        for ((_, stored_file), entry) in &mut self.entries {
-            if stored_file != file {
-                continue;
-            }
-            had_entries = true;
-            if !entry.stale {
+        for server in servers {
+            let cache_key = (server.clone(), file.to_path_buf());
+            if let Some(entry) = self
+                .entries
+                .get_mut(&cache_key)
+                .filter(|entry| !entry.stale)
+            {
                 entry.stale = true;
                 changed = true;
             }
@@ -554,6 +611,7 @@ impl DiagnosticsStore {
         if changed {
             self.generation = self.generation.wrapping_add(1);
         }
+        self.debug_assert_index_consistent();
         (had_entries, changed)
     }
 
@@ -579,9 +637,14 @@ impl DiagnosticsStore {
         self.entries.retain(|(k, _), _| k != key);
         self.order.retain(|(k, _)| k != key);
         self.last_publish_at_for_file.retain(|(k, _), _| k != key);
+        self.by_file.retain(|_, servers| {
+            servers.remove(key);
+            !servers.is_empty()
+        });
         if self.entries.len() != before {
             self.generation = self.generation.wrapping_add(1);
         }
+        self.debug_assert_index_consistent();
     }
 
     /// Backward-compatible alias for tests/callers that already used the
@@ -597,7 +660,9 @@ impl DiagnosticsStore {
         }
         let evicted = self.order.remove(0);
         self.entries.remove(&evicted);
+        self.unindex_entry(&evicted);
         self.last_publish_at_for_file.remove(&evicted);
+        self.debug_assert_index_consistent();
         Some(evicted)
     }
 
@@ -606,6 +671,56 @@ impl DiagnosticsStore {
             let removed = self.order.remove(idx);
             self.order.push(removed);
         }
+    }
+
+    fn index_entry(&mut self, (server, file): &(ServerKey, PathBuf)) {
+        self.by_file
+            .entry(file.clone())
+            .or_default()
+            .insert(server.clone());
+    }
+
+    fn unindex_entry(&mut self, (server, file): &(ServerKey, PathBuf)) {
+        let remove_file = self.by_file.get_mut(file).is_some_and(|servers| {
+            servers.remove(server);
+            servers.is_empty()
+        });
+        if remove_file {
+            self.by_file.remove(file);
+        }
+    }
+
+    fn debug_assert_index_consistent(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let indexed_entries = self.by_file.values().map(HashSet::len).sum::<usize>();
+            debug_assert_eq!(indexed_entries, self.entries.len());
+            for (server, file) in self.entries.keys() {
+                debug_assert!(self
+                    .by_file
+                    .get(file)
+                    .is_some_and(|servers| servers.contains(server)));
+            }
+            for (file, servers) in &self.by_file {
+                debug_assert!(!servers.is_empty());
+                for server in servers {
+                    debug_assert!(self.entries.contains_key(&(server.clone(), file.clone())));
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn mark_stale_for_file_linear_reference(&self, file: &Path) -> (bool, bool) {
+        let mut had_entries = false;
+        let mut changed = false;
+        for ((_, stored_file), entry) in &self.entries {
+            if stored_file == file {
+                had_entries = true;
+                changed |= !entry.stale;
+            }
+        }
+        (had_entries, changed)
     }
 }
 
@@ -923,8 +1038,82 @@ mod tests {
         );
         assert_eq!(store.len(), 2);
         assert!(!store.has_any_report_for_file(Path::new("/a.rs")));
+        assert!(!store.by_file.contains_key(Path::new("/a.rs")));
         assert!(store.has_any_report_for_file(Path::new("/b.rs")));
         assert!(store.has_any_report_for_file(Path::new("/c.rs")));
+        store.debug_assert_index_consistent();
+    }
+
+    #[test]
+    fn secondary_index_stays_consistent_through_seeded_mutation_storm() {
+        fn next_random(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+
+        let servers = [
+            server_key(ServerKind::Rust),
+            server_key(ServerKind::TypeScript),
+            server_key(ServerKind::Python),
+            server_key(ServerKind::Biome),
+        ];
+        let files = (0..11)
+            .map(|index| PathBuf::from(format!("/tmp/index-{index}.rs")))
+            .collect::<Vec<_>>();
+        let mut store = DiagnosticsStore::with_capacity(7);
+        let mut seed = 0x05ee_dd1a_6005_71c5_u64;
+        let mut operation_counts = [0usize; 7];
+        let mut stale_hits = 0usize;
+
+        for step in 0..1_000 {
+            let operation = (next_random(&mut seed) % operation_counts.len() as u64) as usize;
+            operation_counts[operation] += 1;
+            let server = servers[(next_random(&mut seed) % servers.len() as u64) as usize].clone();
+            let file = files[(next_random(&mut seed) % files.len() as u64) as usize].clone();
+
+            match operation {
+                0 | 1 => store.publish(
+                    server,
+                    file.clone(),
+                    vec![diag(
+                        file.to_str().unwrap(),
+                        step + 1,
+                        "seeded diagnostic",
+                        DiagnosticSeverity::Warning,
+                    )],
+                ),
+                2 => {
+                    let expected = store.mark_stale_for_file_linear_reference(&file);
+                    let actual = store.mark_stale_for_file(&file);
+                    assert_eq!(actual, expected);
+                    stale_hits += usize::from(actual.0);
+                }
+                3 => {
+                    store.clear_for_server_file(&server, &file);
+                }
+                4 => {
+                    store.clear_for_file(&file);
+                }
+                5 => {
+                    store.clear_for_server(&server);
+                }
+                6 => {
+                    store.clear_server(server.kind);
+                }
+                _ => unreachable!(),
+            }
+
+            store.debug_assert_index_consistent();
+            assert!(store.len() <= 7);
+        }
+
+        assert!(operation_counts.into_iter().all(|count| count > 0));
+        assert!(
+            stale_hits > 0,
+            "seeded sequence must stale existing entries"
+        );
     }
 
     #[test]
