@@ -9,6 +9,8 @@ use super::helpers::AftProcess;
 #[cfg(unix)]
 use super::helpers::user_config;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Helper: create a temp directory with a unique name for this test.
 fn temp_dir(test_name: &str) -> std::path::PathBuf {
@@ -185,6 +187,130 @@ fn test_operation_undo_restores_multiple_deleted_files() {
     assert_eq!(fs::read_to_string(&file_a).unwrap(), "original-a");
     assert_eq!(fs::read_to_string(&file_b).unwrap(), "original-b");
 
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_delete_does_not_shadow_the_previous_undo_operation() {
+    let dir = temp_dir("failed_delete_does_not_shadow_undo");
+    let edited = dir.join("edited.txt");
+    let protected_dir = dir.join("protected");
+    let victim = protected_dir.join("victim.txt");
+    fs::create_dir_all(&protected_dir).unwrap();
+    fs::write(&edited, "before edit\n").unwrap();
+    fs::write(&victim, "untouched victim\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let edit = serde_json::json!({
+        "id": "edit-before-failed-delete",
+        "command": "edit_match",
+        "file": edited.display().to_string(),
+        "match": "before edit",
+        "replacement": "after edit",
+    });
+    let edit_resp = aft.send(&serde_json::to_string(&edit).unwrap());
+    assert_eq!(edit_resp["success"], true, "edit: {edit_resp:?}");
+    assert_eq!(fs::read_to_string(&edited).unwrap(), "after edit\n");
+
+    fs::set_permissions(&protected_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let delete = serde_json::json!({
+        "id": "permission-denied-delete",
+        "command": "delete_file",
+        "file": victim.display().to_string(),
+    });
+    let delete_resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    assert_eq!(delete_resp["success"], false, "delete: {delete_resp:?}");
+    assert_eq!(delete_resp["code"], "io_error");
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched victim\n");
+
+    let undo = aft.send(r#"{"id":"undo-after-failed-delete","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(undo["restored_count"], 1);
+    assert_eq!(fs::read_to_string(&edited).unwrap(), "before edit\n");
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched victim\n");
+
+    fs::set_permissions(&protected_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_failed_delete_has_no_history_and_undo_restores_only_deleted_file() {
+    let dir = temp_dir("batch_failed_delete_history");
+    let deleted = dir.join("deleted.txt");
+    let protected_dir = dir.join("protected");
+    let victim = protected_dir.join("victim.txt");
+    fs::create_dir_all(&protected_dir).unwrap();
+    fs::write(&deleted, "restore me\n").unwrap();
+    fs::write(&victim, "never deleted\n").unwrap();
+    fs::set_permissions(&protected_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "mixed-delete",
+        "command": "delete_file",
+        "files": [victim.display().to_string(), deleted.display().to_string()],
+    });
+    let delete_resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    assert_eq!(delete_resp["success"], true, "delete: {delete_resp:?}");
+    assert_eq!(delete_resp["complete"], false);
+    assert_eq!(delete_resp["deleted"].as_array().unwrap().len(), 1);
+    assert_eq!(delete_resp["skipped_files"].as_array().unwrap().len(), 1);
+    assert!(!deleted.exists());
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "never deleted\n");
+
+    let history = aft.send(&format!(
+        r#"{{"id":"failed-delete-history","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&victim.display())
+    ));
+    assert_eq!(history["success"], true, "history: {history:?}");
+    assert!(history["entries"].as_array().unwrap().is_empty());
+
+    let undo = aft.send(r#"{"id":"undo-mixed-delete","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(undo["restored_count"], 1);
+    assert_eq!(fs::read_to_string(&deleted).unwrap(), "restore me\n");
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "never deleted\n");
+
+    fs::set_permissions(&protected_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_recursive_delete_does_not_keep_backups_for_intact_files() {
+    let dir = temp_dir("failed_recursive_delete_history");
+    let tree = dir.join("tree");
+    let protected_dir = tree.join("protected");
+    let victim = protected_dir.join("victim.txt");
+    fs::create_dir_all(&protected_dir).unwrap();
+    fs::write(&victim, "never deleted\n").unwrap();
+    fs::set_permissions(&protected_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "permission-denied-recursive-delete",
+        "command": "delete_file",
+        "file": tree.display().to_string(),
+        "recursive": true,
+    });
+    let delete_resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    assert_eq!(delete_resp["success"], false, "delete: {delete_resp:?}");
+    assert_eq!(delete_resp["code"], "io_error");
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "never deleted\n");
+
+    let history = aft.send(&format!(
+        r#"{{"id":"recursive-delete-history","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&victim.display())
+    ));
+    assert_eq!(history["success"], true, "history: {history:?}");
+    assert!(history["entries"].as_array().unwrap().is_empty());
+
+    fs::set_permissions(&protected_dir, fs::Permissions::from_mode(0o755)).unwrap();
     let status = aft.shutdown();
     assert!(status.success());
 }

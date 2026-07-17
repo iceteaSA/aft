@@ -226,6 +226,15 @@ fn delete_one_or_dir(
 
     // Delete the file
     if let Err(e) = std::fs::remove_file(&path) {
+        // A failed remove leaves this file unchanged. Discard its snapshot so
+        // the failed request does not become a phantom undo operation.
+        if backup_id.is_some() {
+            ctx.backup().lock().discard_latest_operation_entry_for_path(
+                req.session(),
+                op_id,
+                &path,
+            );
+        }
         return Err(Response::error(
             &req.id,
             "io_error",
@@ -308,6 +317,7 @@ fn delete_directory(
     }
 
     let mut backup_ids: Vec<String> = Vec::new();
+    let mut backed_up_paths: Vec<PathBuf> = Vec::new();
     for file_path in &files_to_backup {
         match edit::auto_backup(
             ctx,
@@ -316,9 +326,15 @@ fn delete_directory(
             "delete_file: pre-delete backup (directory contents)",
             Some(op_id),
         ) {
-            Ok(Some(id)) => backup_ids.push(id),
+            Ok(Some(id)) => {
+                backup_ids.push(id);
+                backed_up_paths.push(file_path.clone());
+            }
             Ok(None) => {}
             Err(e) => {
+                // Directory mutation has not started, so snapshots already
+                // captured by this failed request must not enter undo history.
+                discard_delete_backups(ctx, req.session(), op_id, &backed_up_paths);
                 return Err(Response::error(
                     &req.id,
                     e.code(),
@@ -334,6 +350,14 @@ fn delete_directory(
     }
 
     if let Err(e) = std::fs::remove_dir_all(path) {
+        // Recursive removal may fail after deleting part of the tree. Keep
+        // backups for missing files, but discard entries for files left intact.
+        let not_deleted_paths = backed_up_paths
+            .iter()
+            .filter(|file_path| std::fs::symlink_metadata(file_path).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        discard_delete_backups(ctx, req.session(), op_id, &not_deleted_paths);
         return Err(Response::error(
             &req.id,
             "io_error",
@@ -363,6 +387,13 @@ fn delete_directory(
         "files_deleted": files_to_backup.len(),
         "backup_ids": backup_ids,
     }))
+}
+
+fn discard_delete_backups(ctx: &AppContext, session: &str, op_id: &str, paths: &[PathBuf]) {
+    let mut backup = ctx.backup().lock();
+    for path in paths {
+        backup.discard_latest_operation_entry_for_path(session, op_id, path);
+    }
 }
 
 /// Guardrail for recursive deletes: the backup/undo format currently records
