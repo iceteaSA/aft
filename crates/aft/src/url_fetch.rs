@@ -100,7 +100,8 @@ pub fn fetch_url_to_cache(
     options: UrlFetchOptions,
 ) -> Result<PathBuf, UrlFetchError> {
     let parsed = Url::parse(url).map_err(|_| UrlFetchError::new(format!("Invalid URL: {url}")))?;
-    validate_public_url(&parsed, &options)?;
+    let fetch_url = rewrite_url_for_fetch(&parsed);
+    validate_public_url(&fetch_url, &options)?;
 
     let dir = cache_dir(storage_dir);
     fs::create_dir_all(&dir).map_err(|error| {
@@ -112,11 +113,11 @@ pub fn fetch_url_to_cache(
 
     let hash = hash_url(url);
     let meta_file = meta_path(storage_dir, &hash);
-    if let Some(cached) = fresh_cached_path(storage_dir, &hash, &meta_file, &parsed)? {
+    if let Some(cached) = fresh_cached_path(storage_dir, &hash, &meta_file, &fetch_url)? {
         return Ok(cached);
     }
 
-    let response = fetch_with_redirects(&parsed, url, &options)?;
+    let response = fetch_with_redirects(&fetch_url, url, &options)?;
     if !response.status().is_success() {
         return Err(UrlFetchError::new(format!(
             "HTTP {} {} fetching {url}",
@@ -132,7 +133,7 @@ pub fn fetch_url_to_cache(
         .unwrap_or("text/plain")
         .to_string();
     let (extension, from_source_path) =
-        resolve_fetch_extension(&parsed, &content_type).ok_or_else(|| {
+        resolve_fetch_extension(&fetch_url, &content_type).ok_or_else(|| {
             UrlFetchError::new(format!(
                 "Unsupported content type '{content_type}' for {url}. Supported: text/html, text/markdown, application/json, text/plain; source files via URL path extension (e.g. .rs, .ts, .mjs)"
             ))
@@ -250,6 +251,70 @@ fn cache_dir(storage_dir: &Path) -> PathBuf {
 fn hash_url(url: &str) -> String {
     let digest = Sha256::digest(url.as_bytes());
     format!("{digest:x}").chars().take(16).collect()
+}
+
+/// Rewrite well-known web-view links before fetching because those pages serve
+/// an HTML application shell instead of the file contents agents need to read.
+fn rewrite_url_for_fetch(url: &Url) -> Url {
+    let original = url.clone();
+    let mut rewritten = url.clone();
+    rewritten.set_fragment(None);
+
+    let Some(host) = url.host_str() else {
+        return rewritten;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return rewritten;
+    }
+
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|segments| segments.collect())
+        .unwrap_or_default();
+    let (raw_host, raw_path) = if matches!(host, "github.com" | "www.github.com") {
+        if segments.len() >= 5 && matches!(segments[2], "blob" | "raw") {
+            (
+                "raw.githubusercontent.com",
+                format!(
+                    "/{}/{}/{}/{}",
+                    segments[0],
+                    segments[1],
+                    segments[3],
+                    segments[4..].join("/")
+                ),
+            )
+        } else {
+            return rewritten;
+        }
+    } else if host == "gitlab.com"
+        && segments.len() >= 6
+        && segments[2] == "-"
+        && segments[3] == "blob"
+    {
+        (
+            "gitlab.com",
+            format!(
+                "/{}/{}/-/raw/{}/{}",
+                segments[0],
+                segments[1],
+                segments[4],
+                segments[5..].join("/")
+            ),
+        )
+    } else {
+        return rewritten;
+    };
+
+    rewritten
+        .set_host(Some(raw_host))
+        .expect("raw content host should be a valid URL host");
+    rewritten.set_path(&raw_path);
+    log::debug!(
+        "url_fetch: rewriting web-view URL to raw content: {} -> {}",
+        original,
+        rewritten
+    );
+    rewritten
 }
 
 fn meta_path(storage_dir: &Path, hash: &str) -> PathBuf {
@@ -930,6 +995,48 @@ fn reqwest_error_detail(error: &reqwest::Error) -> String {
 mod tests {
     use super::*;
     use url::Url;
+
+    #[test]
+    fn web_view_urls_rewrite_to_raw_content() {
+        let cases = [
+            (
+                "https://github.com/owner/repo/blob/main/docs/guide.md?download=1#L42",
+                "https://raw.githubusercontent.com/owner/repo/main/docs/guide.md?download=1",
+            ),
+            (
+                "https://github.com/owner/repo/raw/v1.2/src/lib.rs?raw=1#L7",
+                "https://raw.githubusercontent.com/owner/repo/v1.2/src/lib.rs?raw=1",
+            ),
+            (
+                "https://www.github.com/owner/repo/blob/main/README.md",
+                "https://raw.githubusercontent.com/owner/repo/main/README.md",
+            ),
+            (
+                "https://gitlab.com/owner/repo/-/blob/main/docs/guide.md?plain=1#L4",
+                "https://gitlab.com/owner/repo/-/raw/main/docs/guide.md?plain=1",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let url = Url::parse(input).unwrap();
+            assert_eq!(rewrite_url_for_fetch(&url).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn non_web_view_urls_are_not_rewritten() {
+        for input in [
+            "https://gist.github.com/owner/abcdef/blob/main/file.md",
+            "https://github.com/owner/repo",
+            "https://github.com/owner/repo/blob",
+            "https://api.github.com/repos/owner/repo",
+            "https://notgithub.com/owner/repo/blob/main/file.md",
+            "https://gitlab.example.com/owner/repo/-/blob/main/file.md",
+        ] {
+            let url = Url::parse(input).unwrap();
+            assert_eq!(rewrite_url_for_fetch(&url).as_str(), input);
+        }
+    }
 
     #[test]
     fn extension_from_path_uses_parser_mapping() {

@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -273,6 +273,40 @@ fn redirect_revalidates_each_hop() {
     assert!(
         err.to_string().contains("Blocked private URL host"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn github_blob_url_fetches_from_raw_content_path() {
+    let storage = TempDir::new().unwrap();
+    let requested_path = Arc::new(Mutex::new(None));
+    let requested_path_for_handler = Arc::clone(&requested_path);
+    let server = spawn_mock_server(1, move |path, stream| {
+        *requested_path_for_handler.lock().unwrap() = Some(path);
+        write_response(stream, "200 OK", "text/markdown", b"# Raw GitHub content\n");
+    });
+
+    let cached = fetch_url_to_cache(
+        "http://www.github.com/owner/repo/blob/main/docs/guide.md?download=1#L42",
+        storage.path(),
+        UrlFetchOptions {
+            public_host_overrides: vec![(
+                "raw.githubusercontent.com".to_string(),
+                vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            )],
+            connect_overrides: vec![("raw.githubusercontent.com".to_string(), server.addr)],
+            ..UrlFetchOptions::default()
+        },
+    )
+    .expect("GitHub blob URL should fetch raw content");
+
+    assert_eq!(
+        *requested_path.lock().unwrap(),
+        Some("/owner/repo/main/docs/guide.md?download=1".to_string())
+    );
+    assert_eq!(
+        fs::read_to_string(cached).unwrap(),
+        "# Raw GitHub content\n"
     );
 }
 
