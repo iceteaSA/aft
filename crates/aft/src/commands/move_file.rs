@@ -186,16 +186,91 @@ enum MoveOutcome {
 fn move_file_on_disk(src_path: &Path, dst_path: &Path) -> MoveOutcome {
     match fs::rename(src_path, dst_path) {
         Ok(()) => MoveOutcome::Moved,
-        Err(rename_error) => match fs::copy(src_path, dst_path) {
-            Ok(_) => match fs::remove_file(src_path) {
-                Ok(()) => MoveOutcome::Moved,
-                Err(remove_error) => {
-                    MoveOutcome::CopiedSourceDeleteFailed(remove_error.to_string())
-                }
-            },
-            Err(_) => MoveOutcome::Failed(rename_error.to_string()),
-        },
+        Err(rename_error) => {
+            let source_is_symlink = fs::symlink_metadata(src_path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if source_is_symlink {
+                return move_symlink_after_rename_failure(src_path, dst_path, &rename_error);
+            }
+
+            match fs::copy(src_path, dst_path) {
+                Ok(_) => remove_source_after_fallback(src_path),
+                Err(_) => MoveOutcome::Failed(rename_error.to_string()),
+            }
+        }
     }
+}
+
+fn move_symlink_after_rename_failure(
+    src_path: &Path,
+    dst_path: &Path,
+    rename_error: &std::io::Error,
+) -> MoveOutcome {
+    let target = match fs::read_link(src_path) {
+        Ok(target) => target,
+        Err(_) => return MoveOutcome::Failed(rename_error.to_string()),
+    };
+
+    // std::fs::copy follows a symlink and would silently turn the destination
+    // into a regular file. Recreate the link itself, preserving its target text:
+    // a relative target stays relative and can legitimately dangle after a move.
+    let create_result = create_symlink(&target, src_path, dst_path);
+    let create_result = if create_result
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+        && rename_error.kind() == std::io::ErrorKind::CrossesDevices
+    {
+        match fs::remove_file(dst_path) {
+            Ok(()) => create_symlink(&target, src_path, dst_path),
+            Err(error) => Err(error),
+        }
+    } else {
+        create_result
+    };
+
+    match create_result {
+        Ok(()) => remove_source_after_fallback(src_path),
+        Err(_) => MoveOutcome::Failed(rename_error.to_string()),
+    }
+}
+
+fn remove_source_after_fallback(src_path: &Path) -> MoveOutcome {
+    match fs::remove_file(src_path) {
+        Ok(()) => MoveOutcome::Moved,
+        Err(remove_error) => MoveOutcome::CopiedSourceDeleteFailed(remove_error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, _src_path: &Path, dst_path: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, dst_path)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, src_path: &Path, dst_path: &Path) -> std::io::Result<()> {
+    let resolved_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        src_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target)
+    };
+    if fs::metadata(resolved_target).is_ok_and(|metadata| metadata.is_dir()) {
+        std::os::windows::fs::symlink_dir(target, dst_path)
+    } else {
+        // Dangling targets cannot reveal their type; file links are the safest
+        // default and match this command's file-only contract.
+        std::os::windows::fs::symlink_file(target, dst_path)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(_target: &Path, _src_path: &Path, _dst_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlink moves are unsupported on this platform",
+    ))
 }
 
 fn unresolved_existing_path(resolved_path: &Path, requested_path: &Path) -> PathBuf {
@@ -232,6 +307,13 @@ fn move_success_result(
 mod tests {
     use super::{move_success_result, MoveOutcome};
 
+    #[cfg(unix)]
+    use super::move_symlink_after_rename_failure;
+    #[cfg(unix)]
+    use std::io::{Error, ErrorKind};
+    #[cfg(unix)]
+    use std::path::Path;
+
     #[test]
     fn copied_but_source_delete_failed_shape_marks_partial_success() {
         let result = move_success_result(
@@ -246,5 +328,91 @@ mod tests {
         assert!(result["warning"]
             .as_str()
             .is_some_and(|warning| warning.contains("Both paths now exist")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_fallback_preserves_relative_target_text() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir_all(&source_dir).expect("source directory");
+        std::fs::create_dir_all(&destination_dir).expect("destination directory");
+        std::fs::write(source_dir.join("target.txt"), "target contents\n").expect("target file");
+        let source = source_dir.join("link.txt");
+        let destination = destination_dir.join("link.txt");
+        let target = Path::new("target.txt");
+        std::os::unix::fs::symlink(target, &source).expect("source symlink");
+
+        let outcome = move_symlink_after_rename_failure(
+            &source,
+            &destination,
+            &Error::from(ErrorKind::CrossesDevices),
+        );
+
+        assert_eq!(outcome, MoveOutcome::Moved);
+        assert!(std::fs::symlink_metadata(&source).is_err());
+        assert!(std::fs::symlink_metadata(&destination)
+            .expect("destination metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&destination).expect("link target"),
+            target
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_fallback_moves_dangling_link() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source-link");
+        let destination = temp.path().join("destination-link");
+        let target = Path::new("missing/target.txt");
+        std::os::unix::fs::symlink(target, &source).expect("dangling source symlink");
+
+        let outcome = move_symlink_after_rename_failure(
+            &source,
+            &destination,
+            &Error::from(ErrorKind::CrossesDevices),
+        );
+
+        assert_eq!(outcome, MoveOutcome::Moved);
+        assert!(std::fs::symlink_metadata(&source).is_err());
+        assert!(std::fs::symlink_metadata(&destination)
+            .expect("destination metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&destination).expect("link target"),
+            target
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_symlink_fallback_replaces_existing_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source-link");
+        let destination = temp.path().join("destination-link");
+        let target = Path::new("target.txt");
+        std::os::unix::fs::symlink(target, &source).expect("source symlink");
+        std::fs::write(&destination, "stale destination\n").expect("existing destination");
+
+        let outcome = move_symlink_after_rename_failure(
+            &source,
+            &destination,
+            &Error::from(ErrorKind::CrossesDevices),
+        );
+
+        assert_eq!(outcome, MoveOutcome::Moved);
+        assert!(std::fs::symlink_metadata(&destination)
+            .expect("destination metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&destination).expect("link target"),
+            target
+        );
     }
 }
