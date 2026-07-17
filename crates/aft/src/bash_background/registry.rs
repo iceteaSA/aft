@@ -3788,6 +3788,8 @@ impl BgTask {
                 .as_ref()
                 .map(|cache| (cache.output_preview.clone(), cache.output_truncated))
                 .unwrap_or_else(|| (String::new(), false))
+        } else if preview_bytes == 0 {
+            (String::new(), false)
         } else {
             state.buffer.read_tail(preview_bytes)
         };
@@ -4340,6 +4342,61 @@ mod tests {
             .expect("insert terminal task");
         let task = registry.task_for_session(&task_id, "session").unwrap();
         (task_id, task)
+    }
+
+    #[test]
+    fn bash_zero_preview_running_status_skips_output_read_while_explicit_preview_reads() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = format!("bash-test-{}", random_slug());
+        let paths = task_paths(dir.path(), "session", &task_id);
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(&paths.stdout, "live output\n").unwrap();
+        fs::write(&paths.stderr, "").unwrap();
+        let stdout_path = paths.stdout.clone();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            "sleep 60".to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            Some(30_000),
+            true,
+            false,
+        );
+        metadata.status = BgTaskStatus::Running;
+        write_task(&paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, false)
+            .expect("insert running task");
+
+        crate::bash_background::buffer::reset_tail_read_count(&stdout_path);
+        for _ in 0..5 {
+            let snapshot = registry
+                .status(&task_id, "session", Some(dir.path()), Some(dir.path()), 0)
+                .expect("running snapshot");
+            assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+            assert!(snapshot.output_preview.is_empty());
+        }
+        assert_eq!(
+            crate::bash_background::buffer::tail_read_count(&stdout_path),
+            0
+        );
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                Some(dir.path()),
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .expect("explicit running snapshot");
+        assert_eq!(snapshot.output_preview, "live output\n");
+        assert_eq!(
+            crate::bash_background::buffer::tail_read_count(&stdout_path),
+            1
+        );
     }
 
     #[test]

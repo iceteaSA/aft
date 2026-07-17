@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES;
 use crate::bash_background::registry::BgTaskSnapshot;
 use crate::bash_background::BgTaskStatus;
 use crate::context::AppContext;
@@ -155,13 +154,15 @@ pub fn build_bash_outcome(
     let session_id_for_cleanup = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
+        // Foreground polls only need task state. Terminal snapshots still
+        // return cached output.
         let response = if let Some(snapshot) = poll_bash_status(
             ctx,
             &task_id_for_poll,
             &session_id_for_poll,
             project_root.as_deref(),
             &storage_dir,
-            RUNNING_OUTPUT_PREVIEW_BYTES,
+            0,
         ) {
             if snapshot.info.status.is_terminal() {
                 Some(foreground_result_response(&request_id_for_poll, snapshot))

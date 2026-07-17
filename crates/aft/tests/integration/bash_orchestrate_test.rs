@@ -167,16 +167,22 @@ fn orchestrated_wait_true_does_not_promote() {
     let response = aft.send(&bash_request(
         "bash-wait-orchestrated",
         json!({
-            "command": "sleep 1; printf 'wait-done\\n'",
+            "command": "printf 'wait-early\\n'; sleep 1; printf 'wait-late\\n'",
             "timeout": 3_000,
             "foreground_orchestrate": true,
             "wait": true,
+            "compressed": false,
         }),
     ));
 
     assert_eq!(response["success"], true, "response: {response:?}");
     assert_eq!(response["status"], "completed", "response: {response:?}");
-    assert!(response["output"].as_str().unwrap().contains("wait-done"));
+    assert_eq!(
+        response["output_preview"].as_str().unwrap(),
+        "wait-early\nwait-late\n"
+    );
+    assert!(response["output"].as_str().unwrap().contains("wait-early"));
+    assert!(response["output"].as_str().unwrap().contains("wait-late"));
     assert!(!response["output"]
         .as_str()
         .unwrap()

@@ -1,6 +1,11 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
+static TAIL_READS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> = OnceLock::new();
 
 pub const DISK_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -77,6 +82,8 @@ impl BgBuffer {
     }
 
     pub fn read_tail(&self, max_bytes: usize) -> (String, bool) {
+        #[cfg(test)]
+        bump_tail_read_count(self);
         match self {
             Self::Pipes {
                 stdout_path,
@@ -223,6 +230,44 @@ impl BgBuffer {
             }
         }
     }
+}
+
+#[cfg(test)]
+fn tail_reads() -> &'static Mutex<std::collections::HashMap<PathBuf, usize>> {
+    TAIL_READS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn tail_read_key(buffer: &BgBuffer) -> &Path {
+    match buffer {
+        BgBuffer::Pipes { stdout_path, .. } => stdout_path,
+        BgBuffer::Pty { combined_path } => combined_path,
+    }
+}
+
+#[cfg(test)]
+fn bump_tail_read_count(buffer: &BgBuffer) {
+    if let Ok(mut reads) = tail_reads().lock() {
+        *reads
+            .entry(tail_read_key(buffer).to_path_buf())
+            .or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_tail_read_count(path: &Path) {
+    if let Ok(mut reads) = tail_reads().lock() {
+        reads.remove(path);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn tail_read_count(path: &Path) -> usize {
+    tail_reads()
+        .lock()
+        .ok()
+        .and_then(|reads| reads.get(path).copied())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

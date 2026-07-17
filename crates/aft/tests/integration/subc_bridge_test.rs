@@ -3038,7 +3038,7 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
         117,
         "bash",
         json!({
-            "command": "sleep 1; printf 'wait-done\\n'",
+            "command": "printf 'wait-early\\n'; sleep 1; printf 'wait-late\\n'",
             "foreground_orchestrate": true,
             "wait": true,
             "timeout": 5_000,
@@ -3055,7 +3055,11 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
     assert_eq!(frame.header.corr, 117);
     assert!(!tool_result_is_error(&frame));
     let text = tool_result_text(&frame);
-    assert!(text.contains("wait-done"), "unexpected bash text: {text:?}");
+    assert!(
+        text.contains("wait-early"),
+        "unexpected bash text: {text:?}"
+    );
+    assert!(text.contains("wait-late"), "unexpected bash text: {text:?}");
     assert!(!text.contains("promoted to background"));
     send_connection_goodbye(&mut stream).await;
 }

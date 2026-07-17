@@ -550,13 +550,15 @@ async fn run_deferred_bash_wait(
                             let mut poll_text_tx = Some(poll_text_tx);
                             let mut poll_control_tx = Some(poll_control_tx);
 
+                            // Foreground polls only need task state. Terminal snapshots still
+                            // return cached output.
                             let Some(snapshot) = crate::commands::bash_orchestrate::poll_bash_status(
                                 ctx,
                                 &task_id_for_poll,
                                 &session_for_poll,
                                 project_root_for_poll.as_deref(),
                                 &storage_for_poll,
-                                crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES,
+                                0,
                             ) else {
                                 if detach_on_user_message {
                                     ctx.bash_background()
