@@ -255,7 +255,7 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Build param→arg map ---
     let args = extract_call_arguments(&call_node, &source, lang);
-    let param_to_arg = match build_param_to_arg_map(&param_patterns, &args) {
+    let param_to_arg = match build_param_to_arg_map(&param_patterns, &args, lang) {
         Ok(map) => map,
         Err(reason) => {
             return Response::error_with_data(
@@ -542,7 +542,7 @@ fn find_node_at<'a>(
 enum InlineParam {
     Simple {
         name: String,
-        default_value: Option<String>,
+        default_value: Option<InlineArgument>,
     },
     Destructured {
         bindings: Vec<DestructuredBinding>,
@@ -559,6 +559,87 @@ enum InlineParam {
 struct DestructuredBinding {
     name: String,
     access_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct InlineArgument {
+    text: String,
+    kind: String,
+    has_template_substitution: bool,
+}
+
+impl InlineArgument {
+    fn from_node(node: &tree_sitter::Node, source: &str) -> Self {
+        Self {
+            text: node_text(source, node).to_string(),
+            kind: node.kind().to_string(),
+            has_template_substitution: node_contains_kind(node, "template_substitution"),
+        }
+    }
+
+    fn substitution_text(&self, lang: LangId) -> String {
+        // Parameter references are expression positions because binding identifiers are
+        // excluded by `substitute_params`. Atomic expressions can replace an identifier
+        // directly; every unknown or precedence-sensitive form is grouped because extra
+        // parentheses preserve expression semantics while missing ones can change them.
+        if argument_is_atomic(self, lang) {
+            self.text.clone()
+        } else {
+            format!("({})", self.text)
+        }
+    }
+}
+
+fn node_contains_kind(node: &tree_sitter::Node, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+
+    (0..node.child_count()).any(|index| {
+        node.child(index as u32)
+            .is_some_and(|child| node_contains_kind(&child, kind))
+    })
+}
+
+fn argument_is_atomic(argument: &InlineArgument, lang: LangId) -> bool {
+    match lang {
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => match argument.kind.as_str() {
+            "identifier"
+            | "number"
+            | "string"
+            | "regex"
+            | "true"
+            | "false"
+            | "null"
+            | "member_expression"
+            | "call_expression"
+            | "parenthesized_expression"
+            | "array"
+            | "object" => true,
+            "template_string" => !argument.has_template_substitution,
+            _ => false,
+        },
+        LangId::Python => matches!(
+            argument.kind.as_str(),
+            "identifier"
+                | "integer"
+                | "float"
+                | "string"
+                | "concatenated_string"
+                | "true"
+                | "false"
+                | "none"
+                | "ellipsis"
+                | "attribute"
+                | "call"
+                | "parenthesized_expression"
+                | "list"
+                | "set"
+                | "dictionary"
+                | "tuple"
+        ),
+        _ => false,
+    }
 }
 
 impl InlineParam {
@@ -655,9 +736,7 @@ fn extract_ts_param_pattern(node: &tree_sitter::Node, source: &str) -> Option<In
                     if pattern.kind() == "identifier" {
                         return Some(InlineParam::Simple {
                             name: node_text(source, &pattern).to_string(),
-                            default_value: Some(
-                                node_text(source, &default_value).trim().to_string(),
-                            ),
+                            default_value: Some(InlineArgument::from_node(&default_value, source)),
                         });
                     }
                 }
@@ -681,7 +760,7 @@ fn extract_ts_param_pattern(node: &tree_sitter::Node, source: &str) -> Option<In
                 (Some(left), Some(right)) if left.kind() == "identifier" => {
                     Some(InlineParam::Simple {
                         name: node_text(source, &left).to_string(),
-                        default_value: Some(node_text(source, &right).trim().to_string()),
+                        default_value: Some(InlineArgument::from_node(&right, source)),
                     })
                 }
                 (Some(left), _) => extract_ts_param_pattern(&left, source),
@@ -844,7 +923,8 @@ fn property_access_for_key(node: &tree_sitter::Node, source: &str) -> Option<Str
 
 fn build_param_to_arg_map(
     params: &[InlineParam],
-    args: &[String],
+    args: &[InlineArgument],
+    lang: LangId,
 ) -> Result<HashMap<String, String>, String> {
     let mut param_to_arg = HashMap::new();
 
@@ -855,9 +935,9 @@ fn build_param_to_arg_map(
                 default_value,
             } => {
                 if let Some(arg) = args.get(i) {
-                    param_to_arg.insert(name.clone(), arg.clone());
+                    param_to_arg.insert(name.clone(), arg.substitution_text(lang));
                 } else if let Some(default_value) = default_value {
-                    param_to_arg.insert(name.clone(), default_value.clone());
+                    param_to_arg.insert(name.clone(), default_value.substitution_text(lang));
                 }
             }
             InlineParam::Destructured { bindings } => {
@@ -867,23 +947,28 @@ fn build_param_to_arg_map(
                         i + 1
                     ));
                 };
-                if !is_simple_identifier(arg.trim()) {
+                if !is_simple_identifier(arg.text.trim()) {
                     return Err(format!(
                         "destructured parameter {} requires a simple variable argument, got `{}`",
                         i + 1,
-                        arg.trim()
+                        arg.text.trim()
                     ));
                 }
                 for binding in bindings {
                     param_to_arg.insert(
                         binding.name.clone(),
-                        format!("{}{}", arg.trim(), binding.access_path),
+                        format!("{}{}", arg.text.trim(), binding.access_path),
                     );
                 }
             }
             InlineParam::Rest { name } => {
                 let rest_args = if i < args.len() { &args[i..] } else { &[] };
-                param_to_arg.insert(name.clone(), format!("[{}]", rest_args.join(", ")));
+                let elements = rest_args
+                    .iter()
+                    .map(|argument| argument.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                param_to_arg.insert(name.clone(), format!("[{elements}]"));
             }
             InlineParam::Unsupported { description } => return Err(description.clone()),
         }
@@ -1054,7 +1139,7 @@ fn extract_call_arguments(
     call_node: &tree_sitter::Node,
     source: &str,
     lang: LangId,
-) -> Vec<String> {
+) -> Vec<InlineArgument> {
     let mut args = Vec::new();
 
     let args_node = match lang {
@@ -1075,7 +1160,7 @@ fn extract_call_arguments(
                     && child.kind() != ","
                     && !child.kind().is_empty()
                 {
-                    args.push(node_text(source, &child).to_string());
+                    args.push(InlineArgument::from_node(&child, source));
                 }
             }
         }

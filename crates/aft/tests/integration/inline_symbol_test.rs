@@ -555,3 +555,229 @@ export function main() {
 
     aft.shutdown();
 }
+
+#[test]
+fn inline_symbol_parenthesizes_binary_argument_to_preserve_precedence() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("precedence.ts");
+    std::fs::write(
+        &file,
+        r#"function twice(x: number): number {
+  return x * 2;
+}
+
+export function main() {
+  const result = twice(1 + 2);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+    let resp = aft.send(&format!(
+        r#"{{"id":"precedence","command":"inline_symbol","file":{},"symbol":"twice","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("const result = (1 + 2) * 2;"),
+        "binary argument should retain its grouping:\n{content}"
+    );
+    assert!(
+        !content.contains("const result = 1 + 2 * 2;"),
+        "inline must not change operator precedence:\n{content}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_wraps_ts_precedence_sensitive_arguments() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("sensitive_arguments.ts");
+    std::fs::write(
+        &file,
+        r#"function twice(x: number): number {
+  return x * 2;
+}
+
+function invoke(fn: (n: number) => number): number {
+  return fn(2);
+}
+
+async function getValue(): Promise<number> {
+  return 3;
+}
+
+export async function main(flag: boolean) {
+  const ternaryResult = twice(flag ? 1 : 2);
+  const arrowResult = invoke((n: number) => n + 1);
+  const awaitResult = twice(await getValue());
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+    for (id, symbol, line) in [
+        ("ternary", "twice", 14),
+        ("arrow", "invoke", 15),
+        ("await", "twice", 16),
+    ] {
+        let resp = aft.send(&format!(
+            r#"{{"id":"{id}","command":"inline_symbol","file":{},"symbol":"{symbol}","call_site_line":{line}}}"#,
+            crate::helpers::json_string(&file.display())
+        ));
+        assert_eq!(
+            resp["success"], true,
+            "{id} inline should succeed: {resp:?}"
+        );
+    }
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("const ternaryResult = (flag ? 1 : 2) * 2;"),
+        "ternary argument should be wrapped:\n{content}"
+    );
+    assert!(
+        content.contains("const arrowResult = ((n: number) => n + 1)(2);"),
+        "arrow argument should be wrapped:\n{content}"
+    );
+    assert!(
+        content.contains("const awaitResult = (await getValue()) * 2;"),
+        "await argument should be wrapped:\n{content}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_keeps_atomic_arguments_bare() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("atomic_arguments.ts");
+    std::fs::write(
+        &file,
+        r#"function identity<T>(x: T): T {
+  return x;
+}
+
+const a = { b: { c: 3 } };
+function f(): number {
+  return 4;
+}
+
+export function main(value: number) {
+  const identifierResult = identity(value);
+  const literalResult = identity(5);
+  const memberResult = identity(a.b.c);
+  const callResult = identity(f());
+  const parenthesizedResult = identity((value + 1));
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+    for (id, line) in [
+        ("identifier", 11),
+        ("literal", 12),
+        ("member", 13),
+        ("call", 14),
+        ("parenthesized", 15),
+    ] {
+        let resp = aft.send(&format!(
+            r#"{{"id":"{id}","command":"inline_symbol","file":{},"symbol":"identity","call_site_line":{line}}}"#,
+            crate::helpers::json_string(&file.display())
+        ));
+        assert_eq!(
+            resp["success"], true,
+            "{id} inline should succeed: {resp:?}"
+        );
+    }
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    for expected in [
+        "const identifierResult = value;",
+        "const literalResult = 5;",
+        "const memberResult = a.b.c;",
+        "const callResult = f();",
+        "const parenthesizedResult = (value + 1);",
+    ] {
+        assert!(
+            content.contains(expected),
+            "atomic argument gained unnecessary parentheses; missing `{expected}`:\n{content}"
+        );
+    }
+    assert!(
+        !content.contains("((value + 1))"),
+        "parenthesized argument should not be double-wrapped:\n{content}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_wraps_every_use_of_non_atomic_argument() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("multiple_uses.ts");
+    std::fs::write(
+        &file,
+        r#"function addToItself(x: number): number {
+  return x + x;
+}
+
+export function main() {
+  const result = addToItself(1 + 2);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+    let resp = aft.send(&format!(
+        r#"{{"id":"multiple-uses","command":"inline_symbol","file":{},"symbol":"addToItself","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("const result = (1 + 2) + (1 + 2);"),
+        "every substituted use should retain argument grouping:\n{content}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_wraps_python_conditional_argument() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("conditional.py");
+    std::fs::write(
+        &file,
+        r#"def twice(x):
+    return x * 2
+
+flag = True
+result = twice(1 if flag else 2)
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+    let resp = aft.send(&format!(
+        r#"{{"id":"python-conditional","command":"inline_symbol","file":{},"symbol":"twice","call_site_line":5}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("result = (1 if flag else 2) * 2"),
+        "Python conditional argument should be wrapped:\n{content}"
+    );
+    aft.shutdown();
+}
