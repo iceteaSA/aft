@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::{CompressionResult, Compressor};
+use crate::compress::{CompressionResult, Compressor, OutputProbe};
 
 const MAX_LINES: usize = 200;
 const MAX_DIAGNOSTICS_PER_RULE: usize = 10;
@@ -39,6 +39,15 @@ impl Compressor for BiomeCompressor {
             .any(|line| is_biome_output_rule_header(line.trim()))
             || looks_like_biome_json_output(output)
     }
+
+    fn matches_output_probe(&self, probe: &OutputProbe<'_>) -> bool {
+        let output = probe.output();
+        output
+            .lines()
+            .any(|line| is_biome_output_rule_header(line.trim()))
+            || (output.trim_start().starts_with('{')
+                && probe.json().is_some_and(looks_like_biome_json_value))
+    }
 }
 
 fn looks_like_biome_json_output(output: &str) -> bool {
@@ -49,7 +58,11 @@ fn looks_like_biome_json_output(output: &str) -> bool {
 
     serde_json::from_str::<Value>(trimmed)
         .ok()
-        .is_some_and(|value| value.get("diagnostics").is_some() || value.get("errors").is_some())
+        .is_some_and(|value| looks_like_biome_json_value(&value))
+}
+
+fn looks_like_biome_json_value(value: &Value) -> bool {
+    value.get("diagnostics").is_some() || value.get("errors").is_some()
 }
 
 fn is_biome_output_rule_header(trimmed: &str) -> bool {

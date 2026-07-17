@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::{dedup_consecutive, strip_ansi, GenericCompressor};
-use crate::compress::{CompressionResult, Compressor};
+use crate::compress::{CompressionResult, Compressor, OutputProbe};
 
 pub struct VitestCompressor;
 
@@ -30,6 +30,14 @@ impl Compressor for VitestCompressor {
         looks_like_vitest_output(output)
             || looks_like_jest_output(output)
             || looks_like_jest_json_output(output)
+    }
+
+    fn matches_output_probe(&self, probe: &OutputProbe<'_>) -> bool {
+        let output = probe.output();
+        looks_like_vitest_output(output)
+            || looks_like_jest_output(output)
+            || (output.trim_start().starts_with('{')
+                && probe.json().is_some_and(looks_like_jest_json_value))
     }
 
     fn compress_output_match_with_exit_code(
@@ -74,9 +82,11 @@ fn looks_like_jest_json_output(output: &str) -> bool {
     }
     serde_json::from_str::<Value>(trimmed)
         .ok()
-        .is_some_and(|value| {
-            value.get("numTotalTests").is_some() && value.get("testResults").is_some()
-        })
+        .is_some_and(|value| looks_like_jest_json_value(&value))
+}
+
+fn looks_like_jest_json_value(value: &Value) -> bool {
+    value.get("numTotalTests").is_some() && value.get("testResults").is_some()
 }
 
 fn compress_test_runner(command: &str, output: &str) -> CompressionResult {

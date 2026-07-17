@@ -63,6 +63,7 @@ use pnpm::PnpmCompressor;
 use prettier::PrettierCompressor;
 use pytest::PytestCompressor;
 use ruff::RuffCompressor;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,66 @@ pub type SharedFilterRegistry = Arc<RwLock<FilterRegistry>>;
 pub enum Specificity {
     Specific,
     PackageManager,
+}
+
+/// Shared, per-dispatch view of command output for output-shape matchers.
+///
+/// Several matchers recognize JSON by inspecting different top-level keys. A
+/// probe lets them share one lazy parse while leaving each matcher's decision
+/// and dispatch priority unchanged.
+pub struct OutputProbe<'a> {
+    output: &'a str,
+    json: OnceCell<Option<serde_json::Value>>,
+}
+
+impl<'a> OutputProbe<'a> {
+    pub fn new(output: &'a str) -> Self {
+        Self {
+            output,
+            json: OnceCell::new(),
+        }
+    }
+
+    pub fn output(&self) -> &'a str {
+        self.output
+    }
+
+    /// Parse plausible JSON at most once for all matchers in this dispatch.
+    pub fn json(&self) -> Option<&serde_json::Value> {
+        self.json
+            .get_or_init(|| {
+                let trimmed = self.output.trim_start();
+                if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
+                    return None;
+                }
+                record_output_probe_json_parse();
+                serde_json::from_str(trimmed).ok()
+            })
+            .as_ref()
+    }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static OUTPUT_PROBE_JSON_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+fn record_output_probe_json_parse() {
+    OUTPUT_PROBE_JSON_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(debug_assertions))]
+fn record_output_probe_json_parse() {}
+
+#[cfg(all(debug_assertions, test))]
+fn reset_output_probe_json_parse_count() {
+    OUTPUT_PROBE_JSON_PARSE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(all(debug_assertions, test))]
+fn output_probe_json_parse_count() -> usize {
+    OUTPUT_PROBE_JSON_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +302,12 @@ pub trait Compressor: Send + Sync {
         false
     }
 
+    /// Probe-aware output matching. Matchers that need shared derived data can
+    /// override this; all other matchers retain their existing implementation.
+    fn matches_output_probe(&self, probe: &OutputProbe<'_>) -> bool {
+        self.matches_output(probe.output())
+    }
+
     /// Compress output after an output-shape match when the process exit code is unknown.
     fn compress_output_match(&self, output: &str) -> CompressionResult {
         self.compress_output_match_with_exit_code(output, None)
@@ -321,28 +388,7 @@ pub fn compress_with_registry_exit_code(
     };
     let dispatch_cmd = dispatch_owned.as_str();
 
-    let compressors: [&dyn Compressor; 20] = [
-        &GitCompressor,
-        &CargoCompressor,
-        &TscCompressor,
-        &NpmCompressor,
-        &BunCompressor,
-        &PnpmCompressor,
-        &PytestCompressor,
-        &EslintCompressor,
-        &VitestCompressor,
-        &BiomeCompressor,
-        &PrettierCompressor,
-        &RuffCompressor,
-        &MypyCompressor,
-        &GoCompressor,
-        &GolangciLintCompressor,
-        &PlaywrightCompressor,
-        &NextCompressor,
-        &LsCompressor,
-        &FindCompressor,
-        &TreeCompressor,
-    ];
+    let compressors = compressors_in_dispatch_order();
 
     // Tier 1a: Specific command compressors win first.
     for compressor in compressors
@@ -361,12 +407,13 @@ pub fn compress_with_registry_exit_code(
     // `just test`, etc. Collision order is deterministic: Specific compressors
     // in registry order win before PackageManager sniffers (currently Bun's
     // test-output signature).
+    let output_probe = OutputProbe::new(&stripped_for_generic);
     for specificity in [Specificity::Specific, Specificity::PackageManager] {
         for compressor in compressors
             .iter()
             .filter(|c| c.specificity() == specificity)
         {
-            if compressor.matches_output(&stripped_for_generic) {
+            if compressor.matches_output_probe(&output_probe) {
                 let result = compressor
                     .compress_output_match_with_exit_code(&stripped_for_generic, exit_code);
                 return failure_preserving_result(
@@ -400,6 +447,31 @@ pub fn compress_with_registry_exit_code(
 
     // Tier 3: generic fallback.
     GenericCompressor.compress_with_exit_code(command, &stripped_for_generic, exit_code)
+}
+
+fn compressors_in_dispatch_order() -> [&'static dyn Compressor; 20] {
+    [
+        &GitCompressor,
+        &CargoCompressor,
+        &TscCompressor,
+        &NpmCompressor,
+        &BunCompressor,
+        &PnpmCompressor,
+        &PytestCompressor,
+        &EslintCompressor,
+        &VitestCompressor,
+        &BiomeCompressor,
+        &PrettierCompressor,
+        &RuffCompressor,
+        &MypyCompressor,
+        &GoCompressor,
+        &GolangciLintCompressor,
+        &PlaywrightCompressor,
+        &NextCompressor,
+        &LsCompressor,
+        &FindCompressor,
+        &TreeCompressor,
+    ]
 }
 
 fn failure_preserving_result(
@@ -1335,6 +1407,177 @@ mod tests {
             "root"
         );
         assert!(!storage.join("filters/root-only.toml").exists());
+    }
+}
+
+#[cfg(test)]
+mod output_probe_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct CorpusEntry {
+        file: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct MatchPhaseResult {
+        selected: Option<usize>,
+        output: CompressionResult,
+    }
+
+    fn legacy_match_phase(output: &str) -> MatchPhaseResult {
+        let compressors = compressors_in_dispatch_order();
+        let selected = [Specificity::Specific, Specificity::PackageManager]
+            .into_iter()
+            .find_map(|specificity| {
+                compressors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, compressor)| compressor.specificity() == specificity)
+                    .find_map(|(index, compressor)| {
+                        compressor.matches_output(output).then_some(index)
+                    })
+            });
+        match_phase_result(&compressors, selected, output)
+    }
+
+    fn probe_match_phase(output: &str) -> MatchPhaseResult {
+        let compressors = compressors_in_dispatch_order();
+        let probe = OutputProbe::new(output);
+        let selected = [Specificity::Specific, Specificity::PackageManager]
+            .into_iter()
+            .find_map(|specificity| {
+                compressors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, compressor)| compressor.specificity() == specificity)
+                    .find_map(|(index, compressor)| {
+                        compressor.matches_output_probe(&probe).then_some(index)
+                    })
+            });
+        match_phase_result(&compressors, selected, output)
+    }
+
+    fn match_phase_result(
+        compressors: &[&dyn Compressor],
+        selected: Option<usize>,
+        output: &str,
+    ) -> MatchPhaseResult {
+        let output = selected.map_or_else(
+            || GenericCompressor.compress_with_exit_code("", output, None),
+            |index| compressors[index].compress_output_match_with_exit_code(output, None),
+        );
+        MatchPhaseResult { selected, output }
+    }
+
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("aft crate should be nested under the repository root")
+            .to_path_buf()
+    }
+
+    fn benchmark_corpus() -> Vec<(String, String)> {
+        let fixtures = repository_root().join("benchmarks/compression-tokens/fixtures");
+        let manifest_text = fs::read_to_string(fixtures.join("manifest.json"))
+            .expect("compression corpus manifest should be readable");
+        let manifest: Vec<CorpusEntry> =
+            serde_json::from_str(&manifest_text).expect("compression corpus manifest should parse");
+        manifest
+            .into_iter()
+            .map(|entry| {
+                let output = fs::read_to_string(fixtures.join(&entry.file))
+                    .unwrap_or_else(|error| panic!("failed to read {}: {error}", entry.file));
+                (format!("compression corpus {}", entry.file), output)
+            })
+            .collect()
+    }
+
+    fn integration_filter_inputs() -> Vec<(String, String)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/integration/fixtures/compress_filters");
+        let mut paths = Vec::new();
+        collect_named_files(&root, "input.txt", &mut paths);
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let output = fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+                (format!("filter fixture {}", path.display()), output)
+            })
+            .collect()
+    }
+
+    fn collect_named_files(root: &Path, wanted_name: &str, paths: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(root)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", root.display()));
+        for entry in entries {
+            let path = entry
+                .expect("fixture directory entry should be readable")
+                .path();
+            if path.is_dir() {
+                collect_named_files(&path, wanted_name, paths);
+            } else if path.file_name().is_some_and(|name| name == wanted_name) {
+                paths.push(path);
+            }
+        }
+    }
+
+    fn hostile_outputs() -> Vec<(String, String)> {
+        let huge_json_array = format!(
+            "[{}]",
+            (0..20_000)
+                .map(|index| format!(r#"{{"index":{index},"value":"payload"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let ansi_heavy = (0..2_000)
+            .map(|index| format!("\u{1b}[31mordinary output {index}\u{1b}[0m"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        vec![
+            (
+                "valid non-tool JSON object".to_string(),
+                r#" {"payload":{"nested":[1,2,3]},"ok":true}"#.to_string(),
+            ),
+            ("huge JSON array".to_string(), huge_json_array),
+            (
+                "almost JSON".to_string(),
+                r#"{"payload":[1,2,3],"unterminated":true"#.to_string(),
+            ),
+            ("empty output".to_string(), String::new()),
+            ("ANSI-heavy output".to_string(), ansi_heavy),
+        ]
+    }
+
+    #[test]
+    fn shared_probe_preserves_match_selection_and_output_across_corpora() {
+        let cases = benchmark_corpus()
+            .into_iter()
+            .chain(integration_filter_inputs())
+            .chain(hostile_outputs());
+
+        for (label, raw_output) in cases {
+            let output = strip_ansi(&raw_output);
+            let legacy = legacy_match_phase(&output);
+            let probed = probe_match_phase(&output);
+            assert_eq!(legacy, probed, "output-shape dispatch changed for {label}");
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn unmatched_json_object_is_parsed_once_across_match_phase() {
+        let output = r#"{"payload":{"nested":[1,2,3]},"ok":true}"#;
+        reset_output_probe_json_parse_count();
+
+        let result = probe_match_phase(output);
+
+        assert_eq!(result.selected, None);
+        assert_eq!(output_probe_json_parse_count(), 1);
     }
 }
 

@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::{CompressionResult, Compressor};
+use crate::compress::{CompressionResult, Compressor, OutputProbe};
 
 const MAX_LINES: usize = 400;
 const MAX_JSON_FAILURES: usize = 20;
@@ -42,6 +42,15 @@ impl Compressor for PlaywrightCompressor {
             .any(|line| is_playwright_running_signature(line.trim_start()))
             || looks_like_playwright_json_output(output)
     }
+
+    fn matches_output_probe(&self, probe: &OutputProbe<'_>) -> bool {
+        let output = probe.output();
+        output
+            .lines()
+            .any(|line| is_playwright_running_signature(line.trim_start()))
+            || (output.trim_start().starts_with('{')
+                && probe.json().is_some_and(looks_like_playwright_json_value))
+    }
 }
 
 fn is_success_summary(text: &str) -> bool {
@@ -57,7 +66,11 @@ fn looks_like_playwright_json_output(output: &str) -> bool {
     }
     serde_json::from_str::<Value>(trimmed)
         .ok()
-        .is_some_and(|value| value.get("stats").is_some() && value.get("suites").is_some())
+        .is_some_and(|value| looks_like_playwright_json_value(&value))
+}
+
+fn looks_like_playwright_json_value(value: &Value) -> bool {
+    value.get("stats").is_some() && value.get("suites").is_some()
 }
 
 fn is_playwright_running_signature(trimmed: &str) -> bool {

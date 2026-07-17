@@ -1,5 +1,5 @@
 use crate::compress::generic::GenericCompressor;
-use crate::compress::{CompressionResult, Compressor};
+use crate::compress::{CompressionResult, Compressor, OutputProbe};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -67,6 +67,10 @@ impl Compressor for GolangciLintCompressor {
     fn matches_output(&self, output: &str) -> bool {
         looks_like_golangci_output(output)
     }
+
+    fn matches_output_probe(&self, probe: &OutputProbe<'_>) -> bool {
+        looks_like_golangci_output_probe(probe)
+    }
 }
 
 fn preserve_go_failure(output: &str, compressed: String, exit_code: Option<i32>) -> String {
@@ -122,10 +126,32 @@ fn looks_like_golangci_output(output: &str) -> bool {
     has_summary && has_issue
 }
 
+fn looks_like_golangci_output_probe(probe: &OutputProbe<'_>) -> bool {
+    let output = probe.output();
+    if output.trim_start().starts_with('{')
+        && probe.json().is_some_and(looks_like_golangci_json_value)
+    {
+        return true;
+    }
+
+    let mut has_summary = false;
+    let mut has_issue = false;
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        has_summary |= is_golangci_summary_header(trimmed);
+        has_issue |= is_golangci_issue_line(trimmed);
+    }
+    has_summary && has_issue
+}
+
 fn looks_like_golangci_json_root(output: &str) -> bool {
     serde_json::from_str::<Value>(output)
         .ok()
-        .is_some_and(|value| value.get("Issues").and_then(Value::as_array).is_some())
+        .is_some_and(|value| looks_like_golangci_json_value(&value))
+}
+
+fn looks_like_golangci_json_value(value: &Value) -> bool {
+    value.get("Issues").and_then(Value::as_array).is_some()
 }
 
 fn go_subcommand(command: &str) -> Option<String> {
