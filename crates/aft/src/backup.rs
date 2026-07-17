@@ -466,24 +466,7 @@ impl BackupStore {
         let (id, order) = self.next_id_and_order();
         let entry = backup_entry_from_path(path, id.clone(), order, description, op_id)?;
 
-        let max_depth = self.policy.max_depth;
-        let pre_mutation_stack = self
-            .entries
-            .get(session)
-            .and_then(|files| files.get(&key))
-            .cloned();
-        let session_entries = self.entries.entry(session.to_string()).or_default();
-        let stack = session_entries.entry(key.clone()).or_default();
-        trim_stack_to_depth(stack, max_depth.saturating_sub(1));
-        stack.push(entry);
-        trim_stack_to_depth(stack, max_depth);
-
-        // Persist to disk
-        let stack_clone = stack.clone();
-        if let Err(error) = self.write_snapshot_to_disk_locked(session, &key, &stack_clone) {
-            self.restore_in_memory_stack(session, &key, pre_mutation_stack);
-            return Err(error);
-        }
+        self.persist_new_entry_locked(session, &key, entry)?;
         self.touch_session(session);
 
         Ok(Some(id))
@@ -521,23 +504,7 @@ impl BackupStore {
             created_dirs,
         };
 
-        let max_depth = self.policy.max_depth;
-        let pre_mutation_stack = self
-            .entries
-            .get(session)
-            .and_then(|files| files.get(&key))
-            .cloned();
-        let session_entries = self.entries.entry(session.to_string()).or_default();
-        let stack = session_entries.entry(key.clone()).or_default();
-        trim_stack_to_depth(stack, max_depth.saturating_sub(1));
-        stack.push(entry);
-        trim_stack_to_depth(stack, max_depth);
-
-        let stack_clone = stack.clone();
-        if let Err(error) = self.write_snapshot_to_disk_locked(session, &key, &stack_clone) {
-            self.restore_in_memory_stack(session, &key, pre_mutation_stack);
-            return Err(error);
-        }
+        self.persist_new_entry_locked(session, &key, entry)?;
         self.touch_session(session);
 
         Ok(Some(id))
@@ -1279,6 +1246,42 @@ impl BackupStore {
                     (current < next_counter).then_some(next_counter)
                 });
         }
+    }
+
+    fn persist_new_entry_locked(
+        &mut self,
+        session: &str,
+        key: &Path,
+        entry: BackupEntry,
+    ) -> Result<(), AftError> {
+        let max_depth = self.policy.max_depth;
+        // Detach the stack so persistence can borrow it while updating the rest of
+        // the store. Keep evicted entries by ownership until the disk commit, which
+        // lets a failed write rebuild the original order without cloning file data.
+        let mut stack = self
+            .entries
+            .get_mut(session)
+            .and_then(|files| files.remove(key))
+            .unwrap_or_default();
+        let mut evicted = drain_stack_to_depth(&mut stack, max_depth.saturating_sub(1));
+        if max_depth > 0 {
+            stack.push(entry);
+        }
+
+        if let Err(error) = self.write_snapshot_to_disk_locked(session, key, &stack) {
+            if max_depth > 0 {
+                stack.pop();
+            }
+            evicted.append(&mut stack);
+            self.restore_in_memory_stack(session, key, Some(evicted));
+            return Err(error);
+        }
+
+        self.entries
+            .entry(session.to_string())
+            .or_default()
+            .insert(key.to_path_buf(), stack);
+        Ok(())
     }
 
     fn restore_in_memory_stack(
@@ -3348,14 +3351,14 @@ fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
     })
 }
 
+fn drain_stack_to_depth(stack: &mut Vec<BackupEntry>, max_depth: usize) -> Vec<BackupEntry> {
+    let overflow = stack.len().saturating_sub(max_depth);
+    stack.drain(..overflow).collect()
+}
+
 fn trim_stack_to_depth(stack: &mut Vec<BackupEntry>, max_depth: usize) {
-    if max_depth == 0 {
-        stack.clear();
-        return;
-    }
-    while stack.len() > max_depth {
-        stack.remove(0);
-    }
+    let overflow = stack.len().saturating_sub(max_depth);
+    drop(stack.drain(..overflow));
 }
 
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std::io::Result<()> {
@@ -4762,28 +4765,34 @@ mod tests {
         store.snapshot(session, &path, "second").unwrap();
         fs::write(&path, "v2").unwrap();
         let key = canonicalize_key(&path);
-        let before_file_stack = store
-            .entries
-            .get(session)
-            .unwrap()
-            .get(&key)
-            .unwrap()
-            .clone();
+        let before_file_stack = store.entries.get(session).unwrap().get(&key).unwrap();
+        let before_file_identity = before_file_stack
+            .iter()
+            .map(|entry| (entry.backup_id.clone(), entry.order))
+            .collect::<Vec<_>>();
 
         store.fail_next_disk_write_for_tests();
         let error = store.snapshot(session, &path, "third").unwrap_err();
         assert_eq!(error.code(), "io_error");
         let after_file_stack = store.entries.get(session).unwrap().get(&key).unwrap();
+        assert_eq!(after_file_stack.len(), before_file_identity.len());
         assert_eq!(
             after_file_stack
                 .iter()
-                .map(|entry| entry.description.as_str())
+                .map(|entry| (entry.backup_id.clone(), entry.order))
                 .collect::<Vec<_>>(),
-            before_file_stack
-                .iter()
-                .map(|entry| entry.description.as_str())
-                .collect::<Vec<_>>()
+            before_file_identity
         );
+
+        let successful_id = store
+            .snapshot(session, &path, "after failure")
+            .unwrap()
+            .unwrap();
+        let successful_stack = store.entries.get(session).unwrap().get(&key).unwrap();
+        assert_eq!(successful_stack.len(), 2);
+        assert_eq!(successful_stack[0].description, "second");
+        assert_eq!(successful_stack[1].description, "after failure");
+        assert_eq!(successful_stack[1].backup_id, successful_id);
 
         let tombstone = project.path().join("created-by-op.txt");
         store
@@ -4798,8 +4807,11 @@ mod tests {
             .get(session)
             .unwrap()
             .get(&tombstone_key)
-            .unwrap()
-            .clone();
+            .unwrap();
+        let before_tombstone_identity = before_tombstone_stack
+            .iter()
+            .map(|entry| (entry.backup_id.clone(), entry.order, entry.op_id.clone()))
+            .collect::<Vec<_>>();
 
         store.fail_next_disk_write_for_tests();
         let error = store
@@ -4815,13 +4827,59 @@ mod tests {
         assert_eq!(
             after_tombstone_stack
                 .iter()
-                .map(|entry| entry.op_id.as_deref())
+                .map(|entry| (entry.backup_id.clone(), entry.order, entry.op_id.clone()))
                 .collect::<Vec<_>>(),
-            before_tombstone_stack
-                .iter()
-                .map(|entry| entry.op_id.as_deref())
-                .collect::<Vec<_>>()
+            before_tombstone_identity
         );
+
+        let successful_id = store
+            .snapshot_op_tombstone(session, "op-four", &tombstone, "created four")
+            .unwrap()
+            .unwrap();
+        let successful_stack = store
+            .entries
+            .get(session)
+            .unwrap()
+            .get(&tombstone_key)
+            .unwrap();
+        assert_eq!(successful_stack.len(), 2);
+        assert_eq!(successful_stack[0].op_id.as_deref(), Some("op-two"));
+        assert_eq!(successful_stack[1].op_id.as_deref(), Some("op-four"));
+        assert_eq!(successful_stack[1].backup_id, successful_id);
+    }
+
+    #[test]
+    fn snapshot_at_max_depth_keeps_newest_window() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "depth-window-session";
+        let path = project.path().join("window.txt");
+        fs::write(&path, "v0").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        store.set_policy(BackupPolicy {
+            enabled: true,
+            max_depth: 2,
+            max_file_size: None,
+        });
+
+        store.snapshot(session, &path, "first").unwrap();
+        fs::write(&path, "v1").unwrap();
+        let second_id = store.snapshot(session, &path, "second").unwrap().unwrap();
+        fs::write(&path, "v2").unwrap();
+        let third_id = store.snapshot(session, &path, "third").unwrap().unwrap();
+
+        let history = store.history(session, &path);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.backup_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second_id.as_str(), third_id.as_str()]
+        );
+        assert_eq!(history[0].content_bytes, b"v1");
+        assert_eq!(history[1].content_bytes, b"v2");
     }
 
     #[test]
