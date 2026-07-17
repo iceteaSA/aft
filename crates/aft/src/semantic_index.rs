@@ -1439,6 +1439,21 @@ pub struct SemanticChunk {
 pub struct EmbeddingEntry {
     chunk: SemanticChunk,
     vector: Vec<f32>,
+    /// Cached L2 norm so searches only recompute the query norm. Remote embedding
+    /// backends do not guarantee unit vectors, so keep the actual norm instead of
+    /// assuming it is 1.0.
+    norm: f32,
+}
+
+impl EmbeddingEntry {
+    fn new(chunk: SemanticChunk, vector: Vec<f32>) -> Self {
+        let norm = vector_norm(&vector);
+        Self {
+            chunk,
+            vector,
+            norm,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2078,7 +2093,7 @@ impl SemanticIndex {
 
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
             if let Some(vector) = Self::reusable_vector_for_chunk(reuse_map, &chunk) {
-                entries_by_chunk[chunk_index] = Some(EmbeddingEntry { chunk, vector });
+                entries_by_chunk[chunk_index] = Some(EmbeddingEntry::new(chunk, vector));
             } else {
                 misses.push((chunk_index, chunk));
             }
@@ -2117,7 +2132,7 @@ impl SemanticIndex {
 
             for (i, vector) in vectors.into_iter().enumerate() {
                 let (chunk_index, chunk) = misses[batch_start + i].clone();
-                entries_by_chunk[chunk_index] = Some(EmbeddingEntry { chunk, vector });
+                entries_by_chunk[chunk_index] = Some(EmbeddingEntry::new(chunk, vector));
             }
 
             completed += batch_end - batch_start;
@@ -2202,10 +2217,7 @@ impl SemanticIndex {
 
             for (i, vector) in vectors.into_iter().enumerate() {
                 let chunk_idx = batch_start + i;
-                entries.push(EmbeddingEntry {
-                    chunk: chunks[chunk_idx].clone(),
-                    vector,
-                });
+                entries.push(EmbeddingEntry::new(chunks[chunk_idx].clone(), vector));
             }
 
             if let Some(callback) = progress.as_mut() {
@@ -2832,11 +2844,20 @@ impl SemanticIndex {
             return Vec::new();
         }
 
+        // Query norms are shared by every entry; entry norms are cached because
+        // remote embedding backends may return non-normalized vectors.
+        let query_norm = vector_norm(query_vector);
         let mut scored: Vec<(f32, usize)> = entries
             .iter()
             .enumerate()
             .map(|(i, entry)| {
-                let mut score = cosine_similarity(query_vector, &entry.vector);
+                let dot = if query_vector.len() == entry.vector.len() {
+                    dot_product(query_vector, &entry.vector)
+                } else {
+                    0.0
+                };
+                let denom = query_norm * entry.norm;
+                let mut score = if denom == 0.0 { 0.0 } else { dot / denom };
                 if entry.chunk.exported {
                     score *= 1.1;
                 }
@@ -3652,8 +3673,8 @@ impl SemanticIndex {
                 vector.push(f32::from_le_bytes(bytes));
             }
 
-            entries.push(EmbeddingEntry {
-                chunk: SemanticChunk {
+            entries.push(EmbeddingEntry::new(
+                SemanticChunk {
                     file,
                     name,
                     qualified_name,
@@ -3665,7 +3686,7 @@ impl SemanticIndex {
                     snippet,
                 },
                 vector,
-            });
+            ));
         }
 
         if entries.len() != entry_count {
@@ -4334,7 +4355,17 @@ fn semantic_score_order(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Orderin
         .then_with(|| a.1.cmp(&b.1))
 }
 
-/// Cosine similarity between two vectors
+/// Compute an embedding's L2 norm for its in-memory search cache.
+fn vector_norm(vector: &[f32]) -> f32 {
+    vector.iter().map(|value| value * value).sum::<f32>().sqrt()
+}
+
+fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(a, b)| a * b).sum::<f32>()
+}
+
+/// Cosine similarity reference retained for focused unit tests.
+#[cfg(test)]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
@@ -4903,6 +4934,7 @@ Connection: close
                 embed_text: format!("function {name} body"),
                 snippet: format!("fn {name}() {{}}"),
             },
+            norm: vector_norm(&[1.0, 2.0, 3.0]),
             vector: vec![1.0, 2.0, 3.0],
         };
         index.entries.push(entry("one"));
@@ -5112,6 +5144,7 @@ Connection: close
                 embed_text: "shared symbol".to_string(),
                 snippet: "pub fn shared_symbol() -> bool { true }".to_string(),
             },
+            norm: vector_norm(&[1.0, 0.0, 0.0]),
             vector: vec![1.0, 0.0, 0.0],
         });
         index.file_mtimes.insert(
@@ -5219,6 +5252,7 @@ Connection: close
                 embed_text: "hash guard".to_string(),
                 snippet: "pub fn hash_guard() {}".to_string(),
             },
+            norm: vector_norm(&[1.0, 0.0]),
             vector: vec![1.0, 0.0],
         });
         index.file_mtimes.insert(
@@ -5251,7 +5285,9 @@ Connection: close
         .unwrap();
         assert!(shared.shared_base.is_some());
 
-        index.entries[0].vector = vec![0.0, 1.0];
+        let changed_vector = vec![0.0, 1.0];
+        index.entries[0].norm = vector_norm(&changed_vector);
+        index.entries[0].vector = changed_vector;
         fs::write(dir.join("semantic.bin"), index.to_bytes()).unwrap();
         let fallback = SemanticIndex::read_from_disk_borrow_tolerant(
             storage.path(),
@@ -5640,6 +5676,7 @@ Connection: close
                 embed_text: "outside".to_string(),
                 snippet: "outside".to_string(),
             },
+            norm: vector_norm(&[1.0, 0.0, 0.0]),
             vector: vec![1.0, 0.0, 0.0],
         });
 
@@ -5655,11 +5692,11 @@ Connection: close
         let file = project_root.join("src/lib.rs");
         let mut index = SemanticIndex::new(project_root, 2);
         let entries = [
-            ("alpha", vec![1.0, 0.0], false),
-            ("beta", vec![0.0, 1.0], false),
-            ("gamma", vec![1.0, 0.0], false),
-            ("delta", vec![0.5, 0.5], true),
-            ("epsilon", vec![-1.0, 0.0], false),
+            ("alpha", vec![2.0, 0.0], false),
+            ("beta", vec![0.0, 3.0], false),
+            ("gamma", vec![4.0, 0.0], false),
+            ("delta", vec![1.0, 1.0], true),
+            ("epsilon", vec![-5.0, 0.0], false),
         ];
         for (line, (name, vector, exported)) in entries.into_iter().enumerate() {
             index.entries.push(EmbeddingEntry {
@@ -5674,18 +5711,30 @@ Connection: close
                     embed_text: name.to_string(),
                     snippet: format!("fn {name}() {{}}"),
                 },
+                norm: vector_norm(&vector),
                 vector,
             });
         }
 
-        let query = vec![1.0, 0.0];
+        let query = vec![2.0, 0.0];
         let top_k = 4;
         let mut reference: Vec<(f32, usize)> = index
             .entries
             .iter()
             .enumerate()
             .map(|(idx, entry)| {
-                let mut score = cosine_similarity(&query, &entry.vector);
+                // Recompute both norms for every entry as the reference
+                // implementation, so cached norms cannot change ranking or scores.
+                let mut dot = 0.0f32;
+                let mut query_squared_norm = 0.0f32;
+                let mut entry_squared_norm = 0.0f32;
+                for i in 0..query.len() {
+                    dot += query[i] * entry.vector[i];
+                    query_squared_norm += query[i] * query[i];
+                    entry_squared_norm += entry.vector[i] * entry.vector[i];
+                }
+                let denom = query_squared_norm.sqrt() * entry_squared_norm.sqrt();
+                let mut score = if denom == 0.0 { 0.0 } else { dot / denom };
                 if entry.chunk.exported {
                     score *= 1.1;
                 }
@@ -5755,6 +5804,7 @@ Connection: close
                 embed_text: "file:src/main.rs kind:function name:handle_request".to_string(),
                 snippet: "fn handle_request() {\n  // ...\n}".to_string(),
             },
+            norm: vector_norm(&[0.1, 0.2, 0.3, 0.4]),
             vector: vec![0.1, 0.2, 0.3, 0.4],
         });
         index.dimension = 4;
@@ -5776,6 +5826,10 @@ Connection: close
         assert_eq!(restored.entries.len(), 1);
         assert_eq!(restored.entries[0].chunk.name, "handle_request");
         assert_eq!(restored.entries[0].vector, vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(
+            restored.entries[0].norm,
+            vector_norm(&restored.entries[0].vector)
+        );
         assert_eq!(restored.dimension, 4);
         assert_eq!(restored.backend_label(), Some("fastembed"));
         assert_eq!(restored.model_label(), Some("all-MiniLM-L6-v2"));
@@ -5810,6 +5864,7 @@ Connection: close
                 embed_text: "file:src/lib.rs kind:function name:alpha".to_string(),
                 snippet: "pub fn alpha() {}".to_string(),
             },
+            norm: vector_norm(&[0.1, 0.2, 0.3]),
             vector: vec![0.1, 0.2, 0.3],
         });
         index.entries.push(EmbeddingEntry {
@@ -5824,6 +5879,7 @@ Connection: close
                 embed_text: "file:src/lib.rs kind:function name:beta".to_string(),
                 snippet: "pub fn beta() {}".to_string(),
             },
+            norm: vector_norm(&[0.4, 0.5, 0.6]),
             vector: vec![0.4, 0.5, 0.6],
         });
         let fingerprint = SemanticIndexFingerprint {
@@ -5963,6 +6019,7 @@ Connection: close
                     embed_text: format!("kind:function name:{}", name),
                     snippet: format!("fn {}() {{}}", name),
                 },
+                norm: vector_norm(&vec),
                 vector: vec,
             });
         }
@@ -6140,6 +6197,7 @@ public class Greeter {
                 embed_text: "main".to_string(),
                 snippet: "fn main() {}".to_string(),
             },
+            norm: vector_norm(&[1.0; DEFAULT_DIMENSION]),
             vector: vec![1.0; DEFAULT_DIMENSION],
         });
         index
@@ -6642,6 +6700,7 @@ public class Greeter {
                 embed_text: "file:src/main.rs kind:function name:handle_request".to_string(),
                 snippet: "fn handle_request() {}".to_string(),
             },
+            norm: vector_norm(&[0.1, 0.2, 0.3]),
             vector: vec![0.1, 0.2, 0.3],
         });
         index.dimension = 3;
@@ -6743,6 +6802,7 @@ public class Greeter {
                 embed_text: "file:src/main.rs kind:function name:handle_request".to_string(),
                 snippet: "fn handle_request() {}".to_string(),
             },
+            norm: vector_norm(&[0.1, 0.2, 0.3]),
             vector: vec![0.1, 0.2, 0.3],
         });
         index.dimension = 3;
