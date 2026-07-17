@@ -10,7 +10,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
@@ -946,11 +946,12 @@ describe("bash tool adapter", () => {
         .execute("call", { task_id: "bash-pi-wait", pattern: "ready" }, undefined, undefined, {
           cwd: projectRoot,
         })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
-      expect(toolText(result)).toContain('matched "ready" at offset 6');
+      expect(toolText(result)).toContain('matched "ready" in stdout at offset 6');
       expect(result.details.waited).toMatchObject({
         reason: "matched",
         match: "ready",
         match_offset: 6,
+        match_stream: "stdout",
       });
       expect(calls.some((call) => (call as [string])[0] === "bash_regex_match")).toBe(false);
       const callArgs = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
@@ -1000,7 +1001,7 @@ describe("bash tool adapter", () => {
           { cwd: projectRoot },
         )) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
 
-      expect(toolText(result)).toContain('matched "ready: 4242" at offset 4');
+      expect(toolText(result)).toContain('matched "ready: 4242" in stdout at offset 4');
       expect(result.details.waited).toMatchObject({
         reason: "matched",
         match: "ready: 4242",
@@ -1075,12 +1076,100 @@ describe("bash tool adapter", () => {
         .execute("call", { task_id: "bash-pi-stderr", pattern: "READY" }, undefined, undefined, {
           cwd: projectRoot,
         })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
-      expect(toolText(result)).toContain('matched "READY" at offset 16');
+      expect(toolText(result)).toContain('matched "READY" in stderr at offset 9');
       expect(result.details.waited).toMatchObject({
         reason: "matched",
         match: "READY",
-        match_offset: 16,
+        match_offset: 9,
+        match_stream: "stderr",
       });
+    } finally {
+      await rm(spill.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch does not combine stdout and stderr into a fabricated match", async () => {
+    const spill = await spillPair("ERR", "OR");
+    try {
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      const { bridge } = makeTrackableMockBridge({
+        status: "completed",
+        exit_code: 0,
+        mode: "pipes",
+        output_path: spill.stdoutPath,
+        stderr_path: spill.stderrPath,
+      });
+      registerBashTool(api, makeMockContext(bridge));
+
+      const result = (await tools
+        .get("bash_watch")!
+        .execute(
+          "call",
+          { task_id: "bash-pi-stream-boundary", pattern: "ERROR" },
+          undefined,
+          undefined,
+          { cwd: projectRoot },
+        )) as { details: { waited?: { reason: string } } };
+
+      expect(toolText(result)).toContain("task exited (completed, exit 0)");
+      expect(toolText(result)).not.toContain("matched");
+      expect(result.details.waited?.reason).toBe("exited");
+    } finally {
+      await rm(spill.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch preserves a same-stream match split across poll reads", async () => {
+    const spill = await spillPair("RE", "");
+    let polls = 0;
+    try {
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      const bridge = {
+        send: async (command: string) => {
+          if (command === "bash_status") {
+            polls += 1;
+            if (polls === 2) await appendFile(spill.stdoutPath, "ADY");
+          }
+          return {
+            success: true,
+            status: "running",
+            mode: "pipes",
+            output_path: spill.stdoutPath,
+            stderr_path: spill.stderrPath,
+          };
+        },
+      } as unknown as BinaryBridge;
+      registerBashTool(api, makeMockContext(bridge));
+
+      const result = (await tools
+        .get("bash_watch")!
+        .execute(
+          "call",
+          { task_id: "bash-pi-same-stream-boundary", pattern: "READY", timeout_ms: 500 },
+          undefined,
+          undefined,
+          { cwd: projectRoot },
+        )) as {
+        details: {
+          waited?: {
+            reason: string;
+            match?: string;
+            match_offset?: number;
+            match_stream?: string;
+          };
+        };
+      };
+
+      expect(toolText(result)).toContain('matched "READY" in stdout at offset 0');
+      expect(result.details.waited).toMatchObject({
+        reason: "matched",
+        match: "READY",
+        match_offset: 0,
+        match_stream: "stdout",
+      });
+      expect(polls).toBe(2);
     } finally {
       await rm(spill.dir, { recursive: true, force: true });
     }
@@ -1104,7 +1193,7 @@ describe("bash tool adapter", () => {
         .execute("call", { task_id: "bash-pi-race", pattern: "pattern" }, undefined, undefined, {
           cwd: projectRoot,
         })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
-      expect(toolText(result)).toContain('matched "pattern" at offset 0');
+      expect(toolText(result)).toContain('matched "pattern" in stdout at offset 0');
       expect(toolText(result)).not.toContain("task exited");
       expect(result.details.waited).toMatchObject({ reason: "matched", match_offset: 0 });
     } finally {

@@ -243,6 +243,7 @@ interface BashStatusWaited {
   elapsed_ms: number;
   match?: string;
   match_offset?: number;
+  match_stream?: "stdout" | "stderr";
 }
 
 /**
@@ -826,7 +827,10 @@ function bashKillResult(
 }
 
 type BashWaitPattern = { kind: "substring"; value: string } | { kind: "regex"; source: string };
-type OutputCursor = { output: number; stderr: number; combined: number };
+type OutputStream = "output" | "stderr";
+type OutputCursor = { output: number; stderr: number };
+type OutputScanChunk = { stream: OutputStream; text: string; baseOffset: number };
+type OutputScanState = Record<OutputStream, { text: string; baseOffset: number }>;
 
 async function bashStatusSnapshot(
   bridge: AftProjectTransport,
@@ -856,9 +860,11 @@ async function waitForBashStatus(
 ): Promise<Record<string, unknown> & { waited: BashStatusWaited }> {
   const startedAt = Date.now();
   const deadline = startedAt + effectiveWaitMs;
-  let spillCursor: OutputCursor = { output: 0, stderr: 0, combined: 0 };
-  let scanText = "";
-  let scanBaseOffset = 0;
+  let spillCursor: OutputCursor = { output: 0, stderr: 0 };
+  const scanState: OutputScanState = {
+    output: { text: "", baseOffset: 0 },
+    stderr: { text: "", baseOffset: 0 },
+  };
   const bridgeOptions = {
     keepBridgeOnTimeout: true,
     transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
@@ -911,34 +917,43 @@ async function waitForBashStatus(
         const scan = await readNewTaskOutput(data, spillCursor);
         if (scan) {
           spillCursor = scan.nextCursor;
-          if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
-          scanText += scan.text;
-          if (waitFor.kind === "regex") {
-            const trimmed = trimWaitScanBuffer(scanText, scanBaseOffset, waitFor);
-            scanText = trimmed.text;
-            scanBaseOffset = trimmed.baseOffset;
-          }
-          const match = await findWaitMatch(bridge, extCtx, scanText, waitFor);
-          if (match) {
-            if (waitForExit && terminal) {
-              sawTerminal = true;
-              consumeBgCompletion(sessionId, taskId);
-              await markBgCompletionDelivered(
-                { ctx, directory: extCtx.cwd, sessionID: sessionId },
-                taskId,
-              );
+          // Independent buffers prevent a stdout suffix and stderr prefix from
+          // becoming a fabricated match. When both streams match in one poll,
+          // readNewTaskOutput's stdout-first chunk order is the tie-breaker.
+          for (const chunk of scan.chunks) {
+            const state = scanState[chunk.stream];
+            if (state.text.length === 0) state.baseOffset = chunk.baseOffset;
+            state.text += chunk.text;
+            if (waitFor.kind === "regex") {
+              const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
+              state.text = trimmed.text;
+              state.baseOffset = trimmed.baseOffset;
             }
-            return withWaited(data, {
-              reason: "matched",
-              elapsed_ms: Date.now() - startedAt,
-              match: match.text,
-              match_offset: scanBaseOffset + match.byteOffset,
-            });
-          }
-          if (waitFor.kind === "substring") {
-            const trimmed = trimWaitScanBuffer(scanText, scanBaseOffset, waitFor);
-            scanText = trimmed.text;
-            scanBaseOffset = trimmed.baseOffset;
+            const match = await findWaitMatch(bridge, extCtx, state.text, waitFor);
+            if (match) {
+              if (waitForExit && terminal) {
+                sawTerminal = true;
+                consumeBgCompletion(sessionId, taskId);
+                await markBgCompletionDelivered(
+                  { ctx, directory: extCtx.cwd, sessionID: sessionId },
+                  taskId,
+                );
+              }
+              const matchStream: "stdout" | "stderr" | undefined =
+                data.mode === "pty" ? undefined : chunk.stream === "output" ? "stdout" : "stderr";
+              return withWaited(data, {
+                reason: "matched",
+                elapsed_ms: Date.now() - startedAt,
+                match: match.text,
+                match_offset: state.baseOffset + match.byteOffset,
+                match_stream: matchStream,
+              });
+            }
+            if (waitFor.kind === "substring") {
+              const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
+              state.text = trimmed.text;
+              state.baseOffset = trimmed.baseOffset;
+            }
           }
         }
       }
@@ -975,7 +990,7 @@ async function waitForBashStatus(
 async function readNewTaskOutput(
   data: Record<string, unknown>,
   cursor: OutputCursor,
-): Promise<{ text: string; baseOffset: number; nextCursor: OutputCursor } | undefined> {
+): Promise<{ chunks: OutputScanChunk[]; nextCursor: OutputCursor } | undefined> {
   const outputPath = data.output_path as string | undefined;
   const stderrPath = data.mode === "pty" ? undefined : (data.stderr_path as string | undefined);
   if (!outputPath && !stderrPath) return undefined;
@@ -987,13 +1002,26 @@ async function readNewTaskOutput(
     : Buffer.alloc(0);
   const bytesRead = stdoutBytes.length + stderrBytes.length;
   if (bytesRead === 0) return undefined;
+  const chunks: OutputScanChunk[] = [];
+  if (stdoutBytes.length > 0) {
+    chunks.push({
+      stream: "output",
+      text: stdoutBytes.toString("utf8"),
+      baseOffset: cursor.output,
+    });
+  }
+  if (stderrBytes.length > 0) {
+    chunks.push({
+      stream: "stderr",
+      text: stderrBytes.toString("utf8"),
+      baseOffset: cursor.stderr,
+    });
+  }
   return {
-    text: Buffer.concat([stdoutBytes, stderrBytes]).toString("utf8"),
-    baseOffset: cursor.combined,
+    chunks,
     nextCursor: {
       output: cursor.output + stdoutBytes.length,
       stderr: cursor.stderr + stderrBytes.length,
-      combined: cursor.combined + bytesRead,
     },
   };
 }
@@ -1141,7 +1169,8 @@ function withWaited(
 
 function formatWaitSummary(waited: BashStatusWaited, details: BashStatusDetails): string {
   if (waited.reason === "matched") {
-    return `Waited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")} at offset ${waited.match_offset ?? 0}.`;
+    const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
+    return `Waited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
   }
   if (waited.reason === "timeout") {
     return `Waited ${waited.elapsed_ms}ms; timeout reached without match.`;

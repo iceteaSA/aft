@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, mock, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { BridgePool, BridgeRequestOptions } from "@cortexkit/aft-bridge";
@@ -938,11 +938,12 @@ describe("bash_status tool", () => {
         { taskId: "bash-wait", pattern: "Server listening" },
         createMockSdkContext({ metadata }),
       );
-      expect(result).toContain('matched "Server listening" at offset 7');
+      expect(result).toContain('matched "Server listening" in stdout at offset 7');
       expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
         reason: "matched",
         match: "Server listening",
         match_offset: 7,
+        match_stream: "stdout",
       });
       expect(calls.some((call) => call.cmd === "bash_regex_match")).toBe(false);
     } finally {
@@ -974,7 +975,7 @@ describe("bash_status tool", () => {
         { taskId: "bash-regex", pattern: { regex: "ready: \\d+" } },
         createMockSdkContext(),
       );
-      expect(result).toContain('matched "ready: 4242" at offset 4');
+      expect(result).toContain('matched "ready: 4242" in stdout at offset 4');
       expect(calls.filter((call) => call.cmd === "bash_regex_match")).toEqual([
         expect.objectContaining({
           params: expect.objectContaining({ pattern: "ready: \\d+", text: "" }),
@@ -1079,7 +1080,7 @@ describe("bash_status tool", () => {
         { taskId: "bash-race", pattern: "pattern" },
         createMockSdkContext(),
       );
-      expect(result).toContain('matched "pattern" at offset 0');
+      expect(result).toContain('matched "pattern" in stdout at offset 0');
       expect(result).not.toContain("task exited");
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
@@ -1099,7 +1100,7 @@ describe("bash_status tool", () => {
         { taskId: "bash-piped", pattern: "two" },
         createMockSdkContext(),
       );
-      expect(result).toContain('matched "two" at offset 4');
+      expect(result).toContain('matched "two" in stdout at offset 4');
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
     }
@@ -1108,6 +1109,7 @@ describe("bash_status tool", () => {
   test("bash_watch on PIPED bash scans stderr_path as well as output_path", async () => {
     const spill = await spillPair("stdout\n", "warning: READY on stderr\n");
     try {
+      const metadata = mock(() => {});
       const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
@@ -1117,9 +1119,78 @@ describe("bash_status tool", () => {
       }));
       const result = await watchTool.execute(
         { taskId: "bash-stderr", pattern: "READY" },
-        createMockSdkContext(),
+        createMockSdkContext({ metadata }),
       );
-      expect(result).toContain('matched "READY" at offset 16');
+      expect(result).toContain('matched "READY" in stderr at offset 9');
+      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
+        reason: "matched",
+        match: "READY",
+        match_offset: 9,
+        match_stream: "stderr",
+      });
+    } finally {
+      await rm(spill.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch does not combine stdout and stderr into a fabricated match", async () => {
+    const spill = await spillPair("ERR", "OR");
+    try {
+      const metadata = mock(() => {});
+      const { watchTool } = makeCtx(() => ({
+        success: true,
+        status: "completed",
+        exit_code: 0,
+        mode: "pipes",
+        output_path: spill.stdoutPath,
+        stderr_path: spill.stderrPath,
+      }));
+
+      const result = await watchTool.execute(
+        { taskId: "bash-stream-boundary", pattern: "ERROR" },
+        createMockSdkContext({ metadata }),
+      );
+
+      expect(result).toContain("task exited (completed, exit 0)");
+      expect(result).not.toContain("matched");
+      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({ reason: "exited" });
+    } finally {
+      await rm(spill.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch preserves a same-stream match split across poll reads", async () => {
+    const spill = await spillPair("RE", "");
+    let polls = 0;
+    try {
+      const metadata = mock(() => {});
+      const { watchTool } = makeCtx(async (command) => {
+        if (command === "bash_status") {
+          polls += 1;
+          if (polls === 2) await appendFile(spill.stdoutPath, "ADY");
+        }
+        return {
+          success: true,
+          status: "running",
+          mode: "pipes",
+          output_path: spill.stdoutPath,
+          stderr_path: spill.stderrPath,
+        };
+      });
+
+      const result = await watchTool.execute(
+        { taskId: "bash-same-stream-boundary", pattern: "READY", timeoutMs: 500 },
+        createMockSdkContext({ metadata }),
+      );
+
+      expect(result).toContain('matched "READY" in stdout at offset 0');
+      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
+        reason: "matched",
+        match: "READY",
+        match_offset: 0,
+        match_stream: "stdout",
+      });
+      expect(polls).toBe(2);
     } finally {
       await rm(spill.dir, { recursive: true, force: true });
     }
