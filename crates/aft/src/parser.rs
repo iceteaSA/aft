@@ -972,8 +972,13 @@ fn cached_file_is_fresh(
     }
 
     let current_mtime = metadata.modified().unwrap_or(fallback_mtime);
+    // Matching size and mtime is the steady-state fast path. If only mtime moved,
+    // hash below to keep touched or no-op rewritten files cached when content is identical.
+    if current_mtime == cached_mtime {
+        return true;
+    }
     if current_size > cache_freshness::CONTENT_HASH_SIZE_CAP {
-        return current_mtime == cached_mtime;
+        return false;
     }
 
     matches!(
@@ -9342,6 +9347,61 @@ pub(crate) mod outer {
     }
 
     // --- Symbol cache tests ---
+
+    fn cached_freshness_fixture(
+        content: &str,
+    ) -> (tempfile::TempDir, PathBuf, SystemTime, u64, blake3::Hash) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, content).unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let mtime = metadata.modified().unwrap();
+        let size = metadata.len();
+        let hash = cache_freshness::hash_bytes(content.as_bytes());
+        (dir, file, mtime, size, hash)
+    }
+
+    #[test]
+    fn cached_freshness_unchanged_metadata_skips_hashing() {
+        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+
+        cache_freshness::reset_hash_file_if_small_count_for_debug();
+        assert!(cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 0);
+    }
+
+    #[test]
+    fn cached_freshness_changed_mtime_with_identical_content_hashes_fresh() {
+        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
+
+        cache_freshness::reset_hash_file_if_small_count_for_debug();
+        assert!(cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
+    }
+
+    #[test]
+    fn cached_freshness_changed_mtime_and_same_size_content_hashes_stale() {
+        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn one() {}\n");
+        std::fs::write(&file, "pub fn two() {}\n").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), size);
+
+        cache_freshness::reset_hash_file_if_small_count_for_debug();
+        assert!(!cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
+    }
+
+    #[test]
+    fn cached_freshness_changed_size_skips_hashing() {
+        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        std::fs::write(&file, "pub fn hello() {}\n// longer\n").unwrap();
+
+        cache_freshness::reset_hash_file_if_small_count_for_debug();
+        assert!(!cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 0);
+    }
 
     #[test]
     fn symbol_cache_returns_cached_results_on_second_call() {
