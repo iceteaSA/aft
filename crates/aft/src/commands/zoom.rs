@@ -11,10 +11,11 @@ use crate::commands::symbol_render::{
 };
 use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
+use crate::language::LanguageProvider;
 use crate::lsp_hints;
 use crate::parser::{detect_language, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
-use crate::symbols::Range;
+use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
 
 /// A reference to a called/calling function.
@@ -556,29 +557,13 @@ fn zoom_one_symbol(
     context_lines: usize,
     include_callgraph: bool,
 ) -> Response {
-    // Resolve the target symbol. Markdown/HTML headings are often copied from outline output
-    // with a visible level prefix (e.g. "## Basic usage" or "<h2>Features"); normalize only
-    // that heading lookup path so code-symbol resolution keeps exact matching semantics.
-    let lookup_name = match detect_language(path) {
-        Some(LangId::Markdown | LangId::Html) => normalize_heading_query(symbol_name),
-        _ => symbol_name,
-    };
-    let matches = match ctx.provider().resolve_symbol(path, lookup_name) {
-        Ok(m) => m,
-        Err(crate::error::AftError::SymbolNotFound { name, .. }) => {
-            let mut msg = format!("symbol '{}' not found", name);
-            if let Ok(all_symbols) = ctx.provider().list_symbols(path) {
-                let available: Vec<String> = all_symbols.into_iter().map(|s| s.name).collect();
-                let suggestions = suggest_close_symbols(&name, &available, 5);
-                if !suggestions.is_empty() {
-                    msg.push_str(&format!(", did you mean: [{}]", suggestions.join(", ")));
-                }
-            }
-            return Response::error(&req.id, "symbol_not_found", msg);
-        }
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
+    // Keep raw heading labels for outline display. Zoom resolves heading names in tiers:
+    // exact raw text, normalized text, case-insensitive normalized text, then anchor slugs.
+    // Code symbols continue through the provider's exact resolver.
+    let is_heading = is_heading_zoom_language(detect_language(path));
+    let matches = match resolve_zoom_symbol(ctx.provider(), path, symbol_name, is_heading) {
+        Ok(matches) => matches,
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
 
     // LSP-enhanced disambiguation (S03)
@@ -621,8 +606,12 @@ fn zoom_one_symbol(
     if matches.is_empty() {
         let mut msg = format!("symbol '{}' not found", symbol_name);
         if let Ok(all_symbols) = ctx.provider().list_symbols(path) {
-            let available: Vec<String> = all_symbols.into_iter().map(|s| s.name).collect();
-            let suggestions = suggest_close_symbols(symbol_name, &available, 5);
+            let suggestions = if is_heading {
+                suggest_heading_symbols(symbol_name, &all_symbols, 5)
+            } else {
+                let available: Vec<String> = all_symbols.into_iter().map(|s| s.name).collect();
+                suggest_close_symbols(symbol_name, &available, 5)
+            };
             if !suggestions.is_empty() {
                 msg.push_str(&format!(", did you mean: [{}]", suggestions.join(", ")));
             }
@@ -930,21 +919,328 @@ fn suggest_close_symbols(query: &str, available: &[String], k: usize) -> Vec<Str
         .collect()
 }
 
-fn normalize_heading_query(input: &str) -> &str {
-    let trimmed = input.trim_start();
-    let hash_stripped = trimmed.trim_start_matches('#').trim_start();
+fn resolve_zoom_symbol(
+    provider: &dyn LanguageProvider,
+    path: &Path,
+    query: &str,
+    is_heading: bool,
+) -> Result<Vec<SymbolMatch>, crate::error::AftError> {
+    if is_heading {
+        return resolve_heading_symbols(provider, path, query);
+    }
 
-    if let Some(after_open) = hash_stripped.strip_prefix('<') {
-        let after_slash = after_open.strip_prefix('/').unwrap_or(after_open);
-        let mut chars = after_slash.chars();
-        if matches!(chars.next(), Some('h' | 'H')) && matches!(chars.next(), Some('1'..='6')) {
-            if let Some(end) = hash_stripped.find('>') {
-                return hash_stripped[end + 1..].trim_start();
+    match provider.resolve_symbol(path, query) {
+        Err(crate::error::AftError::SymbolNotFound { .. }) => Ok(Vec::new()),
+        result => result,
+    }
+}
+
+/// Keep document headings' raw labels for outline fidelity while allowing zoom to use
+/// human-readable labels, section prefixes, or anchors without affecting code symbols.
+fn resolve_heading_symbols(
+    provider: &dyn LanguageProvider,
+    path: &Path,
+    query: &str,
+) -> Result<Vec<SymbolMatch>, crate::error::AftError> {
+    let headings: Vec<SymbolMatch> = provider
+        .list_symbols(path)?
+        .into_iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Heading)
+        .map(|symbol| SymbolMatch {
+            file: path.display().to_string(),
+            symbol,
+        })
+        .collect();
+
+    Ok(match_heading_identity(&headings, query))
+}
+
+fn match_heading_identity(headings: &[SymbolMatch], query: &str) -> Vec<SymbolMatch> {
+    let exact: Vec<_> = headings
+        .iter()
+        .filter(|candidate| heading_identity_is_exact(&candidate.symbol, query))
+        .cloned()
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    let normalized_query = normalize_heading_label(query);
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+
+    let normalized: Vec<_> = headings
+        .iter()
+        .filter(|candidate| heading_identity_is_normalized(&candidate.symbol, &normalized_query))
+        .cloned()
+        .collect();
+    if !normalized.is_empty() {
+        return normalized;
+    }
+
+    let folded_query = normalized_query.to_lowercase();
+    let case_insensitive: Vec<_> = headings
+        .iter()
+        .filter(|candidate| heading_identity_is_case_insensitive(&candidate.symbol, &folded_query))
+        .cloned()
+        .collect();
+    if !case_insensitive.is_empty() {
+        return case_insensitive;
+    }
+
+    let query_slug = slugify_heading_label(&normalized_query);
+    if query_slug.is_empty() {
+        return Vec::new();
+    }
+
+    headings
+        .iter()
+        .filter(|candidate| heading_identity_has_slug(&candidate.symbol, &query_slug))
+        .cloned()
+        .collect()
+}
+
+fn qualified_heading_name(symbol: &Symbol) -> String {
+    if symbol.scope_chain.is_empty() {
+        return symbol.name.clone();
+    }
+    format!("{}.{}", symbol.scope_chain.join("."), symbol.name)
+}
+
+fn heading_identity_is_exact(symbol: &Symbol, query: &str) -> bool {
+    symbol.name == query || qualified_heading_name(symbol) == query
+}
+
+fn heading_identity_is_normalized(symbol: &Symbol, query: &str) -> bool {
+    normalize_heading_label(&symbol.name) == query
+        || normalize_heading_label(&qualified_heading_name(symbol)) == query
+}
+
+fn heading_identity_is_case_insensitive(symbol: &Symbol, query: &str) -> bool {
+    normalize_heading_label(&symbol.name).to_lowercase() == query
+        || normalize_heading_label(&qualified_heading_name(symbol)).to_lowercase() == query
+}
+
+fn heading_identity_has_slug(symbol: &Symbol, query_slug: &str) -> bool {
+    slugify_heading_label(&normalize_heading_label(&symbol.name)) == query_slug
+        || slugify_heading_label(&normalize_heading_label(&qualified_heading_name(symbol)))
+            == query_slug
+}
+
+fn suggest_heading_symbols(query: &str, symbols: &[Symbol], k: usize) -> Vec<String> {
+    let available: Vec<String> = symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Heading)
+        .map(|symbol| normalize_heading_label(&symbol.name))
+        .filter(|name| !name.is_empty())
+        .collect();
+    let normalized_query = normalize_heading_label(query);
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+    suggest_close_symbols(&normalized_query, &available, k)
+}
+
+fn normalize_heading_label(input: &str) -> String {
+    let mut value = collapse_heading_whitespace(&strip_markdown_links(input));
+
+    // A label can contain both a document prefix and a decorative symbol cluster.
+    // Repeat the small cleanup sequence so either order is handled consistently.
+    for _ in 0..4 {
+        let mut next = value.as_str();
+        let without_heading_markers = next.trim_start_matches('#').trim_start();
+        if without_heading_markers != next {
+            next = without_heading_markers;
+        }
+        if let Some(rest) = strip_heading_html_prefix(next) {
+            next = rest;
+        }
+        if let Some(rest) = strip_leading_section_prefix(next) {
+            next = rest;
+        }
+        if let Some(rest) = strip_leading_symbol_cluster(next) {
+            next = rest;
+        }
+
+        let collapsed = collapse_heading_whitespace(next);
+        if collapsed == value {
+            break;
+        }
+        value = collapsed;
+    }
+
+    value
+}
+
+fn collapse_heading_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn strip_markdown_links(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while let Some(relative_open) = input[cursor..].find('[') {
+        let open = cursor + relative_open;
+        let Some(close) = find_matching_delimiter(input, open, b'[', b']') else {
+            output.push_str(&input[cursor..]);
+            return output;
+        };
+
+        if input.as_bytes().get(close + 1) != Some(&b'(') {
+            output.push_str(&input[cursor..=close]);
+            cursor = close + 1;
+            continue;
+        }
+
+        let target_open = close + 1;
+        let Some(target_close) = find_matching_delimiter(input, target_open, b'(', b')') else {
+            output.push_str(&input[cursor..]);
+            return output;
+        };
+
+        output.push_str(&input[cursor..open]);
+        output.push_str(&input[open + 1..close]);
+        cursor = target_close + 1;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn find_matching_delimiter(input: &str, start: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 0;
+    for (index, byte) in input.as_bytes().iter().enumerate().skip(start) {
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
             }
         }
     }
+    None
+}
 
-    hash_stripped
+fn strip_heading_html_prefix(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    let bytes = input.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+
+    let mut index = 1;
+    if bytes.get(index) == Some(&b'/') {
+        index += 1;
+    }
+    if !matches!(bytes.get(index), Some(b'h' | b'H')) {
+        return None;
+    }
+    index += 1;
+    if !matches!(bytes.get(index), Some(b'1'..=b'6')) {
+        return None;
+    }
+
+    let end = input.find('>')?;
+    let rest = input[end + 1..].trim_start();
+    if rest.chars().any(|character| character.is_alphanumeric()) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn strip_leading_section_prefix(input: &str) -> Option<&str> {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    let mut saw_dot = false;
+
+    if !bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_alphanumeric() {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'.') {
+            break;
+        }
+        saw_dot = true;
+        index += 1;
+        if bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            let rest = input[index..].trim_start();
+            return if rest.chars().any(|character| character.is_alphanumeric()) {
+                Some(rest)
+            } else {
+                None
+            };
+        }
+        if !bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+    }
+
+    if saw_dot
+        && bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        let rest = input[index..].trim_start();
+        if rest.chars().any(|character| character.is_alphanumeric()) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+fn strip_leading_symbol_cluster(input: &str) -> Option<&str> {
+    let first_text = input
+        .char_indices()
+        .find(|(_, character)| character.is_alphanumeric())
+        .map(|(index, _)| index)?;
+    if first_text == 0 {
+        return None;
+    }
+
+    let rest = &input[first_text..];
+    if rest.chars().any(|character| character.is_alphanumeric()) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn slugify_heading_label(label: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_separator = false;
+
+    for character in label.chars() {
+        if character.is_alphanumeric() {
+            if pending_separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            for lowercase in character.to_lowercase() {
+                slug.push(lowercase);
+            }
+            pending_separator = false;
+        } else if !slug.is_empty() {
+            pending_separator = true;
+        }
+    }
+
+    slug
 }
 
 /// Extract call expression names within a byte range of the AST.

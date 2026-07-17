@@ -249,6 +249,146 @@ fn markdown_zoom_accepts_copied_heading_prefixes() {
 }
 
 #[test]
+fn markdown_zoom_normalizes_heading_identity_variants() {
+    let dir = TempDir::new().unwrap();
+    let md_file = dir.path().join("decorated-headings.md");
+    fs::write(
+        &md_file,
+        r#"# 12.1.5 Internationalization and links
+
+Internationalization details.
+
+## 📓 [Community Issue Tracker](https://example.com/issues)
+
+Community tracker details.
+
+## HTTP Flow
+
+HTTP flow details.
+"#,
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    aft.configure(dir.path());
+
+    for (id, symbol, expected) in [
+        (
+            "md-normalized-numeric",
+            "Internationalization and links",
+            "Internationalization details.",
+        ),
+        (
+            "md-normalized-emoji-link",
+            "Community Issue Tracker",
+            "Community tracker details.",
+        ),
+        (
+            "md-normalized-anchor-underscore",
+            "#http_flow",
+            "HTTP flow details.",
+        ),
+        (
+            "md-normalized-anchor-hyphen",
+            "http-flow",
+            "HTTP flow details.",
+        ),
+    ] {
+        let resp = aft.send(
+            &serde_json::json!({
+                "id": id,
+                "command": "zoom",
+                "file": md_file,
+                "symbol": symbol,
+            })
+            .to_string(),
+        );
+        assert_eq!(resp["success"], true, "normalized heading zoom: {resp:?}");
+        assert!(
+            resp["content"].as_str().unwrap().contains(expected),
+            "zoom should include {expected:?}: {resp:?}"
+        );
+    }
+
+    let exact = aft.send(
+        &serde_json::json!({
+            "id": "md-normalized-exact",
+            "command": "zoom",
+            "file": md_file,
+            "symbol": "📓 [Community Issue Tracker](https://example.com/issues)",
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        exact["success"], true,
+        "raw heading should still match: {exact:?}"
+    );
+    assert_eq!(
+        exact["name"],
+        "📓 [Community Issue Tracker](https://example.com/issues)"
+    );
+
+    let suggestion = aft.send(
+        &serde_json::json!({
+            "id": "md-normalized-suggestion",
+            "command": "zoom",
+            "file": md_file,
+            "symbol": "Community Issue Tracke",
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        suggestion["success"], false,
+        "misspelled heading should fail"
+    );
+    let message = suggestion["message"].as_str().unwrap();
+    assert!(message.contains("did you mean: [Community Issue Tracker]"));
+    assert!(!message.contains("[Community Issue Tracker](https://example.com/issues)"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn markdown_zoom_normalization_collision_is_ambiguous() {
+    let dir = TempDir::new().unwrap();
+    let md_file = dir.path().join("ambiguous-headings.md");
+    fs::write(
+        &md_file,
+        "# 1. Intro\n\nFirst intro.\n\n# 2. Intro\n\nSecond intro.\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    aft.configure(dir.path());
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "md-normalized-ambiguous",
+            "command": "zoom",
+            "file": md_file,
+            "symbol": "Intro",
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "collision should return a menu: {resp:?}"
+    );
+    assert_eq!(resp["kind"], "ambiguous_symbol");
+    let content = resp["content"].as_str().unwrap();
+    assert!(
+        content.contains("1. Intro"),
+        "raw candidate should be listed: {content}"
+    );
+    assert!(
+        content.contains("2. Intro"),
+        "raw candidate should be listed: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn markdown_zoom_heading_not_found() {
     let dir = TempDir::new().unwrap();
     let md_file = dir.path().join("readme.md");

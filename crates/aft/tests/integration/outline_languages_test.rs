@@ -622,6 +622,60 @@ fn zoom_html_heading_accepts_outline_style_prefix() {
 }
 
 #[test]
+fn zoom_html_heading_normalizes_identity_variants() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "decorated-headings.html",
+        r#"<html>
+<body>
+<h1>12.1.5 Internationalization and links</h1>
+<p>Internationalization details.</p>
+<h2>📓 Community Issue Tracker</h2>
+<p>Community tracker details.</p>
+<h2>HTTP Flow</h2>
+<p>HTTP flow details.</p>
+</body>
+</html>
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    for (id, symbol, expected) in [
+        (
+            "html-normalized-numeric",
+            "Internationalization and links",
+            "Internationalization details.",
+        ),
+        (
+            "html-normalized-emoji",
+            "Community Issue Tracker",
+            "Community tracker details.",
+        ),
+        ("html-normalized-anchor", "http_flow", "HTTP flow details."),
+    ] {
+        let resp = send(
+            &mut aft,
+            json!({
+                "id": id,
+                "command": "zoom",
+                "file": file,
+                "symbol": symbol,
+            }),
+        );
+        assert_eq!(resp["success"], true, "normalized HTML zoom: {resp:?}");
+        assert!(
+            resp["content"].as_str().unwrap().contains(expected),
+            "zoom should include {expected:?}: {resp:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn zoom_html_last_heading_range_stays_within_file() {
     let dir = TempDir::new().unwrap();
     let file = write_file(
