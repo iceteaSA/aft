@@ -41,6 +41,31 @@ run_phase "cargo test --workspace --lib --bins --quiet" \
 # + exec once so the assessment happens HERE, visibly, instead of as a
 # 90-test failure storm.
 if [[ "$(uname)" == "Darwin" ]]; then
+  # Separately, XprotectService itself sometimes wedges (Developer Tools
+  # exemptions do not cover XProtect malware scans): fresh-script execs take
+  # 10s+ or hang outright, so tests that install shims or exec new binaries
+  # time out with no real failure. Probe with a throwaway script; on a slow
+  # exec, kill the wedged scanners (they respawn clean) and re-probe.
+  # Opt out with AFT_GATE_NO_XPROTECT_REMEDIATION=1.
+  probe_exec_ms() {
+    local dir script started
+    dir="$(mktemp -d)"
+    script="$dir/exec-probe.sh"
+    printf '#!/bin/sh\nexit 0\n' > "$script"
+    chmod +x "$script"
+    started=$(date +%s%N 2>/dev/null || echo 0)
+    "$script" >/dev/null 2>&1 || true
+    if [[ "$started" == 0 ]]; then echo 0; else echo $((($(date +%s%N) - started) / 1000000)); fi
+    rm -rf "$dir"
+  }
+  probe_ms=$(probe_exec_ms)
+  if [[ "$probe_ms" -gt 1500 && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
+    echo "==> fresh-exec probe took ${probe_ms}ms — XProtect assessment wedge; killing wedged scanners"
+    pkill -9 -f XprotectService 2>/dev/null || true
+    pkill -9 syspolicyd 2>/dev/null || true
+    sleep 3
+    echo "    re-probe: $(probe_exec_ms)ms"
+  fi
   run_phase "warm target/debug/aft exec assessment (macOS syspolicyd)" \
     bash -c 'cargo build -p agent-file-tools --quiet && codesign -f -s - target/debug/aft 2>/dev/null && target/debug/aft --version >/dev/null'
 fi

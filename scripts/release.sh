@@ -209,6 +209,28 @@ echo "  cargo fmt --check..."
 cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fmt')"; exit 1; }
 
 # Slow checks AFTER the fast ones pass.
+#
+# TRUST_CI=1: skip the local Rust/JS/docker test re-run when CI is already
+# green on EXACTLY this commit. The local suite duplicates CI's coverage and
+# on macOS randomly loses 30-90 minutes to exec-assessment wedges; CI on the
+# same SHA is strictly more coverage (3 OS × unit + e2e). Verified, never
+# assumed: gh must report a completed successful run for HEAD's SHA.
+if [ "${TRUST_CI:-}" = "1" ]; then
+  head_sha=$(git rev-parse HEAD)
+  ci_ok=$(gh run list --commit "$head_sha" --workflow Tests --json status,conclusion \
+    --jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' 2>/dev/null || echo 0)
+  if [ "${ci_ok:-0}" -ge 1 ]; then
+    echo "  TRUST_CI: CI is green on $head_sha — skipping local Rust/JS/docker test re-run"
+    SKIP_RUST_TESTS=1
+    SKIP_JS_TESTS=1
+    SKIP_DOCKER_E2E=1
+  else
+    echo "Error: TRUST_CI=1 but no completed successful Tests run found for $head_sha"
+    echo "  ↳ push the commit, let CI finish green, then retry (or drop TRUST_CI)."
+    exit 1
+  fi
+fi
+
 if [ "${SKIP_RUST_TESTS:-}" = "1" ]; then
   echo "  (skipping local cargo tests — SKIP_RUST_TESTS=1)"
   echo "  ↳ CI still runs the full suite on its own runners before publishing."
