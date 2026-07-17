@@ -2422,10 +2422,19 @@ fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<Stri
     let warning = depth_warning(record, "max_depth_reached", "truncated_paths");
     let hub_summary = hub_summary_line(record);
     let total_paths = number_field(record, "total_paths").unwrap_or(paths.len() as i64);
+    let total_paths_is_lower_bound = record
+        .get("total_paths_is_lower_bound")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let entry_points = number_field(record, "entry_points_found").unwrap_or(0);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total_paths} path{}",
+            "{}{total_paths} path{}",
+            if total_paths_is_lower_bound {
+                "at least "
+            } else {
+                ""
+            },
             if total_paths == 1 { "" } else { "s" }
         )),
         Some(format!(
@@ -2886,5 +2895,47 @@ mod status_memory_tests {
         );
         assert!(rendered.contains("/repo: 3.0 MiB (semantic 2.0 MiB, trigram 1.0 MiB"));
         assert!(!rendered.contains("\"memory\""));
+    }
+}
+
+#[cfg(test)]
+mod callgraph_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn trace_to_formats_budgeted_path_count_as_lower_bound() {
+        let rendered = format_callgraph(
+            "trace_to",
+            &json!({
+                "total_paths": 7,
+                "total_paths_is_lower_bound": true,
+                "entry_points_found": 2,
+                "hub_summary": {
+                    "message": "Next: at least 7 paths — showing 2; traversal capped; narrow with scope"
+                },
+                "paths": []
+            }),
+            false,
+        );
+
+        assert!(rendered.starts_with("at least 7 paths · 2 entry points"));
+        assert!(rendered.contains("Next: at least 7 paths"));
+    }
+
+    #[test]
+    fn trace_to_exact_path_count_format_is_unchanged() {
+        let rendered = format_callgraph(
+            "trace_to",
+            &json!({
+                "total_paths": 1,
+                "entry_points_found": 1,
+                "paths": []
+            }),
+            false,
+        );
+
+        assert!(rendered.starts_with("1 path · 1 entry point"));
+        assert!(!rendered.contains("at least"));
     }
 }

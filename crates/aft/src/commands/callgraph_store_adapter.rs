@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -22,6 +22,15 @@ pub type StoreAdapterResult<T> = Result<T, CallGraphStoreError>;
 const TRACE_DATA_RESOLVER_PROVENANCE: &str = "treesitter+resolver";
 const HUB_SUMMARY_THRESHOLD: usize = 20;
 const HUB_SUMMARY_LIMIT: usize = 15;
+// The agent only receives 15 representative paths once a trace becomes a hub. A
+// 10k expansion budget leaves ample room for ordinary traces while preventing a
+// layered call graph from unfolding millions of path prefixes synchronously.
+const TRACE_TO_EXPANSION_BUDGET: usize = 10_000;
+const TRACE_TO_RETAINED_PATH_LIMIT: usize = HUB_SUMMARY_LIMIT * 4;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreHubSummary {
@@ -31,6 +40,8 @@ pub struct StoreHubSummary {
     pub shown: usize,
     pub threshold: usize,
     pub limit: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub counts_are_lower_bounds: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -143,6 +154,8 @@ pub struct StoreTraceToResult {
     pub target_file: String,
     pub paths: Vec<StoreTracePath>,
     pub total_paths: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub total_paths_is_lower_bound: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub_summary: Option<StoreHubSummary>,
     pub entry_points_found: usize,
@@ -280,6 +293,7 @@ fn test_hidden_summary(
         shown,
         threshold: HUB_SUMMARY_THRESHOLD,
         limit: HUB_SUMMARY_LIMIT,
+        counts_are_lower_bounds: false,
     }
 }
 
@@ -301,6 +315,37 @@ fn included_summary(
         shown,
         threshold: HUB_SUMMARY_THRESHOLD,
         limit: HUB_SUMMARY_LIMIT,
+        counts_are_lower_bounds: false,
+    }
+}
+
+fn lower_bound_trace_summary(
+    total: usize,
+    hidden_tests: usize,
+    shown: usize,
+    include_tests: bool,
+) -> StoreHubSummary {
+    let test_note = if include_tests {
+        if hidden_tests == 0 {
+            " (test-path count also incomplete)".to_string()
+        } else {
+            format!(" (at least {hidden_tests} in tests, included)")
+        }
+    } else if hidden_tests == 0 {
+        " (additional test paths may be uncounted — pass includeTests)".to_string()
+    } else {
+        format!(" (at least {hidden_tests} in tests, hidden — pass includeTests)")
+    };
+    StoreHubSummary {
+        message: format!(
+            "Next: at least {total} paths{test_note} — showing {shown}; traversal capped; narrow with scope"
+        ),
+        total,
+        hidden_tests,
+        shown,
+        threshold: HUB_SUMMARY_THRESHOLD,
+        limit: HUB_SUMMARY_LIMIT,
+        counts_are_lower_bounds: true,
     }
 }
 
@@ -333,6 +378,52 @@ fn dedup_paths_for_summary(paths: Vec<StoreTracePath>) -> Vec<StoreTracePath> {
         .into_iter()
         .filter(|path| seen.insert(trace_path_shape(path)))
         .collect()
+}
+
+fn trace_path_order(left: &StoreTracePath, right: &StoreTracePath) -> std::cmp::Ordering {
+    let left_entry = left
+        .hops
+        .first()
+        .map(|hop| hop.symbol.as_str())
+        .unwrap_or("");
+    let right_entry = right
+        .hops
+        .first()
+        .map(|hop| hop.symbol.as_str())
+        .unwrap_or("");
+    left_entry
+        .cmp(right_entry)
+        .then(left.hops.len().cmp(&right.hops.len()))
+}
+
+fn store_trace_path(elems: &[TraceElem]) -> StoreTracePath {
+    let hops = elems
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, elem)| StoreTraceHop {
+            symbol: elem.node.symbol.clone(),
+            file: elem.node.file.clone(),
+            line: elem.node.line,
+            signature: elem.node.signature.clone(),
+            is_entry_point: index == 0 && elem.node.is_entry_point,
+            approximate: elem.edge.approximate,
+            resolved_by: elem.edge.resolved_by.clone(),
+        })
+        .collect();
+    StoreTracePath { hops }
+}
+
+fn retain_trace_path(retained: &mut Vec<StoreTracePath>, path: StoreTracePath) {
+    retained.push(path);
+    if retained.len() <= TRACE_TO_RETAINED_PATH_LIMIT {
+        return;
+    }
+    retained.sort_by(trace_path_order);
+    *retained = dedup_paths_for_summary(std::mem::take(retained))
+        .into_iter()
+        .take(TRACE_TO_RETAINED_PATH_LIMIT)
+        .collect();
 }
 
 fn filter_call_tree_tests(node: &mut StoreCallTreeNode) {
@@ -578,6 +669,25 @@ pub fn trace_to_result(
     max_depth: usize,
     include_tests: bool,
 ) -> StoreAdapterResult<StoreTraceToResult> {
+    trace_to_result_with_budget(
+        store,
+        file,
+        symbol,
+        max_depth,
+        include_tests,
+        TRACE_TO_EXPANSION_BUDGET,
+    )
+    .map(|(result, _)| result)
+}
+
+fn trace_to_result_with_budget(
+    store: &impl CallGraphRead,
+    file: &Path,
+    symbol: &str,
+    max_depth: usize,
+    include_tests: bool,
+    expansion_budget: usize,
+) -> StoreAdapterResult<(StoreTraceToResult, usize)> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_max = if max_depth == 0 { 10 } else { max_depth };
 
@@ -585,16 +695,33 @@ pub fn trace_to_result(
         node: target.representative.clone(),
         edge: EdgeMarker::default(),
     }];
-    let mut complete_paths = Vec::new();
+    let mut retained_paths = Vec::new();
+    let mut total_paths = 0usize;
+    let mut hidden_tests = 0usize;
     if target.representative.is_entry_point {
-        complete_paths.push(initial.clone());
+        total_paths = 1;
+        let path = store_trace_path(&initial);
+        if trace_path_starts_in_test(&path) {
+            hidden_tests = 1;
+        }
+        if include_tests || hidden_tests == 0 {
+            retain_trace_path(&mut retained_paths, path);
+        }
     }
 
     let mut queue = vec![(initial, 0usize)];
     let mut max_depth_reached = false;
     let mut truncated_paths = 0usize;
+    let mut expansions = 0usize;
+    let mut budget_exhausted = false;
+    let mut callers_by_symbol: HashMap<(String, String), Vec<StoreCallSite>> = HashMap::new();
 
-    while let Some((path, depth)) = queue.pop() {
+    'traversal: while let Some((path, depth)) = queue.pop() {
+        if expansions >= expansion_budget {
+            budget_exhausted = true;
+            break;
+        }
+        expansions += 1;
         if depth >= effective_max {
             max_depth_reached = true;
             continue;
@@ -602,9 +729,17 @@ pub fn trace_to_result(
         let Some(current) = path.last() else {
             continue;
         };
-        let callers = dedup_call_sites(
-            store.direct_callers_of(Path::new(&current.node.file), &current.node.symbol)?,
-        );
+        let caller_key = (current.node.file.clone(), current.node.symbol.clone());
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            callers_by_symbol.entry(caller_key.clone())
+        {
+            let callers =
+                dedup_call_sites(store.direct_callers_of(Path::new(&caller_key.0), &caller_key.1)?);
+            entry.insert(callers);
+        }
+        let callers = callers_by_symbol
+            .get(&caller_key)
+            .expect("trace caller cache populated above");
         if callers.is_empty() {
             if path.len() > 1 {
                 truncated_paths += 1;
@@ -629,7 +764,21 @@ pub fn trace_to_result(
                 edge: EdgeMarker::default(),
             });
             if site.caller.is_entry_point {
-                complete_paths.push(next_path.clone());
+                total_paths = total_paths.saturating_add(1);
+                let completed = store_trace_path(&next_path);
+                let from_test = trace_path_starts_in_test(&completed);
+                if from_test {
+                    hidden_tests = hidden_tests.saturating_add(1);
+                }
+                if include_tests || !from_test {
+                    retain_trace_path(&mut retained_paths, completed);
+                }
+            }
+            // Reserve at most one future expansion slot per queued path. This
+            // bounds queue memory as well as the number of paths actually popped.
+            if expansions.saturating_add(queue.len()) >= expansion_budget {
+                budget_exhausted = true;
+                break 'traversal;
             }
             queue.push((next_path, depth + 1));
         }
@@ -638,61 +787,20 @@ pub fn trace_to_result(
         }
     }
 
-    let mut paths: Vec<StoreTracePath> = complete_paths
-        .into_iter()
-        .map(|mut elems| {
-            elems.reverse();
-            let hops = elems
-                .iter()
-                .enumerate()
-                .map(|(index, elem)| StoreTraceHop {
-                    symbol: elem.node.symbol.clone(),
-                    file: elem.node.file.clone(),
-                    line: elem.node.line,
-                    signature: elem.node.signature.clone(),
-                    is_entry_point: index == 0 && elem.node.is_entry_point,
-                    approximate: elem.edge.approximate,
-                    resolved_by: elem.edge.resolved_by.clone(),
-                })
-                .collect();
-            StoreTracePath { hops }
-        })
-        .collect();
-    paths.sort_by(|left, right| {
-        let left_entry = left
-            .hops
-            .first()
-            .map(|hop| hop.symbol.as_str())
-            .unwrap_or("");
-        let right_entry = right
-            .hops
-            .first()
-            .map(|hop| hop.symbol.as_str())
-            .unwrap_or("");
-        left_entry
-            .cmp(right_entry)
-            .then(left.hops.len().cmp(&right.hops.len()))
-    });
-    let total_paths = paths.len();
-    let hidden_tests = paths
-        .iter()
-        .filter(|path| trace_path_starts_in_test(path))
-        .count();
-    let summarize = total_paths > HUB_SUMMARY_THRESHOLD;
-    let visible_paths = paths
-        .into_iter()
-        .filter(|path| include_tests || !trace_path_starts_in_test(path))
-        .collect::<Vec<_>>();
+    retained_paths.sort_by(trace_path_order);
+    let summarize = budget_exhausted || total_paths > HUB_SUMMARY_THRESHOLD;
     let paths = if summarize {
-        dedup_paths_for_summary(visible_paths)
+        dedup_paths_for_summary(retained_paths)
             .into_iter()
             .take(HUB_SUMMARY_LIMIT)
             .collect::<Vec<_>>()
     } else {
-        visible_paths
+        retained_paths
     };
     let hub_summary = if summarize {
-        Some(if include_tests {
+        Some(if budget_exhausted {
+            lower_bound_trace_summary(total_paths, hidden_tests, paths.len(), include_tests)
+        } else if include_tests {
             included_summary("paths", total_paths, hidden_tests, paths.len())
         } else {
             test_hidden_summary("paths", total_paths, hidden_tests, paths.len())
@@ -709,16 +817,20 @@ pub fn trace_to_result(
         .collect::<HashSet<_>>()
         .len();
 
-    Ok(StoreTraceToResult {
-        target_symbol: target.representative.symbol,
-        target_file: target.representative.file,
-        total_paths,
-        hub_summary,
-        paths,
-        entry_points_found,
-        max_depth_reached,
-        truncated_paths,
-    })
+    Ok((
+        StoreTraceToResult {
+            target_symbol: target.representative.symbol,
+            target_file: target.representative.file,
+            total_paths,
+            total_paths_is_lower_bound: budget_exhausted,
+            hub_summary,
+            paths,
+            entry_points_found,
+            max_depth_reached,
+            truncated_paths,
+        },
+        expansions,
+    ))
 }
 
 pub fn ensure_symbol_resolves(
@@ -1866,4 +1978,306 @@ fn absolute_file(store: &impl CallGraphRead, file: &Path) -> PathBuf {
         file.to_path_buf()
     };
     std::fs::canonicalize(&full_path).unwrap_or(full_path)
+}
+
+#[cfg(test)]
+mod trace_to_tests {
+    use super::*;
+    use crate::callgraph_store::{
+        Result as CallGraphResult, StoreCallersResult as RawCallersResult,
+        StoreImpactResult as RawImpactResult, StoredEdge,
+    };
+    use std::cell::RefCell;
+
+    struct CountingStore {
+        root: PathBuf,
+        sqlite_path: PathBuf,
+        nodes: HashMap<(String, String), StoreNode>,
+        callers: HashMap<(String, String), Vec<StoreCallSite>>,
+        caller_queries: RefCell<HashMap<(String, String), usize>>,
+    }
+
+    impl CountingStore {
+        fn new() -> Self {
+            Self {
+                root: PathBuf::from("/repo"),
+                sqlite_path: PathBuf::from("/repo/callgraph.sqlite"),
+                nodes: HashMap::new(),
+                callers: HashMap::new(),
+                caller_queries: RefCell::new(HashMap::new()),
+            }
+        }
+
+        fn add_node(&mut self, node: StoreNode) {
+            self.nodes
+                .insert((node.file.clone(), node.symbol.clone()), node);
+        }
+
+        fn add_caller(&mut self, target: &StoreNode, caller: &StoreNode) {
+            self.callers
+                .entry((target.file.clone(), target.symbol.clone()))
+                .or_default()
+                .push(StoreCallSite {
+                    caller: caller.clone(),
+                    target_file: target.file.clone(),
+                    target_symbol: target.symbol.clone(),
+                    target: Some(target.clone()),
+                    line: caller.line,
+                    byte_start: 0,
+                    byte_end: 1,
+                    resolved: true,
+                    provenance: TRACE_DATA_RESOLVER_PROVENANCE.to_string(),
+                });
+        }
+
+        fn total_caller_queries(&self) -> usize {
+            self.caller_queries.borrow().values().sum()
+        }
+    }
+
+    impl CallGraphRead for CountingStore {
+        fn project_root(&self) -> &Path {
+            &self.root
+        }
+
+        fn project_key(&self) -> &str {
+            "test-project"
+        }
+
+        fn sqlite_path(&self) -> &Path {
+            &self.sqlite_path
+        }
+
+        fn is_current(&self) -> bool {
+            true
+        }
+
+        fn edge_snapshot(&self) -> CallGraphResult<BTreeSet<StoredEdge>> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn indexed_file_count(&self) -> CallGraphResult<usize> {
+            Ok(self.nodes.len())
+        }
+
+        fn node_for(&self, file_rel: &Path, symbol: &str) -> CallGraphResult<StoreNode> {
+            Ok(self
+                .nodes_for(file_rel, symbol)?
+                .into_iter()
+                .next()
+                .expect("fixture node"))
+        }
+
+        fn nodes_for(&self, file_rel: &Path, symbol: &str) -> CallGraphResult<Vec<StoreNode>> {
+            let key = (
+                file_rel.to_string_lossy().replace('\\', "/"),
+                symbol.to_string(),
+            );
+            Ok(self.nodes.get(&key).cloned().into_iter().collect())
+        }
+
+        fn nodes_matching(&self, symbol: &str) -> CallGraphResult<Vec<StoreNode>> {
+            Ok(self
+                .nodes
+                .values()
+                .filter(|node| node.symbol == symbol)
+                .cloned()
+                .collect())
+        }
+
+        fn direct_callers_of(
+            &self,
+            file_rel: &Path,
+            symbol: &str,
+        ) -> CallGraphResult<Vec<StoreCallSite>> {
+            let key = (
+                file_rel.to_string_lossy().replace('\\', "/"),
+                symbol.to_string(),
+            );
+            *self
+                .caller_queries
+                .borrow_mut()
+                .entry(key.clone())
+                .or_default() += 1;
+            Ok(self.callers.get(&key).cloned().unwrap_or_default())
+        }
+
+        fn callers_of(
+            &self,
+            _file_rel: &Path,
+            _symbol: &str,
+            _depth: usize,
+        ) -> CallGraphResult<RawCallersResult> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn impact_of(
+            &self,
+            _file_rel: &Path,
+            _symbol: &str,
+            _depth: usize,
+        ) -> CallGraphResult<RawImpactResult> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn outgoing_calls_of(&self, _node: &StoreNode) -> CallGraphResult<Vec<StoreCallSite>> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn resolved_self_calls_of(&self, _node: &StoreNode) -> CallGraphResult<Vec<StoreCallSite>> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn unresolved_calls_of(
+            &self,
+            _node: &StoreNode,
+        ) -> CallGraphResult<Vec<StoreUnresolvedCall>> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn call_tree(
+            &self,
+            _file_rel: &Path,
+            _symbol: &str,
+            _depth: usize,
+        ) -> CallGraphResult<callgraph::CallTreeNode> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn trace_to(
+            &self,
+            _file_rel: &Path,
+            _symbol: &str,
+            _max_depth: usize,
+        ) -> CallGraphResult<callgraph::TraceToResult> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn trace_to_symbol_candidates(
+            &self,
+            _to_symbol: &str,
+        ) -> CallGraphResult<Vec<TraceToSymbolCandidate>> {
+            unreachable!("not used by trace_to_result")
+        }
+
+        fn trace_to_symbol(
+            &self,
+            _file_rel: &Path,
+            _symbol: &str,
+            _to_symbol: &str,
+            _to_file: Option<&Path>,
+            _max_depth: usize,
+        ) -> CallGraphResult<callgraph::TraceToSymbolResult> {
+            unreachable!("not used by trace_to_result")
+        }
+    }
+
+    fn node(symbol: &str, is_entry_point: bool) -> StoreNode {
+        StoreNode::for_test(&format!("{symbol}.ts"), symbol, is_entry_point)
+    }
+
+    fn layered_store(width: usize, layers: usize) -> (CountingStore, StoreNode) {
+        let mut store = CountingStore::new();
+        let target = node("target", false);
+        store.add_node(target.clone());
+        let mut previous = vec![target.clone()];
+        for layer in 1..=layers {
+            let current = (0..width)
+                .map(|index| node(&format!("layer_{layer}_{index}"), layer == layers))
+                .collect::<Vec<_>>();
+            for caller in &current {
+                store.add_node(caller.clone());
+            }
+            for target_node in &previous {
+                for caller in &current {
+                    store.add_caller(target_node, caller);
+                }
+            }
+            previous = current;
+        }
+        (store, target)
+    }
+
+    #[test]
+    fn trace_to_caches_callers_for_convergent_path_prefixes() {
+        let (store, target) = layered_store(2, 3);
+
+        let (result, expansions) = trace_to_result_with_budget(
+            &store,
+            Path::new(&target.file),
+            &target.symbol,
+            10,
+            true,
+            100,
+        )
+        .expect("trace result");
+
+        assert_eq!(result.total_paths, 8);
+        assert!(!result.total_paths_is_lower_bound);
+        assert_eq!(expansions, 15);
+        assert_eq!(store.total_caller_queries(), 7);
+        assert!(store
+            .caller_queries
+            .borrow()
+            .values()
+            .all(|queries| *queries == 1));
+    }
+
+    #[test]
+    fn trace_to_budget_returns_valid_paths_and_marks_counts_as_lower_bounds() {
+        let (store, target) = layered_store(2, 3);
+
+        let (result, expansions) = trace_to_result_with_budget(
+            &store,
+            Path::new(&target.file),
+            &target.symbol,
+            10,
+            true,
+            10,
+        )
+        .expect("trace result");
+
+        assert!(result.total_paths_is_lower_bound);
+        assert!(result.total_paths > 0);
+        assert!(expansions <= 10);
+        assert!(store.total_caller_queries() <= 10);
+        let summary = result.hub_summary.expect("lower-bound summary");
+        assert!(summary.counts_are_lower_bounds);
+        assert!(summary.message.contains("at least"));
+        for path in result.paths {
+            assert!(path.hops.first().is_some_and(|hop| hop.is_entry_point));
+            assert_eq!(
+                path.hops.last().map(|hop| hop.symbol.as_str()),
+                Some("target")
+            );
+        }
+    }
+
+    #[test]
+    fn trace_to_below_budget_preserves_exact_serialized_contract() {
+        let mut store = CountingStore::new();
+        let target = node("target", false);
+        let middle = node("middle", false);
+        let entry = node("entry", true);
+        for fixture_node in [&target, &middle, &entry] {
+            store.add_node(fixture_node.clone());
+        }
+        store.add_caller(&target, &middle);
+        store.add_caller(&middle, &entry);
+
+        let (result, _expansions) = trace_to_result_with_budget(
+            &store,
+            Path::new(&target.file),
+            &target.symbol,
+            10,
+            true,
+            100,
+        )
+        .expect("trace result");
+
+        assert_eq!(
+            serde_json::to_string(&result).expect("serialize trace result"),
+            r#"{"target_symbol":"target","target_file":"target.ts","paths":[{"hops":[{"symbol":"entry","file":"entry.ts","line":1,"is_entry_point":true},{"symbol":"middle","file":"middle.ts","line":1,"is_entry_point":false},{"symbol":"target","file":"target.ts","line":1,"is_entry_point":false}]}],"total_paths":1,"entry_points_found":1,"max_depth_reached":false,"truncated_paths":1}"#
+        );
+    }
 }

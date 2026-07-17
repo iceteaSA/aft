@@ -1056,6 +1056,25 @@ pub struct StoreNode {
     pub lang: LangId,
 }
 
+#[cfg(test)]
+impl StoreNode {
+    pub(crate) fn for_test(file: &str, symbol: &str, is_entry_point: bool) -> Self {
+        Self {
+            node_id: format!("{file}:{symbol}"),
+            file: file.to_string(),
+            symbol: symbol.to_string(),
+            name: symbol.to_string(),
+            kind: "function".to_string(),
+            line: 1,
+            end_line: 1,
+            signature: None,
+            exported: is_entry_point,
+            is_entry_point,
+            lang: LangId::TypeScript,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreCallSite {
     pub caller: StoreNode,

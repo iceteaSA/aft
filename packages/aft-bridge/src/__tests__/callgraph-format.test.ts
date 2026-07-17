@@ -169,6 +169,20 @@ describe("formatCallgraphSections", () => {
     expect(text).toContain("Path 1");
   });
 
+  test("trace_to renders budgeted path counts as lower bounds", () => {
+    const text = formatCallgraphSections("trace_to", {
+      total_paths: 7,
+      total_paths_is_lower_bound: true,
+      entry_points_found: 2,
+      hub_summary: {
+        message: "Next: at least 7 paths — showing 2; traversal capped; narrow with scope",
+      },
+      paths: [],
+    }).join("\n");
+    expect(text).toContain("at least 7 paths");
+    expect(text).toContain("Next: at least 7 paths");
+  });
+
   test("impact lists affected sites", () => {
     const text = formatCallgraphSections("impact", {
       total_affected: 1,

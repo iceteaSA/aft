@@ -271,10 +271,14 @@ export function formatCallgraphSections(
     const warning = depthWarning(record, theme, "max_depth_reached", "truncated_paths");
     const hubSummary = hubSummaryLine(record, theme);
     const totalPaths = asNumber(record.total_paths) ?? paths.length;
+    const totalPathsIsLowerBound = asBoolean(record.total_paths_is_lower_bound) ?? false;
     const entryPoints = asNumber(record.entry_points_found) ?? 0;
     const sections = [
       joinNonEmpty([
-        theme.fg("success", `${totalPaths} path${totalPaths === 1 ? "" : "s"}`),
+        theme.fg(
+          "success",
+          `${totalPathsIsLowerBound ? "at least " : ""}${totalPaths} path${totalPaths === 1 ? "" : "s"}`,
+        ),
         theme.fg("muted", `${entryPoints} entry point${entryPoints === 1 ? "" : "s"}`),
         warning,
       ]),
