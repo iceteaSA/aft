@@ -113,15 +113,39 @@ fn render_nearest_miss(lines: &[&str], pattern: &[&str], file_size_bytes: usize)
     }
 }
 
+fn dominant_line_ending(content: &str) -> &'static str {
+    let bytes = content.as_bytes();
+    let mut newline_count = 0usize;
+    let mut crlf_count = 0usize;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            newline_count += 1;
+            if index > 0 && bytes[index - 1] == b'\r' {
+                crlf_count += 1;
+            }
+        }
+    }
+
+    // Mixed files use their majority convention; ties and files without newlines use LF.
+    if crlf_count > newline_count - crlf_count {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 /// Apply parsed update chunks to original file content, returning the patched text or an error string.
 pub fn apply_update_chunks(
     original_content: &str,
     file_path: &str,
     chunks: &[UpdateFileChunk],
 ) -> Result<String, String> {
+    let line_ending = dominant_line_ending(original_content);
+    // Remove CRLF's carriage return before matching, then restore the chosen convention on output.
     let mut original_lines: Vec<String> = original_content
         .split('\n')
-        .map(ToOwned::to_owned)
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
         .collect();
 
     if original_lines.last().is_some_and(String::is_empty) {
@@ -232,7 +256,7 @@ pub fn apply_update_chunks(
         result.push(String::new());
     }
 
-    Ok(result.join("\n"))
+    Ok(result.join(line_ending))
 }
 
 #[cfg(test)]
@@ -543,5 +567,66 @@ mod tests {
             apply_update_chunks("alpha\n", "src/trailing.ts", &chunks).unwrap(),
             "beta\n"
         );
+    }
+
+    #[test]
+    fn crlf_replacements_and_insertions_use_crlf_bytes() {
+        let replacement = apply_update_chunks(
+            "alpha\r\nold\r\nomega\r\n",
+            "src/crlf.txt",
+            &[chunk(&["old"], &["new"])],
+        )
+        .unwrap();
+        assert_eq!(replacement.as_bytes(), b"alpha\r\nnew\r\nomega\r\n");
+
+        let insertion = apply_update_chunks(
+            "alpha\r\nomega\r\n",
+            "src/crlf.txt",
+            &[chunk(&[], &["inserted"])],
+        )
+        .unwrap();
+        assert_eq!(insertion.as_bytes(), b"alpha\r\nomega\r\ninserted\r\n");
+    }
+
+    #[test]
+    fn mixed_and_unterminated_files_follow_dominant_newline_policy() {
+        let mixed = apply_update_chunks(
+            "alpha\r\nold\nomega\r\n",
+            "src/mixed.txt",
+            &[chunk(&["old"], &["new"])],
+        )
+        .unwrap();
+        assert_eq!(mixed.as_bytes(), b"alpha\r\nnew\r\nomega\r\n");
+
+        let unterminated =
+            apply_update_chunks("alpha\r\nold", "src/crlf.txt", &[chunk(&["old"], &["new"])])
+                .unwrap();
+        assert_eq!(unterminated.as_bytes(), b"alpha\r\nnew\r\n");
+    }
+
+    #[test]
+    fn lf_updates_keep_existing_byte_behavior() {
+        let cases = [
+            (
+                "alpha\nold\nomega\n",
+                chunk(&["old"], &["new"]),
+                b"alpha\nnew\nomega\n".as_slice(),
+            ),
+            (
+                "alpha\nomega\n",
+                chunk(&[], &["inserted"]),
+                b"alpha\nomega\ninserted\n".as_slice(),
+            ),
+            (
+                "alpha\nold",
+                chunk(&["old"], &["new"]),
+                b"alpha\nnew\n".as_slice(),
+            ),
+        ];
+
+        for (original, update, expected) in cases {
+            let result = apply_update_chunks(original, "src/lf.txt", &[update]).unwrap();
+            assert_eq!(result.as_bytes(), expected);
+        }
     }
 }

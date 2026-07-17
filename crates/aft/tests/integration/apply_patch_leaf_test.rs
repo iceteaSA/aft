@@ -140,6 +140,104 @@ fn apply_patch_update_uses_reflow_fuzzy_hunk() {
 }
 
 #[test]
+fn apply_patch_preserves_dominant_line_endings_and_preview_parity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let replacement = root.join("replacement.txt");
+    fs::write(&replacement, b"alpha\r\nold\r\nomega\r\n").unwrap();
+    let mut aft = configured_aft(root);
+
+    let replacement_patch = r#"*** Begin Patch
+*** Update File: replacement.txt
+@@
+-old
++new
+*** End Patch"#;
+    let preview_resp = preview(&mut aft, "preview-crlf", replacement_patch);
+    assert_eq!(
+        preview_resp["success"], true,
+        "preview failed: {preview_resp:?}"
+    );
+    assert_eq!(
+        fs::read(&replacement).unwrap(),
+        b"alpha\r\nold\r\nomega\r\n"
+    );
+
+    let apply_resp = apply(&mut aft, "apply-crlf", replacement_patch);
+    assert_eq!(
+        apply_resp["success"], true,
+        "CRLF replacement failed: {apply_resp:?}"
+    );
+    assert_eq!(
+        preview_resp["preview_diff"], apply_resp["metadata"]["diff"],
+        "preview and apply must render the same resulting bytes"
+    );
+    assert_eq!(
+        fs::read(&replacement).unwrap(),
+        b"alpha\r\nnew\r\nomega\r\n"
+    );
+
+    let fixtures = [
+        ("insertion.txt", b"alpha\r\nomega\r\n".as_slice()),
+        ("mixed.txt", b"alpha\r\nold\nomega\r\n".as_slice()),
+        ("unterminated.txt", b"alpha\r\nold".as_slice()),
+        ("lf-replacement.txt", b"alpha\nold\nomega\n".as_slice()),
+        ("lf-insertion.txt", b"alpha\nomega\n".as_slice()),
+        ("lf-unterminated.txt", b"alpha\nold".as_slice()),
+    ];
+    for (path, contents) in fixtures {
+        fs::write(root.join(path), contents).unwrap();
+    }
+
+    let remaining_patch = r#"*** Begin Patch
+*** Update File: insertion.txt
+@@
++inserted
+*** Update File: mixed.txt
+@@
+-old
++new
+*** Update File: unterminated.txt
+@@
+-old
++new
+*** Update File: lf-replacement.txt
+@@
+-old
++new
+*** Update File: lf-insertion.txt
+@@
++inserted
+*** Update File: lf-unterminated.txt
+@@
+-old
++new
+*** End Patch"#;
+    let remaining_resp = apply(&mut aft, "apply-line-endings", remaining_patch);
+    assert_eq!(
+        remaining_resp["success"], true,
+        "line-ending updates failed: {remaining_resp:?}"
+    );
+
+    let expected = [
+        (
+            "insertion.txt",
+            b"alpha\r\nomega\r\ninserted\r\n".as_slice(),
+        ),
+        ("mixed.txt", b"alpha\r\nnew\r\nomega\r\n".as_slice()),
+        ("unterminated.txt", b"alpha\r\nnew\r\n".as_slice()),
+        ("lf-replacement.txt", b"alpha\nnew\nomega\n".as_slice()),
+        ("lf-insertion.txt", b"alpha\nomega\ninserted\n".as_slice()),
+        ("lf-unterminated.txt", b"alpha\nnew\n".as_slice()),
+    ];
+    for (path, contents) in expected {
+        assert_eq!(fs::read(root.join(path)).unwrap(), contents, "{path}");
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn apply_patch_move_happy_path_and_undo_restores_source() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
