@@ -1,3 +1,5 @@
+#[cfg(debug_assertions)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -42,6 +44,23 @@ const POSTING_BYTES: usize = 6;
 const ARTIFACT_CACHE_KEY_MEMO_FILE: &str = "cache-keys.json";
 static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static POSTINGS_FOR_TRIGRAM_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_postings_for_trigram_count_for_debug() {
+    POSTINGS_FOR_TRIGRAM_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn postings_for_trigram_count_for_debug() -> usize {
+    POSTINGS_FOR_TRIGRAM_CALLS.with(Cell::get)
+}
 
 #[cfg(test)]
 type RootCommitProbeOverride =
@@ -425,10 +444,15 @@ impl SearchIndexSnapshot {
         let selected_count = non_zero.len().min(3);
         let candidate_cap = if selected_count == 3 { 200 } else { 500 };
 
+        // Candidate discovery needs only the three rarest trigrams, while scoring
+        // needs every query trigram. Materialize all lists once per query so both
+        // phases reuse the same disk-backed postings instead of rereading them for
+        // every candidate. Memory remains bounded by the query's posting lists.
+        let postings_by_trigram = materialize_query_postings(self, query_trigrams);
         let mut candidate_ids = BTreeSet::new();
         for (trigram, _) in non_zero.iter().take(selected_count) {
-            for file_id in self.postings_for_trigram(*trigram, None) {
-                candidate_ids.insert(file_id);
+            if let Some(postings) = postings_by_trigram.get(trigram) {
+                candidate_ids.extend(postings.iter().copied());
             }
         }
         let pre_filter_candidate_count = candidate_ids.len();
@@ -451,7 +475,8 @@ impl SearchIndexSnapshot {
 
         let mut ranked = Vec::new();
         for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {
-            let score = lexical_score_snapshot(self, query_trigrams, file_id);
+            let score =
+                lexical_score_from_postings(self, query_trigrams, &postings_by_trigram, file_id);
             if score > 0.0 {
                 ranked.push((entry.path.clone(), score));
             }
@@ -1894,6 +1919,9 @@ impl SearchIndexSnapshot {
     }
 
     fn postings_for_trigram(&self, trigram: u32, filter: Option<PostingFilter>) -> Vec<u32> {
+        #[cfg(debug_assertions)]
+        POSTINGS_FOR_TRIGRAM_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+
         let mut matches = Vec::new();
 
         if let Some(base_entry) = self
@@ -3188,7 +3216,126 @@ pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) 
     lexical_score_snapshot(&index.snapshot(), query_trigrams, file_id)
 }
 
+fn materialize_query_postings(
+    index: &SearchIndexSnapshot,
+    query_trigrams: &[u32],
+) -> HashMap<u32, Vec<u32>> {
+    let mut postings_by_trigram = HashMap::with_capacity(query_trigrams.len());
+    for &trigram in query_trigrams {
+        postings_by_trigram
+            .entry(trigram)
+            .or_insert_with(|| index.postings_for_trigram(trigram, None));
+    }
+    postings_by_trigram
+}
+
 fn lexical_score_snapshot(
+    index: &SearchIndexSnapshot,
+    query_trigrams: &[u32],
+    file_id: u32,
+) -> f32 {
+    let postings_by_trigram = materialize_query_postings(index, query_trigrams);
+    lexical_score_from_postings(index, query_trigrams, &postings_by_trigram, file_id)
+}
+
+fn lexical_score_from_postings(
+    index: &SearchIndexSnapshot,
+    query_trigrams: &[u32],
+    postings_by_trigram: &HashMap<u32, Vec<u32>>,
+    file_id: u32,
+) -> f32 {
+    if query_trigrams.is_empty() {
+        return 0.0;
+    }
+
+    let mut hits = 0u32;
+    for &trigram in query_trigrams {
+        if postings_by_trigram
+            .get(&trigram)
+            .is_some_and(|postings| postings.binary_search(&file_id).is_ok())
+        {
+            hits += 1;
+        }
+    }
+
+    if hits == 0 {
+        return 0.0;
+    }
+
+    let file_trigram_count = index
+        .file_trigram_count
+        .get(file_id as usize)
+        .copied()
+        .unwrap_or(1)
+        .max(1) as f32;
+    (hits as f32) / (1.0 + file_trigram_count.ln())
+}
+
+#[cfg(test)]
+fn lexical_rank_with_stats_reference(
+    index: &SearchIndexSnapshot,
+    query_trigrams: &[u32],
+    candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+    max_files: usize,
+) -> LexicalRankResult {
+    if query_trigrams.is_empty() || max_files == 0 {
+        return LexicalRankResult::default();
+    }
+
+    let mut non_zero: Vec<(u32, usize)> = query_trigrams
+        .iter()
+        .filter_map(|trigram| {
+            let posting_count = index.posting_count(*trigram);
+            (posting_count > 0).then_some((*trigram, posting_count))
+        })
+        .collect();
+    if non_zero.is_empty() {
+        return LexicalRankResult::default();
+    }
+
+    non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
+    let selected_count = non_zero.len().min(3);
+    let candidate_cap = if selected_count == 3 { 200 } else { 500 };
+
+    let mut candidate_ids = BTreeSet::new();
+    for (trigram, _) in non_zero.iter().take(selected_count) {
+        candidate_ids.extend(index.postings_for_trigram(*trigram, None));
+    }
+    let pre_filter_candidate_count = candidate_ids.len();
+    let engine_capped = pre_filter_candidate_count > candidate_cap;
+    let filtered_candidates = candidate_ids
+        .into_iter()
+        .filter_map(|file_id| {
+            index
+                .files
+                .get(file_id as usize)
+                .map(|entry| (file_id, entry))
+        })
+        .filter(|(_, entry)| {
+            candidate_filter
+                .map(|filter| filter(&entry.path))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+
+    let mut ranked = Vec::new();
+    for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {
+        let score = lexical_score_snapshot_reference(index, query_trigrams, file_id);
+        if score > 0.0 {
+            ranked.push((entry.path.clone(), score));
+        }
+    }
+
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(max_files);
+    LexicalRankResult {
+        files: ranked,
+        engine_capped,
+    }
+}
+
+#[cfg(test)]
+fn lexical_score_snapshot_reference(
     index: &SearchIndexSnapshot,
     query_trigrams: &[u32],
     file_id: u32,
@@ -4717,6 +4864,59 @@ mod tests {
 
     use super::*;
 
+    fn lexical_rank_mixed_storage_fixture() -> (tempfile::TempDir, SearchIndex) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        for index in 0..205 {
+            fs::write(
+                project.join(format!("file_{index:03}.txt")),
+                format!("abcdefghij sharedalpha marker_{index}"),
+            )
+            .expect("write base fixture file");
+        }
+
+        let cache_dir = dir.path().join("cache");
+        let mut built = SearchIndex::build(&project);
+        assert!(built.write_to_disk(&cache_dir, None));
+        let mut index = SearchIndex::read_from_disk(&cache_dir, &project).expect("load base index");
+
+        let replaced = project.join("file_000.txt");
+        index.remove_file(&replaced);
+        index.index_file(&replaced, b"abcdefghij sharedalpha replacement_delta");
+
+        let removed = project.join("file_001.txt");
+        index.remove_file(&removed);
+
+        let added = project.join("added_delta.txt");
+        fs::write(&added, "abcdefghij sharedalpha added_delta").expect("write delta file");
+        index.index_file(&added, b"abcdefghij sharedalpha added_delta");
+
+        assert!(index.base.is_some());
+        assert!(!index.delta_postings.is_empty());
+        assert!(!index.superseded.is_empty());
+        (dir, index)
+    }
+
+    fn assert_rank_matches_reference(
+        index: &SearchIndex,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        max_files: usize,
+    ) -> LexicalRankResult {
+        let snapshot = index.snapshot();
+        let expected = lexical_rank_with_stats_reference(
+            &snapshot,
+            query_trigrams,
+            candidate_filter,
+            max_files,
+        );
+        let actual = snapshot.lexical_rank_with_stats(query_trigrams, candidate_filter, max_files);
+        assert_eq!(actual.files, expected.files);
+        assert_eq!(actual.engine_capped, expected.engine_capped);
+        actual
+    }
+
     #[test]
     fn cached_path_under_root_allows_missing_lexical_child() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -4898,6 +5098,47 @@ mod tests {
             expected
         });
         assert!(!ids.contains(&old_a_id));
+    }
+
+    #[test]
+    fn lexical_rank_cached_postings_match_reference_for_base_delta_and_superseded_files() {
+        let (_dir, index) = lexical_rank_mixed_storage_fixture();
+        let long_query = query_trigrams_from_tokens(&["abcdefghij"]);
+        assert!(long_query.len() > 3);
+        let long_result = assert_rank_matches_reference(&index, &long_query, None, 1_000);
+        assert!(long_result.engine_capped);
+
+        let short_query = query_trigrams_from_tokens(&["abc"]);
+        assert_eq!(short_query.len(), 1);
+        assert_rank_matches_reference(&index, &short_query, None, 100);
+
+        let mixed_query = query_trigrams_from_tokens(&["sharedalpha", "absentzzz"]);
+        let production_only = |path: &Path| !path.ends_with("file_002.txt");
+        assert_rank_matches_reference(&index, &mixed_query, Some(&production_only), 25);
+
+        let mut duplicate_query = query_trigrams_from_tokens(&["abcdefghij"]);
+        duplicate_query.push(duplicate_query[0]);
+        assert_rank_matches_reference(&index, &duplicate_query, None, 40);
+    }
+
+    #[test]
+    fn lexical_rank_reads_each_distinct_query_posting_list_once() {
+        let (_dir, index) = lexical_rank_mixed_storage_fixture();
+        let mut query = query_trigrams_from_tokens(&["abcdefghij", "sharedalpha"]);
+        query.push(query[0]);
+        let distinct_trigrams = query.iter().copied().collect::<HashSet<_>>().len();
+
+        reset_postings_for_trigram_count_for_debug();
+        let result = index
+            .snapshot()
+            .lexical_rank_with_stats(&query, None, 1_000);
+
+        assert!(result.files.len() > 1);
+        assert_eq!(
+            postings_for_trigram_count_for_debug(),
+            distinct_trigrams,
+            "candidate discovery and scoring must share query-local posting lists"
+        );
     }
 
     #[test]
