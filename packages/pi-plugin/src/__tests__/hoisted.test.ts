@@ -5,7 +5,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TSchema } from "typebox";
@@ -971,5 +971,31 @@ describe("hoisted tool adapters", () => {
       formatReadFooter(true, { truncated: true, start_line: 1, end_line: 100, total_lines: 500 }),
     ).toBe("");
     expect(formatReadFooter(false, { truncated: true })).toBe("");
+  });
+});
+
+describe("file: URL path arguments", () => {
+  test("read resolves a file:/// URL to the local path", async () => {
+    // resolvePathArg is the single choke point every hoisted Pi tool routes
+    // path arguments through; a file: URL must reach the bridge as a plain
+    // absolute path, byte-identical to what the Rust decoder would produce.
+    const { resolvePathArg } = await import("../tools/hoisted.js");
+    const dir = await mkdtemp(join(tmpdir(), "aft-pi-fileurl-"));
+    try {
+      const target = join(dir, "a b.txt");
+      await writeFile(target, "x");
+      const url = `file://${target.replaceAll(" ", "%20")}`;
+      expect(await resolvePathArg(dir, url)).toBe(target);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("malformed escapes decode tolerantly (Rust parity)", async () => {
+    const { resolvePathArg } = await import("../tools/hoisted.js");
+    // %2e%2e decodes to .. even with a trailing malformed %ZZ — matching the
+    // byte-wise Rust decoder, NOT decodeURIComponent's all-or-nothing throw.
+    const resolved = await resolvePathArg("/proj", "file:///proj/%2e%2e/%ZZ/x");
+    expect(resolved).toBe("/proj/../%ZZ/x");
   });
 });

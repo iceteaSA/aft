@@ -198,3 +198,58 @@ export function markAnnouncementSeen(
     // Best-effort.
   }
 }
+
+/**
+ * Decode an RFC 8089 `file:` URL to a local path. Models routinely spell
+ * local targets as file:///path (or file:/path, file://localhost/path);
+ * rejecting them only produces failed tool calls. MUST match the Rust
+ * decoder (subc_translate.rs decode_file_url) so plugin-side permission
+ * gates judge the same target the server resolves. Returns the input
+ * unchanged when it is not a decodable local file URL.
+ *
+ * The percent-decode is byte-wise and tolerant, matching Rust EXACTLY:
+ * each valid %HH decodes independently; malformed escapes stay literal.
+ * decodeURIComponent is all-or-nothing (throws on one malformed %ZZ,
+ * leaving VALID escapes like %2e%2e encoded too) — that divergence lets a
+ * crafted URL read as in-project at the permission gate while the server
+ * resolves the decoded ../ out of the project.
+ */
+export function decodeFileUrl(target: string): string {
+  if (!target.startsWith("file:")) return target;
+  const rest = target.slice("file:".length);
+  let pathPart: string;
+  if (rest.startsWith("//")) {
+    const after = rest.slice(2);
+    const slash = after.indexOf("/");
+    const authority = slash === -1 ? after : after.slice(0, slash);
+    const p = slash === -1 ? "" : after.slice(slash);
+    if (authority === "" || authority === "localhost") pathPart = p;
+    else if (process.platform === "win32") pathPart = `//${authority}${p}`;
+    else return target;
+  } else if (rest.startsWith("/")) {
+    pathPart = rest;
+  } else {
+    return target;
+  }
+  const bytes: number[] = [];
+  for (let i = 0; i < pathPart.length; ) {
+    if (pathPart[i] === "%" && i + 2 < pathPart.length) {
+      const hex = pathPart.slice(i + 1, i + 3);
+      if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+        bytes.push(Number.parseInt(hex, 16));
+        i += 3;
+        continue;
+      }
+    }
+    const cp = pathPart.codePointAt(i) as number;
+    const ch = String.fromCodePoint(cp);
+    for (const b of Buffer.from(ch, "utf8")) bytes.push(b);
+    i += ch.length;
+  }
+  const decoded = Buffer.from(bytes).toString("utf8");
+  // file:///C:/x decodes to /C:/x — strip the slash for the drive form.
+  if (process.platform === "win32" && /^\/[A-Za-z]:/.test(decoded)) {
+    return decoded.slice(1);
+  }
+  return decoded;
+}

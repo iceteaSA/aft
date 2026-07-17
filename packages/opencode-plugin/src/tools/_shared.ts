@@ -25,7 +25,7 @@ import type {
   ToolCallOptions,
   ToolCallResult,
 } from "@cortexkit/aft-bridge";
-import { canonicalizeProjectRoot, timeoutForCommand } from "@cortexkit/aft-bridge";
+import { canonicalizeProjectRoot, decodeFileUrl, timeoutForCommand } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import { getSessionDirectory, getSessionDirectoryCached } from "../shared/session-directory.js";
@@ -169,60 +169,10 @@ export function expandTilde(input: string): string {
   return input;
 }
 
-/**
- * Decode an RFC 8089 `file:` URL to a local path. Models routinely spell
- * local targets as file:///path (or file:/path, file://localhost/path);
- * rejecting them only produces failed tool calls. MUST match the Rust
- * decoder (subc_translate.rs decode_file_url) so the plugin's permission
- * gates judge the same target the server resolves. Returns the input
- * unchanged when it is not a decodable local file URL.
- */
-export function decodeFileUrl(target: string): string {
-  if (!target.startsWith("file:")) return target;
-  const rest = target.slice("file:".length);
-  let pathPart: string;
-  if (rest.startsWith("//")) {
-    const after = rest.slice(2);
-    const slash = after.indexOf("/");
-    const authority = slash === -1 ? after : after.slice(0, slash);
-    const p = slash === -1 ? "" : after.slice(slash);
-    if (authority === "" || authority === "localhost") pathPart = p;
-    else if (process.platform === "win32") pathPart = `//${authority}${p}`;
-    else return target;
-  } else if (rest.startsWith("/")) {
-    pathPart = rest;
-  } else {
-    return target;
-  }
-  // Byte-wise tolerant percent-decode, matching Rust's percent_decode
-  // EXACTLY: each valid %HH decodes independently; malformed escapes stay
-  // literal. decodeURIComponent is all-or-nothing (throws on one malformed
-  // %ZZ, leaving VALID escapes like %2e%2e encoded too) — that divergence
-  // let a crafted URL read as in-project here while Rust resolved the
-  // decoded ../ out of the project, splitting the permission check from
-  // the filesystem target.
-  const bytes: number[] = [];
-  for (let i = 0; i < pathPart.length; ) {
-    if (pathPart[i] === "%" && i + 2 < pathPart.length) {
-      const hex = pathPart.slice(i + 1, i + 3);
-      if (/^[0-9a-fA-F]{2}$/.test(hex)) {
-        bytes.push(Number.parseInt(hex, 16));
-        i += 3;
-        continue;
-      }
-    }
-    const cp = pathPart.codePointAt(i) as number;
-    const ch = String.fromCodePoint(cp);
-    for (const b of Buffer.from(ch, "utf8")) bytes.push(b);
-    i += ch.length;
-  }
-  const decoded = Buffer.from(bytes).toString("utf8");
-  // file:///C:/x decodes to /C:/x — strip the slash for the drive form.
-  if (process.platform === "win32" && /^\/[A-Za-z]:/.test(decoded)) {
-    return decoded.slice(1);
-  }
-  return decoded;
-}
+// Shared with the Pi plugin and matched byte-for-byte by the Rust decoder
+// (subc_translate.rs decode_file_url) so permission gates and the server
+// judge the same filesystem target.
+export { decodeFileUrl } from "@cortexkit/aft-bridge";
 
 /** Resolve a user path exactly as a bridge request will: file: URLs decode
  * to local paths, `~` expands to home, absolute paths are preserved;

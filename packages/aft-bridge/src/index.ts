@@ -118,6 +118,7 @@ export {
 } from "./onnx-runtime.js";
 export type { LegacyAftConfigSource, ResolvedAftConfigPaths } from "./paths.js";
 export {
+  decodeFileUrl,
   markAnnouncementSeen,
   repairRootScopedStorageFile,
   resolveCortexKitConfigPaths,

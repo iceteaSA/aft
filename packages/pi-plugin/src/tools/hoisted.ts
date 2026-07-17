@@ -23,6 +23,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
   coerceAliasedStringParam,
   coerceBoolean,
+  decodeFileUrl,
   formatEditSummary,
   formatReadFooter as formatSharedReadFooter,
 } from "@cortexkit/aft-bridge";
@@ -108,22 +109,25 @@ function containsPath(parent: string, child: string): boolean {
 }
 
 /**
- * Expand a leading `~` to the user's home directory. Returns the path
- * unchanged if it does not start with `~`. Mirrors shell-style expansion so
- * agent calls like `grep ... in ~/Work/...` resolve before any filesystem
- * stat or permission check sees the literal tilde.
+ * Normalize a raw path argument: decode RFC 8089 `file:` URLs (models spell
+ * local targets as file:///path) and expand a leading `~` to the user's home
+ * directory. Runs before any filesystem stat or permission check so both see
+ * the real target. The file: decode uses the shared byte-wise decoder so
+ * Pi's permission check and the Rust resolver (subc_translate.rs
+ * decode_file_url) judge the same filesystem path.
  */
-function expandTilde(path: string): string {
-  if (!path || !path.startsWith("~")) return path;
-  if (path === "~") return homedir();
-  if (path.startsWith(`~${sep}`) || path.startsWith("~/")) {
-    return resolve(homedir(), path.slice(2));
+function normalizePathInput(path: string): string {
+  const decoded = decodeFileUrl(path);
+  if (!decoded || !decoded.startsWith("~")) return decoded;
+  if (decoded === "~") return homedir();
+  if (decoded.startsWith(`~${sep}`) || decoded.startsWith("~/")) {
+    return resolve(homedir(), decoded.slice(2));
   }
-  return path;
+  return decoded;
 }
 
 function absoluteSearchPath(cwd: string, target: string): string {
-  const expanded = expandTilde(target);
+  const expanded = normalizePathInput(target);
   return isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
 }
 
@@ -198,7 +202,7 @@ export async function assertExternalDirectoryPermission(
   options: { restrictToProjectRoot?: boolean; serverValidatedRead?: boolean } = {},
 ): Promise<void> {
   if (!target) return;
-  const expanded = expandTilde(target);
+  const expanded = normalizePathInput(target);
   const absoluteTarget = isAbsolute(expanded) ? expanded : resolve(extCtx.cwd, expanded);
   if (containsPath(extCtx.cwd, absoluteTarget)) return;
 
@@ -979,9 +983,10 @@ function shortenPath(path: string): string {
   return path;
 }
 
-/** Resolve a path argument to an absolute path if it exists, expanding `~`. */
+/** Resolve a path argument to an absolute path if it exists, decoding file:
+ * URLs and expanding `~`. */
 export async function resolvePathArg(cwd: string, path: string): Promise<string> {
-  const expanded = expandTilde(path);
+  const expanded = normalizePathInput(path);
   const abs = absoluteSearchPath(cwd, path);
   try {
     await stat(abs);
