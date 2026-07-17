@@ -182,6 +182,105 @@ fn apply_patch_move_happy_path_and_undo_restores_source() {
 }
 
 #[test]
+fn apply_patch_same_path_move_is_an_in_place_update_and_undoable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "source.txt", "before\nkeep\n");
+    let mut aft = configured_aft(root);
+
+    let patch = r#"*** Begin Patch
+*** Update File: source.txt
+*** Move to: source.txt
+@@
+-before
++after
+ keep
+*** End Patch"#;
+
+    let resp = apply(&mut aft, "apply-same-path-move", patch);
+    assert_eq!(resp["success"], true, "same-path update failed: {resp:?}");
+    assert_eq!(resp["output"], "Updated source.txt");
+    let file = &resp["metadata"]["files"][0];
+    assert_eq!(file["type"], "update");
+    assert_eq!(file["relativePath"], "source.txt");
+    assert!(file.get("movePath").is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("source.txt")).unwrap(),
+        "after\nkeep\n"
+    );
+
+    let undo = aft.send(&json!({ "id": "undo-same-path", "command": "undo" }).to_string());
+    assert_eq!(undo["success"], true, "undo failed: {undo:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("source.txt")).unwrap(),
+        "before\nkeep\n"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn apply_patch_same_path_move_alias_is_an_in_place_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "source.txt", "before\n");
+    let mut aft = configured_aft(root);
+
+    let patch = r#"*** Begin Patch
+*** Update File: source.txt
+*** Move to: ./source.txt
+@@
+-before
++after
+*** End Patch"#;
+
+    let resp = apply(&mut aft, "apply-same-path-alias", patch);
+    assert_eq!(resp["success"], true, "aliased update failed: {resp:?}");
+    assert_eq!(resp["output"], "Updated source.txt");
+    let file = &resp["metadata"]["files"][0];
+    assert_eq!(file["type"], "update");
+    assert!(file.get("movePath").is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("source.txt")).unwrap(),
+        "after\n"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn apply_patch_same_path_move_preview_is_an_in_place_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "source.txt", "before\nkeep\n");
+    let mut aft = configured_aft(root);
+
+    let patch = r#"*** Begin Patch
+*** Update File: source.txt
+*** Move to: source.txt
+@@
+-before
++after
+ keep
+*** End Patch"#;
+
+    let resp = preview(&mut aft, "preview-same-path-move", patch);
+    assert_eq!(resp["success"], true, "preview failed: {resp:?}");
+    assert_eq!(resp["preview"], true);
+    assert_eq!(resp["affected_rel_paths"], json!(["source.txt"]));
+    assert!(resp["preview_diff"]
+        .as_str()
+        .unwrap()
+        .contains("-before\n+after"));
+    assert_eq!(
+        fs::read_to_string(root.join("source.txt")).unwrap(),
+        "before\nkeep\n"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn apply_patch_partial_keeps_successful_hunks_and_reports_failure() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

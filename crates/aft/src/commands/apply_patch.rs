@@ -170,8 +170,14 @@ fn resolve_hunks(
         );
         let move_dest = if let Some(move_path) = move_path {
             let dest = resolve_path(req, ctx, move_path)?;
-            remember_path(&dest.abs, &dest.rel, &mut affected_abs, &mut affected_rel);
-            Some(dest)
+            if dest.abs == source.abs {
+                // Models can spell an in-place edit as a move back to the same file.
+                // Drop the move so apply and preview both use the normal update path.
+                None
+            } else {
+                remember_path(&dest.abs, &dest.rel, &mut affected_abs, &mut affected_rel);
+                Some(dest)
+            }
         } else {
             None
         };
@@ -891,7 +897,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
             } => match apply_update(req, ctx, resolved_hunk, chunks, &op_id, &mut backed_paths) {
                 Ok(mut result) => {
                     result.index = index;
-                    if let Some(move_path) = move_path {
+                    if let (Some(_), Some(move_path)) = (&resolved_hunk.move_dest, move_path) {
                         output_lines.push(format!("Updated and moved {path} → {move_path}"));
                     } else {
                         output_lines.push(format!("Updated {path}"));
