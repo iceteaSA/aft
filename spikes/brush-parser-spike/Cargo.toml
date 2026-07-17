@@ -1,0 +1,13 @@
+[package]
+name = "brush-parser-scanner-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Keep this probe outside AFT's workspace; the empty table makes Cargo treat
+# this manifest as a standalone workspace root even though it lives in-tree.
+[workspace]
+
+[dependencies]
+aft = { package = "agent-file-tools", path = "../../crates/aft" }
+brush-parser = "0.4.0"
