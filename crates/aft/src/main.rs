@@ -316,10 +316,24 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
     aft::logging::perf_tick(None);
 }
 
+#[cfg(test)]
+fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
         let _ = runtime.flush_search_index_on_graceful_shutdown();
     }
+    // Tests run in parallel, but callgraph refreshes use one process-wide
+    // worker. Without this lock, one test's graceful shutdown can reject
+    // another test's pending refresh.
+    #[cfg(test)]
+    let _callgraph_refresh_worker_guard = callgraph_refresh_worker_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
 }
 
@@ -1932,6 +1946,15 @@ mod watcher_filter_tests {
 
     #[test]
     fn watcher_drain_refreshes_open_callgraph_store() {
+        let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                30
+            )),
+            "a prior callgraph refresh worker should fully stop before this test"
+        );
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         let source = root.join("main.ts");
