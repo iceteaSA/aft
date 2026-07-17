@@ -130,7 +130,7 @@ pub fn effective_path() -> &'static OsStr {
                 if let Some(new_path) = new_path_opt {
                     write_login_path_memo(&new_path);
                     let current = std::env::var_os("PATH").unwrap_or_default();
-                    let merged = merge_login_and_current_path(&new_path, &current);
+                    let merged = merge_current_and_login_path(&current, &new_path);
                     let home = std::env::var_os("HOME");
                     let enriched =
                         append_missing_standard_dirs(&merged, home.as_deref(), |dir| dir.is_dir());
@@ -148,7 +148,7 @@ pub fn effective_path() -> &'static OsStr {
                         current_state.last_probe_attempt = Some(Instant::now());
                         if let Some(memo_path) = memo_path_opt {
                             let current = std::env::var_os("PATH").unwrap_or_default();
-                            let merged = merge_login_and_current_path(&memo_path, &current);
+                            let merged = merge_current_and_login_path(&current, &memo_path);
                             let home = std::env::var_os("HOME");
                             let enriched =
                                 append_missing_standard_dirs(&merged, home.as_deref(), |dir| {
@@ -173,19 +173,18 @@ pub fn effective_path() -> &'static OsStr {
     let mut is_fallback = false;
     let mut last_probe_attempt = None;
 
-    let path = if !path_is_impoverished(&current, home.as_deref(), |dir| dir.is_dir()) {
-        current.to_os_string()
+    // Probe every startup: a daemon PATH can contain the usual system and
+    // package-manager directories while still omitting entries added by an
+    // interactive shell rc file.
+    let path = if let Some(login_path) = probe_login_shell_path() {
+        write_login_path_memo(&login_path);
+        merge_current_and_login_path(&current, &login_path)
+    } else if let Some(memo_path) = read_login_path_memo() {
+        merge_current_and_login_path(&current, &memo_path)
     } else {
-        if let Some(login_path) = probe_login_shell_path() {
-            write_login_path_memo(&login_path);
-            merge_login_and_current_path(&login_path, &current)
-        } else if let Some(memo_path) = read_login_path_memo() {
-            merge_login_and_current_path(&memo_path, &current)
-        } else {
-            is_fallback = true;
-            last_probe_attempt = Some(Instant::now());
-            current.to_os_string()
-        }
+        is_fallback = true;
+        last_probe_attempt = Some(Instant::now());
+        current.to_os_string()
     };
 
     let enriched = append_missing_standard_dirs(&path, home.as_deref(), |dir| dir.is_dir());
@@ -208,25 +207,7 @@ fn compute_effective_path() -> OsString {
     std::env::var_os("PATH").unwrap_or_default()
 }
 
-#[cfg(unix)]
-fn path_is_impoverished<D>(current: &OsStr, home: Option<&OsStr>, mut dir_exists: D) -> bool
-where
-    D: FnMut(&Path) -> bool,
-{
-    let current_entries: Vec<PathBuf> = std::env::split_paths(current).collect();
-    core_standard_path_dirs(home).into_iter().any(|dir| {
-        dir_exists(&dir)
-            && !current_entries
-                .iter()
-                .any(|entry| entry.as_path() == dir.as_path())
-    })
-}
-
-/// Core tool dirs whose absence from PATH signals an impoverished daemon
-/// environment worth paying a login-shell probe for. Deliberately excludes
-/// the interactive-gated extras below: those are appended unconditionally by
-/// `append_missing_standard_dirs`, so missing them alone never justifies a
-/// probe.
+/// Core tool directories are kept first in the standard-directory fallback.
 #[cfg(unix)]
 fn core_standard_path_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
     let mut dirs = vec![
@@ -242,8 +223,7 @@ fn core_standard_path_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
 }
 
 /// All dirs merged into every constructed PATH when present on disk. Includes
-/// installers that only amend interactive shell rc blocks (bun, pnpm, mise,
-/// deno, volta), which even a successful login-shell probe cannot see.
+/// common installer locations that may not be represented in a shell probe.
 #[cfg(unix)]
 fn user_standard_path_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
     let mut dirs = core_standard_path_dirs(home);
@@ -334,22 +314,10 @@ fn set_nonblocking<F: AsRawFd>(file: &F) -> std::io::Result<()> {
 #[cfg(unix)]
 fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut command = Command::new(shell);
-    let is_fish = shell
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.eq_ignore_ascii_case("fish"))
-        .unwrap_or(false);
-
-    let cmd_str = if is_fish {
-        r#"printf %s (string join : $PATH)"#
-    } else {
-        r#"printf %s "$PATH""#
-    };
 
     command
-        .arg("-l")
-        .arg("-c")
-        .arg(cmd_str)
+        .arg(probe_shell_flags(shell))
+        .arg(probe_shell_command(shell))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -391,7 +359,7 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
                         }
                     }
                 }
-                return Some(OsString::from_vec(output_bytes));
+                return extract_probe_path(&output_bytes);
             }
             Ok(n) => {
                 output_bytes.extend_from_slice(&buf[..n]);
@@ -418,7 +386,7 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
                     }
                 }
                 let _ = child.wait();
-                return Some(OsString::from_vec(output_bytes));
+                return extract_probe_path(&output_bytes);
             }
             Ok(None) if Instant::now() >= deadline => {
                 kill_login_shell_probe(&mut child);
@@ -433,6 +401,45 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn probe_shell_flags(shell: &Path) -> &'static str {
+    let name = shell.file_name().and_then(|name| name.to_str());
+    if name.is_some_and(|name| name.eq_ignore_ascii_case("zsh")) {
+        // zsh login shells read .zprofile/.zlogin, while interactive shells
+        // read .zshrc; both modes are needed to reproduce a terminal PATH.
+        "-lic"
+    } else {
+        // bash -lc reads the login startup files (which conventionally source
+        // .bashrc), and fish -lc reads config.fish without needing -i.
+        "-lc"
+    }
+}
+
+#[cfg(unix)]
+fn probe_shell_command(shell: &Path) -> &'static str {
+    let name = shell.file_name().and_then(|name| name.to_str());
+    if name.is_some_and(|name| name.eq_ignore_ascii_case("fish")) {
+        r#"printf '\n__AFT_PATH_BEGIN__%s__AFT_PATH_END__\n' (string join : $PATH)"#
+    } else {
+        r#"printf '\n__AFT_PATH_BEGIN__%s__AFT_PATH_END__\n' "$PATH""#
+    }
+}
+
+#[cfg(unix)]
+fn extract_probe_path(output: &[u8]) -> Option<OsString> {
+    const BEGIN: &[u8] = b"__AFT_PATH_BEGIN__";
+    const END: &[u8] = b"__AFT_PATH_END__";
+    let begin = output
+        .windows(BEGIN.len())
+        .position(|window| window == BEGIN)?
+        + BEGIN.len();
+    let end = output[begin..]
+        .windows(END.len())
+        .position(|window| window == END)?
+        + begin;
+    Some(OsString::from_vec(output[begin..end].to_vec()))
 }
 
 #[cfg(unix)]
@@ -477,11 +484,13 @@ fn login_path_is_acceptable(path: &OsStr) -> bool {
 }
 
 #[cfg(unix)]
-fn merge_login_and_current_path(login_path: &OsStr, current_path: &OsStr) -> OsString {
+fn merge_current_and_login_path(current_path: &OsStr, login_path: &OsStr) -> OsString {
     let mut seen = HashSet::new();
     let mut merged = Vec::new();
 
-    for entry in std::env::split_paths(login_path).chain(std::env::split_paths(current_path)) {
+    // Keep daemon-provided ordering and precedence; shell startup files only
+    // contribute entries that are not already present, appended at the end.
+    for entry in std::env::split_paths(current_path).chain(std::env::split_paths(login_path)) {
         if seen.insert(entry.clone()) {
             merged.push(entry);
         }
@@ -548,35 +557,86 @@ mod tests {
         }
     }
 
-    fn reset_effective_path_state() {
-        let mut guard = EFFECTIVE_PATH_STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *guard = None;
+    fn write_executable_shim(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
-    fn impoverished_path_merges_login_first_and_keeps_current_entries() {
-        let current = OsStr::new("/usr/bin:/bin:/home/alice/.cargo/bin:/custom/current");
-        let login = OsString::from("/fake/login/bin:/usr/bin:/opt/homebrew/bin");
+    fn probe_entries_are_appended_after_current_entries_without_duplicates() {
+        let current = OsStr::new("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+        let login = OsString::from("/usr/bin:/custom/bin:/opt/homebrew/bin");
 
-        let mut dir_exists = |_dir: &Path| true;
-        let probe_login_path = || Some(login.clone());
-
-        if !path_is_impoverished(current, Some(OsStr::new("/home/alice")), &mut dir_exists) {
-            panic!("should be impoverished");
-        }
-
-        let login_path = probe_login_path()
-            .filter(|path| login_path_is_acceptable(path))
-            .unwrap();
-        let effective = merge_login_and_current_path(&login_path, current);
+        let effective = merge_current_and_login_path(current, &login);
 
         assert_eq!(
             effective,
-            OsString::from(
-                "/fake/login/bin:/usr/bin:/opt/homebrew/bin:/bin:/home/alice/.cargo/bin:/custom/current"
-            )
+            OsString::from("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/custom/bin")
+        );
+    }
+
+    #[test]
+    fn probe_shell_flags_match_shell_startup_conventions() {
+        assert_eq!(probe_shell_flags(Path::new("/bin/zsh")), "-lic");
+        assert_eq!(probe_shell_flags(Path::new("/bin/bash")), "-lc");
+        assert_eq!(
+            probe_shell_flags(Path::new("/opt/homebrew/bin/fish")),
+            "-lc"
+        );
+    }
+
+    #[test]
+    fn marker_extraction_ignores_shell_startup_noise() {
+        let output = b"banner before\n__AFT_PATH_BEGIN__/custom/bin:/usr/bin__AFT_PATH_END__\nbanner after\n";
+
+        assert_eq!(
+            extract_probe_path(output),
+            Some(OsString::from("/custom/bin:/usr/bin"))
+        );
+    }
+
+    #[test]
+    fn zsh_probe_uses_interactive_login_and_reads_zshrc() {
+        let _guard = crate::test_env::process_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let custom_bin = home.join(".custom/bin");
+        let shell = dir.path().join("zsh");
+        fs::create_dir_all(&custom_bin).unwrap();
+        fs::write(
+            home.join(".zshrc"),
+            format!(
+                "printf 'banner before\n'; export PATH=\"$PATH:{}\"; printf 'banner after\n'\n",
+                custom_bin.display()
+            ),
+        )
+        .unwrap();
+        write_executable_shim(
+            &shell,
+            r#"#!/bin/sh
+if [ "$1" != '-lic' ]; then
+  exit 64
+fi
+if [ -f "$ZDOTDIR/.zshrc" ]; then
+  . "$ZDOTDIR/.zshrc"
+fi
+eval "$2"
+"#,
+        );
+
+        let _path_guard = EnvVarGuard::set("PATH", "/usr/bin:/bin");
+        let _home_guard = EnvVarGuard::set("HOME", home.to_str().unwrap());
+        let _zdotdir_guard = EnvVarGuard::set("ZDOTDIR", home.to_str().unwrap());
+        let probed = probe_login_shell_path_once(&shell, LOGIN_SHELL_PATH_PROBE_TIMEOUT);
+
+        assert_eq!(
+            probed,
+            Some(OsString::from(format!(
+                "/usr/bin:/bin:{}",
+                custom_bin.display()
+            )))
         );
     }
 
@@ -593,19 +653,6 @@ mod tests {
         for probe_path in rejected {
             assert!(!login_path_is_acceptable(&probe_path));
         }
-    }
-
-    #[test]
-    fn rich_current_path_does_not_probe_login_shell() {
-        let current = OsStr::new(
-            "/opt/homebrew/bin:/usr/local/bin:/home/alice/.cargo/bin:/home/alice/.local/bin:/usr/bin:/bin",
-        );
-
-        assert!(!path_is_impoverished(
-            current,
-            Some(OsStr::new("/home/alice")),
-            |_| true
-        ));
     }
 
     #[test]
@@ -657,58 +704,20 @@ mod tests {
     }
 
     #[test]
-    fn test_bounded_re_probe() {
-        let _guard = crate::test_env::process_env_lock();
-        reset_effective_path_state();
+    fn probe_failure_falls_back_to_current_path_and_appends_standard_dirs() {
+        let home = Path::new("/home/alice");
+        let current = OsStr::new("/usr/bin:/bin");
+        let missing_shell = Path::new("/nonexistent/shell");
 
-        let temp = tempfile::tempdir().unwrap();
-        let _cache_guard = EnvVarGuard::set("AFT_CACHE_DIR", temp.path().to_str().unwrap());
+        assert!(probe_login_shell_path_once(missing_shell, Duration::from_millis(10)).is_none());
 
-        // Force impoverished PATH
-        let _path_guard = EnvVarGuard::set("PATH", "/usr/bin:/bin");
-
-        // Set SHELL to a non-existent shell so probe fails
-        let _shell_guard = EnvVarGuard::set("SHELL", "/nonexistent/shell");
-
-        // Set candidates override to nonexistent shell to force probe failure
-        let _candidates_guard =
-            EnvVarGuard::set("AFT_TEST_LOGIN_SHELL_CANDIDATES", "/nonexistent/shell");
-
-        // First call: probe fails, no memo, falls back to the impoverished
-        // PATH (plus whatever standard dirs exist on the test machine, which
-        // the unconditional append may add — assert the prefix, not equality).
-        let path1 = effective_path();
-        assert!(path1.to_string_lossy().starts_with("/usr/bin:/bin"));
-
-        {
-            let guard = EFFECTIVE_PATH_STATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let state = guard.as_ref().unwrap();
-            assert!(state.is_fallback);
-            assert!(state.last_probe_attempt.is_some());
-        }
-
-        // Second call immediately: should NOT retry probe (returns cached fallback)
-        let path2 = effective_path();
-        assert_eq!(path2, path1);
-
-        // Simulate 61 seconds passing by modifying last_probe_attempt
-        {
-            let mut guard = EFFECTIVE_PATH_STATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let state = guard.as_mut().unwrap();
-            state.last_probe_attempt = Some(Instant::now() - Duration::from_secs(61));
-        }
-
-        // Now write a memo so the next probe/fallback can succeed
-        write_login_path_memo(OsStr::new("/opt/homebrew/bin:/usr/bin:/bin"));
-
-        // Third call: should retry probe (which still fails because SHELL is nonexistent),
-        // but now it reads from the memo!
-        let path3 = effective_path();
-        assert!(path3.to_string_lossy().contains("/opt/homebrew/bin"));
+        let enriched = append_missing_standard_dirs(current, Some(home.as_os_str()), |dir| {
+            dir == Path::new("/home/alice/.bun/bin")
+        });
+        assert_eq!(
+            enriched,
+            OsString::from("/usr/bin:/bin:/home/alice/.bun/bin")
+        );
     }
 
     #[test]

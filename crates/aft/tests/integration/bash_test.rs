@@ -46,24 +46,37 @@ fn wait_for_terminal_status(aft: &mut AftProcess, task_id: &str) -> serde_json::
 fn bash_inherits_login_shell_enriched_path() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
-    let fake_bin = dir.path().join("fake-bin");
+    let custom_bin = home.join(".custom/bin");
     let cargo_bin = home.join(".cargo/bin");
-    std::fs::create_dir_all(&fake_bin).unwrap();
+    let local_bin = home.join(".local/bin");
+    let fake_shell = dir.path().join("bin/zsh");
+    std::fs::create_dir_all(&custom_bin).unwrap();
     std::fs::create_dir_all(&cargo_bin).unwrap();
+    std::fs::create_dir_all(&local_bin).unwrap();
+    std::fs::create_dir_all(fake_shell.parent().unwrap()).unwrap();
 
     let tool_name = format!("aft-path-probe-{}", std::process::id());
-    let tool_path = fake_bin.join(&tool_name);
+    let tool_path = custom_bin.join(&tool_name);
     write_executable_shim(&tool_path, "#!/bin/sh\nexit 0\n");
+    std::fs::write(
+        home.join(".zshrc"),
+        format!(
+            "printf 'banner before\\n'; export PATH=\"$PATH:{}\"; printf 'banner after\\n'\\n",
+            custom_bin.display()
+        ),
+    )
+    .unwrap();
 
-    let fake_shell = dir.path().join("fake-login-shell");
     write_executable_shim(
         &fake_shell,
         r#"#!/bin/sh
-if [ "$1" = '-l' ] && [ "$2" = '-c' ]; then
-  printf '%s' "$AFT_TEST_FAKE_LOGIN_PATH"
-  exit 0
+if [ "$1" != '-lic' ]; then
+  exit 64
 fi
-exit 64
+if [ -f "$ZDOTDIR/.zshrc" ]; then
+  . "$ZDOTDIR/.zshrc"
+fi
+eval "$2"
 "#,
     );
 
@@ -74,19 +87,20 @@ exit 64
     let _ = std::process::Command::new(&fake_shell).status();
     let _ = std::process::Command::new(&tool_path).status();
 
-    let login_path = format!("{}:/usr/bin:/bin", fake_bin.display());
+    let daemon_path = format!(
+        "/opt/homebrew/bin:/usr/local/bin:{}:{}:/usr/bin:/bin",
+        cargo_bin.display(),
+        local_bin.display()
+    );
     let mut aft = AftProcess::spawn_with_env(&[
         // The harness defaults AFT_TEST_RAW_PATH=1 (PATH isolation for
         // formatter/checker tests); this test IS the PATH feature, so opt back
         // in to the real probe+enrichment pipeline.
         ("AFT_TEST_RAW_PATH", std::ffi::OsStr::new("0")),
-        ("PATH", std::ffi::OsStr::new("/usr/bin:/bin")),
+        ("PATH", std::ffi::OsStr::new(&daemon_path)),
         ("HOME", home.as_os_str()),
+        ("ZDOTDIR", home.as_os_str()),
         ("SHELL", fake_shell.as_os_str()),
-        (
-            "AFT_TEST_FAKE_LOGIN_PATH",
-            std::ffi::OsStr::new(&login_path),
-        ),
     ]);
 
     let response = aft.send(
@@ -106,7 +120,7 @@ exit 64
     assert_eq!(
         status["output_preview"].as_str().unwrap().trim(),
         tool_path.to_string_lossy(),
-        "bash child did not inherit the login-shell-enriched PATH: {status:?}"
+        "bash child did not inherit the rc-enriched PATH: {status:?}"
     );
 
     assert!(aft.shutdown().success());
