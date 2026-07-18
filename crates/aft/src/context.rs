@@ -210,6 +210,10 @@ impl SubcLifecycleAdmission {
         !*self.unbound.lock()
     }
 
+    fn try_is_bound(&self) -> Option<bool> {
+        self.unbound.try_lock().map(|unbound| !*unbound)
+    }
+
     fn is_unbound(&self) -> bool {
         !self.is_bound()
     }
@@ -1833,6 +1837,13 @@ impl AppContext {
     }
 
     pub fn try_health_snapshot(&self, project_root: &Path) -> RootHealthSnapshot {
+        // Read lifecycle state before taking artifact locks. Worker admission takes
+        // the lifecycle lock first and then installs artifact receivers, so the
+        // reverse order here would deadlock a health poll against worker startup.
+        let heavy_root_work_allowed = match self.try_heavy_root_work_allowed() {
+            Some(allowed) => allowed,
+            None => return RootHealthSnapshot::busy(project_root),
+        };
         let config = match self.config.try_read() {
             Ok(guard) => Arc::clone(&*guard),
             Err(_) => return RootHealthSnapshot::busy(project_root),
@@ -1891,7 +1902,7 @@ impl AppContext {
             SemanticIndexStatus::Failed(_) => "degraded",
         };
         let callgraph_writer = self.callgraph_writer.load(Ordering::SeqCst);
-        let callgraph_store_status = if !self.heavy_root_work_allowed() {
+        let callgraph_store_status = if !heavy_root_work_allowed {
             "disabled"
         } else if callgraph_store.as_ref().is_some() {
             "ready"
@@ -3087,6 +3098,13 @@ impl AppContext {
 
     pub fn heavy_root_work_allowed(&self) -> bool {
         self.heavy_root_work_allowed.load(Ordering::SeqCst) && !self.subc_lifecycle.is_unbound()
+    }
+
+    fn try_heavy_root_work_allowed(&self) -> Option<bool> {
+        if !self.heavy_root_work_allowed.load(Ordering::SeqCst) {
+            return Some(false);
+        }
+        self.subc_lifecycle.try_is_bound()
     }
 
     pub fn add_degraded_reason(&self, reason: impl Into<String>) -> bool {
@@ -5863,6 +5881,47 @@ mod subc_lifecycle_admission_tests {
                 })
                 .is_none(),
             "worker starts after unbind must be denied"
+        );
+    }
+
+    #[test]
+    fn health_snapshot_returns_busy_before_locking_artifact_receivers() {
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config::default(),
+        ));
+        let lifecycle_guard = ctx.subc_lifecycle.unbound.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let worker_ctx = Arc::clone(&ctx);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            snapshot_tx
+                .send(worker_ctx.try_health_snapshot(Path::new("health-root")))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("health snapshot worker should start");
+
+        let snapshot = snapshot_rx.recv_timeout(Duration::from_secs(2));
+        let callgraph_receiver_available = ctx.callgraph_store_rx.try_lock().is_some();
+        drop(lifecycle_guard);
+        worker.join().unwrap();
+
+        assert!(
+            matches!(
+                snapshot,
+                Ok(RootHealthSnapshot {
+                    state: RootHealthState::Busy,
+                    ..
+                })
+            ),
+            "health snapshots must report busy instead of waiting for lifecycle admission"
+        );
+        assert!(
+            callgraph_receiver_available,
+            "health snapshots must not hold the callgraph receiver while lifecycle admission is busy"
         );
     }
 
