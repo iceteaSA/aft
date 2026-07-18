@@ -75,6 +75,11 @@ export interface AftStatusSnapshot {
     semantic_disk_bytes: number;
   };
   lsp_servers: number;
+  runtime: {
+    live_watchers: number;
+    live_actor_roots: number;
+    open_routes: number;
+  };
   symbol_cache: {
     local_entries: number;
     warm_entries: number;
@@ -212,6 +217,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
   };
   const disk = asRecord(response.disk);
   const symbolCache = asRecord(response.symbol_cache);
+  const runtime = asRecord(response.runtime);
   const session = asRecord(response.session);
 
   return {
@@ -256,6 +262,11 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       semantic_disk_bytes: readNumber(disk.semantic_disk_bytes),
     },
     lsp_servers: readNumber(response.lsp_servers),
+    runtime: {
+      live_watchers: readNumber(runtime.live_watchers),
+      live_actor_roots: readNumber(runtime.live_actor_roots),
+      open_routes: readNumber(runtime.open_routes),
+    },
     symbol_cache: {
       local_entries: readNumber(symbolCache.local_entries),
       warm_entries: readNumber(symbolCache.warm_entries),

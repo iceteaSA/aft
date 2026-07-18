@@ -30,6 +30,7 @@ use crate::parser::{SharedSymbolCache, SymbolCache, TreeSitterProvider};
 use crate::protocol::{
     ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
 };
+use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
@@ -216,6 +217,14 @@ impl SubcLifecycleAdmission {
 
     fn is_unbound(&self) -> bool {
         !self.is_bound()
+    }
+
+    fn run_if_unbound<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
+        let unbound = self.unbound.lock();
+        if !*unbound {
+            return None;
+        }
+        Some(action())
     }
 }
 
@@ -1012,6 +1021,8 @@ pub struct App {
     /// descriptors for the same database.
     db: parking_lot::Mutex<Option<(PathBuf, Arc<Mutex<Connection>>)>>,
     active_watchers: AtomicUsize,
+    active_actor_roots: AtomicUsize,
+    open_routes: AtomicUsize,
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
     provider_factory: LanguageProviderFactory,
@@ -1025,6 +1036,8 @@ impl App {
         Self {
             db: parking_lot::Mutex::new(None),
             active_watchers: AtomicUsize::new(0),
+            active_actor_roots: AtomicUsize::new(0),
+            open_routes: AtomicUsize::new(0),
             lsp_child_registry: crate::lsp::child_registry::LspChildRegistry::new(),
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
             provider_factory,
@@ -1140,10 +1153,33 @@ impl App {
     }
 
     /// Number of live watcher filter runtimes registered by this process.
-    /// This is intentionally process-scoped so subc tests and diagnostics can
-    /// verify that idle roots do not retain OS watcher threads.
+    /// A runtime remains counted until its OS watcher thread has actually exited.
     pub fn watcher_count(&self) -> usize {
         self.active_watchers.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn actor_root_registered(&self) {
+        self.active_actor_roots.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn actor_root_unregistered(&self) {
+        self.active_actor_roots
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    pub fn actor_root_count(&self) -> usize {
+        self.active_actor_roots.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_open_route_count(&self, count: usize) {
+        self.open_routes.store(count, Ordering::SeqCst);
+    }
+
+    pub fn open_route_count(&self) -> usize {
+        self.open_routes.load(Ordering::SeqCst)
     }
 }
 
@@ -1496,8 +1532,19 @@ impl Drop for AppContext {
     fn drop(&mut self) {
         self.artifact_owner_lease.get_mut().take();
         if let Some(runtime) = self.watcher_thread.get_mut().take() {
-            self.app.watcher_stopped();
-            runtime.shutdown_and_join();
+            let root = self
+                .canonical_cache_root
+                .get_mut()
+                .clone()
+                .or_else(|| {
+                    self.config
+                        .get_mut()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .project_root
+                        .clone()
+                })
+                .unwrap_or_else(|| PathBuf::from("<unconfigured>"));
+            Self::spawn_watcher_shutdown(Arc::clone(&self.app), root, runtime);
         }
     }
 }
@@ -5069,42 +5116,68 @@ impl AppContext {
     ) {
         let _runtime_guard = self.watcher_runtime_lock.lock();
         let replaced = self.watcher_thread.lock().replace(runtime);
+        self.app.watcher_started();
         if let Some(runtime) = replaced {
-            self.app.watcher_stopped();
-            runtime.shutdown_and_join();
-        } else {
-            self.app.watcher_started();
+            Self::spawn_watcher_shutdown(Arc::clone(&self.app), self.watcher_root_path(), runtime);
         }
         *self.watcher_rx.lock() = Some(rx);
         *self.watcher_drain_slice.lock() = None;
     }
 
-    /// Stop the watcher filter thread (if any) and clear the dispatch receiver.
-    /// Used on reconfigure, watcher failure, root deletion, and test teardown.
-    pub fn stop_watcher_runtime(&self) {
-        let _runtime_guard = self.watcher_runtime_lock.lock();
-        if let Some(runtime) = self.watcher_thread.lock().take() {
-            self.app.watcher_stopped();
-            runtime.shutdown_and_join();
-        }
-        *self.watcher_rx.lock() = None;
-        *self.watcher_drain_slice.lock() = None;
-        *self.watcher.lock() = None;
+    fn watcher_root_path(&self) -> PathBuf {
+        self.canonical_cache_root_opt()
+            .or_else(|| self.config().project_root.clone())
+            .unwrap_or_else(|| PathBuf::from("<unconfigured>"))
     }
 
-    /// Request watcher shutdown without joining on the executor lane. Some
-    /// platform watcher backends can block while their OS thread unwinds, so
-    /// idle-root and root-deleted cleanup performs the join on a detached
-    /// reaper thread instead.
-    pub fn stop_watcher_runtime_in_background(&self) {
+    fn spawn_watcher_shutdown(app: Arc<App>, root: PathBuf, runtime: WatcherThreadHandle) {
+        const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+        // Signal the watcher before scheduling the joiner so teardown does not
+        // depend on a newly spawned thread winning CPU time under fleet load.
+        runtime.request_shutdown();
+        std::thread::spawn(
+            move || match runtime.shutdown_and_join_timeout(JOIN_TIMEOUT) {
+                WatcherJoinOutcome::Joined => {
+                    app.watcher_stopped();
+                    crate::slog_info!("watcher stopped: {}", root.display());
+                }
+                WatcherJoinOutcome::TimedOut(join) => {
+                    crate::slog_warn!(
+                        "watcher stop timed out after {} ms: {}",
+                        JOIN_TIMEOUT.as_millis(),
+                        root.display()
+                    );
+                    std::thread::spawn(move || {
+                        let _ = join.join();
+                        app.watcher_stopped();
+                        crate::slog_info!("watcher stopped: {}", root.display());
+                    });
+                }
+            },
+        );
+    }
+
+    fn take_watcher_runtime(&self) -> Option<WatcherThreadHandle> {
         let _runtime_guard = self.watcher_runtime_lock.lock();
-        if let Some(runtime) = self.watcher_thread.lock().take() {
-            self.app.watcher_stopped();
-            std::thread::spawn(move || runtime.shutdown_and_join());
-        }
+        let runtime = self.watcher_thread.lock().take();
         *self.watcher_rx.lock() = None;
         *self.watcher_drain_slice.lock() = None;
         *self.watcher.lock() = None;
+        runtime
+    }
+
+    /// Stop the watcher runtime without waiting on its OS thread. Shutdown and
+    /// the bounded join run on a detached reaper so configure and transport
+    /// loops never wait on FSEvents or inotify teardown.
+    pub fn stop_watcher_runtime(&self) {
+        if let Some(runtime) = self.take_watcher_runtime() {
+            Self::spawn_watcher_shutdown(Arc::clone(&self.app), self.watcher_root_path(), runtime);
+        }
+    }
+
+    /// Request watcher shutdown without joining on the executor lane.
+    pub fn stop_watcher_runtime_in_background(&self) {
+        self.stop_watcher_runtime();
     }
 
     /// Remove a watcher runtime whose OS thread already exited (backend
@@ -5112,27 +5185,30 @@ impl AppContext {
     /// Returns true when a finished corpse was actually removed so the caller
     /// can apply watcher-gap invalidation exactly once.
     pub(crate) fn take_finished_watcher_runtime(&self) -> bool {
-        let _runtime_guard = self.watcher_runtime_lock.lock();
-        let finished = self
-            .watcher_thread
-            .lock()
-            .as_ref()
-            .is_some_and(|runtime| runtime.is_finished());
-        if !finished {
-            return false;
+        let runtime = {
+            let _runtime_guard = self.watcher_runtime_lock.lock();
+            let finished = self
+                .watcher_thread
+                .lock()
+                .as_ref()
+                .is_some_and(|runtime| runtime.is_finished());
+            if !finished {
+                return false;
+            }
+            let runtime = self.watcher_thread.lock().take();
+            *self.watcher_rx.lock() = None;
+            *self.watcher_drain_slice.lock() = None;
+            *self.watcher.lock() = None;
+            runtime
+        };
+        if let Some(runtime) = runtime {
+            Self::spawn_watcher_shutdown(Arc::clone(&self.app), self.watcher_root_path(), runtime);
         }
-        if let Some(runtime) = self.watcher_thread.lock().take() {
-            self.app.watcher_stopped();
-            std::thread::spawn(move || runtime.shutdown_and_join());
-        }
-        *self.watcher_rx.lock() = None;
-        *self.watcher_drain_slice.lock() = None;
-        *self.watcher.lock() = None;
         true
     }
 
     /// Process-scoped watcher count used by maintenance diagnostics and
-    /// regression tests. The count drops as soon as shutdown is requested.
+    /// regression tests. A runtime remains counted until its thread exits.
     pub fn watcher_registry_count(&self) -> usize {
         self.app.watcher_count()
     }
@@ -5210,7 +5286,56 @@ impl AppContext {
         self.borrowed_index_cache.lock().clear();
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
+        self.clear_tsconfig_membership_cache();
         true
+    }
+
+    /// Test seam for the serialized real-watcher integration suite. Production
+    /// callers cannot trigger it without the explicit test-only environment flag.
+    #[doc(hidden)]
+    pub fn force_idle_teardown_for_test(self: &Arc<Self>) -> bool {
+        if std::env::var("AFT_TEST_ALLOW_FORCE_IDLE_REAP").as_deref() != Ok("1") {
+            return false;
+        }
+        if !self.evict_idle_artifacts() {
+            return false;
+        }
+        self.stop_watcher_runtime_in_background();
+        self.invalidate_artifacts_after_watcher_gap();
+        true
+    }
+
+    /// Release resources that can be recreated by an equivalent later bind.
+    /// LSP shutdown can wait on child processes, so all work stays off the
+    /// executor and subc frame loops.
+    pub(crate) fn release_idle_reopenable_resources_in_background(self: &Arc<Self>) {
+        let ctx = Arc::clone(self);
+        std::thread::spawn(move || {
+            if !ctx.subc_unbound_quiesced() {
+                return;
+            }
+            {
+                let mut lsp = ctx.lsp_manager.lock();
+                if !ctx.subc_unbound_quiesced() {
+                    return;
+                }
+                lsp.shutdown_all();
+            }
+            let _ = ctx.subc_lifecycle.run_if_unbound(|| {
+                ctx.bash_background.clear_db_pool();
+                ctx.backup.lock().clear_db_pool();
+            });
+        });
+    }
+
+    /// Final cleanup for an actor whose project directory no longer exists.
+    /// The executor invokes this only after proving the actor has no queued or
+    /// running jobs, and always from a detached teardown thread.
+    pub(crate) fn teardown_deleted_root(&self) {
+        self.bash_background.detach();
+        self.bash_background.clear_db_pool();
+        self.backup.lock().clear_db_pool();
+        self.lsp_manager.lock().shutdown_all();
     }
 
     /// Access the LSP manager.

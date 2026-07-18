@@ -398,7 +398,8 @@ fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
 /// Restore the watcher after an idle root released its runtime. Artifact stores
 /// are lazy by design, so the first request is the natural point to reattach
 /// external-change invalidation as well.
-pub(crate) fn ensure_project_watcher(ctx: &AppContext) {
+#[doc(hidden)]
+pub fn ensure_project_watcher(ctx: &AppContext) {
     if ctx.watcher_runtime_active() {
         return;
     }

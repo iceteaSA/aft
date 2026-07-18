@@ -22,5 +22,6 @@ mod helpers;
 
 mod callgraph_watcher_test;
 mod configure_watcher_test;
+mod idle_root_watcher_test;
 mod semantic_refresh_watcher_test;
 mod watcher_search_semantic_regression_test;

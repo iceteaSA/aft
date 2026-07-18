@@ -287,6 +287,11 @@ impl AppContext {
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
             "memory": memory,
+            "runtime": {
+                "live_watchers": self.app().watcher_count(),
+                "live_actor_roots": self.app().actor_root_count(),
+                "open_routes": self.app().open_route_count(),
+            },
             "compression": compression,
             "storage_dir": storage_dir,
             // Project-wide (all sessions): total in-memory checkpoint count.

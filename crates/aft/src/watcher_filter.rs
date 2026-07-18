@@ -54,6 +54,12 @@ pub struct WatcherThreadHandle {
     join: Option<JoinHandle<()>>,
 }
 
+/// Result of a bounded watcher-thread join.
+pub enum WatcherJoinOutcome {
+    Joined,
+    TimedOut(JoinHandle<()>),
+}
+
 impl WatcherThreadHandle {
     pub fn new(shutdown: Arc<AtomicBool>, join: JoinHandle<()>) -> Self {
         Self {
@@ -74,6 +80,26 @@ impl WatcherThreadHandle {
         self.request_shutdown();
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+    }
+
+    /// Request shutdown and wait only up to `timeout` for the watcher thread.
+    /// The caller owns the still-live join handle on timeout and can monitor it
+    /// without blocking an executor or transport loop.
+    pub fn shutdown_and_join_timeout(mut self, timeout: Duration) -> WatcherJoinOutcome {
+        self.request_shutdown();
+        let Some(join) = self.join.take() else {
+            return WatcherJoinOutcome::Joined;
+        };
+        let deadline = Instant::now() + timeout;
+        while !join.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if join.is_finished() {
+            let _ = join.join();
+            WatcherJoinOutcome::Joined
+        } else {
+            WatcherJoinOutcome::TimedOut(join)
         }
     }
 }

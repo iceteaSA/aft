@@ -193,6 +193,32 @@ pub(crate) fn record_verify_completed_if_unchanged(
     true
 }
 
+/// Seed the search-index verification memo for integration lifecycle tests.
+#[doc(hidden)]
+pub fn seed_search_verify_memo_for_test(root: &Path, artifact_path: &Path) -> bool {
+    let ticket = capture_verify_ticket(root);
+    record_verify_completed_if_unchanged(
+        root,
+        VerifyArtifact::Search,
+        artifact_generation(artifact_path),
+        ticket,
+    )
+}
+
+/// Return the current search warm-verify plan as a stable test label.
+#[doc(hidden)]
+pub fn search_warm_verify_plan_for_test(root: &Path, artifact_path: &Path) -> &'static str {
+    match warm_verify_plan(
+        root,
+        VerifyArtifact::Search,
+        artifact_generation(artifact_path),
+    ) {
+        WarmVerifyPlan::Skip => "skip",
+        WarmVerifyPlan::StatFirst => "stat_first",
+        WarmVerifyPlan::Strict => "strict",
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn record_verify_completed(
     root: &Path,

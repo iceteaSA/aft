@@ -458,7 +458,9 @@ impl Executor {
             }
         };
         if inserted {
-            ctx.app().register_memory_context(memory_root, &ctx);
+            let app = ctx.app();
+            app.register_memory_context(memory_root, &ctx);
+            app.actor_root_registered();
         }
         self.wake_scheduler();
         inserted
@@ -478,13 +480,44 @@ impl Executor {
             state.actors.remove(root_id)
         };
         if let Some(actor) = removed.as_ref() {
-            actor
-                .ctx
-                .app()
-                .unregister_memory_context(root_id.as_path(), &actor.ctx);
+            let app = actor.ctx.app();
+            app.unregister_memory_context(root_id.as_path(), &actor.ctx);
+            app.actor_root_unregistered();
         }
         drop(removed);
         self.wake_scheduler();
+    }
+
+    /// Return true only when the actor has no queued or running executor work.
+    pub fn actor_is_idle(&self, root_id: &ProjectRootId) -> bool {
+        let state = self.inner.state.lock();
+        state.actors.get(root_id).is_some_and(ActorState::is_idle)
+    }
+
+    /// Forget an idle actor and drop its root-scoped registries off the scheduler
+    /// thread. This is reserved for roots whose project directory no longer
+    /// exists; retained existing roots are reused on a later bind.
+    pub fn retire_idle_actor_in_background(&self, root_id: &ProjectRootId) -> bool {
+        let removed = {
+            let mut state = self.inner.state.lock();
+            if !state.actors.get(root_id).is_some_and(ActorState::is_idle) {
+                return false;
+            }
+            state.actor_order.retain(|actor_root| actor_root != root_id);
+            state.actors.remove(root_id)
+        };
+        let Some(actor) = removed else {
+            return false;
+        };
+        let app = actor.ctx.app();
+        app.unregister_memory_context(root_id.as_path(), &actor.ctx);
+        app.actor_root_unregistered();
+        std::thread::spawn(move || {
+            actor.ctx.teardown_deleted_root();
+            drop(actor);
+        });
+        self.wake_scheduler();
+        true
     }
 
     /// Cancel maintenance jobs that have not started for one retained actor.
@@ -1118,6 +1151,10 @@ impl ActorState {
 
     fn has_queued_jobs(&self) -> bool {
         self.interactive.has_queued_jobs() || self.maintenance.has_queued_jobs()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.actor_total_inflight == 0 && !self.has_queued_jobs()
     }
 
     fn has_queued_jobs_for(&self, job_class: JobClass) -> bool {

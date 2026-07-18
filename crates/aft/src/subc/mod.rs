@@ -703,12 +703,19 @@ fn quiesce_unbound_root(
     );
 }
 
+#[derive(Debug, Default)]
+struct IdleReapOutcome {
+    evicted: usize,
+    forgotten_deleted_roots: Vec<ProjectRootId>,
+}
+
 fn reap_idle_roots(
     now: Instant,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     executor: &Arc<Executor>,
-) -> usize {
+) -> IdleReapOutcome {
     let pending_bind_roots = pending_binds
         .values()
         .map(|pending| pending.bind_root_id.clone())
@@ -716,41 +723,41 @@ fn reap_idle_roots(
     let candidates = live_roots
         .iter()
         .filter_map(|(root_id, meta)| {
-            // The TTL applies to unbound roots too: a transient unbind (host
-            // restart) keeps the root warm — watcher running, artifacts
-            // resident — and rebinding within the TTL costs nothing. Only a
-            // root that stays unbound past the TTL pays the full teardown.
-            if meta.idle_artifacts_evicted
-                || now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL
+            let deleted = !root_id.as_path().exists();
+            let has_bound_route = root_channels
+                .get(root_id)
+                .is_some_and(|channels| !channels.is_empty());
+            // Route teardown marks the lifecycle admission gate before the last
+            // channel disappears. Requiring zero bound channels and a quiesced
+            // lifecycle prevents a still-bound root from losing its watcher.
+            if has_bound_route
+                || !meta.unbound_quiesced
+                || (!deleted
+                    && (meta.idle_artifacts_evicted
+                        || now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL))
                 || meta.active_bash_waits > 0
                 || meta.maintenance_pending
                 || !meta.maintenance_queued_kinds.is_empty()
                 || pending_bind_roots.contains(root_id)
+                || !executor.actor_is_idle(root_id)
             {
                 return None;
             }
-            Some(root_id.clone())
+            Some((root_id.clone(), deleted))
         })
         .collect::<Vec<_>>();
 
     let mut reaped = Vec::new();
-    for root_id in candidates {
+    let mut forgotten_deleted_roots = Vec::new();
+    for (root_id, deleted) in candidates {
         let Some(ctx) = executor.actor_context(&root_id) else {
             continue;
         };
         // A TTL-aged unbound root retained its watcher-derived pending paths
-        // across the transient-unbind window (they repair artifacts a
-        // pre-unbind worker persisted). The strict gap invalidation below
-        // subsumes their purpose, and leaving them would block eviction
-        // forever through `artifact_eviction_blocked`. Disposal is
-        // TRANSACTIONAL: a secondary blocker (running bash, in-flight build)
-        // can still abort the eviction below, and the root may rebind before
-        // the next reap attempt — the taken paths are the only repair record
-        // for already-consumed watcher events, so they are restored on every
-        // abort path and dropped only after eviction succeeds.
-        let taken_pending = ctx
-            .subc_unbound_quiesced()
-            .then(|| ctx.take_pending_reconciliation_state());
+        // across the transient-unbind window. Strict gap invalidation subsumes
+        // them, but every abort path must restore them because a rebind can
+        // still happen until eviction commits.
+        let taken_pending = Some(ctx.take_pending_reconciliation_state());
         if ctx.artifact_eviction_blocked() {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state(pending);
@@ -765,17 +772,21 @@ fn reap_idle_roots(
             continue;
         }
         drop(taken_pending);
-        // The watcher backend owns the OS watcher and can block while joining
-        // on macOS. Request shutdown here, but let a dedicated reaper thread
-        // perform the join rather than holding up an executor maintenance lane.
         ctx.stop_watcher_runtime_in_background();
-        // The watcher is now stopped: edits during the idle interval go
-        // unobserved, so a later warm reload must not trust the verify memo
-        // (same-size, preserved-mtime edits would pass stat-first) and the
-        // callgraph store must reconcile instead of reopening as fresh.
+        // Edits during watcher downtime are unobserved. Advance publication
+        // epochs and force strict verification before any later warm reload.
         ctx.invalidate_artifacts_after_watcher_gap();
-        if let Some(meta) = live_roots.get_mut(&root_id) {
-            meta.idle_artifacts_evicted = true;
+
+        if deleted {
+            if executor.retire_idle_actor_in_background(&root_id) {
+                live_roots.remove(&root_id);
+                forgotten_deleted_roots.push(root_id.clone());
+            }
+        } else {
+            if let Some(meta) = live_roots.get_mut(&root_id) {
+                meta.idle_artifacts_evicted = true;
+            }
+            ctx.release_idle_reopenable_resources_in_background();
         }
         reaped.push((root_id, memory_before));
     }
@@ -789,7 +800,43 @@ fn reap_idle_roots(
             idle_root_eviction_message(root_id, memory_before, pressure_relief.as_ref())
         );
     }
-    reaped.len()
+    IdleReapOutcome {
+        evicted: reaped.len(),
+        forgotten_deleted_roots,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn purge_deleted_root_residents(
+    root_id: &ProjectRootId,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+) {
+    root_channels.remove(root_id);
+    session_identity.retain(|(root, _), _| root != root_id);
+    push_buffer.retain(|key, _| &key.root != root_id);
+    bg_wake_epoch.retain(|(root, _), _| root != root_id);
+    pending_bash_asks.retain(|_, ask| &ask.root != root_id);
+
+    let stale_subscriptions = bg_sub_by_session
+        .iter()
+        .filter_map(|((root, _), channel)| (root == root_id).then_some(*channel))
+        .collect::<Vec<_>>();
+    bg_sub_by_session.retain(|(root, _), _| root != root_id);
+    for channel in stale_subscriptions {
+        bg_subs.remove(&channel);
+        bg_wake_pending.remove(&channel);
+    }
+    log::info!(
+        "subc attach: fully forgot deleted root {}",
+        root_id.as_path().display()
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2044,6 +2091,7 @@ where
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
 
     let loop_result: Result<ModuleLoopExit, SubcError> = loop {
+        shared_app.set_open_route_count(routes.len());
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
         if let Err(error) = expire_pending_bash_asks(
@@ -2517,14 +2565,28 @@ where
                 // inbound route/control messages and push completions have run,
                 // so maintenance does not block the actor from handling the
                 // first request that arrives after a route bind is acknowledged.
-                let reaped = reap_idle_roots(
+                let reap = reap_idle_roots(
                     Instant::now(),
                     &mut live_roots,
                     &pending_binds,
+                    &root_channels,
                     &executor,
                 );
-                if reaped > 0 {
-                    log::debug!("subc attach: reaped {reaped} idle root(s)");
+                for root_id in &reap.forgotten_deleted_roots {
+                    purge_deleted_root_residents(
+                        root_id,
+                        &mut root_channels,
+                        &mut session_identity,
+                        &mut push_buffer,
+                        &mut bg_subs,
+                        &mut bg_sub_by_session,
+                        &mut bg_wake_pending,
+                        &mut bg_wake_epoch,
+                        &mut pending_bash_asks,
+                    );
+                }
+                if reap.evicted > 0 {
+                    log::debug!("subc attach: reaped {} idle root(s)", reap.evicted);
                 }
                 submit_due_maintenance_jobs(
                     &executor,
@@ -2540,6 +2602,8 @@ where
             }
         }
     };
+
+    shared_app.set_open_route_count(0);
 
     // Sweep pending binds on EVERY loop exit (channel-0 Goodbye, EOF, fatal,
     // error): ExecutorInner::drop joins worker threads, so a configure still
@@ -4619,9 +4683,11 @@ mod tests {
 
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        ctx.mark_subc_unbound();
         let mut live_roots = HashMap::new();
         let mut meta = RootMeta::new(Instant::now());
         meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        meta.unbound_quiesced = true;
         live_roots.insert(root.clone(), meta);
 
         let message = idle_root_eviction_message(&root, &ctx.memory_root_snapshot(), None);
@@ -4634,10 +4700,21 @@ mod tests {
         assert!(message.contains("parser_pool"));
 
         assert_eq!(
-            reap_idle_roots(Instant::now(), &mut live_roots, &HashMap::new(), &executor),
+            reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+            )
+            .evicted,
             1
         );
         assert!(ctx.search_index().read().unwrap().is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ctx.watcher_registry_count() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(ctx.watcher_registry_count(), 0);
         // The watcher stopped with the eviction, so the idle interval is
         // unobserved: the pre-seeded warm-verify memo (Skip) must fall back to
@@ -4657,6 +4734,7 @@ mod tests {
         assert!(
             crate::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root).is_some()
         );
+        ctx.mark_subc_bound();
         assert!(ctx
             .ensure_callgraph_store()
             .expect("reopen callgraph store")
@@ -4670,14 +4748,25 @@ mod tests {
         let ctx = test_ctx();
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), ctx));
+        let ctx = executor.actor_context(&root).expect("actor context");
+        ctx.mark_subc_unbound();
         let now = Instant::now();
-        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(now))]);
+        let mut meta = RootMeta::new(now);
+        meta.unbound_quiesced = true;
+        let mut live_roots = HashMap::from([(root.clone(), meta)]);
 
         // A recently-unbound root stays warm: a transient unbind (host
         // restart) must not pay the strict-verify + forced-rebuild teardown
         // on the next maintenance sweep.
         assert_eq!(
-            reap_idle_roots(now, &mut live_roots, &HashMap::new(), &executor),
+            reap_idle_roots(
+                now,
+                &mut live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+            )
+            .evicted,
             0
         );
         assert!(!live_roots[&root].idle_artifacts_evicted);
@@ -4687,16 +4776,16 @@ mod tests {
         // window would block eviction forever through
         // `artifact_eviction_blocked`; the reaper disposes them because the
         // strict gap invalidation subsumes their purpose.
-        let ctx = executor.actor_context(&root).expect("actor context");
-        ctx.mark_subc_unbound();
         ctx.add_pending_search_index_paths([root.as_path().join("retained.rs")]);
         assert_eq!(
             reap_idle_roots(
                 now + IDLE_ROOT_TTL,
                 &mut live_roots,
                 &HashMap::new(),
+                &HashMap::new(),
                 &executor,
-            ),
+            )
+            .evicted,
             1
         );
         assert!(live_roots[&root].idle_artifacts_evicted);
@@ -4734,10 +4823,18 @@ mod tests {
         let mut live_roots = HashMap::new();
         let mut meta = RootMeta::new(Instant::now());
         meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        meta.unbound_quiesced = true;
         live_roots.insert(root.clone(), meta);
 
         assert_eq!(
-            reap_idle_roots(Instant::now(), &mut live_roots, &HashMap::new(), &executor),
+            reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+            )
+            .evicted,
             0,
             "the dirty index must still block this eviction"
         );
@@ -4746,6 +4843,85 @@ mod tests {
             vec![pending],
             "a blocked eviction must restore the taken pending paths"
         );
+    }
+
+    #[test]
+    fn idle_reap_with_bound_route_keeps_watcher_running() {
+        let (_root_dir, root) = test_root("bound-root-reap-gate");
+        let ctx = test_ctx();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+
+        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
+        let _dispatch_tx = dispatch_tx;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let join = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+        ctx.install_watcher_runtime(
+            dispatch_rx,
+            crate::watcher_filter::WatcherThreadHandle::new(shutdown, join),
+        );
+
+        let mut meta = RootMeta::new(Instant::now());
+        meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        let mut live_roots = HashMap::from([(root.clone(), meta)]);
+        let bound = HashMap::from([(root, HashSet::from([route_key(7, 1)]))]);
+        assert_eq!(
+            reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &HashMap::new(),
+                &bound,
+                &executor,
+            )
+            .evicted,
+            0
+        );
+        assert_eq!(ctx.watcher_registry_count(), 1);
+        ctx.stop_watcher_runtime_in_background();
+    }
+
+    #[test]
+    fn deleted_idle_root_is_fully_forgotten_and_status_counts_drop() {
+        let (root_dir, root) = test_root("deleted-root-reap");
+        let app = App::default_shared();
+        let ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        ctx.mark_subc_unbound();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        assert_eq!(app.actor_root_count(), 1);
+        drop(ctx);
+        root_dir.close().expect("delete project root");
+
+        let mut meta = RootMeta::new(Instant::now());
+        meta.unbound_quiesced = true;
+        let mut live_roots = HashMap::from([(root.clone(), meta)]);
+        let outcome = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &executor,
+        );
+        assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
+        assert!(!executor.actor_registered(&root));
+        assert!(!live_roots.contains_key(&root));
+
+        let status_ctx = AppContext::from_app(app, Config::default());
+        let status = status_ctx.build_status_snapshot();
+        assert_eq!(status["runtime"]["live_actor_roots"], 0);
+        assert_eq!(status["runtime"]["open_routes"], 0);
     }
 
     #[test]

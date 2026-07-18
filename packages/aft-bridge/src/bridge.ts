@@ -324,6 +324,11 @@ export interface StatusSnapshot {
   semantic_index?: Record<string, unknown>;
   disk?: Record<string, unknown>;
   lsp_servers?: number;
+  runtime?: {
+    live_watchers?: number;
+    live_actor_roots?: number;
+    open_routes?: number;
+  };
   symbol_cache?: Record<string, unknown>;
   storage_dir?: string | null;
   features?: Record<string, unknown>;
