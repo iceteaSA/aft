@@ -31,15 +31,18 @@ impl Drop for EnvGuard {
     }
 }
 
-fn open_fd_count() -> usize {
-    let fd_dir = if Path::new("/proc/self/fd").is_dir() {
-        Path::new("/proc/self/fd")
-    } else {
-        Path::new("/dev/fd")
-    };
-    std::fs::read_dir(fd_dir)
-        .expect("read process fd directory")
-        .count()
+/// Descriptor counting is a Unix-only observation (`/proc/self/fd`, `/dev/fd`);
+/// on Windows the release is still exercised, just asserted via the watcher
+/// count alone.
+fn open_fd_count() -> Option<usize> {
+    let fd_dir = [Path::new("/proc/self/fd"), Path::new("/dev/fd")]
+        .into_iter()
+        .find(|dir| dir.is_dir())?;
+    Some(
+        std::fs::read_dir(fd_dir)
+            .expect("read process fd directory")
+            .count(),
+    )
 }
 
 // 90s: FSEvents teardown is a mach RPC that can take tens of seconds when the
@@ -62,12 +65,12 @@ fn wait_for_watcher_count(ctx: &AppContext, expected: usize) {
     }
 }
 
-fn wait_for_fd_count_at_most(maximum: usize) -> usize {
+fn wait_for_fd_count_at_most(maximum: usize) -> Option<usize> {
     let deadline = Instant::now() + SETTLE_BUDGET;
     loop {
-        let observed = open_fd_count();
+        let observed = open_fd_count()?;
         if observed <= maximum {
-            return observed;
+            return Some(observed);
         }
         assert!(
             Instant::now() < deadline,
@@ -124,11 +127,13 @@ fn idle_reap_stops_real_watcher_releases_fd_and_rebind_forces_strict_verify() {
 
     assert!(ctx.force_idle_teardown_for_test());
     wait_for_watcher_count(&ctx, 0);
-    let fds_after_reap = wait_for_fd_count_at_most(fds_before);
-    assert!(
-        fds_after_reap <= fds_before,
-        "watcher descriptors leaked: before={fds_before}, live={fds_with_watcher}, after={fds_after_reap}"
-    );
+    if let Some(before) = fds_before {
+        let after = wait_for_fd_count_at_most(before);
+        assert!(
+            after.is_some_and(|after| after <= before),
+            "watcher descriptors leaked: before={before}, live={fds_with_watcher:?}, after={after:?}"
+        );
+    }
     assert_eq!(
         search_warm_verify_plan_for_test(&canonical_root, &cache_file),
         "strict"
