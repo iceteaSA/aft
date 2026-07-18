@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupRow {
     pub backup_id: String,
     pub harness: String,
@@ -18,14 +18,18 @@ pub struct BackupRow {
 }
 
 pub fn upsert_backup(conn: &Connection, row: &BackupRow) -> rusqlite::Result<()> {
-    let order_blob = row.order.to_be_bytes();
-
-    conn.execute(
-        "DELETE FROM backups
-         WHERE harness = ?1 AND session_id = ?2 AND path_hash = ?3 AND order_blob = ?4",
-        params![row.harness, row.session_id, row.path_hash, &order_blob[..]],
+    delete_backup_for_order(
+        conn,
+        &row.harness,
+        &row.session_id,
+        &row.path_hash,
+        row.order,
     )?;
+    insert_backup(conn, row)
+}
 
+pub fn insert_backup(conn: &Connection, row: &BackupRow) -> rusqlite::Result<()> {
+    let order_blob = row.order.to_be_bytes();
     conn.execute(
         "INSERT INTO backups (
             backup_id, harness, session_id, project_key, op_id, order_blob, file_path,
@@ -52,6 +56,21 @@ pub fn upsert_backup(conn: &Connection, row: &BackupRow) -> rusqlite::Result<()>
     )?;
 
     Ok(())
+}
+
+pub fn delete_backup_for_order(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    path_hash: &str,
+    order: u128,
+) -> rusqlite::Result<usize> {
+    let order_blob = order.to_be_bytes();
+    conn.execute(
+        "DELETE FROM backups
+         WHERE harness = ?1 AND session_id = ?2 AND path_hash = ?3 AND order_blob = ?4",
+        params![harness, session_id, path_hash, &order_blob[..]],
+    )
 }
 
 pub fn get_latest_backup(

@@ -270,6 +270,9 @@ pub struct BackupStore {
     db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     db_harness: RwLock<Option<String>>,
     db_project_key: RwLock<Option<String>>,
+    /// Stacks whose SQLite mirror has a known-good baseline in this process.
+    /// Unknown stacks take the full repair path once before append deltas begin.
+    db_mirrored_stacks: RwLock<HashMap<String, HashSet<PathBuf>>>,
     policy: BackupPolicy,
     #[cfg(test)]
     disk_io_count: AtomicU64,
@@ -281,6 +284,22 @@ pub struct BackupStore {
 struct DiskMeta {
     dir: PathBuf,
     count: usize,
+}
+
+enum DbMirrorPlan<'a> {
+    Full,
+    Append {
+        evicted_orders: &'a [u128],
+        new_entry: Option<&'a BackupEntry>,
+    },
+}
+
+struct DbMirrorContext<'a> {
+    harness: &'a str,
+    session: &'a str,
+    project_key: &'a str,
+    file_path: &'a str,
+    path_hash: &'a str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -303,6 +322,7 @@ impl BackupStore {
             db_pool: RwLock::new(None),
             db_harness: RwLock::new(None),
             db_project_key: RwLock::new(None),
+            db_mirrored_stacks: RwLock::new(HashMap::new()),
             policy: BackupPolicy::default(),
             #[cfg(test)]
             disk_io_count: AtomicU64::new(0),
@@ -348,24 +368,28 @@ impl BackupStore {
         if let Ok(mut slot) = self.db_pool.write() {
             *slot = Some(conn);
         }
+        self.clear_db_mirror_sync();
     }
 
     pub fn clear_db_pool(&self) {
         if let Ok(mut slot) = self.db_pool.write() {
             *slot = None;
         }
+        self.clear_db_mirror_sync();
     }
 
     pub fn set_db_harness(&self, harness: crate::harness::Harness) {
         if let Ok(mut slot) = self.db_harness.write() {
             *slot = Some(harness.storage_segment());
         }
+        self.clear_db_mirror_sync();
     }
 
     pub fn set_db_project_key(&self, project_key: String) {
         if let Ok(mut slot) = self.db_project_key.write() {
             *slot = Some(project_key);
         }
+        self.clear_db_mirror_sync();
     }
 
     /// Select the storage namespace used for lazy backup persistence.
@@ -396,6 +420,7 @@ impl BackupStore {
         self.entries.clear();
         self.disk_index.clear();
         self.session_meta.clear();
+        self.clear_db_mirror_sync();
     }
 
     /// Run namespace repair, stale-session GC, and legacy migration at most once
@@ -1002,6 +1027,34 @@ impl BackupStore {
         Some((pool, harness))
     }
 
+    fn clear_db_mirror_sync(&self) {
+        if let Ok(mut synced) = self.db_mirrored_stacks.write() {
+            synced.clear();
+        }
+    }
+
+    fn db_mirror_is_synced(&self, session: &str, key: &Path) -> bool {
+        self.db_mirrored_stacks
+            .read()
+            .is_ok_and(|synced| synced.get(session).is_some_and(|keys| keys.contains(key)))
+    }
+
+    fn set_db_mirror_synced(&self, session: &str, key: &Path, is_synced: bool) {
+        if let Ok(mut synced) = self.db_mirrored_stacks.write() {
+            if is_synced {
+                synced
+                    .entry(session.to_string())
+                    .or_default()
+                    .insert(key.to_path_buf());
+            } else if let Some(keys) = synced.get_mut(session) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    synced.remove(session);
+                }
+            }
+        }
+    }
+
     fn latest_head_for_key(&self, session: &str, key: &Path) -> Option<BackupEntryHead> {
         self.entries
             .get(session)
@@ -1268,7 +1321,18 @@ impl BackupStore {
             stack.push(entry);
         }
 
-        if let Err(error) = self.write_snapshot_to_disk_locked(session, key, &stack) {
+        // The append path knows its exact database delta without inspecting or
+        // rebuilding retained history: remove evicted orders and add the one new
+        // entry. Disk persistence still receives the complete stack unchanged.
+        let evicted_orders = evicted.iter().map(|entry| entry.order).collect::<Vec<_>>();
+        let new_entry = (max_depth > 0).then(|| stack.last().expect("new backup entry"));
+        if let Err(error) = self.write_appended_snapshot_to_disk_locked(
+            session,
+            key,
+            &stack,
+            &evicted_orders,
+            new_entry,
+        ) {
             if max_depth > 0 {
                 stack.pop();
             }
@@ -2337,6 +2401,35 @@ impl BackupStore {
         key: &Path,
         stack: &[BackupEntry],
     ) -> Result<(), AftError> {
+        self.write_snapshot_to_disk_locked_with_db_plan(session, key, stack, DbMirrorPlan::Full)
+    }
+
+    fn write_appended_snapshot_to_disk_locked(
+        &mut self,
+        session: &str,
+        key: &Path,
+        stack: &[BackupEntry],
+        evicted_orders: &[u128],
+        new_entry: Option<&BackupEntry>,
+    ) -> Result<(), AftError> {
+        self.write_snapshot_to_disk_locked_with_db_plan(
+            session,
+            key,
+            stack,
+            DbMirrorPlan::Append {
+                evicted_orders,
+                new_entry,
+            },
+        )
+    }
+
+    fn write_snapshot_to_disk_locked_with_db_plan(
+        &mut self,
+        session: &str,
+        key: &Path,
+        stack: &[BackupEntry],
+        db_plan: DbMirrorPlan<'_>,
+    ) -> Result<(), AftError> {
         #[cfg(test)]
         if self.fail_next_disk_write {
             self.fail_next_disk_write = false;
@@ -2438,11 +2531,17 @@ impl BackupStore {
                     count: retained.len(),
                 },
             );
-        self.dual_write_stack_to_db(session, key, retained);
+        self.mirror_stack_to_db(session, key, retained, db_plan);
         Ok(())
     }
 
-    fn dual_write_stack_to_db(&self, session: &str, key: &Path, stack: &[BackupEntry]) {
+    fn mirror_stack_to_db(
+        &self,
+        session: &str,
+        key: &Path,
+        stack: &[BackupEntry],
+        plan: DbMirrorPlan<'_>,
+    ) {
         let pool = self.db_pool.read().ok().and_then(|slot| slot.clone());
         let Some(pool) = pool else {
             return;
@@ -2471,6 +2570,7 @@ impl BackupStore {
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => {
+                self.set_db_mirror_synced(session, key, false);
                 crate::slog_warn!(
                     "dual-write backup to DB failed for {}: db mutex poisoned",
                     key.display()
@@ -2481,33 +2581,34 @@ impl BackupStore {
         let path_hash = Self::path_hash(key);
         let file_path = key.display().to_string();
 
-        // Replace the path's stack ATOMICALLY: delete old rows + insert the full
-        // new stack inside one transaction. The previous version deleted, then
-        // inserted row-by-row outside any transaction and merely warned-and-
-        // continued on an insert error — so a crash or SQLITE_BUSY mid-loop left
-        // a PARTIAL stack in the DB, which restore/history then preferred over
-        // the (consistent) disk stack. On any error here the transaction rolls
-        // back, leaving the prior consistent stack untouched.
-        let write_result = (|| -> rusqlite::Result<()> {
-            let tx = conn.unchecked_transaction()?;
-            crate::db::backups::delete_backups_for_path(&tx, &harness, session, &path_hash)?;
-            for entry in stack {
-                let backup_path = content_filename_for_entry(entry);
-                let row = entry.to_backup_row(
-                    &harness,
-                    session,
-                    &project_key,
-                    &file_path,
-                    &path_hash,
-                    backup_path.as_deref(),
-                );
-                crate::db::backups::upsert_backup(&tx, &row)?;
-            }
-            tx.commit()
-        })();
+        let context = DbMirrorContext {
+            harness: &harness,
+            session,
+            project_key: &project_key,
+            file_path: &file_path,
+            path_hash: &path_hash,
+        };
+        let (write_result, operation) = match plan {
+            DbMirrorPlan::Append {
+                evicted_orders,
+                new_entry,
+            } if self.db_mirror_is_synced(session, key) => (
+                apply_backup_append_delta_in_db(&conn, &context, evicted_orders, new_entry),
+                "append delta",
+            ),
+            // A newly configured or previously failed mirror has no trusted DB
+            // baseline. Repair it once from the authoritative disk stack before
+            // later appends switch to constant-work deltas.
+            DbMirrorPlan::Append { .. } | DbMirrorPlan::Full => (
+                replace_backup_stack_in_db(&conn, &context, stack),
+                "full stack",
+            ),
+        };
+        self.set_db_mirror_synced(session, key, write_result.is_ok());
         if let Err(error) = write_result {
             crate::slog_warn!(
-                "dual-write backup stack to DB failed for {} (rolled back, prior stack kept): {}",
+                "dual-write backup {} to DB failed for {} (rolled back, prior stack kept): {}",
+                operation,
                 key.display(),
                 error
             );
@@ -2637,6 +2738,7 @@ impl BackupStore {
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => {
+                self.set_db_mirror_synced(session, key, false);
                 crate::slog_warn!(
                     "delete backup DB rows failed for {}: db mutex poisoned",
                     key.display()
@@ -2645,16 +2747,79 @@ impl BackupStore {
             }
         };
         let path_hash = Self::path_hash(key);
-        if let Err(error) =
-            crate::db::backups::delete_backups_for_path(&conn, &harness, session, &path_hash)
-        {
-            crate::slog_warn!(
-                "delete backup DB rows failed for {}: {}",
-                key.display(),
-                error
-            );
+        match crate::db::backups::delete_backups_for_path(&conn, &harness, session, &path_hash) {
+            // Do not retain synchronization state for an absent stack. A future
+            // first append can cheaply establish its one-row baseline again.
+            Ok(_) => self.set_db_mirror_synced(session, key, false),
+            Err(error) => {
+                self.set_db_mirror_synced(session, key, false);
+                crate::slog_warn!(
+                    "delete backup DB rows failed for {}: {}",
+                    key.display(),
+                    error
+                );
+            }
         }
     }
+}
+
+fn backup_row_for_db(entry: &BackupEntry, context: &DbMirrorContext<'_>) -> BackupRow {
+    let backup_path = content_filename_for_entry(entry);
+    entry.to_backup_row(
+        context.harness,
+        context.session,
+        context.project_key,
+        context.file_path,
+        context.path_hash,
+        backup_path.as_deref(),
+    )
+}
+
+fn replace_backup_stack_in_db(
+    conn: &Connection,
+    context: &DbMirrorContext<'_>,
+    stack: &[BackupEntry],
+) -> rusqlite::Result<()> {
+    // Arbitrary stack transforms require full replacement. Keep the path delete
+    // and every insert in one transaction: if an insert fails or SQLite is busy,
+    // rollback leaves the previously consistent mirror untouched rather than a
+    // partial stack that restore/history could mistake for authoritative data.
+    let tx = conn.unchecked_transaction()?;
+    crate::db::backups::delete_backups_for_path(
+        &tx,
+        context.harness,
+        context.session,
+        context.path_hash,
+    )?;
+    for entry in stack {
+        crate::db::backups::insert_backup(&tx, &backup_row_for_db(entry, context))?;
+    }
+    tx.commit()
+}
+
+fn apply_backup_append_delta_in_db(
+    conn: &Connection,
+    context: &DbMirrorContext<'_>,
+    evicted_orders: &[u128],
+    new_entry: Option<&BackupEntry>,
+) -> rusqlite::Result<()> {
+    // A normal append changes only the entries named by the caller. Applying
+    // those deletes and the single insert atomically preserves the same rollback
+    // guarantee as full replacement without rewriting retained history.
+    let tx = conn.unchecked_transaction()?;
+    for &order in evicted_orders {
+        crate::db::backups::delete_backup_for_order(
+            &tx,
+            context.harness,
+            context.session,
+            context.path_hash,
+            order,
+        )?;
+    }
+    if let Some(entry) = new_entry {
+        crate::db::backups::insert_backup(&tx, &backup_row_for_db(entry, context))?;
+    }
+    tx.commit()
 }
 
 pub fn hash_session(session: &str) -> String {
@@ -3469,7 +3634,20 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    const DB_MIRROR_HARNESS: &str = "opencode";
+    const DB_MIRROR_SESSION: &str = "db-mirror-session";
+    const DB_MIRROR_PROJECT: &str = "db-mirror-project";
+    const DB_MIRROR_FILE: &str = "/project/src/file.rs";
+    const DB_MIRROR_PATH_HASH: &str = "db-mirror-path";
+
+    static MIRROR_SQL_TRACE: LazyLock<Mutex<Vec<String>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+
+    fn capture_mirror_sql(sql: &str) {
+        MIRROR_SQL_TRACE.lock().unwrap().push(sql.to_string());
+    }
 
     fn temp_file(name: &str, content: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("aft_backup_tests");
@@ -3477,6 +3655,236 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, content).unwrap();
         path
+    }
+
+    fn db_mirror_context() -> DbMirrorContext<'static> {
+        DbMirrorContext {
+            harness: DB_MIRROR_HARNESS,
+            session: DB_MIRROR_SESSION,
+            project_key: DB_MIRROR_PROJECT,
+            file_path: DB_MIRROR_FILE,
+            path_hash: DB_MIRROR_PATH_HASH,
+        }
+    }
+
+    fn db_mirror_entry(index: u128, kind: BackupEntryKind) -> BackupEntry {
+        BackupEntry {
+            backup_id: format!("backup-{index}"),
+            content: format!("content-{index}"),
+            content_bytes: format!("content-{index}").into_bytes(),
+            timestamp: u64::try_from(index + 1).unwrap(),
+            order: index + 1,
+            description: format!("generated-{index}"),
+            op_id: index.is_multiple_of(3).then(|| format!("op-{}", index % 5)),
+            kind,
+            mode: None,
+            link_target: None,
+            created_dirs: Vec::new(),
+        }
+    }
+
+    fn db_mirror_rows(conn: &Connection) -> Vec<BackupRow> {
+        crate::db::backups::list_backups(
+            conn,
+            DB_MIRROR_HARNESS,
+            DB_MIRROR_SESSION,
+            DB_MIRROR_PATH_HASH,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn backup_db_append_delta_matches_full_rebuild_for_generated_sequences() {
+        let context = db_mirror_context();
+        let mut saw_eviction = false;
+        let mut saw_tombstone = false;
+
+        for max_depth in [1, 2, 5, 8] {
+            let delta_dir = tempfile::tempdir().unwrap();
+            let full_dir = tempfile::tempdir().unwrap();
+            let delta_conn = crate::db::open(&delta_dir.path().join("aft.db")).unwrap();
+            let full_conn = crate::db::open(&full_dir.path().join("aft.db")).unwrap();
+            let mut stack = Vec::new();
+            let mut generated = 0x9e37_79b9_u64 ^ u64::try_from(max_depth).unwrap();
+
+            for step in 0..64_u128 {
+                generated = generated
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let kind = if generated.is_multiple_of(4) {
+                    saw_tombstone = true;
+                    BackupEntryKind::Tombstone
+                } else {
+                    BackupEntryKind::Content
+                };
+                let entry = db_mirror_entry(step, kind);
+                let evicted = drain_stack_to_depth(&mut stack, max_depth - 1);
+                saw_eviction |= !evicted.is_empty();
+                let evicted_orders = evicted.iter().map(|entry| entry.order).collect::<Vec<_>>();
+                stack.push(entry);
+
+                apply_backup_append_delta_in_db(
+                    &delta_conn,
+                    &context,
+                    &evicted_orders,
+                    stack.last(),
+                )
+                .unwrap();
+                replace_backup_stack_in_db(&full_conn, &context, &stack).unwrap();
+
+                assert_eq!(
+                    db_mirror_rows(&delta_conn),
+                    db_mirror_rows(&full_conn),
+                    "delta mirror drifted at depth {max_depth}, step {step}"
+                );
+            }
+        }
+
+        assert!(saw_eviction, "generated sequence must exercise eviction");
+        assert!(saw_tombstone, "generated sequence must exercise tombstones");
+    }
+
+    #[test]
+    fn backup_db_append_delta_executes_constant_dml_statement_count() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("statement-count.txt");
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        store.set_db_harness(Harness::Opencode);
+        store.set_db_project_key(DB_MIRROR_PROJECT.to_string());
+        store.set_policy(BackupPolicy {
+            enabled: true,
+            max_depth: 4,
+            max_file_size: None,
+        });
+        let shared = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        store.set_db_pool(shared.clone());
+        for version in 0..4 {
+            fs::write(&file, format!("version-{version}")).unwrap();
+            store
+                .snapshot(DB_MIRROR_SESSION, &file, "fill retained stack")
+                .unwrap();
+        }
+
+        MIRROR_SQL_TRACE.lock().unwrap().clear();
+        shared.lock().unwrap().trace(Some(capture_mirror_sql));
+        fs::write(&file, "version-4").unwrap();
+        store
+            .snapshot(DB_MIRROR_SESSION, &file, "measured append")
+            .unwrap();
+        shared.lock().unwrap().trace(None);
+
+        let traced = MIRROR_SQL_TRACE.lock().unwrap().clone();
+        let dml = traced
+            .iter()
+            .filter(|sql| {
+                let sql = sql.trim_start();
+                sql.starts_with("DELETE FROM backups") || sql.starts_with("INSERT INTO backups")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dml.len(),
+            2,
+            "one eviction plus one append must execute exactly two DML statements: {traced:?}"
+        );
+        assert_eq!(
+            dml.iter()
+                .filter(|sql| sql.trim_start().starts_with("DELETE FROM backups"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            dml.iter()
+                .filter(|sql| sql.trim_start().starts_with("INSERT INTO backups"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn backup_db_append_delta_rolls_back_eviction_when_insert_fails() {
+        let context = db_mirror_context();
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let prior_stack = vec![
+            db_mirror_entry(0, BackupEntryKind::Content),
+            db_mirror_entry(1, BackupEntryKind::Content),
+        ];
+        replace_backup_stack_in_db(&conn, &context, &prior_stack).unwrap();
+        let prior_rows = db_mirror_rows(&conn);
+        conn.execute_batch(
+            "CREATE TRIGGER fail_delta_insert
+             BEFORE INSERT ON backups
+             WHEN NEW.backup_id = 'backup-2'
+             BEGIN
+               SELECT RAISE(ABORT, 'forced delta insert failure');
+             END;",
+        )
+        .unwrap();
+
+        let new_entry = db_mirror_entry(2, BackupEntryKind::Tombstone);
+        let error = apply_backup_append_delta_in_db(
+            &conn,
+            &context,
+            &[prior_stack[0].order],
+            Some(&new_entry),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("forced delta insert failure"));
+        assert_eq!(
+            db_mirror_rows(&conn),
+            prior_rows,
+            "failed append must roll back the preceding eviction"
+        );
+    }
+
+    #[test]
+    fn backup_db_unknown_mirror_repairs_disk_history_before_append_deltas() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("repair-before-delta.txt");
+        let mut disk_only = BackupStore::new();
+        disk_only.set_storage_dir(storage.path().to_path_buf(), 72);
+        fs::write(&file, "v1").unwrap();
+        disk_only
+            .snapshot(DB_MIRROR_SESSION, &file, "disk first")
+            .unwrap();
+        fs::write(&file, "v2").unwrap();
+        disk_only
+            .snapshot(DB_MIRROR_SESSION, &file, "disk second")
+            .unwrap();
+
+        let mut mirrored = BackupStore::new();
+        mirrored.set_storage_dir(storage.path().to_path_buf(), 72);
+        mirrored.set_db_harness(Harness::Opencode);
+        mirrored.set_db_project_key(DB_MIRROR_PROJECT.to_string());
+        let conn = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        mirrored.set_db_pool(conn.clone());
+        fs::write(&file, "v3").unwrap();
+        mirrored
+            .snapshot(DB_MIRROR_SESSION, &file, "first mirrored append")
+            .unwrap();
+
+        let key = canonicalize_key(&file);
+        let rows = crate::db::backups::list_backups(
+            &conn.lock().unwrap(),
+            DB_MIRROR_HARNESS,
+            DB_MIRROR_SESSION,
+            &BackupStore::path_hash(&key),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.description.as_str())
+                .collect::<Vec<_>>(),
+            vec!["disk first", "disk second", "first mirrored append"]
+        );
     }
 
     #[test]
