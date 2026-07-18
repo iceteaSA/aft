@@ -65,7 +65,7 @@ impl<'de> serde::Deserialize<'de> for Range {
 }
 
 /// A symbol discovered in a source file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,

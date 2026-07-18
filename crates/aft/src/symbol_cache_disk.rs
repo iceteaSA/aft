@@ -3,13 +3,15 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::fs_lock;
 use crate::parser::SymbolCache;
 use crate::search_index::{cache_relative_path, validate_cached_relative_path};
+use crate::slog_warn;
 use crate::symbols::Symbol;
-use crate::{slog_info, slog_warn};
 
 const MAGIC: &[u8; 8] = b"AFTSYM1\0";
 const FORMAT_VERSION: u32 = 3;
@@ -26,6 +28,8 @@ const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_SYMBOL_BYTES: usize = 16 * 1024 * 1024;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SYMBOL_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static WATCHED_CACHE_WRITE: OnceLock<Mutex<Option<(PathBuf, usize)>>> = OnceLock::new();
 
 pub struct SymbolCacheLock {
     _guard: Option<fs_lock::LockGuard>,
@@ -91,6 +95,37 @@ pub(crate) fn cache_path(storage_dir: &Path, project_key: &str) -> PathBuf {
         .join("symbols.bin")
 }
 
+#[cfg(test)]
+pub(crate) fn watch_cache_writes(path: PathBuf) {
+    *WATCHED_CACHE_WRITE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, 0));
+}
+
+#[cfg(test)]
+pub(crate) fn watched_cache_write_count() -> usize {
+    WATCHED_CACHE_WRITE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map_or(0, |(_, count)| *count)
+}
+
+#[cfg(test)]
+fn note_cache_write(path: &Path) {
+    let mut watched = WATCHED_CACHE_WRITE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((watched_path, count)) = watched.as_mut() {
+        if watched_path == path {
+            *count += 1;
+        }
+    }
+}
+
 pub fn read_from_disk(storage_dir: &Path, project_key: &str) -> Option<DiskSymbolCache> {
     let data_path = cache_path(storage_dir, project_key);
     if !data_path.exists() {
@@ -115,11 +150,6 @@ pub fn write_to_disk(
     storage_dir: &Path,
     project_key: &str,
 ) -> std::io::Result<()> {
-    if cache.len() == 0 {
-        slog_info!("skipping symbol cache persistence (0 entries)");
-        return Ok(());
-    }
-
     let project_root = cache.project_root().ok_or_else(|| {
         std::io::Error::other("symbol cache project root is not set; cannot persist relative paths")
     })?;
@@ -130,6 +160,8 @@ pub fn write_to_disk(
     if !access.allows_write(project_key, &data_path) {
         return Ok(());
     }
+    #[cfg(test)]
+    note_cache_write(&data_path);
     let _cache_lock = SymbolCacheLock::acquire(storage_dir, project_key, &project_root)?;
     fs::create_dir_all(&dir)?;
     let tmp_path = dir.join(format!(

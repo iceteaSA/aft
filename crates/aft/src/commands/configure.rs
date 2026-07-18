@@ -1394,13 +1394,16 @@ fn prewarm_symbol_cache_from_search_files(
             return;
         }
         if let Some(storage_dir) = symbol_storage.as_deref() {
-            let loaded_count = cache.load_from_disk_for_generation(
+            let load_outcome = cache.load_from_disk_for_generation_with_outcome(
                 symbol_cache_generation,
                 storage_dir,
                 &symbol_project_key,
                 &root,
             );
-            slog_info!("loaded symbol cache from disk: {} files", loaded_count);
+            slog_info!(
+                "loaded symbol cache from disk: {} files",
+                load_outcome.loaded
+            );
         }
     } else {
         return;
@@ -1419,8 +1422,10 @@ fn prewarm_symbol_cache_from_search_files(
             skipped_files += 1;
             continue;
         }
-        if parser.extract_symbols(path).is_ok() {
-            warmed_files += 1;
+        match parser.extract_symbols_with_cache_status(path) {
+            Ok((_, true)) => warmed_files += 1,
+            Ok((_, false)) => skipped_files += 1,
+            Err(_) => {}
         }
     }
 
@@ -1432,16 +1437,32 @@ fn prewarm_symbol_cache_from_search_files(
                     slog_info!("skipping stale symbol cache persistence after reconfigure");
                     return;
                 }
-                match crate::symbol_cache_disk::write_to_disk(
-                    &cache,
-                    storage_dir,
-                    &symbol_project_key,
-                ) {
-                    Ok(()) => {
-                        slog_info!("persisted symbol cache: {} files", cache.len());
-                    }
-                    Err(error) => {
-                        slog_warn!("failed to persist symbol cache: {}", error);
+                // Disk-load repairs and actual entry changes advance the cache revision;
+                // a fully unchanged warm load leaves it equal to the persisted revision.
+                if !cache.needs_persistence() {
+                    slog_debug!("symbol cache unchanged, skipping persistence");
+                } else {
+                    let persistence_revision = cache.persistence_revision();
+                    let persisted_files = cache.len();
+                    let write_result = crate::symbol_cache_disk::write_to_disk(
+                        &cache,
+                        storage_dir,
+                        &symbol_project_key,
+                    );
+                    drop(cache);
+                    match write_result {
+                        Ok(()) => {
+                            if let Ok(mut cache) = symbol_cache.write() {
+                                cache.mark_persisted_for_generation(
+                                    symbol_cache_generation,
+                                    persistence_revision,
+                                );
+                            }
+                            slog_info!("persisted symbol cache: {} files", persisted_files);
+                        }
+                        Err(error) => {
+                            slog_warn!("failed to persist symbol cache: {}", error);
+                        }
                     }
                 }
             }
@@ -3870,7 +3891,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
+    use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
     use super::{
@@ -3886,7 +3907,7 @@ mod tests {
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::{AppContext, SemanticRefreshRequest};
-    use crate::parser::TreeSitterProvider;
+    use crate::parser::{FileParser, SymbolCache, TreeSitterProvider};
     use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use crate::search_index::CacheLock;
     use std::process::Command;
@@ -3904,6 +3925,162 @@ mod tests {
     fn handle_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         super::handle_configure(req, ctx)
+    }
+
+    fn symbol_cache_prewarm_test_mutex() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn write_symbol_cache_source(
+        project: &std::path::Path,
+        relative: &str,
+        content: &str,
+    ) -> PathBuf {
+        let path = project.join(relative);
+        std::fs::create_dir_all(path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&path, content).expect("write source");
+        path
+    }
+
+    fn persist_symbol_cache_fixture(
+        project: &std::path::Path,
+        storage: &std::path::Path,
+        project_key: &str,
+        sources: &[PathBuf],
+    ) {
+        let mut parser = FileParser::new();
+        for source in sources {
+            parser.extract_symbols(source).expect("extract symbols");
+        }
+        let shared = parser.symbol_cache();
+        let mut cache = shared.read().expect("read symbol cache").clone();
+        cache.set_project_root(project.to_path_buf());
+        crate::symbol_cache_disk::write_to_disk(&cache, storage, project_key)
+            .expect("persist symbol cache fixture");
+    }
+
+    fn symbol_file(path: &std::path::Path) -> super::SearchIndexSymbolFile {
+        let modified = std::fs::metadata(path)
+            .expect("stat source")
+            .modified()
+            .expect("source mtime");
+        (path.to_path_buf(), modified)
+    }
+
+    #[test]
+    fn configure_symbol_cache_unchanged_prewarm_skips_persistence() {
+        let _guard = symbol_cache_prewarm_test_mutex()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let project_key = "unchanged-prewarm";
+        let source = write_symbol_cache_source(
+            project.path(),
+            "src/lib.rs",
+            "pub fn unchanged() -> bool { true }\n",
+        );
+        persist_symbol_cache_fixture(
+            project.path(),
+            storage.path(),
+            project_key,
+            std::slice::from_ref(&source),
+        );
+        crate::symbol_cache_disk::watch_cache_writes(crate::symbol_cache_disk::cache_path(
+            storage.path(),
+            project_key,
+        ));
+
+        super::prewarm_symbol_cache_from_search_files(
+            project.path().to_path_buf(),
+            Arc::new(RwLock::new(SymbolCache::new())),
+            Some(storage.path().to_path_buf()),
+            project_key.to_string(),
+            0,
+            vec![symbol_file(&source)],
+            false,
+        );
+
+        assert_eq!(crate::symbol_cache_disk::watched_cache_write_count(), 0);
+    }
+
+    #[test]
+    fn configure_symbol_cache_new_file_persists_prewarm_mutation() {
+        let _guard = symbol_cache_prewarm_test_mutex()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let project_key = "new-file-prewarm";
+        let existing =
+            write_symbol_cache_source(project.path(), "src/existing.rs", "pub fn existing() {}\n");
+        let added =
+            write_symbol_cache_source(project.path(), "src/added.rs", "pub fn added() {}\n");
+        persist_symbol_cache_fixture(
+            project.path(),
+            storage.path(),
+            project_key,
+            std::slice::from_ref(&existing),
+        );
+        crate::symbol_cache_disk::watch_cache_writes(crate::symbol_cache_disk::cache_path(
+            storage.path(),
+            project_key,
+        ));
+
+        super::prewarm_symbol_cache_from_search_files(
+            project.path().to_path_buf(),
+            Arc::new(RwLock::new(SymbolCache::new())),
+            Some(storage.path().to_path_buf()),
+            project_key.to_string(),
+            0,
+            vec![symbol_file(&existing), symbol_file(&added)],
+            false,
+        );
+
+        assert_eq!(crate::symbol_cache_disk::watched_cache_write_count(), 1);
+        let disk = crate::symbol_cache_disk::read_from_disk(storage.path(), project_key)
+            .expect("read persisted cache");
+        assert_eq!(disk.len(), 2);
+    }
+
+    #[test]
+    fn configure_symbol_cache_stale_disk_drop_is_persisted() {
+        let _guard = symbol_cache_prewarm_test_mutex()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let project_key = "stale-drop-prewarm";
+        let deleted =
+            write_symbol_cache_source(project.path(), "src/deleted.rs", "pub fn deleted() {}\n");
+        persist_symbol_cache_fixture(
+            project.path(),
+            storage.path(),
+            project_key,
+            std::slice::from_ref(&deleted),
+        );
+        std::fs::remove_file(&deleted).expect("delete stale source");
+        crate::symbol_cache_disk::watch_cache_writes(crate::symbol_cache_disk::cache_path(
+            storage.path(),
+            project_key,
+        ));
+
+        super::prewarm_symbol_cache_from_search_files(
+            project.path().to_path_buf(),
+            Arc::new(RwLock::new(SymbolCache::new())),
+            Some(storage.path().to_path_buf()),
+            project_key.to_string(),
+            0,
+            Vec::new(),
+            false,
+        );
+
+        assert_eq!(crate::symbol_cache_disk::watched_cache_write_count(), 1);
+        let disk = crate::symbol_cache_disk::read_from_disk(storage.path(), project_key)
+            .expect("read compacted cache");
+        assert!(disk.is_empty());
     }
 
     struct EnvVarGuard {

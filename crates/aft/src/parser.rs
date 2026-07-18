@@ -940,7 +940,7 @@ struct CachedTree {
 }
 
 /// Cached symbol extraction result: mtime at extraction time + symbols.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct CachedSymbols {
     mtime: SystemTime,
     size: u64,
@@ -993,10 +993,19 @@ fn cached_file_is_fresh(
 pub struct SymbolCache {
     entries: HashMap<PathBuf, CachedSymbols>,
     generation: u64,
+    // Revisions distinguish real entry changes from successful parses that reuse cached data.
+    mutation_revision: u64,
+    persisted_revision: u64,
     project_root: Option<PathBuf>,
 }
 
 pub type SharedSymbolCache = Arc<RwLock<SymbolCache>>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SymbolCacheLoadOutcome {
+    pub(crate) loaded: usize,
+    pub(crate) needs_persistence: bool,
+}
 
 fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
     symbols.iter().fold(0u64, |bytes, symbol| {
@@ -1031,6 +1040,8 @@ impl SymbolCache {
         Self {
             entries: HashMap::new(),
             generation: 0,
+            mutation_revision: 0,
+            persisted_revision: 0,
             project_root: None,
         }
     }
@@ -1063,16 +1074,19 @@ impl SymbolCache {
         size: u64,
         content_hash: blake3::Hash,
         symbols: Vec<Symbol>,
-    ) {
-        self.entries.insert(
-            path,
-            CachedSymbols {
-                mtime,
-                size,
-                content_hash,
-                symbols,
-            },
-        );
+    ) -> bool {
+        let entry = CachedSymbols {
+            mtime,
+            size,
+            content_hash,
+            symbols,
+        };
+        if self.entries.get(&path) == Some(&entry) {
+            return false;
+        }
+        self.entries.insert(path, entry);
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
+        true
     }
 
     /// Insert symbols only when the caller still belongs to the active cache generation.
@@ -1088,8 +1102,7 @@ impl SymbolCache {
         if self.generation != generation {
             return false;
         }
-        self.insert(path, mtime, size, content_hash, symbols);
-        true
+        self.insert(path, mtime, size, content_hash, symbols)
     }
 
     /// Return cached symbols when the source file is still fresh.
@@ -1130,19 +1143,30 @@ impl SymbolCache {
         project_key: &str,
         current_root: &Path,
     ) -> usize {
+        self.load_from_disk_with_outcome(storage_dir, project_key, current_root)
+            .loaded
+    }
+
+    fn load_from_disk_with_outcome(
+        &mut self,
+        storage_dir: &Path,
+        project_key: &str,
+        current_root: &Path,
+    ) -> SymbolCacheLoadOutcome {
         debug_assert!(current_root.is_absolute());
         let Some(cache) = symbol_cache_disk::read_from_disk(storage_dir, project_key) else {
-            return 0;
+            return SymbolCacheLoadOutcome::default();
         };
 
         self.project_root = Some(current_root.to_path_buf());
         self.entries.clear();
-        let mut loaded = 0usize;
+        let mut outcome = SymbolCacheLoadOutcome::default();
 
         for entry in cache.entries {
             let Some(path) =
                 crate::search_index::cached_path_under_root(current_root, &entry.relative_path)
             else {
+                outcome.needs_persistence = true;
                 continue;
             };
             let cached_freshness = FileFreshness {
@@ -1152,8 +1176,14 @@ impl SymbolCache {
             };
             let mtime = match cache_freshness::verify_file(&path, &cached_freshness) {
                 FreshnessVerdict::HotFresh => entry.mtime,
-                FreshnessVerdict::ContentFresh { new_mtime, .. } => new_mtime,
-                FreshnessVerdict::Stale | FreshnessVerdict::Deleted => continue,
+                FreshnessVerdict::ContentFresh { new_mtime, .. } => {
+                    outcome.needs_persistence = true;
+                    new_mtime
+                }
+                FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
+                    outcome.needs_persistence = true;
+                    continue;
+                }
             };
 
             self.entries.insert(
@@ -1165,10 +1195,12 @@ impl SymbolCache {
                     symbols: entry.symbols,
                 },
             );
-            loaded += 1;
+            outcome.loaded += 1;
         }
 
-        loaded
+        self.mutation_revision = if outcome.needs_persistence { 1 } else { 0 };
+        self.persisted_revision = 0;
+        outcome
     }
 
     /// Load valid symbol entries from disk only when the caller still belongs
@@ -1180,15 +1212,33 @@ impl SymbolCache {
         project_key: &str,
         current_root: &Path,
     ) -> usize {
+        self.load_from_disk_for_generation_with_outcome(
+            generation,
+            storage_dir,
+            project_key,
+            current_root,
+        )
+        .loaded
+    }
+
+    pub(crate) fn load_from_disk_for_generation_with_outcome(
+        &mut self,
+        generation: u64,
+        storage_dir: &Path,
+        project_key: &str,
+        current_root: &Path,
+    ) -> SymbolCacheLoadOutcome {
         if self.generation != generation {
-            return 0;
+            return SymbolCacheLoadOutcome::default();
         }
-        self.load_from_disk(storage_dir, project_key, current_root)
+        self.load_from_disk_with_outcome(storage_dir, project_key, current_root)
     }
 
     /// Invalidate cached symbols for a specific file.
     pub fn invalidate(&mut self, path: &Path) {
-        self.entries.remove(path);
+        if self.entries.remove(path).is_some() {
+            self.mutation_revision = self.mutation_revision.wrapping_add(1);
+        }
     }
 
     /// Clear all entries and advance the generation to ignore stale background writers.
@@ -1196,12 +1246,34 @@ impl SymbolCache {
         self.entries.clear();
         self.project_root = None;
         self.generation = self.generation.wrapping_add(1);
+        self.mutation_revision = 0;
+        self.persisted_revision = 0;
         self.generation
     }
 
     /// Current generation token.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn needs_persistence(&self) -> bool {
+        self.mutation_revision != self.persisted_revision
+    }
+
+    pub(crate) fn persistence_revision(&self) -> u64 {
+        self.mutation_revision
+    }
+
+    pub(crate) fn mark_persisted_for_generation(
+        &mut self,
+        generation: u64,
+        persisted_revision: u64,
+    ) -> bool {
+        if self.generation != generation || self.mutation_revision != persisted_revision {
+            return false;
+        }
+        self.persisted_revision = persisted_revision;
+        true
     }
 
     /// Whether the cache has an entry for a file.
@@ -1481,6 +1553,14 @@ impl FileParser {
     /// Results are cached by `(path, mtime)` — subsequent calls for unchanged
     /// files return the cached symbol table without re-parsing.
     pub fn extract_symbols(&mut self, path: &Path) -> Result<Vec<Symbol>, AftError> {
+        self.extract_symbols_with_cache_status(path)
+            .map(|(symbols, _)| symbols)
+    }
+
+    pub(crate) fn extract_symbols_with_cache_status(
+        &mut self,
+        path: &Path,
+    ) -> Result<(Vec<Symbol>, bool), AftError> {
         let canon = path.to_path_buf();
         let current_mtime = std::fs::metadata(path)
             .and_then(|m| m.modified())
@@ -1497,7 +1577,7 @@ impl FileParser {
             })?
             .get(&canon, current_mtime)
         {
-            return Ok(symbols);
+            return Ok((symbols, false));
         }
 
         let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
@@ -1508,20 +1588,19 @@ impl FileParser {
 
         let symbols = {
             // Reuse the source we just read instead of letting parse() read the
-            // same file a second time (cold-path double-read, council perf #5).
+            // same file a second time.
             let (tree, lang) =
                 self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
             extract_symbols_from_tree(&source, tree, lang)?
         };
 
-        // Cache the result
         let mut symbol_cache = self
             .symbol_cache
             .write()
             .map_err(|_| AftError::ParseError {
                 message: "symbol cache lock poisoned".to_string(),
             })?;
-        if let Some(generation) = self.symbol_cache_generation {
+        let cache_changed = if let Some(generation) = self.symbol_cache_generation {
             symbol_cache.insert_for_generation(
                 generation,
                 canon,
@@ -1529,12 +1608,12 @@ impl FileParser {
                 size,
                 content_hash,
                 symbols.clone(),
-            );
+            )
         } else {
-            symbol_cache.insert(canon, current_mtime, size, content_hash, symbols.clone());
-        }
+            symbol_cache.insert(canon, current_mtime, size, content_hash, symbols.clone())
+        };
 
-        Ok(symbols)
+        Ok((symbols, cache_changed))
     }
 
     /// Invalidate cached symbols for a specific file (e.g., after an edit).
@@ -8206,12 +8285,59 @@ pub(crate) mod outer {
             .expect("write symbol cache");
 
         let mut restored = SymbolCache::new();
-        let loaded = restored.load_from_disk(storage.path(), "unit-project", project.path());
+        let outcome =
+            restored.load_from_disk_with_outcome(storage.path(), "unit-project", project.path());
         let symbols = restored.get(&source, mtime).expect("restored symbols");
 
-        assert_eq!(loaded, 1);
+        assert_eq!(outcome.loaded, 1);
+        assert!(!outcome.needs_persistence);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "cached");
+    }
+
+    #[test]
+    fn symbol_cache_load_from_disk_marks_mtime_refresh_for_persistence() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let source = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source, "pub fn cached() {}\n").expect("write source");
+        let metadata = std::fs::metadata(&source).expect("stat source");
+        let mtime = metadata.modified().expect("source mtime");
+        let content = std::fs::read(&source).expect("read source");
+
+        let mut cache = SymbolCache::new();
+        cache.set_project_root(project.path().to_path_buf());
+        cache.insert(
+            source.clone(),
+            mtime,
+            content.len() as u64,
+            crate::cache_freshness::hash_bytes(&content),
+            vec![test_symbol("cached")],
+        );
+        symbol_cache_disk::write_to_disk(&cache, storage.path(), "mtime-unit-project")
+            .expect("write symbol cache");
+
+        let advanced_mtime = mtime
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("advance source mtime");
+        filetime::set_file_mtime(
+            &source,
+            filetime::FileTime::from_system_time(advanced_mtime),
+        )
+        .expect("touch source");
+
+        let mut restored = SymbolCache::new();
+        let outcome = restored.load_from_disk_with_outcome(
+            storage.path(),
+            "mtime-unit-project",
+            project.path(),
+        );
+
+        assert_eq!(outcome.loaded, 1);
+        assert!(outcome.needs_persistence);
+        assert!(restored.get(&source, advanced_mtime).is_some());
     }
 
     #[test]
@@ -8245,9 +8371,14 @@ pub(crate) mod outer {
         std::fs::write(&source, "pub fn cached() {}\npub fn fresh() {}\n").expect("change source");
 
         let mut restored = SymbolCache::new();
-        let loaded = restored.load_from_disk(storage.path(), "stale-unit-project", project.path());
+        let outcome = restored.load_from_disk_with_outcome(
+            storage.path(),
+            "stale-unit-project",
+            project.path(),
+        );
 
-        assert_eq!(loaded, 0);
+        assert_eq!(outcome.loaded, 0);
+        assert!(outcome.needs_persistence);
         assert_eq!(restored.len(), 0);
     }
 
