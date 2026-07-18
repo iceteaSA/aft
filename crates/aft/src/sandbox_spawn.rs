@@ -275,6 +275,10 @@ pub(crate) fn with_spawn_plan_for_test<R>(plan: SpawnPlan, run: impl FnOnce() ->
 }
 
 /// Build a detached `Command` while enforcing the required launch plan.
+///
+/// Windows detached spawns route through the shell-candidate ladder, which
+/// enforces the plan inline, so this helper is Unix-only.
+#[cfg(unix)]
 pub(crate) fn detached_command_for_plan(
     plan: &SpawnPlan,
     program: &OsStr,

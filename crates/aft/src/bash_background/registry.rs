@@ -6057,6 +6057,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 command,
                 "session".to_string(),
                 dir.path().to_path_buf(),
