@@ -176,6 +176,11 @@ pub fn resolve_sandbox_spawn(
 ) -> SpawnPlan {
     note_test_observation(ctx, principal, requested_tier, task_kind);
 
+    #[cfg(test)]
+    if let Some(plan) = TEST_PLAN_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return plan;
+    }
+
     #[cfg(windows)]
     {
         return SpawnPlan::Unsandboxed;
@@ -183,11 +188,6 @@ pub fn resolve_sandbox_spawn(
 
     #[cfg(not(windows))]
     {
-        #[cfg(test)]
-        if let Some(plan) = TEST_PLAN_OVERRIDE.with(|slot| slot.borrow().clone()) {
-            return plan;
-        }
-
         let _ = (principal, requested_tier, task_kind);
         SpawnPlan::Unsandboxed
     }

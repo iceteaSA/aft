@@ -1843,6 +1843,10 @@ fn cancel_cancellable_mutating_signals_running_job_and_preserves_actor() {
     assert!(executor.register_actor(root.clone(), test_ctx()));
 
     let (started_tx, started_rx) = crossbeam_channel::bounded::<()>(1);
+    // Dropping this sender during a panic releases the worker before Executor's
+    // destructor joins it. Without that escape hatch, a failed assertion before
+    // cancellation can leave the worker polling forever during test teardown.
+    let (_abort_tx, abort_rx) = crossbeam_channel::bounded::<()>(1);
     let (running_rx, running_token) = executor.submit_cancellable_async(
         root.clone(),
         Lane::Mutating,
@@ -1851,7 +1855,16 @@ fn cancel_cancellable_mutating_signals_running_job_and_preserves_actor() {
             started_tx.send(()).expect("signal running start");
             let token = current_job_cancellation().expect("cancellable job sees its own token");
             while !token.cancel_requested_before_commit() {
-                thread::sleep(Duration::from_millis(2));
+                match abort_rx.recv_timeout(Duration::from_millis(2)) {
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        return Response::error(
+                            "running-configure",
+                            "test_aborted",
+                            "test released cancellation worker during teardown",
+                        );
+                    }
+                }
             }
             Response::error(
                 "running-configure",
@@ -1863,10 +1876,19 @@ fn cancel_cancellable_mutating_signals_running_job_and_preserves_actor() {
     started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("running job starts");
-    assert_eq!(
-        executor.try_mutating_job_state_label(&root, "running-configure"),
-        Some("running"),
-    );
+
+    // The label query deliberately uses try_lock, so scheduler contention can
+    // transiently return None even though the start signal proves the job runs.
+    let state_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match executor.try_mutating_job_state_label(&root, "running-configure") {
+            Some("running") => break,
+            None if Instant::now() < state_deadline => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            state => panic!("running job state did not become observable: {state:?}"),
+        }
+    }
 
     let outcome = executor.cancel_job(&root, &running_token);
     assert_eq!(outcome, JobCancelOutcome::RunningSignalled);
