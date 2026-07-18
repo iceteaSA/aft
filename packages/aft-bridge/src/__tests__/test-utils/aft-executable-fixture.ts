@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 
 export interface AftFixtureBehavior {
@@ -29,25 +31,56 @@ export function writeAftVersionFixture(path: string, version: string): string {
 }
 
 function writeNativeFixture(path: string, behavior: AftFixtureBehavior): void {
-  const sourcePath = `${path}.c`;
-  writeFileSync(sourcePath, nativeFixtureSource(behavior), "utf8");
+  const source = nativeFixtureSource(behavior);
 
+  // Compiling with cc at test time is the slow, flaky step on contended CI
+  // runners (a single compile can blow a 5s test budget). Identical behaviors
+  // produce identical sources, so compile each source once per machine into a
+  // content-keyed cache and copy the binary for every later request.
+  const cacheKey = createHash("sha256")
+    .update(`${process.platform}\0${source}`)
+    .digest("hex")
+    .slice(0, 16);
+  const cacheDir = join(tmpdir(), "aft-fixture-cache");
+  const cachedBinary = join(cacheDir, `aft-fixture-${cacheKey}`);
+
+  if (!existsSync(cachedBinary)) {
+    compileNativeFixture(source, cacheDir, cachedBinary);
+  }
+
+  copyFileSync(cachedBinary, path);
+  chmodSync(path, 0o755);
+}
+
+function compileNativeFixture(source: string, cacheDir: string, cachedBinary: string): void {
   if (!nativeCompiler)
     throw new Error("Native aft test fixtures are not available on this platform");
 
+  mkdirSync(cacheDir, { recursive: true });
+  // Unique staging names so concurrent test files never race on the same
+  // output; the final publish is an atomic-enough copy to the keyed name.
+  const staging = join(
+    cacheDir,
+    `stage-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  );
+  const sourcePath = `${staging}.c`;
+  writeFileSync(sourcePath, source, "utf8");
+
   const result = spawnSync(
     nativeCompiler.command,
-    [...nativeCompiler.args, sourcePath, "-o", path],
+    [...nativeCompiler.args, sourcePath, "-o", staging],
     {
       encoding: "utf8",
       env: { ...process.env, PATH: compilerSearchPath },
       stdio: ["ignore", "pipe", "pipe"],
+      timeout: 60_000,
     },
   );
 
   if (result.error || result.status !== 0) {
     const detail = [
       result.error instanceof Error ? result.error.message : undefined,
+      result.signal ? `signal: ${result.signal}` : undefined,
       String(result.stdout ?? "").trim(),
       String(result.stderr ?? "").trim(),
     ]
@@ -58,7 +91,9 @@ function writeNativeFixture(path: string, behavior: AftFixtureBehavior): void {
     );
   }
 
-  chmodSync(path, 0o755);
+  chmodSync(staging, 0o755);
+  copyFileSync(staging, cachedBinary);
+  chmodSync(cachedBinary, 0o755);
 }
 
 function nativeFixtureSource(behavior: AftFixtureBehavior): string {
