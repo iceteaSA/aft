@@ -16,6 +16,7 @@ use crate::extract::{detect_scope_conflicts, substitute_params, validate_single_
 use crate::lsp_hints;
 use crate::parser::{detect_language, grammar_for, node_text, LangId};
 use crate::protocol::{RawRequest, Response};
+use crate::symbols::{SymbolKind, SymbolMatch};
 
 /// Handle an `inline_symbol` request.
 ///
@@ -150,34 +151,121 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Resolve function symbol ---
-    let matches = match ctx.provider().resolve_symbol(&path, symbol) {
-        Ok(m) => m,
+    let resolved_matches = match ctx.provider().resolve_symbol(&path, symbol) {
+        Ok(matches) => matches
+            .into_iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.symbol.kind,
+                    SymbolKind::Function | SymbolKind::Method
+                )
+            })
+            .collect::<Vec<_>>(),
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };
+    if resolved_matches.is_empty() {
+        return Response::error(
+            &req.id,
+            "symbol_not_found",
+            format!("inline_symbol: no function '{}' found in {}", symbol, file),
+        );
+    }
 
-    // LSP-enhanced disambiguation (S03)
+    let candidates =
+        inline_symbol_candidates(&resolved_matches, &tree.root_node(), &source, symbol, lang);
+
+    // LSP hints may narrow declarations, but qualified calls still require the
+    // complete candidate set below because a receiver cannot be type-resolved
+    // safely from its final property name alone.
     let matches = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
-        lsp_hints::apply_lsp_disambiguation(matches, &hints)
+        lsp_hints::apply_lsp_disambiguation(resolved_matches.clone(), &hints)
     } else {
-        matches
+        resolved_matches.clone()
     };
 
-    // Find the first function/method match
-    let sym = match matches.iter().find(|m| {
-        matches!(
-            m.symbol.kind,
-            crate::symbols::SymbolKind::Function | crate::symbols::SymbolKind::Method
-        )
-    }) {
-        Some(m) => &m.symbol,
-        None => {
-            return Response::error(
+    // --- Find call expression at call_site_line ---
+    let call_line_start = edit::line_col_to_byte(&source, call_site_line, 0);
+    let call_line_end = if (call_site_line + 1) as usize <= source.lines().count() {
+        edit::line_col_to_byte(&source, call_site_line + 1, 0)
+    } else {
+        source.len()
+    };
+    let display_call_line = call_site_line + 1;
+
+    let call_nodes = find_call_nodes_at_line(
+        &tree.root_node(),
+        symbol,
+        &source,
+        call_line_start,
+        call_line_end,
+        lang,
+    );
+    if call_nodes.is_empty() {
+        return Response::error(
+            &req.id,
+            "call_not_found",
+            format!(
+                "inline_symbol: no call to '{}' found at line {} in {}",
+                symbol, display_call_line, file
+            ),
+        );
+    }
+    if call_nodes.len() > 1 {
+        let calls = call_nodes
+            .iter()
+            .map(|node| node_text(&source, node).to_string())
+            .collect::<Vec<_>>();
+        return Response::error_with_data(
+            &req.id,
+            "ambiguous_call_site",
+            format!(
+                "inline_symbol: line {} contains multiple calls named '{}'; choose a line with exactly one call",
+                display_call_line, symbol
+            ),
+            serde_json::json!({
+                "call_site_line": display_call_line,
+                "calls": calls,
+                "candidates": inline_candidates_json(&candidates),
+            }),
+        );
+    }
+    let call_node = call_nodes[0];
+    let call_form = inline_callee_form(&call_node);
+
+    // Bare identifiers can only refer to free functions. Qualified calls can
+    // only use a uniquely resolved method; guessing a receiver from the final
+    // property name can silently substitute an unrelated function body.
+    let eligible = match call_form {
+        InlineCalleeForm::Bare => matches
+            .iter()
+            .filter(|candidate| candidate.symbol.kind == SymbolKind::Function)
+            .collect::<Vec<_>>(),
+        InlineCalleeForm::Qualified => matches
+            .iter()
+            .filter(|candidate| candidate.symbol.kind == SymbolKind::Method)
+            .collect::<Vec<_>>(),
+    };
+
+    let sym = match call_form {
+        InlineCalleeForm::Bare if eligible.len() == 1 => eligible[0].symbol.clone(),
+        InlineCalleeForm::Qualified if eligible.len() == 1 && candidates.len() == 1 => {
+            eligible[0].symbol.clone()
+        }
+        InlineCalleeForm::Qualified => {
+            let callee = crate::calls::extract_full_callee(&call_node, &source)
+                .unwrap_or_else(|| node_text(&source, &call_node).to_string());
+            return unsafe_qualified_call_response(
                 &req.id,
-                "symbol_not_found",
-                format!("inline_symbol: no function '{}' found in {}", symbol, file),
+                symbol,
+                display_call_line,
+                &callee,
+                &candidates,
             );
+        }
+        InlineCalleeForm::Bare => {
+            return ambiguous_bare_call_response(&req.id, symbol, display_call_line, &candidates);
         }
     };
 
@@ -219,35 +307,6 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         .iter()
         .flat_map(InlineParam::binding_names)
         .collect::<Vec<_>>();
-
-    // --- Find call expression at call_site_line ---
-    let call_line_start = edit::line_col_to_byte(&source, call_site_line, 0);
-    let call_line_end = if (call_site_line + 1) as usize <= source.lines().count() {
-        edit::line_col_to_byte(&source, call_site_line + 1, 0)
-    } else {
-        source.len()
-    };
-
-    let call_node = match find_call_node_at_line(
-        &tree.root_node(),
-        symbol,
-        &source,
-        call_line_start,
-        call_line_end,
-        lang,
-    ) {
-        Some(n) => n,
-        None => {
-            return Response::error(
-                &req.id,
-                "call_not_found",
-                format!(
-                    "inline_symbol: no call to '{}' found at line {} in {}",
-                    symbol, call_site_line, file
-                ),
-            );
-        }
-    };
 
     // --- Determine call context ---
     let (call_context, replacement_node, assignment_var) =
@@ -1021,62 +1080,263 @@ fn strip_braces(text: &str) -> String {
     }
 }
 
-/// Find a call expression node calling `symbol` within the given byte range.
-fn find_call_node_at_line<'a>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineCalleeForm {
+    Bare,
+    Qualified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineCandidate {
+    name: String,
+    qualified: String,
+    line: u32,
+    kind: String,
+}
+
+fn inline_callee_form(call_node: &tree_sitter::Node) -> InlineCalleeForm {
+    let mut callee = call_node
+        .child_by_field_name("function")
+        .or_else(|| call_node.child(0));
+    while let Some(node) = callee {
+        if matches!(
+            node.kind(),
+            "generic_function" | "template_function" | "template_method"
+        ) {
+            callee = node
+                .child_by_field_name("function")
+                .or_else(|| node.named_child(0));
+        } else {
+            return if node.kind() == "identifier" {
+                InlineCalleeForm::Bare
+            } else {
+                InlineCalleeForm::Qualified
+            };
+        }
+    }
+
+    // A missing or unfamiliar callee shape must not be treated as a bare call.
+    // Qualified handling rejects it unless a unique method declaration exists.
+    InlineCalleeForm::Qualified
+}
+
+fn inline_symbol_candidates(
+    matches: &[SymbolMatch],
+    root: &tree_sitter::Node,
+    source: &str,
+    symbol: &str,
+    lang: LangId,
+) -> Vec<InlineCandidate> {
+    let mut candidates = matches
+        .iter()
+        .map(|candidate| {
+            let symbol = &candidate.symbol;
+            InlineCandidate {
+                name: symbol.name.clone(),
+                qualified: if symbol.scope_chain.is_empty() {
+                    symbol.name.clone()
+                } else {
+                    format!("{}::{}", symbol.scope_chain.join("::"), symbol.name)
+                },
+                line: symbol.range.start_line + 1,
+                kind: inline_symbol_kind(&symbol.kind),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // The shared symbol index currently records methods owned by classes, but
+    // object-literal methods are still declarations relevant to ambiguity. Scan
+    // those AST nodes locally so a qualified call is rejected instead of being
+    // mistaken for a same-named free function.
+    if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        collect_local_method_candidates(root, source, symbol, &mut candidates);
+    }
+
+    candidates.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.qualified.cmp(&right.qualified))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    candidates.dedup();
+    candidates
+}
+
+fn inline_symbol_kind(kind: &SymbolKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(String::from))
+        .unwrap_or_else(|| format!("{kind:?}").to_lowercase())
+}
+
+fn collect_local_method_candidates(
+    node: &tree_sitter::Node,
+    source: &str,
+    symbol: &str,
+    candidates: &mut Vec<InlineCandidate>,
+) {
+    if node.kind() == "method_definition" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            if node_text(source, &name_node) == symbol {
+                let owner = inline_method_owner(node, source);
+                candidates.push(InlineCandidate {
+                    name: symbol.to_string(),
+                    qualified: owner
+                        .map(|owner| format!("{owner}::{symbol}"))
+                        .unwrap_or_else(|| symbol.to_string()),
+                    line: node.start_position().row as u32 + 1,
+                    kind: "method".to_string(),
+                });
+            }
+        }
+    }
+
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index as u32) {
+            collect_local_method_candidates(&child, source, symbol, candidates);
+        }
+    }
+}
+
+fn inline_method_owner(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if matches!(current.kind(), "class_declaration" | "variable_declarator") {
+            if let Some(name) = current.child_by_field_name("name") {
+                return Some(node_text(source, &name).to_string());
+            }
+        }
+        ancestor = current.parent();
+    }
+    None
+}
+
+fn inline_candidates_json(candidates: &[InlineCandidate]) -> Vec<serde_json::Value> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "name": candidate.name,
+                "qualified": candidate.qualified,
+                "line": candidate.line,
+                "kind": candidate.kind,
+            })
+        })
+        .collect()
+}
+
+fn inline_candidates_text(candidates: &[InlineCandidate]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{} ({} at line {})",
+                candidate.qualified, candidate.kind, candidate.line
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unsafe_qualified_call_response(
+    request_id: &str,
+    symbol: &str,
+    call_site_line: u32,
+    callee: &str,
+    candidates: &[InlineCandidate],
+) -> Response {
+    Response::error_with_data(
+        request_id,
+        "ambiguous_call_target",
+        format!(
+            "inline_symbol: qualified call '{callee}' at line {call_site_line} cannot be safely resolved because receiver dispatch is not type-resolved; candidate declarations for '{symbol}': {}",
+            inline_candidates_text(candidates)
+        ),
+        serde_json::json!({
+            "call_site_line": call_site_line,
+            "callee": callee,
+            "candidates": inline_candidates_json(candidates),
+        }),
+    )
+}
+
+fn ambiguous_bare_call_response(
+    request_id: &str,
+    symbol: &str,
+    call_site_line: u32,
+    candidates: &[InlineCandidate],
+) -> Response {
+    Response::error_with_data(
+        request_id,
+        "ambiguous_call_target",
+        format!(
+            "inline_symbol: bare call '{symbol}' at line {call_site_line} does not resolve to exactly one free-function declaration; candidates: {}",
+            inline_candidates_text(candidates)
+        ),
+        serde_json::json!({
+            "call_site_line": call_site_line,
+            "callee": symbol,
+            "candidates": inline_candidates_json(candidates),
+        }),
+    )
+}
+
+/// Find every call named `symbol` that starts on the requested source line.
+fn find_call_nodes_at_line<'a>(
     root: &tree_sitter::Node<'a>,
     symbol: &str,
     source: &str,
     start_byte: usize,
     end_byte: usize,
     lang: LangId,
-) -> Option<tree_sitter::Node<'a>> {
-    let call_kinds: Vec<&str> = match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => vec!["call_expression"],
-        LangId::Python => vec!["call"],
-        _ => vec![],
+) -> Vec<tree_sitter::Node<'a>> {
+    let call_kinds: &[&str] = match lang {
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => &["call_expression"],
+        LangId::Python => &["call"],
+        _ => &[],
     };
-
-    find_call_recursive(root, symbol, source, start_byte, end_byte, &call_kinds)
+    let mut matches = Vec::new();
+    collect_call_nodes(
+        root,
+        symbol,
+        source,
+        start_byte,
+        end_byte,
+        call_kinds,
+        &mut matches,
+    );
+    matches
 }
 
-/// Recursively find the first call node to `symbol` in the byte range.
-fn find_call_recursive<'a>(
+fn collect_call_nodes<'a>(
     node: &tree_sitter::Node<'a>,
     symbol: &str,
     source: &str,
     start_byte: usize,
     end_byte: usize,
     call_kinds: &[&str],
-) -> Option<tree_sitter::Node<'a>> {
+    matches: &mut Vec<tree_sitter::Node<'a>>,
+) {
     if node.end_byte() <= start_byte || node.start_byte() >= end_byte {
-        return None;
+        return;
     }
 
     if call_kinds.contains(&node.kind())
         && node.start_byte() >= start_byte
         && node.start_byte() < end_byte
         && node.end_byte() <= source.len()
+        && crate::calls::extract_callee_name(node, source).as_deref() == Some(symbol)
     {
-        if let Some(callee_name) = crate::calls::extract_callee_name(node, source) {
-            if callee_name == symbol {
-                return Some(*node);
-            }
-        }
+        matches.push(*node);
     }
 
-    // Recurse depth-first
-    let child_count = node.child_count();
-    for i in 0..child_count {
-        if let Some(child) = node.child(i as u32) {
-            if let Some(found) =
-                find_call_recursive(&child, symbol, source, start_byte, end_byte, call_kinds)
-            {
-                return Some(found);
-            }
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index as u32) {
+            collect_call_nodes(
+                &child, symbol, source, start_byte, end_byte, call_kinds, matches,
+            );
         }
     }
-
-    None
 }
 
 /// Detect call context: whether the call is an assignment RHS or standalone.

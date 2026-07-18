@@ -781,3 +781,150 @@ result = twice(1 if flag else 2)
     );
     aft.shutdown();
 }
+
+#[test]
+fn inline_symbol_rejects_qualified_call_with_same_named_free_function() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("qualified_collision.ts");
+    let original = "function helper(x: number): number {\n  return x + 1;\n}\n\nconst obj = { helper(x: number) { return x * 2; } };\nconst result = obj.helper(3);\n";
+    std::fs::write(&file, original).expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"qualified-collision","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+
+    assert_eq!(
+        resp["success"], false,
+        "qualified call must reject: {resp:?}"
+    );
+    assert_eq!(resp["code"], "ambiguous_call_target");
+    let message = resp["message"].as_str().expect("error message");
+    assert!(
+        message.contains("line 6"),
+        "missing call-site line: {message}"
+    );
+    assert!(
+        message.contains("helper (function at line 1)"),
+        "missing free-function candidate: {message}"
+    );
+    assert!(
+        message.contains("obj::helper (method at line 5)"),
+        "missing object-method candidate: {message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read fixture"),
+        original,
+        "rejected inline must not mutate the file"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_bare_call_selects_free_function_despite_same_named_method() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("bare_collision.ts");
+    std::fs::write(
+        &file,
+        "function helper(x: number): number {\n  return x + 1;\n}\n\nconst obj = { helper(x: number) { return x * 2; } };\nconst result = helper(5);\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"bare-collision","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+
+    assert_eq!(resp["success"], true, "bare call should inline: {resp:?}");
+    let content = std::fs::read_to_string(&file).expect("read fixture");
+    assert!(
+        content.contains("const result = 5 + 1;"),
+        "bare call should use the free-function body:\n{content}"
+    );
+    assert!(
+        content.contains("return x * 2;"),
+        "same-named object method must remain unchanged:\n{content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_rejects_python_attribute_call_with_same_named_function() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("qualified_collision.py");
+    let original = "def helper(x):\n    return x + 1\n\nclass Obj:\n    def helper(self, x):\n        return x * 2\n\nobj = Obj()\nresult = obj.helper(3)\n";
+    std::fs::write(&file, original).expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"python-qualified-collision","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":9}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+
+    assert_eq!(
+        resp["success"], false,
+        "attribute call must reject: {resp:?}"
+    );
+    assert_eq!(resp["code"], "ambiguous_call_target");
+    let candidates = resp["candidates"].as_array().expect("candidate array");
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate["kind"] == "function" && candidate["line"] == 1),
+        "missing Python free-function candidate: {candidates:?}"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate["kind"] == "method" && candidate["line"] == 5),
+        "missing Python method candidate: {candidates:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read fixture"),
+        original,
+        "rejected inline must not mutate the file"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_preserves_unambiguous_method_inlining() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("method_only.ts");
+    std::fs::write(
+        &file,
+        "class Calculator {\n  helper(x: number): number {\n    return x * 2;\n  }\n}\nconst calculator = new Calculator();\nconst result = calculator.helper(3);\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"method-only","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":7}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "unambiguous method call should keep working: {resp:?}"
+    );
+    let content = std::fs::read_to_string(&file).expect("read fixture");
+    assert!(
+        content.contains("const result = 3 * 2;"),
+        "method body should be inlined:\n{content}"
+    );
+
+    aft.shutdown();
+}
