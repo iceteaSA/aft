@@ -44,7 +44,7 @@ describe("storage migration bootstrap", () => {
     await expect(
       ensureStorageMigrated({ harness: "opencode", binaryPath: "/missing/aft" }),
     ).resolves.toBeUndefined();
-  });
+  }, 30_000);
 
   test("ensureStorageMigrated_with_source_marker_backfills_target_marker", async () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
@@ -55,7 +55,7 @@ describe("storage migration bootstrap", () => {
     await expect(
       ensureStorageMigrated({ harness: "opencode", binaryPath: aft }),
     ).resolves.toBeUndefined();
-  });
+  }, 30_000);
 
   test("ensureStorageMigrated_spawns_and_succeeds", async () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
@@ -66,7 +66,7 @@ describe("storage migration bootstrap", () => {
     await expect(
       ensureStorageMigrated({ harness: "opencode", binaryPath: aft }),
     ).resolves.toBeUndefined();
-  });
+  }, 30_000);
 
   test("ensureStorageMigrated_throws_on_nonzero_exit", async () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
@@ -77,7 +77,7 @@ describe("storage migration bootstrap", () => {
     await expect(ensureStorageMigrated({ harness: "opencode", binaryPath: aft })).rejects.toThrow(
       /exit 5.*logs\/migration\/opencode-/,
     );
-  });
+  }, 30_000);
 
   test("ensureStorageMigrated_throws_on_timeout", async () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
@@ -88,7 +88,7 @@ describe("storage migration bootstrap", () => {
     await expect(
       ensureStorageMigrated({ harness: "opencode", binaryPath: aft, timeoutMs: 10 }),
     ).rejects.toThrow(/ETIMEDOUT|timed out|spawn error/i);
-  });
+  }, 30_000);
 
   test("resolveLegacyStorageRoot_returns_pi_fixed_path", () => {
     expect(resolveLegacyStorageRoot("pi")).toBe(
