@@ -10,7 +10,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 # Docker's default seccomp profile may reject the Landlock syscalls before the
-# kernel can report its ABI, so this spike removes that outer syscall filter.
+# kernel can report its ABI, so the runner removes that outer syscall filter.
 docker run --rm \
   --security-opt seccomp=unconfined \
   --mount "type=bind,source=${repo_root},target=/work,readonly" \
@@ -27,23 +27,20 @@ docker run --rm \
 
     echo "kernel: $(uname -srvm)"
     cargo build --quiet -p agent-file-tools --bin aft
+    cargo build --quiet --release -p agent-file-tools --bin aft
 
-    echo "Landlock feature probe:"
+    echo "Landlock support probe:"
     /tmp/aft-sandbox-s1-target/debug/aft sandbox-launch --support
 
-    echo "Runnable probe battery:"
-    cargo test --quiet -p agent-file-tools --test sandbox_launch_probe -- --test-threads=1 --nocapture
+    echo "Linux first-party probe battery:"
+    # P1/P2/P3/P6 assert the write allowlist; P4/P5/P8 assert ALLOWED plus
+    # the structured unenforced warning; P7 records hardlinks; P9 covers PTY.
+    cargo test --quiet -p agent-file-tools --test sandbox_launch_probe -- \
+      --test-threads=1 --nocapture
 
-    echo "Expected-verdict probes that nono 0.68.0 cannot satisfy on Linux:"
-    for probe in \
-      p4_nested_project_write_denies_are_enforced \
-      p5_secret_read_is_denied_and_other_reads_are_allowed \
-      p8_docker_and_agent_socket_connects_are_denied
-    do
-      if cargo test --quiet -p agent-file-tools --test sandbox_launch_probe "${probe}" -- --ignored --exact --nocapture; then
-        echo "${probe}: unexpectedly matched the desired verdict"
-      else
-        echo "${probe}: expected-verdict assertion failed (recorded spike finding)"
-      fi
-    done
+    echo "Release-build P10 overhead:"
+    cargo test --quiet --release -p agent-file-tools \
+      --test sandbox_launch_probe \
+      p10_launcher_latency_delta_is_measured_over_twenty_iterations -- \
+      --exact --nocapture
   '

@@ -35,7 +35,21 @@ fn parse_subc_arg(
 }
 
 fn main() {
-    // Handle --version flag before anything else
+    // Confinement must be installed before global argument scanning, logging,
+    // PATH discovery, or application threads. Target arguments such as
+    // `--version` belong to the command after `--`, not to AFT itself.
+    if std::env::args().nth(1).as_deref() == Some("sandbox-launch") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::sandbox_launch::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
+    // Handle --version before starting the normal application.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("aft {}", env!("CARGO_PKG_VERSION"));
         return;

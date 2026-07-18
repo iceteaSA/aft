@@ -101,6 +101,7 @@ pub mod root_cache;
 pub mod run_tool_call;
 pub mod runtime_drain;
 pub mod runtime_registry;
+pub mod sandbox_profile;
 pub mod search_index;
 pub mod semantic_index;
 pub mod subc;

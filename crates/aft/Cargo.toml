@@ -123,6 +123,9 @@ vt100 = "0.16"
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.5"
+
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
