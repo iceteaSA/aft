@@ -713,6 +713,52 @@ contract C {}
             }],
         },
         Scenario {
+            name: "java_add_remove_static_member_round_trip",
+            ext: "java",
+            input: "package com.example;\n\nimport java.util.List;\n\nclass C {}\n",
+            ops: &[
+                Op::AddForm {
+                    module: "java.util.Collections",
+                    names: &["emptyList"],
+                    namespace: None,
+                    alias: None,
+                    modifiers: &["static"],
+                    import_kind: None,
+                },
+                Op::Remove {
+                    module: "java.util.Collections",
+                    name: Some("emptyList"),
+                },
+            ],
+        },
+        Scenario {
+            name: "java_remove_static_member_keeps_sibling",
+            ext: "java",
+            input: "package com.example;\n\nimport static java.util.Collections.emptyList;\nimport static java.util.Collections.singletonList;\nimport java.util.List;\n\nclass C {}\n",
+            ops: &[Op::Remove {
+                module: "java.util.Collections",
+                name: Some("emptyList"),
+            }],
+        },
+        Scenario {
+            name: "java_remove_static_member_keeps_wildcard",
+            ext: "java",
+            input: "package com.example;\n\nimport static java.util.Collections.*;\nimport static java.util.Collections.emptyList;\n\nclass C {}\n",
+            ops: &[Op::Remove {
+                module: "java.util.Collections",
+                name: Some("emptyList"),
+            }],
+        },
+        Scenario {
+            name: "java_remove_type_removes_static_members_and_exact_import",
+            ext: "java",
+            input: "package com.example;\n\nimport static java.util.Collections.emptyList;\nimport static java.util.Collections.singletonList;\nimport java.util.Collections;\nimport java.util.List;\n\nclass C {}\n",
+            ops: &[Op::Remove {
+                module: "java.util.Collections",
+                name: None,
+            }],
+        },
+        Scenario {
             name: "java_add_static_wildcard",
             ext: "java",
             input: "package com.example;\n\nimport java.util.List;\n\nclass C {}\n",

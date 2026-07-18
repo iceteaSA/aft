@@ -61,16 +61,29 @@ fn parse_java_import_declaration(source: &str, node: &Node) -> Option<ImportStat
         }
     }
 
-    let module_path = module_path?;
+    let mut module_path = module_path?;
     if module_path.is_empty() {
         return None;
+    }
+
+    // Java static member imports use the same module-plus-names model accepted
+    // by add_import. Wildcards stay attached to the declaring type because `*`
+    // is a statement modifier rather than a removable member binding.
+    let mut names = Vec::new();
+    let is_static = modifiers.iter().any(|modifier| modifier == "static");
+    let is_wildcard = modifiers.iter().any(|modifier| modifier == "wildcard");
+    if is_static && !is_wildcard {
+        if let Some((declaring_type, member)) = module_path.rsplit_once('.') {
+            names.push(member.to_string());
+            module_path = declaring_type.to_string();
+        }
     }
 
     let group = classify_group_java(&module_path);
 
     Some(ImportStatement {
         module_path,
-        names: vec![],
+        names: names.clone(),
         default_import: None,
         namespace_import: None,
         kind: ImportKind::Value,
@@ -78,7 +91,7 @@ fn parse_java_import_declaration(source: &str, node: &Node) -> Option<ImportStat
         byte_range,
         raw_text,
         form: ImportForm::Structured {
-            named: vec![],
+            named: names,
             namespace: None,
             alias: None,
             modifiers,
@@ -153,13 +166,12 @@ mod tests {
     fn structured_modifiers(import: &ImportStatement) -> &[String] {
         match &import.form {
             ImportForm::Structured {
-                named,
+                named: _,
                 namespace,
                 alias,
                 modifiers,
                 import_kind,
             } => {
-                assert!(named.is_empty());
                 assert!(namespace.is_none());
                 assert!(alias.is_none());
                 assert!(import_kind.is_none());
@@ -222,10 +234,12 @@ mod tests {
         assert_eq!(block.imports[0].group, ImportGroup::Stdlib);
         assert!(structured_modifiers(&block.imports[0]).is_empty());
 
-        assert_eq!(
-            block.imports[1].module_path,
-            "java.util.Collections.emptyList"
-        );
+        assert_eq!(block.imports[1].module_path, "java.util.Collections");
+        assert_eq!(block.imports[1].names, ["emptyList"]);
+        match &block.imports[1].form {
+            ImportForm::Structured { named, .. } => assert_eq!(named, &["emptyList"]),
+            other => panic!("expected Structured form, got {other:?}"),
+        }
         assert_eq!(
             structured_modifiers(&block.imports[1]),
             &["static".to_string()]
@@ -238,6 +252,7 @@ mod tests {
         );
 
         assert_eq!(block.imports[3].module_path, "java.util.Arrays");
+        assert!(block.imports[3].names.is_empty());
         assert_eq!(
             structured_modifiers(&block.imports[3]),
             &["static".to_string(), "wildcard".to_string()]

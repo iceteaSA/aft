@@ -1077,6 +1077,116 @@ fn remove_import_preserves_default_when_named_removed() {
     aft.shutdown();
 }
 
+#[test]
+fn java_static_member_add_then_remove_round_trip() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("StaticRoundTrip.java");
+    let original = "package com.example;\n\nimport java.util.List;\n\nclass C {}\n";
+    fs::write(&file, original).unwrap();
+    let file_str = file.display().to_string();
+
+    let add = aft.send(
+        &serde_json::json!({
+            "id": "java-static-add",
+            "command": "add_import",
+            "file": file_str,
+            "module": "java.util.Collections",
+            "names": ["emptyList"],
+            "modifiers": ["static"],
+        })
+        .to_string(),
+    );
+    assert_eq!(add["success"], true, "add should succeed: {add:?}");
+    assert_eq!(add["added"], true, "member import should be added: {add:?}");
+    assert!(
+        fs::read_to_string(&file)
+            .unwrap()
+            .contains("import static java.util.Collections.emptyList;"),
+        "add should generate the requested static member import"
+    );
+
+    let remove = send_remove_import(
+        &mut aft,
+        "java-static-remove",
+        &file_str,
+        "java.util.Collections",
+        Some("emptyList"),
+    );
+    assert_eq!(remove["success"], true, "remove should succeed: {remove:?}");
+    assert_eq!(
+        remove["removed"], true,
+        "member import should be removed: {remove:?}"
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    aft.shutdown();
+}
+
+#[test]
+fn java_remove_module_removes_static_members_and_exact_import() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("RemoveStaticType.java");
+    fs::write(
+        &file,
+        "package com.example;\n\nimport static java.util.Collections.emptyList;\nimport static java.util.Collections.singletonList;\nimport java.util.Collections;\nimport java.util.List;\n\nclass C {}\n",
+    )
+    .unwrap();
+    let file_str = file.display().to_string();
+
+    let remove = send_remove_import(
+        &mut aft,
+        "java-static-remove-type",
+        &file_str,
+        "java.util.Collections",
+        None,
+    );
+    assert_eq!(remove["success"], true, "remove should succeed: {remove:?}");
+    assert_eq!(
+        remove["removed"], true,
+        "imports should be removed: {remove:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "package com.example;\n\nimport java.util.List;\n\nclass C {}\n"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn java_remove_static_member_keeps_sibling_and_wildcard() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("RemoveOneStaticMember.java");
+    fs::write(
+        &file,
+        "package com.example;\n\nimport static java.util.Collections.*;\nimport static java.util.Collections.emptyList;\nimport static java.util.Collections.singletonList;\n\nclass C {}\n",
+    )
+    .unwrap();
+    let file_str = file.display().to_string();
+
+    let remove = send_remove_import(
+        &mut aft,
+        "java-static-remove-one",
+        &file_str,
+        "java.util.Collections",
+        Some("emptyList"),
+    );
+    assert_eq!(remove["success"], true, "remove should succeed: {remove:?}");
+    assert_eq!(
+        remove["removed"], true,
+        "member should be removed: {remove:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "package com.example;\n\nimport static java.util.Collections.*;\nimport static java.util.Collections.singletonList;\n\nclass C {}\n"
+    );
+
+    aft.shutdown();
+}
+
 // ===========================================================================
 // organize_imports tests
 // ===========================================================================
