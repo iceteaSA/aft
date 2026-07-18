@@ -74,7 +74,7 @@ pub(crate) fn spawn_pty_for_command(
                 spawn_plan,
                 task_id,
                 session_id,
-                shell.binary().as_ref(),
+                std::ffi::OsStr::new(shell.binary().as_ref()),
                 &args,
                 paths,
                 workdir,
