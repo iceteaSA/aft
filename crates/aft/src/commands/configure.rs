@@ -6735,6 +6735,27 @@ mod tests {
             }
         }
 
+        // Watcher teardown happens on a detached reaper thread, so drops land
+        // asynchronously; the count must still reach the exact expected value.
+        fn wait_for_drop_count(
+            drops: &Arc<std::sync::atomic::AtomicUsize>,
+            expected: usize,
+            what: &str,
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let observed = drops.load(Ordering::SeqCst);
+                if observed == expected {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: expected={expected}, observed={observed}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
         let root1 = tempfile::tempdir().unwrap();
         let root2 = tempfile::tempdir().unwrap();
         let root3 = tempfile::tempdir().unwrap();
@@ -6767,11 +6788,7 @@ mod tests {
                 })
             },
         );
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            1,
-            "first watcher should be dropped on reconfigure"
-        );
+        wait_for_drop_count(&drops, 1, "first watcher should be dropped on reconfigure");
 
         let drops_for_watcher = Arc::clone(&drops);
         install_project_watcher_with(
@@ -6785,17 +6802,13 @@ mod tests {
                 })
             },
         );
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            2,
-            "second watcher should be dropped on reconfigure"
-        );
+        wait_for_drop_count(&drops, 2, "second watcher should be dropped on reconfigure");
 
         ctx.stop_watcher_runtime();
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
+        wait_for_drop_count(
+            &drops,
             3,
-            "final watcher should be dropped on explicit shutdown"
+            "final watcher should be dropped on explicit shutdown",
         );
     }
 
