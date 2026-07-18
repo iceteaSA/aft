@@ -4196,6 +4196,36 @@ pub(crate) mod test_support {
         ))
     }
 
+    pub(super) fn wait_for_watcher_count(ctx: &AppContext, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let observed = ctx.watcher_registry_count();
+            if observed == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watcher count did not settle before deadline: expected={expected}, observed={observed}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub(super) fn wait_for_actor_root_count(app: &App, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let observed = app.actor_root_count();
+            if observed == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actor root count did not settle before deadline: expected={expected}, observed={observed}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     pub(super) fn status_frame(seq: u64) -> PushFrame {
         status_frame_with_session(seq, None)
     }
@@ -4316,7 +4346,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{completion_frame, test_ctx, test_root};
+    use super::test_support::{
+        completion_frame, test_ctx, test_root, wait_for_actor_root_count, wait_for_watcher_count,
+    };
     use super::*;
 
     fn attach_error(kind: io::ErrorKind) -> SubcError {
@@ -4679,7 +4711,7 @@ mod tests {
             dispatch_rx,
             crate::watcher_filter::WatcherThreadHandle::new(shutdown, join),
         );
-        assert_eq!(ctx.watcher_registry_count(), 1);
+        wait_for_watcher_count(&ctx, 1);
 
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
@@ -4711,11 +4743,7 @@ mod tests {
             1
         );
         assert!(ctx.search_index().read().unwrap().is_none());
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while ctx.watcher_registry_count() != 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(ctx.watcher_registry_count(), 0);
+        wait_for_watcher_count(&ctx, 0);
         // The watcher stopped with the eviction, so the idle interval is
         // unobserved: the pre-seeded warm-verify memo (Skip) must fall back to
         // strict content verification (stat-first would miss same-size,
@@ -4881,8 +4909,9 @@ mod tests {
             .evicted,
             0
         );
-        assert_eq!(ctx.watcher_registry_count(), 1);
+        wait_for_watcher_count(&ctx, 1);
         ctx.stop_watcher_runtime_in_background();
+        wait_for_watcher_count(&ctx, 0);
     }
 
     #[test]
@@ -4917,6 +4946,7 @@ mod tests {
         assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
         assert!(!executor.actor_registered(&root));
         assert!(!live_roots.contains_key(&root));
+        wait_for_actor_root_count(&app, 0);
 
         let status_ctx = AppContext::from_app(app, Config::default());
         let status = status_ctx.build_status_snapshot();

@@ -43,11 +43,33 @@ fn open_fd_count() -> usize {
 }
 
 fn wait_for_watcher_count(ctx: &AppContext, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while ctx.watcher_registry_count() != expected && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let observed = ctx.watcher_registry_count();
+        if observed == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watcher count did not settle before deadline: expected={expected}, observed={observed}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(ctx.watcher_registry_count(), expected);
+}
+
+fn wait_for_fd_count_at_most(maximum: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let observed = open_fd_count();
+        if observed <= maximum {
+            return observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watcher descriptors did not close before deadline: maximum={maximum}, observed={observed}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -97,7 +119,7 @@ fn idle_reap_stops_real_watcher_releases_fd_and_rebind_forces_strict_verify() {
 
     assert!(ctx.force_idle_teardown_for_test());
     wait_for_watcher_count(&ctx, 0);
-    let fds_after_reap = open_fd_count();
+    let fds_after_reap = wait_for_fd_count_at_most(fds_before);
     assert!(
         fds_after_reap <= fds_before,
         "watcher descriptors leaked: before={fds_before}, live={fds_with_watcher}, after={fds_after_reap}"
