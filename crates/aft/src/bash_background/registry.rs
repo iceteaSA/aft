@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::compress::caps::DropClass;
 use crate::compress::CompressionResult;
 use crate::context::SharedProgressSender;
+use crate::db::compression_events::CompressionAggregateCache;
 use crate::harness::Harness;
 use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, PushFrame};
 
@@ -232,6 +233,7 @@ pub(crate) struct RegistryInner {
         Mutex<Option<Box<dyn Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     pub(crate) db_harness: RwLock<Option<String>>,
+    pub(crate) compression_aggregates: Arc<CompressionAggregateCache>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
     pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
     pub(crate) watch_registry: Mutex<WatchRegistry>,
@@ -300,6 +302,7 @@ impl BgTaskRegistry {
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_harness: RwLock::new(None),
+                compression_aggregates: Arc::new(CompressionAggregateCache::default()),
                 wake_tx,
                 wake_rx,
                 watch_registry: Mutex::new(WatchRegistry::default()),
@@ -348,12 +351,18 @@ impl BgTaskRegistry {
         if let Ok(mut slot) = self.inner.db_pool.write() {
             *slot = Some(conn);
         }
+        self.inner.compression_aggregates.clear();
     }
 
     pub fn clear_db_pool(&self) {
         if let Ok(mut slot) = self.inner.db_pool.write() {
             *slot = None;
         }
+        self.inner.compression_aggregates.clear();
+    }
+
+    pub(crate) fn compression_aggregate_cache(&self) -> Arc<CompressionAggregateCache> {
+        Arc::clone(&self.inner.compression_aggregates)
     }
 
     pub fn begin_wait_mode_session(&self, session_id: &str) {
@@ -2626,7 +2635,13 @@ impl BgTaskRegistry {
             }
         };
         match crate::db::compression_events::insert_compression_event(&conn, &row) {
-            Ok(_) => {
+            Ok(Some(row_id)) => {
+                // The database mutex remains held while the matching warm entries
+                // advance, so status cannot observe the durable row without its
+                // in-process aggregate delta.
+                self.inner
+                    .compression_aggregates
+                    .record_successful_insert(&conn, &row, row_id);
                 // DEBUG-level: each foreground bash call records one of these,
                 // which clutters info-level logs without adding diagnostic value.
                 // Aggregate totals are visible via the status RPC / TUI sidebar.
@@ -2637,6 +2652,14 @@ impl BgTaskRegistry {
                     metadata.session_id,
                     original_tokens,
                     compressed_tokens
+                );
+            }
+            Ok(None) => {
+                crate::slog_debug!(
+                    "duplicate compression event ignored for {} (project={}, session={})",
+                    metadata.task_id,
+                    project_key,
+                    metadata.session_id
                 );
             }
             Err(error) => {

@@ -1473,6 +1473,7 @@ pub struct AppContext {
     /// same counts independently.
     status_bar_last_emitted: RwLock<Option<StatusBarCounts>>,
     status_bar_cached: RwLock<StatusBarCache>,
+    compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
@@ -1709,6 +1710,8 @@ impl AppContext {
         // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
         // so the documented `lsp.diagnostic_cache_size` knob takes effect.
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
+        let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
+        let compression_aggregates = bash_background.compression_aggregate_cache();
         let context = AppContext {
             app: Arc::clone(&app),
             provider,
@@ -1801,7 +1804,8 @@ impl AppContext {
             status_emitter,
             status_bar_last_emitted: RwLock::new(None),
             status_bar_cached: RwLock::new(StatusBarCache::default()),
-            bash_background: BgTaskRegistry::new(Arc::clone(&progress_sender)),
+            compression_aggregates,
+            bash_background,
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
             )),
@@ -2914,14 +2918,22 @@ impl AppContext {
 
     pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
         self.app.set_db(conn);
+        self.compression_aggregates.clear();
     }
 
     pub fn clear_db(&self) {
         self.app.clear_db();
+        self.compression_aggregates.clear();
     }
 
     pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
         self.app.db()
+    }
+
+    pub(crate) fn compression_aggregate_cache(
+        &self,
+    ) -> &crate::db::compression_events::CompressionAggregateCache {
+        self.compression_aggregates.as_ref()
     }
 
     /// Access an owned configuration snapshot.
