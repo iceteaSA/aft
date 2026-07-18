@@ -42,8 +42,13 @@ fn open_fd_count() -> usize {
         .count()
 }
 
+// 90s: FSEvents teardown is a mach RPC that can take tens of seconds when the
+// host fseventsd is saturated by other watcher-heavy processes; the assertion
+// stays strict, only the settle window is generous.
+const SETTLE_BUDGET: Duration = Duration::from_secs(90);
+
 fn wait_for_watcher_count(ctx: &AppContext, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + SETTLE_BUDGET;
     loop {
         let observed = ctx.watcher_registry_count();
         if observed == expected {
@@ -58,7 +63,7 @@ fn wait_for_watcher_count(ctx: &AppContext, expected: usize) {
 }
 
 fn wait_for_fd_count_at_most(maximum: usize) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + SETTLE_BUDGET;
     loop {
         let observed = open_fd_count();
         if observed <= maximum {
