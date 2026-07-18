@@ -18,6 +18,7 @@ use crate::context::SharedProgressSender;
 use crate::db::compression_events::CompressionAggregateCache;
 use crate::harness::Harness;
 use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, PushFrame};
+use crate::sandbox_spawn::SpawnPlan;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -660,6 +661,7 @@ impl BgTaskRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &self,
+        spawn_plan: SpawnPlan,
         command: &str,
         session_id: String,
         workdir: PathBuf,
@@ -708,7 +710,7 @@ impl BgTaskRegistry {
         create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
 
-        let child = match spawn_detached_child(command, &paths, &workdir, &env) {
+        let child = match spawn_detached_child(&spawn_plan, command, &paths, &workdir, &env) {
             Ok(child) => child,
             Err(error) => {
                 crate::slog_warn!("failed to spawn background bash task {task_id}; deleting partial bundle: {error}");
@@ -753,6 +755,7 @@ impl BgTaskRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_pty(
         &self,
+        spawn_plan: SpawnPlan,
         command: &str,
         session_id: String,
         workdir: PathBuf,
@@ -801,6 +804,7 @@ impl BgTaskRegistry {
             .map_err(|e| format!("failed to create PTY capture file: {e}"))?;
 
         let runtime = match spawn_pty_for_command(
+            &spawn_plan,
             &task_id,
             &session_id,
             command,
@@ -862,6 +866,7 @@ impl BgTaskRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &self,
+        spawn_plan: SpawnPlan,
         command: &str,
         session_id: String,
         workdir: PathBuf,
@@ -912,7 +917,7 @@ impl BgTaskRegistry {
         create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
 
-        let child = match spawn_detached_child(command, &paths, &workdir, &env) {
+        let child = match spawn_detached_child(&spawn_plan, command, &paths, &workdir, &env) {
             Ok(child) => child,
             Err(error) => {
                 crate::slog_warn!("failed to spawn background bash task {task_id}; deleting partial bundle: {error}");
@@ -3972,19 +3977,31 @@ fn write_unix_command_script(command: &str, paths: &TaskPaths) -> Result<PathBuf
 }
 
 #[cfg(unix)]
-fn detached_shell_command(command_script: &Path, exit_path: &Path) -> Command {
+fn detached_shell_command(
+    spawn_plan: &SpawnPlan,
+    command_script: &Path,
+    exit_path: &Path,
+    paths: &TaskPaths,
+) -> Result<Command, String> {
     let shell = resolve_posix_shell();
-    let mut cmd = crate::effective_path::new_command(&shell);
     // Keep the user-provided command body out of argv and shell `-c` parsing.
     // The direct child is still a tiny wrapper so it can write the authoritative
     // exit marker after the command script exits (including if that script calls
     // `exit`). Passing only file paths through `-c` avoids newline/quote/length
     // edge cases where a multi-command script can be mangled before execution.
-    cmd.arg("-c")
-        .arg(r#""$0" "$1"; code=$?; printf "%s" "$code" > "$2.tmp.$$"; mv -f "$2.tmp.$$" "$2""#)
-        .arg(&shell)
-        .arg(command_script)
-        .arg(exit_path);
+    let args = vec![
+        "-c".into(),
+        r#""$0" "$1"; code=$?; printf "%s" "$code" > "$2.tmp.$$"; mv -f "$2.tmp.$$" "$2""#.into(),
+        shell.as_os_str().to_os_string(),
+        command_script.as_os_str().to_os_string(),
+        exit_path.as_os_str().to_os_string(),
+    ];
+    let mut cmd = crate::sandbox_spawn::detached_command_for_plan(
+        spawn_plan,
+        shell.as_os_str(),
+        &args,
+        &paths.json,
+    )?;
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -3993,7 +4010,7 @@ fn detached_shell_command(command_script: &Path, exit_path: &Path) -> Command {
             Ok(())
         });
     }
-    cmd
+    Ok(cmd)
 }
 
 #[cfg(unix)]
@@ -4111,6 +4128,7 @@ fn detached_shell_command_for(
 /// return immediately without retry — they indicate a problem with the
 /// resolved shell that retrying with a different shell won't fix.
 fn spawn_detached_child(
+    spawn_plan: &SpawnPlan,
     command: &str,
     paths: &TaskPaths,
     workdir: &Path,
@@ -4123,7 +4141,7 @@ fn spawn_detached_child(
         let stderr = create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
         let command_script = write_unix_command_script(command, paths)?;
-        detached_shell_command(&command_script, &paths.exit)
+        detached_shell_command(spawn_plan, &command_script, &paths.exit, paths)?
             .current_dir(workdir)
             .envs(env)
             .stdin(Stdio::null())
@@ -4135,6 +4153,11 @@ fn spawn_detached_child(
     #[cfg(windows)]
     {
         use crate::windows_shell::shell_candidates;
+        match spawn_plan {
+            SpawnPlan::Unsandboxed => {}
+            SpawnPlan::Refused { code } => return Err((*code).to_string()),
+            SpawnPlan::Launcher { .. } => return Err("sandbox_unavailable".to_string()),
+        }
         // Spawn priority: pwsh → powershell → git-bash → cmd. Same as the
         // legacy foreground bash spawn path. v0.20 routes ALL bash through
         // this background spawn helper, including foreground tool calls
@@ -4645,6 +4668,7 @@ mod tests {
             let session_id = format!("session-{name}");
             let task_id = registry
                 .spawn(
+                    SpawnPlan::Unsandboxed,
                     command,
                     session_id.clone(),
                     dir.path().to_path_buf(),
@@ -5196,6 +5220,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn_pty(
+                SpawnPlan::Unsandboxed,
                 QUICK_SUCCESS_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5275,6 +5300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 LONG_RUNNING_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5347,6 +5373,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 LONG_RUNNING_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5403,6 +5430,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 QUICK_SUCCESS_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5436,6 +5464,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 QUICK_SUCCESS_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5470,6 +5499,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 QUICK_SUCCESS_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5645,6 +5675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 QUICK_SUCCESS_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5807,6 +5838,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 QUICK_SUCCESS_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5905,6 +5937,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 QUICK_SUCCESS_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),
@@ -5980,6 +6013,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
+                SpawnPlan::Unsandboxed,
                 LONG_RUNNING_COMMAND,
                 "session".to_string(),
                 dir.path().to_path_buf(),

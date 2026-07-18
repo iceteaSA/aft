@@ -583,4 +583,196 @@ mod tests {
             "empty list must report no-attempt error: {err}"
         );
     }
+
+    fn spawn_test_context(project_root: &Path, storage_dir: &Path) -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project_root.to_path_buf()),
+                storage_dir: Some(storage_dir.to_path_buf()),
+                experimental_bash_background: true,
+                ..crate::config::Config::default()
+            },
+        )
+    }
+
+    fn spawn_test_request(id: &str, command: &str, background: bool) -> RawRequest {
+        serde_json::from_value(json!({
+            "id": id,
+            "command": "bash",
+            "session_id": "sandbox-spawn-test",
+            "params": {
+                "command": command,
+                "background": background,
+                "compressed": false,
+            },
+        }))
+        .unwrap()
+    }
+
+    fn stop_spawned_test_task(ctx: &AppContext, response: &Response) {
+        if let Some(task_id) = response
+            .data
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            let _ = ctx.bash_background().kill(task_id, "sandbox-spawn-test");
+        }
+    }
+
+    #[test]
+    fn foreground_and_background_bash_both_resolve_a_spawn_plan() {
+        use crate::sandbox_spawn::{
+            clear_sandbox_spawn_test_seam, install_sandbox_spawn_test_seam,
+            sandbox_spawn_test_observations, AuthenticatedPrincipal, RequestedSandboxTier,
+            SandboxTaskKind,
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        install_sandbox_spawn_test_seam(project.path().to_path_buf());
+
+        let foreground = handle(
+            &spawn_test_request("sandbox-foreground", "echo foreground", false),
+            &ctx,
+        );
+        assert!(
+            foreground.success,
+            "foreground spawn failed: {foreground:?}"
+        );
+        let background = handle(
+            &spawn_test_request("sandbox-background", "echo background", true),
+            &ctx,
+        );
+        assert!(
+            background.success,
+            "background spawn failed: {background:?}"
+        );
+
+        let observations = sandbox_spawn_test_observations(project.path());
+        clear_sandbox_spawn_test_seam(project.path());
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.task_kind)
+                .collect::<Vec<_>>(),
+            vec![
+                SandboxTaskKind::BashForeground,
+                SandboxTaskKind::BashBackground,
+            ]
+        );
+        assert!(observations.iter().all(|observation| {
+            observation.principal == AuthenticatedPrincipal::FirstParty
+                && observation.requested_tier == RequestedSandboxTier::Disabled
+        }));
+
+        stop_spawned_test_task(&ctx, &foreground);
+        stop_spawned_test_task(&ctx, &background);
+    }
+
+    #[test]
+    fn refused_test_plan_fails_closed_before_process_creation() {
+        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let sentinel = project.path().join("must-not-exist");
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let request = spawn_test_request(
+            "sandbox-refused",
+            &format!("touch {}", sentinel.display()),
+            false,
+        );
+
+        let response = with_spawn_plan_for_test(
+            SpawnPlan::refused_for_test("sandbox_principal_unknown"),
+            || handle(&request, &ctx),
+        );
+
+        assert!(!response.success);
+        assert_eq!(
+            response
+                .data
+                .get("code")
+                .and_then(serde_json::Value::as_str),
+            Some("sandbox_principal_unknown")
+        );
+        assert!(!sentinel.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_test_plan_wraps_the_spawned_command_line() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        use crate::sandbox_profile::SandboxProfile;
+        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let args_log = project.path().join("launcher-args.txt");
+        let launcher = project.path().join("fake-sandbox-launcher.sh");
+        fs::write(
+            &launcher,
+            r#"#!/bin/sh
+printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
+mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
+[ "$1" = "--profile-fd" ] || exit 91
+[ "$2" = "9" ] || exit 92
+[ "$3" = "--" ] || exit 93
+shift 3
+exec "$@"
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&launcher, permissions).unwrap();
+
+        let profile = SandboxProfile::build(
+            vec![project.path().to_path_buf()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            storage.path().to_path_buf(),
+        )
+        .unwrap();
+        let plan = SpawnPlan::launcher_for_test(profile, launcher.clone());
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "sandbox-launcher",
+            "command": "bash",
+            "session_id": "sandbox-spawn-test",
+            "params": {
+                "command": "printf launcher-wrapped",
+                "compressed": false,
+                "env": { "AFT_TEST_LAUNCH_ARGS": args_log.to_string_lossy() },
+            },
+        }))
+        .unwrap();
+
+        let response = with_spawn_plan_for_test(plan, || handle(&request, &ctx));
+        assert!(response.success, "launcher spawn failed: {response:?}");
+
+        let started = Instant::now();
+        while !args_log.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "fake launcher did not record its argv"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let args = fs::read_to_string(&args_log).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert_eq!(lines[0], launcher.to_string_lossy());
+        assert_eq!(&lines[1..4], &["--profile-fd", "9", "--"]);
+        assert!(lines.len() >= 6, "wrapped argv missing target: {lines:?}");
+
+        stop_spawned_test_task(&ctx, &response);
+    }
 }

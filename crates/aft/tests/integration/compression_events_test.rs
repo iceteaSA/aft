@@ -43,6 +43,7 @@ fn fresh_registry(conn: Arc<Mutex<Connection>>, harness: Harness) -> BgTaskRegis
 fn spawn_task(registry: &BgTaskRegistry, storage: &Path, project: &Path, command: &str) -> String {
     registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             command,
             SESSION.to_string(),
             project.to_path_buf(),

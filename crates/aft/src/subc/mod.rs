@@ -37,6 +37,7 @@ use crate::run_tool_call::{
     ToolCallResult,
 };
 use crate::runtime_drain;
+use crate::sandbox_spawn::{AuthenticatedPrincipal, PrincipalTrust};
 
 use subc_protocol::manifest::{
     Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
@@ -255,6 +256,13 @@ impl BindTrust {
             Self::Untrusted => "untrusted",
         }
     }
+
+    fn sandbox_trust(self) -> PrincipalTrust {
+        match self {
+            Self::FirstParty => PrincipalTrust::FirstParty,
+            Self::Untrusted => PrincipalTrust::Untrusted,
+        }
+    }
 }
 
 pub(super) fn trust_for_principal(principal: &Option<Principal>) -> BindTrust {
@@ -286,13 +294,17 @@ pub(super) fn trust_for_bind(harness: &str, principal: &Option<Principal>) -> Bi
     }
 }
 
-fn principal_label(principal: &Option<Principal>) -> String {
+fn principal_id(principal: &Option<Principal>) -> Option<String> {
     match principal {
-        Some(Principal::Direct) => "direct".to_string(),
-        Some(Principal::Reserved { module_id }) => format!("reserved:{module_id}"),
-        Some(Principal::Unverified) => "unverified".to_string(),
-        None => "absent".to_string(),
+        Some(Principal::Direct) => Some("direct".to_string()),
+        Some(Principal::Reserved { module_id }) => Some(format!("reserved:{module_id}")),
+        Some(Principal::Unverified) => Some("unverified".to_string()),
+        None => None,
     }
+}
+
+fn principal_label(principal: &Option<Principal>) -> String {
+    principal_id(principal).unwrap_or_else(|| "absent".to_string())
 }
 
 #[derive(Debug)]
@@ -355,6 +367,7 @@ struct RouteIdentityData {
     harness: String,
     session: String,
     trust: BindTrust,
+    spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
 }
 
@@ -426,6 +439,7 @@ struct PendingBashAsk {
     root: ProjectRootId,
     project_root: PathBuf,
     session_id: String,
+    spawn_principal: AuthenticatedPrincipal,
     request_id: String,
     arguments: Value,
     format_context: crate::subc_format::FormatContext,
@@ -1273,6 +1287,7 @@ async fn handle_bash_elicitation_reply(
                 pending.format_context,
                 pending.cancel,
                 BindTrust::Untrusted,
+                pending.spawn_principal,
                 Some(pending.grants),
             );
             return Ok(());
@@ -3304,6 +3319,7 @@ async fn handle_control_request(
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
             let bind_trust = trust_for_bind(&bind_harness, &principal);
+            let bind_principal_id = principal_id(&principal);
             // Typed capability declaration from the consumer: the facade stamps it
             // from the MCP host's initialize-advertised capabilities. Absent
             // means no reverse-request capability — flat deny, fail-closed. A
@@ -3368,6 +3384,15 @@ async fn handle_control_request(
                 harness: bind_harness.clone(),
                 session: bind_session.clone(),
                 trust: bind_trust,
+                spawn_principal: AuthenticatedPrincipal::RouteBind {
+                    trust: bind_trust.sandbox_trust(),
+                    route_channel,
+                    route_epoch: epoch,
+                    project_root: PathBuf::from(&bind_project_root),
+                    harness: bind_harness.clone(),
+                    session_id: bind_session.clone(),
+                    principal_id: bind_principal_id,
+                },
                 consumer_elicitation_capable,
             }));
             let configure_session = route_identity.session.clone();
@@ -3814,6 +3839,7 @@ async fn handle_tool_call(
                     root: identity.root.clone(),
                     project_root: identity.project_root.clone(),
                     session_id: identity.session.clone(),
+                    spawn_principal: identity.spawn_principal.clone(),
                     request_id,
                     arguments,
                     format_context,
@@ -3863,6 +3889,7 @@ async fn handle_tool_call(
             format_context,
             cancel,
             bind_trust,
+            identity.spawn_principal.clone(),
             None,
         );
         return Ok(());
@@ -4314,6 +4341,18 @@ pub(crate) mod test_support {
             harness: "opencode".to_string(),
             session: session_id.to_string(),
             trust,
+            spawn_principal: AuthenticatedPrincipal::RouteBind {
+                trust: trust.sandbox_trust(),
+                route_channel: 0,
+                route_epoch: 0,
+                project_root: root.as_path().to_path_buf(),
+                harness: "opencode".to_string(),
+                session_id: session_id.to_string(),
+                principal_id: Some(match trust {
+                    BindTrust::FirstParty => "direct".to_string(),
+                    BindTrust::Untrusted => "unverified".to_string(),
+                }),
+            },
             consumer_elicitation_capable: false,
         }))
     }
@@ -5696,6 +5735,7 @@ mod tests {
             harness: "opencode".to_string(),
             session: "b2-session".to_string(),
             trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
         }));
         let replay_key = push::ReplayKey::from_identity(&identity);

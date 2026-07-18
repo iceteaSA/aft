@@ -226,6 +226,7 @@ pub(super) fn submit_deferred_bash(
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     bind_trust: BindTrust,
+    spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     permissions_granted: Option<Vec<String>>,
 ) {
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
@@ -297,7 +298,10 @@ pub(super) fn submit_deferred_bash(
                     session_id: Some(session_for_spawn.clone()),
                     params: Value::Object(translated.args),
                 };
-                let response = dispatch(raw_req, ctx);
+                let response =
+                    crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
+                        dispatch(raw_req, ctx)
+                    });
                 if !response.success {
                     return finish_bash_spawn_immediate(
                         response,

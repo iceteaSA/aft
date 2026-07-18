@@ -2039,6 +2039,16 @@ fn subc_bridge_bg_events_idle_completion_wake_lane() {
 }
 
 #[test]
+fn subc_bridge_bash_resolver_receives_route_bind_principals() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_resolver_receives_route_bind_principals",
+        Duration::from_secs(45),
+        drive_bash_resolver_principal_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_principal_trust_enforces_restrict_and_bash_deny() {
     run_subc_bridge_test(
         "subc_bridge_principal_trust_enforces_restrict_and_bash_deny",
@@ -5650,6 +5660,112 @@ async fn drive_first_party_bash_permission_required_regression_daemon(input: Fak
         !touched.exists(),
         "permission_required must not spawn before a grant"
     );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
+    use aft::sandbox_spawn::{
+        clear_sandbox_spawn_test_seam, install_sandbox_spawn_test_seam,
+        sandbox_spawn_test_observations, AuthenticatedPrincipal, PrincipalTrust,
+        RequestedSandboxTier, SandboxTaskKind,
+    };
+
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    let seam_root = std::fs::canonicalize(&root1).expect("canonical test root");
+    install_sandbox_spawn_test_seam(seam_root.clone());
+
+    bind_route_with_principal(
+        &mut stream,
+        1,
+        101,
+        &root1,
+        "opencode",
+        "first-party-principal-session",
+        Some(Principal::Direct),
+    )
+    .await;
+    send_tool_call(
+        &mut stream,
+        1,
+        102,
+        "bash",
+        json!({ "command": "echo first-party-principal", "compressed": false }),
+    )
+    .await;
+    let first_party = read_frame_timeout(&mut stream, "first-party principal bash").await;
+    assert!(!tool_result_is_error(&first_party));
+
+    bind_untrusted_elicitation_route(&mut stream, 2, 201, &root1).await;
+    send_tool_call(
+        &mut stream,
+        2,
+        202,
+        "bash",
+        json!({ "command": "echo untrusted-principal", "compressed": false }),
+    )
+    .await;
+    let (ask_corr, _) = expect_bash_elicitation_request(&mut stream, 2, "echo").await;
+    send_bash_elicitation_reply(
+        &mut stream,
+        2,
+        ask_corr,
+        json!({ "action": "accept", "content": { "decision": "allow" } }),
+    )
+    .await;
+    let untrusted = read_frame_timeout(&mut stream, "untrusted principal bash").await;
+    assert!(!tool_result_is_error(&untrusted));
+
+    let observations = sandbox_spawn_test_observations(&seam_root);
+    clear_sandbox_spawn_test_seam(&seam_root);
+    assert_eq!(observations.len(), 2, "observations: {observations:?}");
+    assert!(observations.iter().all(|observation| {
+        observation.requested_tier == RequestedSandboxTier::Disabled
+            && observation.task_kind == SandboxTaskKind::BashForeground
+    }));
+
+    match &observations[0].principal {
+        AuthenticatedPrincipal::RouteBind {
+            trust,
+            route_channel,
+            route_epoch,
+            project_root,
+            harness,
+            session_id,
+            principal_id,
+        } => {
+            assert_eq!(*trust, PrincipalTrust::FirstParty);
+            assert_eq!(*route_channel, 1);
+            assert_eq!(*route_epoch, 1);
+            assert_eq!(project_root, &root1);
+            assert_eq!(harness, "opencode");
+            assert_eq!(session_id, "first-party-principal-session");
+            assert_eq!(principal_id.as_deref(), Some("direct"));
+        }
+        principal => panic!("expected bound first-party principal, got {principal:?}"),
+    }
+    match &observations[1].principal {
+        AuthenticatedPrincipal::RouteBind {
+            trust,
+            route_channel,
+            route_epoch,
+            project_root,
+            harness,
+            session_id,
+            principal_id,
+        } => {
+            assert_eq!(*trust, PrincipalTrust::Untrusted);
+            assert_eq!(*route_channel, 2);
+            assert_eq!(*route_epoch, 1);
+            assert_eq!(project_root, &root1);
+            assert_eq!(harness, "runner");
+            assert_eq!(session_id, "elicitation-session-2");
+            assert_eq!(principal_id.as_deref(), Some("reserved:subc-mcp"));
+        }
+        principal => panic!("expected bound untrusted principal, got {principal:?}"),
+    }
 
     send_connection_goodbye(&mut stream).await;
 }

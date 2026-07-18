@@ -14,6 +14,9 @@ pub mod watches;
 
 use crate::context::AppContext;
 use crate::protocol::Response;
+use crate::sandbox_spawn::{
+    current_authenticated_principal, resolve_sandbox_spawn, RequestedSandboxTier, SandboxTaskKind,
+};
 use persistence::BgMode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -106,8 +109,27 @@ pub fn spawn(
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
 
     let env = env.unwrap_or_default();
+    let task_kind = if pty {
+        SandboxTaskKind::BashPty
+    } else if require_background_flag {
+        SandboxTaskKind::BashBackground
+    } else {
+        SandboxTaskKind::BashForeground
+    };
+    let principal = current_authenticated_principal();
+    let spawn_plan =
+        resolve_sandbox_spawn(ctx, &principal, RequestedSandboxTier::Disabled, task_kind);
+    if let Some(code) = spawn_plan.refusal_code() {
+        return Response::error(
+            request_id,
+            code,
+            format!("bash process creation refused by sandbox policy: {code}"),
+        );
+    }
+
     let spawn_result = if pty {
         ctx.bash_background().spawn_pty(
+            spawn_plan,
             command,
             session_id.to_string(),
             workdir,
@@ -123,6 +145,7 @@ pub fn spawn(
         )
     } else {
         ctx.bash_background().spawn(
+            spawn_plan,
             command,
             session_id.to_string(),
             workdir,

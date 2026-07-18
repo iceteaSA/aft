@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -10,13 +11,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use portable_pty::{CommandBuilder, PtySize};
+use portable_pty::PtySize;
+
+use crate::sandbox_spawn::SpawnPlan;
 
 use super::persistence::{atomic_write, ExitMarker, TaskPaths};
 use super::pty_runtime::{CompletionCoordinator, PtyRuntime};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_pty_for_command(
+    spawn_plan: &SpawnPlan,
     task_id: &str,
     session_id: &str,
     user_command: &str,
@@ -30,14 +34,20 @@ pub(crate) fn spawn_pty_for_command(
     #[cfg(unix)]
     {
         let shell = resolve_posix_shell();
-        let mut command = CommandBuilder::new(shell.as_os_str());
-        command.arg("-c");
-        command.arg(user_command);
-        command.cwd(workdir.as_os_str());
-        for (key, value) in env {
-            command.env(key, value);
-        }
-        try_spawn_pty(task_id, session_id, command, paths, rows, cols, wake_tx)
+        let args = vec![OsString::from("-c"), OsString::from(user_command)];
+        try_spawn_pty(
+            spawn_plan,
+            task_id,
+            session_id,
+            shell.as_os_str(),
+            &args,
+            paths,
+            workdir,
+            env,
+            rows,
+            cols,
+            wake_tx,
+        )
     }
     #[cfg(windows)]
     {
@@ -54,20 +64,21 @@ pub(crate) fn spawn_pty_for_command(
                 continue;
             }
 
-            let mut command = CommandBuilder::new(shell.binary().as_ref());
-            for arg in shell.pty_wrapper_args(&wrapper_path) {
-                command.arg(arg);
-            }
-            command.cwd(workdir.as_os_str());
-            for (key, value) in env {
-                command.env(key, value);
-            }
+            let args: Vec<OsString> = shell
+                .pty_wrapper_args(&wrapper_path)
+                .into_iter()
+                .map(OsString::from)
+                .collect();
 
             match try_spawn_pty(
+                spawn_plan,
                 task_id,
                 session_id,
-                command,
+                shell.binary().as_ref(),
+                &args,
                 paths,
+                workdir,
+                env,
                 rows,
                 cols,
                 wake_tx.clone(),
@@ -146,14 +157,26 @@ fn windows_wrapper_path(
 
 #[allow(clippy::too_many_arguments)]
 fn try_spawn_pty(
+    spawn_plan: &SpawnPlan,
     task_id: &str,
     session_id: &str,
-    command: CommandBuilder,
+    program: &std::ffi::OsStr,
+    args: &[OsString],
     paths: &TaskPaths,
+    workdir: &Path,
+    env: &HashMap<String, String>,
     rows: u16,
     cols: u16,
     wake_tx: crossbeam_channel::Sender<()>,
 ) -> Result<PtyRuntime, String> {
+    let command = crate::sandbox_spawn::pty_command_for_plan(
+        spawn_plan,
+        program,
+        args,
+        &paths.json,
+        workdir,
+        env,
+    )?;
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(PtySize {

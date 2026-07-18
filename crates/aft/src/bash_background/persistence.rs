@@ -358,6 +358,7 @@ pub fn task_bundle_files(paths: &TaskPaths) -> Vec<PathBuf> {
         for extension in ["ps1", "bat", "sh"] {
             files.push(paths.dir.join(format!("{stem}.{extension}")));
         }
+        files.push(paths.dir.join(format!("{stem}.sandbox-profile.json")));
     }
     files
 }

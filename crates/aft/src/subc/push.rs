@@ -998,6 +998,7 @@ mod tests {
                 harness: "opencode".to_string(),
                 session: session.clone(),
                 trust: BindTrust::FirstParty,
+                spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,
             })),
         );

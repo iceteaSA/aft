@@ -302,6 +302,7 @@ fn bash_status_same_session_cold_bridge_replays_from_disk() {
     let first = registry();
     let task_id = first
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "true",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -338,6 +339,7 @@ fn bash_status_cross_session_same_project_finds_task_by_id() {
     let first = registry();
     let task_id = first
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "true",
             "session-a".to_string(),
             project.path().to_path_buf(),
@@ -374,6 +376,7 @@ fn bash_status_cross_session_different_project_returns_not_found() {
     let first = registry();
     let task_id = first
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "true",
             "session-a".to_string(),
             project_a.path().to_path_buf(),
@@ -431,6 +434,7 @@ fn bash_kill_cross_session_still_returns_not_found() {
     let registry = registry();
     let task_id = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 5",
             "session-a".to_string(),
             project.path().to_path_buf(),
@@ -479,6 +483,7 @@ fn bash_promote_cross_session_still_returns_not_found() {
     let registry = registry();
     let task_id = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 5",
             "session-a".to_string(),
             project.path().to_path_buf(),
@@ -712,6 +717,7 @@ fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
     let registry = registry();
     let task_id = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 5",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -755,6 +761,7 @@ fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
     let registry = registry();
     let removable = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 5",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -769,6 +776,7 @@ fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
         .unwrap();
     let live = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 5",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -847,6 +855,7 @@ fn cleanup_finished_retains_undelivered_terminals() {
     let registry = registry();
     let task_id = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 5",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -1460,6 +1469,7 @@ fn bash_kill_preserves_real_exit_code_when_marker_present() {
     let registry = registry();
     let task_id = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 5",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -1489,6 +1499,7 @@ fn failed_spawn_cleans_up_bundle() {
 
     let err = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "true",
             SESSION.to_string(),
             missing_workdir,
@@ -1543,6 +1554,7 @@ fn background_bash_uses_bash_syntax_when_available() {
     let registry = registry();
     let task_id = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "[[ 1 -eq 1 ]] && echo ok",
             SESSION.to_string(),
             project.path().to_path_buf(),

@@ -100,6 +100,7 @@ fn pty_spawn_echo_exit() {
     let registry = registry();
     let task_id = registry
         .spawn_pty(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "printf 'hello pty\\n'",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -251,6 +252,7 @@ fn pipes_unaffected_by_pty_changes() {
     let registry = registry();
     let task_id = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "printf pipe-ok",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -278,6 +280,7 @@ fn pty_waiter_writes_code_marker_on_natural_exit() {
     let registry = registry();
     let task_id = registry
         .spawn_pty(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "exit 3",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -310,6 +313,7 @@ fn pty_reader_drains_before_completion_fires() {
     let registry = registry();
     let task_id = registry
         .spawn_pty(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "head -c 102400 /dev/zero | tr '\\0' A",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -351,6 +355,7 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
     let registry = registry();
     let task_id = registry
         .spawn_pty(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "/bin/sh -c 'while [ ! -f wake-ready ]; do sleep 0.01; done; printf wake'",
             SESSION.to_string(),
             project.path().to_path_buf(),
@@ -449,6 +454,7 @@ fn spawn_pty_task(
 ) -> String {
     registry
         .spawn_pty(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             command,
             SESSION.to_string(),
             project.to_path_buf(),
@@ -581,6 +587,7 @@ fn pty_write_non_pty_task() {
     let registry = registry();
     let task_id = registry
         .spawn(
+            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 1",
             SESSION.to_string(),
             project.path().to_path_buf(),
