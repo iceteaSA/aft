@@ -1,12 +1,16 @@
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use aft::sandbox_profile::SandboxProfile;
 use std::ffi::OsString;
 use std::fmt;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::fs::File;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::Read;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
@@ -30,6 +34,7 @@ impl SandboxLaunchError {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn runtime(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -59,9 +64,12 @@ impl std::error::Error for SandboxLaunchError {}
 
 pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return Err(SandboxLaunchError::unavailable(
-        "sandbox-launch is supported only on macOS and Linux",
-    ));
+    {
+        let _ = args;
+        return Err(SandboxLaunchError::unavailable(
+            "sandbox-launch is supported only on macOS and Linux",
+        ));
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
