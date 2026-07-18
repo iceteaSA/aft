@@ -67,11 +67,26 @@ fn observe_max(max_seen: &AtomicUsize, value: usize) {
     }
 }
 
-fn recv_async(rx: tokio::sync::oneshot::Receiver<Response>) -> Response {
+const ASYNC_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[track_caller]
+fn recv_async(rx: tokio::sync::oneshot::Receiver<Response>, awaited: &str) -> Response {
     tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("build current-thread runtime")
-        .block_on(async { rx.await.expect("async completion sender stays alive") })
+        .block_on(async {
+            match tokio::time::timeout(ASYNC_COMPLETION_TIMEOUT, rx).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => {
+                    panic!("async completion sender dropped while awaiting {awaited}")
+                }
+                Err(_) => panic!(
+                    "timed out after {}s awaiting {awaited}",
+                    ASYNC_COMPLETION_TIMEOUT.as_secs()
+                ),
+            }
+        })
 }
 
 #[test]
@@ -164,7 +179,13 @@ fn cancel_queued_maintenance_preserves_interactive_work_and_actor() {
     );
 
     assert_eq!(executor.cancel_queued_maintenance(&root), 2);
-    for response in [recv_async(cancelled_mutating), recv_async(cancelled_commit)] {
+    for response in [
+        recv_async(
+            cancelled_mutating,
+            "cancelled mutating maintenance completion",
+        ),
+        recv_async(cancelled_commit, "cancelled commit maintenance completion"),
+    ] {
         assert!(!response.success);
         assert_eq!(response.data["code"], "maintenance_cancelled");
     }
@@ -639,7 +660,7 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         .send(())
         .expect("release maintenance");
     release_occupied_tx.send(()).expect("release occupied read");
-    assert!(recv_async(maintenance).success);
+    assert!(recv_async(maintenance, "maintenance completion").success);
     occupied
         .recv_timeout(Duration::from_secs(12))
         .expect("occupied completion");
@@ -1118,7 +1139,7 @@ fn maintenance_cap_preserves_reserved_workers_for_interactive() {
             .expect("release maintenance blocker");
     }
     for rx in maintenance {
-        assert!(recv_async(rx).success);
+        assert!(recv_async(rx, "queued maintenance completion").success);
     }
     assert_eq!(dirs.len(), 3);
 }
@@ -1189,7 +1210,7 @@ fn interactive_mutator_dispatches_while_maintenance_backlog_saturates_pool() {
             .expect("release maintenance backlog");
     }
     for rx in maintenance {
-        assert!(recv_async(rx).success);
+        assert!(recv_async(rx, "queued maintenance completion").success);
     }
     assert_eq!(dirs.len(), pool_size + 1);
 }
@@ -1280,7 +1301,7 @@ fn startup_burst_maintenance_warmups_do_not_delay_interactive_binds() {
             .expect("release startup maintenance");
     }
     for rx in maintenance_receivers {
-        assert!(recv_async(rx).success);
+        assert!(recv_async(rx, "queued maintenance completion").success);
     }
     assert_eq!(dirs.len(), maintenance_roots + interactive_roots);
 }
@@ -1350,11 +1371,11 @@ fn newer_interactive_mutator_beats_older_same_actor_maintenance_mutator() {
         .expect("interactive completion response");
 
     release_block_tx.send(()).expect("release blocker");
-    assert!(recv_async(blocker).success);
+    assert!(recv_async(blocker, "priority blocker completion").success);
     maintenance_started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("maintenance starts after cap frees");
-    assert!(recv_async(maintenance).success);
+    assert!(recv_async(maintenance, "maintenance completion").success);
 }
 
 #[test]
@@ -1412,7 +1433,7 @@ fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
             ok("watcher-drain")
         }),
     );
-    assert!(recv_async(maintenance).success);
+    assert!(recv_async(maintenance, "maintenance completion").success);
 
     let deadline = Instant::now() + Duration::from_secs(1);
     while callgraph_refresh_worker_test_counts(root_dir.path()).0 == 0 {
@@ -1434,7 +1455,7 @@ fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
     mutating_started_rx
         .recv_timeout(Duration::from_millis(150))
         .expect("interactive writer should admit while store worker is mid-write");
-    assert!(recv_async(mutating).success);
+    assert!(recv_async(mutating, "interactive edit completion").success);
     assert!(flush_callgraph_store_refreshes_with_budget(
         Duration::from_secs(1)
     ));
@@ -1559,8 +1580,12 @@ fn pure_reads_admit_ahead_of_queued_interactive_mutating() {
             .expect("second queued job runs"),
         "mutator-2"
     );
-    for handle in [first_mutator, second_mutator, read] {
-        recv_async(handle);
+    for (index, handle) in [first_mutator, second_mutator, read]
+        .into_iter()
+        .enumerate()
+    {
+        let awaited = format!("read-priority completion {index}");
+        recv_async(handle, &awaited);
     }
 }
 
@@ -1717,7 +1742,7 @@ fn maintenance_commit_overlaps_pure_reads_and_defers_to_writers() {
         "read-overlap".to_string(),
         Box::new(|_ctx| ok("read-overlap")),
     );
-    let read_response = recv_async(read);
+    let read_response = recv_async(read, "overlapping pure-read completion");
     assert!(
         read_response.success,
         "read must complete while maintenance holds the read gate"
@@ -1742,7 +1767,7 @@ fn maintenance_commit_overlaps_pure_reads_and_defers_to_writers() {
     );
 
     release_mc_tx.send(()).expect("release maintenance commit");
-    recv_async(mc);
+    recv_async(mc, "first maintenance-commit completion");
     mc2_started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("second maintenance commit runs after the first");
@@ -1754,24 +1779,21 @@ fn cancel_cancellable_mutating_removes_queued_job_and_settles_receiver() {
     let (_dir, root) = test_root("cancel-queued");
     assert!(executor.register_actor(root.clone(), test_ctx()));
 
-    // First mutating job blocks on its own cancellation token so the second
-    // stays queued deterministically (no timing or gate-release involved).
+    // A channel gate keeps the first writer running while the second job is
+    // queued. If the test panics, dropping the sender disconnects the gate so
+    // executor teardown cannot wait forever for a test-owned blocker.
     let (first_started_tx, first_started_rx) = crossbeam_channel::bounded::<()>(1);
-    let (first_rx, first_token) = executor.submit_cancellable_async(
+    let (release_first_tx, release_first_rx) = crossbeam_channel::bounded::<()>(1);
+    let first_rx = executor.submit_async(
         root.clone(),
         Lane::Mutating,
         "first-blocking".to_string(),
         Box::new(move |_ctx| {
             first_started_tx.send(()).expect("signal first start");
-            let token = current_job_cancellation().expect("cancellable job sees its own token");
-            while !token.cancel_requested_before_commit() {
-                thread::sleep(Duration::from_millis(2));
-            }
-            Response::error(
-                "first-blocking",
-                "request_cancelled",
-                "cancelled at checkpoint",
-            )
+            release_first_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("release first mutating job");
+            ok("first-blocking")
         }),
     );
     first_started_rx
@@ -1789,15 +1811,13 @@ fn cancel_cancellable_mutating_removes_queued_job_and_settles_receiver() {
             ok("second-queued")
         }),
     );
-    assert_eq!(
-        executor.try_mutating_job_state_label(&root, "second-queued"),
-        Some("queued"),
-        "second mutating job must be queued behind the running first"
-    );
 
+    // The running writer prevents this job from being dequeued. The blocking
+    // cancellation outcome is authoritative; a nonblocking state probe can
+    // legitimately return None while the scheduler owns its state lock.
     let outcome = executor.cancel_job(&root, &second_token);
     assert_eq!(outcome, JobCancelOutcome::QueuedRemoved);
-    let second_response = recv_async(second_rx);
+    let second_response = recv_async(second_rx, "cancelled queued job completion");
     assert!(!second_response.success);
     assert_eq!(
         second_response.data.get("code").and_then(|v| v.as_str()),
@@ -1809,14 +1829,11 @@ fn cancel_cancellable_mutating_removes_queued_job_and_settles_receiver() {
         "queued-cancelled job must never execute"
     );
 
-    // Cancel the first (running) job rather than releasing a gate.
-    let outcome = executor.cancel_job(&root, &first_token);
-    assert_eq!(outcome, JobCancelOutcome::RunningSignalled);
-    let first_response = recv_async(first_rx);
-    assert_eq!(
-        first_response.data.get("code").and_then(|v| v.as_str()),
-        Some("request_cancelled")
-    );
+    release_first_tx
+        .send(())
+        .expect("release first mutating job");
+    let first_response = recv_async(first_rx, "first mutating blocker completion");
+    assert!(first_response.success);
 }
 
 #[test]
@@ -1853,7 +1870,7 @@ fn cancel_cancellable_mutating_signals_running_job_and_preserves_actor() {
 
     let outcome = executor.cancel_job(&root, &running_token);
     assert_eq!(outcome, JobCancelOutcome::RunningSignalled);
-    let response = recv_async(running_rx);
+    let response = recv_async(running_rx, "cancelled running job completion");
     assert_eq!(
         response.data.get("code").and_then(|v| v.as_str()),
         Some("request_cancelled")
@@ -1922,7 +1939,7 @@ fn cancel_job_after_commit_seal_reports_committed_and_lets_job_finish() {
     );
 
     release_tx.send(()).expect("release job");
-    let response = recv_async(rx);
+    let response = recv_async(rx, "committed job completion");
     assert!(response.success, "committed job finishes normally");
 }
 
