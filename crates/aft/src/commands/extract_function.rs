@@ -219,14 +219,19 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     let enclosing_fn_end_byte = enclosing_fn.map(|n| n.end_byte());
 
     // --- Detect return value ---
-    let return_kind = detect_return_value(
+    let return_kind = match detect_return_value(
         &source,
         &tree,
         start_byte,
         end_byte,
         enclosing_fn_end_byte,
         lang,
-    );
+    ) {
+        Ok(kind) => kind,
+        Err(error) => {
+            return Response::error(&req.id, "unsupported_return_bindings", error.message);
+        }
+    };
 
     // --- Detect indentation ---
     let indent_style = detect_indent(&source, lang);
@@ -307,6 +312,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     let return_type = match &return_kind {
         ReturnKind::Expression(_) => "expression",
         ReturnKind::Variable(_) => "variable",
+        ReturnKind::Variables(_) => "variables",
         ReturnKind::Void => "void",
     };
 

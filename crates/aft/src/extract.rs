@@ -501,6 +501,8 @@ pub enum ReturnKind {
     Expression(String),
     /// A variable declared in-range is used after the range in the enclosing function
     Variable(String),
+    /// Multiple variables declared in-range are used after the range.
+    Variables(Vec<String>),
     /// Nothing needs to be returned (void)
     Void,
 }
@@ -515,10 +517,31 @@ enum JsDeclarationKind {
     Assignment,
 }
 
+impl JsDeclarationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Const => "const",
+            Self::Let => "let",
+            Self::Var => "var",
+            Self::Assignment => "assignment",
+        }
+    }
+
+    fn multi_value_group(self) -> u8 {
+        match self {
+            Self::Const => 0,
+            Self::Let | Self::Var => 1,
+            Self::Assignment => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReturnVariableBinding {
     name: String,
+    bound_names: Vec<String>,
     js_kind: JsDeclarationKind,
+    representable: bool,
 }
 
 impl ReturnVariableBinding {
@@ -538,7 +561,9 @@ fn parse_return_variable(var: &str) -> ReturnVariableBinding {
     if let Some(name) = var.strip_prefix(RETURN_VARIABLE_ASSIGNMENT_PREFIX) {
         return ReturnVariableBinding {
             name: name.to_string(),
+            bound_names: vec![name.to_string()],
             js_kind: JsDeclarationKind::Assignment,
+            representable: true,
         };
     }
 
@@ -550,23 +575,31 @@ fn parse_return_variable(var: &str) -> ReturnVariableBinding {
         if let Some(name) = var.strip_prefix(prefix) {
             return ReturnVariableBinding {
                 name: name.to_string(),
+                bound_names: vec![name.to_string()],
                 js_kind,
+                representable: true,
             };
         }
     }
 
     ReturnVariableBinding {
         name: var.to_string(),
+        bound_names: vec![var.to_string()],
         js_kind: JsDeclarationKind::Const,
+        representable: true,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnValueError {
+    pub message: String,
 }
 
 /// Detect what the extracted code range should return.
 ///
-/// 1. If there's an explicit `return` statement in the range, use its expression.
-/// 2. If a variable declared in-range is referenced after the range (but within
-///    the enclosing function), that variable becomes the return value.
-/// 3. Otherwise, void.
+/// Every live-out binding must be represented in the generated call. Unsupported
+/// binding shapes and incompatible JavaScript declaration kinds are rejected
+/// rather than allowing an extraction to silently discard caller state.
 pub fn detect_return_value(
     source: &str,
     tree: &Tree,
@@ -574,19 +607,15 @@ pub fn detect_return_value(
     end_byte: usize,
     enclosing_fn_end_byte: Option<usize>,
     lang: LangId,
-) -> ReturnKind {
+) -> Result<ReturnKind, ReturnValueError> {
     let root = tree.root_node();
     let effective_enclosing_fn_end_byte = find_enclosing_function(&root, start_byte, lang)
         .map(|node| node.end_byte())
         .or(enclosing_fn_end_byte);
 
-    // Check for explicit return statements in the range
-    if let Some(expr) = find_return_in_range(&root, source, start_byte, end_byte) {
-        return ReturnKind::Expression(expr);
-    }
-
     let in_range_bindings =
         collect_return_bindings_in_range(&root, source, start_byte, end_byte, lang);
+    let mut live_bindings = Vec::new();
 
     // Check if any in-range declaration is used after the range in the enclosing fn
     if let Some(fn_end) = effective_enclosing_fn_end_byte {
@@ -602,15 +631,83 @@ pub fn detect_return_value(
                 &mut post_refs,
             );
 
-            for binding in &in_range_bindings {
-                if post_refs.contains(&binding.name) {
-                    return ReturnKind::Variable(binding.encoded_for_return_kind());
+            let mut seen = HashSet::new();
+            for binding in in_range_bindings {
+                let live_names = binding
+                    .bound_names
+                    .iter()
+                    .filter(|name| post_refs.contains(name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if live_names.is_empty() {
+                    continue;
+                }
+                if !binding.representable {
+                    return Err(ReturnValueError {
+                        message: format!(
+                            "extract_function cannot preserve unsupported live-out binding shape '{}' (bindings: {})",
+                            binding.name,
+                            live_names.join(", ")
+                        ),
+                    });
+                }
+                if seen.insert(binding.name.clone()) {
+                    live_bindings.push(binding);
                 }
             }
         }
     }
 
-    ReturnKind::Void
+    if let Some(expr) = find_return_in_range(&root, source, start_byte, end_byte) {
+        if !live_bindings.is_empty() {
+            return Err(ReturnValueError {
+                message: format!(
+                    "extract_function cannot preserve explicit return together with live-out bindings: {}",
+                    live_bindings
+                        .iter()
+                        .map(|binding| binding.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        return Ok(ReturnKind::Expression(expr));
+    }
+
+    match live_bindings.as_slice() {
+        [] => Ok(ReturnKind::Void),
+        [binding] => Ok(ReturnKind::Variable(binding.encoded_for_return_kind())),
+        bindings => {
+            if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+                let group = bindings[0].js_kind.multi_value_group();
+                if bindings
+                    .iter()
+                    .any(|binding| binding.js_kind.multi_value_group() != group)
+                {
+                    return Err(ReturnValueError {
+                        message: format!(
+                            "extract_function cannot preserve mixed live-out binding kinds: {}",
+                            bindings
+                                .iter()
+                                .map(|binding| format!(
+                                    "{} ({})",
+                                    binding.name,
+                                    binding.js_kind.label()
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
+            }
+            Ok(ReturnKind::Variables(
+                bindings
+                    .iter()
+                    .map(ReturnVariableBinding::encoded_for_return_kind)
+                    .collect(),
+            ))
+        }
+    }
 }
 
 /// Collect in-range names that can be returned to preserve post-range uses.
@@ -644,20 +741,23 @@ fn collect_return_bindings_recursive(
                 if let Some(name_node) = node.child_by_field_name("name") {
                     if name_node.start_byte() >= start_byte && name_node.end_byte() <= end_byte {
                         let name = node_text(source, &name_node).to_string();
+                        let bound_names = collect_binding_pattern_names(source, &name_node, lang);
                         out.push(ReturnVariableBinding {
+                            representable: name_node.kind() == "identifier",
                             name,
+                            bound_names,
                             js_kind: js_declaration_kind_for_declarator(node),
                         });
                     }
                 }
             } else if is_assignment_node(node) {
                 if let Some(left) = node.child_by_field_name("left") {
-                    if left.kind() == "identifier"
-                        && left.start_byte() >= start_byte
-                        && left.end_byte() <= end_byte
-                    {
+                    if left.start_byte() >= start_byte && left.end_byte() <= end_byte {
+                        let name = node_text(source, &left).to_string();
                         out.push(ReturnVariableBinding {
-                            name: node_text(source, &left).to_string(),
+                            representable: left.kind() == "identifier",
+                            bound_names: collect_binding_pattern_names(source, &left, lang),
+                            name,
                             js_kind: JsDeclarationKind::Assignment,
                         });
                     }
@@ -667,12 +767,12 @@ fn collect_return_bindings_recursive(
         LangId::Python => {
             if node.kind() == "assignment" {
                 if let Some(left) = node.child_by_field_name("left") {
-                    if left.kind() == "identifier"
-                        && left.start_byte() >= start_byte
-                        && left.end_byte() <= end_byte
-                    {
+                    if left.start_byte() >= start_byte && left.end_byte() <= end_byte {
+                        let name = node_text(source, &left).to_string();
                         out.push(ReturnVariableBinding {
-                            name: node_text(source, &left).to_string(),
+                            representable: left.kind() == "identifier",
+                            bound_names: collect_binding_pattern_names(source, &left, lang),
+                            name,
                             js_kind: JsDeclarationKind::Assignment,
                         });
                     }
@@ -688,6 +788,53 @@ fn collect_return_bindings_recursive(
             collect_return_bindings_recursive(&child, source, start_byte, end_byte, lang, out);
         }
     }
+}
+
+fn collect_binding_pattern_names(source: &str, node: &Node, lang: LangId) -> Vec<String> {
+    fn collect(source: &str, node: &Node, lang: LangId, out: &mut Vec<String>) {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                let name = node_text(source, node).to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            "pair_pattern" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    collect(source, &value, lang, out);
+                }
+            }
+            "assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    collect(source, &left, lang, out);
+                }
+            }
+            "object_pattern" | "array_pattern" | "rest_pattern"
+                if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) =>
+            {
+                for index in 0..node.named_child_count() as u32 {
+                    if let Some(child) = node.named_child(index) {
+                        collect(source, &child, lang, out);
+                    }
+                }
+            }
+            "pattern_list" | "tuple_pattern" | "list_pattern" | "list" | "tuple"
+            | "starred_expression"
+                if lang == LangId::Python =>
+            {
+                for index in 0..node.named_child_count() as u32 {
+                    if let Some(child) = node.named_child(index) {
+                        collect(source, &child, lang, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut names = Vec::new();
+    collect(source, node, lang, &mut names);
+    names
 }
 
 fn js_declaration_kind_for_declarator(node: &Node) -> JsDeclarationKind {
@@ -853,6 +1000,17 @@ fn generate_ts_function(
                 base_indent, indent_unit, binding.name
             ));
         }
+        ReturnKind::Variables(vars) => {
+            let names = vars
+                .iter()
+                .map(|var| parse_return_variable(var).name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "{}{}return {{ {} }};",
+                base_indent, indent_unit, names
+            ));
+        }
         ReturnKind::Expression(_) => {
             // The return is already in the body text
         }
@@ -895,6 +1053,14 @@ fn generate_py_function(
                 "{}{}return {}",
                 base_indent, indent_unit, binding.name
             ));
+        }
+        ReturnKind::Variables(vars) => {
+            let names = vars
+                .iter()
+                .map(|var| parse_return_variable(var).name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("{}{}return {}", base_indent, indent_unit, names));
         }
         ReturnKind::Expression(_) => {
             // Already in body
@@ -978,6 +1144,37 @@ pub fn generate_call_site(
             }
             _ => format!("{}const {} = {}({});", indent, var, name, args_str),
         },
+        ReturnKind::Variables(vars) => {
+            let bindings = vars
+                .iter()
+                .map(|var| parse_return_variable(var))
+                .collect::<Vec<_>>();
+            let names = bindings
+                .iter()
+                .map(|binding| binding.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            match lang {
+                LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
+                    let declaration = match bindings[0].js_kind.multi_value_group() {
+                        0 => "const ",
+                        1 => "let ",
+                        2 => "",
+                        _ => unreachable!(),
+                    };
+                    if declaration.is_empty() {
+                        format!("{}({{ {} }} = {}({}));", indent, names, name, args_str)
+                    } else {
+                        format!(
+                            "{}{}{{ {} }} = {}({});",
+                            indent, declaration, names, name, args_str
+                        )
+                    }
+                }
+                LangId::Python => format!("{}{} = {}({})", indent, names, name, args_str),
+                _ => format!("{}const {{ {} }} = {}({});", indent, names, name, args_str),
+            }
+        }
         ReturnKind::Expression(_expr) => match lang {
             LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
                 format!("{}return {}({});", indent, name, args_str)
@@ -1569,7 +1766,8 @@ class UserService:
         let start = crate::edit::line_col_to_byte(&source, 14, 0);
         let end = crate::edit::line_col_to_byte(&source, 17, 0);
 
-        let result = detect_return_value(&source, &tree, start, end, None, LangId::TypeScript);
+        let result =
+            detect_return_value(&source, &tree, start, end, None, LangId::TypeScript).unwrap();
         assert_eq!(result, ReturnKind::Expression("added".to_string()));
     }
 
@@ -1589,7 +1787,8 @@ class UserService:
         let fn_end = crate::edit::line_col_to_byte(&source, 10, 0);
 
         let result =
-            detect_return_value(&source, &tree, start, end, Some(fn_end), LangId::TypeScript);
+            detect_return_value(&source, &tree, start, end, Some(fn_end), LangId::TypeScript)
+                .unwrap();
         // `filtered` is declared in-range and used after the range
         assert_eq!(result, ReturnKind::Variable("filtered".to_string()));
     }
@@ -1610,8 +1809,142 @@ class UserService:
             end,
             Some(crate::edit::line_col_to_byte(&source, 23, 0)),
             LangId::TypeScript,
-        );
+        )
+        .unwrap();
         assert_eq!(result, ReturnKind::Void);
+    }
+
+    #[test]
+    fn return_value_collects_multiple_const_live_outs_in_order() {
+        let source = "function f() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}\n";
+        let tree = parse_source(source, LangId::TypeScript);
+        let start = crate::edit::line_col_to_byte(source, 1, 0);
+        let end = crate::edit::line_col_to_byte(source, 3, 0);
+
+        let result =
+            detect_return_value(source, &tree, start, end, None, LangId::TypeScript).unwrap();
+
+        assert_eq!(
+            result,
+            ReturnKind::Variables(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            generate_extracted_function(
+                "makeValues",
+                &[],
+                &result,
+                "  const a = 1;\n  const b = 2;",
+                "",
+                LangId::TypeScript,
+                IndentStyle::Spaces(2),
+            ),
+            "function makeValues() {\n  const a = 1;\n  const b = 2;\n  return { a, b };\n}"
+        );
+        assert_eq!(
+            generate_call_site("makeValues", &[], &result, "  ", LangId::TypeScript),
+            "  const { a, b } = makeValues();"
+        );
+    }
+
+    #[test]
+    fn return_value_generates_mutable_destructure_for_let_pair() {
+        let source = "function f() {\n  let a = 1;\n  let b = 2;\n  return a + b;\n}\n";
+        let tree = parse_source(source, LangId::TypeScript);
+        let start = crate::edit::line_col_to_byte(source, 1, 0);
+        let end = crate::edit::line_col_to_byte(source, 3, 0);
+
+        let result =
+            detect_return_value(source, &tree, start, end, None, LangId::TypeScript).unwrap();
+
+        assert_eq!(
+            result,
+            ReturnKind::Variables(vec!["let a".to_string(), "let b".to_string()])
+        );
+        assert_eq!(
+            generate_call_site("makeValues", &[], &result, "  ", LangId::TypeScript),
+            "  let { a, b } = makeValues();"
+        );
+    }
+
+    #[test]
+    fn return_value_generates_python_tuple_pair() {
+        let source = "def f():\n    a = 1\n    b = 2\n    return a + b\n";
+        let tree = parse_source(source, LangId::Python);
+        let start = crate::edit::line_col_to_byte(source, 1, 0);
+        let end = crate::edit::line_col_to_byte(source, 3, 0);
+
+        let result = detect_return_value(source, &tree, start, end, None, LangId::Python).unwrap();
+
+        assert_eq!(
+            generate_extracted_function(
+                "make_values",
+                &[],
+                &result,
+                "    a = 1\n    b = 2",
+                "",
+                LangId::Python,
+                IndentStyle::Spaces(4),
+            ),
+            "def make_values():\n    a = 1\n    b = 2\n    return a, b"
+        );
+        assert_eq!(
+            generate_call_site("make_values", &[], &result, "    ", LangId::Python),
+            "    a, b = make_values()"
+        );
+    }
+
+    #[test]
+    fn return_value_rejects_mixed_javascript_binding_kinds() {
+        let source = "function f() {\n  const a = 1;\n  let b = 2;\n  return a + b;\n}\n";
+        let tree = parse_source(source, LangId::TypeScript);
+        let start = crate::edit::line_col_to_byte(source, 1, 0);
+        let end = crate::edit::line_col_to_byte(source, 3, 0);
+
+        let error =
+            detect_return_value(source, &tree, start, end, None, LangId::TypeScript).unwrap_err();
+
+        assert!(error.message.contains("a (const)"), "{}", error.message);
+        assert!(error.message.contains("b (let)"), "{}", error.message);
+    }
+
+    #[test]
+    fn return_value_rejects_destructured_live_out_binding() {
+        let source = "function f(input) {\n  const { a, b } = input;\n  return a + b;\n}\n";
+        let tree = parse_source(source, LangId::TypeScript);
+        let start = crate::edit::line_col_to_byte(source, 1, 0);
+        let end = crate::edit::line_col_to_byte(source, 2, 0);
+
+        let error =
+            detect_return_value(source, &tree, start, end, None, LangId::TypeScript).unwrap_err();
+
+        assert!(error.message.contains("unsupported live-out binding shape"));
+        assert!(error.message.contains("a, b"), "{}", error.message);
+    }
+
+    #[test]
+    fn single_live_out_generation_remains_byte_identical() {
+        let return_kind = ReturnKind::Variable("let result".to_string());
+        let extracted = generate_extracted_function(
+            "computeInitial",
+            &[],
+            &return_kind,
+            "  let result = compute();",
+            "",
+            LangId::TypeScript,
+            IndentStyle::Spaces(2),
+        );
+        let call = generate_call_site(
+            "computeInitial",
+            &[],
+            &return_kind,
+            "  ",
+            LangId::TypeScript,
+        );
+
+        assert_eq!(
+            format!("{extracted}\n\nfunction f() {{\n{call}\n  return result;\n}}\n"),
+            "function computeInitial() {\n  let result = compute();\n  return result;\n}\n\nfunction f() {\n  let result = computeInitial();\n  return result;\n}\n"
+        );
     }
 
     // --- Function generation ---

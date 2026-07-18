@@ -239,6 +239,34 @@ fn extract_function_preserves_let_return_binding() {
     aft.shutdown();
 }
 
+#[test]
+fn extract_function_preserves_every_const_live_out_binding() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("multi_output.ts");
+    std::fs::write(
+        &file,
+        "function f() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"makeValues","start_line":2,"end_line":4}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert_eq!(
+        content,
+        "function makeValues() {\n  const a = 1;\n  const b = 2;\n  return { a, b };\n}\n\nfunction f() {\n  const { a, b } = makeValues();\n  return a + b;\n}\n"
+    );
+
+    aft.shutdown();
+}
+
 /// Python extract: verify correct `def` syntax.
 #[test]
 fn extract_function_python() {
