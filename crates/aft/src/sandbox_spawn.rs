@@ -30,6 +30,7 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
@@ -102,6 +103,7 @@ impl SpawnPlan {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn launcher_for_test(profile: SandboxProfile, launcher_path: PathBuf) -> Self {
         Self::Launcher {
             profile,
