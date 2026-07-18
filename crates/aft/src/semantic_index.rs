@@ -1630,6 +1630,8 @@ pub struct SemanticIndex {
     project_root: PathBuf,
     deferred_files: HashSet<PathBuf>,
     shared_base: Option<Arc<SharedSemanticBase>>,
+    #[cfg(test)]
+    removal_retain_passes: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1740,6 +1742,8 @@ impl SemanticIndex {
             project_root,
             deferred_files: HashSet::new(),
             shared_base: Some(shared_base),
+            #[cfg(test)]
+            removal_retain_passes: 0,
         }
     }
 
@@ -1815,6 +1819,8 @@ impl SemanticIndex {
             project_root,
             deferred_files: HashSet::new(),
             shared_base: None,
+            #[cfg(test)]
+            removal_retain_passes: 0,
         }
     }
 
@@ -2183,6 +2189,8 @@ impl SemanticIndex {
                 project_root: project_root.to_path_buf(),
                 deferred_files: HashSet::new(),
                 shared_base: None,
+                #[cfg(test)]
+                removal_retain_passes: 0,
             });
         }
 
@@ -2262,6 +2270,8 @@ impl SemanticIndex {
             project_root: project_root.to_path_buf(),
             deferred_files: HashSet::new(),
             shared_base: None,
+            #[cfg(test)]
+            removal_retain_passes: 0,
         })
     }
 
@@ -2822,15 +2832,27 @@ impl SemanticIndex {
         }
     }
 
-    fn remove_indexed_files(&mut self, files: &[PathBuf]) {
-        let deleted_set: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+    fn remove_indexed_file_keys(
+        &mut self,
+        entry_files: &HashSet<PathBuf>,
+        metadata_files: &[PathBuf],
+    ) {
+        #[cfg(test)]
+        {
+            self.removal_retain_passes += 1;
+        }
         self.entries
-            .retain(|entry| !deleted_set.contains(entry.chunk.file.as_path()));
-        for path in files {
+            .retain(|entry| !entry_files.contains(&entry.chunk.file));
+        for path in metadata_files {
             self.file_mtimes.remove(path);
             self.file_sizes.remove(path);
             self.file_hashes.remove(path);
         }
+    }
+
+    fn remove_indexed_files(&mut self, files: &[PathBuf]) {
+        let deleted_set = files.iter().cloned().collect();
+        self.remove_indexed_file_keys(&deleted_set, files);
     }
 
     /// Search the index with a query embedding, returning top-K results sorted by relevance
@@ -2970,24 +2992,41 @@ impl SemanticIndex {
             .any(|path| !self.file_sizes.contains_key(path));
     }
 
-    /// Remove entries for a specific file
+    /// Remove entries for a specific file.
     pub fn remove_file(&mut self, file: &Path) {
         self.invalidate_file(file);
     }
 
     pub fn invalidate_file(&mut self, file: &Path) {
-        self.materialize_shared_base();
-        let canonical_file = canonicalize_existing_or_deleted_path(file);
-        self.entries
-            .retain(|e| e.chunk.file != file && e.chunk.file != canonical_file);
-        self.file_mtimes.remove(file);
-        self.file_sizes.remove(file);
-        self.file_hashes.remove(file);
-        if canonical_file.as_path() != file {
-            self.file_mtimes.remove(&canonical_file);
-            self.file_sizes.remove(&canonical_file);
-            self.file_hashes.remove(&canonical_file);
+        let file = file.to_path_buf();
+        self.invalidate_files(std::slice::from_ref(&file));
+    }
+
+    pub fn invalidate_files(&mut self, files: &[PathBuf]) {
+        if files.is_empty() {
+            return;
         }
+        self.materialize_shared_base();
+
+        // Watchers may report a symlinked spelling while persisted metadata uses
+        // the canonical spelling (or vice versa), so both keys must be removed.
+        let mut invalidated = HashSet::with_capacity(files.len().saturating_mul(2));
+        let mut metadata_keys = Vec::with_capacity(files.len().saturating_mul(2));
+        for file in files {
+            metadata_keys.push(file.clone());
+            invalidated.insert(file.clone());
+            let canonical = canonicalize_existing_or_deleted_path(file);
+            if canonical != *file {
+                metadata_keys.push(canonical.clone());
+                invalidated.insert(canonical);
+            }
+        }
+        self.remove_indexed_file_keys(&invalidated, &metadata_keys);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn removal_retain_passes_for_test(&self) -> usize {
+        self.removal_retain_passes
     }
 
     /// Get the embedding dimension
@@ -3719,6 +3758,8 @@ impl SemanticIndex {
             project_root: current_canonical_root.to_path_buf(),
             deferred_files: HashSet::new(),
             shared_base: None,
+            #[cfg(test)]
+            removal_retain_passes: 0,
         })
     }
 }
@@ -6179,6 +6220,119 @@ public class Greeter {
         bytes.extend_from_slice(&0u32.to_le_bytes());
 
         assert!(SemanticIndex::from_bytes(&bytes, &test_project_root()).is_err());
+    }
+
+    fn add_invalidation_fixture_entry(index: &mut SemanticIndex, file: PathBuf, ordinal: u64) {
+        index.entries.push(EmbeddingEntry::new(
+            SemanticChunk {
+                file: file.clone(),
+                name: format!("symbol_{ordinal}"),
+                qualified_name: None,
+                kind: SymbolKind::Function,
+                start_line: ordinal as u32,
+                end_line: ordinal as u32 + 1,
+                exported: false,
+                embed_text: format!("symbol {ordinal}"),
+                snippet: format!("fn symbol_{ordinal}() {{}}"),
+            },
+            vec![ordinal as f32 + 1.0, 1.0],
+        ));
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(ordinal + 1);
+        index.file_mtimes.insert(file.clone(), mtime);
+        index.file_sizes.insert(file.clone(), ordinal + 10);
+        index
+            .file_hashes
+            .insert(file, blake3::hash(&ordinal.to_le_bytes()));
+    }
+
+    #[test]
+    fn batch_invalidation_matches_sequential_calls_with_one_retain_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().canonicalize().unwrap();
+        let mut source = SemanticIndex::new(project_root.clone(), 2);
+        let files = (0..8)
+            .map(|ordinal| {
+                let file = project_root.join(format!("file_{ordinal}.rs"));
+                fs::write(&file, format!("fn symbol_{ordinal}() {{}}\n")).unwrap();
+                add_invalidation_fixture_entry(&mut source, file.clone(), ordinal);
+                file
+            })
+            .collect::<Vec<_>>();
+        let invalidated = vec![files[1].clone(), files[3].clone(), files[6].clone()];
+
+        let shared = Arc::new(source.into_shared_base().unwrap());
+        let mut shared_batched =
+            SemanticIndex::from_shared_base(project_root.clone(), Arc::clone(&shared));
+        shared_batched.invalidate_files(&invalidated);
+        let mut source = SemanticIndex::from_shared_base(project_root, shared);
+        source.materialize_shared_base();
+        let mut sequential = source.clone();
+        let mut batched = source;
+        for file in &invalidated {
+            sequential.invalidate_file(file);
+        }
+        batched.invalidate_files(&invalidated);
+
+        assert!(sequential.shared_base.is_none());
+        assert!(batched.shared_base.is_none());
+        assert!(shared_batched.shared_base.is_none());
+        assert_eq!(batched.to_bytes(), sequential.to_bytes());
+        assert_eq!(shared_batched.file_mtimes, batched.file_mtimes);
+        assert_eq!(shared_batched.file_sizes, batched.file_sizes);
+        assert_eq!(shared_batched.file_hashes, batched.file_hashes);
+        assert_eq!(
+            format!("{:?}", shared_batched.entries),
+            format!("{:?}", batched.entries)
+        );
+        assert_eq!(
+            sequential.removal_retain_passes_for_test(),
+            invalidated.len()
+        );
+        assert_eq!(batched.removal_retain_passes_for_test(), 1);
+        assert_eq!(shared_batched.removal_retain_passes_for_test(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_invalidation_removes_raw_and_canonical_alias_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().canonicalize().unwrap();
+        let real_dir = project_root.join("real");
+        let alias_dir = project_root.join("alias");
+        fs::create_dir(&real_dir).unwrap();
+        symlink(&real_dir, &alias_dir).unwrap();
+        let real_file = real_dir.join("lib.rs");
+        let alias_file = alias_dir.join("lib.rs");
+        let untouched = project_root.join("untouched.rs");
+        fs::write(&real_file, "fn aliased() {}\n").unwrap();
+        fs::write(&untouched, "fn untouched() {}\n").unwrap();
+        assert_eq!(fs::canonicalize(&alias_file).unwrap(), real_file);
+
+        let mut index = SemanticIndex::new(project_root, 2);
+        add_invalidation_fixture_entry(&mut index, alias_file.clone(), 1);
+        add_invalidation_fixture_entry(&mut index, real_file.clone(), 2);
+        add_invalidation_fixture_entry(&mut index, untouched.clone(), 3);
+        let mut sequential = index.clone();
+        sequential.invalidate_file(&alias_file);
+        index.invalidate_files(std::slice::from_ref(&alias_file));
+
+        assert_eq!(index.to_bytes(), sequential.to_bytes());
+        assert!(index
+            .entries
+            .iter()
+            .all(|entry| entry.chunk.file != alias_file && entry.chunk.file != real_file));
+        assert!(!index.file_mtimes.contains_key(&alias_file));
+        assert!(!index.file_mtimes.contains_key(&real_file));
+        assert!(index.file_mtimes.contains_key(&untouched));
+        assert!(!index.file_sizes.contains_key(&alias_file));
+        assert!(!index.file_sizes.contains_key(&real_file));
+        assert!(index.file_sizes.contains_key(&untouched));
+        assert!(!index.file_hashes.contains_key(&alias_file));
+        assert!(!index.file_hashes.contains_key(&real_file));
+        assert!(index.file_hashes.contains_key(&untouched));
+        assert_eq!(index.removal_retain_passes_for_test(), 1);
     }
 
     #[test]

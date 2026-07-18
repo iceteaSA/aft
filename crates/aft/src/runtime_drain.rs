@@ -696,13 +696,12 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                     receiver_epoch,
                     |receiver| {
                         mark_semantic_corpus_refresh_success(ctx);
-                        let mut refresh_paths = Vec::new();
-                        for path in ctx.take_pending_semantic_index_paths() {
-                            if watcher_path_is_semantic_source(&path) {
-                                index.invalidate_file(&path);
-                                refresh_paths.push(path);
-                            }
-                        }
+                        let refresh_paths = ctx
+                            .take_pending_semantic_index_paths()
+                            .into_iter()
+                            .filter(|path| watcher_path_is_semantic_source(path))
+                            .collect::<Vec<_>>();
+                        index.invalidate_files(&refresh_paths);
                         let corpus_refresh = ctx.take_pending_semantic_corpus_refresh();
                         *ctx.semantic_index()
                             .write()
@@ -1237,15 +1236,17 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                     );
                 }
                 let pending_paths = ctx.take_pending_semantic_index_paths();
+                let mut invalidated_paths = Vec::new();
                 for path in pending_paths {
                     if !aft::runtime_drain::watcher_path_is_semantic_source(&path) {
                         continue;
                     }
-                    index.invalidate_file(&path);
                     if !aft::runtime_drain::watcher_path_is_ignored_by_current_matcher(ctx, &path) {
-                        replay_refresh_paths.push(path);
+                        replay_refresh_paths.push(path.clone());
                     }
+                    invalidated_paths.push(path);
                 }
+                index.invalidate_files(&invalidated_paths);
                 *ctx.semantic_index()
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
@@ -2095,20 +2096,28 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     }
                 },
             ),
-            WatcherDrainApplyPhase::SemanticIndex => apply_watcher_path_phase(
-                WatcherDrainApplyPhase::SemanticIndex,
-                &mut paths,
-                &mut remaining,
-                started,
-                WATCHER_DRAIN_SLICE_BUDGET,
-                |path| {
-                    if !heavy_root_work_allowed
-                        || shared_artifacts_read_only
-                        || oversized_inline_batch
-                        || !watcher_path_is_semantic_source(path)
-                    {
-                        return;
-                    }
+            WatcherDrainApplyPhase::SemanticIndex => {
+                let mut invalidated_paths = Vec::new();
+                let completed = apply_watcher_path_phase(
+                    WatcherDrainApplyPhase::SemanticIndex,
+                    &mut paths,
+                    &mut remaining,
+                    started,
+                    WATCHER_DRAIN_SLICE_BUDGET,
+                    |path| {
+                        if heavy_root_work_allowed
+                            && !shared_artifacts_read_only
+                            && !oversized_inline_batch
+                            && watcher_path_is_semantic_source(path)
+                        {
+                            invalidated_paths.push(path.to_path_buf());
+                        }
+                    },
+                );
+
+                if !invalidated_paths.is_empty() {
+                    // Invalidate all semantic paths processed in this slice under
+                    // one write lock so a multi-file edit scans the index once.
                     let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
                         let invalidated = {
                             let mut semantic_index_ref = ctx
@@ -2116,7 +2125,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             semantic_index_ref.as_mut().is_some_and(|index| {
-                                index.invalidate_file(path);
+                                index.invalidate_files(&invalidated_paths);
                                 true
                             })
                         };
@@ -2126,14 +2135,17 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                                status.add_refreshing_file(path.to_path_buf());
-                                semantic_refresh_paths.push(path.to_path_buf());
+                                for path in invalidated_paths {
+                                    status.add_refreshing_file(path.clone());
+                                    semantic_refresh_paths.push(path);
+                                }
                                 status_changed = true;
                             }
                         }
                     });
-                },
-            ),
+                }
+                completed
+            }
             WatcherDrainApplyPhase::LspDiagnostics => apply_watcher_path_phase(
                 WatcherDrainApplyPhase::LspDiagnostics,
                 &mut paths,
@@ -2659,6 +2671,56 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         (ctx, tx)
+    }
+
+    #[test]
+    fn watcher_semantic_phase_batches_invalidation_into_one_retain_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let files = (0..4)
+            .map(|ordinal| {
+                let file = root_path.join(format!("source_{ordinal}.rs"));
+                std::fs::write(&file, format!("pub fn source_{ordinal}() {{}}\n")).unwrap();
+                file
+            })
+            .collect::<Vec<_>>();
+        let mut embed = |texts: Vec<String>| {
+            Ok::<_, String>(texts.into_iter().map(|_| vec![1.0, 0.5]).collect())
+        };
+        let index = crate::semantic_index::SemanticIndex::build(
+            &root_path,
+            &files,
+            &mut embed,
+            files.len(),
+        )
+        .unwrap();
+        assert!(index.entry_count() >= files.len());
+
+        let (ctx, watcher_tx) = watcher_context(&root_path);
+        ctx.mark_subc_bound();
+        ctx.set_heavy_root_work_allowed(true);
+        ctx.set_cache_writer_capabilities(true, true);
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(files.clone()))
+            .unwrap();
+
+        let outcome = drain_watcher_events_bounded(&ctx, files.len());
+
+        assert_eq!(outcome.processed, files.len());
+        assert!(!outcome.has_more);
+        let index = ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = index.as_ref().unwrap();
+        assert_eq!(index.entry_count(), 0);
+        assert_eq!(index.removal_retain_passes_for_test(), 1);
     }
 
     #[test]
