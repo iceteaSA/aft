@@ -27,6 +27,7 @@ pub struct SandboxLaunchError {
 }
 
 impl SandboxLaunchError {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn usage(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -97,6 +98,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Default)]
 struct LaunchArgs {
     profile_fd: Option<i32>,
@@ -105,6 +107,7 @@ struct LaunchArgs {
     support: bool,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl LaunchArgs {
     fn parse(args: Vec<OsString>) -> Result<Self, SandboxLaunchError> {
         let mut parsed = Self::default();
@@ -145,6 +148,7 @@ impl LaunchArgs {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_fd(value: &OsString) -> Result<i32, SandboxLaunchError> {
     let value = value
         .to_str()
