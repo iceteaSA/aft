@@ -59,6 +59,28 @@ fn coerce_string_array_param(params: &serde_json::Value, key: &str) -> Result<Ve
     }
 }
 
+/// Merge named import specifiers while preserving aliases and deterministic order.
+pub(crate) fn merge_named_import_specifiers(
+    existing: &[String],
+    additions: &[String],
+) -> Vec<String> {
+    let mut merged = existing.to_vec();
+    for addition in additions {
+        let imported = imports::specifier_imported_name(addition);
+        let local = imports::specifier_local_name(addition);
+        if !merged.iter().any(|name| {
+            imports::specifier_imported_name(name) == imported
+                && imports::specifier_local_name(name) == local
+        }) {
+            merged.push(addition.clone());
+        }
+    }
+    merged.sort_by(|left, right| {
+        imports::specifier_local_name(left).cmp(imports::specifier_local_name(right))
+    });
+    merged
+}
+
 /// Handle an `add_import` request.
 ///
 /// Params:
@@ -350,18 +372,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         merge_target
     {
         // Build the merged named-import list: union of existing + new, sorted.
-        let mut merged_names: Vec<String> = existing.names.clone();
-        for name in &names {
-            if !merged_names
-                .iter()
-                .any(|n| imports::specifier_matches(n, name))
-            {
-                merged_names.push(name.clone());
-            }
-        }
-        // Sort for deterministic output (matches generate_import_line behavior).
-        merged_names
-            .sort_by(|a, b| imports::specifier_local_name(a).cmp(imports::specifier_local_name(b)));
+        let merged_names = merge_named_import_specifiers(&existing.names, &names);
 
         let merged_line = imports::generate_import_line(
             lang,

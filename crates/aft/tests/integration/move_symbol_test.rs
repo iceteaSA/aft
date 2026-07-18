@@ -73,6 +73,40 @@ fn write_file(path: &std::path::Path, content: &str) {
     std::fs::write(path, content).expect("write file");
 }
 
+fn setup_namespace_move_case(
+    consumer_content: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let source = tmp.path().join("source.ts");
+    let destination = tmp.path().join("dest.ts");
+    let consumer = tmp.path().join("consumer.ts");
+    write_file(
+        &source,
+        "export function moved(): string { return 'ok'; }\n\
+export function stays(): string { return 'stay'; }\n",
+    );
+    write_file(&destination, "export const existing = true;\n");
+    write_file(&consumer, consumer_content);
+    (tmp, source, destination, consumer)
+}
+
+fn request_namespace_move(
+    aft: &mut AftProcess,
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> serde_json::Value {
+    aft.send(&format!(
+        r#"{{"id":"namespace-move","command":"move_symbol","file":{},"symbol":"moved","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&destination.display())
+    ))
+}
+
 fn assert_move_symbol_unsupported(ext: &str, source: &str, dest: &str) {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let src = tmp.path().join(format!("source.{ext}"));
@@ -614,6 +648,222 @@ fn move_symbol_aliased_import() {
         "should import from ./utils:\n{}",
         cc
     );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_rewrites_namespace_member_consumer() {
+    let (tmp, source, destination, consumer) = setup_namespace_move_case(
+        "import * as service from './source';\n\
+export const result = service.moved();\n",
+    );
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = request_namespace_move(&mut aft, &source, &destination);
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert_eq!(resp["consumers_updated"], 1);
+    assert_eq!(
+        std::fs::read_to_string(&consumer).unwrap(),
+        "import { moved } from './dest';\n\
+import * as service from './source';\n\
+export const result = moved();\n"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_rewrites_namespace_members_in_js_and_tsx_consumers() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let source = tmp.path().join("source.ts");
+    let destination = tmp.path().join("dest.ts");
+    let javascript_consumer = tmp.path().join("consumer.js");
+    let tsx_consumer = tmp.path().join("component.tsx");
+    write_file(
+        &source,
+        "export function moved(): string { return 'ok'; }\n\
+export function stays(): string { return 'stay'; }\n",
+    );
+    write_file(&destination, "export const existing = true;\n");
+    write_file(
+        &javascript_consumer,
+        "import * as service from './source';\n\
+export const result = service.moved();\n",
+    );
+    write_file(
+        &tsx_consumer,
+        "import * as service from './source';\n\
+export const view = <span>{service.moved()}</span>;\n",
+    );
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = request_namespace_move(&mut aft, &source, &destination);
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert_eq!(resp["consumers_updated"], 2);
+    for consumer in [&javascript_consumer, &tsx_consumer] {
+        let content = std::fs::read_to_string(consumer).unwrap();
+        assert!(content.contains("import { moved } from './dest';"));
+        assert!(content.contains("import * as service from './source';"));
+        assert!(!content.contains("service.moved"));
+    }
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_merges_namespace_rewrite_into_existing_destination_import() {
+    let (tmp, source, destination, consumer) = setup_namespace_move_case(
+        "import { existing } from './dest';\n\
+import * as service from './source';\n\
+export const result = service.moved() + String(existing);\n",
+    );
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = request_namespace_move(&mut aft, &source, &destination);
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert_eq!(resp["consumers_updated"], 1);
+    assert_eq!(
+        std::fs::read_to_string(&consumer).unwrap(),
+        "import { existing, moved } from './dest';\n\
+import * as service from './source';\n\
+export const result = moved() + String(existing);\n"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_aliases_namespace_rewrite_when_local_binding_collides() {
+    let (tmp, source, destination, consumer) = setup_namespace_move_case(
+        "import * as service from './source';\n\
+const moved = () => 'local';\n\
+export const result = service.moved() + moved();\n",
+    );
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = request_namespace_move(&mut aft, &source, &destination);
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert_eq!(resp["consumers_updated"], 1);
+    assert_eq!(
+        std::fs::read_to_string(&consumer).unwrap(),
+        "import { moved as moved_2 } from './dest';\n\
+import * as service from './source';\n\
+const moved = () => 'local';\n\
+export const result = moved_2() + moved();\n"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_rejects_computed_namespace_access_before_writing() {
+    let (tmp, source, destination, consumer) = setup_namespace_move_case(
+        "import * as service from './source';\n\
+export const result = service[\"moved\"]();\n",
+    );
+    let source_before = std::fs::read_to_string(&source).unwrap();
+    let destination_before = std::fs::read_to_string(&destination).unwrap();
+    let consumer_before = std::fs::read_to_string(&consumer).unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = request_namespace_move(&mut aft, &source, &destination);
+    assert_eq!(resp["success"], false, "move should reject: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_namespace_usage");
+    assert!(
+        resp["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file.as_str().unwrap().ends_with("consumer.ts")),
+        "error should name the unsupported consumer: {resp:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_before);
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        destination_before
+    );
+    assert_eq!(std::fs::read_to_string(&consumer).unwrap(), consumer_before);
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_rejects_namespace_binding_used_as_value() {
+    let (tmp, source, destination, consumer) = setup_namespace_move_case(
+        "import * as service from './source';\n\
+const inspect = (value: object) => value;\n\
+export const result = service.moved() + String(inspect(service));\n",
+    );
+    let source_before = std::fs::read_to_string(&source).unwrap();
+    let destination_before = std::fs::read_to_string(&destination).unwrap();
+    let consumer_before = std::fs::read_to_string(&consumer).unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = request_namespace_move(&mut aft, &source, &destination);
+    assert_eq!(resp["success"], false, "move should reject: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_namespace_usage");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_before);
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        destination_before
+    );
+    assert_eq!(std::fs::read_to_string(&consumer).unwrap(), consumer_before);
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_leaves_unrelated_namespace_consumer_untouched() {
+    let consumer_before = "import * as service from './source';\n\
+const other = { moved: () => 'other' };\n\
+const text = 'service.moved'; // service.moved is not executable code.\n\
+export const result = service.stays() + other.moved() + text;\n";
+    let (tmp, source, destination, consumer) = setup_namespace_move_case(consumer_before);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = request_namespace_move(&mut aft, &source, &destination);
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert_eq!(resp["consumers_updated"], 0);
+    assert_eq!(std::fs::read_to_string(&consumer).unwrap(), consumer_before);
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_rejects_namespace_reexport_before_writing() {
+    let (tmp, source, destination, consumer) =
+        setup_namespace_move_case("export * as service from './source';\n");
+    let source_before = std::fs::read_to_string(&source).unwrap();
+    let destination_before = std::fs::read_to_string(&destination).unwrap();
+    let consumer_before = std::fs::read_to_string(&consumer).unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = request_namespace_move(&mut aft, &source, &destination);
+    assert_eq!(resp["success"], false, "move should reject: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_namespace_usage");
+    assert!(
+        resp["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file.as_str().unwrap().ends_with("consumer.ts")),
+        "error should name the unsupported consumer: {resp:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_before);
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        destination_before
+    );
+    assert_eq!(std::fs::read_to_string(&consumer).unwrap(), consumer_before);
 
     aft.shutdown();
 }

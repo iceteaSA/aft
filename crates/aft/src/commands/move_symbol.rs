@@ -371,10 +371,16 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // `lang` already detected above for the export-keyword extension.
 
+    // Compute every consumer change before creating backups or writing files.
+    // Namespace imports need semantic usage checks: clean property accesses can
+    // be rewritten, while dynamic or value-level uses must reject the whole move.
+    let mut unsupported_consumer_usages: Vec<(PathBuf, Vec<String>)> = Vec::new();
+
     // If the original source still references the moved symbol after removing
     // its declaration, it is also a consumer. Run the same import-rewrite path
     // against the post-removal source text so those local references resolve.
-    let source_rewritten_as_consumer = if let Some(rewritten) = rewrite_consumer_imports(
+    let mut source_rewritten_as_consumer = false;
+    match rewrite_consumer_imports(
         &new_source,
         source_path,
         source_path,
@@ -383,11 +389,13 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Some(source_lang),
         moved_symbol_is_default,
     ) {
-        new_source = rewritten;
-        true
-    } else {
-        false
-    };
+        Ok(Some(rewritten)) => {
+            new_source = rewritten;
+            source_rewritten_as_consumer = true;
+        }
+        Ok(None) => {}
+        Err(usages) => unsupported_consumer_usages.push((source_path.to_path_buf(), usages)),
+    }
 
     // --- Compute consumer rewrites ---
     let mut consumer_rewrites: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, new)
@@ -400,19 +408,49 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(_) => continue,
         };
 
-        let new_consumer = rewrite_consumer_imports(
+        match rewrite_consumer_imports(
             &consumer_content,
             consumer_file,
             source_path,
             dest_path,
             symbol_name,
-            Some(source_lang),
+            detect_language(consumer_file),
             moved_symbol_is_default,
-        );
-
-        if let Some(rewritten) = new_consumer {
-            consumer_rewrites.push((consumer_file.clone(), consumer_content, rewritten));
+        ) {
+            Ok(Some(rewritten)) => {
+                consumer_rewrites.push((consumer_file.clone(), consumer_content, rewritten));
+            }
+            Ok(None) => {}
+            Err(usages) => {
+                unsupported_consumer_usages.push((consumer_file.clone(), usages));
+            }
         }
+    }
+
+    if !unsupported_consumer_usages.is_empty() {
+        unsupported_consumer_usages.sort_by(|left, right| left.0.cmp(&right.0));
+        let files: Vec<String> = unsupported_consumer_usages
+            .iter()
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        let usages: Vec<serde_json::Value> = unsupported_consumer_usages
+            .iter()
+            .map(|(path, shapes)| {
+                serde_json::json!({
+                    "file": path.display().to_string(),
+                    "shapes": shapes,
+                })
+            })
+            .collect();
+        return Response::error_with_data(
+            &req.id,
+            "unsupported_namespace_usage",
+            format!(
+                "move_symbol: cannot safely rewrite namespace usage in: {}",
+                files.join(", ")
+            ),
+            serde_json::json!({ "files": files, "usages": usages }),
+        );
     }
 
     // --- Create checkpoint (D105) ---
@@ -1023,11 +1061,8 @@ fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, 
     }
 }
 
-/// Rewrite a consumer file's imports to point to the new destination.
-///
-/// Finds imports from the source file that include the moved symbol,
-/// and rewrites them to import from the destination instead.
-/// Returns `None` if no changes needed.
+/// Rewrite imports and supported namespace-member references to the destination.
+/// Unsupported namespace usage is returned so the caller can reject before any write.
 fn rewrite_consumer_imports(
     consumer_content: &str,
     consumer_file: &Path,
@@ -1036,35 +1071,65 @@ fn rewrite_consumer_imports(
     symbol_name: &str,
     lang: Option<LangId>,
     moved_symbol_is_default: bool,
-) -> Option<String> {
-    let lang = lang?;
+) -> Result<Option<String>, Vec<String>> {
+    let Some(lang) = lang else {
+        return Ok(None);
+    };
 
-    // Only handle TS/JS/TSX for now (the primary use case)
+    // Only handle TS/JS/TSX for now (the primary use case).
     if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
-        return None;
+        return Ok(None);
     }
 
     // Parse imports from the content passed in. For the source file this is
     // the post-removal text, not the original on-disk content.
-    let (tree, block) = parse_imports_from_content(consumer_content, lang)?;
+    let Some((tree, block)) = parse_imports_from_content(consumer_content, lang) else {
+        return Ok(None);
+    };
 
     let content = consumer_content;
+    let new_import_path = compute_relative_import_path(consumer_file, dest_file);
 
-    // Find imports from the source file that reference the moved symbol
-    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-
-    // Process imports in reverse order to maintain byte offsets
+    // Find imports from the source file that reference the moved symbol.
     let mut matching_imports: Vec<(usize, &imports::ImportStatement)> = block
         .imports
         .iter()
         .enumerate()
         .filter(|(_, imp)| import_path_matches_file(&imp.module_path, consumer_file, source_file))
         .collect();
+    matching_imports.sort_by(|left, right| right.1.byte_range.start.cmp(&left.1.byte_range.start));
 
-    // Sort by byte range start descending so we edit from end to start
-    matching_imports.sort_by(|a, b| b.1.byte_range.start.cmp(&a.1.byte_range.start));
+    let namespace_aliases = matching_imports
+        .iter()
+        .filter_map(|(_, import)| import.namespace_import.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let existing_moved_binding = (!moved_symbol_is_default)
+        .then(|| {
+            matching_imports.iter().find_map(|(_, import)| {
+                (import.kind == imports::ImportKind::Value)
+                    .then(|| {
+                        import
+                            .names
+                            .iter()
+                            .find(|name| imports::specifier_imported_name(name) == symbol_name)
+                            .map(|name| imports::specifier_local_name(name).to_string())
+                    })
+                    .flatten()
+            })
+        })
+        .flatten();
+    let namespace_plan = build_namespace_rewrite_plan(
+        content,
+        &tree,
+        &block,
+        &namespace_aliases,
+        consumer_file,
+        dest_file,
+        symbol_name,
+        existing_moved_binding.as_deref(),
+    )?;
 
-    let mut made_changes = false;
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
     for (_, imp) in &matching_imports {
         let moved_bindings = moved_bindings_for_import(imp, symbol_name, moved_symbol_is_default);
@@ -1072,15 +1137,13 @@ fn rewrite_consumer_imports(
             continue;
         }
 
-        let new_import_path = compute_relative_import_path(consumer_file, dest_file);
-
         // Check if this import has other symbols besides the moved one. Default
         // imports are only moved when the target declaration was the default
         // export, preserving the consumer's local alias (`import Bar ...`).
         let remaining_names: Vec<String> = imp
             .names
             .iter()
-            .filter(|n| !moved_bindings.named.iter().any(|moved| moved == *n))
+            .filter(|name| !moved_bindings.named.iter().any(|moved| moved == *name))
             .cloned()
             .collect();
         let remaining_default = if moved_bindings.default_import.is_some() {
@@ -1098,16 +1161,12 @@ fn rewrite_consumer_imports(
         let moved_import =
             generate_import_for_bindings(lang, &new_import_path, &moved_bindings, type_only);
 
-        // Build the replacement text
         if remaining_names.is_empty()
             && remaining_default.is_none()
             && remaining_namespace.is_none()
         {
-            // All symbols in this import are moving — replace entire import with
-            // a same-kind import from the new path.
             edits.push((imp.byte_range.clone(), moved_import));
         } else {
-            // Some symbols remain — keep old import for remaining, add new import for moved.
             let kept_import = imports::generate_import_line_with_namespace(
                 lang,
                 &imp.module_path,
@@ -1116,9 +1175,10 @@ fn rewrite_consumer_imports(
                 remaining_namespace.as_deref(),
                 type_only,
             );
-
-            let replacement = format!("{}\n{}", kept_import, moved_import);
-            edits.push((imp.byte_range.clone(), replacement));
+            edits.push((
+                imp.byte_range.clone(),
+                format!("{kept_import}\n{moved_import}"),
+            ));
         }
     }
 
@@ -1140,16 +1200,13 @@ fn rewrite_consumer_imports(
             }
         }
 
-        exports.sort_by(|a, b| b.byte_range().start.cmp(&a.byte_range().start));
+        exports.sort_by(|left, right| right.byte_range().start.cmp(&left.byte_range().start));
         for node in exports {
+            if export_statement_is_namespace_reexport(content, &node) {
+                return Err(vec!["namespace re-export (`export * as ...`)".to_string()]);
+            }
             if export_statement_has_wildcard(content, &node) {
-                // TODO: safely rewrite `export * from "..."` once moved-symbol
-                // provenance can distinguish which names are provided by the star.
-                crate::slog_warn!(
-                    "move_symbol: leaving wildcard re-export unchanged in {}",
-                    consumer_file.display()
-                );
-                continue;
+                return Err(vec!["wildcard re-export (`export * from ...`)".to_string()]);
             }
             if !export_statement_contains_name(content, &node, symbol_name) {
                 continue;
@@ -1162,9 +1219,8 @@ fn rewrite_consumer_imports(
             else {
                 continue;
             };
-            let new_import_path = compute_relative_import_path(consumer_file, dest_file);
             if remaining_specs.is_empty() {
-                edits.push((module_range, new_import_path));
+                edits.push((module_range, new_import_path.clone()));
             } else {
                 let old_path = &content[module_range];
                 let replacement = format!(
@@ -1195,7 +1251,26 @@ fn rewrite_consumer_imports(
         }
     }
 
-    edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    if let Some(binding_name) = namespace_plan.binding_name.as_deref() {
+        for range in namespace_plan.member_ranges {
+            edits.push((range, binding_name.to_string()));
+        }
+        if let Some(import_specifier) = namespace_plan.import_specifier.as_deref() {
+            if let Some(import_edit) = build_add_moved_import_edit(
+                content,
+                &block,
+                consumer_file,
+                dest_file,
+                import_specifier,
+                lang,
+                false,
+            ) {
+                edits.push(import_edit);
+            }
+        }
+    }
+
+    edits.sort_by(|left, right| right.0.start.cmp(&left.0.start));
     let mut result = content.to_string();
     for (range, replacement) in edits {
         result = format!(
@@ -1204,14 +1279,289 @@ fn rewrite_consumer_imports(
             replacement,
             &result[range.end..]
         );
-        made_changes = true;
     }
 
-    if made_changes {
-        Some(result)
+    if result == content {
+        Ok(None)
     } else {
-        None
+        Ok(Some(result))
     }
+}
+
+#[derive(Debug, Default)]
+struct NamespaceRewritePlan {
+    member_ranges: Vec<std::ops::Range<usize>>,
+    binding_name: Option<String>,
+    import_specifier: Option<String>,
+}
+
+fn build_namespace_rewrite_plan(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    import_block: &imports::ImportBlock,
+    namespace_aliases: &std::collections::BTreeSet<String>,
+    consumer_file: &Path,
+    dest_file: &Path,
+    symbol_name: &str,
+    existing_moved_binding: Option<&str>,
+) -> Result<NamespaceRewritePlan, Vec<String>> {
+    if namespace_aliases.is_empty() {
+        return Ok(NamespaceRewritePlan::default());
+    }
+
+    let mut member_ranges = Vec::new();
+    let mut namespace_object_ranges = Vec::new();
+    let mut unsupported_shapes = std::collections::BTreeSet::new();
+    collect_namespace_symbol_usages(
+        source,
+        tree.root_node(),
+        namespace_aliases,
+        symbol_name,
+        &mut member_ranges,
+        &mut namespace_object_ranges,
+        &mut unsupported_shapes,
+    );
+
+    if !unsupported_shapes.is_empty() {
+        return Err(unsupported_shapes.into_iter().collect());
+    }
+    if member_ranges.is_empty() {
+        return Ok(NamespaceRewritePlan::default());
+    }
+
+    member_ranges.sort_by_key(|range| (range.start, range.end));
+    member_ranges.dedup();
+    namespace_object_ranges.sort_by_key(|range| (range.start, range.end));
+    namespace_object_ranges.dedup();
+
+    let existing_destination_binding =
+        existing_named_binding_from_file(import_block, consumer_file, dest_file, symbol_name);
+    if let Some(binding) = existing_moved_binding.or(existing_destination_binding.as_deref()) {
+        if name_is_shadowed_at_namespace_sites(
+            source,
+            tree.root_node(),
+            &namespace_object_ranges,
+            binding,
+        ) {
+            return Err(vec![format!(
+                "namespace member replacement collides with existing binding `{binding}`"
+            )]);
+        }
+        return Ok(NamespaceRewritePlan {
+            member_ranges,
+            binding_name: Some(binding.to_string()),
+            import_specifier: None,
+        });
+    }
+
+    let root = tree.root_node();
+    let collides = import_block_binds_name(import_block, symbol_name)
+        || root_scope_binds_name(&root, source, symbol_name)
+        || node_references_identifier(&root, source, symbol_name)
+        || name_is_shadowed_at_namespace_sites(source, root, &namespace_object_ranges, symbol_name);
+
+    let binding_name = if collides {
+        let mut identifiers = std::collections::BTreeSet::new();
+        collect_identifier_names(source, root, &mut identifiers);
+        next_available_import_alias(symbol_name, &identifiers)
+    } else {
+        symbol_name.to_string()
+    };
+    let import_specifier = if binding_name == symbol_name {
+        symbol_name.to_string()
+    } else {
+        format!("{symbol_name} as {binding_name}")
+    };
+
+    Ok(NamespaceRewritePlan {
+        member_ranges,
+        binding_name: Some(binding_name),
+        import_specifier: Some(import_specifier),
+    })
+}
+
+fn collect_namespace_symbol_usages(
+    source: &str,
+    node: tree_sitter::Node,
+    namespace_aliases: &std::collections::BTreeSet<String>,
+    symbol_name: &str,
+    member_ranges: &mut Vec<std::ops::Range<usize>>,
+    namespace_object_ranges: &mut Vec<std::ops::Range<usize>>,
+    unsupported_shapes: &mut std::collections::BTreeSet<String>,
+) {
+    if matches!(node.kind(), "identifier" | "shorthand_property_identifier") {
+        let alias = source[node.byte_range()].trim();
+        if namespace_aliases.contains(alias)
+            && !node_is_inside_import_statement(node)
+            && !identifier_is_shadowed_by_enclosing_scope(
+                &node,
+                source,
+                alias,
+                IdentifierNamespace::Value,
+            )
+        {
+            match node.parent() {
+                Some(parent)
+                    if parent.kind() == "member_expression"
+                        && parent
+                            .child_by_field_name("object")
+                            .is_some_and(|object| same_node(&object, &node)) =>
+                {
+                    if parent
+                        .child_by_field_name("property")
+                        .is_some_and(|property| source[property.byte_range()].trim() == symbol_name)
+                    {
+                        member_ranges.push(parent.byte_range());
+                        namespace_object_ranges.push(node.byte_range());
+                    }
+                }
+                Some(parent)
+                    if parent.kind() == "subscript_expression"
+                        && parent
+                            .child_by_field_name("object")
+                            .is_some_and(|object| same_node(&object, &node)) =>
+                {
+                    unsupported_shapes.insert(format!("computed namespace access `{alias}[...]`"));
+                }
+                _ => {
+                    unsupported_shapes
+                        .insert(format!("namespace binding `{alias}` used as a value"));
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_namespace_symbol_usages(
+                source,
+                cursor.node(),
+                namespace_aliases,
+                symbol_name,
+                member_ranges,
+                namespace_object_ranges,
+                unsupported_shapes,
+            );
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn node_is_inside_import_statement(mut node: tree_sitter::Node) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "import_statement" {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn existing_named_binding_from_file(
+    import_block: &imports::ImportBlock,
+    consumer_file: &Path,
+    target_file: &Path,
+    symbol_name: &str,
+) -> Option<String> {
+    import_block.imports.iter().find_map(|import| {
+        if import.kind != imports::ImportKind::Value
+            || !import_path_matches_file(&import.module_path, consumer_file, target_file)
+        {
+            return None;
+        }
+        import
+            .names
+            .iter()
+            .find(|name| imports::specifier_imported_name(name) == symbol_name)
+            .map(|name| imports::specifier_local_name(name).to_string())
+    })
+}
+
+fn import_block_binds_name(import_block: &imports::ImportBlock, name: &str) -> bool {
+    import_block.imports.iter().any(|import| {
+        import.default_import.as_deref() == Some(name)
+            || import.namespace_import.as_deref() == Some(name)
+            || import
+                .names
+                .iter()
+                .any(|specifier| imports::specifier_local_name(specifier) == name)
+    })
+}
+
+fn root_scope_binds_name(root: &tree_sitter::Node, source: &str, name: &str) -> bool {
+    (0..root.child_count()).any(|index| {
+        root.child(index as u32).is_some_and(|child| {
+            direct_scope_child_binds_name(&child, source, name, IdentifierNamespace::Value)
+                || direct_scope_child_binds_name(&child, source, name, IdentifierNamespace::Type)
+        })
+    })
+}
+
+fn name_is_shadowed_at_namespace_sites(
+    source: &str,
+    node: tree_sitter::Node,
+    namespace_object_ranges: &[std::ops::Range<usize>],
+    name: &str,
+) -> bool {
+    if namespace_object_ranges
+        .iter()
+        .any(|range| range.start == node.start_byte() && range.end == node.end_byte())
+        && identifier_is_shadowed_by_enclosing_scope(
+            &node,
+            source,
+            name,
+            IdentifierNamespace::Value,
+        )
+    {
+        return true;
+    }
+
+    (0..node.child_count()).any(|index| {
+        node.child(index as u32).is_some_and(|child| {
+            name_is_shadowed_at_namespace_sites(source, child, namespace_object_ranges, name)
+        })
+    })
+}
+
+fn collect_identifier_names(
+    source: &str,
+    node: tree_sitter::Node,
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    if node.kind().contains("identifier") {
+        let name = source[node.byte_range()].trim();
+        if !name.is_empty() {
+            names.insert(name.to_string());
+        }
+    }
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index as u32) {
+            collect_identifier_names(source, child, names);
+        }
+    }
+}
+
+fn next_available_import_alias(
+    symbol_name: &str,
+    identifiers: &std::collections::BTreeSet<String>,
+) -> String {
+    for suffix in 2usize.. {
+        let candidate = format!("{symbol_name}_{suffix}");
+        if !identifiers.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("the monotonically increasing alias suffix must eventually be unused")
+}
+
+fn export_statement_is_namespace_reexport(source: &str, node: &tree_sitter::Node) -> bool {
+    node.kind() == "export_statement"
+        && source[node.byte_range()]
+            .trim_start()
+            .starts_with("export * as ")
 }
 
 fn export_path_matches_file(
@@ -1382,6 +1732,40 @@ fn build_add_moved_import_edit(
 
     if imports::is_duplicate(block, &new_import_path, &names, default_import, false) {
         return None;
+    }
+
+    // Match add_import's same-module merge behavior so namespace rewrites do
+    // not create a second named-import statement when the destination is already
+    // imported. Preserve the existing module spelling (for example `./dest.js`).
+    if !moved_symbol_is_default {
+        if let Some(existing) = block.imports.iter().find(|import| {
+            import.kind == imports::ImportKind::Value
+                && import.namespace_import.is_none()
+                && import.default_import.is_none()
+                && !import.names.is_empty()
+                && import_path_matches_file(&import.module_path, consumer_file, dest_file)
+        }) {
+            let requested = &names[0];
+            let requested_imported = imports::specifier_imported_name(requested);
+            let requested_local = imports::specifier_local_name(requested);
+            if existing.names.iter().any(|name| {
+                imports::specifier_imported_name(name) == requested_imported
+                    && imports::specifier_local_name(name) == requested_local
+            }) {
+                return None;
+            }
+
+            let merged_names =
+                super::add_import::merge_named_import_specifiers(&existing.names, &names);
+            let merged_line = imports::generate_import_line(
+                lang,
+                &existing.module_path,
+                &merged_names,
+                None,
+                false,
+            );
+            return Some((existing.byte_range.clone(), merged_line));
+        }
     }
 
     let group = imports::classify_group(lang, &new_import_path);
