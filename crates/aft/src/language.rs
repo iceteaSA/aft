@@ -3,6 +3,14 @@ use std::path::Path;
 use crate::error::AftError;
 pub use crate::symbols::{Range, Symbol, SymbolMatch};
 
+/// An explicitly declared heading anchor used as a URL fragment, with its source location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadingAnchor {
+    pub start_line: u32,
+    pub start_col: u32,
+    pub id: String,
+}
+
 /// Trait for language-specific symbol resolution.
 ///
 /// S02 implements this with tree-sitter parsing via `TreeSitterProvider`.
@@ -12,6 +20,11 @@ pub trait LanguageProvider: Send + Sync {
 
     /// List all top-level symbols in a file.
     fn list_symbols(&self, file: &Path) -> Result<Vec<Symbol>, AftError>;
+
+    /// Return explicitly declared heading anchors and their source locations.
+    fn heading_anchors(&self, _file: &Path) -> Result<Vec<HeadingAnchor>, AftError> {
+        Ok(Vec::new())
+    }
 
     /// Downcast to concrete type for provider-specific operations.
     fn as_any(&self) -> &dyn std::any::Any;

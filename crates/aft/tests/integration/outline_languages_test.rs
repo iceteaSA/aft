@@ -676,6 +676,160 @@ fn zoom_html_heading_normalizes_identity_variants() {
 }
 
 #[test]
+fn zoom_html_heading_resolves_explicit_and_legacy_anchors_without_changing_outline() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "custom-anchors.html",
+        r##"<a href="#install-v2">Jump to setup</a>
+<h2 id="install-v2">Setup Guide</h2>
+<p>Custom anchor details.</p>
+<h2>Fallback Heading</h2>
+<p>Fallback details.</p>
+<h2 name="legacy-setup">Legacy Setup</h2>
+<p>Legacy anchor details.</p>
+"##,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    assert_eq!(
+        outline_text(&mut aft, &file),
+        "custom-anchors.html\n  - h    <h2> Setup Guide 2:3\n  - h    <h2> Fallback Heading 4:5\n  - h    <h2> Legacy Setup 6:7\n"
+    );
+
+    let explicit = send(
+        &mut aft,
+        json!({
+            "id": "html-explicit-anchor",
+            "command": "zoom",
+            "file": file,
+            "symbol": "#install-v2",
+        }),
+    );
+    assert_eq!(
+        explicit["success"], true,
+        "explicit anchor zoom: {explicit:?}"
+    );
+    assert!(explicit["content"]
+        .as_str()
+        .unwrap()
+        .contains("Custom anchor details."));
+    assert!(explicit["context_before"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| line.as_str().unwrap().contains("href=\"#install-v2\"")));
+
+    for (id, symbol, expected) in [
+        (
+            "html-explicit-heading-text-slug-fallback",
+            "#setup-guide",
+            "Custom anchor details.",
+        ),
+        (
+            "html-text-slug-fallback",
+            "#fallback-heading",
+            "Fallback details.",
+        ),
+    ] {
+        let fallback = send(
+            &mut aft,
+            json!({
+                "id": id,
+                "command": "zoom",
+                "file": file,
+                "symbol": symbol,
+            }),
+        );
+        assert_eq!(
+            fallback["success"], true,
+            "text slug fallback: {fallback:?}"
+        );
+        assert!(fallback["content"].as_str().unwrap().contains(expected));
+    }
+
+    let legacy = send(
+        &mut aft,
+        json!({
+            "id": "html-legacy-name-anchor",
+            "command": "zoom",
+            "file": file,
+            "symbol": "#legacy-setup",
+        }),
+    );
+    assert_eq!(legacy["success"], true, "legacy anchor zoom: {legacy:?}");
+    assert!(legacy["content"]
+        .as_str()
+        .unwrap()
+        .contains("Legacy anchor details."));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_html_explicit_anchor_collisions_are_ambiguous() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "anchor-collisions.html",
+        r#"<h2 id="duplicate">First Duplicate</h2>
+<p>First details.</p>
+<h2 id="duplicate">Second Duplicate</h2>
+<p>Second details.</p>
+<h2 id="collision">Explicit Owner</h2>
+<p>Explicit details.</p>
+<h2>Collision</h2>
+<p>Slug details.</p>
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    for (id, symbol, expected_names) in [
+        (
+            "html-duplicate-explicit-anchor",
+            "#duplicate",
+            ["First Duplicate", "Second Duplicate"],
+        ),
+        (
+            "html-explicit-text-slug-collision",
+            "#collision",
+            ["Explicit Owner", "Collision"],
+        ),
+    ] {
+        let resp = send(
+            &mut aft,
+            json!({
+                "id": id,
+                "command": "zoom",
+                "file": file,
+                "symbol": symbol,
+            }),
+        );
+        assert_eq!(resp["success"], true, "ambiguous anchor zoom: {resp:?}");
+        assert_eq!(
+            resp["kind"], "ambiguous_symbol",
+            "anchor must not pick arbitrarily"
+        );
+        let candidates = resp["candidates"].as_array().expect("candidate list");
+        assert_eq!(candidates.len(), 2, "ambiguous candidates: {resp:?}");
+        for expected_name in expected_names {
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate["name"] == expected_name),
+                "missing {expected_name:?}: {resp:?}"
+            );
+        }
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn zoom_html_last_heading_range_stays_within_file() {
     let dir = TempDir::new().unwrap();
     let file = write_file(

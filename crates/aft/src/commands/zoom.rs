@@ -11,7 +11,7 @@ use crate::commands::symbol_render::{
 };
 use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
-use crate::language::LanguageProvider;
+use crate::language::{HeadingAnchor, LanguageProvider};
 use crate::lsp_hints;
 use crate::parser::{detect_language, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
@@ -952,10 +952,50 @@ fn resolve_heading_symbols(
         })
         .collect();
 
-    Ok(match_heading_identity(&headings, query))
+    let anchors = if query.starts_with('#') {
+        provider.heading_anchors(path)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(match_heading_identity(&headings, query, &anchors))
 }
 
-fn match_heading_identity(headings: &[SymbolMatch], query: &str) -> Vec<SymbolMatch> {
+fn match_heading_identity(
+    headings: &[SymbolMatch],
+    query: &str,
+    anchors: &[HeadingAnchor],
+) -> Vec<SymbolMatch> {
+    if let Some(anchor_query) = query.strip_prefix('#') {
+        let mut matches: Vec<_> = headings
+            .iter()
+            .filter(|candidate| {
+                anchors.iter().any(|anchor| {
+                    anchor.id == anchor_query
+                        && anchor.start_line == candidate.symbol.range.start_line
+                        && anchor.start_col == candidate.symbol.range.start_col
+                })
+            })
+            .cloned()
+            .collect();
+
+        let normalized_query = normalize_heading_label(query);
+        let query_slug = slugify_heading_label(&normalized_query);
+        if !query_slug.is_empty() {
+            for candidate in headings
+                .iter()
+                .filter(|candidate| heading_identity_has_slug(&candidate.symbol, &query_slug))
+            {
+                if !matches.iter().any(|existing| {
+                    existing.file == candidate.file && existing.symbol == candidate.symbol
+                }) {
+                    matches.push(candidate.clone());
+                }
+            }
+        }
+        return matches;
+    }
+
     let exact: Vec<_> = headings
         .iter()
         .filter(|candidate| heading_identity_is_exact(&candidate.symbol, query))

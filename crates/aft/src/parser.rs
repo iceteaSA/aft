@@ -7058,7 +7058,7 @@ fn source_line_end_col(source: &str, line: u32) -> u32 {
 }
 
 fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
-    let mut headings: Vec<(u8, Symbol)> = Vec::new();
+    let mut headings = Vec::new();
     collect_html_headings(source, root, &mut headings);
 
     let total_lines = source.lines().count() as u32;
@@ -7067,35 +7067,45 @@ fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
     // same or shallower level (or EOF). This makes aft_zoom return the full
     // section content rather than just the heading element's single line.
     for i in 0..headings.len() {
-        let level = headings[i].0;
+        let level = headings[i].level;
         let section_end = headings[i + 1..]
             .iter()
-            .find(|(l, _)| *l <= level)
-            .map(|(_, s)| s.range.start_line.saturating_sub(1))
+            .find(|heading| heading.level <= level)
+            .map(|heading| heading.symbol.range.start_line.saturating_sub(1))
             .unwrap_or_else(|| total_lines.saturating_sub(1));
-        headings[i].1.range.end_line = section_end;
-        if section_end != headings[i].1.range.start_line {
-            headings[i].1.range.end_col = source_line_end_col(source, section_end);
+        headings[i].symbol.range.end_line = section_end;
+        if section_end != headings[i].symbol.range.start_line {
+            headings[i].symbol.range.end_col = source_line_end_col(source, section_end);
         }
     }
 
     // Build hierarchy: assign scope_chain and parent based on heading level
     let mut scope_stack: Vec<(u8, String)> = Vec::new(); // (level, name)
-    for (level, symbol) in headings.iter_mut() {
+    for heading in &mut headings {
         // Pop scope entries that are at the same level or deeper
-        while scope_stack.last().is_some_and(|(l, _)| *l >= *level) {
+        while scope_stack
+            .last()
+            .is_some_and(|(level, _)| *level >= heading.level)
+        {
             scope_stack.pop();
         }
-        symbol.scope_chain = scope_stack.iter().map(|(_, name)| name.clone()).collect();
-        symbol.parent = scope_stack.last().map(|(_, name)| name.clone());
-        scope_stack.push((*level, symbol.name.clone()));
+        heading.symbol.scope_chain = scope_stack.iter().map(|(_, name)| name.clone()).collect();
+        heading.symbol.parent = scope_stack.last().map(|(_, name)| name.clone());
+        scope_stack.push((heading.level, heading.symbol.name.clone()));
     }
 
-    Ok(headings.into_iter().map(|(_, s)| s).collect())
+    Ok(headings.into_iter().map(|heading| heading.symbol).collect())
+}
+
+/// A parsed HTML heading and its explicit `id` or legacy `name` URL anchor.
+struct HtmlHeading {
+    level: u8,
+    symbol: Symbol,
+    anchor_id: Option<String>,
 }
 
 /// Recursively collect h1-h6 elements from the HTML tree.
-fn collect_html_headings(source: &str, node: &Node, headings: &mut Vec<(u8, Symbol)>) {
+fn collect_html_headings(source: &str, node: &Node, headings: &mut Vec<HtmlHeading>) {
     let mut cursor = node.walk();
     if !cursor.goto_first_child() {
         return;
@@ -7128,9 +7138,10 @@ fn collect_html_headings(source: &str, node: &Node, headings: &mut Vec<(u8, Symb
                         if !text.is_empty() {
                             let range = node_range(&child);
                             let signature = format!("<h{}> {}", level, text);
-                            headings.push((
+                            headings.push(HtmlHeading {
                                 level,
-                                Symbol {
+                                anchor_id: html_heading_anchor_id(source, &start_tag),
+                                symbol: Symbol {
                                     name: text,
                                     kind: SymbolKind::Heading,
                                     range,
@@ -7139,7 +7150,7 @@ fn collect_html_headings(source: &str, node: &Node, headings: &mut Vec<(u8, Symb
                                     exported: false,
                                     parent: None, // filled later
                                 },
-                            ));
+                            });
                         }
                     }
                 }
@@ -7155,6 +7166,63 @@ fn collect_html_headings(source: &str, node: &Node, headings: &mut Vec<(u8, Symb
             break;
         }
     }
+}
+
+fn extract_html_heading_anchors(source: &str, root: &Node) -> Vec<crate::language::HeadingAnchor> {
+    let mut headings = Vec::new();
+    collect_html_headings(source, root, &mut headings);
+    headings
+        .into_iter()
+        .filter_map(|heading| {
+            heading.anchor_id.map(|id| crate::language::HeadingAnchor {
+                start_line: heading.symbol.range.start_line,
+                start_col: heading.symbol.range.start_col,
+                id,
+            })
+        })
+        .collect()
+}
+
+fn html_heading_anchor_id(source: &str, start_tag: &Node) -> Option<String> {
+    for expected_name in ["id", "name"] {
+        let mut cursor = start_tag.walk();
+        for attribute in start_tag.named_children(&mut cursor) {
+            if attribute.kind() != "attribute" {
+                continue;
+            }
+            let Some(name_node) = attribute
+                .child_by_field_name("name")
+                .or_else(|| find_child_by_kind(attribute, "attribute_name"))
+            else {
+                continue;
+            };
+            if !node_text(source, &name_node).eq_ignore_ascii_case(expected_name) {
+                continue;
+            }
+            let Some(value_node) = attribute
+                .child_by_field_name("value")
+                .or_else(|| find_child_by_kind(attribute, "quoted_attribute_value"))
+                .or_else(|| find_child_by_kind(attribute, "attribute_value"))
+            else {
+                continue;
+            };
+            let raw_value = node_text(source, &value_node).trim();
+            let value = raw_value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    raw_value
+                        .strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                })
+                .unwrap_or(raw_value)
+                .trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Extract text content from an HTML element, stripping tags.
@@ -7872,6 +7940,18 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
     fn list_symbols(&self, file: &Path) -> Result<Vec<Symbol>, AftError> {
         let mut parser = FileParser::with_symbol_cache(self.symbol_cache());
         parser.extract_symbols(file)
+    }
+
+    fn heading_anchors(
+        &self,
+        file: &Path,
+    ) -> Result<Vec<crate::language::HeadingAnchor>, AftError> {
+        if detect_language(file) != Some(LangId::Html) {
+            return Ok(Vec::new());
+        }
+        let mut parser = FileParser::with_symbol_cache(self.symbol_cache());
+        let (source, tree, _) = self.read_parsed_file(&mut parser, file)?;
+        Ok(extract_html_heading_anchors(&source, &tree.root_node()))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
