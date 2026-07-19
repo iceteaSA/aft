@@ -56,6 +56,14 @@ interface MockToolDef {
 interface MockExtensionContext {
   cwd: string;
   hasUI: boolean;
+  signal?: AbortSignal;
+  ui?: {
+    confirm: (
+      title: string,
+      message: string,
+      options?: { signal?: AbortSignal },
+    ) => Promise<boolean>;
+  };
 }
 
 // Mock theme for renderer tests
@@ -173,6 +181,7 @@ describe("bash tool adapter", () => {
     const properties = (bashTool!.parameters as { properties?: Record<string, unknown> })
       .properties;
     expect(properties?.wait).toBeDefined();
+    expect(properties?.sandbox).toMatchObject({ const: "host" });
   });
 
   test("schema omits background and PTY params when bash.background is disabled", () => {
@@ -195,6 +204,7 @@ describe("bash tool adapter", () => {
       "workdir",
       "description",
       "wait",
+      "sandbox",
       "compressed",
     ]);
     expect(properties?.background).toBeUndefined();
@@ -858,6 +868,70 @@ describe("bash tool adapter", () => {
 
     expect(result.details.bg_completions).toBeUndefined();
     expect(result.content[0].text).toBe("Main output");
+  });
+
+  test("host escalation prompt shows exact payload and retry carries opaque grant", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const calls: Array<Record<string, unknown>> = [];
+    const command = "printf 'exact  value'\nprintf done";
+    const cwd = "/tmp/exact cwd";
+    const bridge = {
+      send: async (_name: string, params: Record<string, unknown>) => {
+        calls.push(params);
+        if (calls.length === 1) {
+          return {
+            success: false,
+            code: "permission_required",
+            message: "approval required",
+            asks: [
+              {
+                kind: "escalation",
+                command,
+                cwd,
+                grant_id: "esc_server_minted",
+              },
+            ],
+          };
+        }
+        return { success: true, output: "approved", exit_code: 0 };
+      },
+    } as unknown as BinaryBridge;
+    const confirmations: Array<{ title: string; message: string }> = [];
+    const extCtx: MockExtensionContext = {
+      cwd: projectRoot,
+      hasUI: true,
+      ui: {
+        confirm: async (title, message) => {
+          confirmations.push({ title, message });
+          return true;
+        },
+      },
+    };
+
+    registerBashTool(api, makeMockContext(bridge));
+    const bashTool = tools.get("bash")!;
+    await bashTool.execute(
+      "host-call",
+      { command, workdir: cwd, sandbox: "host" },
+      undefined,
+      undefined,
+      extCtx,
+    );
+
+    expect(confirmations).toEqual([
+      {
+        title: "Run command unsandboxed on host?",
+        message: `This command will run UNSANDBOXED on the host.\n\nExact command:\n${command}\n\nWorking directory:\n${cwd}`,
+      },
+    ]);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({
+      command,
+      workdir: cwd,
+      sandbox: "host",
+      permissions_granted: ["esc_server_minted"],
+    });
   });
 
   test("permission_required error throws clear message", async () => {

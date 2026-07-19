@@ -4026,7 +4026,10 @@ fn detached_shell_command(
     exit_path: &Path,
     paths: &TaskPaths,
 ) -> Result<Command, String> {
-    let shell = resolve_posix_shell();
+    let shell = spawn_plan
+        .host_shell_path()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(resolve_posix_shell);
     // Keep the user-provided command body out of argv and shell `-c` parsing.
     // The direct child is still a tiny wrapper so it can write the authoritative
     // exit marker after the command script exits (including if that script calls
@@ -4058,7 +4061,7 @@ fn detached_shell_command(
 }
 
 #[cfg(unix)]
-fn resolve_posix_shell() -> PathBuf {
+pub(crate) fn resolve_posix_shell() -> PathBuf {
     static POSIX_SHELL: OnceLock<PathBuf> = OnceLock::new();
     POSIX_SHELL
         .get_or_init(|| {
@@ -4201,7 +4204,7 @@ fn spawn_detached_child(
     {
         use crate::windows_shell::shell_candidates;
         match spawn_plan {
-            SpawnPlan::Unsandboxed => {}
+            SpawnPlan::Unsandboxed | SpawnPlan::Host { .. } => {}
             SpawnPlan::Refused { code, .. } => return Err((*code).to_string()),
             SpawnPlan::Launcher { .. } => return Err("sandbox_unavailable".to_string()),
         }

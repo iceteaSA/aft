@@ -2110,6 +2110,16 @@ fn subc_bridge_untrusted_bash_elicitation_goodbye_sweeps_pending() {
 }
 
 #[test]
+fn subc_bridge_untrusted_host_escalation_is_denied_without_elicitation() {
+    run_subc_bridge_test(
+        "subc_bridge_untrusted_host_escalation_is_denied_without_elicitation",
+        Duration::from_secs(45),
+        drive_bash_host_escalation_denied_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_untrusted_bash_without_elicitation_stays_denied() {
     run_subc_bridge_test(
         "subc_bridge_untrusted_bash_without_elicitation_stays_denied",
@@ -5595,6 +5605,51 @@ async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput) {
     assert_eq!(frame.header.corr, 401);
     assert_untrusted_tool_error(&frame, "cannot run shell commands", "goodbye deny");
     assert!(!touched.exists(), "GOODBYE-denied bash must not spawn");
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_host_escalation_denied_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route_with_principal(
+        &mut stream,
+        1,
+        101,
+        &root1,
+        "runner",
+        "host-escalation-denied-session",
+        Some(subc_mcp_principal()),
+    )
+    .await;
+
+    let touched = root1.join("host-escalation-denied.txt");
+    send_tool_call(
+        &mut stream,
+        1,
+        102,
+        "bash",
+        json!({
+            "command": touch_command(&touched),
+            "compressed": false,
+            "sandbox": "host",
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "host escalation denial response").await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 102);
+    assert_untrusted_tool_error(
+        &frame,
+        "host escalation is unavailable",
+        "host escalation denial response",
+    );
+    assert!(
+        !touched.exists(),
+        "denied host escalation must not spawn bash"
+    );
 
     send_connection_goodbye(&mut stream).await;
 }

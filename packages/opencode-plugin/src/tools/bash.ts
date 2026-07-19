@@ -87,9 +87,12 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
 }
 
 interface PermissionAsk {
-  kind: "external_directory" | "bash";
-  patterns: string[];
-  always: string[];
+  kind: "external_directory" | "bash" | "escalation";
+  patterns?: string[];
+  always?: string[];
+  command?: string;
+  cwd?: string;
+  grant_id?: string;
 }
 
 type BridgeCaller = typeof callBashBridge;
@@ -110,8 +113,8 @@ function groupBashPermissionAsks(asks: PermissionAsk[]): PermissionAsk[] {
         bashAsk = { kind: "bash", patterns: [], always: [] };
         grouped.push(bashAsk);
       }
-      pushUnique(bashAsk.patterns, ask.patterns);
-      pushUnique(bashAsk.always, ask.always);
+      pushUnique(bashAsk.patterns ?? [], ask.patterns ?? []);
+      pushUnique(bashAsk.always ?? [], ask.always ?? []);
       continue;
     }
 
@@ -122,7 +125,15 @@ function groupBashPermissionAsks(asks: PermissionAsk[]): PermissionAsk[] {
 }
 
 function permissionsGrantedForRetry(asks: PermissionAsk[]): string[] {
-  return asks.flatMap((ask) => (ask.always.length > 0 ? ask.always : ask.patterns));
+  return asks.flatMap((ask) => {
+    if (ask.kind === "escalation") return ask.grant_id ? [ask.grant_id] : [];
+    const always = ask.always ?? [];
+    return always.length > 0 ? always : (ask.patterns ?? []);
+  });
+}
+
+function escalationAskText(ask: PermissionAsk): string {
+  return `This command will run UNSANDBOXED on the host.\n\nExact command:\n${ask.command ?? ""}\n\nWorking directory:\n${ask.cwd ?? ""}`;
 }
 
 async function withPermissionLoop(
@@ -132,33 +143,49 @@ async function withPermissionLoop(
   bridgeCall: BridgeCaller,
   options?: BridgeRequestOptions,
 ): ReturnType<BridgeCaller> {
-  const first = await bridgeCall(ctx, runtime, "bash", params, options);
-  if (first.success !== false || first.code !== "permission_required") return first;
+  const granted = Array.isArray(params.permissions_granted)
+    ? params.permissions_granted.filter((value): value is string => typeof value === "string")
+    : [];
+  let response = await bridgeCall(ctx, runtime, "bash", params, options);
 
-  const asks = Array.isArray(first.asks) ? (first.asks as PermissionAsk[]) : [];
-  for (const ask of groupBashPermissionAsks(asks)) {
-    const permission = ask.kind === "external_directory" ? "external_directory" : "bash";
-    await runAsk(
-      runtime.ask({
-        permission,
-        patterns: ask.patterns,
-        always: ask.always,
-        metadata: {},
-      }),
+  for (let round = 0; round < 8; round++) {
+    if (response.success !== false || response.code !== "permission_required") return response;
+    const asks = Array.isArray(response.asks) ? (response.asks as PermissionAsk[]) : [];
+    if (asks.length === 0) throw new Error("bash permission retry failed: no asks returned");
+
+    for (const ask of groupBashPermissionAsks(asks)) {
+      const permission = ask.kind === "external_directory" ? "external_directory" : "bash";
+      const escalation = ask.kind === "escalation";
+      await runAsk(
+        runtime.ask({
+          permission,
+          patterns: escalation ? [escalationAskText(ask)] : (ask.patterns ?? []),
+          always: escalation ? [] : (ask.always ?? []),
+          metadata: escalation
+            ? {
+                command: ask.command ?? "",
+                cwd: ask.cwd ?? "",
+                grant_id: ask.grant_id ?? "",
+                unsandboxed: true,
+              }
+            : {},
+        }),
+      );
+    }
+
+    for (const grant of permissionsGrantedForRetry(asks)) {
+      if (!granted.includes(grant)) granted.push(grant);
+    }
+    response = await bridgeCall(
+      ctx,
+      runtime,
+      "bash",
+      { ...params, permissions_granted: granted },
+      options,
     );
   }
 
-  const second = await bridgeCall(
-    ctx,
-    runtime,
-    "bash",
-    { ...params, permissions_granted: permissionsGrantedForRetry(asks) },
-    options,
-  );
-  if (second.success === false && second.code === "permission_required") {
-    throw new Error("bash permission retry failed");
-  }
-  return second;
+  throw new Error("bash permission retry failed: too many rounds");
 }
 
 export function createBashTool(
@@ -218,6 +245,12 @@ export function createBashTool(
       .optional()
       .describe(
         "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; if you send a new message, the wait detaches to background. Use only when you know the result is required before doing anything else.",
+      ),
+    sandbox: z
+      .literal("host")
+      .optional()
+      .describe(
+        "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
       ),
     ...backgroundFlagArg,
     compressed: z
@@ -337,6 +370,7 @@ export function createBashTool(
           foreground_orchestrate: true,
           block_to_completion: blockToCompletion,
           wait: requestedWait,
+          sandbox: args.sandbox,
         },
         callBashBridge,
         {

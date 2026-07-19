@@ -79,10 +79,12 @@ export function resolveSessionId(extCtx: ExtensionContext): string | undefined {
  */
 export class BridgeError extends Error {
   readonly code: string;
-  constructor(message: string, code: string) {
+  readonly response?: Record<string, unknown>;
+  constructor(message: string, code: string, response?: Record<string, unknown>) {
     super(message);
     this.name = "BridgeError";
     this.code = code;
+    this.response = response;
   }
 }
 
@@ -121,6 +123,7 @@ export async function callBridge(
     throw new BridgeError(
       formatBridgeErrorMessage(command, response, merged),
       typeof response.code === "string" ? response.code : "",
+      response,
     );
   }
   ingestBgCompletions(sessionId, response.bg_completions);

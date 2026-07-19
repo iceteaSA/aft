@@ -33,7 +33,10 @@ pub(crate) fn spawn_pty_for_command(
 ) -> Result<PtyRuntime, String> {
     #[cfg(unix)]
     {
-        let shell = resolve_posix_shell();
+        let shell = spawn_plan
+            .host_shell_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(resolve_posix_shell);
         let args = vec![OsString::from("-c"), OsString::from(user_command)];
         try_spawn_pty(
             spawn_plan,
@@ -100,7 +103,7 @@ pub(crate) fn spawn_pty_for_command(
 }
 
 #[cfg(unix)]
-fn resolve_posix_shell() -> PathBuf {
+pub(crate) fn resolve_posix_shell() -> PathBuf {
     resolve_posix_shell_with(
         || std::env::var_os("SHELL").map(PathBuf::from),
         is_executable_file,

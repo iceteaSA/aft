@@ -118,6 +118,12 @@ const BashBaseParams = {
         "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; if you send a new message, the wait detaches to background. Use only when you know the result is required before doing anything else.",
     }),
   ),
+  sandbox: Type.Optional(
+    Type.Literal("host", {
+      description:
+        "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+    }),
+  ),
 };
 
 const BashBackgroundFlagParam = {
@@ -302,6 +308,78 @@ async function callBashBridge(
   });
 }
 
+interface BashPermissionAsk {
+  kind?: string;
+  command?: string;
+  cwd?: string;
+  grant_id?: string;
+}
+
+function piEscalationAskText(ask: BashPermissionAsk): string {
+  return `This command will run UNSANDBOXED on the host.\n\nExact command:\n${ask.command ?? ""}\n\nWorking directory:\n${ask.cwd ?? ""}`;
+}
+
+async function callBashWithPermissionLoop(
+  bridge: AftProjectTransport,
+  params: Record<string, unknown>,
+  extCtx: ExtensionContext,
+  options?: BridgeRequestOptions,
+): Promise<Record<string, unknown>> {
+  const granted = Array.isArray(params.permissions_granted)
+    ? params.permissions_granted.filter((value): value is string => typeof value === "string")
+    : [];
+
+  for (let round = 0; round < 8; round++) {
+    try {
+      return await callBashBridge(
+        bridge,
+        "bash",
+        { ...params, ...(granted.length > 0 ? { permissions_granted: granted } : {}) },
+        extCtx,
+        options,
+      );
+    } catch (error) {
+      if (!(error instanceof BridgeError)) {
+        if (error instanceof Error && error.message.includes("permission_required")) {
+          throw new Error("Permission ask reached Pi adapter — this is a bug.");
+        }
+        throw error;
+      }
+      if (error.code !== "permission_required") throw error;
+      const asks = Array.isArray(error.response?.asks)
+        ? (error.response.asks as BashPermissionAsk[])
+        : [];
+      if (asks.length === 0 || asks.some((ask) => ask.kind !== "escalation")) {
+        throw new Error(
+          "Permission ask reached Pi adapter without a host escalation grant — this is a bug.",
+        );
+      }
+      if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
+        throw new BridgeError(
+          "Permission denied: host escalation approval requires an interactive UI.",
+          "permission_denied",
+        );
+      }
+      for (const ask of asks) {
+        const approved = await extCtx.ui.confirm(
+          "Run command unsandboxed on host?",
+          piEscalationAskText(ask),
+          { signal: extCtx.signal },
+        );
+        if (!approved) {
+          throw new BridgeError(
+            "Permission denied: unsandboxed host execution was denied.",
+            "permission_denied",
+          );
+        }
+        if (ask.grant_id && !granted.includes(ask.grant_id)) granted.push(ask.grant_id);
+      }
+    }
+  }
+
+  throw new Error("bash permission retry failed: too many rounds");
+}
+
 /** Truncate output to last N visual lines for terminal width. */
 function truncateToVisualLines(text: string, maxLines: number): string {
   const lines = text.split("\n");
@@ -440,9 +518,8 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
       const bridgeCommand = spawnContext.command;
 
       let streamed = "";
-      const response = await callBashBridge(
+      const response = await callBashWithPermissionLoop(
         bridge,
-        "bash",
         {
           command: bridgeCommand,
           timeout: effectiveTimeout,
@@ -458,6 +535,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           foreground_orchestrate: true,
           block_to_completion: blockToCompletion,
           wait: requestedWait,
+          sandbox: params.sandbox,
         },
         extCtx,
         {
@@ -474,16 +552,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
             onUpdate?.(bashResult(displayText, { streaming: true }));
           },
         },
-      ).catch((err) => {
-        if (err instanceof Error && err.message.includes("permission_required")) {
-          // Pi has no permission system — this should never reach us from Rust
-          // (Track C scan returns empty for Pi). If it somehow did, throw clearly.
-          throw new Error(
-            "Permission ask reached Pi adapter — this is a bug. Pi has no permission system.",
-          );
-        }
-        throw err;
-      });
+      );
 
       if (response.success === false) {
         throw new Error((response.message as string | undefined) ?? "bash failed");

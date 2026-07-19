@@ -17,7 +17,7 @@ use crate::context::AppContext;
 use crate::protocol::Response;
 use crate::sandbox_spawn::{
     current_authenticated_principal, native_sandbox_enforced, resolve_sandbox_spawn,
-    RequestedSandboxTier, SandboxTaskKind,
+    HostEscalationAttempt, RequestedSandboxTier, SandboxTaskKind,
 };
 use persistence::BgMode;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
+
+#[cfg(unix)]
+pub(crate) fn resolved_shell_path(pty: bool) -> PathBuf {
+    if pty {
+        pty_process::resolve_posix_shell()
+    } else {
+        registry::resolve_posix_shell()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BgTaskInfo {
@@ -79,6 +88,7 @@ pub fn spawn(
     pty_rows: u16,
     pty_cols: u16,
     scanner_report: Vec<PermissionAsk>,
+    host_escalation: Option<HostEscalationAttempt>,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -120,7 +130,9 @@ pub fn spawn(
         SandboxTaskKind::BashForeground
     };
     let principal = current_authenticated_principal();
-    let requested_tier = if ctx.config().sandbox.enabled {
+    let requested_tier = if host_escalation.is_some() {
+        RequestedSandboxTier::Host
+    } else if ctx.config().sandbox.enabled {
         RequestedSandboxTier::Native
     } else {
         RequestedSandboxTier::Disabled
@@ -137,16 +149,27 @@ pub fn spawn(
             );
         }
     }
-    let spawn_plan =
-        resolve_sandbox_spawn(ctx, &principal, requested_tier, task_kind, &task_bundle_dir);
+    let spawn_plan = resolve_sandbox_spawn(
+        ctx,
+        &principal,
+        requested_tier,
+        task_kind,
+        &task_bundle_dir,
+        host_escalation.as_ref(),
+    );
     if let Some(code) = spawn_plan.refusal_code() {
-        return Response::error(
-            request_id,
-            code,
-            spawn_plan
-                .refusal_message()
-                .unwrap_or("bash process creation refused by sandbox policy"),
-        );
+        let message = spawn_plan
+            .refusal_message()
+            .unwrap_or("bash process creation refused by sandbox policy");
+        return match spawn_plan.refusal_mismatch_class() {
+            Some(class) => Response::error_with_data(
+                request_id,
+                code,
+                message,
+                json!({ "mismatch_class": class }),
+            ),
+            None => Response::error(request_id, code, message),
+        };
     }
 
     let cleanup_plan = spawn_plan.clone();

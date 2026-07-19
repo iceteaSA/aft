@@ -118,6 +118,8 @@ describe("OpenCode bash adapter", () => {
     expect(safeParse(bash.args.workdir, PROJECT_CWD).success).toBe(true);
     expect(safeParse(bash.args.description, "List files").success).toBe(true);
     expect(safeParse(bash.args.wait, true).success).toBe(true);
+    expect(safeParse(bash.args.sandbox, "host").success).toBe(true);
+    expect(safeParse(bash.args.sandbox, "native").success).toBe(false);
     expect(safeParse(bash.args.background, true).success).toBe(true);
     expect(safeParse(bash.args.compressed, false).success).toBe(true);
     expect(safeParse(bash.args.ptyRows, 50).success).toBe(true);
@@ -162,6 +164,7 @@ describe("OpenCode bash adapter", () => {
       "workdir",
       "description",
       "wait",
+      "sandbox",
       "compressed",
     ]);
     expect(bash.args.background).toBeUndefined();
@@ -253,6 +256,55 @@ describe("OpenCode bash adapter", () => {
     });
     expect(calls).toHaveLength(2);
     expect(calls[1].params.permissions_granted).toEqual(["rm *", "/tmp/*"]);
+  });
+
+  test("host escalation ask shows exact payload and retries with opaque grant", async () => {
+    const ask = mockAsk();
+    let sendCount = 0;
+    const command = "printf 'exact  value'\nprintf done";
+    const cwd = "/tmp/exact cwd";
+    const { calls, tool: bash } = createHarness(() => {
+      sendCount++;
+      if (sendCount === 1) {
+        return {
+          success: false,
+          code: "permission_required",
+          asks: [
+            {
+              kind: "escalation",
+              command,
+              cwd,
+              grant_id: "esc_server_minted",
+            },
+          ],
+        };
+      }
+      return { success: true, output: "approved", exit_code: 0, truncated: false };
+    });
+
+    bashText(
+      await bash.execute({ command, workdir: cwd, sandbox: "host" }, createMockSdkContext({ ask })),
+    );
+
+    expect(ask).toHaveBeenCalledTimes(1);
+    const request = ask.mock.calls[0][0];
+    expect(request.permission).toBe("bash");
+    expect(request.patterns).toEqual([
+      `This command will run UNSANDBOXED on the host.\n\nExact command:\n${command}\n\nWorking directory:\n${cwd}`,
+    ]);
+    expect(request.metadata).toMatchObject({
+      command,
+      cwd,
+      grant_id: "esc_server_minted",
+      unsandboxed: true,
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[1].params).toMatchObject({
+      command,
+      workdir: cwd,
+      sandbox: "host",
+      permissions_granted: ["esc_server_minted"],
+    });
   });
 
   test("shell.env trigger fires before bridge call and merged env is forwarded", async () => {

@@ -411,6 +411,12 @@ fn translate_bash(args: &Value, project_root: &Path) -> Result<Translated, Trans
     if let Some(env) = map_in.get("env") {
         out.insert("env".to_string(), env.clone());
     }
+    if let Some(sandbox) = map_in.get("sandbox") {
+        if sandbox.as_str() != Some("host") {
+            return Err(invalid_request("bash: 'sandbox' must be 'host'"));
+        }
+        out.insert("sandbox".to_string(), sandbox.clone());
+    }
 
     Ok(Translated {
         command: "bash".into(),

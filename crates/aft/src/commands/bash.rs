@@ -32,6 +32,12 @@ const BLOCKED_ENV_VARS: &[&str] = &[
     "PATH",
 ];
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BashSandbox {
+    Host,
+}
+
 #[derive(Debug, Deserialize)]
 struct BashParams {
     command: String,
@@ -55,6 +61,8 @@ struct BashParams {
     notify_on_completion: bool,
     #[serde(default = "default_compressed")]
     compressed: bool,
+    #[serde(default)]
+    sandbox: Option<BashSandbox>,
     #[serde(default)]
     permissions_granted: Vec<String>,
     #[serde(default)]
@@ -126,7 +134,104 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .clone()
         .unwrap_or_else(|| default_workdir(ctx));
     let principal = crate::sandbox_spawn::current_authenticated_principal();
-    let native_report_only = crate::sandbox_spawn::native_sandbox_enforced(ctx, &principal);
+    let host_requested = matches!(params.sandbox, Some(BashSandbox::Host));
+    if host_requested && !crate::sandbox_spawn::principal_is_first_party(&principal) {
+        return Response::error(
+            &req.id,
+            "sandbox_escalation_denied",
+            "sandbox host escalation is unavailable to untrusted principals",
+        );
+    }
+
+    #[cfg(unix)]
+    let mut spawn_workdir = params.workdir.clone();
+    #[cfg(not(unix))]
+    let spawn_workdir = params.workdir.clone();
+    #[cfg(unix)]
+    let mut host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
+    #[cfg(not(unix))]
+    let host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
+    #[cfg(unix)]
+    if host_requested && ctx.config().sandbox.enabled {
+        let configured_root = ctx
+            .config()
+            .project_root
+            .clone()
+            .unwrap_or_else(|| default_workdir(ctx));
+        let root = match std::fs::canonicalize(&configured_root) {
+            Ok(root) => root,
+            Err(error) => {
+                return Response::error(
+                    &req.id,
+                    "sandbox_escalation_denied",
+                    format!("failed to canonicalize sandbox escalation root: {error}"),
+                );
+            }
+        };
+        let candidate_cwd = if workdir.is_absolute() {
+            workdir.clone()
+        } else {
+            root.join(&workdir)
+        };
+        let cwd = match std::fs::canonicalize(&candidate_cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                return Response::error(
+                    &req.id,
+                    "sandbox_escalation_denied",
+                    format!("failed to canonicalize sandbox escalation cwd: {error}"),
+                );
+            }
+        };
+        let shell_path = crate::bash_background::resolved_shell_path(params.pty);
+        let shell_path = std::fs::canonicalize(&shell_path).unwrap_or(shell_path);
+        let environment = crate::sandbox_spawn::capture_child_environment(&params.env);
+        if let Some(grant_id) = params
+            .permissions_granted
+            .iter()
+            .find(|grant| grant.starts_with("esc_"))
+        {
+            host_escalation = Some(crate::sandbox_spawn::HostEscalationAttempt {
+                grant_id: grant_id.clone(),
+                command: params.command.as_bytes().to_vec(),
+                root,
+                cwd: cwd.clone(),
+                shell_path,
+                environment,
+            });
+            spawn_workdir = Some(cwd);
+        } else {
+            let grant_id = match crate::sandbox_spawn::mint_host_escalation_grant(
+                ctx,
+                &principal,
+                params.command.as_bytes(),
+                &root,
+                &cwd,
+                &shell_path,
+                &environment,
+            ) {
+                Ok(grant_id) => grant_id,
+                Err(error) => {
+                    return Response::error(&req.id, "sandbox_escalation_denied", error);
+                }
+            };
+            return Response::error_with_data(
+                &req.id,
+                ERROR_PERMISSION_REQUIRED,
+                "bash command requires host escalation approval",
+                json!({
+                    "asks": [{
+                        "kind": "escalation",
+                        "command": params.command,
+                        "cwd": cwd,
+                        "grant_id": grant_id,
+                    }]
+                }),
+            );
+        }
+    }
+    let native_report_only =
+        crate::sandbox_spawn::native_sandbox_enforced(ctx, &principal) && host_escalation.is_none();
     let permission_asks =
         if native_report_only || params.permissions_requested || ctx.config().bash_permissions {
             crate::bash_permissions::scan::scan_with_cwd(&params.command, ctx, &workdir)
@@ -153,7 +258,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // workdir/notes.txt — silent wrong-file mutation. Rewrite is a pure
     // optimization, so skip it and let native bash (which honors cwd) run the
     // command verbatim when the workdir differs from the project root.
-    if workdir_matches_project_root(&workdir, ctx) {
+    if host_escalation.is_none() && workdir_matches_project_root(&workdir, ctx) {
         if let Some(mut response) =
             crate::bash_rewrite::try_rewrite(&params.command, req.session_id.as_deref(), ctx)
         {
@@ -167,7 +272,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let workdir = params.workdir.clone();
+    let workdir = spawn_workdir;
     let env = (!params.env.is_empty()).then_some(params.env.clone());
     // pty:true silently implies background:true so agents don't need to know
     // both flags. The PTY runtime requires a polling lifecycle regardless.
@@ -200,6 +305,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         pty_rows,
         pty_cols,
         scanner_report,
+        host_escalation,
     )
 }
 
@@ -626,6 +732,97 @@ mod tests {
         {
             let _ = ctx.bash_background().kill(task_id, "sandbox-spawn-test");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_request_returns_exact_escalation_ask_and_untrusted_request_is_denied() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        ctx.update_config(|config| config.sandbox.enabled = true);
+        crate::sandbox_spawn::install_sandbox_spawn_test_seam(project.path().to_path_buf());
+        let mut request = spawn_test_request("host-ask", "printf 'exact  value'", false);
+        request.params["params"]["sandbox"] = json!("host");
+
+        let response = handle(&request, &ctx);
+        assert!(!response.success);
+        assert_eq!(
+            response
+                .data
+                .get("code")
+                .and_then(serde_json::Value::as_str),
+            Some(ERROR_PERMISSION_REQUIRED)
+        );
+        let ask = &response.data["asks"][0];
+        assert_eq!(ask["kind"], "escalation");
+        assert_eq!(ask["command"], "printf 'exact  value'");
+        let canonical_project = project.path().canonicalize().unwrap();
+        assert_eq!(ask["cwd"].as_str(), canonical_project.to_str());
+        let grant_id = ask["grant_id"].as_str().unwrap().to_string();
+        assert!(grant_id.starts_with("esc_"));
+
+        let mut changed = spawn_test_request("host-changed", "printf 'exact  valuE'", false);
+        changed.params["params"]["sandbox"] = json!("host");
+        changed.params["params"]["permissions_granted"] = json!([grant_id]);
+        let changed_response = handle(&changed, &ctx);
+        assert!(!changed_response.success);
+        assert_eq!(changed_response.data["code"], "sandbox_escalation_denied");
+        assert_eq!(changed_response.data["mismatch_class"], "digest_mismatch");
+        assert_eq!(
+            ctx.bash_background().try_health_counts().unwrap().running,
+            0
+        );
+
+        let mut approved = spawn_test_request("host-approved", "printf 'exact  value'", false);
+        approved.params["params"]["sandbox"] = json!("host");
+        approved.params["params"]["permissions_granted"] = json!([grant_id]);
+        let invalidated_response = handle(&approved, &ctx);
+        assert!(!invalidated_response.success);
+        assert_eq!(invalidated_response.data["mismatch_class"], "consumed");
+
+        approved.params["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("permissions_granted");
+        let remint_response = handle(&approved, &ctx);
+        assert!(!remint_response.success);
+        assert_eq!(remint_response.data["code"], ERROR_PERMISSION_REQUIRED);
+        let fresh_grant = remint_response.data["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        approved.params["params"]["permissions_granted"] = json!([fresh_grant]);
+        let approved_response = handle(&approved, &ctx);
+        assert!(approved_response.success, "{:#?}", approved_response.data);
+        assert_eq!(
+            crate::sandbox_spawn::sandbox_spawn_test_observations(project.path())
+                .last()
+                .map(|observation| observation.requested_tier),
+            Some(crate::sandbox_spawn::RequestedSandboxTier::Host)
+        );
+        stop_spawned_test_task(&ctx, &approved_response);
+
+        let consumed_response = handle(&approved, &ctx);
+        assert!(!consumed_response.success);
+        assert_eq!(consumed_response.data["mismatch_class"], "consumed");
+
+        let principal = crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+            trust: crate::sandbox_spawn::PrincipalTrust::Untrusted,
+            route_channel: 4,
+            route_epoch: 2,
+            project_root: project.path().to_path_buf(),
+            harness: "mcp:test".to_string(),
+            session_id: "mcp-session".to_string(),
+            principal_id: Some("unverified".to_string()),
+        };
+        let denied = crate::sandbox_spawn::with_authenticated_principal(principal, || {
+            handle(&request, &ctx)
+        });
+        assert!(!denied.success);
+        assert_eq!(denied.data["code"], "sandbox_escalation_denied");
+        assert_eq!(ctx.escalation_grants().lock().len_for_test(), 2);
+        crate::sandbox_spawn::clear_sandbox_spawn_test_seam(project.path());
     }
 
     #[test]

@@ -3821,6 +3821,39 @@ async fn handle_tool_call(
         .map(|meta| meta.diagnostics_on_edit)
         .unwrap_or(false);
 
+    let requests_host = bare_name == "bash"
+        && arguments
+            .get("sandbox")
+            .or_else(|| {
+                arguments
+                    .get("params")
+                    .and_then(|params| params.get("sandbox"))
+            })
+            .and_then(Value::as_str)
+            == Some("host");
+    if matches!(bind_trust, BindTrust::Untrusted) && requests_host {
+        let response = Response::error(
+            request_id.clone(),
+            "sandbox_escalation_denied",
+            "sandbox host escalation is unavailable to untrusted principals",
+        );
+        let text = crate::subc_format::format_response_with_context(
+            &bare_name,
+            &response,
+            &format_context,
+        );
+        let result = ToolCallResult { text, response };
+        let response_frame = build_tool_response_frame(
+            frame.header.ver,
+            route_id,
+            frame.header.corr,
+            frame.header.flags,
+            &result,
+            bind_trust,
+        )?;
+        return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+    }
+
     if matches!(bind_trust, BindTrust::Untrusted)
         && is_bash_family_tool(&bare_name)
         && (bare_name != "bash" || !identity.consumer_elicitation_capable)

@@ -18,7 +18,7 @@
 //! AFT's internal tooling.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::fs::{DirBuilder, OpenOptions};
@@ -32,6 +32,8 @@ use std::process::Command;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use portable_pty::CommandBuilder;
 
@@ -72,6 +74,72 @@ pub enum AuthenticatedPrincipal {
 pub enum RequestedSandboxTier {
     Disabled,
     Native,
+    Host,
+}
+
+pub(crate) type ChildEnvironment = BTreeMap<OsString, OsString>;
+
+#[cfg(unix)]
+const ESCALATION_GRANT_TTL: Duration = Duration::from_secs(120);
+#[cfg(unix)]
+const ESCALATION_DIGEST_TAG: &[u8] = b"aft-escalation-v1";
+#[cfg(unix)]
+const ESCALATION_TIER: &[u8] = b"host";
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct EscalationGrant {
+    principal: AuthenticatedPrincipal,
+    root: PathBuf,
+    digest: blake3::Hash,
+    expires_at: Instant,
+    consumed: bool,
+    environment: ChildEnvironment,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct EscalationGrantStore {
+    grants: HashMap<String, EscalationGrant>,
+}
+
+#[cfg(unix)]
+impl EscalationGrantStore {
+    #[cfg(test)]
+    pub(crate) fn len_for_test(&self) -> usize {
+        self.grants.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HostEscalationAttempt {
+    pub grant_id: String,
+    pub command: Vec<u8>,
+    pub root: PathBuf,
+    pub cwd: PathBuf,
+    pub shell_path: PathBuf,
+    pub environment: ChildEnvironment,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EscalationRefusal {
+    Expired,
+    Consumed,
+    DigestMismatch,
+    WrongPrincipal,
+}
+
+#[cfg(unix)]
+impl EscalationRefusal {
+    pub(crate) fn class(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Consumed => "consumed",
+            Self::DigestMismatch => "digest_mismatch",
+            Self::WrongPrincipal => "wrong_principal",
+        }
+    }
 }
 
 /// Agent-command path that is about to create a process.
@@ -86,6 +154,10 @@ pub enum SandboxTaskKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnPlan {
     Unsandboxed,
+    Host {
+        shell_path: PathBuf,
+        environment: ChildEnvironment,
+    },
     Launcher {
         profile: SandboxProfile,
         launcher_path: PathBuf,
@@ -93,6 +165,7 @@ pub enum SpawnPlan {
     Refused {
         code: &'static str,
         message: String,
+        mismatch_class: Option<&'static str>,
     },
 }
 
@@ -100,14 +173,21 @@ impl SpawnPlan {
     pub(crate) fn refusal_code(&self) -> Option<&'static str> {
         match self {
             Self::Refused { code, .. } => Some(code),
-            Self::Unsandboxed | Self::Launcher { .. } => None,
+            Self::Unsandboxed | Self::Host { .. } | Self::Launcher { .. } => None,
         }
     }
 
     pub(crate) fn refusal_message(&self) -> Option<&str> {
         match self {
             Self::Refused { message, .. } => Some(message),
-            Self::Unsandboxed | Self::Launcher { .. } => None,
+            Self::Unsandboxed | Self::Host { .. } | Self::Launcher { .. } => None,
+        }
+    }
+
+    pub(crate) fn refusal_mismatch_class(&self) -> Option<&'static str> {
+        match self {
+            Self::Refused { mismatch_class, .. } => *mismatch_class,
+            Self::Unsandboxed | Self::Host { .. } | Self::Launcher { .. } => None,
         }
     }
 
@@ -115,10 +195,25 @@ impl SpawnPlan {
         matches!(self, Self::Launcher { .. })
     }
 
+    pub(crate) fn host_environment(&self) -> Option<&ChildEnvironment> {
+        match self {
+            Self::Host { environment, .. } => Some(environment),
+            Self::Unsandboxed | Self::Launcher { .. } | Self::Refused { .. } => None,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn host_shell_path(&self) -> Option<&Path> {
+        match self {
+            Self::Host { shell_path, .. } => Some(shell_path),
+            Self::Unsandboxed | Self::Launcher { .. } | Self::Refused { .. } => None,
+        }
+    }
+
     pub(crate) fn temp_dir(&self) -> Option<&Path> {
         match self {
             Self::Launcher { profile, .. } => Some(&profile.temp_dir),
-            Self::Unsandboxed | Self::Refused { .. } => None,
+            Self::Unsandboxed | Self::Host { .. } | Self::Refused { .. } => None,
         }
     }
 
@@ -145,6 +240,7 @@ impl SpawnPlan {
         Self::Refused {
             code,
             message: format!("bash process creation refused by sandbox policy: {code}"),
+            mismatch_class: None,
         }
     }
 }
@@ -205,6 +301,202 @@ pub(crate) fn principal_is_first_party(principal: &AuthenticatedPrincipal) -> bo
     )
 }
 
+#[cfg(unix)]
+pub(crate) fn capture_child_environment(overrides: &HashMap<String, String>) -> ChildEnvironment {
+    let mut environment = std::env::vars_os().collect::<ChildEnvironment>();
+    for (key, value) in overrides {
+        environment.insert(OsString::from(key), OsString::from(value));
+    }
+    environment
+}
+
+#[cfg(unix)]
+pub(crate) fn mint_host_escalation_grant(
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+    command: &[u8],
+    root: &Path,
+    cwd: &Path,
+    shell_path: &Path,
+    environment: &ChildEnvironment,
+) -> Result<String, String> {
+    mint_host_escalation_grant_at(
+        ctx,
+        principal,
+        command,
+        root,
+        cwd,
+        shell_path,
+        environment,
+        Instant::now(),
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn mint_host_escalation_grant_at(
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+    command: &[u8],
+    root: &Path,
+    cwd: &Path,
+    shell_path: &Path,
+    environment: &ChildEnvironment,
+    now: Instant,
+) -> Result<String, String> {
+    let mut store = ctx.escalation_grants().lock();
+    let grant_id = loop {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|error| format!("failed to mint sandbox escalation grant: {error}"))?;
+        let candidate = format!("esc_{}", hex_bytes(&random));
+        if !store.grants.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    let grant = EscalationGrant {
+        principal: principal.clone(),
+        root: root.to_path_buf(),
+        digest: escalation_digest(command, root, cwd, principal, shell_path, environment),
+        expires_at: now + ESCALATION_GRANT_TTL,
+        consumed: false,
+        environment: environment.clone(),
+    };
+    store.grants.insert(grant_id.clone(), grant);
+    Ok(grant_id)
+}
+
+#[cfg(unix)]
+fn consume_host_escalation_grant_at(
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+    attempt: &HostEscalationAttempt,
+    now: Instant,
+) -> Result<ChildEnvironment, EscalationRefusal> {
+    let mut store = ctx.escalation_grants().lock();
+    let Some(grant) = store.grants.get_mut(&attempt.grant_id) else {
+        return Err(EscalationRefusal::DigestMismatch);
+    };
+    if grant.principal != *principal {
+        return Err(EscalationRefusal::WrongPrincipal);
+    }
+    if grant.root != attempt.root {
+        grant.consumed = true;
+        grant.environment.clear();
+        return Err(EscalationRefusal::DigestMismatch);
+    }
+    if now >= grant.expires_at {
+        grant.environment.clear();
+        return Err(EscalationRefusal::Expired);
+    }
+    if grant.consumed {
+        return Err(EscalationRefusal::Consumed);
+    }
+    let digest = escalation_digest(
+        &attempt.command,
+        &attempt.root,
+        &attempt.cwd,
+        principal,
+        &attempt.shell_path,
+        &attempt.environment,
+    );
+    if digest != grant.digest {
+        grant.consumed = true;
+        grant.environment.clear();
+        return Err(EscalationRefusal::DigestMismatch);
+    }
+    grant.consumed = true;
+    Ok(std::mem::take(&mut grant.environment))
+}
+
+#[cfg(unix)]
+fn escalation_digest(
+    command: &[u8],
+    root: &Path,
+    cwd: &Path,
+    principal: &AuthenticatedPrincipal,
+    shell_path: &Path,
+    environment: &ChildEnvironment,
+) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hash_field(&mut hasher, ESCALATION_DIGEST_TAG);
+    hash_field(&mut hasher, command);
+    hash_field(&mut hasher, &os_bytes(root.as_os_str()));
+    hash_field(&mut hasher, &os_bytes(cwd.as_os_str()));
+    hash_principal(&mut hasher, principal);
+    hash_field(&mut hasher, &os_bytes(shell_path.as_os_str()));
+    hash_field(&mut hasher, env!("CARGO_PKG_VERSION").as_bytes());
+    hash_field(&mut hasher, ESCALATION_TIER);
+    hasher.update(&(environment.len() as u64).to_be_bytes());
+    for (key, value) in environment {
+        hash_field(&mut hasher, &os_bytes(key));
+        hash_field(&mut hasher, &os_bytes(value));
+    }
+    hasher.finalize()
+}
+
+#[cfg(unix)]
+fn hash_principal(hasher: &mut blake3::Hasher, principal: &AuthenticatedPrincipal) {
+    match principal {
+        AuthenticatedPrincipal::FirstParty => hash_field(hasher, b"first_party"),
+        AuthenticatedPrincipal::RouteBind {
+            trust,
+            route_channel,
+            route_epoch,
+            project_root,
+            harness,
+            session_id,
+            principal_id,
+        } => {
+            hash_field(hasher, b"route_bind");
+            hash_field(
+                hasher,
+                match trust {
+                    PrincipalTrust::FirstParty => b"first_party",
+                    PrincipalTrust::Untrusted => b"untrusted",
+                },
+            );
+            hasher.update(&route_channel.to_be_bytes());
+            hasher.update(&route_epoch.to_be_bytes());
+            hash_field(hasher, &os_bytes(project_root.as_os_str()));
+            hash_field(hasher, harness.as_bytes());
+            hash_field(hasher, session_id.as_bytes());
+            match principal_id {
+                Some(id) => {
+                    hasher.update(&[1]);
+                    hash_field(hasher, id.as_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn hash_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+#[cfg(unix)]
+fn os_bytes(value: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Whether permission-scanner findings should be recorded instead of prompting.
 pub(crate) fn native_sandbox_enforced(
     ctx: &AppContext,
@@ -224,6 +516,7 @@ pub fn resolve_sandbox_spawn(
     requested_tier: RequestedSandboxTier,
     task_kind: SandboxTaskKind,
     task_bundle_dir: &Path,
+    host_escalation: Option<&HostEscalationAttempt>,
 ) -> SpawnPlan {
     note_test_observation(ctx, principal, requested_tier, task_kind);
 
@@ -235,10 +528,49 @@ pub fn resolve_sandbox_spawn(
         return plan;
     }
 
-    if requested_tier == RequestedSandboxTier::Disabled
-        || !ctx.config().sandbox.enabled
-        || !principal_is_first_party(principal)
-    {
+    if requested_tier == RequestedSandboxTier::Disabled || !ctx.config().sandbox.enabled {
+        return SpawnPlan::Unsandboxed;
+    }
+
+    if requested_tier == RequestedSandboxTier::Host {
+        if !principal_is_first_party(principal) {
+            return SpawnPlan::Refused {
+                code: "sandbox_escalation_denied",
+                message: "sandbox host escalation is unavailable to untrusted principals"
+                    .to_string(),
+                mismatch_class: Some("wrong_principal"),
+            };
+        }
+
+        #[cfg(windows)]
+        {
+            warn_windows_unsupported_once();
+            let _ = (ctx, task_kind, task_bundle_dir, host_escalation);
+            return SpawnPlan::Unsandboxed;
+        }
+
+        #[cfg(unix)]
+        {
+            let Some(attempt) = host_escalation else {
+                return escalation_refused(EscalationRefusal::DigestMismatch);
+            };
+            return match consume_host_escalation_grant_at(ctx, principal, attempt, Instant::now()) {
+                Ok(environment) => SpawnPlan::Host {
+                    shell_path: attempt.shell_path.clone(),
+                    environment,
+                },
+                Err(refusal) => escalation_refused(refusal),
+            };
+        }
+
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let _ = (ctx, task_kind, task_bundle_dir, host_escalation);
+            return SpawnPlan::Unsandboxed;
+        }
+    }
+
+    if !principal_is_first_party(principal) {
         return SpawnPlan::Unsandboxed;
     }
 
@@ -259,6 +591,7 @@ pub fn resolve_sandbox_spawn(
                     message: format!(
                         "native sandbox setup failed: {error}; set sandbox.enabled=false to disable native sandboxing"
                     ),
+                    mismatch_class: None,
                 };
             }
         };
@@ -271,6 +604,7 @@ pub fn resolve_sandbox_spawn(
                     message: format!(
                         "native sandbox setup failed to locate the aft executable: {error}; set sandbox.enabled=false to disable native sandboxing"
                     ),
+                    mismatch_class: None,
                 };
             }
         };
@@ -284,6 +618,16 @@ pub fn resolve_sandbox_spawn(
     {
         let _ = (ctx, principal, task_kind, task_bundle_dir);
         SpawnPlan::Unsandboxed
+    }
+}
+
+#[cfg(unix)]
+fn escalation_refused(refusal: EscalationRefusal) -> SpawnPlan {
+    let class = refusal.class();
+    SpawnPlan::Refused {
+        code: "sandbox_escalation_denied",
+        message: format!("sandbox host escalation grant refused: {class}"),
+        mismatch_class: Some(class),
     }
 }
 
@@ -581,7 +925,9 @@ pub(crate) fn detached_command_for_plan(
 
 #[cfg(unix)]
 pub(crate) fn apply_sandbox_environment(plan: &SpawnPlan, command: &mut Command) {
-    if let Some(temp_dir) = plan.temp_dir() {
+    if let Some(environment) = plan.host_environment() {
+        command.env_clear().envs(environment);
+    } else if let Some(temp_dir) = plan.temp_dir() {
         command.env("TMPDIR", temp_dir).env("TEMP", temp_dir);
     }
 }
@@ -601,12 +947,19 @@ pub(crate) fn pty_command_for_plan(
         command.arg(arg);
     }
     command.cwd(workdir.as_os_str());
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    if let Some(temp_dir) = plan.temp_dir() {
-        command.env("TMPDIR", temp_dir);
-        command.env("TEMP", temp_dir);
+    if let Some(environment) = plan.host_environment() {
+        command.env_clear();
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+    } else {
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        if let Some(temp_dir) = plan.temp_dir() {
+            command.env("TMPDIR", temp_dir);
+            command.env("TEMP", temp_dir);
+        }
     }
     Ok(command)
 }
@@ -619,7 +972,9 @@ fn command_argv_for_plan(
     exit_marker: Option<&Path>,
 ) -> Result<(OsString, Vec<OsString>), String> {
     match plan {
-        SpawnPlan::Unsandboxed => Ok((program.to_os_string(), args.to_vec())),
+        SpawnPlan::Unsandboxed | SpawnPlan::Host { .. } => {
+            Ok((program.to_os_string(), args.to_vec()))
+        }
         SpawnPlan::Refused { code, .. } => Err((*code).to_string()),
         SpawnPlan::Launcher {
             profile,
@@ -747,6 +1102,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_plan_clears_inherited_environment_and_applies_snapshot() {
+        let environment =
+            ChildEnvironment::from([(OsString::from("APPROVED"), OsString::from("snapshot"))]);
+        let plan = SpawnPlan::Host {
+            shell_path: PathBuf::from("/bin/sh"),
+            environment,
+        };
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("test -z \"$SHOULD_DISAPPEAR\" && printf %s \"$APPROVED\"")
+            .env("SHOULD_DISAPPEAR", "yes");
+        apply_sandbox_environment(&plan, &mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"snapshot");
+    }
+
+    #[test]
     fn product_profile_file_is_private() {
         let root = tempfile::tempdir().unwrap();
         let task_dir = root.path().join("task");
@@ -810,8 +1184,242 @@ mod policy_tests {
             RequestedSandboxTier::Native,
             SandboxTaskKind::BashForeground,
             project.path(),
+            None,
         );
         assert_eq!(plan, SpawnPlan::Unsandboxed);
+    }
+
+    #[cfg(unix)]
+    fn grant_attempt(
+        grant_id: String,
+        project: &Path,
+        command: &[u8],
+        environment: ChildEnvironment,
+    ) -> HostEscalationAttempt {
+        HostEscalationAttempt {
+            grant_id,
+            command: command.to_vec(),
+            root: project.to_path_buf(),
+            cwd: project.to_path_buf(),
+            shell_path: PathBuf::from("/bin/sh"),
+            environment,
+        }
+    }
+
+    #[cfg(unix)]
+    fn mint_test_grant(
+        ctx: &AppContext,
+        principal: &AuthenticatedPrincipal,
+        project: &Path,
+        command: &[u8],
+        environment: &ChildEnvironment,
+        now: Instant,
+    ) -> String {
+        mint_host_escalation_grant_at(
+            ctx,
+            principal,
+            command,
+            project,
+            project,
+            Path::new("/bin/sh"),
+            environment,
+            now,
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn refusal_class(plan: &SpawnPlan) -> Option<&'static str> {
+        plan.refusal_mismatch_class()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escalation_grant_binds_exact_command_and_environment() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::FirstParty;
+        let environment = ChildEnvironment::from([
+            (OsString::from("A"), OsString::from("one")),
+            (OsString::from("B"), OsString::from("two")),
+        ]);
+
+        for (command, retry_environment) in [
+            (b"printf approved!".as_slice(), environment.clone()),
+            (
+                b"printf approved".as_slice(),
+                ChildEnvironment::from([
+                    (OsString::from("A"), OsString::from("changed")),
+                    (OsString::from("B"), OsString::from("two")),
+                ]),
+            ),
+        ] {
+            let grant_id = mint_test_grant(
+                &ctx,
+                &principal,
+                project.path(),
+                b"printf approved",
+                &environment,
+                Instant::now(),
+            );
+            let attempt = grant_attempt(grant_id, project.path(), command, retry_environment);
+            let plan = resolve_sandbox_spawn(
+                &ctx,
+                &principal,
+                RequestedSandboxTier::Host,
+                SandboxTaskKind::BashForeground,
+                project.path(),
+                Some(&attempt),
+            );
+            assert_eq!(refusal_class(&plan), Some("digest_mismatch"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escalation_grant_is_single_use_and_expires() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::FirstParty;
+        let environment =
+            ChildEnvironment::from([(OsString::from("ONLY"), OsString::from("snapshot"))]);
+        let grant_id = mint_test_grant(
+            &ctx,
+            &principal,
+            project.path(),
+            b"true",
+            &environment,
+            Instant::now(),
+        );
+        let attempt = grant_attempt(grant_id, project.path(), b"true", environment.clone());
+        let first = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            Some(&attempt),
+        );
+        assert!(matches!(first, SpawnPlan::Host { .. }));
+        let second = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            Some(&attempt),
+        );
+        assert_eq!(refusal_class(&second), Some("consumed"));
+
+        let expired_id = mint_test_grant(
+            &ctx,
+            &principal,
+            project.path(),
+            b"true",
+            &environment,
+            Instant::now() - ESCALATION_GRANT_TTL - Duration::from_millis(1),
+        );
+        let expired_attempt =
+            grant_attempt(expired_id, project.path(), b"true", environment.clone());
+        let expired = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            Some(&expired_attempt),
+        );
+        assert_eq!(refusal_class(&expired), Some("expired"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escalation_grant_binds_principal_and_happy_path_reuses_snapshot() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::FirstParty,
+            route_channel: 9,
+            route_epoch: 2,
+            project_root: project.path().to_path_buf(),
+            harness: "opencode".to_string(),
+            session_id: "session-x".to_string(),
+            principal_id: Some("direct".to_string()),
+        };
+        let environment =
+            ChildEnvironment::from([(OsString::from("APPROVED"), OsString::from("snapshot"))]);
+        let wrong_id = mint_test_grant(
+            &ctx,
+            &principal,
+            project.path(),
+            b"true",
+            &environment,
+            Instant::now(),
+        );
+        let wrong_attempt = grant_attempt(wrong_id, project.path(), b"true", environment.clone());
+        let wrong = resolve_sandbox_spawn(
+            &ctx,
+            &AuthenticatedPrincipal::FirstParty,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            Some(&wrong_attempt),
+        );
+        assert_eq!(refusal_class(&wrong), Some("wrong_principal"));
+
+        let happy_id = mint_test_grant(
+            &ctx,
+            &principal,
+            project.path(),
+            b"true",
+            &environment,
+            Instant::now(),
+        );
+        let happy_attempt = grant_attempt(happy_id, project.path(), b"true", environment.clone());
+        let happy = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            Some(&happy_attempt),
+        );
+        match happy {
+            SpawnPlan::Host {
+                shell_path,
+                environment: actual,
+            } => {
+                assert_eq!(shell_path, Path::new("/bin/sh"));
+                assert_eq!(actual, environment);
+            }
+            other => panic!("expected host plan, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_host_request_refuses_without_minting_a_grant() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::Untrusted,
+            route_channel: 7,
+            route_epoch: 1,
+            project_root: project.path().to_path_buf(),
+            harness: "mcp:test".to_string(),
+            session_id: "untrusted-escalation-test".to_string(),
+            principal_id: Some("unverified".to_string()),
+        };
+        let plan = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            None,
+        );
+        assert_eq!(plan.refusal_code(), Some("sandbox_escalation_denied"));
+        assert!(ctx.escalation_grants().lock().grants.is_empty());
     }
 
     #[test]
@@ -826,6 +1434,22 @@ mod policy_tests {
 
     #[cfg(windows)]
     #[test]
+    fn enabled_host_request_is_unsandboxed_on_windows_without_a_grant() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let plan = resolve_sandbox_spawn(
+            &ctx,
+            &AuthenticatedPrincipal::FirstParty,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            None,
+        );
+        assert_eq!(plan, SpawnPlan::Unsandboxed);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn enabled_native_tier_is_unsandboxed_on_windows() {
         let project = tempfile::tempdir().unwrap();
         let ctx = context(project.path().to_path_buf());
@@ -835,6 +1459,7 @@ mod policy_tests {
             RequestedSandboxTier::Native,
             SandboxTaskKind::BashForeground,
             project.path(),
+            None,
         );
         assert_eq!(plan, SpawnPlan::Unsandboxed);
     }

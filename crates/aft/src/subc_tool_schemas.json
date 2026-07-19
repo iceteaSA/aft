@@ -31,6 +31,11 @@
         "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; if you send a new message, the wait detaches to background. Use only when you know the result is required before doing anything else.",
         "type": "boolean"
       },
+      "sandbox": {
+        "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+        "type": "string",
+        "const": "host"
+      },
       "background": {
         "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
         "type": "boolean"

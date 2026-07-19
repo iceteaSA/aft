@@ -1481,6 +1481,8 @@ pub struct AppContext {
     status_bar_cached: RwLock<StatusBarCache>,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
+    #[cfg(unix)]
+    escalation_grants: parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
     /// handlers (which use it through `filter_registry()` -> read guard) and
@@ -1812,6 +1814,10 @@ impl AppContext {
             status_bar_cached: RwLock::new(StatusBarCache::default()),
             compression_aggregates,
             bash_background,
+            #[cfg(unix)]
+            escalation_grants: parking_lot::Mutex::new(
+                crate::sandbox_spawn::EscalationGrantStore::default(),
+            ),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
             )),
@@ -2907,6 +2913,13 @@ impl AppContext {
 
     pub fn bash_background(&self) -> &BgTaskRegistry {
         &self.bash_background
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn escalation_grants(
+        &self,
+    ) -> &parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore> {
+        &self.escalation_grants
     }
 
     pub fn drain_bg_completions(&self) -> Vec<BgCompletion> {
