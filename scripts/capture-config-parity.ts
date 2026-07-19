@@ -189,6 +189,17 @@ const CASES: ParityCase[] = [
     },
   },
   {
+    // Hardening is one-way: a project may enable the sandbox for itself.
+    name: "sandbox_project_opt_in",
+    user: {},
+    project: {
+      sandbox: {
+        enabled: true,
+        read_deny: ["/tmp/aft-sandbox-project-secret"],
+      },
+    },
+  },
+  {
     name: "drop_semantic_backend",
     user: {
       semantic: {

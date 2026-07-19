@@ -672,6 +672,12 @@ fn merge_project_sandbox(
             }
         }
     }
+    // A project may ENABLE the sandbox for itself (hardening is one-way): a
+    // repo can opt its own bash into kernel confinement, but a project-tier
+    // `enabled: false` can never switch off what the user turned on.
+    if project.enabled == Some(true) {
+        sandbox.enabled = Some(true);
+    }
     (sandbox.enabled.is_some() || sandbox.write_allow.is_some() || sandbox.read_deny.is_some())
         .then_some(sandbox)
 }
@@ -928,7 +934,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         push_drop(dropped, "backup", tier, USER_ONLY_REASON);
     }
     if let Some(sandbox) = &raw.sandbox {
-        if sandbox.enabled.is_some() {
+        // enabled:true is an accepted project-tier hardening opt-in (merged by
+        // merge_project_sandbox); only the weakening direction is dropped.
+        if sandbox.enabled == Some(false) {
             push_drop(dropped, "sandbox.enabled", tier, USER_ONLY_REASON);
         }
         if sandbox.write_allow.is_some() {
@@ -1778,6 +1786,28 @@ mod tests {
                 "sandbox.write_allow".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn project_can_enable_sandbox_but_never_disable_it() {
+        // Hardening is one-way: a repo may opt itself into kernel confinement.
+        let opt_in = resolve_config(&[
+            tier("user", r#"{}"#),
+            tier("project", r#"{ "sandbox": { "enabled": true } }"#),
+        ]);
+        assert!(opt_in.config.sandbox.enabled);
+        assert!(
+            !drop_keys(&opt_in).contains(&"sandbox.enabled".to_string()),
+            "project enabled:true is an accepted opt-in, not a dropped key"
+        );
+
+        // The weakening direction stays user-only: project false cannot win.
+        let opt_out = resolve_config(&[
+            tier("user", r#"{ "sandbox": { "enabled": true } }"#),
+            tier("project", r#"{ "sandbox": { "enabled": false } }"#),
+        ]);
+        assert!(opt_out.config.sandbox.enabled);
+        assert!(drop_keys(&opt_out).contains(&"sandbox.enabled".to_string()));
     }
 
     #[test]

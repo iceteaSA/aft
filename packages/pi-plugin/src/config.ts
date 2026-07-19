@@ -206,7 +206,7 @@ export interface AftConfig {
   inspect?: InspectConfig;
   /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
   backup?: BackupConfig;
-  /** Native first-party bash sandbox. Enabling and write allowances are user-only. */
+  /** Native first-party bash sandbox. Write allowances are user-only; a project may enable but never disable. */
   sandbox?: SandboxConfig;
   /**
    * Bash tool family (hoist + rewrite + compress + background execution).
@@ -1087,6 +1087,9 @@ function mergeSandboxConfig(
   const merged = {
     ...base,
     ...(readDeny.length > 0 ? { read_deny: readDeny } : {}),
+    // A project may ENABLE the sandbox for itself (hardening is one-way);
+    // project enabled:false can never switch off what the user turned on.
+    ...(project?.enabled === true ? { enabled: true } : {}),
   };
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -1206,7 +1209,9 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.bridge !== undefined) stripped.push("bridge");
   if (override.backup !== undefined) stripped.push("backup");
-  if (override.sandbox?.enabled !== undefined) stripped.push("sandbox.enabled");
+  // enabled:true is an accepted project-tier hardening opt-in; only the
+  // weakening direction (enabled:false) is stripped as user-only.
+  if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");

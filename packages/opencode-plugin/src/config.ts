@@ -187,6 +187,7 @@ const SandboxConfigSchema = z.object({
   /** Enable native containment for first-party bash and PTY processes. Default: false. */
   enabled: z.boolean().optional(),
   /** Additional absolute directories where sandboxed commands may write. User config only. */
+  // (write_allow weakens confinement, so it never merges from project tier.)
   write_allow: z.array(z.string()).optional(),
   /** Additional absolute paths sandboxed commands may not read. Project config may add entries. */
   read_deny: z.array(z.string()).optional(),
@@ -338,7 +339,7 @@ export const AftConfigSchema = z.preprocess(
       inspect: InspectConfigSchema.optional(),
       /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
       backup: BackupConfigSchema.optional(),
-      /** Native first-party bash sandbox. Enabling and write allowances are user-only. */
+      /** Native first-party bash sandbox. Write allowances are user-only; a project may enable but never disable. */
       sandbox: SandboxConfigSchema.optional(),
       /**
        * Bash tool family (hoist + rewrite + compress + background execution).
@@ -1173,6 +1174,9 @@ function mergeSandboxConfig(
   const merged = {
     ...base,
     ...(readDeny.length > 0 ? { read_deny: readDeny } : {}),
+    // A project may ENABLE the sandbox for itself (hardening is one-way);
+    // project enabled:false can never switch off what the user turned on.
+    ...(project?.enabled === true ? { enabled: true } : {}),
   };
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -1302,7 +1306,9 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.auto_update !== undefined) stripped.push("auto_update");
   if (override.bridge !== undefined) stripped.push("bridge");
   if (override.backup !== undefined) stripped.push("backup");
-  if (override.sandbox?.enabled !== undefined) stripped.push("sandbox.enabled");
+  // enabled:true is an accepted project-tier hardening opt-in; only the
+  // weakening direction (enabled:false) is stripped as user-only.
+  if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");

@@ -1,0 +1,8 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "read_deny": [
+      "/tmp/aft-sandbox-project-secret"
+    ]
+  }
+}

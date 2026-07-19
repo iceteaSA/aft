@@ -1,0 +1,12 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "restrict_to_project_root": false,
+  "sandbox": {
+    "enabled": true,
+    "read_deny": [
+      "/tmp/aft-sandbox-project-secret"
+    ]
+  }
+}
