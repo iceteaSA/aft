@@ -50,9 +50,12 @@ fn validate_restore_paths(
     ctx: &AppContext,
     file_paths: &[std::path::PathBuf],
 ) -> Result<Vec<std::path::PathBuf>, Response> {
-    let mut validated = Vec::with_capacity(file_paths.len());
     for path in file_paths {
-        validated.push(ctx.validate_path(req_id, path)?);
+        ctx.validate_write_location(req_id, path)?;
     }
-    Ok(validated)
+
+    // Authorization must not replace the checkpoint key with a symlink target.
+    // The restore writer removes a final-component symlink before materializing
+    // the snapshot, so the stored location is both the lookup and write target.
+    Ok(file_paths.to_vec())
 }

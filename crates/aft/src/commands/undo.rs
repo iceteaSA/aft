@@ -30,7 +30,7 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         };
     };
 
-    let resolved = match ctx.validate_path(&req.id, Path::new(file)) {
+    let resolved = match ctx.validate_write_location(&req.id, Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return resp,
     };
@@ -64,11 +64,19 @@ pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
         .or_else(|| req.params.get("filePath"))
         .and_then(|v| v.as_str())
         .map(|file| {
-            backup
-                .preview_latest_path(req.session(), Path::new(file))
-                .map(|path| vec![path])
+            ctx.validate_write_location(&req.id, Path::new(file))
+                .and_then(|path| {
+                    backup
+                        .preview_latest_path(req.session(), &path)
+                        .map(|path| vec![path])
+                        .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))
+                })
         })
-        .unwrap_or_else(|| backup.preview_last_operation_paths(req.session()));
+        .unwrap_or_else(|| {
+            backup
+                .preview_last_operation_paths(req.session())
+                .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))
+        });
 
     match preview {
         Ok(paths) => Response::success(
@@ -78,6 +86,6 @@ pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
                 "count": paths.len(),
             }),
         ),
-        Err(e) => Response::error(&req.id, e.code(), e.to_string()),
+        Err(response) => response,
     }
 }

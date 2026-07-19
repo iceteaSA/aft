@@ -3,11 +3,19 @@
 //! Tests exercise the full round-trip through the binary's JSON protocol:
 //! snapshot → checkpoint → modify → restore → verify file contents.
 
-use super::helpers::AftProcess;
-// `user_config` is only used by the #[cfg(unix)] symlink restriction test below;
-// gate the import to match so Windows (-D warnings) doesn't see it as unused.
+use super::helpers::{user_config, AftProcess};
 #[cfg(unix)]
-use super::helpers::user_config;
+use aft::commands::checkpoint::handle_checkpoint;
+#[cfg(unix)]
+use aft::commands::restore_checkpoint::handle_restore_checkpoint;
+#[cfg(unix)]
+use aft::config::Config;
+#[cfg(unix)]
+use aft::context::AppContext;
+#[cfg(unix)]
+use aft::language::StubProvider;
+#[cfg(unix)]
+use aft::protocol::RawRequest;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -21,6 +29,20 @@ fn temp_dir(test_name: &str) -> std::path::PathBuf {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+fn configure_restricted(aft: &mut AftProcess, root: &std::path::Path, request_id: &str) {
+    let response = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": request_id,
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.display().to_string(),
+            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(response["success"], true, "configure: {response:?}");
 }
 
 #[test]
@@ -1107,4 +1129,243 @@ fn checkpoint_paths_reports_restore_targets_without_mutating() {
     let status = aft.shutdown();
     assert!(status.success());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn restricted_checkpoint_restore_replaces_in_root_symlink_without_changing_its_target() {
+    let root = temp_dir("checkpoint_restore_in_root_symlink");
+    let file = root.join("a.txt");
+    let target = root.join("b.txt");
+    fs::write(&file, "checkpoint-a").unwrap();
+    fs::write(&target, "target-b").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_restricted(&mut aft, &root, "cfg-checkpoint-in-root-symlink");
+    let create = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "checkpoint-in-root-symlink",
+            "command": "checkpoint",
+            "name": "in-root-symlink",
+            "files": [file.display().to_string()],
+        }))
+        .unwrap(),
+    );
+    assert_eq!(create["success"], true, "checkpoint: {create:?}");
+
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&target, &file).unwrap();
+
+    let restore = aft.send(
+        r#"{"id":"restore-in-root-symlink","command":"restore_checkpoint","name":"in-root-symlink"}"#,
+    );
+    assert_eq!(restore["success"], true, "restore: {restore:?}");
+    assert_eq!(restore["name"], "in-root-symlink");
+    assert_eq!(restore["file_count"], 1);
+    assert!(restore["created_at"].is_u64());
+    assert!(!fs::symlink_metadata(&file)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&file).unwrap(), "checkpoint-a");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target-b");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_restricted_checkpoint_restore_replaces_external_target_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(outside.path(), "outside-unchanged").unwrap();
+    let file = root.path().join("a.txt");
+    fs::write(&file, "checkpoint-a").unwrap();
+
+    let ctx = AppContext::new(
+        Box::new(StubProvider),
+        Config {
+            project_root: Some(root.path().to_path_buf()),
+            restrict_to_project_root: false,
+            ..Config::default()
+        },
+    );
+    let create: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "force-checkpoint-external-target",
+        "command": "checkpoint",
+        "name": "external-target",
+        "files": [file.display().to_string()],
+    }))
+    .unwrap();
+    let create_response = ctx.with_force_restrict(&create.id, || handle_checkpoint(&create, &ctx));
+    let create_value = serde_json::to_value(create_response).unwrap();
+    assert_eq!(
+        create_value["success"], true,
+        "checkpoint: {create_value:?}"
+    );
+
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &file).unwrap();
+
+    let restore: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "force-restore-external-target",
+        "command": "restore_checkpoint",
+        "name": "external-target",
+    }))
+    .unwrap();
+    let restore_response =
+        ctx.with_force_restrict(&restore.id, || handle_restore_checkpoint(&restore, &ctx));
+    let restore_value = serde_json::to_value(restore_response).unwrap();
+
+    assert_eq!(restore_value["success"], true, "restore: {restore_value:?}");
+    assert!(!fs::symlink_metadata(&file)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&file).unwrap(), "checkpoint-a");
+    assert_eq!(
+        fs::read_to_string(outside.path()).unwrap(),
+        "outside-unchanged"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restricted_checkpoint_restore_replaces_dangling_symlink() {
+    let root = temp_dir("checkpoint_restore_dangling_symlink");
+    let file = root.join("a.txt");
+    let missing_target = root.join("missing.txt");
+    fs::write(&file, "checkpoint-a").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_restricted(&mut aft, &root, "cfg-checkpoint-dangling-symlink");
+    let create = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "checkpoint-dangling-symlink",
+            "command": "checkpoint",
+            "name": "dangling-symlink",
+            "files": [file.display().to_string()],
+        }))
+        .unwrap(),
+    );
+    assert_eq!(create["success"], true, "checkpoint: {create:?}");
+
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&missing_target, &file).unwrap();
+
+    let restore = aft.send(
+        r#"{"id":"restore-dangling-symlink","command":"restore_checkpoint","name":"dangling-symlink"}"#,
+    );
+    assert_eq!(restore["success"], true, "restore: {restore:?}");
+    assert!(!fs::symlink_metadata(&file)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&file).unwrap(), "checkpoint-a");
+    assert!(!missing_target.exists());
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn restricted_checkpoint_restore_rejects_stored_lexical_path_outside_root() {
+    let container = tempfile::tempdir().unwrap();
+    let root = container.path().join("project");
+    let outside = container.path().join("outside.txt");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&outside, "checkpoint-outside").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let create = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "checkpoint-outside-before-restriction",
+            "command": "checkpoint",
+            "name": "outside-before-restriction",
+            "files": [outside.display().to_string()],
+        }))
+        .unwrap(),
+    );
+    assert_eq!(create["success"], true, "checkpoint: {create:?}");
+    fs::write(&outside, "modified-outside").unwrap();
+
+    configure_restricted(&mut aft, &root, "cfg-checkpoint-outside-path");
+    let restore = aft.send(
+        r#"{"id":"restore-outside-path","command":"restore_checkpoint","name":"outside-before-restriction"}"#,
+    );
+    assert_eq!(restore["success"], false, "restore: {restore:?}");
+    assert_eq!(restore["code"], "path_outside_root");
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "modified-outside");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn restricted_undo_preview_and_undo_preserve_symlinked_backup_key() {
+    let root = temp_dir("undo_symlinked_backup_key");
+    let file = root.join("a.txt");
+    let target = root.join("b.txt");
+    fs::write(&file, "original-a").unwrap();
+    fs::write(&target, "target-b").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_restricted(&mut aft, &root, "cfg-undo-symlinked-key");
+    let edit = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "edit-before-symlinked-undo",
+            "command": "edit_match",
+            "file": file.display().to_string(),
+            "match": "original-a",
+            "replacement": "modified-a",
+        }))
+        .unwrap(),
+    );
+    assert_eq!(edit["success"], true, "edit: {edit:?}");
+
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&target, &file).unwrap();
+
+    let preview = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "preview-symlinked-undo",
+            "command": "undo_preview",
+            "file": file.display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(preview["success"], true, "preview: {preview:?}");
+    assert_eq!(preview["count"], 1);
+    assert_eq!(
+        preview["paths"][0],
+        fs::canonicalize(&root)
+            .unwrap()
+            .join("a.txt")
+            .display()
+            .to_string()
+    );
+
+    let undo = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "undo-symlinked-key",
+            "command": "undo",
+            "file": file.display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert!(!fs::symlink_metadata(&file)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&file).unwrap(), "original-a");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target-b");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&root);
 }

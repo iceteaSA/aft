@@ -827,6 +827,12 @@ impl Drop for ReceiverTerminalGuard {
 
 pub type SemanticRefreshWorkerSlot = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
 
+struct PathRestrictionContext {
+    raw_root: PathBuf,
+    resolved_root: PathBuf,
+    path_for_resolution: PathBuf,
+}
+
 /// Normalize a path by resolving `.` and `..` components lexically,
 /// without touching the filesystem. This prevents path traversal
 /// attacks when `fs::canonicalize` fails (e.g. for non-existent paths).
@@ -5715,6 +5721,43 @@ impl AppContext {
         ))
     }
 
+    fn path_restriction_context(
+        &self,
+        req_id: &str,
+        path: &Path,
+    ) -> Result<Option<PathRestrictionContext>, crate::protocol::Response> {
+        let config = self.config();
+        let force_restrict = self.request_force_restrict(req_id);
+        if !config.restrict_to_project_root && !force_restrict {
+            return Ok(None);
+        }
+        let root = match &config.project_root {
+            Some(root) => root.clone(),
+            None if force_restrict => {
+                return Err(crate::protocol::Response::error(
+                    req_id,
+                    "path_outside_root",
+                    "project root is required when path restriction is forced",
+                ));
+            }
+            None => return Ok(None),
+        };
+        drop(config);
+
+        let raw_root = root.clone();
+        let resolved_root = std::fs::canonicalize(&root).unwrap_or(root);
+        let path_for_resolution = if path.is_relative() {
+            raw_root.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        Ok(Some(PathRestrictionContext {
+            raw_root,
+            resolved_root,
+            path_for_resolution,
+        }))
+    }
+
     /// Validate that a file path falls within the configured project root.
     ///
     /// When `project_root` is configured (normal plugin usage), this resolves the
@@ -5731,9 +5774,51 @@ impl AppContext {
         self.validate_path_with_artifact_session(req_id, path, None)
     }
 
-    /// Validate a read path, including the narrow exception for a bash artifact
-    /// registered to the requesting session. Mutating tools deliberately use
-    /// [`AppContext::validate_path`] and never receive this exception.
+    /// Validate a write location without following its final path component.
+    ///
+    /// Restores use this mode because the final component is the object being
+    /// replaced. Following a symlink there would authorize its target and would
+    /// also change the stored key used to find the snapshot. Every ancestor is
+    /// still resolved so a symlinked parent cannot escape the project root.
+    pub fn validate_write_location(
+        &self,
+        req_id: &str,
+        path: &Path,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        let Some(PathRestrictionContext {
+            raw_root,
+            resolved_root,
+            path_for_resolution,
+        }) = self.path_restriction_context(req_id, path)?
+        else {
+            return Ok(path.to_path_buf());
+        };
+        let normalized = normalize_path(&path_for_resolution);
+        let Some(file_name) = normalized.file_name() else {
+            return self.validate_path(req_id, path);
+        };
+        let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
+        let resolved_parent = match std::fs::canonicalize(parent) {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                reject_escaping_symlink(req_id, path, parent, &resolved_root, &raw_root)?;
+                resolve_with_existing_ancestors(parent)
+            }
+        };
+        let resolved = normalize_path(&resolved_parent.join(file_name));
+
+        if !resolved.starts_with(&resolved_root) {
+            return Err(path_error_response(req_id, path, &resolved_root));
+        }
+
+        Ok(resolved)
+    }
+
+    /// Validate a read path. A file produced by a background bash task may live
+    /// outside the project root, so the session that owns the registered output
+    /// may read that specific file. Mutating tools deliberately use
+    /// [`AppContext::validate_path`] or [`AppContext::validate_write_location`]
+    /// and never receive this exception.
     pub fn validate_read_path(
         &self,
         req_id: &str,
@@ -5749,43 +5834,21 @@ impl AppContext {
         path: &Path,
         artifact_session_id: Option<&str>,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        let config = self.config();
-        let force_restrict = self.request_force_restrict(req_id);
-        let enforce = config.restrict_to_project_root || force_restrict;
-        // When no restriction is configured or forced (the default standalone
-        // path), preserve the historical passthrough behavior exactly.
-        if !enforce {
+        let Some(PathRestrictionContext {
+            raw_root,
+            resolved_root,
+            path_for_resolution,
+        }) = self.path_restriction_context(req_id, path)?
+        else {
+            // When path restriction is disabled, callers receive the input path
+            // unchanged instead of an implicitly canonicalized filesystem path.
             return Ok(path.to_path_buf());
-        }
-        let root = match &config.project_root {
-            Some(r) => r.clone(),
-            None if force_restrict => {
-                return Err(crate::protocol::Response::error(
-                    req_id,
-                    "path_outside_root",
-                    "project root is required when path restriction is forced",
-                ));
-            }
-            None => return Ok(path.to_path_buf()), // No root configured, allow all
         };
-        drop(config);
-
-        // Keep the raw root for symlink-guard comparisons. On macOS, tempdir()
-        // returns /var/... paths while canonicalize gives /private/var/...; we
-        // need both forms so reject_escaping_symlink can recognise in-root
-        // symlinks regardless of which prefix form `current` happens to have.
-        let raw_root = root.clone();
-        let resolved_root = std::fs::canonicalize(&root).unwrap_or(root);
 
         // Resolve the path (follow symlinks, normalize ..). If canonicalization
         // fails (e.g. path does not exist or traverses a broken symlink), inspect
         // every existing component with lstat before falling back lexically so a
         // broken in-root symlink cannot be used to write outside project_root.
-        let path_for_resolution = if path.is_relative() {
-            raw_root.join(path)
-        } else {
-            path.to_path_buf()
-        };
         let resolved = match std::fs::canonicalize(&path_for_resolution) {
             Ok(resolved) => resolved,
             Err(_) => {
@@ -6304,6 +6367,69 @@ mod force_restrict_tests {
         assert!(ctx.validate_path("panic", &outside_path).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validate_write_location_keeps_final_symlink_as_the_authorized_location() {
+        let root = TempDir::new().expect("root tempdir");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        let link = root.path().join("file.txt");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("create final symlink");
+        let ctx = test_context(Some(root.path().to_path_buf()), false);
+        let _guard = ctx.force_restrict_guard("write-location-final-link");
+
+        let validated = ctx
+            .validate_write_location("write-location-final-link", &link)
+            .expect("the in-root link location is writable");
+
+        assert_eq!(
+            validated,
+            std::fs::canonicalize(root.path()).unwrap().join("file.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_write_location_rejects_symlinked_parent_escape() {
+        let root = TempDir::new().expect("root tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let linked_parent = root.path().join("linked-parent");
+        std::os::unix::fs::symlink(outside.path(), &linked_parent).expect("create parent symlink");
+        let candidate = linked_parent.join("file.txt");
+        let ctx = test_context(Some(root.path().to_path_buf()), false);
+        let _guard = ctx.force_restrict_guard("write-location-parent-link");
+
+        let error = ctx
+            .validate_write_location("write-location-parent-link", &candidate)
+            .expect_err("a symlinked parent must not escape the project root");
+
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["code"],
+            "path_outside_root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_write_location_rejects_outside_link_to_inside_file() {
+        let root = TempDir::new().expect("root tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let inside = root.path().join("inside.txt");
+        std::fs::write(&inside, "inside").unwrap();
+        let outside_link = outside.path().join("outside-link.txt");
+        std::os::unix::fs::symlink(&inside, &outside_link).expect("create outside symlink");
+        let ctx = test_context(Some(root.path().to_path_buf()), false);
+        let _guard = ctx.force_restrict_guard("write-location-outside-link");
+
+        let error = ctx
+            .validate_write_location("write-location-outside-link", &outside_link)
+            .expect_err("an out-of-root lexical location must remain blocked");
+
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["code"],
+            "path_outside_root"
+        );
+    }
+
     #[test]
     fn forced_restrict_without_project_root_fails_closed() {
         let ctx = test_context(None, false);
@@ -6313,6 +6439,14 @@ mod force_restrict_tests {
             .expect_err("forced restriction without a root must fail closed");
         assert_eq!(
             serde_json::to_value(err).unwrap()["code"],
+            "path_outside_root"
+        );
+
+        let write_err = ctx
+            .validate_write_location("missing-root", Path::new("relative.txt"))
+            .expect_err("write-location validation must also fail closed");
+        assert_eq!(
+            serde_json::to_value(write_err).unwrap()["code"],
             "path_outside_root"
         );
     }
