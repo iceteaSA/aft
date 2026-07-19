@@ -2786,8 +2786,14 @@ where
             let dequeued = measure.then(Instant::now);
             metrics.writer_active.store(true, Ordering::Relaxed);
             decrement_counted_channel(&metrics.writer_queued);
-            let write_timing =
-                write_frame_contiguous(&mut write, &queued.frame, &mut write_buffer, measure).await;
+            let write_timing = write_frame_contiguous(
+                &mut write,
+                queued.frame(),
+                queued.body(),
+                &mut write_buffer,
+                measure,
+            )
+            .await;
             metrics.writer_active.store(false, Ordering::Relaxed);
             let write_timing = write_timing?;
 
@@ -2828,24 +2834,25 @@ struct FrameWriteTiming {
 async fn write_frame_contiguous<W>(
     writer: &mut W,
     frame: &Frame,
+    body: &[u8],
     buffer: &mut Vec<u8>,
     measure: bool,
 ) -> Result<Option<FrameWriteTiming>, subc_transport::FrameIoError>
 where
     W: AsyncWrite + Unpin,
 {
-    if frame.header.len as usize != frame.body.len() {
+    if frame.header.len as usize != body.len() {
         return Err(subc_transport::FrameIoError::BodyLengthMismatch {
             header_len: frame.header.len,
-            body_len: frame.body.len(),
+            body_len: body.len(),
         });
     }
 
     let header = frame.header.encode();
     buffer.clear();
-    buffer.reserve(header.len() + frame.body.len());
+    buffer.reserve(header.len() + body.len());
     buffer.extend_from_slice(&header);
-    buffer.extend_from_slice(&frame.body);
+    buffer.extend_from_slice(body);
     let write_started = measure.then(Instant::now);
     writer
         .write_all(buffer)

@@ -4,8 +4,8 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 
 use super::{
-    control_flags, fmt, mpsc, AtomicUsize, BindTrust, DispatchPathMetrics, ErrorBody, Flags, Frame,
-    FrameType, Ordering, PathBuf, Response, RouteChannel, ToolCallResult, Value,
+    control_flags, fmt, mpsc, Arc, AtomicUsize, BindTrust, DispatchPathMetrics, ErrorBody, Flags,
+    Frame, FrameType, Ordering, PathBuf, Response, RouteChannel, ToolCallResult, Value,
     CONTROL_SEND_TIMEOUT, RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
 };
 use crate::run_tool_call::{PhaseTrace, ToolCallEgressTiming, ToolCallPhaseDurations};
@@ -102,8 +102,15 @@ pub(super) struct CompletedToolResponseTrace {
     pub(super) phases: ToolCallPhaseDurations,
 }
 
+enum WriterFrameBody {
+    Owned,
+    SharedPush(Arc<Vec<u8>>),
+}
+
 pub(super) struct WriterFrame {
+    /// The route-specific header. Shared Push bodies remain outside this frame.
     pub(super) frame: Frame,
+    body: WriterFrameBody,
     pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
 }
 
@@ -119,6 +126,16 @@ impl WriterFrame {
     pub(super) fn plain(frame: Frame) -> Self {
         Self {
             frame,
+            body: WriterFrameBody::Owned,
+            tool_response_trace: None,
+        }
+    }
+
+    pub(super) fn shared_push(frame: Frame, body: Arc<Vec<u8>>) -> Self {
+        debug_assert_eq!(frame.header.len as usize, body.len());
+        Self {
+            frame,
+            body: WriterFrameBody::SharedPush(body),
             tool_response_trace: None,
         }
     }
@@ -126,7 +143,27 @@ impl WriterFrame {
     fn traced_tool_response(frame: Frame, trace: ToolResponseWriteTrace) -> Self {
         Self {
             frame,
+            body: WriterFrameBody::Owned,
             tool_response_trace: Some(trace),
+        }
+    }
+
+    pub(super) fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    pub(super) fn body(&self) -> &[u8] {
+        match &self.body {
+            WriterFrameBody::Owned => &self.frame.body,
+            WriterFrameBody::SharedPush(body) => body,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn shared_push_body_strong_count(&self) -> Option<usize> {
+        match &self.body {
+            WriterFrameBody::Owned => None,
+            WriterFrameBody::SharedPush(body) => Some(Arc::strong_count(body)),
         }
     }
 
@@ -222,6 +259,15 @@ pub(super) fn try_enqueue_writer_frame(
     frame: Frame,
 ) -> WriterEnqueueOutcome {
     try_enqueue_writer_item(tx, metrics, WriterFrame::plain(frame))
+}
+
+pub(super) fn try_enqueue_shared_push_frame(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+    body: Arc<Vec<u8>>,
+) -> WriterEnqueueOutcome {
+    try_enqueue_writer_item(tx, metrics, WriterFrame::shared_push(frame, body))
 }
 
 async fn send_reliable_writer_item(

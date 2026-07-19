@@ -1,6 +1,9 @@
 //! Push-frame classification, fan-out, buffering, replay, and background wake plumbing.
 
-use super::wire::{send_reliable_writer_frame, try_enqueue_writer_frame, WriterEnqueueOutcome};
+use super::wire::{
+    send_reliable_writer_frame, try_enqueue_shared_push_frame, try_enqueue_writer_frame,
+    WriterEnqueueOutcome,
+};
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -289,6 +292,45 @@ fn try_send_push_body(
         }
     };
     match try_enqueue_writer_frame(writer_tx, metrics, push_frame) {
+        WriterEnqueueOutcome::Enqueued => PushSendOutcome::Sent,
+        WriterEnqueueOutcome::Full(_) => PushSendOutcome::Backpressure,
+        WriterEnqueueOutcome::Closed => {
+            log::warn!("subc attach: writer closed while sending Push frame");
+            PushSendOutcome::PermanentFailure
+        }
+    }
+}
+
+fn try_send_shared_push_body(
+    writer_tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    channel: RouteChannel,
+    body: Arc<Vec<u8>>,
+) -> PushSendOutcome {
+    let body_len = match u32::try_from(body.len()) {
+        Ok(body_len) => body_len,
+        Err(_) => {
+            log::warn!("subc attach: Push body exceeds the wire length limit");
+            return PushSendOutcome::PermanentFailure;
+        }
+    };
+    let mut push_frame = match Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Push,
+        control_flags(),
+        channel.channel,
+        channel.epoch,
+        0,
+        Vec::new(),
+    ) {
+        Ok(frame) => frame,
+        Err(error) => {
+            log::warn!("subc attach: failed to build shared Push frame: {error}");
+            return PushSendOutcome::PermanentFailure;
+        }
+    };
+    push_frame.header.len = body_len;
+    match try_enqueue_shared_push_frame(writer_tx, metrics, push_frame, body) {
         WriterEnqueueOutcome::Enqueued => PushSendOutcome::Sent,
         WriterEnqueueOutcome::Full(_) => PushSendOutcome::Backpressure,
         WriterEnqueueOutcome::Closed => {
@@ -665,11 +707,13 @@ fn fan_out_lossy_push_frame(
         }
     };
 
+    // Route headers differ, but every recipient can retain the one serialized body.
+    let body = Arc::new(body);
     let sent_frames = matching_channels
         .into_iter()
         .filter(|&channel| {
             matches!(
-                try_send_push_body(writer_tx, metrics, channel, &body),
+                try_send_shared_push_body(writer_tx, metrics, channel, Arc::clone(&body)),
                 PushSendOutcome::Sent
             )
         })
@@ -1532,6 +1576,54 @@ mod tests {
             writer_rx.try_recv().is_err(),
             "push should be dropped on full writer"
         );
+    }
+
+    #[test]
+    fn lossy_fanout_shares_one_body_and_stamps_each_route_header() {
+        const MATCHING_ROUTES: usize = 8;
+
+        let (_root_dir, root) = test_root("subc-shared-lossy-body-root");
+        let frame = progress_frame(
+            "request-shared-body",
+            ProgressKind::Stdout,
+            &"x".repeat(4 * 1024),
+        );
+        let expected_body = serde_json::to_vec(&frame).expect("serialize progress Push frame");
+        let routes = HashMap::new();
+        let expected_headers: HashSet<_> = (1..=MATCHING_ROUTES)
+            .map(|channel| route_key(channel as u16, (channel * 10) as u32))
+            .collect();
+        let mut root_channels = HashMap::new();
+        root_channels.insert(root.clone(), expected_headers.clone());
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(MATCHING_ROUTES);
+        let metrics = DispatchPathMetrics::new();
+
+        assert_eq!(
+            fan_out_lossy_push_frame(&writer_tx, &metrics, &routes, &root_channels, &root, &frame,),
+            FanOutResult {
+                matched_channels: MATCHING_ROUTES,
+                sent_frames: MATCHING_ROUTES,
+            }
+        );
+
+        let mut seen_headers = HashSet::new();
+        for index in 0..MATCHING_ROUTES {
+            let queued = writer_rx.try_recv().expect("queued Push frame");
+            if index == 0 {
+                assert_eq!(
+                    queued.shared_push_body_strong_count(),
+                    Some(MATCHING_ROUTES),
+                    "all route frames must retain the same payload allocation"
+                );
+            }
+            assert_eq!(queued.frame().header.ty, FrameType::Push);
+            assert_eq!(queued.body(), expected_body.as_slice());
+            seen_headers.insert(RouteChannel {
+                channel: queued.frame().header.channel,
+                epoch: queued.frame().header.epoch,
+            });
+        }
+        assert_eq!(seen_headers, expected_headers);
     }
 
     #[test]
