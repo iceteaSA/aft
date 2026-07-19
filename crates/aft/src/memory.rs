@@ -292,10 +292,28 @@ impl ProcessMemorySnapshot {
     }
 }
 
+/// Cap on per-root detail entries in serialized snapshots. Process totals
+/// always cover every root; only the per-root breakdown is capped so a
+/// many-root daemon process cannot balloon the status payload past
+/// downstream consumers' size limits (the daemon metrics cache truncates
+/// around 27 KB, and JSON keys serialize alphabetically, so an oversized
+/// `memory.roots` map pushes later sections past the cut).
+pub const MEMORY_SNAPSHOT_ROOT_DETAIL_CAP: usize = 8;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemorySnapshot {
     pub roots_status: &'static str,
+    /// Top roots by attributed bytes, capped at
+    /// [`MEMORY_SNAPSHOT_ROOT_DETAIL_CAP`]; the remainder is summarized by
+    /// `roots_omitted` / `roots_omitted_bytes`.
     pub roots: BTreeMap<String, RootMemorySnapshot>,
+    /// Total roots attributed (including omitted ones).
+    pub roots_total: usize,
+    /// Roots summarized out of the detail map.
+    pub roots_omitted: usize,
+    /// Attributed bytes carried by the omitted roots (already included in
+    /// `process.total_attributed_bytes`).
+    pub roots_omitted_bytes: u64,
     /// Immutable borrowed semantic snapshots, attributed once process-wide.
     pub shared_semantic_bases: MemoryEstimate,
     pub process: ProcessMemorySnapshot,
@@ -304,13 +322,104 @@ pub struct MemorySnapshot {
 impl MemorySnapshot {
     pub fn new(roots_status: &'static str, roots: BTreeMap<String, RootMemorySnapshot>) -> Self {
         let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
+        // Totals cover EVERY root before the detail map is capped.
         let process = ProcessMemorySnapshot::from_roots(&roots, &shared_semantic_bases);
+        let roots_total = roots.len();
+        let (roots, roots_omitted, roots_omitted_bytes) =
+            cap_root_detail(roots, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
         Self {
             roots_status,
             roots,
+            roots_total,
+            roots_omitted,
+            roots_omitted_bytes,
             shared_semantic_bases,
             process,
         }
+    }
+}
+
+/// Keep the `cap` roots with the highest attributed bytes; report the rest
+/// as an omitted-count + omitted-bytes rollup.
+fn cap_root_detail(
+    roots: BTreeMap<String, RootMemorySnapshot>,
+    cap: usize,
+) -> (BTreeMap<String, RootMemorySnapshot>, usize, u64) {
+    if roots.len() <= cap {
+        return (roots, 0, 0);
+    }
+    let mut entries: Vec<(String, RootMemorySnapshot)> = roots.into_iter().collect();
+    // Sort by attributed bytes descending; ties keep path order for determinism.
+    entries.sort_by(|a, b| {
+        b.1.attributed_bytes
+            .cmp(&a.1.attributed_bytes)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let omitted: Vec<(String, RootMemorySnapshot)> = entries.split_off(cap);
+    let omitted_bytes = omitted
+        .iter()
+        .map(|(_, snapshot)| snapshot.attributed_bytes)
+        .fold(0u64, u64::saturating_add);
+    (entries.into_iter().collect(), omitted.len(), omitted_bytes)
+}
+
+#[cfg(test)]
+mod snapshot_cap_tests {
+    use super::*;
+
+    fn root_with_bytes(bytes: u64) -> RootMemorySnapshot {
+        let estimate = MemoryEstimate::estimated;
+        RootMemorySnapshot::new(
+            estimate(bytes),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+            estimate(0),
+        )
+    }
+
+    #[test]
+    fn detail_map_capped_but_totals_cover_all_roots() {
+        let mut roots = BTreeMap::new();
+        for i in 0..(MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 4) {
+            // Distinct sizes so the kept set is deterministic: later roots larger.
+            roots.insert(
+                format!("/root/{i:02}"),
+                root_with_bytes((i as u64 + 1) * 1000),
+            );
+        }
+        let snapshot = MemorySnapshot::new("ready", roots);
+
+        assert_eq!(snapshot.roots.len(), MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
+        assert_eq!(snapshot.roots_total, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 4);
+        assert_eq!(snapshot.roots_omitted, 4);
+        // The four smallest (1000..=4000) are the omitted ones.
+        assert_eq!(snapshot.roots_omitted_bytes, 1000 + 2000 + 3000 + 4000);
+        // Largest roots are the ones kept.
+        assert!(snapshot
+            .roots
+            .values()
+            .all(|root| root.attributed_bytes > 4000));
+        // Process totals include omitted roots' bytes.
+        let expected_total: u64 = (1..=(MEMORY_SNAPSHOT_ROOT_DETAIL_CAP as u64 + 4))
+            .map(|i| i * 1000)
+            .sum();
+        assert!(snapshot.process.total_attributed_bytes >= expected_total);
+    }
+
+    #[test]
+    fn under_cap_keeps_everything_with_zero_omitted() {
+        let mut roots = BTreeMap::new();
+        roots.insert("/a".to_string(), root_with_bytes(10));
+        roots.insert("/b".to_string(), root_with_bytes(20));
+        let snapshot = MemorySnapshot::new("ready", roots);
+        assert_eq!(snapshot.roots.len(), 2);
+        assert_eq!(snapshot.roots_total, 2);
+        assert_eq!(snapshot.roots_omitted, 0);
+        assert_eq!(snapshot.roots_omitted_bytes, 0);
     }
 }
 
