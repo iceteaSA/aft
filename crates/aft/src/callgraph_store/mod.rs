@@ -10655,8 +10655,11 @@ export function leaf() {}
             set_cold_build_before_publish_observer(None);
             result
         });
+        // Positive wait: the older build runs a real cold build (git probe +
+        // SQLite schema init) before the barrier, which can exceed 5s on a
+        // contended Windows CI runner. Only negative waits stay short.
         reached_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("older build did not reach its publication barrier");
 
         std::fs::write(&source, "pub fn new_generation_marker() {}\n").unwrap();
