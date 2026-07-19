@@ -30,13 +30,21 @@ pub fn acquire_blocking(kind: &str) -> ColdBuildPermit {
 /// before every attempt, so a root that becomes unbound does not consume a slot
 /// after spending time queued behind the process-wide cap.
 pub fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option<ColdBuildPermit> {
+    acquire_blocking_while_with_limiter(&GLOBAL_COLD_BUILD_LIMITER, kind, admitted)
+}
+
+fn acquire_blocking_while_with_limiter(
+    limiter: &Arc<ColdBuildLimiter>,
+    kind: &str,
+    admitted: impl Fn() -> bool,
+) -> Option<ColdBuildPermit> {
     let started = Instant::now();
     let mut logged = false;
     loop {
         if !admitted() {
             return None;
         }
-        if let Some(permit) = GLOBAL_COLD_BUILD_LIMITER.try_acquire() {
+        if let Some(permit) = limiter.try_acquire() {
             // The root can become unbound after the pre-attempt check but
             // before the permit CAS succeeds. Recheck while owning the slot;
             // dropping the permit here returns it before any build starts.
@@ -56,7 +64,7 @@ pub fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option
         if !logged {
             crate::slog_info!(
                 "maintenance build queued behind concurrency cap ({}): {}",
-                GLOBAL_COLD_BUILD_LIMITER.limit(),
+                limiter.limit(),
                 kind
             );
             logged = true;
@@ -69,8 +77,22 @@ pub fn limit() -> usize {
     GLOBAL_COLD_BUILD_LIMITER.limit()
 }
 
+#[cfg(test)]
+pub(crate) fn test_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
+    Arc::new(ColdBuildLimiter::new(limit))
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_blocking_while_with_test_limiter(
+    limiter: &Arc<ColdBuildLimiter>,
+    kind: &str,
+    admitted: impl Fn() -> bool,
+) -> Option<ColdBuildPermit> {
+    acquire_blocking_while_with_limiter(limiter, kind, admitted)
+}
+
 #[derive(Debug)]
-struct ColdBuildLimiter {
+pub(crate) struct ColdBuildLimiter {
     available: AtomicUsize,
     limit: usize,
 }

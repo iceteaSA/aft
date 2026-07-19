@@ -18,6 +18,7 @@ use crate::config::{Config, SemanticBackendConfig};
 use crate::context::{
     AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticIndexEvent,
     SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+    SubcLifecycleAdmission,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -173,6 +174,36 @@ fn semantic_refresh_quiet_window() -> Duration {
     Duration::from_millis(from_env.unwrap_or(SEMANTIC_REFRESH_QUIET_WINDOW_MS))
 }
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
+const SEMANTIC_REFRESH_LIMITER_KIND: &str = "semantic refresh";
+
+#[derive(Clone)]
+enum SemanticRefreshLimiter {
+    ProcessWide,
+    #[cfg(test)]
+    Test(Arc<crate::cold_build_limiter::ColdBuildLimiter>),
+}
+
+impl SemanticRefreshLimiter {
+    fn acquire(
+        &self,
+        admitted: impl Fn() -> bool,
+    ) -> Option<crate::cold_build_limiter::ColdBuildPermit> {
+        match self {
+            Self::ProcessWide => crate::cold_build_limiter::acquire_blocking_while(
+                SEMANTIC_REFRESH_LIMITER_KIND,
+                admitted,
+            ),
+            #[cfg(test)]
+            Self::Test(limiter) => {
+                crate::cold_build_limiter::acquire_blocking_while_with_test_limiter(
+                    limiter,
+                    SEMANTIC_REFRESH_LIMITER_KIND,
+                    admitted,
+                )
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 static CONFIGURE_REPLAY_SESSION_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -448,6 +479,10 @@ fn spawn_semantic_refresh_worker(
     max_files: usize,
     request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
     event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
+    lifecycle: SubcLifecycleAdmission,
+    generation_flag: Arc<AtomicU64>,
+    generation: u64,
+    limiter: SemanticRefreshLimiter,
     session_id: Option<String>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -500,6 +535,22 @@ fn spawn_semantic_refresh_worker(
                 if disconnected {
                     break;
                 }
+
+                if !lifecycle.is_current(generation_flag.as_ref(), generation) {
+                    return;
+                }
+
+                // Corpus catch-up and watcher batches share this worker, so both
+                // use the process-wide cap. Watcher batches keep their 15-second
+                // quiet window and acquire immediately when a slot is free; queueing
+                // them behind another root is preferable to bursting a shared backend.
+                // Interactive QueryBudget embeddings do not run on this worker and
+                // therefore never wait on this maintenance limiter.
+                let Some(_refresh_permit) =
+                    limiter.acquire(|| lifecycle.is_current(generation_flag.as_ref(), generation))
+                else {
+                    return;
+                };
 
                 if corpus_requested {
                     let mut current_files = match walk_semantic_project_files_bounded(
@@ -3192,6 +3243,26 @@ fn schedule_artifact_loads(
                                 WarmVerifyPlan::Strict => VerifyStrategy::Strict,
                                 WarmVerifyPlan::Skip => unreachable!(),
                             };
+                            // This is the post-bind cached-index catch-up path.
+                            // It runs on the deferred artifact thread, not the bind
+                            // acknowledgement path, and waits only while this root
+                            // remains bound so an unbound root cannot take a slot.
+                            let Some(_refresh_permit) =
+                                crate::cold_build_limiter::acquire_blocking_while(
+                                    SEMANTIC_REFRESH_LIMITER_KIND,
+                                    || {
+                                        semantic_lifecycle.is_current(
+                                            semantic_generation_flag.as_ref(),
+                                            semantic_generation,
+                                        )
+                                    },
+                                )
+                            else {
+                                return Err(
+                                    "semantic post-bind refresh cancelled because root is unbound"
+                                        .to_string(),
+                                );
+                            };
                             match cached.refresh_stale_files_with_strategy(
                                 &root_clone,
                                 &current_files,
@@ -3571,6 +3642,10 @@ fn schedule_artifact_loads(
                                     semantic_config.max_files,
                                     refresh_rx,
                                     refresh_event_tx,
+                                    semantic_lifecycle.clone(),
+                                    Arc::clone(&semantic_generation_flag),
+                                    semantic_generation,
+                                    SemanticRefreshLimiter::ProcessWide,
                                     log_ctx::current_session(),
                                 );
                                 if let Ok(mut slot) = refresh_worker_slot.lock() {
@@ -3905,11 +3980,12 @@ mod tests {
         validate_storage_dir,
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
-    use crate::config::{Config, SemanticBackendConfig};
-    use crate::context::{AppContext, SemanticRefreshRequest};
+    use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
+    use crate::context::{AppContext, SemanticRefreshEvent, SemanticRefreshRequest};
     use crate::parser::{FileParser, SymbolCache, TreeSitterProvider};
     use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use crate::search_index::CacheLock;
+    use crate::semantic_index::SemanticIndex;
     use std::process::Command;
 
     fn test_context() -> AppContext {
@@ -4329,6 +4405,51 @@ mod tests {
             .join("semantic.bin")
     }
 
+    fn semantic_refresh_test_config(base_url: &str) -> SemanticBackendConfig {
+        SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "semantic-refresh-test".to_string(),
+            base_url: Some(base_url.to_string()),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            query_timeout_ms: 5_000,
+            max_batch_size: 64,
+            max_files: 1_000,
+        }
+    }
+
+    fn spawn_semantic_corpus_refresh_worker_for_test(
+        project_root: PathBuf,
+        config: &SemanticBackendConfig,
+        limiter: super::SemanticRefreshLimiter,
+    ) -> (
+        AppContext,
+        crossbeam_channel::Sender<SemanticRefreshRequest>,
+        crossbeam_channel::Receiver<SemanticRefreshEvent>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let ctx = test_context();
+        let generation = ctx.configure_generation();
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let worker = super::spawn_semantic_refresh_worker(
+            project_root.clone(),
+            SemanticIndex::new(project_root, 3),
+            crate::semantic_index::EmbeddingModel::from_config(config)
+                .expect("construct semantic refresh model"),
+            config.max_batch_size,
+            config.max_files,
+            request_rx,
+            event_tx,
+            ctx.subc_lifecycle_admission(),
+            ctx.configure_generation_flag(),
+            generation,
+            limiter,
+            None,
+        );
+        (ctx, request_tx, event_rx, worker)
+    }
+
     fn count_non_probe_inputs(requests: &[Vec<String>]) -> usize {
         requests
             .iter()
@@ -4403,7 +4524,24 @@ mod tests {
             )
         }
 
+        fn non_probe_request_count(&self) -> usize {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|inputs| {
+                    inputs
+                        .iter()
+                        .any(|text| text != "semantic index fingerprint probe")
+                })
+                .count()
+        }
+
         fn wait_for_non_probe_input(&self, timeout: Duration) -> bool {
+            self.wait_for_non_probe_input_count(1, timeout)
+        }
+
+        fn wait_for_non_probe_input_count(&self, expected: usize, timeout: Duration) -> bool {
             let requests = self
                 .requests
                 .lock()
@@ -4411,10 +4549,41 @@ mod tests {
             let (requests, result) = self
                 .request_changed
                 .wait_timeout_while(requests, timeout, |requests| {
-                    count_non_probe_inputs(requests) == 0
+                    count_non_probe_inputs(requests) < expected
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            !result.timed_out() || count_non_probe_inputs(&requests) > 0
+            !result.timed_out() || count_non_probe_inputs(&requests) >= expected
+        }
+
+        fn wait_for_non_probe_request_count(&self, expected: usize, timeout: Duration) -> bool {
+            let requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (requests, result) = self
+                .request_changed
+                .wait_timeout_while(requests, timeout, |requests| {
+                    requests
+                        .iter()
+                        .filter(|inputs| {
+                            inputs
+                                .iter()
+                                .any(|text| text != "semantic index fingerprint probe")
+                        })
+                        .count()
+                        < expected
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !result.timed_out()
+                || requests
+                    .iter()
+                    .filter(|inputs| {
+                        inputs
+                            .iter()
+                            .any(|text| text != "semantic index fingerprint probe")
+                    })
+                    .count()
+                    >= expected
         }
 
         fn release_responses(&self) {
@@ -5337,6 +5506,103 @@ mod tests {
             "expected only the new file's semantic chunks to be embedded, got {followup_inputs}"
         );
         super::reset_semantic_stale_generation_discards_for_test();
+    }
+
+    #[test]
+    fn semantic_catchup_refreshes_never_embed_more_than_two_roots_concurrently() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let config = semantic_refresh_test_config(&server.base_url);
+        let limiter = crate::cold_build_limiter::test_limiter(2);
+        let mut workers = Vec::new();
+
+        for root_number in 0..3 {
+            let root = temp.path().join(format!("root-{root_number}"));
+            std::fs::create_dir_all(&root).expect("create refresh test root");
+            std::fs::write(
+                root.join("lib.rs"),
+                format!("pub fn refresh_root_{root_number}() {{}}\n"),
+            )
+            .expect("write refresh test source");
+            let (ctx, request_tx, event_rx, worker) = spawn_semantic_corpus_refresh_worker_for_test(
+                root,
+                &config,
+                super::SemanticRefreshLimiter::Test(Arc::clone(&limiter)),
+            );
+            request_tx
+                .send(SemanticRefreshRequest::Corpus)
+                .expect("queue corpus refresh");
+            drop(request_tx);
+            workers.push((ctx, event_rx, worker));
+        }
+
+        assert!(
+            server.wait_for_non_probe_request_count(2, Duration::from_secs(5)),
+            "two semantic refreshes did not reach the embedding server"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            server.non_probe_request_count(),
+            2,
+            "the third root must wait for a process-wide semantic refresh slot"
+        );
+
+        server.release_responses();
+        assert!(
+            server.wait_for_non_probe_request_count(3, Duration::from_secs(5)),
+            "queued semantic refresh did not start after a slot was released"
+        );
+        for (_ctx, _event_rx, worker) in workers {
+            worker.join().expect("semantic refresh worker joins");
+        }
+    }
+
+    #[test]
+    fn unbound_semantic_refresh_worker_never_takes_a_queued_slot() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).expect("create refresh test root");
+        std::fs::write(root.join("lib.rs"), "pub fn queued_refresh() {}\n")
+            .expect("write refresh test source");
+        let config = semantic_refresh_test_config(&server.base_url);
+        let limiter = crate::cold_build_limiter::test_limiter(1);
+        let held = crate::cold_build_limiter::acquire_blocking_while_with_test_limiter(
+            &limiter,
+            "test queued semantic refresh",
+            || true,
+        )
+        .expect("hold test refresh slot");
+        let (ctx, request_tx, event_rx, worker) = spawn_semantic_corpus_refresh_worker_for_test(
+            root,
+            &config,
+            super::SemanticRefreshLimiter::Test(Arc::clone(&limiter)),
+        );
+        request_tx
+            .send(SemanticRefreshRequest::Corpus)
+            .expect("queue corpus refresh");
+        drop(request_tx);
+
+        std::thread::sleep(Duration::from_millis(150));
+        ctx.mark_subc_unbound();
+        drop(held);
+        server.release_responses();
+        worker.join().expect("queued refresh worker joins");
+
+        assert_eq!(
+            server.non_probe_request_count(),
+            0,
+            "an unbound root must leave the limiter queue without embedding"
+        );
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Disconnected)
+            ),
+            "an unbound worker must not publish a refresh event after its slot wait"
+        );
     }
 
     #[test]
