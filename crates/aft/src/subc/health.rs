@@ -1,5 +1,7 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::{
     json, Arc, AtomicBool, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport,
     HealthStatus, Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
@@ -7,6 +9,116 @@ use super::{
 };
 use crate::context::{AppContext, RootHealthState};
 use crate::executor::BindBlockerSnapshot;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ReapBlockerCensus {
+    pub(super) deleted_retained: usize,
+    pub(super) bound_routes: usize,
+    pub(super) unbound_quiesced: usize,
+    pub(super) bash_waits: usize,
+    pub(super) maintenance_pending: usize,
+    pub(super) maintenance_queued: usize,
+    pub(super) pending_binds: usize,
+    pub(super) actor_busy: usize,
+    pub(super) actor_state_busy: usize,
+    pub(super) artifact_eviction_blocked: usize,
+    pub(super) artifact_eviction_failed: usize,
+}
+
+impl ReapBlockerCensus {
+    pub(super) fn blocker_histogram(&self) -> String {
+        format!(
+            "bound_routes={},unbound_quiesced={},bash_waits={},maintenance_pending={},maintenance_queued={},pending_binds={},actor_busy={},actor_state_busy={},artifact_eviction_blocked={},artifact_eviction_failed={}",
+            self.bound_routes,
+            self.unbound_quiesced,
+            self.bash_waits,
+            self.maintenance_pending,
+            self.maintenance_queued,
+            self.pending_binds,
+            self.actor_busy,
+            self.actor_state_busy,
+            self.artifact_eviction_blocked,
+            self.artifact_eviction_failed,
+        )
+    }
+}
+
+struct ReapMetrics {
+    last_sweep_ms: AtomicU64,
+    deleted_retained: AtomicUsize,
+    bound_routes: AtomicUsize,
+    unbound_quiesced: AtomicUsize,
+    bash_waits: AtomicUsize,
+    maintenance_pending: AtomicUsize,
+    maintenance_queued: AtomicUsize,
+    pending_binds: AtomicUsize,
+    actor_busy: AtomicUsize,
+    actor_state_busy: AtomicUsize,
+    artifact_eviction_blocked: AtomicUsize,
+    artifact_eviction_failed: AtomicUsize,
+}
+
+impl ReapMetrics {
+    fn new() -> Self {
+        Self {
+            last_sweep_ms: AtomicU64::new(0),
+            deleted_retained: AtomicUsize::new(0),
+            bound_routes: AtomicUsize::new(0),
+            unbound_quiesced: AtomicUsize::new(0),
+            bash_waits: AtomicUsize::new(0),
+            maintenance_pending: AtomicUsize::new(0),
+            maintenance_queued: AtomicUsize::new(0),
+            pending_binds: AtomicUsize::new(0),
+            actor_busy: AtomicUsize::new(0),
+            actor_state_busy: AtomicUsize::new(0),
+            artifact_eviction_blocked: AtomicUsize::new(0),
+            artifact_eviction_failed: AtomicUsize::new(0),
+        }
+    }
+
+    fn record(&self, now_ms: u64, census: ReapBlockerCensus) {
+        self.last_sweep_ms.store(now_ms, Ordering::Relaxed);
+        self.deleted_retained
+            .store(census.deleted_retained, Ordering::Relaxed);
+        self.bound_routes
+            .store(census.bound_routes, Ordering::Relaxed);
+        self.unbound_quiesced
+            .store(census.unbound_quiesced, Ordering::Relaxed);
+        self.bash_waits.store(census.bash_waits, Ordering::Relaxed);
+        self.maintenance_pending
+            .store(census.maintenance_pending, Ordering::Relaxed);
+        self.maintenance_queued
+            .store(census.maintenance_queued, Ordering::Relaxed);
+        self.pending_binds
+            .store(census.pending_binds, Ordering::Relaxed);
+        self.actor_busy.store(census.actor_busy, Ordering::Relaxed);
+        self.actor_state_busy
+            .store(census.actor_state_busy, Ordering::Relaxed);
+        self.artifact_eviction_blocked
+            .store(census.artifact_eviction_blocked, Ordering::Relaxed);
+        self.artifact_eviction_failed
+            .store(census.artifact_eviction_failed, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({
+            "deleted_retained": self.deleted_retained.load(Ordering::Relaxed),
+            "blockers": {
+                "bound_routes": self.bound_routes.load(Ordering::Relaxed),
+                "unbound_quiesced": self.unbound_quiesced.load(Ordering::Relaxed),
+                "bash_waits": self.bash_waits.load(Ordering::Relaxed),
+                "maintenance_pending": self.maintenance_pending.load(Ordering::Relaxed),
+                "maintenance_queued": self.maintenance_queued.load(Ordering::Relaxed),
+                "pending_binds": self.pending_binds.load(Ordering::Relaxed),
+                "actor_busy": self.actor_busy.load(Ordering::Relaxed),
+                "actor_state_busy": self.actor_state_busy.load(Ordering::Relaxed),
+                "artifact_eviction_blocked": self.artifact_eviction_blocked.load(Ordering::Relaxed),
+                "artifact_eviction_failed": self.artifact_eviction_failed.load(Ordering::Relaxed),
+            },
+            "last_sweep_ms": self.last_sweep_ms.load(Ordering::Relaxed),
+        })
+    }
+}
 
 pub(super) struct DispatchPathMetrics {
     pub(super) origin: Instant,
@@ -21,6 +133,7 @@ pub(super) struct DispatchPathMetrics {
     pub(super) reliable_push_budget_deferrals: AtomicU64,
     pub(super) maintenance_budget_deferrals: AtomicU64,
     pub(super) response_tasks_live: AtomicUsize,
+    reap: ReapMetrics,
 }
 
 impl DispatchPathMetrics {
@@ -38,6 +151,7 @@ impl DispatchPathMetrics {
             reliable_push_budget_deferrals: AtomicU64::new(0),
             maintenance_budget_deferrals: AtomicU64::new(0),
             response_tasks_live: AtomicUsize::new(0),
+            reap: ReapMetrics::new(),
         }
     }
 
@@ -48,6 +162,18 @@ impl DispatchPathMetrics {
     pub(super) fn mark_frame_loop_tick(&self) {
         self.frame_loop_last_tick_ms
             .store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    pub(super) fn record_reap(&self, census: ReapBlockerCensus) {
+        let last_sweep_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(duration_millis_u64)
+            .unwrap_or(0);
+        self.reap.record(last_sweep_ms, census);
+    }
+
+    fn reap_snapshot(&self) -> Value {
+        self.reap.snapshot()
     }
 
     fn snapshot(
@@ -333,6 +459,7 @@ pub(super) fn build_health_report(
             "root_count": roots.len(),
             "memory": memory,
             "roots": roots,
+            "reap": dispatch_path_metrics.reap_snapshot(),
             "dispatch_liveness": dispatch_liveness_metrics(executor),
             "dispatch_path": dispatch_path_metrics.snapshot(pending_binds, executor),
         })),

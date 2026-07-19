@@ -658,6 +658,11 @@ export class SubcTransportPool implements AftTransportPool {
         if (record.routeEntry === entry) {
           entry.closed = true;
           record.routeEntry = null;
+          if (entry.handle != null) {
+            // Forgetting only the local handle leaves the module's route bound
+            // when a request times out but the shared connection remains alive.
+            safeCloseRoute(entry.client, entry.handle);
+          }
         }
       };
 

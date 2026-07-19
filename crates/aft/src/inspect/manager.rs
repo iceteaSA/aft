@@ -198,8 +198,12 @@ impl InspectManager {
             .store(false, Ordering::SeqCst);
     }
 
+    pub fn automatic_tier2_refresh_enabled(&self) -> bool {
+        self.automatic_tier2_refresh_allowed.load(Ordering::SeqCst)
+    }
+
     pub fn automatic_tier2_refresh_allowed(&self) -> bool {
-        let allowed = self.automatic_tier2_refresh_allowed.load(Ordering::SeqCst);
+        let allowed = self.automatic_tier2_refresh_enabled();
         if !allowed
             && !self
                 .automatic_tier2_skip_logged

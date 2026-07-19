@@ -150,7 +150,8 @@ mod push;
 mod wire;
 
 use self::health::{
-    build_health_report, warn_slow_pending_binds, DispatchPathMetrics, ResponseTaskGuard,
+    build_health_report, warn_slow_pending_binds, DispatchPathMetrics, ReapBlockerCensus,
+    ResponseTaskGuard,
 };
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
@@ -717,6 +718,46 @@ fn quiesce_unbound_root(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn quiesce_connection_roots(
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    installed_route_epochs: &mut HashMap<u16, u32>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    executor: &Arc<Executor>,
+) {
+    for cancel in route_bash_cancels.values() {
+        cancel.token.cancel();
+    }
+    route_bash_cancels.clear();
+
+    let mut roots = live_roots.keys().cloned().collect::<HashSet<_>>();
+    for pending in pending_binds.values_mut() {
+        pending.cancelled = true;
+        roots.insert(pending.bind_root_id.clone());
+        let _ = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
+    }
+
+    // A connection exit abandons every installed route at once. Close lifecycle
+    // admission before cancelling maintenance so no deferred worker can restore
+    // root activity after the loop-owned route tables disappear.
+    for root_id in roots {
+        if live_roots.contains_key(&root_id) {
+            quiesce_unbound_root(&root_id, live_roots, executor);
+        } else if let Some(ctx) = executor.actor_context(&root_id) {
+            ctx.mark_subc_unbound();
+            executor.cancel_queued_maintenance(&root_id);
+            crate::commands::configure::cancel_deferred_configure_maintenance(&ctx);
+        }
+    }
+
+    routes.clear();
+    root_channels.clear();
+    installed_route_epochs.clear();
+}
+
 #[derive(Debug, Default)]
 struct IdleReapOutcome {
     evicted: usize,
@@ -729,42 +770,92 @@ fn reap_idle_roots(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     executor: &Arc<Executor>,
+    metrics: &DispatchPathMetrics,
 ) -> IdleReapOutcome {
     let pending_bind_roots = pending_binds
         .values()
         .map(|pending| pending.bind_root_id.clone())
         .collect::<HashSet<_>>();
-    let candidates = live_roots
-        .iter()
-        .filter_map(|(root_id, meta)| {
-            let deleted = !root_id.as_path().exists();
-            let has_bound_route = root_channels
-                .get(root_id)
-                .is_some_and(|channels| !channels.is_empty());
+    let mut census = ReapBlockerCensus::default();
+    let mut candidates = Vec::new();
+
+    for (root_id, meta) in live_roots.iter() {
+        let deleted = !root_id.as_path().exists();
+        let has_bound_route = root_channels
+            .get(root_id)
+            .is_some_and(|channels| !channels.is_empty());
+        let has_pending_bind = pending_bind_roots.contains(root_id);
+
+        if deleted {
+            let mut retained = false;
+            if has_bound_route {
+                census.bound_routes += 1;
+                retained = true;
+            }
+            // Count roots whose unbound state has not yet been quiesced.
+            if !meta.unbound_quiesced {
+                census.unbound_quiesced += 1;
+                retained = true;
+            }
+            if meta.active_bash_waits > 0 {
+                census.bash_waits += 1;
+                retained = true;
+            }
+            if meta.maintenance_pending {
+                census.maintenance_pending += 1;
+                retained = true;
+            }
+            if !meta.maintenance_queued_kinds.is_empty() {
+                census.maintenance_queued += 1;
+                retained = true;
+            }
+            if has_pending_bind {
+                census.pending_binds += 1;
+                retained = true;
+            }
+            match executor.try_actor_is_idle(root_id) {
+                Some(true) => {}
+                Some(false) => {
+                    census.actor_busy += 1;
+                    retained = true;
+                }
+                None => {
+                    census.actor_state_busy += 1;
+                    retained = true;
+                }
+            }
+            if retained {
+                census.deleted_retained += 1;
+                continue;
+            }
+        } else {
             // Route teardown marks the lifecycle admission gate before the last
             // channel disappears. Requiring zero bound channels and a quiesced
             // lifecycle prevents a still-bound root from losing its watcher.
             if has_bound_route
                 || !meta.unbound_quiesced
-                || (!deleted
-                    && (meta.idle_artifacts_evicted
-                        || now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL))
+                || meta.idle_artifacts_evicted
+                || now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL
                 || meta.active_bash_waits > 0
                 || meta.maintenance_pending
                 || !meta.maintenance_queued_kinds.is_empty()
-                || pending_bind_roots.contains(root_id)
+                || has_pending_bind
                 || !executor.actor_is_idle(root_id)
             {
-                return None;
+                continue;
             }
-            Some((root_id.clone(), deleted))
-        })
-        .collect::<Vec<_>>();
+        }
+        candidates.push((root_id.clone(), deleted));
+    }
 
     let mut reaped = Vec::new();
     let mut forgotten_deleted_roots = Vec::new();
     for (root_id, deleted) in candidates {
         let Some(ctx) = executor.actor_context(&root_id) else {
+            if deleted {
+                census.deleted_retained += 1;
+                census.actor_busy += 1;
+            }
             continue;
         };
         // A TTL-aged unbound root retained its watcher-derived pending paths
@@ -776,12 +867,20 @@ fn reap_idle_roots(
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state(pending);
             }
+            if deleted {
+                census.deleted_retained += 1;
+                census.artifact_eviction_blocked += 1;
+            }
             continue;
         }
         let memory_before = ctx.memory_root_snapshot();
         if !ctx.evict_idle_artifacts() {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state(pending);
+            }
+            if deleted {
+                census.deleted_retained += 1;
+                census.artifact_eviction_failed += 1;
             }
             continue;
         }
@@ -795,6 +894,9 @@ fn reap_idle_roots(
             if executor.retire_idle_actor_in_background(&root_id) {
                 live_roots.remove(&root_id);
                 forgotten_deleted_roots.push(root_id.clone());
+            } else {
+                census.deleted_retained += 1;
+                census.actor_busy += 1;
             }
         } else {
             if let Some(meta) = live_roots.get_mut(&root_id) {
@@ -803,6 +905,15 @@ fn reap_idle_roots(
             ctx.release_idle_reopenable_resources_in_background();
         }
         reaped.push((root_id, memory_before));
+    }
+
+    metrics.record_reap(census);
+    if census.deleted_retained > 0 {
+        log::info!(
+            "subc attach: retained {} deleted root(s) during idle reap; blockers={}",
+            census.deleted_retained,
+            census.blocker_histogram()
+        );
     }
 
     let pressure_relief = (!reaped.is_empty())
@@ -2586,6 +2697,7 @@ where
                     &pending_binds,
                     &root_channels,
                     &executor,
+                    &dispatch_path_metrics,
                 );
                 for root_id in &reap.forgotten_deleted_roots {
                     purge_deleted_root_residents(
@@ -2620,12 +2732,18 @@ where
 
     shared_app.set_open_route_count(0);
 
-    // Sweep pending binds on EVERY loop exit (channel-0 Goodbye, EOF, fatal,
-    // error): ExecutorInner::drop joins worker threads, so a configure still
-    // parked at a cancellation checkpoint would wedge module shutdown.
-    for pending in pending_binds.values() {
-        let _ = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
-    }
+    connection_cancel.cancel();
+    // Channel-0 Goodbye, EOF, and fatal exits bypass per-route Goodbye. Settle
+    // their root lifecycle state before loop-owned routing metadata is dropped.
+    quiesce_connection_roots(
+        &mut live_roots,
+        &mut pending_binds,
+        &mut routes,
+        &mut root_channels,
+        &mut installed_route_epochs,
+        &mut route_bash_cancels,
+        &executor,
+    );
 
     let mut loop_result = loop_result;
     if !pending_bash_asks.is_empty() {
@@ -2647,7 +2765,6 @@ where
 
     // The reader task may be parked on `read_frame`; abort it (we are done with
     // the connection) and flush the writer.
-    connection_cancel.cancel();
     reader_task.abort();
     drop(writer_tx);
     let writer_result = finish_writer_task(writer_task).await;
@@ -3797,6 +3914,17 @@ async fn handle_tool_call(
                 }
             };
 
+            let reverse_corr =
+                allocate_reverse_corr(pending_bash_asks, route_id, next_bash_ask_corr);
+            let ask_frame = build_bash_elicitation_request_frame(
+                frame.header.ver,
+                route_id,
+                reverse_corr,
+                frame.header.flags,
+                &plan.command,
+                &plan.asks,
+            )?;
+
             let meta = live_roots
                 .entry(identity.root.clone())
                 .or_insert_with(|| RootMeta::new(Instant::now()));
@@ -3815,17 +3943,6 @@ async fn handle_tool_call(
                 connection: connection_cancel.clone(),
                 route: route_cancel.token.clone(),
             };
-
-            let reverse_corr =
-                allocate_reverse_corr(pending_bash_asks, route_id, next_bash_ask_corr);
-            let ask_frame = build_bash_elicitation_request_frame(
-                frame.header.ver,
-                route_id,
-                reverse_corr,
-                frame.header.flags,
-                &plan.command,
-                &plan.asks,
-            )?;
             pending_bash_asks.insert(
                 ReverseCorrKey {
                     route: route_id,
@@ -4386,7 +4503,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        completion_frame, test_ctx, test_root, wait_for_actor_root_count, wait_for_watcher_count,
+        completion_frame, route_identity, test_ctx, test_root, wait_for_actor_root_count,
+        wait_for_watcher_count,
     };
     use super::*;
 
@@ -4777,6 +4895,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &executor,
+                &DispatchPathMetrics::new(),
             )
             .evicted,
             1
@@ -4832,6 +4951,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &executor,
+                &DispatchPathMetrics::new(),
             )
             .evicted,
             0
@@ -4851,6 +4971,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &executor,
+                &DispatchPathMetrics::new(),
             )
             .evicted,
             1
@@ -4900,6 +5021,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &executor,
+                &DispatchPathMetrics::new(),
             )
             .evicted,
             0,
@@ -4944,6 +5066,7 @@ mod tests {
                 &HashMap::new(),
                 &bound,
                 &executor,
+                &DispatchPathMetrics::new(),
             )
             .evicted,
             0
@@ -4981,6 +5104,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &executor,
+            &DispatchPathMetrics::new(),
         );
         assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
         assert!(!executor.actor_registered(&root));
@@ -4991,6 +5115,105 @@ mod tests {
         let status = status_ctx.build_status_snapshot();
         assert_eq!(status["runtime"]["live_actor_roots"], 0);
         assert_eq!(status["runtime"]["open_routes"], 0);
+    }
+
+    #[test]
+    fn deleted_root_reap_blocker_census_is_exposed_in_health_metrics() {
+        let (root_dir, root) = test_root("deleted-root-reap-census");
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        root_dir.close().expect("delete project root");
+
+        let mut live_roots = HashMap::from([(root, RootMeta::new(Instant::now()))]);
+        let metrics = DispatchPathMetrics::new();
+        let outcome = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &executor,
+            &metrics,
+        );
+        assert_eq!(outcome.evicted, 0);
+
+        let report = build_health_report(&executor, &HashMap::new(), &metrics);
+        let reap = report
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.get("reap"))
+            .expect("reap health metrics");
+        assert_eq!(reap["deleted_retained"].as_u64(), Some(1));
+        assert_eq!(reap["blockers"]["unbound_quiesced"].as_u64(), Some(1));
+        assert_eq!(reap["blockers"]["actor_busy"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn connection_exit_quiesces_queued_maintenance_and_deleted_root_is_purged() {
+        let (root_dir, root) = test_root("connection-exit-deleted-root");
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+
+        let route = route_key(11, 1);
+        let mut meta = RootMeta::new(Instant::now());
+        meta.maintenance_pending = true;
+        meta.maintenance_queued_kinds
+            .push_back(MaintenanceDrainKind::CompletionDrains);
+        let mut live_roots = HashMap::from([(root.clone(), meta)]);
+        let mut pending_binds = HashMap::new();
+        let mut routes = HashMap::from([(route, route_identity(&root, "abandoned"))]);
+        let mut root_channels = HashMap::from([(root.clone(), HashSet::from([route]))]);
+        let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
+        let mut route_bash_cancels = HashMap::new();
+
+        quiesce_connection_roots(
+            &mut live_roots,
+            &mut pending_binds,
+            &mut routes,
+            &mut root_channels,
+            &mut installed_route_epochs,
+            &mut route_bash_cancels,
+            &executor,
+        );
+        assert!(live_roots[&root].unbound_quiesced);
+        assert!(!live_roots[&root].maintenance_pending);
+        assert!(live_roots[&root].maintenance_queued_kinds.is_empty());
+        assert!(routes.is_empty());
+        assert!(root_channels.is_empty());
+
+        root_dir.close().expect("delete project root");
+        let metrics = DispatchPathMetrics::new();
+        let outcome = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &pending_binds,
+            &root_channels,
+            &executor,
+            &metrics,
+        );
+        let mut session_identity = HashMap::new();
+        let mut push_buffer = HashMap::new();
+        let mut bg_subs = HashMap::new();
+        let mut bg_sub_by_session = HashMap::new();
+        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_epoch = HashMap::new();
+        let mut pending_bash_asks = HashMap::new();
+        for forgotten in &outcome.forgotten_deleted_roots {
+            purge_deleted_root_residents(
+                forgotten,
+                &mut root_channels,
+                &mut session_identity,
+                &mut push_buffer,
+                &mut bg_subs,
+                &mut bg_sub_by_session,
+                &mut bg_wake_pending,
+                &mut bg_wake_epoch,
+                &mut pending_bash_asks,
+            );
+        }
+
+        assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
+        assert!(!executor.actor_registered(&root));
+        assert!(!live_roots.contains_key(&root));
     }
 
     #[test]

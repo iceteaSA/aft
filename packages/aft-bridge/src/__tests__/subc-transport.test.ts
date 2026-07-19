@@ -357,6 +357,7 @@ describe("SubcTransport Rd reconnect", () => {
     expect(client.requests[0]?.channel).toBe(1);
     expect(client.requests[1]?.channel).toBe(2);
     expect(client.requests[1]?.body).toEqual(client.requests[0]?.body);
+    expect(client.closedRoutes).toEqual([1]);
   });
 
   test("outcome-unknown request failures still surface without an in-place retry", async () => {

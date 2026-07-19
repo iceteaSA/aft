@@ -2310,7 +2310,18 @@ fn subc_bridge_health_check_returns_root_status_report() {
         "subc_bridge_health_check_returns_root_status_report",
         Duration::from_secs(30),
         drive_health_check_daemon,
-        |_, _, _| {},
+        |_, executor, roots| {
+            let root_id = ProjectRootId::from_path(roots.root1.path()).expect("root1 id");
+            let ctx = executor.actor_context(&root_id).expect("root1 actor");
+            assert!(
+                ctx.subc_unbound_quiesced(),
+                "channel-0 Goodbye must quiesce every installed route"
+            );
+            assert!(
+                executor.actor_is_idle(&root_id),
+                "connection teardown must cancel queued root maintenance"
+            );
+        },
     );
 }
 

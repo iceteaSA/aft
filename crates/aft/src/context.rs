@@ -1973,18 +1973,23 @@ impl AppContext {
         } else {
             "disabled"
         };
-        let tier2_status = if !config.inspect.enabled
-            || (tier2.dead_code.is_none()
-                && tier2.unused_exports.is_none()
-                && tier2.duplicates.is_none())
-        {
-            "disabled"
-        } else if tier2.dead_code.is_some()
+        let tier2_complete = tier2.dead_code.is_some()
             && tier2.unused_exports.is_some()
             && tier2.duplicates.is_some()
-            && !tier2.stale
-        {
+            && !tier2.stale;
+        let tier2_has_aggregates = tier2.dead_code.is_some()
+            || tier2.unused_exports.is_some()
+            || tier2.duplicates.is_some();
+        let tier2_refresh_gated = borrows_shared_artifacts
+            || !heavy_root_work_allowed
+            || !self.inspect_writer.load(Ordering::SeqCst)
+            || !self.inspect_manager.automatic_tier2_refresh_enabled();
+        let tier2_status = if tier2_complete {
             "ready"
+        } else if !config.inspect.enabled || !tier2_has_aggregates || tier2_refresh_gated {
+            // A partial snapshot can only be "building" when this root is
+            // allowed to run the refresh that would complete it.
+            "disabled"
         } else {
             "building"
         };
@@ -2433,7 +2438,8 @@ impl AppContext {
             .mark_unbound(self.configure_generation.as_ref());
     }
 
-    pub(crate) fn subc_unbound_quiesced(&self) -> bool {
+    #[doc(hidden)]
+    pub fn subc_unbound_quiesced(&self) -> bool {
         self.subc_lifecycle.is_unbound()
     }
 
@@ -6122,6 +6128,51 @@ mod subc_lifecycle_admission_tests {
         assert!(
             callgraph_receiver_available,
             "health snapshots must not hold the callgraph receiver while lifecycle admission is busy"
+        );
+    }
+
+    #[test]
+    fn borrow_only_root_with_partial_tier2_aggregates_reports_disabled() {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        ctx.set_artifact_owner(
+            Some(crate::artifact_owner::ArtifactOwnerStatus {
+                mode: crate::artifact_owner::ArtifactOwnerMode::ReadOnly,
+                project_key: "borrowed".to_string(),
+                manifest_path: "manifest.json".to_string(),
+                owner_project_scope_key: "owner".to_string(),
+                owner_checkout_path: "/owner".to_string(),
+                note: None,
+            }),
+            None,
+        );
+        ctx.update_status_bar_tier2(Some(4), None, None, None, true);
+
+        let snapshot = ctx.try_health_snapshot(Path::new("borrow-only-root"));
+
+        assert_eq!(snapshot.tier2.expect("tier2 health").status, "disabled");
+    }
+
+    #[test]
+    fn worktree_guard_prevents_partial_tier2_from_reporting_building() {
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        ctx.set_cache_writer_capabilities(true, true);
+        ctx.update_status_bar_tier2(Some(4), None, None, None, true);
+        assert_eq!(
+            ctx.try_health_snapshot(Path::new("writer-root"))
+                .tier2
+                .expect("tier2 health")
+                .status,
+            "building"
+        );
+
+        ctx.set_cache_role(true, None);
+
+        assert_eq!(
+            ctx.try_health_snapshot(Path::new("worktree-root"))
+                .tier2
+                .expect("tier2 health")
+                .status,
+            "disabled"
         );
     }
 

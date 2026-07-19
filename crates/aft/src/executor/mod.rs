@@ -494,6 +494,14 @@ impl Executor {
         state.actors.get(root_id).is_some_and(ActorState::is_idle)
     }
 
+    /// Non-blocking idle probe for maintenance sweeps. A contended scheduler is
+    /// reported separately so root retirement can conservatively wait for the
+    /// next sweep without stalling the module loop.
+    pub fn try_actor_is_idle(&self, root_id: &ProjectRootId) -> Option<bool> {
+        let state = self.inner.state.try_lock()?;
+        Some(state.actors.get(root_id).is_some_and(ActorState::is_idle))
+    }
+
     /// Forget an idle actor and drop its root-scoped registries off the scheduler
     /// thread. This is reserved for roots whose project directory no longer
     /// exists; retained existing roots are reused on a later bind.
