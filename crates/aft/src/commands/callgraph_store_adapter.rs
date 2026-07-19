@@ -1684,7 +1684,9 @@ fn collect_callers_recursive(
     truncated: &mut usize,
 ) -> StoreAdapterResult<()> {
     if current_depth >= max_depth {
-        let omitted = dedup_call_site_count(store.direct_callers_of(Path::new(file), symbol)?);
+        let target = (file.to_string(), symbol.to_string());
+        let counts = store.direct_caller_counts_of(std::slice::from_ref(&target))?;
+        let omitted = counts.get(&target).copied().unwrap_or_default();
         if omitted > 0 {
             *depth_limited = true;
             *truncated += omitted;
@@ -1697,9 +1699,12 @@ fn collect_callers_recursive(
     }
 
     let sites = store.direct_callers_of(Path::new(file), symbol)?;
-    for site in sites {
-        result.push(site.clone());
-        if current_depth + 1 < max_depth {
+    if sites.is_empty() {
+        return Ok(());
+    }
+    if current_depth + 1 < max_depth {
+        for site in sites {
+            result.push(site.clone());
             collect_callers_recursive(
                 store,
                 &site.caller.file,
@@ -1711,10 +1716,19 @@ fn collect_callers_recursive(
                 depth_limited,
                 truncated,
             )?;
-        } else {
-            let omitted = dedup_call_site_count(
-                store.direct_callers_of(Path::new(&site.caller.file), &site.caller.symbol)?,
-            );
+        }
+    } else {
+        let boundary_targets = sites
+            .iter()
+            .map(|site| (site.caller.file.clone(), site.caller.symbol.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let boundary_counts = store.direct_caller_counts_of(&boundary_targets)?;
+        for site in sites {
+            result.push(site.clone());
+            let key = (site.caller.file.clone(), site.caller.symbol.clone());
+            let omitted = boundary_counts.get(&key).copied().unwrap_or_default();
             if omitted > 0 {
                 *depth_limited = true;
                 *truncated += omitted;
@@ -1900,6 +1914,7 @@ fn dedup_call_sites(sites: Vec<StoreCallSite>) -> Vec<StoreCallSite> {
     deduped
 }
 
+#[cfg(test)]
 fn dedup_call_site_count(sites: Vec<StoreCallSite>) -> usize {
     sites
         .into_iter()
@@ -1995,6 +2010,8 @@ mod trace_to_tests {
         nodes: HashMap<(String, String), StoreNode>,
         callers: HashMap<(String, String), Vec<StoreCallSite>>,
         caller_queries: RefCell<HashMap<(String, String), usize>>,
+        caller_count_queries: RefCell<usize>,
+        caller_count_targets: RefCell<usize>,
     }
 
     impl CountingStore {
@@ -2005,6 +2022,8 @@ mod trace_to_tests {
                 nodes: HashMap::new(),
                 callers: HashMap::new(),
                 caller_queries: RefCell::new(HashMap::new()),
+                caller_count_queries: RefCell::new(0),
+                caller_count_targets: RefCell::new(0),
             }
         }
 
@@ -2014,6 +2033,10 @@ mod trace_to_tests {
         }
 
         fn add_caller(&mut self, target: &StoreNode, caller: &StoreNode) {
+            self.add_caller_at(target, caller, caller.line);
+        }
+
+        fn add_caller_at(&mut self, target: &StoreNode, caller: &StoreNode, line: u32) {
             self.callers
                 .entry((target.file.clone(), target.symbol.clone()))
                 .or_default()
@@ -2022,7 +2045,7 @@ mod trace_to_tests {
                     target_file: target.file.clone(),
                     target_symbol: target.symbol.clone(),
                     target: Some(target.clone()),
-                    line: caller.line,
+                    line,
                     byte_start: 0,
                     byte_end: 1,
                     resolved: true,
@@ -2032,6 +2055,20 @@ mod trace_to_tests {
 
         fn total_caller_queries(&self) -> usize {
             self.caller_queries.borrow().values().sum()
+        }
+
+        fn total_caller_count_queries(&self) -> usize {
+            *self.caller_count_queries.borrow()
+        }
+
+        fn caller_count_target_count(&self) -> usize {
+            *self.caller_count_targets.borrow()
+        }
+
+        fn reset_query_counts(&self) {
+            self.caller_queries.borrow_mut().clear();
+            *self.caller_count_queries.borrow_mut() = 0;
+            *self.caller_count_targets.borrow_mut() = 0;
         }
     }
 
@@ -2100,6 +2137,27 @@ mod trace_to_tests {
                 .entry(key.clone())
                 .or_default() += 1;
             Ok(self.callers.get(&key).cloned().unwrap_or_default())
+        }
+
+        fn direct_caller_counts_of(
+            &self,
+            targets: &[(String, String)],
+        ) -> CallGraphResult<HashMap<(String, String), usize>> {
+            *self.caller_count_queries.borrow_mut() += 1;
+            *self.caller_count_targets.borrow_mut() = targets.len();
+            Ok(targets
+                .iter()
+                .cloned()
+                .map(|target| {
+                    let count = self
+                        .callers
+                        .get(&target)
+                        .cloned()
+                        .map(dedup_call_site_count)
+                        .unwrap_or_default();
+                    (target, count)
+                })
+                .collect())
         }
 
         fn callers_of(
@@ -2196,6 +2254,44 @@ mod trace_to_tests {
             previous = current;
         }
         (store, target)
+    }
+
+    #[test]
+    fn batched_boundary_counts_preserve_serialized_callers_and_impact_contract() {
+        let mut store = CountingStore::new();
+        let target = node("target", false);
+        let boundary = node("hubCaller", false);
+        let upstream_a = node("upstreamA", true);
+        let upstream_b = node("upstreamB", true);
+        for fixture_node in [&target, &boundary, &upstream_a, &upstream_b] {
+            store.add_node(fixture_node.clone());
+        }
+        for line in 1..=21 {
+            store.add_caller_at(&target, &boundary, line);
+        }
+        store.add_caller(&boundary, &upstream_a);
+        store.add_caller(&boundary, &upstream_b);
+
+        let callers = callers_result(&store, Path::new(&target.file), &target.symbol, 1, true)
+            .expect("callers result");
+        assert_eq!(store.total_caller_queries(), 1);
+        assert_eq!(store.total_caller_count_queries(), 1);
+        assert_eq!(store.caller_count_target_count(), 1);
+        assert_eq!(
+            serde_json::to_string(&callers).expect("serialize callers result"),
+            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"hubCaller.ts","callers":[{"symbol":"hubCaller","line":1}]}],"total_callers":21,"hub_summary":{"message":"Next: 21 callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"scanned_files":4,"depth_limited":true,"truncated":42}"#
+        );
+
+        store.reset_query_counts();
+        let impact = impact_result(&store, Path::new(&target.file), &target.symbol, 1, true)
+            .expect("impact result");
+        assert_eq!(store.total_caller_queries(), 1);
+        assert_eq!(store.total_caller_count_queries(), 1);
+        assert_eq!(store.caller_count_target_count(), 1);
+        assert_eq!(
+            serde_json::to_string(&impact).expect("serialize impact result"),
+            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"is_entry_point":false,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":42}"#
+        );
     }
 
     #[test]

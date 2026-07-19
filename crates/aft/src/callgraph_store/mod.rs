@@ -13,11 +13,14 @@ use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, LangId};
 use crate::symbols::{Range, SymbolKind};
 use rayon::prelude::*;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, Transaction};
+use rusqlite::{
+    params, params_from_iter, Connection, OpenFlags, OptionalExtension, Statement, Transaction,
+};
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -884,6 +887,9 @@ pub struct CallGraphStore {
     generation: Option<String>,
     writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
     read_marker: Option<crate::root_cache::ReadMarker>,
+    // Readiness is monotonic for an open generation: builds only publish `ready=1`.
+    // Failed validations are not cached, so a later successful build remains visible.
+    database_ready: AtomicBool,
     conn: Mutex<Connection>,
 }
 
@@ -903,6 +909,10 @@ pub trait CallGraphRead {
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>>;
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>>;
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>>;
+    fn direct_caller_counts_of(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), usize>>;
     fn callers_of(&self, file_rel: &Path, symbol: &str, depth: usize)
         -> Result<StoreCallersResult>;
     fn impact_of(&self, file_rel: &Path, symbol: &str, depth: usize) -> Result<StoreImpactResult>;
@@ -1981,8 +1991,18 @@ impl CallGraphStore {
             generation,
             writer_lease,
             read_marker,
+            database_ready: AtomicBool::new(false),
             conn: Mutex::new(conn),
         }
+    }
+
+    fn ensure_ready(&self, conn: &Connection) -> Result<()> {
+        if self.database_ready.load(AtomicOrdering::Acquire) {
+            return Ok(());
+        }
+        ensure_database_ready(conn)?;
+        self.database_ready.store(true, AtomicOrdering::Release);
+        Ok(())
     }
 
     pub fn project_root(&self) -> &Path {
@@ -2560,14 +2580,14 @@ impl CallGraphStore {
     pub fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         edge_snapshot_with_conn(&conn)
     }
 
     pub fn indexed_file_count(&self) -> Result<usize> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         indexed_file_count(&conn)
     }
 
@@ -2576,7 +2596,7 @@ impl CallGraphStore {
         let abs_path = normalize_file_path(&self.project_root, file_rel)?;
         let rel_path = relative_path(&self.project_root, &abs_path);
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         resolve_node_for_rel(&conn, &rel_path, symbol)
     }
 
@@ -2589,7 +2609,7 @@ impl CallGraphStore {
         let abs_path = normalize_file_path(&self.project_root, file_rel)?;
         let rel_path = relative_path(&self.project_root, &abs_path);
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         nodes_for_file_matching_symbol(&conn, &rel_path, symbol)
     }
 
@@ -2597,7 +2617,7 @@ impl CallGraphStore {
     pub fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         nodes_matching_symbol(&conn, symbol)
     }
 
@@ -2607,8 +2627,22 @@ impl CallGraphStore {
         let abs_path = normalize_file_path(&self.project_root, file_rel)?;
         let rel_path = relative_path(&self.project_root, &abs_path);
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         direct_callers_for_tuple(&conn, &rel_path, symbol)
+    }
+
+    /// Count distinct direct call sites for store-relative target tuples in bounded batches.
+    pub fn direct_caller_counts_of(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), usize>> {
+        if targets.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        direct_caller_counts_for_tuples(&conn, targets)
     }
 
     pub fn callers_of(
@@ -2619,7 +2653,7 @@ impl CallGraphStore {
     ) -> Result<StoreCallersResult> {
         let target = self.node_for(file_rel, symbol)?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         let effective_depth = depth.max(1);
         let mut visited = HashSet::new();
         let mut callers = Vec::new();
@@ -2698,7 +2732,7 @@ impl CallGraphStore {
     pub fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         outgoing_calls_for_node(&conn, node)
     }
 
@@ -2706,14 +2740,14 @@ impl CallGraphStore {
     pub fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         resolved_self_calls_for_node(&conn, node)
     }
 
     pub fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         unresolved_calls_for_node(&conn, node)
     }
 
@@ -2725,7 +2759,7 @@ impl CallGraphStore {
     ) -> Result<callgraph::CallTreeNode> {
         let node = self.node_for(file_rel, symbol)?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         let mut visited = HashSet::new();
         call_tree_inner(&conn, &node, max_depth, 0, &mut visited)
     }
@@ -2738,7 +2772,7 @@ impl CallGraphStore {
     ) -> Result<callgraph::TraceToResult> {
         let target = self.node_for(file_rel, symbol)?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         let effective_max = if max_depth == 0 { 10 } else { max_depth };
 
         #[derive(Clone)]
@@ -2855,7 +2889,7 @@ impl CallGraphStore {
     ) -> Result<Vec<callgraph::TraceToSymbolCandidate>> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         let mut candidates_by_file: HashMap<String, u32> = HashMap::new();
         for node in nodes_matching_symbol(&conn, to_symbol)? {
             candidates_by_file
@@ -2886,7 +2920,7 @@ impl CallGraphStore {
             .transpose()?
             .map(|path| relative_path(&self.project_root, &path));
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        ensure_database_ready(&conn)?;
+        self.ensure_ready(&conn)?;
         let effective_max = if max_depth == 0 {
             10
         } else {
@@ -3017,6 +3051,13 @@ impl ReadonlyCallGraphStore {
         self.inner.direct_callers_of(file_rel, symbol)
     }
 
+    pub fn direct_caller_counts_of(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), usize>> {
+        self.inner.direct_caller_counts_of(targets)
+    }
+
     pub fn callers_of(
         &self,
         file_rel: &Path,
@@ -3116,6 +3157,12 @@ impl CallGraphRead for CallGraphStore {
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
         CallGraphStore::direct_callers_of(self, file_rel, symbol)
     }
+    fn direct_caller_counts_of(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), usize>> {
+        CallGraphStore::direct_caller_counts_of(self, targets)
+    }
     fn callers_of(
         &self,
         file_rel: &Path,
@@ -3198,6 +3245,12 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
         (**self).direct_callers_of(file_rel, symbol)
     }
+    fn direct_caller_counts_of(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), usize>> {
+        (**self).direct_caller_counts_of(targets)
+    }
     fn callers_of(
         &self,
         file_rel: &Path,
@@ -3279,6 +3332,12 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     }
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
         self.direct_callers_of(file_rel, symbol)
+    }
+    fn direct_caller_counts_of(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), usize>> {
+        self.direct_caller_counts_of(targets)
     }
     fn callers_of(
         &self,
@@ -3486,6 +3545,63 @@ fn collect_callers_recursive(
         }
     }
     Ok(())
+}
+
+// Each target uses two parameters; 499 stays below SQLite's legacy 999-variable limit.
+const DIRECT_CALLER_COUNT_BATCH_SIZE: usize = 499;
+
+fn direct_caller_counts_for_tuples(
+    conn: &Connection,
+    targets: &[(String, String)],
+) -> Result<HashMap<(String, String), usize>> {
+    let unique_targets = targets.iter().cloned().collect::<BTreeSet<_>>();
+    let mut counts = unique_targets
+        .iter()
+        .cloned()
+        .map(|target| (target, 0usize))
+        .collect::<HashMap<_, _>>();
+
+    let unique_targets = unique_targets.into_iter().collect::<Vec<_>>();
+    for chunk in unique_targets.chunks(DIRECT_CALLER_COUNT_BATCH_SIZE) {
+        let requested_values = (0..chunk.len())
+            .map(|_| "(?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH requested(target_file, target_symbol) AS (VALUES {requested_values}),
+             deduped AS (
+                 SELECT e.target_file, e.target_symbol, src.file_path AS caller_file, e.line
+                 FROM requested requested
+                 JOIN edges e
+                   ON e.target_file = requested.target_file
+                  AND e.target_symbol = requested.target_symbol
+                  AND e.kind = 'call'
+                 JOIN refs r ON r.ref_id = e.ref_id
+                 JOIN nodes src ON src.id = e.source_node
+                 JOIN files src_file ON src_file.path = src.file_path
+                 GROUP BY e.target_file, e.target_symbol, src.file_path, e.line
+             )
+             SELECT target_file, target_symbol, COUNT(*)
+             FROM deduped
+             GROUP BY target_file, target_symbol"
+        );
+        let bindings = chunk
+            .iter()
+            .flat_map(|(file, symbol)| [file.as_str(), symbol.as_str()]);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(bindings), |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (target, count) = row?;
+            counts.insert(target, usize::try_from(count).unwrap_or(usize::MAX));
+        }
+    }
+
+    Ok(counts)
 }
 
 fn direct_caller_count_for_tuple(
@@ -10334,9 +10450,31 @@ mod refresh_worker_tests {
 mod cold_build_insert_tests {
     use super::*;
     use crate::imports::ImportBlock;
+    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    thread_local! {
+        static CALLER_QUERY_SELECTS: Cell<usize> = const { Cell::new(0) };
+        static BOUNDARY_COUNT_SELECTS: Cell<usize> = const { Cell::new(0) };
+        static TOTAL_CALLER_TRAVERSAL_SELECTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn count_caller_traversal_selects(sql: &str) {
+        let sql = sql.trim_start();
+        if sql.starts_with("SELECT") || sql.starts_with("WITH requested") {
+            TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(count.get() + 1));
+        }
+        if sql.contains("SELECT e.target_file, e.target_symbol, e.line")
+            && sql.contains("e.target_file =")
+        {
+            CALLER_QUERY_SELECTS.with(|count| count.set(count.get() + 1));
+        }
+        if sql.starts_with("WITH requested") {
+            BOUNDARY_COUNT_SELECTS.with(|count| count.set(count.get() + 1));
+        }
+    }
 
     #[test]
     fn nonrepairing_open_policy_leaves_moved_root_metadata_for_maintenance() {
@@ -10485,6 +10623,102 @@ mod cold_build_insert_tests {
     }
 
     #[test]
+    fn readiness_cache_only_skips_checks_after_a_successful_validation() {
+        let dir = tempdir().expect("temp dir");
+        let file = dir.path().join("main.ts");
+        fs::write(&file, "export function main() {}\n").expect("write fixture");
+        let store = CallGraphStore::open(
+            dir.path().join(".store-readiness-cache"),
+            dir.path().to_path_buf(),
+        )
+        .expect("open store");
+        {
+            let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            conn.trace(Some(count_caller_traversal_selects));
+        }
+
+        TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(0));
+        assert!(store.indexed_file_count().is_err());
+        assert!(store.indexed_file_count().is_err());
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 6);
+
+        store
+            .cold_build(std::slice::from_ref(&file))
+            .expect("cold build");
+        TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(0));
+        assert_eq!(store.indexed_file_count().expect("first ready read"), 1);
+        assert_eq!(store.indexed_file_count().expect("cached ready read"), 1);
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 5);
+
+        let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
+        conn.trace(None);
+    }
+
+    #[test]
+    fn callers_depth_boundary_batches_sqlite_counts() {
+        const CALLER_COUNT: usize = 1_000;
+
+        let dir = tempdir().expect("temp dir");
+        let file = dir.path().join("main.ts");
+        let mut source = String::from("export function sharedHotHelper() {}\n");
+        for index in 0..CALLER_COUNT {
+            source.push_str(&format!(
+                "export function caller{index}() {{ sharedHotHelper(); }}\n"
+            ));
+        }
+        fs::write(&file, source).expect("write fixture");
+
+        let store = CallGraphStore::open(
+            dir.path().join(".store-callers-query-fanout"),
+            dir.path().to_path_buf(),
+        )
+        .expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&file))
+            .expect("cold build");
+
+        CALLER_QUERY_SELECTS.with(|count| count.set(0));
+        BOUNDARY_COUNT_SELECTS.with(|count| count.set(0));
+        TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(0));
+        {
+            let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            conn.trace(Some(count_caller_traversal_selects));
+        }
+
+        let started = Instant::now();
+        let result = crate::commands::callgraph_store_adapter::callers_result(
+            &store,
+            Path::new("main.ts"),
+            "sharedHotHelper",
+            1,
+            true,
+        )
+        .expect("callers result");
+        let elapsed = started.elapsed();
+
+        {
+            let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            conn.trace(None);
+        }
+        let caller_queries = CALLER_QUERY_SELECTS.with(Cell::get);
+        let boundary_queries = BOUNDARY_COUNT_SELECTS.with(Cell::get);
+        let total_selects = TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get);
+        eprintln!(
+            "SQLITE_CALLERS_AFTER callers={} caller_queries={} boundary_queries={} total_selects={} elapsed_ms={:.3}",
+            result.total_callers,
+            caller_queries,
+            boundary_queries,
+            total_selects,
+            elapsed.as_secs_f64() * 1_000.0
+        );
+
+        assert_eq!(result.total_callers, CALLER_COUNT);
+        assert_eq!(caller_queries, 1);
+        assert_eq!(boundary_queries, 3);
+        assert_eq!(total_selects, 9);
+    }
+
+    #[test]
     fn depth_boundary_counts_match_full_fetch_lengths_with_dangling_edges() {
         let dir = tempdir().expect("temp dir");
         let file = dir.path().join("main.ts");
@@ -10569,14 +10803,41 @@ export function leaf() {}
                 "forward boundary COUNT must mirror outgoing_calls_for_node + unresolved_calls_for_node"
             );
 
-            let full_direct_len = direct_callers_for_tuple(&conn, &root.file, &root.symbol)
-                .expect("full direct callers")
-                .len();
+            let full_direct = direct_callers_for_tuple(&conn, &root.file, &root.symbol)
+                .expect("full direct callers");
+            let full_direct_len = full_direct.len();
             let counted_direct_len = direct_caller_count_for_tuple(&conn, &root.file, &root.symbol)
                 .expect("counted direct callers");
             assert_eq!(
                 counted_direct_len, full_direct_len,
                 "direct-caller boundary COUNT must mirror direct_callers_for_tuple"
+            );
+
+            let distinct_direct_len = full_direct
+                .iter()
+                .map(|site| {
+                    (
+                        site.caller.file.clone(),
+                        site.line,
+                        site.target_file.clone(),
+                        site.target_symbol.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+                .len();
+            let batch_counts = direct_caller_counts_for_tuples(
+                &conn,
+                &[
+                    (root.file.clone(), root.symbol.clone()),
+                    (root.file.clone(), root.symbol.clone()),
+                    (leaf.file.clone(), leaf.symbol.clone()),
+                ],
+            )
+            .expect("batched direct-caller counts");
+            assert_eq!(batch_counts.len(), 2);
+            assert_eq!(
+                batch_counts.get(&(root.file.clone(), root.symbol.clone())),
+                Some(&distinct_direct_len)
             );
 
             (full_forward_len, full_direct_len)
