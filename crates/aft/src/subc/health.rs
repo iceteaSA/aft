@@ -7,7 +7,7 @@ use super::{
     HealthStatus, Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
     DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
-use crate::context::{AppContext, RootHealthState};
+use crate::context::{App, AppContext, RootHealthState};
 use crate::executor::BindBlockerSnapshot;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -394,6 +394,7 @@ pub(super) fn build_health_report(
     executor: &Executor,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     dispatch_path_metrics: &DispatchPathMetrics,
+    shared_app: &App,
 ) -> HealthReport {
     // Health replies must stay cheap under any load (subc-health rule: a
     // probe that queues behind busy state lies about liveness and gets the
@@ -457,6 +458,13 @@ pub(super) fn build_health_report(
         metrics: Some(json!({
             "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
             "root_count": roots.len(),
+            // Lifecycle audit counters (fleet leak tracking): process-wide
+            // watcher runtimes, registered actor roots, and open routes.
+            "runtime": {
+                "live_watchers": shared_app.watcher_count(),
+                "live_actor_roots": shared_app.actor_root_count(),
+                "open_routes": shared_app.open_route_count(),
+            },
             "memory": memory,
             "roots": roots,
             "reap": dispatch_path_metrics.reap_snapshot(),
@@ -560,7 +568,12 @@ mod tests {
 
         let metrics = DispatchPathMetrics::new();
         let pending_binds = HashMap::new();
-        let report = build_health_report(&executor, &pending_binds, &metrics);
+        let report = build_health_report(
+            &executor,
+            &pending_binds,
+            &metrics,
+            &crate::context::App::default_shared(),
+        );
         let dispatch = report
             .metrics
             .as_ref()
@@ -593,7 +606,12 @@ mod tests {
             drr_quantum: 1,
         });
         let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
-        let report = build_health_report(&executor, &HashMap::new(), &dispatch_path_metrics);
+        let report = build_health_report(
+            &executor,
+            &HashMap::new(),
+            &dispatch_path_metrics,
+            &crate::context::App::default_shared(),
+        );
         let metrics = report.metrics.expect("health metrics present");
         let memory = metrics.get("memory").expect("memory rollup present");
         // No actors registered: ready rollup with zero roots and process totals.
@@ -601,6 +619,15 @@ mod tests {
         assert_eq!(memory.get("roots_total").and_then(Value::as_u64), Some(0));
         assert!(memory.get("total_attributed_bytes").is_some());
         assert!(memory.get("rss_bytes").is_some());
+        // Lifecycle audit counters ride the same probe so operator drill-downs
+        // and fleet leak checks read one surface.
+        let runtime = metrics.get("runtime").expect("runtime counters present");
+        for key in ["live_watchers", "live_actor_roots", "open_routes"] {
+            assert!(
+                runtime.get(key).and_then(Value::as_u64).is_some(),
+                "runtime.{key} must be a number"
+            );
+        }
     }
 
     #[test]
@@ -635,7 +662,12 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("mutating lock holder starts");
 
-        let report = build_health_report(&executor, &HashMap::new(), &DispatchPathMetrics::new());
+        let report = build_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &crate::context::App::default_shared(),
+        );
 
         // Settle the holder before asserting so a verdict failure cannot drop the release
         // sender and make the worker panic while the test unwinds.

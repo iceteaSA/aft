@@ -3601,7 +3601,7 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
-            let report = build_health_report(executor, pending_binds, metrics);
+            let report = build_health_report(executor, pending_binds, metrics, shared_app);
             let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(SubcError::Json)?;
             let response = Frame::build_with_version(
@@ -5136,7 +5136,12 @@ mod tests {
         );
         assert_eq!(outcome.evicted, 0);
 
-        let report = build_health_report(&executor, &HashMap::new(), &metrics);
+        let report = build_health_report(
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &crate::context::App::default_shared(),
+        );
         let reap = report
             .metrics
             .as_ref()
