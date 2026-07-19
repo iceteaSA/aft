@@ -597,6 +597,11 @@ mod tests {
         );
     }
 
+    /// Generous budget for tests that assert a PROBE SUCCEEDS (spawning a
+    /// real shim): decoupled from the production timeout so machine load
+    /// cannot convert a working probe into a test failure.
+    const TEST_PROBE_SUCCESS_TIMEOUT: Duration = Duration::from_secs(30);
+
     #[test]
     fn zsh_probe_uses_interactive_login_and_reads_zshrc() {
         let _guard = crate::test_env::process_env_lock();
@@ -629,7 +634,15 @@ eval "$2"
         let _path_guard = EnvVarGuard::set("PATH", "/usr/bin:/bin");
         let _home_guard = EnvVarGuard::set("HOME", home.to_str().unwrap());
         let _zdotdir_guard = EnvVarGuard::set("ZDOTDIR", home.to_str().unwrap());
-        let probed = probe_login_shell_path_once(&shell, LOGIN_SHELL_PATH_PROBE_TIMEOUT);
+        // Warm the freshly written shim with one untimed exec: macOS assesses
+        // never-seen executables on first exec (syspolicyd), which can take
+        // tens of seconds on a loaded machine and would read as a probe
+        // failure. The timed probe below then measures the shell, not the OS.
+        let _ = Command::new(&shell).arg("--warmup").output();
+        // Success-asserting probe tests use a generous budget: the production
+        // 3s timeout is a startup-cost bound, and a loaded machine can push a
+        // real shim spawn past it, which reads as a false test failure.
+        let probed = probe_login_shell_path_once(&shell, TEST_PROBE_SUCCESS_TIMEOUT);
 
         assert_eq!(
             probed,
@@ -674,9 +687,11 @@ eval "$2"
         let probed = probe_login_shell_path_once(&shell, LOGIN_SHELL_PATH_PROBE_TIMEOUT);
 
         assert!(probed.is_none());
+        // Upper bound proves the 3s timeout fired instead of waiting out the
+        // 10s sleep; 8s leaves headroom for a loaded machine to reap the kill.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "login-shell PATH probe exceeded the 5s test budget"
+            started.elapsed() < Duration::from_secs(8),
+            "login-shell PATH probe exceeded the 8s test budget"
         );
     }
 
