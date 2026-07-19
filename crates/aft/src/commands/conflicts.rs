@@ -45,15 +45,33 @@ fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(toplevel))
 }
 
+/// Construct a filesystem path from Git's raw NUL-delimited pathname bytes.
+///
+/// Git's normal line-oriented output C-quotes names containing non-ASCII or
+/// control characters, so that representation must never be used to open files.
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 /// Find all conflicted files using index-unmerged state plus tracked working-tree markers.
 /// Returns the git toplevel and unique file paths relative to that toplevel.
-fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<String>), String> {
+fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>), String> {
     let toplevel = git_toplevel(base_dir)?;
-    let mut files: Vec<String> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
     let mut seen = HashSet::new();
 
     let output = crate::effective_path::new_command("git")
-        .args(["ls-files", "--unmerged"])
+        .args(["ls-files", "--unmerged", "-z"])
         .current_dir(&toplevel)
         .output()
         .map_err(|e| format!("failed to run git: {}", e))?;
@@ -66,28 +84,30 @@ fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<String>), 
         return Err(format!("git ls-files failed: {}", stderr.trim()));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        // Format: "<mode> <hash> <stage>\t<filename>"
-        if let Some(tab_pos) = line.find('\t') {
-            let filename = &line[tab_pos + 1..];
-            if seen.insert(filename.to_string()) {
-                files.push(filename.to_string());
+    for record in output.stdout.split(|byte| *byte == b'\0') {
+        // Format: "<mode> <hash> <stage>\t<filename>\0"
+        if let Some(tab_pos) = record.iter().position(|byte| *byte == b'\t') {
+            let path = path_from_git_bytes(&record[tab_pos + 1..]);
+            if seen.insert(path.clone()) {
+                files.push(path);
             }
         }
     }
 
     let grep_output = crate::effective_path::new_command("git")
-        .args(["grep", "-lE", r"^(<<<<<<< |>>>>>>> )"])
+        .args(["grep", "-z", "-lE", r"^(<<<<<<< |>>>>>>> )"])
         .current_dir(&toplevel)
         .output()
         .map_err(|e| format!("failed to run git: {}", e))?;
 
     if grep_output.status.success() {
-        let stdout = String::from_utf8_lossy(&grep_output.stdout);
-        for filename in stdout.lines() {
-            if seen.insert(filename.to_string()) {
-                files.push(filename.to_string());
+        for filename in grep_output.stdout.split(|byte| *byte == b'\0') {
+            if filename.is_empty() {
+                continue;
+            }
+            let path = path_from_git_bytes(filename);
+            if seen.insert(path.clone()) {
+                files.push(path);
             }
         }
     } else {
@@ -263,12 +283,13 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
             Ok(path) => path,
             Err(resp) => return resp,
         };
+        let display_path = file_path.display().to_string();
 
         // Read file content
         let content = match std::fs::read_to_string(&validated_path) {
             Ok(c) => c,
             Err(e) => {
-                output.push_str(&format!("── {} [error: {}] ──\n\n", file_path, e));
+                output.push_str(&format!("── {} [error: {}] ──\n\n", display_path, e));
                 continue;
             }
         };
@@ -280,7 +301,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
             // (could be a deleted-vs-modified conflict)
             output.push_str(&format!(
                 "── {} [unmerged — no conflict markers found] ──\n\n",
-                file_path
+                display_path
             ));
             continue;
         }
@@ -288,8 +309,8 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         total_conflicts += regions.len();
         files_with_conflicts += 1;
 
-        // Format this file's conflicts
-        let formatted = format_file_conflicts(file_path, &content, &regions, context_lines);
+        // Use the raw path before rendering it because rendering can lossy-convert pathname bytes.
+        let formatted = format_file_conflicts(&display_path, &content, &regions, context_lines);
         output.push_str(&formatted);
         output.push('\n');
     }

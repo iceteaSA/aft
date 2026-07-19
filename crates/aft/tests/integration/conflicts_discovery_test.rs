@@ -197,6 +197,40 @@ fn toplevel_relative_conflict_path_reads_nested_file_content() {
 }
 
 #[test]
+fn conflicts_in_non_ascii_filename_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    create_merge_conflict(dir.path(), "nested/café.txt");
+
+    let (aft, resp) = configure_and_conflicts(dir.path());
+
+    assert_eq!(resp["success"], true, "conflicts response: {resp:?}");
+    assert_eq!(resp["file_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["conflict_count"], 1, "conflicts response: {resp:?}");
+    let text = response_text(&resp);
+    assert!(text.contains("nested/café.txt"));
+    assert!(text.contains("<<<<<<< HEAD"));
+    assert!(text.contains(">>>>>>> theirs"));
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn conflicts_in_newline_filename_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    create_merge_conflict(dir.path(), "nested/conflict\nname.txt");
+
+    let (aft, resp) = configure_and_conflicts(dir.path());
+
+    assert_eq!(resp["success"], true, "conflicts response: {resp:?}");
+    assert_eq!(resp["file_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["conflict_count"], 1, "conflicts response: {resp:?}");
+    let text = response_text(&resp);
+    assert!(text.contains("nested/conflict\nname.txt"));
+    assert!(text.contains("<<<<<<< HEAD"));
+    assert!(text.contains(">>>>>>> theirs"));
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn optional_path_can_inspect_external_repo_and_reports_checked_root() {
     let conflicted_dir = tempfile::tempdir().unwrap();
     create_merge_conflict(conflicted_dir.path(), "packages/a/x.txt");
